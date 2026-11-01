@@ -31,6 +31,8 @@ publish.workspace = true
 # feature (verified to compile; wired live in the next step). Default-off keeps the shared
 # workspace build lean.
 default = []
+# Explicit connected preparation builds this probe; native lanes execute it offline.
+native-policy-qualification = ["real-transport"]
 real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "dep:freshell-platform", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]

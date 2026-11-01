@@ -1,0 +1,12 @@
+{
+  "version": "0.164.0",
+  "packageName": "@openai/codex",
+  "packageVersion": "0.164.0-linux-x64",
+  "platform": "linux",
+  "arch": "x64",
+  "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-linux-x64.tgz",
+  "integrity": "sha512-XLAoaWsGOT2khzl+P4FYDPTkzAr9W0VFXFaVkqlFdkM0soa1gH/4S0wSD57Ek3HHwkirAEGz2/Mwehseh+l5Mg==",
+  "unpackedBytes": 444349626,
+  "fileCount": 45,
+  "executable": "vendor/x86_64-unknown-linux-musl/bin/codex"
+}

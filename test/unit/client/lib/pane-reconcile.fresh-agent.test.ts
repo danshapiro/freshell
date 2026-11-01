@@ -15,15 +15,15 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 
 import panesReducer, {
   initLayout,
+  updatePaneContent,
   applyReconcileAttach,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
-  setDeadSessionAdjudication,
+  setPaneReconcileNotice,
   setPaneRestoreError,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type {
-  DeadSessionEntry,
   FreshAgentPaneContent,
   TerminalPaneContent,
 } from '@/store/paneTypes'
@@ -175,15 +175,18 @@ describe('managed bootstrap history fold', () => {
     ['kilroy', 'claude', DURABLE],
     ['freshcodex', 'codex', 'native-managed-codex'],
     ['freshopencode', 'opencode', 'ses_managed_opencode'],
-  ] as const)('preserves the %s canonical source through an actual fresh fold', (sessionType, provider, nativeId) => {
+  ] as const)('preserves the %s canonical source when managed ownership arrives during an in-flight fresh fold', (sessionType, provider, nativeId) => {
     const store = configureStore({ reducer: { panes: panesReducer } })
     const sessionRef = { provider, sessionId: nativeId }
     store.dispatch(initLayout({ tabId: 'owned-tab', paneId: 'owned-pane', content: {
       kind: 'fresh-agent', sessionType, provider, createRequestId: FA_CREATE_REQUEST_ID,
       sessionId: 'old-live-handle', sessionRef, resumeSessionId: nativeId, status: 'connected',
-      soulId: 'owned-soul', soulIntentRevision: 7,
     } }))
     const request = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
+    const beforeOwnership = store.getState().panes.layouts['owned-tab']
+    if (beforeOwnership.type !== 'leaf') throw new Error('expected owned pane')
+    store.dispatch(updatePaneContent({ tabId: 'owned-tab', paneId: 'owned-pane',
+      content: { ...beforeOwnership.content, soulId: 'owned-soul', soulIntentRevision: 7 } }))
     const result = resultFor(request, [{ paneKey: request.panes[0].paneKey, verdict: 'fresh', reason: 'identity_never_observed' }])
     const outcome = foldVerdicts(store.dispatch as AppDispatch, request, result)
     expect(outcome.fresh).toBe(1)
@@ -193,8 +196,7 @@ describe('managed bootstrap history fold', () => {
     expect(root.content).toMatchObject({ sessionRef, resumeSessionId: nativeId, soulId: 'owned-soul',
       soulIntentRevision: 7, createRequestId: FA_CREATE_REQUEST_ID, pendingReconcile: 'fresh', reconcileEpoch: 1, status: 'creating' })
     expect((root.content as FreshAgentPaneContent).sessionId).toBeUndefined()
-    expect(buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!.panes[0])
-      .toMatchObject({ createRequestId: FA_CREATE_REQUEST_ID, sessionRef })
+    expect(buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })).toBeNull()
   })
 })
 
@@ -209,6 +211,32 @@ describe('fresh-agent reconcile capability latch', () => {
 })
 
 describe('buildReconcileRequest with fresh-agent panes', () => {
+  it.each([
+    ['freshclaude', 'claude', DURABLE],
+    ['kilroy', 'claude', DURABLE],
+    ['freshcodex', 'codex', 'native-managed-codex'],
+    ['freshopencode', 'opencode', 'ses_managed_opencode'],
+  ] as const)(
+    'leaves supervisor-owned %s panes to managed recovery in both builders', (sessionType, provider, nativeId) => {
+      let panes = addFreshAgentPane(emptyPanesState(), 'managed-tab', 'managed-pane', {
+        sessionType, provider, soulId: 'managed-soul',
+        sessionRef: { provider, sessionId: nativeId },
+      })
+      expect(buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })).toBeNull()
+      expect(buildReconcileRequestForPanes(asRootState(panes), [
+        { tabId: 'managed-tab', paneId: 'managed-pane' },
+      ])).toBeNull()
+      panes = addFreshAgentPane(panes, 'legacy-tab', 'legacy-pane')
+      const state = asRootState(panes)
+      for (const request of [buildReconcileRequest(state, { includeFreshAgent: true }),
+        buildReconcileRequestForPanes(state, [
+          { tabId: 'managed-tab', paneId: 'managed-pane' },
+          { tabId: 'legacy-tab', paneId: 'legacy-pane' },
+        ])]) {
+        expect(request?.panes.map(pane => pane.paneKey)).toEqual(['legacy-tab:legacy-pane'])
+      }
+    })
+
   it('excludes fresh-agent panes by default (frozen behavior)', () => {
     const req = buildReconcileRequest(stateWithBothKinds())
     expect(req!.panes).toHaveLength(1)
@@ -355,20 +383,27 @@ describe('foldVerdicts fresh-agent routing', () => {
     })
   })
 
-  it('dead_session joins ONE batched adjudication with kind fresh-agent and sets per-pane restoreError', () => {
+  it('dead_session sets exactly one per-pane restoreError per pane — no batched dispatch, no dead-copy notice', () => {
+    // No-modal contract (Task 4): the fresh-agent dead arm keeps ONLY the
+    // per-pane restoreError latch (FreshAgentView's banner reads it). No
+    // batched adjudication dispatch, and NO dead-copy reconcileNotice mint —
+    // FreshAgentView renders reconcileNotice as a transient status, so the
+    // notice is a terminal-arm signal only. RED while the batch dispatch
+    // still exists (it is the 3rd dispatch for 2 dead panes).
     const { req, dispatch, dispatched } = freshAgentFoldHarness([
       ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-0' }, reason: 'session_missing' }],
       ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-1' }, reason: 'session_missing' }],
     ])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
-    const batched = dispatched.actions.filter((a) => a.type === setDeadSessionAdjudication.type)
-    expect(batched).toHaveLength(1)
-    const entries = (batched[0] as { payload: DeadSessionEntry[] }).payload
-    expect(entries).toHaveLength(2)
-    expect(entries.every((e) => e.kind === 'fresh-agent')).toBe(true)
-    expect(entries.every((e) => e.title.length > 0)).toBe(true)
-    expect(outcome.dead).toBe(2)
-    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(2)
+    expect(outcome.cardinalityViolation).toBe(false)
+    expect(dispatched.actions).toHaveLength(2)
+    expect(new Set(dispatched.actions.map((a) => a.type))).toEqual(new Set([setPaneRestoreError.type]))
+    expect(dispatched.countOf(setPaneReconcileNotice.type)).toBe(0)
+    const restoreErrors = dispatched.actions
+      .filter((a) => a.type === setPaneRestoreError.type)
+      .map((a) => (a as unknown as { payload: { restoreError: { code: string; reason: string } } }).payload.restoreError)
+    expect(restoreErrors).toHaveLength(2)
+    expect(restoreErrors.every((r) => r.code === 'RESTORE_UNAVAILABLE' && r.reason === 'durable_artifact_missing')).toBe(true)
     expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
     })

@@ -77,6 +77,7 @@ pub(super) fn prepare_retained(
         });
     }
     Ok(Preparation {
+        codex_approval: None,
         manifest_bytes,
         selections,
         binds: inputs.config_binds,

@@ -25,18 +25,20 @@
 //                     ExitPlanMode with no input
 //   plan-empty        plan mode: ExitPlanMode with no input and no plan file
 //
-// Usage: node claude-permission-contract.mjs <repoRoot>. Prints ONE JSON line
-// (the receipt), with every fixture path replaced by `<root>`; structured
-// progress and failures go to stderr as JSONL.
+// Usage: node --import tsx claude-permission-contract.mjs <repoRoot>. Prints
+// ONE JSON line (the receipt), with every fixture path replaced by `<root>`;
+// structured progress and failures go to stderr as JSONL.
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
+import { stopFixtureProcessThen } from '../../support/stop-fixture-process.js'
 import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvider } from './claude-local-provider.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
+const fixturePrefix = process.env.FRESHELL_CLAUDE_PERMISSION_FIXTURE_PREFIX ?? 'freshell-claude-perm'
 
 const TURN_TIMEOUT_MS = 45_000
 export const PLAN = '# Plan\n\n1. Edit foo.ts\n2. Run the tests'
@@ -46,6 +48,14 @@ const log = (severity, event, fields = {}) => {
   process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), severity, component: 'claude-permission-contract', event, ...fields })}\n`)
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const errorDetail = (error) => {
+  if (error instanceof AggregateError) return `${error.message}: ${error.errors.map(errorDetail).join('; ')}`
+  if (error && typeof error === 'object') {
+    const message = typeof error.message === 'string' ? error.message : String(error)
+    return error.cause ? `${message}; cause: ${errorDetail(error.cause)}` : message
+  }
+  return String(error)
+}
 
 const pinned = await resolvePinnedClaude(repoRoot)
 
@@ -129,7 +139,7 @@ async function readJson(file) {
 }
 
 async function runScenario(name, spec) {
-  const fixture = await createClaudeFixture({ prefix: `freshell-claude-perm-${name}-` })
+  const fixture = await createClaudeFixture({ prefix: `${fixturePrefix}-${name}-` })
   const outside = path.join(fixture.root, 'outside')
   await fs.mkdir(outside, { recursive: true })
   const ctx = { cwd: fixture.cwd, outsideFile: path.join(outside, 'notes.txt'), planPath: null }
@@ -156,9 +166,25 @@ async function runScenario(name, spec) {
   let provider
   let sidecar
   let sidecarExit
+  // Resolves when the directly spawned sidecar exits; fixture cleanup also
+  // waits for its stdio close before removing the root.
+  let exited = Promise.resolve()
   let failure
+  let cleanupFailure
   let settingsLocal = null
   const written = {}
+  let providerClosed = false
+  const closeProvider = async () => {
+    if (!provider || providerClosed) return
+    providerClosed = true
+    try {
+      await provider.close()
+    } catch (error) {
+      const detail = errorDetail(error)
+      failure ??= `provider close failed: ${detail}`
+      log('error', 'provider.close_failed', { scenario: name, error: detail })
+    }
+  }
   try {
     provider = await startLocalProvider({ respond })
     sidecar = spawn(process.execPath, [path.join(repoRoot, 'crates/freshell-claude-sidecar/index.mjs')], {
@@ -166,8 +192,9 @@ async function runScenario(name, spec) {
       env: fixture.env(provider.url, { CLAUDE_CMD: pinned.nativeCli, FRESHELL_CLAUDE_ONECLI_API_KEY: '1', npm_config_update_notifier: 'false' }),
       stdio: ['pipe', 'pipe', 'pipe'],
     })
+    fixture.ownProcess(sidecar)
     sidecar.stdin.on('error', () => {})
-    const exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
+    exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
     createInterface({ input: sidecar.stderr }).on('line', () => {})
     const send = (message) => sidecar.stdin.write(`${JSON.stringify(message)}\n`)
     const waiters = []
@@ -223,17 +250,61 @@ async function runScenario(name, spec) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
   } finally {
-    if (sidecar && !sidecarExit) sidecar.kill('SIGKILL')
-    if (provider) await provider.close()
-    await fixture.cleanup()
+    // Test the unclean-exit retention path after the real child has exited,
+    // without leaving its native CLI writer orphaned.
+    if (process.env.FRESHELL_CLAUDE_PERMISSION_TEST_UNCLEAN_EXIT_SCENARIO === name
+      && sidecarExit?.code === 0 && sidecarExit.signal === null) {
+      sidecarExit = { code: 1, signal: null }
+    }
+    let cleanupCallbackStarted = false
+    let fixtureCleanupStarted = false
+    try {
+      await stopFixtureProcessThen(sidecar, async () => {
+        cleanupCallbackStarted = true
+        await closeProvider()
+        if (sidecar && (sidecarExit?.code !== 0 || sidecarExit.signal !== null)) {
+          // The native CLI is deliberately outside this harness's process
+          // ownership; retain its fixture in case it is still writing.
+          throw new Error(`sidecar did not complete a clean shutdown (code=${sidecarExit?.code ?? 'unknown'}, signal=${sidecarExit?.signal ?? 'none'}); fixture was retained`)
+        }
+        fixtureCleanupStarted = true
+        await fixture.cleanup()
+      })
+    } catch (error) {
+      const detail = errorDetail(error)
+      if (!fixtureCleanupStarted) {
+        const stopFailed = !cleanupCallbackStarted
+        cleanupFailure = `fixture cleanup failed: ${stopFailed ? 'the sidecar did not exit' : 'the sidecar did not complete a clean shutdown'}: ${detail}`
+        failure ??= cleanupFailure
+        log('error', stopFailed ? 'sidecar.stop_failed' : 'sidecar.unclean_exit', {
+          scenario: name,
+          error: detail,
+          exitCode: sidecarExit?.code ?? null,
+          signal: sidecarExit?.signal ?? null,
+          fixtureRoot: fixture.root,
+          sidecarPid: sidecar?.pid ?? null,
+        })
+      } else {
+        cleanupFailure = `fixture cleanup failed: ${detail}`
+        failure ??= cleanupFailure
+        log('error', 'fixture.cleanup_failed', {
+          scenario: name,
+          error: detail,
+          fixtureRoot: fixture.root,
+          sidecarPid: sidecar?.pid ?? null,
+        })
+      }
+    } finally {
+      await closeProvider()
+    }
   }
   const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
   const relabel = (value) => JSON.parse(JSON.stringify(value).replaceAll(fixture.root, '<root>'))
-  return relabel({ failure, fixtureRemoved, sidecarExit, frames: frames.map(slim), answered, settingsLocal, written })
+  return relabel({ failure, cleanupFailure, fixtureRemoved, sidecarExit, frames: frames.map(slim), answered, settingsLocal, written })
 }
 
 const entries = await Promise.all(Object.entries(SCENARIOS).map(async ([name, spec]) => [name, await runScenario(name, spec)]))
 const scenarios = Object.fromEntries(entries)
-const failed = entries.some(([, result]) => result.failure || !result.fixtureRemoved)
+const failed = entries.some(([, result]) => result.failure || result.cleanupFailure || !result.fixtureRemoved)
 const receipt = { sdkVersion: pinned.sdkVersion, bundledCliVersion: pinned.cliVersion, plan: PLAN, planFileText: PLAN_FILE_TEXT, scenarios }
 process.stdout.write(`${JSON.stringify(receipt)}\n`, () => process.exit(failed ? 1 : 0))

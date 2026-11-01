@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use freshell_opencode::events::parse_serve_event;
 use freshell_opencode::serve::{
-    Endpoint, EventSink, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
-    ProcessSpawner, ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError,
+    Endpoint, EventSink, EventSource, EventStreamHandle, IdleWait, OpencodeServeManager,
+    PortAllocator, ProcessSpawner, ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError,
     ServeHttpRequest, ServeHttpResponse, ServeProcess, SpawnRequest,
 };
 use serde_json::json;
@@ -189,37 +189,84 @@ async fn does_not_resolve_from_status_idle_without_prior_activity() {
     // Guard against a false-green: an idle status with NO observed running activity must
     // NOT resolve (the reference requires observedActivity before counting idle polls).
     // With no SSE activity and no idle edge, onceIdle must time out.
-    let mgr = started_manager(json!({ "ses_x": { "type": "idle" } }), 15).await;
-    let rx = mgr.subscribe("ses_x");
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        mgr.await_idle("ses_x", rx, Duration::from_millis(150), None),
-    )
-    .await
-    .expect("must not hang");
-    assert!(
-        matches!(result, Err(ServeError::IdleTimeout { .. })),
-        "idle status without prior activity must not resolve, got {result:?}"
-    );
+    for wait in [
+        IdleWait::Timeout(Duration::from_millis(150)),
+        IdleWait::WhileActive(Duration::from_millis(150)),
+    ] {
+        let mgr = started_manager(json!({ "ses_x": { "type": "idle" } }), 15).await;
+        let rx = mgr.subscribe("ses_x");
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            mgr.await_idle("ses_x", rx, wait, None),
+        )
+        .await
+        .expect("must not hang");
+        assert!(
+            matches!(result, Err(ServeError::IdleTimeout { .. })),
+            "idle status without prior activity must not resolve {wait:?}, got {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn rejects_on_sidecar_lost() {
-    let mgr = started_manager(json!({}), 500).await;
-    let rx = mgr.subscribe("ses_x");
-    mgr.emit_lost_for_all();
+    for wait in [
+        IdleWait::Timeout(Duration::from_secs(2)),
+        IdleWait::WhileActive(Duration::from_secs(2)),
+    ] {
+        let mgr = started_manager(json!({}), 500).await;
+        let rx = mgr.subscribe("ses_x");
+        mgr.emit_lost_for_all();
 
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            mgr.await_idle("ses_x", rx, wait, None),
+        )
+        .await
+        .expect("must not hang");
+        assert!(
+            matches!(result, Err(ServeError::SidecarLost { .. })),
+            "a lost sidecar ends {wait:?}, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_activity_based_idle_observer_ends_when_its_event_emitter_closes() {
+    let mgr = started_manager(json!({}), 500).await;
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    drop(tx);
     let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        mgr.await_idle("ses_x", rx, Duration::from_secs(2), None),
+        Duration::from_secs(1),
+        mgr.await_idle(
+            "ses_x",
+            rx,
+            IdleWait::WhileActive(Duration::from_secs(2)),
+            None,
+        ),
     )
     .await
-    .expect("must not hang");
-    assert!(
-        matches!(result, Err(ServeError::SidecarLost { .. })),
-        "a lost sidecar rejects onceIdle, got {result:?}"
-    );
+    .expect("a closed stream must not spin forever");
+    assert!(matches!(result, Err(ServeError::SidecarLost { .. })));
+}
+
+#[tokio::test]
+async fn bounded_idle_wait_still_times_out_while_the_native_session_is_busy() {
+    let mgr = started_manager(json!({"ses_x":{"type":"busy"}}), 15).await;
+    let rx = mgr.subscribe("ses_x");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_millis(120), None),
+    )
+    .await
+    .expect("bounded API waits must return on their deadline");
+    assert!(matches!(
+        result,
+        Err(ServeError::IdleTimeout {
+            timeout_ms: 120,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

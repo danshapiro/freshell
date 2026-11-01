@@ -58,14 +58,15 @@ export function buildFreshAgentPaneContent({
     ...(modelEffortLevels ? { modelEffortLevels } : {}),
     ...(permissionMode ? { permissionMode } : {}),
     sandbox: freshAgentType.runtimeProvider === 'codex'
-      ? codingCliSettings?.providers?.[freshAgentType.runtimeProvider]?.sandbox
+      ? providerSettings?.sandbox ?? codingCliSettings?.providers?.[freshAgentType.runtimeProvider]?.sandbox
       : undefined,
     // Undefined effort is meaningful for opencode live-catalog models:
     // the Default row (no variant) persists as the provider default.
     ...(createEffort ? { effort: createEffort } : {}),
     plugins: freshAgentType.runtimeProvider === 'claude' ? freshAgentSettings?.defaultPlugins : undefined,
     style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
-    ...(cwd ? { initialCwd: cwd } : {}),
+    ...(cwd ?? providerSettings?.cwd ? { initialCwd: cwd ?? providerSettings?.cwd } : {}),
+    ...(freshAgentType.runtimeProvider === 'codex' ? { collaborationMode: providerSettings?.collaborationMode ?? 'default', effortIsNativeDefault: createEffort === undefined } : {}),
     ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
   }
 }

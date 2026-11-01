@@ -734,6 +734,7 @@ mod tests {
             provider_launch_context: crate::ProviderLaunchContext {
                 prepared_inputs: Some(prepared()),
                 preparation: crate::ProviderPreparation::Codex {
+                    approval_default: None,
                     tui_args: vec![],
                     sidecar_args: vec![],
                 },
@@ -944,6 +945,7 @@ mod tests {
         let context = crate::ProviderLaunchContext {
             prepared_inputs: Some(prepared()),
             preparation: crate::ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },

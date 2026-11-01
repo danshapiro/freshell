@@ -1763,6 +1763,64 @@ describe('PaneContainer', () => {
       ).toBeTruthy()
     })
 
+    it.each([false, true])('settles a sessionRef-only Close with success:%s while preserving native ownership until acknowledged cleanup', async (success) => {
+      const node: PaneNode = {
+        type: 'leaf', id: 'pane-native-close', content: {
+          kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+          createRequestId: 'create-native-close', soulId: 'soul-native-close',
+          sessionRef: { provider: 'codex', sessionId: 'native-close' }, status: 'connected',
+        },
+      }
+      const store = createStore({
+        layouts: { 'tab-1': node }, activePane: { 'tab-1': node.id },
+      }, {}, {}, { runtimeOwners: {} })
+      act(() => {
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner', provider: 'codex', sessionId: 'native-close',
+          epoch: 11, generation: 4, ownerKind: 'fresh-agent',
+          operationId: 'native-close-owner', transition: 'handoff-committed',
+        }))
+      })
+      const canonicalOwner = store.getState().freshAgent.runtimeOwners['codex:native-close']
+      const key = makeFreshAgentSessionKey({ sessionType: 'freshcodex', provider: 'codex', sessionId: 'native-close' })
+      renderWithStore(<PaneContainer tabId="tab-1" node={node} />, store)
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+      const kills = mockSend.mock.calls.map(([message]) => message).filter((message) => message.type === 'freshAgent.kill')
+      expect(kills).toEqual([{
+        type: 'freshAgent.kill', sessionId: 'native-close', sessionType: 'freshcodex', provider: 'codex',
+        observedEpoch: 11, observedGeneration: 4,
+      }])
+      const reply = { type: 'freshAgent.killed', sessionId: 'native-close', sessionType: 'freshcodex', provider: 'codex', success }
+      await act(async () => {
+        emitWsMessage({ ...reply, sessionId: 'foreign-native' })
+        emitWsMessage({ ...reply, provider: 'claude' })
+      })
+      expect(store.getState().panes.layouts['tab-1']).toEqual(node)
+      expect(store.getState().freshAgent.sessions[key]?.lastErrorCode).toBeUndefined()
+      expect(mockSend.mock.calls.some(([message]) => ['pane.closed', 'panes.closed'].includes(message.type))).toBe(false)
+
+      await act(async () => { emitWsMessage(reply) })
+      if (success) {
+        await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'panes.closed', panes: [{ createRequestId: 'create-native-close' }],
+        })))
+        expect(store.getState().panes.layouts['tab-1']).toEqual(node)
+        await act(async () => { ackPanesClosedBatchesMocked() })
+        await waitFor(() => expect(store.getState().panes.layouts['tab-1']).toBeUndefined())
+      } else {
+        // This error is written by the actual Close promise's failure branch,
+        // proving settlement from the ACK rather than mere absence of cleanup.
+        await waitFor(() => expect(store.getState().freshAgent.sessions[key]?.lastErrorCode).toBe('KILL_FAILED'))
+        expect(store.getState().panes.layouts['tab-1']).toEqual(node)
+        expect(store.getState().freshAgent.runtimeOwners['codex:native-close']).toEqual(canonicalOwner)
+        expect(mockSend.mock.calls.some(([message]) => ['pane.closed', 'panes.closed'].includes(message.type))).toBe(false)
+      }
+      expect(mockSend.mock.calls.filter(([message]) => message.type === 'freshAgent.kill')).toHaveLength(1)
+      expect(mockSend.mock.calls.filter(([message]) => [
+        'freshAgent.create', 'terminal.create', 'freshAgent.send', 'freshAgent.recovery.stop',
+      ].includes(message.type))).toEqual([])
+    })
+
     it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {
       const node: PaneNode = {
         type: 'leaf',
@@ -2543,7 +2601,7 @@ describe('PaneContainer', () => {
           expect(paneContent.provider).toBe('codex')
           expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
           expect(paneContent.model).toBe('gpt-6-astra')
-          expect(paneContent.effort).toBe('max')
+          expect(paneContent.effort).toBeUndefined()
         }
       })
 
@@ -2555,7 +2613,7 @@ describe('PaneContainer', () => {
       }))
     })
 
-    it('normalizes saved Freshcodex effort from provider settings against the active model', async () => {
+    it.each(['xhigh', 'max'])('preserves saved Freshcodex effort %s from provider settings for native validation', async (effort) => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(
         node,
@@ -2563,7 +2621,7 @@ describe('PaneContainer', () => {
         { codex: { model: 'gpt-5.6-luna' } },
         ['claude', 'codex'],
         { claude: true, codex: true },
-        { freshcodex: { effort: 'xhigh' } },
+        { freshcodex: { effort } },
       )
       mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshcodex-project' })
 
@@ -2584,9 +2642,18 @@ describe('PaneContainer', () => {
         const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
         expect(paneContent.kind).toBe('fresh-agent')
         if (paneContent.kind === 'fresh-agent') {
+          expect(paneContent.sessionType).toBe('freshcodex')
+          expect(paneContent.provider).toBe('codex')
+          expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
+          expect(paneContent.status).toBe('creating')
+          expect(paneContent.createRequestId).toBeDefined()
           expect(paneContent.model).toBe('gpt-5.6-luna')
-          expect(paneContent.effort).toBe('max')
+          expect(paneContent.effort).toBe(effort)
         }
+      })
+
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+        codingCli: { providers: { codex: { model: 'gpt-5.6-luna', cwd: '/home/user/freshcodex-project' } } },
       })
     })
 

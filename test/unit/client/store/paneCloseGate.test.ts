@@ -1269,7 +1269,6 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
           zoomedPane: {},
           refreshRequestsByPane: {},
           restoreFallbackAttemptsByPane: {},
-          deadSessionAdjudication: [],
           reconcileWarming: null,
           reconcilePendingPanes: {},
         },

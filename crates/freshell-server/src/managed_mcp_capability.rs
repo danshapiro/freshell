@@ -83,6 +83,16 @@ struct InputPreparation {
     prior_grant_ids: Vec<String>,
 }
 
+pub(crate) fn opencode_tui_reference(jsonc: bool) -> ProviderConfigReference {
+    let format = if jsonc { "jsonc" } else { "json" };
+    ProviderConfigReference {
+        root: ProviderConfigRoot::Ephemeral,
+        relative_path: format!("tui-config.{format}"),
+        provider_relative_path: format!(".freshell/opencode/user-tui.{format}"),
+        format: format.into(),
+    }
+}
+
 #[derive(Clone)]
 struct Grant {
     soul_id: SoulId,
@@ -112,6 +122,11 @@ struct CapabilitySettings {
 
 fn store() -> &'static CapabilityStore {
     STORE.get_or_init(CapabilityStore::default)
+}
+
+#[cfg(all(test, feature = "managed-fresh-agent-fixtures"))]
+pub(crate) fn grant_count_for_test() -> usize {
+    store().grants.lock().unwrap().len()
 }
 
 fn capability_dir() -> Result<PathBuf, String> {
@@ -319,6 +334,8 @@ struct CapabilityCallback {
     workspace: Option<PathBuf>,
     auth_lookup_authority: Option<String>,
     claude_recovery_source: Option<freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
+    #[serde(default)]
+    codex_source_runtime: Option<freshell_platform::codex_inputs::NativeSourceRuntime>,
     cwd: Option<PathBuf>,
     provider_secret_references: Option<Vec<freshell_runtime_protocol::ProviderSecretReference>>,
     prior_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
@@ -590,15 +607,52 @@ async fn apply_prepared_callback(
         provider,
         callback.prior_context.as_ref(),
     )? {
-        if let Some(plan) = &current_claude_plan {
-            confirm_claude_callback_candidate(&callback, store, directory, client, plan, &reply)
-                .await?;
+        let mut replay = true;
+        if provider == "codex" {
+            use freshell_platform::codex_inputs::{CodexInputManifest, NativeSourceRuntime};
+            let manifest: CodexInputManifest = serde_json::from_slice(&read_prior_manifest_bytes(
+                provider,
+                store,
+                directory,
+                &callback.soul_id,
+                &reply.provider_launch_context,
+            )?)
+            .map_err(|_| "pending Codex source manifest metadata invalid")?;
+            manifest.validate().map_err(str::to_string)?;
+            let current = callback.codex_source_runtime.unwrap_or_default();
+            if manifest.native_source_runtime != current {
+                if current != NativeSourceRuntime::AppServer {
+                    return Err("Codex current consumer cannot use the pending app-server preparation; retain inputs and reconcile".into());
+                }
+                // A legacy candidate may still contain a public untrusted
+                // declaration. Reprepare its accepted selectors, never relabel
+                // copied bytes. Existing pending ownership fences own cleanup.
+                store.abort_preparation(
+                    &reply
+                        .provider_launch_context
+                        .mcp_capability
+                        .as_ref()
+                        .ok_or("pending Codex capability unavailable")?
+                        .grant_id,
+                    &callback.soul_id,
+                    directory,
+                )?;
+                replay = false;
+            }
         }
-        return freshell_runtime_protocol::bounded_json_bytes(
-            &reply,
-            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
-        )
-        .map_err(|_| "replacement provider context exceeds control metadata profile".into());
+        if replay {
+            if let Some(plan) = &current_claude_plan {
+                confirm_claude_callback_candidate(
+                    &callback, store, directory, client, plan, &reply,
+                )
+                .await?;
+            }
+            return freshell_runtime_protocol::bounded_json_bytes(
+                &reply,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .map_err(|_| "replacement provider context exceeds control metadata profile".into());
+        }
     }
     if matches!(provider, "codex" | "claude" | "amplifier") {
         let mut context = callback
@@ -625,10 +679,13 @@ async fn apply_prepared_callback(
         }
         let origins = match provider {
             "codex" => {
-                let manifest: freshell_platform::codex_inputs::CodexInputManifest =
+                let mut manifest: freshell_platform::codex_inputs::CodexInputManifest =
                     serde_json::from_slice(&bytes)
                         .map_err(|_| "prior Codex source manifest metadata invalid")?;
                 manifest.validate().map_err(str::to_string)?;
+                // Only the authenticated current consumer supplies this role.
+                // Accepted selectors and the old generation remain unchanged.
+                manifest.native_source_runtime = callback.codex_source_runtime.unwrap_or_default();
                 AcceptedOrigins::Codex(manifest)
             }
             "claude" => {
@@ -970,6 +1027,7 @@ async fn confirm_claude_callback_candidate(
             observation_request: source,
         },
         true,
+        Some(binding),
     )?;
     let source = request.observation_request.clone();
     let reply = client.observe_claude_sources(request).await.map_err(|_| {
@@ -1105,17 +1163,50 @@ fn apply_callback(
     match callback.action.as_str() {
         "issue" => {
             let provider = callback.provider.ok_or("missing managed MCP provider")?;
-            let references = provider_source_references(&provider, home)?;
+            let secret_references =
+                crate::managed_provider_bootstrap::named_provider_onecli_references(&provider)?;
+            let workspace = callback.workspace.as_deref().unwrap_or(home);
+            let cwd = callback.cwd.as_deref().unwrap_or(workspace);
+            let mut context =
+                crate::managed_provider_bootstrap::provider_launch_context_from_home_at(
+                    &provider, workspace, cwd, home, None,
+                )?
+                .ok_or("managed provider preparation is unavailable")?;
+            let references = context.config.clone();
             let reference = store.issue_replacement(
                 callback.soul_id,
                 directory,
                 endpoint.into(),
                 Some((&provider, home, &references)),
                 callback.tui_source.as_ref(),
-                callback.workspace.as_deref(),
+                Some(workspace),
             )?;
-            serde_json::to_vec(&reference).map_err(|error| error.to_string())
+            let stage = staged_provider_root_path(directory, &reference.grant_id)?;
+            if let freshell_runtime_protocol::ProviderPreparation::Opencode {
+                tui_config,
+                tui_source,
+                inline_config,
+                ..
+            } = &mut context.preparation
+            {
+                *tui_source = callback.tui_source;
+                *inline_config = stage.join("ephemeral/inline-config.json").is_file();
+                for name in ["tui-config.json", "tui-config.jsonc"] {
+                    if stage.join("ephemeral").join(name).is_file() {
+                        *tui_config = Some(opencode_tui_reference(name.ends_with("jsonc")));
+                        break;
+                    }
+                }
+            }
+            context =
+                crate::managed_provider_bootstrap::with_managed_mcp_reference(context, reference)?;
+            serde_json::to_vec(&freshell_runtime_protocol::ProviderReplacementPreparation {
+                context,
+                secret_references,
+            })
+            .map_err(|error| error.to_string())
         }
+
         "activate" => {
             let grant_id = callback.grant_id.ok_or("missing managed MCP grant id")?;
             let incarnation_id = callback
@@ -2025,7 +2116,7 @@ fn stage_provider_root(
             provider,
             selections = selections.len()
         );
-        let copy_result = if provider == "opencode" {
+        let copy_result = if matches!(provider, "opencode" | "codex") {
             freshell_platform::provider_environment::copy_environment_excluding_subtree_for_mounts(
                 &selections,
                 &temporary,
@@ -2224,6 +2315,9 @@ fn stage_provider_root(
             )?;
         }
         if let Some(resources) = &ordinary_resources {
+            if provider == "codex" {
+                ordinary_stage::stage_codex_approval(&temporary, resources)?;
+            }
             if provider == "claude" {
                 claude_stage::stage_settings(
                     &temporary,
@@ -2806,6 +2900,32 @@ impl CapabilityStore {
                             .map_err(|_| "ordinary prepared inputs unavailable")?,
                     );
                     context.config.clear();
+                    if provider == "codex" {
+                        let descriptor = root.join(".freshell/codex-approval.json");
+                        if descriptor.exists() {
+                            let bytes = source_stage::read_source_view(
+                                root,
+                                ".freshell/codex-approval.json",
+                            )?;
+                            let default: freshell_runtime_protocol::CodexApprovalDefault =
+                                serde_json::from_str(&bytes).map_err(|_| {
+                                    "Codex approval_policy prepared intent unavailable"
+                                })?;
+                            if !default.validate() {
+                                return Err(
+                                    "Codex approval_policy prepared source metadata is invalid"
+                                        .into(),
+                                );
+                            }
+                            if let freshell_runtime_protocol::ProviderPreparation::Codex {
+                                approval_default,
+                                ..
+                            } = &mut context.preparation
+                            {
+                                *approval_default = Some(default);
+                            }
+                        }
+                    }
                 }
                 let result = publish_prepared_context_metadata(
                     root,
@@ -2885,10 +3005,14 @@ impl CapabilityStore {
         let Some((id, pending_endpoint, prior_ids)) = candidate else {
             return Ok(None);
         };
+        // Recovery follows the failed replacement once it has been published
+        // in the registry. Its context names this pending generation itself.
         if pending_endpoint != endpoint
             || prior
                 .and_then(|context| context.mcp_capability.as_ref())
-                .is_some_and(|reference| !prior_ids.contains(&reference.grant_id))
+                .is_some_and(|reference| {
+                    reference.grant_id != id && !prior_ids.contains(&reference.grant_id)
+                })
         {
             return Err(
                 "pending complete provider preparation requires exact ownership reconciliation"
@@ -3380,7 +3504,7 @@ fn bind_claude_candidate_request(
     directory: &Path,
     request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
 ) -> Result<freshell_runtime_protocol::ObserveClaudeSourcesRequest, String> {
-    bind_claude_candidate_request_and_plan(store, directory, request, false)
+    bind_claude_candidate_request_and_plan(store, directory, request, false, None)
         .map(|(request, _)| request)
 }
 
@@ -3389,6 +3513,7 @@ fn bind_claude_candidate_request_and_plan(
     directory: &Path,
     mut request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
     use_frozen_revision: bool,
+    recovery: Option<&freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
 ) -> Result<
     (
         freshell_runtime_protocol::ObserveClaudeSourcesRequest,
@@ -3429,7 +3554,7 @@ fn bind_claude_candidate_request_and_plan(
         ".freshell/claude-candidate-binding.json",
         MAX_CONTROL_FRAME_BYTES,
     )?;
-    let publication: ClaudeCandidatePublication =
+    let mut publication: ClaudeCandidatePublication =
         serde_json::from_slice(&published).map_err(|_| blocked())?;
     if use_frozen_revision {
         // A fresh baseline has no prepared revision yet. Same-scope replay
@@ -3477,6 +3602,56 @@ fn bind_claude_candidate_request_and_plan(
     {
         return Err(blocked());
     }
+    // The frozen files can survive a failed reader or replacement. Their
+    // original callback scope cannot authorize the next recovery attempt.
+    // Reconcile only this owned pending generation after current baseline
+    // observation and complete frozen-payload validation above.
+    let published = if let Some(recovery) = recovery {
+        recovery.validate().map_err(|_| blocked())?;
+        let owned = store.grants.lock().unwrap();
+        let grant = owned.get(&generation).ok_or_else(blocked)?;
+        let pending = grant.preparation.as_ref().ok_or_else(blocked)?;
+        if pending.phase == InputPreparationPhase::Committed
+            || grant.soul_id != request.soul_id
+            || (recovery.prior_generation_id != generation
+                && !pending
+                    .prior_grant_ids
+                    .contains(&recovery.prior_generation_id))
+            || publication.initial_reservation_id.is_some()
+            || publication.soul_id != request.soul_id
+            || publication.provider != recovery.provider
+            || publication.intent_revision != recovery.intent_revision
+            || publication.workspace_path != request.workspace_path
+            || publication.git_common_dir != recovery.git_common_dir
+            || recovery.authority_sha256
+                != format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&request.authority, MAX_CONTROL_FRAME_BYTES)
+                            .map_err(|_| blocked())?
+                    )
+                )
+        {
+            return Err(blocked());
+        }
+        drop(owned);
+        publication.authority_sha256 = recovery.authority_sha256.clone();
+        publication.registry_attempt_id = Some(recovery.registry_attempt_id.clone());
+        publication.prior_generation_id = Some(recovery.prior_generation_id.clone());
+        let rebound =
+            bounded_json_bytes(&publication, MAX_CONTROL_FRAME_BYTES).map_err(|_| blocked())?;
+        if rebound != published {
+            let path = root.join(".freshell/claude-candidate-binding.json");
+            replace_staged_private_bytes(&path, &rebound)?;
+            allow_controller_stage_read(&path)?;
+            tracing::info!(event="provider.inputs.claude_candidate.reconciled", soul_id=%request.soul_id,
+                generation_id=%generation, attempt_id=%recovery.registry_attempt_id,
+                "Retained Claude candidate bound to current recovery attempt");
+        }
+        rebound
+    } else {
+        published
+    };
     let binding = CandidateBinding {
         soul_id: publication.soul_id.as_str().into(),
         generation_id: generation,
@@ -3518,6 +3693,48 @@ pub(crate) fn abort_prepared_claude_candidate(
     generation: &str,
 ) -> Result<(), String> {
     store().abort_preparation(generation, soul, &capability_dir()?)
+}
+
+/// Preparation owns an issued grant until the supervisor accepts its launch.
+/// This also covers early returns after provider resources have been staged.
+pub(crate) struct PendingMcpCapability {
+    reference: McpCapabilityReference,
+    armed: bool,
+}
+
+impl PendingMcpCapability {
+    pub(crate) fn new(reference: McpCapabilityReference) -> Self {
+        Self {
+            reference,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn reference(&self) -> McpCapabilityReference {
+        self.reference.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// A prepared-input journal owns this generation once launch is handed to
+    /// the supervisor. Keep its grant available while an uncertain reply is
+    /// reconciled against the recorded incarnation.
+    pub(crate) fn retain_for_reconciliation(mut self) {
+        self.disarm();
+    }
+}
+
+impl Drop for PendingMcpCapability {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = revoke_mcp_capability(&self.reference.grant_id) {
+                tracing::warn!(event = "managed_mcp.pending_cleanup_failed",
+                    grant_id = self.reference.grant_id.as_str(), error = %error);
+            }
+        }
+    }
 }
 
 /// A web-server restart restores only grants whose exact incarnation remains
@@ -3681,6 +3898,133 @@ fn execute_copied_script(path: &Path) -> std::io::Result<std::process::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Linux IN_ACCESS observes actual reads even on noatime-mounted fixture
+    // volumes. Each witness first detects a real one-byte read and drains it,
+    // so a broken observer cannot silently credit the subsequent refusal.
+    struct PayloadReadWitness {
+        #[cfg(target_os = "linux")]
+        events: std::fs::File,
+        #[cfg(not(target_os = "linux"))]
+        path: PathBuf,
+        #[cfg(not(target_os = "linux"))]
+        old_access: std::time::SystemTime,
+    }
+
+    impl PayloadReadWitness {
+        fn new(path: &Path) -> Self {
+            use std::io::Read;
+            #[cfg(target_os = "linux")]
+            let mut witness = {
+                use std::os::{
+                    fd::{AsRawFd, FromRawFd},
+                    unix::ffi::OsStrExt,
+                };
+                let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+                assert!(
+                    fd >= 0,
+                    "create payload read observer: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: inotify_init1 returned a new owned file descriptor.
+                let events = unsafe { std::fs::File::from_raw_fd(fd) };
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                let watch = unsafe {
+                    libc::inotify_add_watch(events.as_raw_fd(), path.as_ptr(), libc::IN_ACCESS)
+                };
+                assert!(
+                    watch >= 0,
+                    "watch payload reads: {}",
+                    std::io::Error::last_os_error()
+                );
+                Self { events }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mut witness = {
+                let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                    .unwrap();
+                Self {
+                    path: path.to_owned(),
+                    old_access,
+                }
+            };
+            std::fs::File::open(path)
+                .unwrap()
+                .read_exact(&mut [0])
+                .unwrap();
+            assert!(
+                witness.take_observed_read(),
+                "fixture must observe actual payload reads"
+            );
+            #[cfg(not(target_os = "linux"))]
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(witness.old_access))
+                .unwrap();
+            witness
+        }
+
+        #[cfg(target_os = "linux")]
+        fn take_observed_read(&mut self) -> bool {
+            use std::io::Read;
+            let mut buffer = [0u8; 4096];
+            let mut observed = false;
+            loop {
+                let count = match self.events.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        return observed
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read payload observer: {error}"),
+                };
+                assert!(count > 0, "payload read observer closed unexpectedly");
+                let mut offset = 0;
+                while offset < count {
+                    let header = std::mem::size_of::<libc::inotify_event>();
+                    assert!(count - offset >= header, "incomplete payload read event");
+                    // SAFETY: the complete event header is in the initialized
+                    // buffer; read_unaligned handles its byte-buffer alignment.
+                    let event = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                        )
+                    };
+                    assert_eq!(
+                        event.mask & libc::IN_Q_OVERFLOW,
+                        0,
+                        "payload read event overflow"
+                    );
+                    assert_eq!(
+                        event.mask & (libc::IN_IGNORED | libc::IN_UNMOUNT),
+                        0,
+                        "payload read observer lost its file"
+                    );
+                    observed |= event.mask & libc::IN_ACCESS != 0;
+                    offset += header + event.len as usize;
+                    assert!(offset <= count, "incomplete payload read event name");
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn take_observed_read(&mut self) -> bool {
+            std::fs::metadata(&self.path).unwrap().accessed().unwrap() != self.old_access
+        }
+
+        fn assert_not_read(&mut self, message: &str) {
+            assert!(!self.take_observed_read(), "{message}");
+        }
+    }
 
     fn opencode_source_view(
         logical_path: PathBuf,
@@ -3982,34 +4326,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_mcp_preparation_inventory_rejects_oversize_before_payload_read() {
-        use std::io::Read;
         let owned = tempfile::tempdir().unwrap();
         let path = grant_path(owned.path(), "grant-pending").unwrap();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         file.set_len(128 * 1024 + 1).unwrap();
-        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
-        file.read_exact(&mut [0]).unwrap();
-        assert_ne!(
-            file.metadata().unwrap().accessed().unwrap(),
-            old_access,
-            "fixture filesystem must observe payload reads"
-        );
-        file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
         drop(file);
+        let mut witness = PayloadReadWitness::new(&path);
         assert!(protected_preparation_ids(owned.path()).is_err());
-        assert_eq!(
-            std::fs::metadata(path).unwrap().accessed().unwrap(),
-            old_access,
-            "oversized preparation inventory payload was read"
-        );
+        witness.assert_not_read("oversized preparation inventory payload was read");
     }
 
     #[cfg(target_os = "linux")]
@@ -4217,8 +4546,9 @@ mod tests {
             assert!(
                 String::from_utf8_lossy(&output.stdout)
                     .contains("recovery_sparse_manifest_reader_ready"),
-                "allocation fixture must execute its child reader: {}",
-                String::from_utf8_lossy(&output.stdout)
+                "allocation fixture must execute its child reader: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
             eprintln!(
                 "recovery_sparse_manifest_child_result status={} oversized_payload_read={}",
@@ -4277,26 +4607,14 @@ mod tests {
                 .manifest
                 .relative_path,
         );
-        let mut sparse = std::fs::OpenOptions::new()
+        let sparse = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         sparse.set_len(64 * 1024 * 1024 + 1).unwrap();
-        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        sparse
-            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
-        std::io::Read::read_exact(&mut sparse, &mut [0u8; 1]).unwrap();
-        assert_ne!(
-            std::fs::metadata(&path).unwrap().accessed().unwrap(),
-            old_access,
-            "fixture filesystem must report actual payload reads"
-        );
-        sparse
-            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
         drop(sparse);
+        let mut witness = PayloadReadWitness::new(&path);
         let pages: u64 = std::fs::read_to_string("/proc/self/statm")
             .unwrap()
             .split_whitespace()
@@ -4312,10 +4630,8 @@ mod tests {
         println!("recovery_sparse_manifest_reader_ready");
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
         assert!(read_prior_manifest_bytes("codex", &store, &directory, &soul, &accepted).is_err());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().accessed().unwrap(),
-            old_access,
-            "oversized manifest payload was read before its physical bound was rejected"
+        witness.assert_not_read(
+            "oversized manifest payload was read before its physical bound was rejected",
         );
         assert!(store.grants.lock().unwrap().contains_key(&grant.grant_id));
         assert_eq!(
@@ -6001,7 +6317,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::fs::create_dir_all(source.join("plugins")).unwrap();
         std::fs::write(source.join("settings.json"), "current setting").unwrap();
         std::fs::write(source.join("plugins/plugin.txt"), "current plugin").unwrap();
-        std::fs::write(source.join("plugins/auth.json"), "secret").unwrap();
+        std::fs::write(source.join("plugins/auth.json"), "package library nonce").unwrap();
         std::fs::write(source.join("auth.json"), "top-level secret").unwrap();
         let outside = home.path().join("outside.txt");
         std::fs::write(&outside, "outside").unwrap();
@@ -6040,7 +6356,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         );
         assert_eq!(
             std::fs::read_to_string(staged.join("plugins/auth.json")).unwrap(),
-            "secret"
+            "package library nonce"
         );
         assert!(!staged.join("plugins/alias-secret.json").exists());
         assert_eq!(
@@ -6282,8 +6598,20 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             home.path(),
         )
         .unwrap();
-        let pending: McpCapabilityReference = serde_json::from_slice(&lost).unwrap();
-        let retry: McpCapabilityReference = serde_json::from_slice(&repeated).unwrap();
+        let pending = serde_json::from_slice::<
+            freshell_runtime_protocol::ProviderReplacementPreparation,
+        >(&lost)
+        .unwrap()
+        .context
+        .mcp_capability
+        .unwrap();
+        let retry = serde_json::from_slice::<
+            freshell_runtime_protocol::ProviderReplacementPreparation,
+        >(&repeated)
+        .unwrap()
+        .context
+        .mcp_capability
+        .unwrap();
         assert_eq!(pending.grant_id, retry.grant_id);
         assert!(staged_provider_root_path(&directory, &first.grant_id)
             .unwrap()
@@ -6541,7 +6869,6 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
 
     #[test]
     fn managed_mcp_generation_abort_cold_pending_requires_complete_matching_ownership() {
-        use std::io::Read;
         let mut failed = Vec::new();
         for case in [
             "pending",
@@ -6598,27 +6925,19 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             std::fs::write(stage.join("usable-resource"), b"pending-input-nonce").unwrap();
             let path = grant_path(&directory, &pending.grant_id).unwrap();
             let before = std::fs::read(&path).unwrap();
-            let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            let mut read_witness = None;
             match case {
                 "missing" => std::fs::remove_file(&path).unwrap(),
                 "malformed" => std::fs::write(&path, b"{\"preparation\":").unwrap(),
                 "oversize" => {
-                    let mut file = std::fs::OpenOptions::new()
+                    let file = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
                         .open(&path)
                         .unwrap();
                     file.set_len(128 * 1024 + 1).unwrap();
-                    file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                        .unwrap();
-                    file.read_exact(&mut [0]).unwrap();
-                    assert_ne!(
-                        file.metadata().unwrap().accessed().unwrap(),
-                        old_access,
-                        "fixture filesystem must observe ownership payload reads"
-                    );
-                    file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                        .unwrap();
+                    drop(file);
+                    read_witness = Some(PayloadReadWitness::new(&path));
                 }
                 "assigned_pending" | "unrecorded" => {
                     let mut stored: serde_json::Value = serde_json::from_slice(&before).unwrap();
@@ -6660,9 +6979,13 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 "malformed" => {
                     std::fs::read(&path).is_ok_and(|bytes| bytes == b"{\"preparation\":")
                 }
-                "oversize" => std::fs::metadata(&path).is_ok_and(|metadata| {
-                    metadata.len() == 128 * 1024 + 1 && metadata.accessed().unwrap() == old_access
-                }),
+                "oversize" => {
+                    read_witness
+                        .as_mut()
+                        .unwrap()
+                        .assert_not_read("oversized ownership payload was read");
+                    std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 128 * 1024 + 1)
+                }
                 "assigned_pending" | "unrecorded" => {
                     std::fs::read(&path).is_ok_and(|bytes| Some(bytes) == modified)
                 }
@@ -7800,6 +8123,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 mcp_capability: None,
                 prepared_inputs: None,
                 preparation: ProviderPreparation::Codex {
+                    approval_default: None,
                     tui_args: mcp.clone(),
                     sidecar_args: mcp,
                 },
@@ -8130,6 +8454,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             mcp_capability: None,
             prepared_inputs: None,
             preparation: ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: mcp.clone(),
                 sidecar_args: mcp,
             },
@@ -8410,97 +8735,713 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[test]
-    fn managed_provider_codex_selected_inputs_reach_private_generation() {
+    #[cfg(unix)]
+    fn managed_provider_codex_workspace_skill_does_not_copy_the_workspace_install() {
+        for nested in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let repository = owned.path().join("parent-repository");
+            let workspace = if nested {
+                repository.join(".worktrees/workspace")
+            } else {
+                owned.path().join("workspace")
+            };
+            let skills = workspace.join(".codex/skills");
+            let skill = workspace.join(".claude/skills/probe");
+            std::fs::create_dir_all(home.join(".codex")).unwrap();
+            std::fs::create_dir_all(&skills).unwrap();
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::create_dir(workspace.join(".git")).unwrap();
+            std::fs::create_dir(workspace.join("node_modules")).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "workspace-skill-nonce").unwrap();
+            std::os::unix::fs::symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
+            std::fs::File::create(workspace.join("node_modules/unrelated-binary"))
+                .unwrap()
+                .set_len(
+                    freshell_platform::provider_environment::CopyLimits::default().max_file_bytes
+                        + 1,
+                )
+                .unwrap();
+            if nested {
+                std::fs::create_dir_all(repository.join("node_modules")).unwrap();
+                std::fs::write(repository.join("package.json"), r#"{"type":"module"}"#).unwrap();
+                std::fs::File::create(repository.join("node_modules/unrelated-parent-binary"))
+                    .unwrap()
+                    .set_len(
+                        freshell_platform::provider_environment::CopyLimits::default()
+                            .max_file_bytes
+                            + 1,
+                    )
+                    .unwrap();
+            }
+            let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+                "codex", &workspace, &home, None,
+            )
+            .unwrap()
+            .unwrap();
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let capability = store
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("codex", &home, &context.config)),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        launch_context: Some(&context),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("a mounted workspace install must not block selected skill staging");
+            let accepted = read_prepared_context(&directory, &capability).unwrap();
+            let inputs = accepted.prepared_inputs.unwrap();
+            let mount = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| mount.logical_destination == skills.to_str().unwrap())
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            assert_eq!(
+                std::fs::read(
+                    stage
+                        .join(&mount.stage_relative_path)
+                        .join("probe/SKILL.md")
+                )
+                .unwrap(),
+                b"workspace-skill-nonce"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_codex_role_refusal_keeps_prior_grant_and_inputs() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
-        let workspace = owned.path().join("workspace");
-        std::fs::create_dir_all(home.join(".codex/agents/nested")).unwrap();
-        std::fs::create_dir_all(workspace.join(".codex/skills/fixture/scripts")).unwrap();
-        std::fs::create_dir(workspace.join(".git")).unwrap();
-        let raw = format!("model_instructions_file = 'instructions.md'\n[projects.{}]\ntrust_level = 'trusted'\n[agents.reader]\nconfig_file = 'agents/nested/reader.toml'\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap());
-        std::fs::write(home.join(".codex/config.toml"), &raw).unwrap();
-        std::fs::write(home.join(".codex/instructions.md"), "home-input").unwrap();
-        std::fs::write(
-            home.join(".codex/agents/nested/reader.toml"),
-            "model_instructions_file = 'instructions.md'\n",
-        )
-        .unwrap();
-        std::fs::write(
-            home.join(".codex/agents/nested/instructions.md"),
-            "role-input",
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.join(".codex/config.toml"),
-            "model_instructions_file = 'instructions.md'\n",
-        )
-        .unwrap();
-        std::fs::write(workspace.join(".codex/instructions.md"), "project-input").unwrap();
-        std::fs::write(
-            workspace.join(".codex/skills/fixture/SKILL.md"),
-            "skill-resource",
-        )
-        .unwrap();
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex/roles")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let config =
+            "approval_policy = 'never'\n[agents.reader]\nconfig_file = 'roles/reader.toml'\n";
+        let role = home.join(".codex/roles/reader.toml");
+        let valid_role = "approval_policy = 'on-request'\n";
+        std::fs::write(home.join(".codex/config.toml"), config).unwrap();
+        std::fs::write(&role, valid_role).unwrap();
         let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
-            "codex", &workspace, &home, None,
+            "codex", &cwd, &home, None,
         )
         .unwrap()
         .unwrap();
         let directory = owned.path().join("control/mcp-capabilities");
         std::fs::create_dir_all(&directory).unwrap();
         let store = CapabilityStore::default();
-        let capability = store
-            .issue(
-                SoulId::new(),
+        let soul = SoulId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        };
+        let issue = || {
+            store.issue(
+                soul.clone(),
                 &directory,
-                "http://host.docker.internal:4000".into(),
-                Some(("codex", &home, &context.config)),
+                endpoint.into(),
+                Some(("codex", &home, &[])),
                 OpencodeEphemeralInput {
-                    cwd: Some(&workspace),
-                    workspace: Some(&workspace),
+                    codex_manifest: Some(&manifest),
                     launch_context: Some(&context),
+                    cwd: Some(&cwd),
+                    workspace: Some(&cwd),
                     ..Default::default()
                 },
                 None,
             )
+        };
+        let prior = issue().unwrap();
+        let incarnation = IncarnationId::new();
+        store
+            .activate(
+                &prior.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &directory,
+                endpoint,
+            )
             .unwrap();
-        let accepted = read_prepared_context(&directory, &capability).unwrap();
-        let inputs = accepted
-            .prepared_inputs
-            .expect("Codex selected layers and typed resources must be accepted as one generation");
-        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
-        for (logical, expected) in [
-            (home.join(".codex/instructions.md"), "home-input"),
-            (
-                home.join(".codex/agents/nested/instructions.md"),
-                "role-input",
-            ),
-            (workspace.join(".codex/instructions.md"), "project-input"),
-        ] {
-            let mount = inputs
-                .resource_mounts
-                .iter()
-                .find(|mount| mount.logical_destination == logical.to_str().unwrap())
-                .expect("ordinary selected resource must retain its original absolute alias");
-            assert_eq!(
-                std::fs::read_to_string(stage.join(&mount.stage_relative_path)).unwrap(),
-                expected
-            );
-        }
-        assert!(inputs
-            .resource_mounts
-            .iter()
-            .any(|mount| mount.logical_destination
-                == workspace.join(".codex/skills").to_str().unwrap()));
-        assert!(inputs
+        store
+            .commit_preparation(&prior.grant_id, &soul, &incarnation, &directory)
+            .unwrap();
+        let prior_path = grant_path(&directory, &prior.grant_id).unwrap();
+        let prior_bytes = std::fs::read(&prior_path).unwrap();
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let descriptor: freshell_runtime_protocol::PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(prior_stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let role_bind = descriptor
             .config_binds
             .iter()
-            .any(|bind| bind.logical_destination
-                == workspace.join(".codex/config.toml").to_str().unwrap()));
+            .find(|bind| bind.logical_destination == role.to_str().unwrap())
+            .unwrap();
+        let prepared_role = prior_stage.join(&role_bind.source_relative_path);
+        assert_eq!(std::fs::read_to_string(&prepared_role).unwrap(), valid_role);
+
+        let rejected_role = "approval_policy = 'untrusted'\n";
+        std::fs::write(&role, rejected_role).unwrap();
+        let error = issue().expect_err("unrepresentable role policy must not publish a generation");
+        assert!(
+            error.contains("approval_policy") && error.contains(role.to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&prior_path).unwrap(), prior_bytes);
+        assert_eq!(std::fs::read_to_string(prepared_role).unwrap(), valid_role);
+        assert_eq!(std::fs::read_to_string(&role).unwrap(), rejected_role);
         assert_eq!(
             std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
-            raw
+            config
         );
+        assert_eq!(store.grants.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(prior_stage.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_codex_nonprojected_policy_stays_under_native_authority() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(home.join(".codex/config.toml"), "approval_policy = { granular = { sandbox_approval = true, rules = true, mcp_elicitations = true } }\n").unwrap();
+        let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        };
+        let prepared = ordinary_stage::prepare(&home, &cwd, Some(&manifest))
+            .expect("untrusted compatibility must not reject a policy it does not need to project");
+        assert!(prepared.codex_approval.is_none());
+    }
+
+    #[test]
+    fn prepared_codex_named_selection_refuses_for_managed_sidecar() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "approval_policy = 'never'\n",
+        )
+        .unwrap();
+        let selected = home.join(".codex/selected.config.toml");
+        std::fs::write(&selected, "model_reasoning_effort = 'low'\n").unwrap();
+        let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::Tui,
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            codex_home: home.join(".codex"),
+            named_profile: Some("selected".into()),
+        };
+        let error = ordinary_stage::prepare(&home, &cwd, Some(&manifest)).err()
+            .expect("managed TUI also has an app-server owner; selecting only the TUI config would lose intent");
+        assert!(error.contains("--profile") && error.contains(selected.to_str().unwrap()));
+    }
+
+    #[test]
+    fn prepared_codex_runtime_purpose_survives_replay() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "approval_policy = 'untrusted'\n",
+        )
+        .unwrap();
+        let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        };
+        let mut metadata = serde_json::to_value(&manifest).unwrap();
+        let accepted = serde_json::from_value(metadata.clone()).unwrap();
+        assert!(ordinary_stage::prepare(&home, &cwd, Some(&accepted))
+            .unwrap()
+            .codex_approval
+            .is_some());
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("nativeSourceRuntime");
+        let legacy = serde_json::from_value(metadata).unwrap();
+        assert!(
+            ordinary_stage::prepare(&home, &cwd, Some(&legacy)).is_err(),
+            "missing old purpose must not authorize public-policy rewriting"
+        );
+    }
+
+    #[test]
+    fn prepared_codex_tui_refuses_before_policy_is_lost() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let source = home.join(".codex/config.toml");
+        std::fs::write(&source, "approval_policy = 'untrusted'\n").unwrap();
+        let error = ordinary_stage::prepare(&home, &cwd, None).err()
+            .expect("a terminal CLI cannot silently lose policy that only app-server typed requests can preserve");
+        assert!(error.contains("approval_policy") && error.contains(source.to_str().unwrap()));
+    }
+
+    #[test]
+    fn prepared_codex_source_change_refuses_before_publishing_policy() {
+        use freshell_platform::provider_environment::{copy_environment, CopyLimits};
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let cwd = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let source = home.join(".codex/config.toml");
+        std::fs::write(&source, "approval_policy = 'untrusted'\nmodel = 'a'\n").unwrap();
+        let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+            native_source_runtime: freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+            version: 1,
+            original_home: home.clone(),
+            cwd: cwd.clone(),
+            codex_home: home.join(".codex"),
+            named_profile: None,
+        };
+        let prepared = ordinary_stage::prepare(&home, &cwd, Some(&manifest)).unwrap();
+        // Same-length unrelated content must still invalidate the accepted
+        // snapshot; the later policy declaration itself remains untrusted.
+        std::fs::write(&source, "approval_policy = 'untrusted'\nmodel = 'b'\n").unwrap();
+        let stage = owned.path().join("stage");
+        copy_environment(&prepared.selections, &stage, &[], CopyLimits::default()).unwrap();
+        let error = ordinary_stage::stage_codex_approval(&stage, &prepared).unwrap_err();
+        assert!(error.contains("approval_policy") && error.contains("source changed"));
+        assert!(!stage.join(".freshell/codex-approval.json").exists());
+    }
+
+    #[cfg(feature = "managed-provider-qualification")]
+    #[tokio::test]
+    async fn prepared_codex_native_config_projection_preserves_effective_source() {
+        use freshell_platform::codex_inputs::CodexInputManifest;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository.join("test/fixtures/coding-cli/codex-native-artifact.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let binary =
+            if std::env::var("FRESHELL_CODEX_QUALIFY_MANAGED_WRAPPER").as_deref() == Ok("1") {
+                let resource: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(repository.join("docker/runtime/codex-native-sandbox.json"))
+                        .unwrap(),
+                )
+                .unwrap();
+                PathBuf::from(resource["native"]["launchWrapper"].as_str().unwrap())
+            } else {
+                repository
+                    .join(".runtime-build/codex-contract/artifact")
+                    .join(metadata["executable"].as_str().unwrap())
+            };
+        let version = std::process::Command::new(&binary)
+            .arg("--version")
+            .output()
+            .expect("connected verified native preparation must precede qualification");
+        assert!(version.status.success());
+        assert_eq!(
+            String::from_utf8(version.stdout).unwrap().trim(),
+            "codex-cli 0.164.0"
+        );
+        async fn rpc(
+            stdin: &mut tokio::process::ChildStdin,
+            lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+            id: u64,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            stdin
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"id":id,"method":method,"params":params})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(25), async {
+                loop {
+                    let line = lines
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .expect("native config parsing must survive the owned projection");
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if frame.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                        assert!(
+                            frame.get("error").is_none(),
+                            "native {method} refused: {frame}"
+                        );
+                        return frame["result"].clone();
+                    }
+                }
+            })
+            .await
+            .expect("bounded actual native qualification response")
+        }
+        for (case, named_policy, project_policy, trusted, expected) in [
+            ("inherited", None, None, true, "untrusted"),
+            (
+                "trusted-project-override",
+                None,
+                Some("never"),
+                true,
+                "never",
+            ),
+            ("disabled-project", None, Some("never"), false, "untrusted"),
+        ] {
+            let owned = executable_fixture_directory();
+            let home = owned.path().join("home");
+            let workspace = owned.path().join("workspace");
+            std::fs::create_dir_all(home.join(".codex")).unwrap();
+            std::fs::create_dir_all(workspace.join(".codex")).unwrap();
+            std::fs::create_dir(workspace.join(".git")).unwrap();
+            let base = format!("approval_policy = 'untrusted'\nmodel_reasoning_effort = 'low'\nmodel = 'contract-model'\nmodel_provider = 'fixture'\n[model_providers.fixture]\nname = 'Owned fixture'\nbase_url = 'http://127.0.0.1:1/v1'\nwire_api = 'responses'\nrequires_openai_auth = false\n[projects.{}]\ntrust_level = '{}'\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap(), if trusted { "trusted" } else { "untrusted" });
+            let named_policy: Option<&str> = named_policy;
+            let named = format!(
+                "model_reasoning_effort = 'low'\n{}",
+                named_policy
+                    .map(|policy| format!("approval_policy = '{policy}'\n"))
+                    .unwrap_or_default()
+            );
+            std::fs::write(home.join(".codex/config.toml"), &base).unwrap();
+            std::fs::write(home.join(".codex/selected.config.toml"), &named).unwrap();
+            std::fs::write(
+                workspace.join(".codex/config.toml"),
+                project_policy
+                    .map(|policy| format!("approval_policy = '{policy}'\n"))
+                    .unwrap_or_default(),
+            )
+            .unwrap();
+            let original = std::fs::read(home.join(".codex/config.toml")).unwrap();
+            let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+                "codex", &workspace, &home, None,
+            )
+            .unwrap()
+            .unwrap();
+            let manifest = CodexInputManifest {
+                native_source_runtime:
+                    freshell_platform::codex_inputs::NativeSourceRuntime::AppServer,
+                version: 1,
+                original_home: home.clone(),
+                cwd: workspace.clone(),
+                codex_home: home.join(".codex"),
+                named_profile: None,
+            };
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let grant = CapabilityStore::default()
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("codex", &home, &context.config)),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        codex_manifest: Some(&manifest),
+                        launch_context: Some(&context),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let accepted = read_prepared_context(&directory, &grant).unwrap();
+            let intent = match &accepted.preparation {
+                freshell_runtime_protocol::ProviderPreparation::Codex {
+                    approval_default: Some(intent),
+                    ..
+                } => intent,
+                _ => panic!("actual prepared policy intent must survive complete publication"),
+            };
+            assert_eq!(intent.policy, expected, "{case}");
+            let source = if project_policy.is_some() && trusted {
+                workspace.join(".codex/config.toml")
+            } else if named_policy.is_some() {
+                home.join(".codex/selected.config.toml")
+            } else {
+                home.join(".codex/config.toml")
+            };
+            assert_eq!(Path::new(&intent.logical_source), source);
+            assert_eq!(
+                std::fs::read(home.join(".codex/config.toml")).unwrap(),
+                original,
+                "preparation cannot edit its source"
+            );
+            let stage = staged_provider_root_path(&directory, &grant.grant_id).unwrap();
+            // Simulate the exact logical file mounts within this owned fixture;
+            // archive originals first, never modify a user's source HOME.
+            for (index, bind) in accepted
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .config_binds
+                .iter()
+                .enumerate()
+            {
+                let logical = Path::new(&bind.logical_destination);
+                if !logical.starts_with(owned.path()) {
+                    continue;
+                }
+                std::fs::rename(logical, owned.path().join(format!("original-{index}"))).unwrap();
+                std::os::unix::fs::symlink(stage.join(&bind.source_relative_path), logical)
+                    .unwrap();
+            }
+            let mut command = tokio::process::Command::new(&binary);
+            let mut child = command
+                .args(["app-server"])
+                .process_group(0)
+                .current_dir(&workspace)
+                .env("HOME", &home)
+                .env("CODEX_HOME", home.join(".codex"))
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            rpc(&mut stdin, &mut lines, 1, "initialize", serde_json::json!({"clientInfo":{"name":"freshell_prepared_codex", "version":"1"},"capabilities":{"experimentalApi":true}})).await;
+            stdin
+                .write_all(b"{\"method\":\"initialized\",\"params\":{}}\n")
+                .await
+                .unwrap();
+            let config = rpc(
+                &mut stdin,
+                &mut lines,
+                2,
+                "config/read",
+                serde_json::json!({"includeLayers":true}),
+            )
+            .await;
+            assert_eq!(
+                config["config"]["model_reasoning_effort"], "low",
+                "unrelated setting survives projection"
+            );
+            let started = rpc(&mut stdin, &mut lines, 3, "thread/start", serde_json::json!({"cwd":workspace,"model":"contract-model","approvalPolicy":intent.policy,"sandbox":"read-only"})).await;
+            assert_eq!(
+                started["approvalPolicy"], expected,
+                "actual native effective policy {case}"
+            );
+            stop_codex_source_child(&mut child).await;
+            println!(
+                "provider_source_consumer {}",
+                serde_json::json!({"provider":"codex","case":case,"nativeVersion":"0.164.0","effectivePolicy":started["approvalPolicy"],"declaringSource":intent.logical_source,"modelWorkSubmitted":false})
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provider_codex_selected_inputs_reach_private_generation() {
+        for untrusted_policy in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let workspace = owned.path().join("workspace");
+            std::fs::create_dir_all(home.join(".codex/agents/nested")).unwrap();
+            std::fs::create_dir_all(workspace.join(".codex/skills/fixture/scripts")).unwrap();
+            std::fs::create_dir(workspace.join(".git")).unwrap();
+            let raw = format!("model_instructions_file = 'instructions.md'\n[projects.{}]\ntrust_level = 'trusted'\n[agents.reader]\nconfig_file = 'agents/nested/reader.toml'\n", serde_json::to_string(workspace.to_str().unwrap()).unwrap());
+            let raw = if untrusted_policy {
+                format!("approval_policy = 'untrusted'\nmodel = 'synthetic'\n{raw}")
+            } else {
+                raw
+            };
+            std::fs::write(home.join(".codex/config.toml"), &raw).unwrap();
+            std::fs::write(home.join(".codex/instructions.md"), "home-input").unwrap();
+            let role_config = "approval_policy = 'on-request'\nmodel = 'role-model'\nmodel_instructions_file = 'instructions.md'\n";
+            std::fs::write(home.join(".codex/agents/nested/reader.toml"), role_config).unwrap();
+            std::fs::write(
+                home.join(".codex/agents/nested/instructions.md"),
+                "role-input",
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.join(".codex/config.toml"),
+                "model_instructions_file = 'instructions.md'\n",
+            )
+            .unwrap();
+            std::fs::write(workspace.join(".codex/instructions.md"), "project-input").unwrap();
+            std::fs::write(
+                workspace.join(".codex/skills/fixture/SKILL.md"),
+                "skill-resource",
+            )
+            .unwrap();
+            let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+                "codex", &workspace, &home, None,
+            )
+            .unwrap()
+            .unwrap();
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let manifest = freshell_platform::codex_inputs::CodexInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                cwd: workspace.clone(),
+                codex_home: home.join(".codex"),
+                named_profile: None,
+                native_source_runtime: if untrusted_policy {
+                    freshell_platform::codex_inputs::NativeSourceRuntime::AppServer
+                } else {
+                    freshell_platform::codex_inputs::NativeSourceRuntime::Tui
+                },
+            };
+            let capability = store
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("codex", &home, &context.config)),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        launch_context: Some(&context),
+                        codex_manifest: Some(&manifest),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let accepted = read_prepared_context(&directory, &capability).unwrap();
+            if untrusted_policy {
+                let freshell_runtime_protocol::ProviderPreparation::Codex {
+                    approval_default: Some(default),
+                    ..
+                } = &accepted.preparation
+                else {
+                    panic!("relative resource preparation lost untrusted intent")
+                };
+                assert_eq!(default.policy, "untrusted");
+                assert_eq!(
+                    default.canonical_source,
+                    home.join(".codex/config.toml").to_str().unwrap()
+                );
+                assert_eq!(
+                    default.source_sha256,
+                    format!("{:x}", Sha256::digest(raw.as_bytes()))
+                );
+            }
+            let inputs = accepted.prepared_inputs.expect(
+                "Codex selected layers and typed resources must be accepted as one generation",
+            );
+            let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            let role_path = home.join(".codex/agents/nested/reader.toml");
+            let role_bind = inputs
+                .config_binds
+                .iter()
+                .find(|bind| bind.logical_destination == role_path.to_str().unwrap())
+                .expect("valid child policy must be published with its own configuration");
+            assert_eq!(
+                std::fs::read_to_string(stage.join(&role_bind.source_relative_path)).unwrap(),
+                role_config
+            );
+            assert_eq!(std::fs::read_to_string(&role_path).unwrap(), role_config);
+            if untrusted_policy {
+                let bind = inputs
+                    .config_binds
+                    .iter()
+                    .find(|bind| {
+                        bind.logical_destination
+                            == home.join(".codex/config.toml").to_str().unwrap()
+                    })
+                    .unwrap();
+                let config: toml::Value = toml::from_str(
+                    &std::fs::read_to_string(stage.join(&bind.source_relative_path)).unwrap(),
+                )
+                .unwrap();
+                assert!(config.get("approval_policy").is_none());
+                assert_eq!(config["model"].as_str(), Some("synthetic"));
+                assert_eq!(
+                    config["model_instructions_file"].as_str(),
+                    Some("instructions.md")
+                );
+                assert_eq!(
+                    config["agents"]["reader"]["config_file"].as_str(),
+                    Some("agents/nested/reader.toml")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+                    raw
+                );
+            }
+
+            for (logical, expected) in [
+                (home.join(".codex/instructions.md"), "home-input"),
+                (
+                    home.join(".codex/agents/nested/instructions.md"),
+                    "role-input",
+                ),
+                (workspace.join(".codex/instructions.md"), "project-input"),
+            ] {
+                let mount = inputs
+                    .resource_mounts
+                    .iter()
+                    .find(|mount| mount.logical_destination == logical.to_str().unwrap())
+                    .expect("ordinary selected resource must retain its original absolute alias");
+                assert_eq!(
+                    std::fs::read_to_string(stage.join(&mount.stage_relative_path)).unwrap(),
+                    expected
+                );
+            }
+            assert!(inputs
+                .resource_mounts
+                .iter()
+                .any(|mount| mount.logical_destination
+                    == workspace.join(".codex/skills").to_str().unwrap()));
+            assert!(inputs
+                .config_binds
+                .iter()
+                .any(|bind| bind.logical_destination
+                    == workspace.join(".codex/config.toml").to_str().unwrap()));
+            assert_eq!(
+                std::fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+                raw
+            );
+        }
     }
 
     #[tokio::test]
@@ -8546,6 +9487,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             std::fs::read(grant_path(&directory, &prior.grant_id).unwrap()).unwrap();
         let context = freshell_runtime_protocol::ProviderLaunchContext {
             preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             },
@@ -8782,6 +9724,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "digest",
             "identity",
             "none",
+            "candidate_unavailable",
+            "new_attempt",
+            "different_intent",
             "pending_selection_drift",
             "replacement",
             "candidate_digest",
@@ -8793,7 +9738,28 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 read_frame, write_frame, AdminCommand, AdminReply, AdminResult, Envelope,
                 InstallationId,
             };
-            let current_callback = if fault == "replacement" {
+            let current_callback = if matches!(fault, "new_attempt" | "different_intent") {
+                let mut value: serde_json::Value = serde_json::from_slice(&callback).unwrap();
+                let authority = ClaudeSourceAuthority::RecoveryAttempt {
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                };
+                let ClaudeSourceAuthority::RecoveryAttempt { attempt_id } = &authority else {
+                    unreachable!()
+                };
+                value["authLookupAuthority"] = serde_json::json!(attempt_id);
+                value["claudeRecoverySource"]["authoritySha256"] = serde_json::json!(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES).unwrap()
+                    )
+                ));
+                value["claudeRecoverySource"]["registryAttemptId"] =
+                    serde_json::to_value(RecoveryAttemptId::new()).unwrap();
+                if fault == "different_intent" {
+                    value["claudeRecoverySource"]["intentRevision"] = serde_json::json!(3);
+                }
+                serde_json::to_vec(&value).unwrap()
+            } else if fault == "replacement" {
                 store
                     .abort_preparation(&replacement.grant_id, &soul, &directory)
                     .unwrap();
@@ -8816,7 +9782,11 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             };
             let socket_path = owned.path().join(format!("source-{fault}.sock"));
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            let expected_scope = scope.clone();
+            let expected_scope = serde_json::from_slice::<serde_json::Value>(&current_callback)
+                .unwrap()["authLookupAuthority"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let expected_soul = soul.clone();
             let expected_cwd = if matches!(fault, "replacement" | "candidate_digest") {
                 resumed.clone()
@@ -8868,7 +9838,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                             },
                             _ => panic!("unexpected scoped source callback request"),
                         };
-                        write_frame(&mut socket, &AdminReply { request_id: request.request_id, result: Ok(result) }).await.unwrap();
+                        let result = if fault == "candidate_unavailable" && matches!(&result, AdminResult::ClaudeSourceObservation(_)) && observations.last() == Some(&true) {
+                            Err(freshell_runtime_protocol::RuntimeError::new(freshell_runtime_protocol::RuntimeErrorCode::HostUnreachable, "synthetic candidate reader failure"))
+                        } else { Ok(result) };
+                        write_frame(&mut socket, &AdminReply { request_id: request.request_id, result }).await.unwrap();
                     }
                     observations
                 }).await.unwrap()
@@ -8889,9 +9862,14 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             let observations = reader.await.unwrap();
             if matches!(
                 fault,
-                "none" | "replacement" | "candidate_digest" | "pending_selection_drift"
+                "none"
+                    | "candidate_unavailable"
+                    | "new_attempt"
+                    | "replacement"
+                    | "candidate_digest"
+                    | "pending_selection_drift"
             ) {
-                assert_eq!(observations, vec![false, true], "both pending replay and new replacement must confirm their actual candidate before any consumer");
+                assert_eq!(observations, vec![false, true], "both pending replay and new replacement must confirm their actual candidate before any consumer; fault={fault}, result={result:?}");
             } else {
                 assert_eq!(
                     observations,
@@ -8899,7 +9877,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                     "failed current source evidence must stop before candidate work"
                 );
             }
-            if fault == "none" {
+            if matches!(fault, "none" | "new_attempt") {
                 assert_eq!(
                     serde_json::from_slice::<serde_json::Value>(&result.unwrap()).unwrap(),
                     serde_json::from_slice::<serde_json::Value>(&pending_before).unwrap()
@@ -8961,7 +9939,13 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             );
             if matches!(
                 fault,
-                "digest" | "identity" | "none" | "pending_selection_drift"
+                "digest"
+                    | "identity"
+                    | "none"
+                    | "candidate_unavailable"
+                    | "new_attempt"
+                    | "different_intent"
+                    | "pending_selection_drift"
             ) {
                 assert_eq!(
                     std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
@@ -9546,6 +10530,20 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         let context = read_prepared_context(&directory, &prior).unwrap();
         assert!(context.prepared_inputs.is_some());
         let prior_inputs = context.prepared_inputs.clone().unwrap();
+        let endpoint = "http://host.docker.internal:4000";
+        let initial_incarnation = IncarnationId::new();
+        store
+            .activate(
+                &prior.grant_id,
+                soul.clone(),
+                initial_incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&prior.grant_id, &soul, &initial_incarnation, &directory)
+            .unwrap();
         std::fs::rename(&home, owned.path().join("unavailable-home")).unwrap();
         let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"amplifier","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[]})).unwrap();
         let client = freshell_runtime_client::RuntimeClient::new(
@@ -9618,6 +10616,61 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert_eq!(inputs.config_binds, prior_inputs.config_binds);
         assert_eq!(inputs.resource_mounts, prior_inputs.resource_mounts);
         assert_ne!(inputs.generation_id, prior_inputs.generation_id);
+        // A dispatched replacement can fail after binding its preparation.
+        // Registry recovery then follows that failed incarnation and supplies
+        // its accepted context, whose capability is the pending generation.
+        let pending_id = ready
+            .provider_launch_context
+            .mcp_capability
+            .as_ref()
+            .unwrap()
+            .grant_id
+            .clone();
+        store
+            .activate(
+                &pending_id,
+                soul.clone(),
+                IncarnationId::new(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        let retry_callback = |context: &ProviderLaunchContext| {
+            serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control",
+                "soulId":soul,"provider":"amplifier","workspace":workspace,"cwd":workspace,
+                "priorContext":context,"providerSecretReferences":ready.provider_secret_references}))
+                .unwrap()
+        };
+        let mut unrelated = ready.provider_launch_context.clone();
+        unrelated.mcp_capability.as_mut().unwrap().grant_id =
+            format!("grant-{}", uuid::Uuid::new_v4());
+        assert!(apply_prepared_callback(
+            &retry_callback(&unrelated),
+            "fixture-control",
+            &store,
+            &directory,
+            endpoint,
+            &wrong,
+            &client,
+        )
+        .await
+        .unwrap_err()
+        .contains("exact ownership reconciliation"));
+        let retried = apply_prepared_callback(
+            &retry_callback(&ready.provider_launch_context),
+            "fixture-control",
+            &store,
+            &directory,
+            endpoint,
+            &wrong,
+            &client,
+        )
+        .await
+        .expect("failed replacement recovery must replay its own bound preparation without rescanning originals");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retried).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&repeated).unwrap()
+        );
         let projected = inputs
             .resource_mounts
             .iter()
@@ -9659,6 +10712,251 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .unwrap(),
             b"retained-bundle-resource"
         );
+        let successor = IncarnationId::new();
+        store
+            .activate(
+                &pending_id,
+                soul.clone(),
+                successor.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&pending_id, &soul, &successor, &directory)
+            .unwrap();
+        assert!(
+            !prior_stage.exists(),
+            "acceptance retires only the prior inputs"
+        );
+        assert!(
+            stage.is_dir(),
+            "the accepted replacement inputs remain available"
+        );
+        let accepted = read_stored_capability(&directory, &pending_id).unwrap();
+        assert_eq!(accepted.incarnation_id, Some(successor));
+        assert!(accepted.preparation.unwrap().phase == InputPreparationPhase::Committed);
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&projected.stage_relative_path)
+                    .join("amplifier-local-0/resource")
+            )
+            .unwrap(),
+            b"retained-bundle-resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_legacy_codex_reissue_requires_current_consumer_role() {
+        use freshell_platform::codex_inputs::{CodexInputManifest, NativeSourceRuntime};
+        use freshell_runtime_protocol::{PreparedProviderContext, ProviderPreparation};
+        for retire_legacy_pending in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("original-home");
+            let selected = owned.path().join("selected-codex");
+            let cwd = owned.path().join("original-workspace");
+            let wrong_home = owned.path().join("wrong-current-home");
+            for path in [&home, &selected, &cwd, &wrong_home] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let source = selected.join("config.toml");
+            std::fs::write(&source, "model = 'synthetic'\napproval_policy = 'never'\n").unwrap();
+            let manifest = CodexInputManifest {
+                version: 1,
+                original_home: home.clone(),
+                codex_home: selected.clone(),
+                cwd: cwd.clone(),
+                named_profile: None,
+                native_source_runtime: NativeSourceRuntime::Tui,
+            };
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let soul = SoulId::new();
+            let initial = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+                "codex", &cwd, &home, None,
+            )
+            .unwrap()
+            .unwrap();
+            let prior = store
+                .issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("codex", &home, &initial.config)),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&cwd),
+                        workspace: Some(&cwd),
+                        launch_context: Some(&initial),
+                        codex_manifest: Some(&manifest),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let context = read_prepared_context(&directory, &prior).unwrap();
+            let prior_bytes =
+                read_prior_manifest_bytes("codex", &store, &directory, &soul, &context).unwrap();
+            let accepted: CodexInputManifest = serde_json::from_slice(&prior_bytes).unwrap();
+            assert_eq!(accepted.native_source_runtime, NativeSourceRuntime::Tui);
+            assert!(!serde_json::from_slice::<serde_json::Value>(&prior_bytes)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("nativeSourceRuntime"));
+            let original =
+            "model = 'synthetic'\napproval_policy = 'untrusted'\nmodel_reasoning_effort = 'low'\n";
+            std::fs::write(&source, original).unwrap();
+            let mut callback = serde_json::json!({"action":"issue", "controlSecret":"fixture-control",
+            "soulId":soul, "provider":"codex", "cwd":wrong_home, "workspace":cwd,
+            "priorContext":context, "providerSecretReferences":[],
+            "authLookupAuthority":"fixture-owned-attempt", "codexSourceRuntime":"app_server"});
+            let client = freshell_runtime_client::RuntimeClient::new(
+                owned.path().join("unused.sock"),
+                "fixture-control",
+            );
+            let invoke = |callback: &serde_json::Value| serde_json::to_vec(callback).unwrap();
+            let legacy_pending = if retire_legacy_pending {
+                std::fs::write(&source, "model = 'synthetic'\napproval_policy = 'never'\n")
+                    .unwrap();
+                callback["codexSourceRuntime"] = "tui".into();
+                let bytes = apply_prepared_callback(
+                    &invoke(&callback),
+                    "fixture-control",
+                    &store,
+                    &directory,
+                    "http://host.docker.internal:4000",
+                    &wrong_home,
+                    &client,
+                )
+                .await
+                .unwrap();
+                let old: PreparedProviderContext = serde_json::from_slice(&bytes).unwrap();
+                let stage = staged_provider_root_path(
+                    &directory,
+                    &old.provider_launch_context.mcp_capability.unwrap().grant_id,
+                )
+                .unwrap();
+                std::fs::write(&source, original).unwrap();
+                callback["codexSourceRuntime"] = "app_server".into();
+                Some(stage)
+            } else {
+                None
+            };
+            let first = apply_prepared_callback(
+                &invoke(&callback),
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &wrong_home,
+                &client,
+            )
+            .await
+            .expect("known Freshcodex consumer must reprepare accepted legacy selectors");
+            let ready: PreparedProviderContext = serde_json::from_slice(&first).unwrap();
+            if let Some(old) = legacy_pending {
+                assert!(
+                    !old.exists(),
+                    "retire only the incompatible unactivated candidate"
+                );
+            }
+            assert!(
+                staged_provider_root_path(&directory, &prior.grant_id)
+                    .unwrap()
+                    .exists(),
+                "retain the accepted prior generation"
+            );
+            let replacement = &ready.provider_launch_context;
+            let ProviderPreparation::Codex {
+                approval_default: Some(default),
+                ..
+            } = &replacement.preparation
+            else {
+                panic!("replacement lost untrusted intent")
+            };
+            assert_eq!(default.policy, "untrusted");
+            assert_eq!(default.canonical_source, source.to_str().unwrap());
+            let next_bytes =
+                read_prior_manifest_bytes("codex", &store, &directory, &soul, replacement).unwrap();
+            let next: CodexInputManifest = serde_json::from_slice(&next_bytes).unwrap();
+            assert_eq!(next.native_source_runtime, NativeSourceRuntime::AppServer);
+            assert_eq!(
+                (
+                    next.original_home,
+                    next.codex_home,
+                    next.cwd,
+                    next.named_profile
+                ),
+                (home.clone(), selected.clone(), cwd.clone(), None)
+            );
+            let stage = staged_provider_root_path(
+                &directory,
+                &replacement.mcp_capability.as_ref().unwrap().grant_id,
+            )
+            .unwrap();
+            let selected_copy = replacement
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .config_binds
+                .iter()
+                .find(|input| input.logical_destination == source.to_str().unwrap())
+                .expect("selected original config remains bound");
+            let prepared: toml::Value = toml::from_str(
+                &std::fs::read_to_string(stage.join(&selected_copy.source_relative_path)).unwrap(),
+            )
+            .unwrap();
+            assert!(prepared.get("approval_policy").is_none());
+            assert_eq!(prepared["model_reasoning_effort"].as_str(), Some("low"));
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+            assert_eq!(
+                read_prior_manifest_bytes("codex", &store, &directory, &soul, &context).unwrap(),
+                prior_bytes
+            );
+            std::fs::remove_file(&source).unwrap();
+            let repeated = apply_prepared_callback(
+                &invoke(&callback),
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &wrong_home,
+                &client,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&repeated).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&first).unwrap()
+            );
+            for role in [Some("tui"), None] {
+                callback
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("codexSourceRuntime");
+                if let Some(role) = role {
+                    callback["codexSourceRuntime"] = role.into();
+                }
+                let error = apply_prepared_callback(
+                    &invoke(&callback),
+                    "fixture-control",
+                    &store,
+                    &directory,
+                    "http://host.docker.internal:4000",
+                    &wrong_home,
+                    &client,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("consumer"), "{error}");
+                assert!(
+                    stage.exists(),
+                    "a refused consumer cannot retire a compatible pending generation"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -11551,6 +12849,102 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[tokio::test]
+    async fn managed_provider_paired_native_auth_transport_reaches_prepared_publication() {
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let raw = r#"{"instructions":["{file:{env:NODE_EXTRA_CA_CERTS}}"]}"#;
+        std::fs::write(workspace.join("opencode.json"), raw).unwrap();
+        let grant = owned.path().join("environment.env");
+        let auth = owned.path().join("auth.json");
+        let ca = owned.path().join("ca.pem");
+        std::fs::write(&grant, "HTTPS_PROXY=http://192.0.2.10:10255\nNODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\nNODE_USE_ENV_PROXY=1\n").unwrap();
+        std::fs::write(
+            &auth,
+            r#"{"openai":{"type":"api","key":"synthetic-native-key"}}"#,
+        )
+        .unwrap();
+        std::fs::write(&ca, "synthetic-ca-nonce").unwrap();
+        for path in [&grant, &auth, &ca] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let references = [
+            (&grant, ProviderSecretProfile::OpencodeOnecliEnvironment),
+            (&auth, ProviderSecretProfile::OpencodeOnecliAuthFile),
+            (&ca, ProviderSecretProfile::OpencodeOnecliCaFile),
+        ]
+        .map(|(path, profile)| ProviderSecretReference {
+            source_path: path.to_str().unwrap().into(),
+            profile,
+            provider_relative_path: None,
+        });
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        // No broker is listening: typed auth must not request a fallback lookup.
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "fixture-existing-soul",
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                original: &|_| None,
+                references: references.to_vec(),
+                auth_authority: Some("fixture-owned-attempt"),
+                selected_sources: None,
+                accepted_global_root: None,
+                selected_resource_roots: None,
+                native_source_flags: None,
+                rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
+            },
+            |soul, home, context, input| {
+                assert!(input.frozen_inputs.unwrap().is_empty());
+                assert_eq!(&input.secret_references.unwrap()[..3], &references);
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .expect("ENV before native AUTH must reach actual prepared-input publication");
+        let inputs = prepared.context.prepared_inputs.as_ref().unwrap();
+        inputs.validate_references(&prepared.references).unwrap();
+        assert!(prepared.references.iter().any(|reference| reference.profile
+            == ProviderSecretProfile::OpencodeConfigurationFile
+            && reference.source_path == ca.to_str().unwrap()));
+        assert_eq!(&prepared.references[..3], &references);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("opencode.json")).unwrap(),
+            raw
+        );
+        assert!(!serde_json::to_string(&prepared.context)
+            .unwrap()
+            .contains("synthetic-native-key"));
+    }
+
+    #[tokio::test]
     async fn managed_provider_explicit_native_source_selection_survives_preparation() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();
@@ -12357,6 +13751,94 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         );
     }
 
+    fn check_replacement_callback_selected_tui_recipe(format: &str) {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join(format!("selected-tui.{format}"));
+        std::fs::write(&selected, r#"{"theme":"prior"}"#).unwrap();
+        let source = approved_tui_source(
+            selected.to_str().unwrap(),
+            home.path(),
+            home.path(),
+            home.path(),
+        )
+        .unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        store
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                OpencodeEphemeralInput {
+                    tui_source: Some(&source),
+                    workspace: Some(home.path()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let refreshed = if format == "jsonc" {
+            "{ // refreshed\n\"theme\":\"current\"}"
+        } else {
+            r#"{"theme":"current"}"#
+        };
+        std::fs::write(&selected, refreshed).unwrap();
+        let request = serde_json::to_vec(&serde_json::json!({
+            "action":"issue", "controlSecret":"test-control-secret", "soulId":soul,
+            "provider":"opencode", "workspace":home.path(), "cwd":home.path(), "tuiSource":source,
+        }))
+        .unwrap();
+        let response = apply_callback(
+            &request,
+            "test-control-secret",
+            &store,
+            &capabilities,
+            "http://host.docker.internal:4000",
+            home.path(),
+        )
+        .unwrap();
+        let replacement: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_slice(&response).unwrap();
+        replacement
+            .context
+            .validate("opencode")
+            .expect("replacement callback must return a host-valid selected TUI recipe");
+        let freshell_runtime_protocol::ProviderPreparation::Opencode {
+            tui_config: Some(reference),
+            tui_source: Some(current_source),
+            ..
+        } = &replacement.context.preparation
+        else {
+            panic!("selected TUI omitted")
+        };
+        let grant = replacement.context.mcp_capability.as_ref().unwrap();
+        let stage = staged_provider_root_path(&capabilities, &grant.grant_id).unwrap();
+        // Resolve exactly as the host does; a doubled ephemeral prefix fails.
+        assert_eq!(
+            std::fs::read_to_string(stage.join("ephemeral").join(&reference.relative_path))
+                .unwrap(),
+            refreshed
+        );
+        assert_eq!(
+            reference.provider_relative_path,
+            current_source.provider_relative_path
+        );
+    }
+
+    #[test]
+    fn replacement_callback_selected_tui_recipe_json() {
+        check_replacement_callback_selected_tui_recipe("json");
+    }
+
+    #[test]
+    fn replacement_callback_selected_tui_recipe_jsonc() {
+        check_replacement_callback_selected_tui_recipe("jsonc");
+    }
+
     #[test]
     fn opencode_private_inputs_survive_restarting_after_container_exits() {
         let control = tempfile::tempdir().unwrap();
@@ -12907,18 +14389,20 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "action": "issue", "controlSecret": "right", "soulId": soul, "provider": "claude",
         }))
         .unwrap();
-        let replacement: McpCapabilityReference = serde_json::from_slice(
-            &apply_callback(
-                &issue,
-                "right",
-                &store,
-                dir.path(),
-                "http://host.docker.internal:4001",
-                dir.path(),
+        let replacement: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_slice(
+                &apply_callback(
+                    &issue,
+                    "right",
+                    &store,
+                    dir.path(),
+                    "http://host.docker.internal:4001",
+                    dir.path(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap();
+        let replacement = replacement.context.mcp_capability.unwrap();
         assert_ne!(replacement.grant_id, reference.grant_id);
         assert_eq!(replacement.endpoint, "http://host.docker.internal:4001");
         assert!(
@@ -12926,6 +14410,68 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "lost issue response must not retire prior grant"
         );
         assert!(store.authenticates(active["scope"].as_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_controller_returns_exact_selected_context_and_resource_projection() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let package = root.path().join("package");
+        std::fs::create_dir_all(home.join(".codex/skills")).unwrap();
+        std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("run"),
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/resource\"\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("resource"), "selected-resource").unwrap();
+        std::fs::set_permissions(package.join("run"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        symlink(&package, home.join(".codex/skills/tool")).unwrap();
+        std::fs::write(home.join(".agents/skills/SKILL.md"), "discovered-selected").unwrap();
+        let capabilities = root.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&capabilities).unwrap();
+        let store = CapabilityStore::default();
+        let request=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"selected-control","soulId":SoulId::new(),"provider":"codex","workspace":workspace})).unwrap();
+        let response = apply_callback(
+            &request,
+            "selected-control",
+            &store,
+            &capabilities,
+            "http://host.docker.internal:4001",
+            &home,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert!(value.get("context").and_then(|context|context.get("preparation")).is_some(),"replacement needs the exact producer recipe, including previously absent legacy contexts");
+        let prepared: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_value(value).unwrap();
+        let context = prepared.context;
+        assert!(context
+            .config
+            .iter()
+            .any(|reference| reference.provider_relative_path == ".freshell/resources"));
+        assert!(context
+            .config
+            .iter()
+            .any(|reference| reference.provider_relative_path
+                == ".codex/skills/freshell-discovered-agents"));
+        let grant = context.mcp_capability.unwrap();
+        let stage = staged_provider_root_path(&capabilities, &grant.grant_id).unwrap();
+        let output = std::process::Command::new(stage.join("skills/tool/run"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"selected-resource");
+        assert_eq!(
+            std::fs::read(stage.join("freshell-discovered-agents/SKILL.md")).unwrap(),
+            b"discovered-selected"
+        );
     }
 
     #[tokio::test]

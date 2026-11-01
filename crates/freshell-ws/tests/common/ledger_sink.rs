@@ -12,16 +12,15 @@
 
 use std::sync::Arc;
 
-/// Deterministic hold point for the shutdown-marker write in the lifecycle
-/// integration test. The sidecar keeps running while this awaited write is
-/// held, so the test can prove how a late CLI result races server shutdown.
+/// Deterministic hold point for an awaited sink write. Integration tests use
+/// it to control shutdown-marker and lazy genesis-clear persistence races.
 #[derive(Debug)]
-pub struct TurnInterruptedMarkerGate {
+pub struct LedgerWriteGate {
     entered: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
 }
 
-impl TurnInterruptedMarkerGate {
+impl LedgerWriteGate {
     pub fn new() -> Self {
         Self {
             entered: tokio::sync::Notify::new(),
@@ -48,6 +47,8 @@ impl TurnInterruptedMarkerGate {
     }
 }
 
+pub type TurnInterruptedMarkerGate = LedgerWriteGate;
+
 use freshell_freshagent::identity_sink::SinkCloseError;
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
@@ -64,7 +65,8 @@ pub struct LedgerSink {
     /// The ownership coordinator an authoritative write is re-validated
     /// against (the one the lanes writing through this sink are wired to).
     ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
-    turn_interrupted_marker_gate: Option<Arc<TurnInterruptedMarkerGate>>,
+    turn_interrupted_marker_gate: Option<Arc<LedgerWriteGate>>,
+    genesis_clear_gate: Option<Arc<LedgerWriteGate>>,
 }
 
 impl LedgerSink {
@@ -74,6 +76,7 @@ impl LedgerSink {
             ledger,
             ownership: None,
             turn_interrupted_marker_gate: None,
+            genesis_clear_gate: None,
         }
     }
 
@@ -87,13 +90,16 @@ impl LedgerSink {
             ledger,
             ownership,
             turn_interrupted_marker_gate: None,
+            genesis_clear_gate: None,
         }
     }
 
-    pub fn with_turn_interrupted_marker_gate(
-        mut self,
-        gate: Arc<TurnInterruptedMarkerGate>,
-    ) -> Self {
+    pub fn with_genesis_clear_gate(mut self, gate: Arc<LedgerWriteGate>) -> Self {
+        self.genesis_clear_gate = Some(gate);
+        self
+    }
+
+    pub fn with_turn_interrupted_marker_gate(mut self, gate: Arc<LedgerWriteGate>) -> Self {
         self.turn_interrupted_marker_gate = Some(gate);
         self
     }
@@ -207,6 +213,7 @@ impl PaneIdentitySink for LedgerSink {
             };
             let stored_genesis = upsert.genesis.stored_value();
             ledger.record_fresh_agent_binding(&FreshAgentBindingWrite {
+                collaboration_mode: upsert.settings.collaboration_mode.as_deref(),
                 genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
                     stored_genesis.as_ref(),
                     upsert.genesis.is_clear(),
@@ -295,6 +302,7 @@ impl PaneIdentitySink for LedgerSink {
             return None;
         }
         let settings = FreshAgentSettings {
+            collaboration_mode: row.collaboration_mode,
             model: row.model,
             sandbox: row.sandbox,
             permission_mode: row.permission_mode,
@@ -324,9 +332,13 @@ impl PaneIdentitySink for LedgerSink {
 
     fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite {
         let ledger = self.ledger.clone();
+        let gate = self.genesis_clear_gate.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
         let now = now_ms();
         Box::pin(async move {
+            if let Some(gate) = &gate {
+                gate.hold().await?;
+            }
             tokio::task::spawn_blocking(move || {
                 ledger.clear_binding_genesis(&p, &s, now).map(|_| ())
             })

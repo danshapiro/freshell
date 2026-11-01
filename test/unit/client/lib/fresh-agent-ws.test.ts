@@ -1,10 +1,11 @@
+import savedCodexNativeHistory from '../../../fixtures/managed-native-history/codex.json'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession, sessionCreated } from '@/store/freshAgentSlice'
 import freshAgentLiveReducer, { liveTailViewerAdded } from '@/store/freshAgentLiveSlice'
 import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
-import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
+import turnCompletionReducer, { markPaneAttention, markTabAttention, resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
 import {
   foldReadyRuntimeOwners,
   foldSessionRuntimeOwnerFrame,
@@ -50,6 +51,7 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
     reducer: {
       freshAgent: freshAgentReducer,
       panes: panesReducer,
+      turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
       panes: emptyPanesState(),
@@ -59,6 +61,59 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 }
 
 describe('fresh-agent-ws', () => {
+  it('routes native patches outside the session slice and fences complete items and stale init incarnations', () => {
+    const store = createFreshAgentStore()
+    const outer = { type: 'freshAgent.event' as const, sessionId: 'native-live', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.init', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0 })
+    const sessions = store.getState().freshAgent.sessions
+    const row = { id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'a', kind: 'text', text: '' }] }
+    send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 't', turns: [row], revision: 1 }, { op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'Hel', revision: 2 }] })
+    const key = 'freshcodex:codex:native-live'
+    expect(store.getState().freshAgentLive.bySession[key].projection?.turns[0].items[0]).toMatchObject({ text: 'Hel' })
+    expect(store.getState().freshAgent.sessions).toBe(sessions)
+    send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'foreign', historyGeneration: 0, ops: [{ op: 'resetTurn', nativeTurnId: 'other', turns: [row], revision: 100 }] })
+    send({ type: 'freshAgent.session.init', sessionId: outer.sessionId, projectionId: 'late-old-incarnation', historyGeneration: 0 })
+    expect(store.getState().freshAgentLive.bySession[key].projection?.id).toBe('p')
+    send({ type: 'freshAgent.transcript.patch', sessionId: outer.sessionId, projectionId: 'p', historyGeneration: 0, ops: [{ op: 'upsertItem', nativeTurnId: 't', row: { ...row, items: [] }, item: { id: 'a', kind: 'text', text: 'Hello' }, complete: true, revision: 3 }, { op: 'appendItem', nativeTurnId: 't', rowId: 't', itemId: 'a', field: 'text', text: 'lo', revision: 4 }] })
+    expect(store.getState().freshAgentLive.bySession[key].projection?.turns[0].items).toEqual([{ id: 'a', kind: 'text', text: 'Hello' }])
+  })
+  it('task6 applies retained output immediately and rejects a retired source after replacement', () => {
+    const store = createFreshAgentStore()
+    const outer = { type: 'freshAgent.event' as const, provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: savedCodexNativeHistory.threadId }
+    const send = (id: string, text: string, incarnationId: string) => handleFreshAgentMessage(store.dispatch, { ...outer,
+      event: { type: 'freshAgent.host.backpressure', retainedState: {
+        source: { projectionId: id, ownerEpoch: 0, ownerGeneration: 0, soulId: 'soul', incarnationId, hostBootId: incarnationId },
+        snapshot: { ...savedCodexNativeHistory, turns: [{ id:'t',turnId:'t',role:'assistant',summary:'',items:[{id:'answer',kind:'text',text}] }], extensions: { codex: { projection: {
+          id,historyGeneration:0,eventRevision:10,eventOwnedTurnIds:['t'],nativePreviewTurnIds:[],nativeFinalTurnIds:[],turnRows:{t:['t']},turnOutputStates:{t:{provenance:'retained',diagnostic:'unsaved',refreshPending:false}},settledTurnIds:['t'],completedItems:{t:['answer']},
+        } } } }, pendingControls: [], attentionMarks: [],
+      } },
+    })
+    send('p1','Recovered final output','incarnation-one')
+    const key = `freshcodex:codex:${outer.sessionId}`
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({text:'Recovered final output'})
+    send('p2','Replacement output','incarnation-two')
+    send('p1','Late retired output','incarnation-one')
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.id).toBe('p2')
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({text:'Replacement output'})
+  })
+  it('task6 detects a missing consumed patch prefix without applying an unbased append', () => {
+    const store = createFreshAgentStore()
+    const outer = {type:'freshAgent.event' as const,provider:'codex' as const,sessionType:'freshcodex' as const,sessionId:'patch-gap'}
+    const send=(event:Record<string,unknown>) => handleFreshAgentMessage(store.dispatch,{...outer,event})
+    send({type:'freshAgent.session.init',projectionId:'p',historyGeneration:0})
+    send({type:'freshAgent.transcript.patch',sessionId:'patch-gap',projectionId:'p',historyGeneration:0,ops:[{op:'resetTurn',nativeTurnId:'t',revision:1,turns:[{id:'t',turnId:'t',role:'assistant',summary:'',items:[{id:'a',kind:'text',text:'Known prefix'}]}]}]})
+    send({type:'freshAgent.transcript.patch',sessionId:'patch-gap',projectionId:'p',historyGeneration:0,afterRevision:4,ops:[{op:'appendItem',nativeTurnId:'t',rowId:'t',itemId:'a',field:'text',text:' unbased suffix',revision:7}]})
+    const projection=store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection
+    expect(projection?.needsResnapshot).toBe(true)
+    expect(projection?.turns[0].items[0]).toMatchObject({text:'Known prefix'})
+    send({type:'freshAgent.transcript.patch',sessionId:'patch-gap',projectionId:'p',historyGeneration:0,afterRevision:7,ops:[{op:'appendItem',nativeTurnId:'t',rowId:'t',itemId:'a',field:'text',text:' another unbased suffix',revision:8}]})
+    expect(store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection?.turns[0].items[0]).toMatchObject({text:'Known prefix'})
+    send({type:'freshAgent.host.backpressure',retainedState:{source:{projectionId:'p',ownerEpoch:0,ownerGeneration:0,soulId:'soul',incarnationId:'incarnation',hostBootId:'host'},snapshot:{...savedCodexNativeHistory,threadId:'patch-gap',turns:[{id:'t',turnId:'t',role:'assistant',summary:'',items:[{id:'a',kind:'text',text:'The authoritative complete prefix'}]}],extensions:{codex:{projection:{id:'p',historyGeneration:0,eventRevision:8,eventOwnedTurnIds:['t'],nativePreviewTurnIds:[],nativeFinalTurnIds:[],turnRows:{t:['t']},turnOutputStates:{t:{provenance:'retained',refreshPending:false}},settledTurnIds:[]}}}},pendingControls:[],attentionMarks:[]}})
+    const recovered=store.getState().freshAgentLive.bySession['freshcodex:codex:patch-gap'].projection
+    expect(recovered?.needsResnapshot).toBe(false)
+    expect(recovered?.turns[0].items[0]).toMatchObject({text:'The authoritative complete prefix'})
+  })
   beforeEach(() => {
     _resetCancelledCreates()
   })
@@ -90,6 +145,54 @@ describe('fresh-agent-ws', () => {
       kind: 'session', provider: 'claude', sessionId: 'replacement',
     })
     expect(layout.content).not.toHaveProperty('namingHandle', 'spent-original-handle')
+  })
+
+  it('adopts the Codex name without changing settings, child selection, retained source or writer', () => {
+    const store = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer, panes: panesReducer,
+    } })
+    const sessionId = savedCodexNativeHistory.threadId
+    const locator = { provider: 'codex', sessionType: 'freshcodex', sessionId } as const
+    store.dispatch(initLayout({ tabId: 'tab', paneId: 'pane', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'stable-create', status: 'running',
+      sessionRef: { provider: 'codex', sessionId },
+      namingHandle: 'spent-handle', nameRef: { kind: 'pending', id: 'spent-handle' },
+      model: 'native-custom', effort: 'xhigh', sandbox: 'workspace-write',
+      initialCwd: '/workspace', observedChildThreadId: 'observed-child',
+    } }))
+    const ws = { send: vi.fn() }
+    const source = { projectionId: 'combined-source', ownerEpoch: 2, ownerGeneration: 3,
+      soulId: 'soul', incarnationId: 'incarnation', hostBootId: 'host' }
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.host.backpressure', retainedState: {
+        source, snapshot: { ...savedCodexNativeHistory, turns: [{
+          id: 'turn', turnId: 'turn', role: 'assistant', summary: '',
+          items: [{ id: 'answer', kind: 'text', text: 'Retained native answer' }],
+        }], extensions: { codex: { projection: {
+          id: source.projectionId, historyGeneration: 0, eventRevision: 1,
+          eventOwnedTurnIds: ['turn'], nativePreviewTurnIds: [], nativeFinalTurnIds: [],
+          turnRows: { turn: ['turn'] }, turnOutputStates: { turn: { provenance: 'retained', refreshPending: false } },
+          settledTurnIds: ['turn'],
+        } } } }, pendingControls: [], attentionMarks: [],
+      },
+    } }, ws)
+    const key = `freshcodex:codex:${sessionId}`
+    const retained = store.getState().freshAgentLive.bySession[key]
+    expect(retained.projection?.turns[0].items[0]).toMatchObject({ text: 'Retained native answer' })
+    const nameRef = { kind: 'session', provider: 'codex', sessionId } as const
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.session.materialized', ...locator,
+      previousSessionId: sessionId, sessionRef: { provider: 'codex', sessionId }, nameRef,
+    }, ws)
+    const layout = store.getState().panes.layouts.tab
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(resolvePaneNameRef(layout.content)).toEqual(nameRef)
+    expect(layout.content).toMatchObject({ ...locator, createRequestId: 'stable-create',
+      model: 'native-custom', effort: 'xhigh', sandbox: 'workspace-write',
+      initialCwd: '/workspace', observedChildThreadId: 'observed-child',
+    })
+    expect(layout.content).not.toHaveProperty('namingHandle')
+    expect(store.getState().freshAgentLive.bySession[key]).toEqual(retained)
+    expect(ws.send).not.toHaveBeenCalled()
   })
 
   it('registers resumed creates with history hydration and handles freshAgent.created', () => {
@@ -636,6 +739,38 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('rebuilds managed state without attention and accepts current edges after a server restart', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-restored', paneId: 'pane-restored',
+      content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        sessionId: 'native-child', createRequestId: 'restored', status: 'running',
+      },
+    }))
+    store.dispatch(resetCompletionDedupeBaselines())
+    const receive = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex',
+      sessionId: 'native-child', event: { sessionId: 'native-child', ...event },
+    })
+    // The managed proxy replays state while withholding old attention edges.
+    expect(receive({ type: 'freshAgent.session.snapshot', latestTurnId: 'restored-turn', status: 'waiting', revision: 1 })).toBe(true)
+    expect(receive({ type: 'freshAgent.status', status: 'waiting' })).toBe(true)
+    expect(receive({ type: 'freshAgent.session.changed' })).toBe(true)
+    expect(receive({ type: 'freshAgent.permission.request', requestId: 'pending-tool', tool: { name: 'exec_command', input: { cmd: 'pwd' } } })).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    const restored = store.getState().freshAgent.sessions['freshcodex:codex:native-child']
+    expect(restored.status).toBe('waiting')
+    expect(restored.latestTurnId).toBe('restored-turn')
+    expect(restored.pendingPermissions['pending-tool']).toMatchObject({ toolName: 'exec_command', input: { cmd: 'pwd' } })
+    expect(receive({ type: 'freshAgent.turn.complete', at: 43, outcome: 'completed' })).toBe(true)
+    expect(receive({ type: 'freshAgent.turn.waiting', at: 44 })).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toMatchObject([
+      { terminalId: 'codex:native-child', at: 43, outcome: 'completed' },
+      { terminalId: 'codex:native-child#waiting', at: 44 },
+    ])
+  })
+
   it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {
     // Wedged-sidecar deadman fold: the STATUS frame itself dispatches no
     // attention — it must land (and stop the busy-driving streaming flag)
@@ -706,12 +841,13 @@ describe('fresh-agent-ws', () => {
       sessionId,
       sessionType: 'freshcodex',
       provider: 'codex',
-      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000 },
+      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000, outcome: 'failed' },
     })).toBe(true)
     expect(actionTypes.filter((type) => type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
     expect(actionTypes.filter((type) => type.startsWith('turnCompletion/') && type !== 'turnCompletion/advanceCompletionBaseline')).toEqual([
       'turnCompletion/recordTurnComplete',
     ])
+    expect(store.getState().turnCompletion.pendingEvents[0]).toMatchObject({ outcome: 'failed' })
     // The status fold itself stays untouched by the companion: still 'stuck',
     // still not streaming.
     const after = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
@@ -1475,4 +1611,21 @@ describe('runtime-owner folds (kata b8ke)', () => {
     expect(sent.observedEpoch).toBeUndefined()
     expect(sent.observedGeneration).toBeUndefined()
   })
+})
+
+
+it('rings server-authored async question attention once without pending controls or changing work status', () => {
+  const actions: Array<{ type: string }> = []
+  const store = configureStore({ reducer: { freshAgent: freshAgentReducer, panes: panesReducer, turnCompletion: turnCompletionReducer }, middleware: (getDefault) => getDefault().concat(() => (next) => (action) => { actions.push(action as { type: string }); return next(action) }) })
+  const locator = { sessionId: 'async-thread', sessionType: 'freshcodex', provider: 'codex' } as const
+  store.dispatch(initLayout({ tabId: 'async-tab', paneId: 'async-pane', content: { kind: 'fresh-agent', ...locator, createRequestId: 'async-create', status: 'running' } }))
+  handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.status', status: 'running' } })
+  const available = { type: 'freshAgent.event' as const, ...locator, event: { type: 'freshAgent.question.available', itemId: 'async-item', awaited: false, at: 1234 } }
+  expect(handleFreshAgentMessage(store.dispatch, available)).toBe(true)
+  handleFreshAgentMessage(store.dispatch, available)
+  const session = store.getState().freshAgent.sessions['freshcodex:codex:async-thread']
+  expect(session.status).toBe('running')
+  expect(session.pendingQuestions).toEqual({})
+  expect(actions.filter((action) => action.type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
+  expect(store.getState().panes.activePane['async-tab']).toBe('async-pane')
 })

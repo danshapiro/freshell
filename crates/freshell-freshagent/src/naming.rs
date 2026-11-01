@@ -11,6 +11,7 @@
 //! rename answer ALWAYS reports the actual accepted winner (including an
 //! unchanged winner when an automatic suggestion loses).
 
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -132,7 +133,7 @@ pub struct RenameNameInput {
 /// Why activity arrived. `AcceptedUserMessage`/`IndexUserMessage` may carry a
 /// first user message (fallback upgrade input); `Opened`/`Resumed` arm an
 /// unattempted generation series only when a first message exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NameActivityReason {
     AcceptedUserMessage,
     IndexUserMessage,
@@ -143,7 +144,7 @@ pub enum NameActivityReason {
 /// One activity event. `event_id` is the existing provider/event message id
 /// (duplicate delivery folds through the series' input fingerprint, never a
 /// new event store).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameActivity {
     pub target: SessionNameRef,
     pub mode: String,
@@ -193,7 +194,7 @@ pub enum NameError {
     /// record at the time of the check.
     Conflict {
         message: String,
-        current: Option<SessionNameRecord>,
+        current: Option<Box<SessionNameRecord>>,
     },
     /// Durable document read/write/parse failure with old state intact
     /// (HTTP 503).
@@ -311,7 +312,7 @@ pub fn named_provider_for(mode: Option<&str>, session_type: Option<&str>) -> Opt
 /// Task 2 interfaces) — carried SEPARATELY from the ledger's `supersedes`
 /// edge, which cannot distinguish a rollback fork from a crash-recovery
 /// mint-new from a deliberate new conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NameTransitionReason {
     /// First verified durable materialization of a pre-durable handle
     /// (requires verified persistence — never a bare start ack).
@@ -340,11 +341,32 @@ pub enum NameTransitionReason {
 /// classification plus the native routing evidence the store retains with
 /// the record. `pending` is the pre-durable handle this transition resolves
 /// (`None` on resume/switch of established identities).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NameTransition {
     pub reason: NameTransitionReason,
     pub acquisition: NativeAcquisition,
     pub pending: Option<String>,
+}
+
+pub const HOSTED_CODEX_NAMING_EVENT: &str = "freshAgent.host.naming";
+
+/// Provider facts transported to the gateway's existing name authority.
+/// These never contain accepted name records or native control answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum HostedCodexNamingFact {
+    Activity(NameActivity),
+    /// Exact persisted metadata for a current session without a pending
+    /// handle. This admits that session's own name; it never transfers one.
+    Acquisition {
+        target: SessionNameRef,
+        acquisition: NativeAcquisition,
+        cwd: Option<String>,
+    },
+    Transition {
+        target: SessionNameRef,
+        transition: NameTransition,
+    },
 }
 
 impl NameTransition {
@@ -932,7 +954,7 @@ pub(crate) mod test_support {
                                     message: format!(
                                         "the record moved to revision {actual} while the editor held {expected}"
                                     ),
-                                    current: Some(record),
+                                    current: Some(Box::new(record)),
                                 })
                             });
                         }
@@ -1163,7 +1185,7 @@ mod tests {
             (
                 NameError::Conflict {
                     message: "moved".into(),
-                    current: Some(SessionNameRecord {
+                    current: Some(Box::new(SessionNameRecord {
                         name_ref: SessionNameRef::Pending { id: "h".into() },
                         name: "current".into(),
                         source: NameSource::Manual,
@@ -1171,7 +1193,7 @@ mod tests {
                         manual_revision: None,
                         renamed_at: None,
                         legacy_origin: None,
-                    }),
+                    })),
                 },
                 409,
                 "NAME_REVISION_CONFLICT",

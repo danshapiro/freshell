@@ -348,6 +348,7 @@ export const TerminalTurnCompleteSchema = z.object({
   terminalId: z.string().min(1),
   provider: z.enum(['opencode', 'claude', 'codex', 'amplifier', 'antigravity']),
   sessionId: z.string().min(1).optional(),
+  outcome: z.enum(['completed', 'failed']).optional(),
   at: z.number().int().nonnegative(),
   completionSeq: z.number().int().positive(),
 })
@@ -893,16 +894,17 @@ export const FreshAgentCreateSchema = z.object({
   model: z.string().optional(),
   permissionMode: z.string().optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
   sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
   modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
-  effort: z.string().trim().min(1).optional(),
+  effort: z.string().trim().min(1).nullable().optional(),
   plugins: z.array(z.string()).optional(),
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
   /** G19: the creating pane's id. With `tabId` it is the pane context the
    * agent's Freshell MCP acts for (FRESHELL_TAB_ID / FRESHELL_PANE_ID).
-   * Additive optional. */
+   * It also binds managed view intent. Additive optional. */
   paneId: z.string().min(1).optional(),
   /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
    * `terminal.create.namingHandle`. Additive optional. */
@@ -962,7 +964,8 @@ export const FreshAgentSendSchema = z.object({
     model: z.string().min(1).optional(),
     permissionMode: z.string().min(1).optional(),
     sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    effort: z.string().trim().min(1).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
+    effort: z.string().trim().min(1).nullable().optional(),
   }).optional(),
   images: z.array(z.object({
     mediaType: z.string(),
@@ -1010,7 +1013,8 @@ export const FreshAgentConfigureSchema = z.object({
     model: z.string().min(1).optional(),
     permissionMode: z.string().min(1).optional(),
     sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    effort: z.string().trim().min(1).optional(),
+  collaborationMode: z.enum(['default', 'plan']).optional(),
+    effort: z.string().trim().min(1).nullable().optional(),
   }),
 })
 
@@ -1048,6 +1052,17 @@ export const FreshAgentQuestionRespondSchema = z.object({
   cwd: z.string().optional(),
   requestId: z.union([z.string().min(1), z.number().int()]),
   answers: z.record(z.string(), z.string()),
+})
+
+export const FreshAgentElicitationRespondSchema = z.object({
+  type: z.literal('freshAgent.elicitation.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  action: z.enum(['accept', 'decline', 'cancel']),
+  content: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())])).nullable(),
 })
 
 export const FreshAgentKillSchema = z.object({
@@ -1144,6 +1159,7 @@ export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
+  FreshAgentElicitationRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
   FreshAgentUndoSchema,
@@ -1322,6 +1338,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
+  FreshAgentElicitationRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
   FreshAgentUndoSchema,
@@ -1355,6 +1372,7 @@ export type ReadyMessage = {
     sessionType?: string
     lastTurnCompleteAt?: number
     lastWaitingAt?: number
+    lastQuestionAvailableAt?: number
   }>
   /** kata b8ke: current runtime-owner state for every recorded
    *  (provider, sessionId) — replayed so a device that missed a handoff

@@ -79,8 +79,8 @@ pub(crate) async fn verify_final(
         &request_sha256,
         &expected,
         (uid, gid),
-        std::time::Duration::from_secs(20),
-        std::time::Duration::from_secs(5),
+        freshell_platform::provider_startup::PROVIDER_METADATA_READ_RUN,
+        freshell_platform::provider_startup::PROVIDER_METADATA_READ_CLEANUP,
     )
     .await;
     match &result {
@@ -562,8 +562,11 @@ fn seed_retained_ordinary_candidate(
                 native_sibling,
             });
         }
-        crate::copy_provider_config_references_with_ownership(
-            &prior, "claude", stage, stage, home, home, identity,
+        // The candidate HOME is an initialized volume. Stage the frozen prior
+        // selection through the same private transaction as ordinary refresh;
+        // only the current selection's physical roots are mounted in this HOME.
+        crate::refresh_provider_config_with_mounted_context(
+            &prior, current, "claude", stage, stage, home,
         )
         .map_err(|_| blocked())?;
         Ok::<_, String>(metadata)
@@ -865,6 +868,560 @@ fn write_reply(reply: &ObservationReply, output: &mut impl Write) -> Result<(), 
 mod tests {
     use super::*;
     use std::io::{Cursor, Error};
+
+    #[test]
+    fn claude_retained_candidate_seeds_as_provider_and_restores_reader_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let restricted = std::env::var_os("FRESHELL_TEST_RESTRICTED_READER").is_some();
+        let reader = unsafe { (libc::geteuid(), libc::getegid()) };
+        if restricted {
+            assert_eq!(reader, (0, 0));
+        }
+        let identity = if restricted { (65534, 0) } else { reader };
+        let owned = crate::tests::executable_fixture();
+        std::fs::set_permissions(owned.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let stage = owned.path().join("stage");
+        let retained = owned.path().join("retained-home");
+        let home = owned.path().join("candidate-home");
+        let workspace = owned.path().join("workspace");
+        for directory in [&stage, &retained, &home, &workspace] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        for directory in [
+            stage.join(".freshell"),
+            stage.join(".claude"),
+            retained.join(".claude"),
+            retained.join(".claude/projects"),
+        ] {
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let settings = br#"{"ordinary":"frozen"}"#;
+        std::fs::write(stage.join(".claude/old-settings.json"), settings).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), b"{}").unwrap();
+        let resource = stage.join(".freshell/resource-units/unit-0");
+        std::fs::create_dir_all(&resource).unwrap();
+        std::fs::write(resource.join("source"), b"frozen-resource").unwrap();
+        let current_resource = stage.join(".freshell/resource-units/unit-1");
+        std::fs::create_dir_all(&current_resource).unwrap();
+        std::fs::write(current_resource.join("source"), b"current-resource").unwrap();
+        for (unit, content) in [
+            ("unit-2", "frozen-directory"),
+            ("unit-3", "current-directory"),
+        ] {
+            let directory = stage
+                .join(".freshell/resource-units")
+                .join(unit)
+                .join("commands");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("command"), content).unwrap();
+        }
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let prior: freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+            "preparation":{"claude":{"mcp_args":[]}},
+            "config":[{"root":"user_provider","relativePath":".claude/old-settings.json","providerRelativePath":".claude/old-settings.json","format":"json"}],
+            "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(b"{}")),"sourceCount":0,"aliasCount":0,"recipeCount":0},
+                "resourceMounts":[
+                    {"stageRelativePath":".freshell/resource-units/unit-0/source","providerRelativePath":".freshell/provider-roots/unit-0/source","logicalDestination":workspace.join("selected-resource"),"effectiveDestination":workspace.join("selected-resource"),"kind":"file"},
+                    {"stageRelativePath":".freshell/resource-units/unit-2","providerRelativePath":".freshell/provider-roots/unit-2","logicalDestination":workspace.join("selected-directory"),"effectiveDestination":workspace.join("selected-directory"),"kind":"directory"}
+                ]}
+        })).unwrap();
+        std::fs::write(
+            stage.join(".freshell/prepared-context.json"),
+            serde_json::to_vec(&prior).unwrap(),
+        )
+        .unwrap();
+        for file in [
+            stage.join(".claude/old-settings.json"),
+            stage.join(".freshell/input-manifest.json"),
+            stage.join(".freshell/prepared-context.json"),
+        ] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let native = retained.join(".claude/projects/native.jsonl");
+        std::fs::write(&native, b"PRIVATE_NATIVE_HISTORY_SENTINEL").unwrap();
+        std::fs::File::open(&native)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        std::fs::write(retained.join(".claude/old-settings.json"), settings).unwrap();
+        std::fs::write(
+            retained.join(crate::PROVIDER_PROJECTION_MANIFEST),
+            br#"[".claude/old-settings.json"]"#,
+        )
+        .unwrap();
+        for file in [
+            &native,
+            &retained.join(".claude/old-settings.json"),
+            &retained.join(crate::PROVIDER_PROJECTION_MANIFEST),
+        ] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            crate::set_owner(file, identity.0, identity.1).unwrap();
+        }
+        for directory in [
+            retained.join(".claude/projects"),
+            retained.join(".claude"),
+            retained.clone(),
+            home.clone(),
+        ] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::set_owner(&directory, identity.0, identity.1).unwrap();
+        }
+        let mut current = prior.clone();
+        let next = format!("grant-{}", uuid::Uuid::new_v4());
+        current.prepared_inputs.as_mut().unwrap().generation_id = next.clone();
+        current.mcp_capability.as_mut().unwrap().grant_id = next;
+        current.prepared_inputs.as_mut().unwrap().resource_mounts[0].provider_relative_path =
+            ".freshell/provider-roots/unit-1/source".into();
+        current.prepared_inputs.as_mut().unwrap().resource_mounts[0].stage_relative_path =
+            ".freshell/resource-units/unit-1/source".into();
+        current.prepared_inputs.as_mut().unwrap().resource_mounts[1].provider_relative_path =
+            ".freshell/provider-roots/unit-3".into();
+        current.prepared_inputs.as_mut().unwrap().resource_mounts[1].stage_relative_path =
+            ".freshell/resource-units/unit-3".into();
+        prior.validate("claude").unwrap();
+        current.validate("claude").unwrap();
+        assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+        let native_metadata = native.metadata().unwrap();
+        // The prior runtime and replacement runtime mount distinct physical
+        // resource roots, even when their logical destination is unchanged.
+        let selected_mountpoints = |context: &freshell_runtime_protocol::ProviderLaunchContext| {
+            context
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .resource_mounts
+                .iter()
+                .map(
+                    |mount| freshell_platform::provider_mountpoints::Mountpoint {
+                        relative_path: mount.provider_relative_path.clone(),
+                        directory: mount.kind
+                            == freshell_runtime_protocol::ProviderResourceKind::Directory,
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        for (root, context) in [(&retained, &prior), (&home, &current)] {
+            let selected = selected_mountpoints(context);
+            if restricted {
+                freshell_platform::provider_mountpoints::prepare(root, &selected).unwrap();
+            } else {
+                for mount in selected {
+                    let path = root.join(mount.relative_path);
+                    if mount.directory {
+                        std::fs::create_dir_all(path).unwrap();
+                    } else {
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(&path, b"").unwrap();
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        let initialized = crate::refresh_provider_config_references(
+            &prior, "claude", &workspace, &stage, &retained, identity.0, identity.1,
+        );
+        assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+        let seeded = initialized.and_then(|()| {
+            seed_retained_ordinary_candidate(
+                &generation,
+                &stage,
+                &retained,
+                &home,
+                &current,
+                identity,
+            )
+        });
+        let restored = unsafe { (libc::geteuid(), libc::getegid()) };
+        let refused_wrong_identity = seed_retained_ordinary_candidate(
+            &generation,
+            &stage,
+            &retained,
+            &home,
+            &current,
+            (identity.0 + 1, identity.1),
+        )
+        .is_err();
+        let provider_command = |program: &str| {
+            let mut command = if identity != reader {
+                let mut command = std::process::Command::new("/usr/bin/setpriv");
+                command
+                    .args(crate::provider_identity_args(identity.0, identity.1))
+                    .arg(program);
+                command
+            } else {
+                std::process::Command::new(program)
+            };
+            command.env_clear().env("PATH", "/usr/bin:/bin");
+            command
+        };
+        let observed = if seeded.is_ok() {
+            Some(
+                provider_command("/usr/bin/python3")
+                    .arg("-c")
+                    .arg(
+                        r#"
+import json,os,sys
+home,retained,uid,gid=sys.argv[1],sys.argv[2],int(sys.argv[3]),int(sys.argv[4])
+assert (os.getuid(),os.geteuid(),os.getgid(),os.getegid())==(uid,uid,gid,gid)
+for root in (home,retained):
+    stat=os.stat(root)
+    assert (stat.st_uid,stat.st_gid,stat.st_mode & 0o777)==(uid,gid,0o700)
+with open(home+'/.claude/old-settings.json') as f: assert json.load(f)=={'ordinary':'frozen'}
+with open(home+'/.freshell/provider-roots/unit-0/source') as f: assert f.read()=='frozen-resource'
+with open(home+'/.freshell/provider-roots/unit-2/commands/command') as f: assert f.read()=='frozen-directory'
+assert not os.path.exists(home+'/.claude/projects/native.jsonl')
+assert os.stat(retained+'/.claude/projects/native.jsonl').st_atime_ns==1000000000
+print('provider-read-verified')
+"#,
+                    )
+                    .arg(&home)
+                    .arg(&retained)
+                    .arg(identity.0.to_string())
+                    .arg(identity.1.to_string())
+                    .output()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let current_guards = if seeded.is_ok() {
+            assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+            let guards = (|| {
+                let refresh = || {
+                    crate::refresh_provider_config_references(
+                        &current, "claude", &workspace, &stage, &home, identity.0, identity.1,
+                    )
+                };
+                let mounted_file = home.join(".freshell/provider-roots/unit-1/source");
+                let inode = std::fs::metadata(&mounted_file)
+                    .map_err(|error| error.to_string())?
+                    .ino();
+                refresh()?;
+                if std::fs::metadata(&mounted_file)
+                    .map_err(|error| error.to_string())?
+                    .ino()
+                    != inode
+                    || std::fs::read(&mounted_file).map_err(|error| error.to_string())?
+                        != b"current-resource"
+                {
+                    return Err("current mounted file was not refreshed in place".into());
+                }
+                std::fs::remove_file(&mounted_file).map_err(|error| error.to_string())?;
+                match refresh() {
+                    Err(error) if error.contains("must retain a regular inode") => {}
+                    result => return Err(format!("missing current mounted file: {result:?}")),
+                }
+                std::fs::create_dir(&mounted_file).map_err(|error| error.to_string())?;
+                if refresh().is_ok() || !mounted_file.is_dir() {
+                    return Err("wrong-type current mounted file was replaced".into());
+                }
+                Ok::<_, String>(())
+            })();
+            assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+            Some(guards)
+        } else {
+            None
+        };
+        let replacement_mountpoints = if restricted {
+            assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+            let prepared = (|| {
+                use std::os::fd::AsRawFd;
+                let selected = selected_mountpoints(&current);
+                for path in [
+                    retained.join(".freshell/provider-roots/unit-0/source"),
+                    retained.join(crate::PROVIDER_PROJECTION_MANIFEST),
+                ] {
+                    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                    assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+                    assert_eq!(
+                        unsafe { libc::fchown(file.as_raw_fd(), reader.0, identity.1) },
+                        0
+                    );
+                    assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+                    let refused =
+                        freshell_platform::provider_mountpoints::prepare(&retained, &selected)
+                            .is_err();
+                    assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+                    assert_eq!(
+                        unsafe { libc::fchown(file.as_raw_fd(), identity.0, identity.1) },
+                        0
+                    );
+                    assert_eq!(unsafe { libc::seteuid(identity.0) }, 0);
+                    if !refused {
+                        return Err("replacement accepted foreign-owned ordinary projection".into());
+                    }
+                }
+                freshell_platform::provider_mountpoints::prepare(&retained, &selected)
+                    .map_err(str::to_owned)?;
+                let resource = retained.join(&selected[0].relative_path);
+                let inode = std::fs::metadata(&resource)
+                    .map_err(|error| error.to_string())?
+                    .ino();
+                crate::refresh_provider_config_references(
+                    &current, "claude", &workspace, &stage, &retained, identity.0, identity.1,
+                )?;
+                if resource
+                    .metadata()
+                    .map_err(|error| error.to_string())?
+                    .ino()
+                    != inode
+                    || std::fs::read(&resource).map_err(|error| error.to_string())?
+                        != b"current-resource"
+                    || retained
+                        .join(".freshell/provider-roots/unit-0/source")
+                        .exists()
+                    || std::fs::read(
+                        retained.join(".freshell/provider-roots/unit-3/commands/command"),
+                    )
+                    .map_err(|error| error.to_string())?
+                        != b"current-directory"
+                    || retained.join(".freshell/provider-roots/unit-2").exists()
+                {
+                    return Err("replacement projection did not hand off its ordinary files".into());
+                }
+                let history = native.metadata().map_err(|error| error.to_string())?;
+                if history.ino() != native_metadata.ino()
+                    || (history.mtime(), history.mtime_nsec())
+                        != (native_metadata.mtime(), native_metadata.mtime_nsec())
+                    || history.len() != b"PRIVATE_NATIVE_HISTORY_SENTINEL".len() as u64
+                    || history.atime() != 1
+                    || (history.uid(), history.gid()) != identity
+                {
+                    return Err("replacement projection changed retained native history".into());
+                }
+                freshell_platform::provider_mountpoints::prepare(&retained, &selected)
+                    .map_err(str::to_owned)?;
+                Ok::<_, String>(())
+            })();
+            assert_eq!(unsafe { libc::seteuid(reader.0) }, 0);
+            Some(prepared)
+        } else {
+            None
+        };
+        for root in [&retained, &home] {
+            let chmod = provider_command("/usr/bin/find")
+                .arg(root)
+                .args(["-type", "d", "-exec", "/usr/bin/chmod", "u+w", "{}", "+"])
+                .status()
+                .unwrap();
+            assert!(chmod.success());
+            let removed = provider_command("/usr/bin/find")
+                .arg(root)
+                .args(["-mindepth", "1", "-delete"])
+                .status()
+                .unwrap();
+            assert!(removed.success());
+            crate::set_owner(root, reader.0, reader.1).unwrap();
+        }
+        assert_eq!(
+            restored, reader,
+            "retained source reader identity must be restored"
+        );
+        assert!(
+            refused_wrong_identity,
+            "wrong declared provider UID must refuse"
+        );
+        assert!(
+            seeded.is_ok(),
+            "actual provider retained seed failed: {seeded:?}"
+        );
+        let observed = observed.unwrap();
+        assert!(
+            observed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&observed.stderr)
+        );
+        assert_eq!(observed.stdout, b"provider-read-verified\n");
+        assert_eq!(current_guards, Some(Ok(())));
+        if let Some(prepared) = replacement_mountpoints {
+            assert_eq!(
+                prepared,
+                Ok(()),
+                "replacement launch mountpoint preparation"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_retained_candidate_full_selection_executes_after_seed_refresh_and_observation() {
+        use freshell_platform::claude_inputs::{ClaudeSettingSource, NativeSourceRuntime};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owned = crate::tests::executable_fixture();
+        let stage = owned.path().join("stage");
+        let workspace = owned.path().join("workspace");
+        let retained = owned.path().join("retained-home");
+        let home = owned.path().join("candidate-home");
+        for path in [&stage, &workspace, &retained, &home] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let unit = stage.join(".freshell/resource-units/unit-0");
+        let dependency = unit.join("node_modules/parity-installed");
+        let entries = dependency.join("entries");
+        std::fs::create_dir_all(&entries).unwrap();
+        std::fs::write(unit.join("package.json"), br#"{"type":"commonjs"}"#).unwrap();
+        std::fs::write(
+            dependency.join("package.json"),
+            br#"{"name":"parity-installed","main":"index.cjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("index.cjs"),
+            "module.exports=require('./entries/entry-4200.cjs')\n",
+        )
+        .unwrap();
+        for index in 0..=4200 {
+            std::fs::write(
+                entries.join(format!("entry-{index}.cjs")),
+                "module.exports='installed-dependency-nonce'\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(unit.join("asset"), "selected-resource-nonce").unwrap();
+        std::fs::write(unit.join("references.json"), br#"{"resource":"./asset"}"#).unwrap();
+        std::fs::write(unit.join("command"), "#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');const config=JSON.parse(fs.readFileSync(path.join(__dirname,'references.json'),'utf8'));const settings=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));process.stdout.write(JSON.stringify({dependency:require('parity-installed'),resource:fs.readFileSync(path.resolve(__dirname,config.resource),'utf8'),entries:fs.readdirSync(path.join(__dirname,'node_modules/parity-installed/entries')).length,selection:settings.selection}));\n").unwrap();
+        std::fs::set_permissions(unit.join("command"), std::fs::Permissions::from_mode(0o751))
+            .unwrap();
+        std::fs::create_dir_all(stage.join(".claude")).unwrap();
+        std::fs::write(
+            stage.join(".claude/old-settings.json"),
+            br#"{"selection":"prior"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join(".claude/settings.json"),
+            br#"{"selection":"current"}"#,
+        )
+        .unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), b"{}").unwrap();
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let context: freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_value(serde_json::json!({
+            "preparation":{"claude":{"mcp_args":[]}},
+            "config":[{"root":"user_provider","relativePath":".claude/old-settings.json","providerRelativePath":".claude/old-settings.json","format":"json"}],
+            "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(b"{}")),"sourceCount":0,"aliasCount":0,"recipeCount":0},
+                "resourceMounts":[{"stageRelativePath":".freshell/resource-units/unit-0","providerRelativePath":".freshell/provider-roots/unit-0","logicalDestination":workspace.join("selected-plugin"),"effectiveDestination":workspace.join("selected-plugin"),"kind":"directory"}]}
+        })).unwrap();
+        std::fs::write(
+            stage.join(".freshell/prepared-context.json"),
+            freshell_runtime_protocol::bounded_json_bytes(
+                &context,
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let identity = unsafe { (libc::geteuid(), libc::getegid()) };
+        fn timed(phase: &str, operation: impl FnOnce()) {
+            let started = std::time::Instant::now();
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info","event":"claude_retained_full_phase","phase":phase,"state":"started","epochSeconds":at,"pid":std::process::id()})
+            );
+            operation();
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info","event":"claude_retained_full_phase","phase":phase,"state":"completed","elapsedMs":started.elapsed().as_millis(),"pid":std::process::id()})
+            );
+        }
+        fn consume(
+            home: &std::path::Path,
+            workspace: &std::path::Path,
+            settings: &str,
+            selection: &str,
+        ) {
+            let output =
+                std::process::Command::new(home.join(".freshell/provider-roots/unit-0/command"))
+                    .arg(home.join(".claude").join(settings))
+                    .current_dir(workspace)
+                    .output()
+                    .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                serde_json::json!({"dependency":"installed-dependency-nonce","resource":"selected-resource-nonce","entries":4201,"selection":selection})
+            );
+        }
+        timed("initial_refresh", || {
+            crate::refresh_provider_config_references(
+                &context, "claude", &workspace, &stage, &retained, identity.0, identity.1,
+            )
+            .unwrap()
+        });
+        let native = retained.join(".claude/projects/native.jsonl");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, b"PRIVATE_NATIVE_HISTORY_SENTINEL").unwrap();
+        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::File::open(&native)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+            .unwrap();
+        let mut current = context.clone();
+        current.config[0].relative_path = ".claude/settings.json".into();
+        current.config[0].provider_relative_path = ".claude/settings.json".into();
+        current.prepared_inputs.as_mut().unwrap().generation_id =
+            format!("grant-{}", uuid::Uuid::new_v4());
+        current.mcp_capability.as_mut().unwrap().grant_id = current
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .generation_id
+            .clone();
+        timed("retained_seed", || {
+            seed_retained_ordinary_candidate(
+                &generation,
+                &stage,
+                &retained,
+                &home,
+                &current,
+                identity,
+            )
+            .unwrap()
+        });
+        let before = std::fs::metadata(retained.join(".claude")).unwrap();
+        let after = std::fs::metadata(home.join(".claude")).unwrap();
+        assert_eq!(
+            (before.uid(), before.gid(), before.mode() & 0o777),
+            (after.uid(), after.gid(), after.mode() & 0o777)
+        );
+        consume(&home, &workspace, "old-settings.json", "prior");
+        timed("candidate_refresh", || {
+            crate::refresh_provider_config_references(
+                &current, "claude", &workspace, &stage, &home, identity.0, identity.1,
+            )
+            .unwrap()
+        });
+        timed("native_observation", || {
+            let observed = observe(
+                &workspace,
+                &home,
+                NativeSourceRuntime::Terminal,
+                &[ClaudeSettingSource::User],
+            )
+            .unwrap();
+            assert_eq!(observed.home.as_deref(), Some(home.as_path()));
+            assert_eq!((observed.euid, observed.egid), identity);
+        });
+        consume(&home, &workspace, "settings.json", "current");
+        assert!(!home.join(".claude/old-settings.json").exists());
+        assert!(!home.join(".claude/projects/native.jsonl").exists());
+        assert_eq!(
+            std::fs::metadata(&native).unwrap().accessed().unwrap(),
+            old_access,
+            "candidate must leave native payload unread"
+        );
+    }
 
     #[test]
     fn claude_retained_candidate_seed_preserves_metadata_and_executes_only_frozen_ordinary_inputs()

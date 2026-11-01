@@ -1,7 +1,7 @@
 {
   "description": "Generated from shared/managed-runtime.ts. Do not edit by hand.",
   "generator": "port/contract/generate-managed-runtime-contract.ts",
-  "schemaCount": 38,
+  "schemaCount": 43,
   "schemas": {
     "ManagedRuntimeAllocationStateSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -480,6 +480,54 @@
                 ],
                 "type": "string"
               },
+              "nativeIdentityObservation": {
+                "additionalProperties": false,
+                "properties": {
+                  "evidenceDigest": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "evidenceRevision": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "incarnationId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "launchNonce": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nativeSessionId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "source": {
+                    "enum": [
+                      "codex_app_server",
+                      "opencode_tui",
+                      "claude_native_event",
+                      "amplifier_native_loaded_context",
+                      "fresh_provider_handshake"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "nativeSessionId",
+                  "incarnationId",
+                  "launchNonce",
+                  "evidenceRevision",
+                  "source",
+                  "evidenceDigest"
+                ],
+                "type": "object"
+              },
               "nativeSessionId": {
                 "type": "string"
               },
@@ -512,7 +560,8 @@
                   "recovering",
                   "blocked",
                   "lost",
-                  "stopped"
+                  "stopped",
+                  "data_repair_complete"
                 ],
                 "type": "string"
               },
@@ -1016,6 +1065,55 @@
       ],
       "type": "object"
     },
+    "ManagedRuntimeNativeIdentityObservationSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "evidenceDigest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "evidenceRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "incarnationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "launchNonce": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "nativeSessionId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "codex_app_server",
+            "opencode_tui",
+            "claude_native_event",
+            "amplifier_native_loaded_context",
+            "fresh_provider_handshake"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "nativeSessionId",
+        "incarnationId",
+        "launchNonce",
+        "evidenceRevision",
+        "source",
+        "evidenceDigest"
+      ],
+      "type": "object"
+    },
     "ManagedRuntimeNoticeDeliveryStateSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "enum": [
@@ -1220,7 +1318,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             }
@@ -1482,7 +1581,8 @@
         "recovering",
         "blocked",
         "lost",
-        "stopped"
+        "stopped",
+        "data_repair_complete"
       ],
       "type": "string"
     },
@@ -1533,7 +1633,8 @@
             "recovering",
             "blocked",
             "lost",
-            "stopped"
+            "stopped",
+            "data_repair_complete"
           ],
           "type": "string"
         }
@@ -1585,6 +1686,177 @@
         "unknownOwnershipCount",
         "blockedObjects",
         "mutationPerformed"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeRepairBatchScopeSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "roots": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "canonicalSoulId": {
+                "anyOf": [
+                  {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "eligibleOwners": {
+                "items": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "graphDigest": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "rootSessionId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "rootSessionId",
+              "graphDigest",
+              "eligibleOwners",
+              "canonicalSoulId"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "scopeId": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "sourceFingerprint": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "sourceStoreId": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "targets": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "evidenceRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "identityRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "incidentRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "nativeImportRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "providerStoreId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "rootSessionId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "target": {
+                "additionalProperties": false,
+                "properties": {
+                  "expectedIntentRevision": {
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "type": "integer"
+                  },
+                  "incidentId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "soulId": {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "soulId",
+                  "incidentId",
+                  "expectedIntentRevision"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "target",
+              "providerStoreId",
+              "rootSessionId",
+              "incidentRevision",
+              "identityRevision",
+              "nativeImportRevision",
+              "evidenceRevision"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "scopeId",
+        "sourceStoreId",
+        "sourceFingerprint",
+        "targets",
+        "roots"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeRepairBatchSourceSelectionSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "rootSessionIds": {
+          "items": {
+            "maxLength": 160,
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "sourceStoreId": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceStoreId",
+        "rootSessionIds"
       ],
       "type": "object"
     },
@@ -1726,6 +1998,234 @@
           "type": "object"
         }
       },
+      "type": "object"
+    },
+    "ManagedRuntimeRestoreLostSoulsRequestSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "canonicalOwners": {
+          "default": [],
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "expectedIntentRevision": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "type": "integer"
+              },
+              "rootSessionId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "soulId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "rootSessionId",
+              "soulId",
+              "expectedIntentRevision"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "idempotencyKey": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "scopeId": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "source": {
+          "additionalProperties": false,
+          "properties": {
+            "rootSessionIds": {
+              "items": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "sourceStoreId": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sourceStoreId",
+            "rootSessionIds"
+          ],
+          "type": "object"
+        },
+        "targets": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "expectedIntentRevision": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "type": "integer"
+              },
+              "incidentId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "soulId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "soulId",
+              "incidentId",
+              "expectedIntentRevision"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "idempotencyKey",
+        "scopeId",
+        "source",
+        "targets",
+        "canonicalOwners"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeRestoreLostSoulsResultSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "operationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "repairedTargetCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "roots": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "canonicalSoulId": {
+                "anyOf": [
+                  {
+                    "maxLength": 160,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "importStatus": {
+                "enum": [
+                  "pending",
+                  "owner_decision_required",
+                  "structurally_verified",
+                  "provider_readable",
+                  "complete"
+                ],
+                "type": "string"
+              },
+              "intentRevision": {
+                "anyOf": [
+                  {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "nativeImportRevision": {
+                "anyOf": [
+                  {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ownerCandidates": {
+                "default": [],
+                "items": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "reasonCode": {
+                "type": "string"
+              },
+              "rootSessionId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "rootSessionId",
+              "canonicalSoulId",
+              "importStatus",
+              "intentRevision",
+              "nativeImportRevision",
+              "ownerCandidates"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "scopeId": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "owner_decision_required",
+            "complete"
+          ],
+          "type": "string"
+        },
+        "totalTargetCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operationId",
+        "scopeId",
+        "status",
+        "repairedTargetCount",
+        "totalTargetCount",
+        "roots"
+      ],
       "type": "object"
     },
     "ManagedRuntimeRevisionMutationSchema": {
@@ -2052,6 +2552,54 @@
               ],
               "type": "string"
             },
+            "nativeIdentityObservation": {
+              "additionalProperties": false,
+              "properties": {
+                "evidenceDigest": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "evidenceRevision": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "incarnationId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "launchNonce": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "nativeSessionId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "codex_app_server",
+                    "opencode_tui",
+                    "claude_native_event",
+                    "amplifier_native_loaded_context",
+                    "fresh_provider_handshake"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nativeSessionId",
+                "incarnationId",
+                "launchNonce",
+                "evidenceRevision",
+                "source",
+                "evidenceDigest"
+              ],
+              "type": "object"
+            },
             "nativeSessionId": {
               "type": "string"
             },
@@ -2084,7 +2632,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             },
@@ -2399,6 +2948,54 @@
           ],
           "type": "string"
         },
+        "nativeIdentityObservation": {
+          "additionalProperties": false,
+          "properties": {
+            "evidenceDigest": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            "evidenceRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "incarnationId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "launchNonce": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "nativeSessionId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "codex_app_server",
+                "opencode_tui",
+                "claude_native_event",
+                "amplifier_native_loaded_context",
+                "fresh_provider_handshake"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "nativeSessionId",
+            "incarnationId",
+            "launchNonce",
+            "evidenceRevision",
+            "source",
+            "evidenceDigest"
+          ],
+          "type": "object"
+        },
         "nativeSessionId": {
           "type": "string"
         },
@@ -2431,7 +3028,8 @@
             "recovering",
             "blocked",
             "lost",
-            "stopped"
+            "stopped",
+            "data_repair_complete"
           ],
           "type": "string"
         },
@@ -2718,6 +3316,54 @@
               ],
               "type": "string"
             },
+            "nativeIdentityObservation": {
+              "additionalProperties": false,
+              "properties": {
+                "evidenceDigest": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "evidenceRevision": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "incarnationId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "launchNonce": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "nativeSessionId": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "codex_app_server",
+                    "opencode_tui",
+                    "claude_native_event",
+                    "amplifier_native_loaded_context",
+                    "fresh_provider_handshake"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nativeSessionId",
+                "incarnationId",
+                "launchNonce",
+                "evidenceRevision",
+                "source",
+                "evidenceDigest"
+              ],
+              "type": "object"
+            },
             "nativeSessionId": {
               "type": "string"
             },
@@ -2750,7 +3396,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             },

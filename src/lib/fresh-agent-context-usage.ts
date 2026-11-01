@@ -14,6 +14,21 @@ export type FreshAgentContextUsage = {
   thresholdTokens: number
 }
 
+export type CodexLatestUsage = { observed: boolean; latestTokens?: number; totalTokens?: number; modelContextWindow?: number }
+
+/** Native last is a measured sample, not demonstrated current context occupancy. */
+export function latestCodexUsage(raw: unknown): CodexLatestUsage {
+  if (!raw || typeof raw !== 'object') return { observed: false }
+  const usage = raw as { last?: { totalTokens?: unknown }; total?: { totalTokens?: unknown }; modelContextWindow?: unknown }
+  const latestTokens = usage.last?.totalTokens
+  const totalTokens = usage.total?.totalTokens
+  if (typeof latestTokens !== 'number' || !Number.isSafeInteger(latestTokens) || latestTokens < 0 || typeof totalTokens !== 'number' || !Number.isSafeInteger(totalTokens) || totalTokens < 0) return { observed: false }
+  const window = usage.modelContextWindow
+  return { observed: true, latestTokens, totalTokens,
+    ...(typeof window === 'number' && Number.isSafeInteger(window) && window >= 0 ? { modelContextWindow: window } : {}),
+  }
+}
+
 export function findIndexedSessionById(
   projects: ProjectGroup[],
   provider: CodingCliProviderName,

@@ -6,17 +6,25 @@ use crate::registry::*;
 use freshell_runtime_protocol::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct RecoveryFixture {
+pub(super) struct RecoveryFixture {
     _root: tempfile::TempDir,
-    supervisor: Supervisor,
-    soul: SoulId,
-    start: RecoveryStart,
-    context: ProviderLaunchContext,
+    pub(super) supervisor: Supervisor,
+    pub(super) soul: SoulId,
+    pub(super) start: RecoveryStart,
+    pub(super) context: ProviderLaunchContext,
 }
 
 /// A retained Claude terminal with one accepted prepared-input generation,
 /// and a recovery attempt that begins from it.
-async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
+pub(super) async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
+    recovery_fixture(budgets, "claude", false).await
+}
+
+async fn recovery_fixture(
+    budgets: ProviderCallbackBudgets,
+    provider: &str,
+    fresh: bool,
+) -> RecoveryFixture {
     let root = tempfile::tempdir().unwrap();
     let binary = root.path().join("host");
     std::fs::write(&binary, b"synthetic helper artifact").unwrap();
@@ -29,16 +37,28 @@ async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
         "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
     }))
     .unwrap();
+    let context = if provider == "codex" {
+        let mut value = serde_json::to_value(&context).unwrap();
+        value["preparation"] = serde_json::json!({"codex":{"tui_args":[],"sidecar_args":[]}});
+        serde_json::from_value(value).unwrap()
+    } else {
+        context
+    };
     let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
-        "terminalId":"callback-budget","streamId":"callback-budget-stream","mode":"claude","program":"claude","args":[],
+        "terminalId":"callback-budget","streamId":"callback-budget-stream","mode":provider,"program":provider,"args":[],
         "cwd":root.path(),"workspacePath":root.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
         "projectKey":"callback-budget-workspace","providerLaunchContext":&context
     }))
     .unwrap();
+    let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+        "sessionId":"callback-codex", "provider":"codex", "sessionType":"freshcodex",
+        "runtimeVariant":"codex", "providerStoreId":"synthetic-store", "cwd":root.path(),
+        "workspacePath":root.path(), "runAsUid":65534, "runAsGid":0, "providerLaunchContext":context,
+    })).unwrap();
     let prepared = registry
         .prepare_launch(LaunchPreparation {
             soul_id: soul.clone(),
-            provider: "claude".into(),
+            provider: provider.into(),
             provider_store_id: "synthetic-store".into(),
             native_session_id: None,
             creation_seed_ref: "synthetic-seed".into(),
@@ -53,8 +73,8 @@ async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
             profile: RuntimeProfile::Custom,
             project_key: "callback-budget-workspace".into(),
             fixture: None,
-            terminal: Some(terminal),
-            fresh_agent: None,
+            terminal: (!fresh).then_some(terminal),
+            fresh_agent: fresh.then_some(fresh_agent),
             view_intent: None,
             admission: crate::admission::AdmissionPolicy::default(),
         })
@@ -65,6 +85,7 @@ async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
         .commit_created(
             prepared.incarnation_id,
             BackendCreatedRecord {
+                launch_policy: Default::default(),
                 daemon_id: DockerDaemonId::new(),
                 container_id: "callback-budget-container".into(),
                 image_ref: image.clone(),
@@ -196,8 +217,9 @@ async fn claude_recovery_callback_outlasts_an_ordinary_callback_with_a_live_scop
         .unwrap_err();
 
     server.await.expect("the server saw a live scope");
+    assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
     assert!(
-        error.message.contains("invalid scoped grant reference"),
+        error.message.contains("invalid exact provider preparation"),
         "the callback was answered, not timed out: {}",
         error.message
     );
@@ -235,4 +257,65 @@ async fn ordinary_callback_keeps_the_ordinary_wait() {
         error.message
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn codex_replacement_callback_uses_validated_current_consumer() {
+    for fresh in [false, true] {
+        let fixture = recovery_fixture(budgets(1000, 1000), "codex", fresh).await;
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        let mut server = slow_callback_server(
+            &fixture.supervisor,
+            Duration::ZERO,
+            b"not a prepared context",
+            move |request, _| {
+                assert_eq!(request["provider"], "codex");
+                assert_eq!(
+                    request["codexSourceRuntime"],
+                    if fresh { "app_server" } else { "tui" },
+                    "current owned workload must supply role independently of saved configuration"
+                );
+            },
+        );
+        let error = fixture
+            .supervisor
+            .issue_replacement_mcp_capability(
+                &fixture.start,
+                "codex",
+                &fixture.context,
+                &[],
+                "/fixture/instance",
+                "/fixture/workspace",
+            )
+            .await
+            .unwrap_err();
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result.expect("current consumer callback must settle"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("current consumer callback was not dispatched or did not settle");
+            }
+        }
+        assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+        let after = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(after.write_fence(), before.write_fence());
+        assert_eq!(after.resume_spec, before.resume_spec);
+        assert!(fixture
+            .supervisor
+            .auth_lookup_authorities
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 }

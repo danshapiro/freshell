@@ -5,14 +5,21 @@
 mod common;
 
 use common::claude_rig::{ClaudeRig, RigKind, RigOptions};
+use common::ledger_sink::LedgerWriteGate;
 use freshell_ws::pane_ledger::{RetiredReason, RowState};
 use serde_json::json;
+use std::sync::Arc;
 
-async fn legacy_close_survives_restart(close_before_restart: bool) {
+async fn legacy_close_survives_restart(
+    close_before_restart: bool,
+    genesis_clear_gate: Option<Arc<LedgerWriteGate>>,
+    upgrade_started: Option<tokio::sync::oneshot::Sender<()>>,
+) {
     let mut rig = ClaudeRig::start_with_options(
         RigKind::Sim,
         RigOptions {
             durable_ledger: true,
+            genesis_clear_gate,
             ..RigOptions::default()
         },
     )
@@ -21,6 +28,10 @@ async fn legacy_close_survives_restart(close_before_restart: bool) {
     let durable = old_server.create("legacy-record-source").await;
     rig.converse(&mut old_server, &durable, &["saved before the upgrade"])
         .await;
+    // A real upgrade ends the old process. This in-process rig keeps Tokio
+    // tasks alive across reloads, so finish the initial lazy write before
+    // giving a second ledger instance the store.
+    rig.wait_for_genesis_cleared(&durable).await;
     let placeholder = "persisted-old-pane-placeholder";
     rig.pane_ledger
         .as_ref()
@@ -29,6 +40,9 @@ async fn legacy_close_survives_restart(close_before_restart: bool) {
         .unwrap();
     // The old runtime is gone. The alias is now exclusively on disk, as
     // it is when a server upgrade first reads an older pane's saved state.
+    if let Some(started) = upgrade_started {
+        let _ = started.send(());
+    }
     rig.restart().await;
     assert!(rig
         .pane_ledger
@@ -87,10 +101,36 @@ async fn legacy_close_survives_restart(close_before_restart: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kill_by_legacy_placeholder_after_restart_closes_its_durable_row() {
-    legacy_close_survives_restart(false).await;
+    legacy_close_survives_restart(false, None, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_legacy_close_written_before_restart_still_blocks_the_late_attach() {
-    legacy_close_survives_restart(true).await;
+    legacy_close_survives_restart(true, None, None).await;
+}
+
+// A rig reload shares the Tokio runtime with its predecessor. Hold the actual
+// lazy ledger write to prove the legacy-upgrade fixture finishes persistence
+// before it replaces that writer, then keep all cold-load/close/reopen checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_upgrade_waits_for_the_initial_genesis_write() {
+    let gate = Arc::new(LedgerWriteGate::new());
+    let (started, mut upgrade_started) = tokio::sync::oneshot::channel();
+    let scenario = legacy_close_survives_restart(true, Some(gate.clone()), Some(started));
+    tokio::pin!(scenario);
+    tokio::select! {
+        _ = &mut scenario => panic!("the fixture finished before its held genesis clear"),
+        _ = gate.wait_until_entered() => {}
+    }
+    let replaced_before_clear = tokio::select! {
+        _ = &mut scenario => panic!("the fixture finished before its held genesis clear"),
+        _ = &mut upgrade_started => true,
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => false,
+    };
+    gate.release();
+    scenario.await;
+    assert!(
+        !replaced_before_clear,
+        "the fixture replaced a ledger with a pending setup write"
+    );
 }

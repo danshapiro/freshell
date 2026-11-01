@@ -794,21 +794,27 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       const tabIdAfter = await harness.getActiveTabId()
       expect(tabIdAfter).toBe(tabId)
 
-      // LOUD: the dead-session adjudication surfaces the stale claim.
+      // LOUD (no-modal contract): the dead verdict folds onto this exact
+      // pane as the durable restoreError latch. This poll is the ONLY
+      // verdict synchronization between the reconnect and the
+      // keep-assertions below (it re-keys the deleted
+      // deadSessionAdjudication state poll to the latch -- the suite's own
+      // leaf-poll idiom); a bare instant no-dialog assert here would race
+      // the boot-reconcile fold.
       await expect
         .poll(async () => {
-          const state = await harness.getState()
-          const entries = state?.panes?.deadSessionAdjudication ?? []
-          return entries.some((e: any) => e?.kind === 'fresh-agent' && e?.sessionRef?.sessionId === staleDurable)
+          const leaf = findPaneById(await harness.getPaneLayout(tabIdAfter!), originalPaneId!)
+          return leaf?.content?.restoreError?.reason ?? null
         }, { timeout: 30_000 })
-        .toBe(true)
+        .toBe('durable_artifact_missing')
       const leaf = findPaneById(await harness.getPaneLayout(tabIdAfter!), originalPaneId!)
       expect(leaf?.content?.kind).toBe('fresh-agent')
       expect(leaf?.content?.restoreError?.reason).toBe('durable_artifact_missing')
-      // Batched dead-session adjudication is a real modal dialog
-      // (DeadSessionPanel.tsx:20-24, role="dialog" aria-label="Dead sessions"),
-      // not just Redux state -- assert it's actually presented to the user.
-      await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toBeVisible({ timeout: 10_000 })
+      // The blocking DeadSessionPanel modal is gone (no-modal contract): the
+      // death is announced ONLY by the pane's own surfaces -- the latch
+      // above and the FreshAgentView role="alert" banner asserted after the
+      // second reload below -- never a dialog.
+      await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
       // Hazard-guard hardening (council fix round): give any async
       // create-firing code a settle window BEFORE snapshotting sent
       // messages, so this "never fires" assertion can't pass merely because

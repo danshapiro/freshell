@@ -448,7 +448,20 @@ impl FreshClaudeState {
                 );
             }
         }
-        if let Err(error) = write_line(&mut stdin, &spec.create_request()).await {
+        let mut create_request = spec.create_request();
+        if self.managed_forks {
+            create_request["nativeQueryGeneration"] =
+                json!(NEXT_MANAGED_QUERY_GENERATION
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            if spec.native_fork_recipe.is_none() {
+                if let Some(recipe) = self.managed_prefix.lock().await.as_ref().filter(|recipe| {
+                    spec.session_id.as_deref() == Some(recipe.child_session_id.as_str())
+                }) {
+                    create_request["nativeForkRecipe"] = json!(recipe);
+                }
+            }
+        }
+        if let Err(error) = write_line(&mut stdin, &create_request).await {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&ownership_id);
             return Err(EstablishError::Write(error));
@@ -786,7 +799,7 @@ impl FreshClaudeState {
                 )
                 .await
             {
-                if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {
+                if let Some(session) = self.sessions.lock().await.remove(&map_key) {
                     let _teardown: LoggedTeardown =
                         self.teardown_removed_session_logged(session).await;
                 }
@@ -801,7 +814,7 @@ impl FreshClaudeState {
             }
             if let Some(claim) = claim.as_ref() {
                 if self.claim_dead_state_advanced(&claim.durable, claim.dead_state) {
-                    if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {
+                    if let Some(session) = self.sessions.lock().await.remove(&map_key) {
                         let _teardown: LoggedTeardown =
                             self.teardown_removed_session_logged(session).await;
                     }

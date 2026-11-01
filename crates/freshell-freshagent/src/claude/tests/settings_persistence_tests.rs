@@ -19,6 +19,7 @@ async fn a_configure_receipt_after_reset_saves_the_same_runtime_under_its_curren
                 .configure_for_send(
                     &old,
                     &freshell_protocol::FreshAgentSendSettings {
+                        collaboration_mode: None,
                         model: Some("sonnet".into()),
                         cwd: None,
                         effort: None,
@@ -91,6 +92,7 @@ async fn settings_persistence_failure_preserves_the_runtime_and_unsent_prompt_fo
     let observed = state.ownership_snapshot(PROVIDER, &session_id);
     let mut send = send_msg(&session_id, "keep this prompt until settings are saved");
     send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+        collaboration_mode: None,
         model: Some("sonnet".into()),
         cwd: None,
         effort: None,

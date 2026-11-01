@@ -12,17 +12,21 @@ const localStorageMock = (() => {
 })()
 Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, writable: true })
 
+import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, {
   initLayout,
   applyReconcileAttach,
+  replacePane,
   resetPaneForReconcileCreate,
-  setDeadSessionAdjudication,
   setReconcileWarming,
+  setPaneReconcileNotice,
   setPaneRestoreError,
+  updatePaneContent,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { TerminalPaneContent, PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
 import type { PaneVerdict, PaneReconcileRequest, PaneReconcileResultMessage } from '@shared/ws-protocol'
 import { ReconcilePaneSchema, ReadyCapabilitiesSchema } from '@shared/ws-protocol'
 import {
@@ -30,9 +34,16 @@ import {
   buildReconcileRequestForPanes,
   collectTerminalPaneTargets,
   foldVerdicts,
+  isDeadSessionReconcileNotice,
   paneKeyFor,
+  DEAD_SESSION_RECONCILE_NOTICES,
 } from '@/lib/pane-reconcile'
-import type { UnknownAction } from '@reduxjs/toolkit'
+import { configureStore, type UnknownAction } from '@reduxjs/toolkit'
+import { ManagedRuntimeInventorySnapshotSchema } from '@shared/managed-runtime'
+import {
+  applyManagedRuntimeMergePlan,
+  buildManagedRuntimeMergePlan,
+} from '@/lib/recovery/managed-runtime-recovery'
 
 function emptyPanesState(): PanesState {
   return {
@@ -161,6 +172,32 @@ describe('paneKeyFor', () => {
 })
 
 describe('buildReconcileRequest', () => {
+  it.each([undefined, 'stopped', 'data_repair_complete', 'blocked', 'lost', 'recovering', 'live'] as const)(
+    'keeps supervisor-owned terminal recovery (%s) out of bulk and targeted legacy requests', (recoveryState) => {
+      let panes = addTerminalPane(emptyPanesState(), 'managed-tab', 'managed-pane', {
+        mode: 'opencode', soulId: 'managed-soul', status: 'exited',
+        ...(recoveryState ? { sessionRef: { provider: 'opencode' as const, sessionId: 'ses_volume_only' } } : {}),
+        ...(recoveryState ? { recoverySummary: { desiredState: 'stopped', recoveryState,
+          durabilityState: 'resume_captured', allocationState: 'allocated' } } : {}),
+      })
+      const managedBefore = panes.layouts['managed-tab']
+      expect(buildReconcileRequest(asRootState(panes))).toBeNull()
+      expect(buildReconcileRequestForPanes(asRootState(panes), [
+        { tabId: 'managed-tab', paneId: 'managed-pane' },
+      ])).toBeNull()
+      panes = addTerminalPane(panes, 'legacy-tab', 'legacy-pane', {
+        sessionRef: { provider: 'claude', sessionId: 'legacy-missing' },
+      })
+      const state = asRootState(panes)
+      for (const request of [buildReconcileRequest(state), buildReconcileRequestForPanes(state, [
+        { tabId: 'managed-tab', paneId: 'managed-pane' },
+        { tabId: 'legacy-tab', paneId: 'legacy-pane' },
+      ])]) {
+        expect(request?.panes.map(pane => pane.paneKey)).toEqual(['legacy-tab:legacy-pane'])
+      }
+      expect(panes.layouts['managed-tab']).toEqual(managedBefore)
+    })
+
   it('collects terminal panes with paneKey tab:pane and required createRequestId', () => {
     const state = storeStateWith2TerminalPanes()
     const req = buildReconcileRequest(state)!
@@ -233,28 +270,82 @@ describe('buildReconcileRequest', () => {
     expect(pane.resumeSessionId).toBeUndefined()
   })
 
-  it("carries the pane's persisted namingHandle, so a restarted server's managed adoption rejoins a zero-turn name", () => {
+  it("serializes an unmanaged zero-turn pane's persisted namingHandle for server adoption", () => {
     let state = emptyPanesState()
-    // A zero-turn managed Claude pane renamed before its first message: its
-    // sessionRef is the preallocated (record-less) session, its name lives
-    // under the pending handle.
+    // Before managed adoption, a renamed zero-turn pane has only a
+    // preallocated session reference and a pending naming handle.
     state = addTerminalPane(state, 'tab1', 'zero-turn', {
       mode: 'claude',
       terminalId: 't-soul',
       status: 'running',
-      soulId: 'soul-1',
       sessionRef: { provider: 'claude', sessionId: 'prealloc-1' },
       namingHandle: 'nh-zero-turn',
     } as Partial<TerminalPaneContent>)
     state = addTerminalPane(state, 'tab2', 'no-handle', { mode: 'claude', terminalId: 't-2' })
 
     const req = buildReconcileRequest(asRootState(state))!
-    const zeroTurn = req.panes.find((p) => p.paneKey === paneKeyFor('tab1', 'zero-turn'))
-    expect(zeroTurn?.namingHandle).toBe('nh-zero-turn')
-    expect(zeroTurn?.sessionRef).toEqual({ provider: 'claude', sessionId: 'prealloc-1' })
+    const zeroTurn = ReconcilePaneSchema.parse(req.panes.find((p) => p.paneKey === paneKeyFor('tab1', 'zero-turn')))
+    expect(zeroTurn.namingHandle).toBe('nh-zero-turn')
+    expect(zeroTurn.sessionRef).toEqual({ provider: 'claude', sessionId: 'prealloc-1' })
     const noHandle = req.panes.find((p) => p.paneKey === paneKeyFor('tab2', 'no-handle'))
     expect(noHandle).toBeDefined()
     expect(noHandle).not.toHaveProperty('namingHandle')
+  })
+
+  it('keeps a managed zero-turn naming handle through inventory updates without legacy reconciliation', () => {
+    const store = configureStore({ reducer: { panes: panesReducer, tabs: tabsReducer } })
+    store.dispatch(addTab({ id: 'managed-tab', mode: 'claude' }))
+    store.dispatch(initLayout({
+      tabId: 'managed-tab', paneId: 'managed-pane',
+      content: {
+        kind: 'terminal', mode: 'claude', shell: 'system', status: 'running',
+        createRequestId: 'managed-create', terminalId: 'old-terminal',
+        soulId: 'managed-soul', viewIntentId: 'managed-view',
+        namingHandle: 'nh-managed-zero-turn',
+        sessionRef: { provider: 'claude', sessionId: 'prealloc-managed' },
+      },
+    }))
+    const inventory = ManagedRuntimeInventorySnapshotSchema.parse({
+      revision: 2,
+      readiness: {
+        inventoryRevision: 2, initialScanState: 'complete', blockedSubsystems: [],
+        startupRecoveryConcurrencyLimit: 4, startupRecoveryPeak: 1,
+      },
+      souls: [{
+        soulId: 'managed-soul', incarnationId: 'new-incarnation',
+        terminalId: 'new-terminal', terminalMode: 'claude',
+        launchState: 'running', cleanupState: 'none', intentRevision: 1, executionGeneration: 2,
+        desiredState: 'running', recoveryState: 'live', durabilityState: 'live_only',
+        allocationState: 'allocated', provider: 'claude', nativeSessionId: 'prealloc-managed',
+        evidenceRevision: 1, successfulRecoveriesInWindow: 0,
+      }],
+      viewIntents: [{
+        viewId: 'managed-view', soulId: 'managed-soul', ownerId: 'owner', workspaceId: 'workspace',
+        kind: 'automatic_primary', preferredTabId: 'managed-tab', preferredPaneId: 'managed-pane',
+        title: 'Claude', placementGroup: 'workspace', visibility: 'visible',
+        revision: 1, soulIntentRevision: 1, createdAt: 1, updatedAt: 1,
+      }],
+      pendingProjectionCount: 0,
+    })
+    const target = [{ tabId: 'managed-tab', paneId: 'managed-pane' }]
+    const assertNoLegacyRequest = () => {
+      const state = store.getState() as RootState
+      expect(buildReconcileRequest(state)).toBeNull()
+      expect(buildReconcileRequestForPanes(state, target)).toBeNull()
+    }
+    assertNoLegacyRequest()
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState())
+    expect(plan.creates).toEqual([])
+    expect(plan.updates).toHaveLength(1)
+    applyManagedRuntimeMergePlan({ dispatch: store.dispatch, getState: () => store.getState() as RootState }, plan)
+    expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+      type: 'leaf', id: 'managed-pane', content: {
+        namingHandle: 'nh-managed-zero-turn', soulId: 'managed-soul',
+        incarnationId: 'new-incarnation', terminalId: 'new-terminal',
+        sessionRef: { provider: 'claude', sessionId: 'prealloc-managed' },
+      },
+    })
+    assertNoLegacyRequest()
   })
 
   it('never promotes a shell-mode legacy resumeSessionId (a stateless shell has no durable identity)', () => {
@@ -310,10 +401,9 @@ describe('foldVerdicts', () => {
       ['error', { reason: 'index_warming' }],
     ])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
-    expect(outcome).toMatchObject({ attached: 1, respawned: 1, fresh: 1, dead: 1, warming: 1, cardinalityViolation: false })
+    expect(outcome).toMatchObject({ attached: 1, respawned: 1, fresh: 1, warming: 1, cardinalityViolation: false })
     expect(dispatched.types).toContain(applyReconcileAttach.type)
     expect(dispatched.types).toContain(resetPaneForReconcileCreate.type)
-    expect(dispatched.types).toContain(setDeadSessionAdjudication.type)
     expect(dispatched.types).toContain(setReconcileWarming.type)
   })
 
@@ -364,12 +454,29 @@ describe('foldVerdicts', () => {
     })
   })
 
-  it('dead sessions are batched into ONE setDeadSessionAdjudication dispatch (never N)', () => {
+  it('dead sessions get exactly one per-pane restoreError latch, one dead-copy reconcileNotice, and no batched dispatch', () => {
+    // No-modal contract (Task 4): dead_session folds carry NO batched
+    // adjudication dispatch anymore — the per-pane restoreError latch is
+    // the single dead-session state, plus the one-shot dead-copy notice
+    // mint. RED while the batched adjudication dispatch still exists (it is
+    // the 7th dispatch for 3 dead panes); GREEN exactly when it is removed.
     const { req, dispatch, dispatched } = foldHarnessAllDead(3)
     const outcome = foldVerdicts(dispatch, req, deadResultFor(req))
-    expect(outcome.dead).toBe(3)
-    expect(dispatched.countOf(setDeadSessionAdjudication.type)).toBe(1)
-    expect(dispatched.lastPayloadOf(setDeadSessionAdjudication.type)).toHaveLength(3)
+    expect(outcome.cardinalityViolation).toBe(false)
+    expect(dispatched.actions).toHaveLength(6)
+    expect(new Set(dispatched.actions.map((a) => a.type))).toEqual(
+      new Set([setPaneRestoreError.type, setPaneReconcileNotice.type]),
+    )
+    const restoreErrors = dispatched.actions
+      .filter((a) => a.type === setPaneRestoreError.type)
+      .map((a) => (a as unknown as { payload: { restoreError: { code: string; reason: string } } }).payload.restoreError)
+    expect(restoreErrors).toHaveLength(3)
+    expect(restoreErrors.every((r) => r.code === 'RESTORE_UNAVAILABLE' && r.reason === 'durable_artifact_missing')).toBe(true)
+    const deadNotices = dispatched.actions
+      .filter((a) => a.type === setPaneReconcileNotice.type)
+      .map((a) => (a as unknown as { payload: { notice: string } }).payload.notice)
+    expect(deadNotices.every((notice) => isDeadSessionReconcileNotice(notice))).toBe(true)
+    expect(deadNotices).toHaveLength(3)
   })
 
   it('dead sessions ALSO get a loud per-pane restoreError breadcrumb', () => {
@@ -379,8 +486,41 @@ describe('foldVerdicts', () => {
     expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
       tabId: 'tab1',
       paneId: 'p1',
-      restoreError: { code: 'RESTORE_UNAVAILABLE' },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
     })
+    // ...beside the one-shot dead-copy notice mint (consumed by
+    // TerminalView's buffer-notice machinery).
+    expect(dispatched.countOf(setPaneReconcileNotice.type)).toBe(1)
+    expect(isDeadSessionReconcileNotice(
+      (dispatched.lastPayloadOf(setPaneReconcileNotice.type) as { notice: string }).notice,
+    )).toBe(true)
+  })
+
+  it('dead terminal verdicts mint a reason-honest dead-copy reconcileNotice beside the latch', () => {
+    // Copy honesty (fresh-eyes round 3): the server also returns dead_session
+    // with reason respawn_exhausted while the session file is PRESENT — the
+    // fold selects the STORE copy from the verdict's reason. Both variants
+    // are the dead-copy CATEGORY (matched by predicate, never one string).
+    const { req, dispatch, dispatched } = foldHarness([
+      ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-file' }, reason: 'session_file_missing' }],
+      ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-respawn' }, reason: 'respawn_exhausted' }],
+      ['dead_session', { sessionRef: { provider: 'claude', sessionId: 'gone-unknown' } }],
+    ])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.cardinalityViolation).toBe(false)
+    const noticePayloads = dispatched.actions
+      .filter((a) => a.type === setPaneReconcileNotice.type)
+      .map((a) => (a as unknown as { payload: { tabId: string; paneId: string; notice: string } }).payload)
+    expect(noticePayloads).toHaveLength(3)
+    expect(noticePayloads.map((p) => p.notice)).toEqual([
+      DEAD_SESSION_RECONCILE_NOTICES.missing,
+      DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted,
+      // An unknown reason is honest about the general case, never a
+      // disk-loss claim (plan prose: only the known-missing family says
+      // "no longer exists on disk").
+      DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted,
+    ])
+    expect(noticePayloads.map((p) => `${p.tabId}:${p.paneId}`)).toEqual(['tab1:p1', 'tab2:p2', 'tab3:p3'])
   })
 
   it('warming verdicts aggregate into ONE setReconcileWarming dispatch', () => {
@@ -427,6 +567,107 @@ describe('foldVerdicts', () => {
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
     expect(outcome.invalid).toBe(1)
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+  })
+})
+
+describe('foldVerdicts stale-verdict identity guard (delta round 4, finding 2)', () => {
+  // The guard lives in the REDUCERS the fold dispatches to, so these pins
+  // drive a REAL store (the recording harness above cannot see reducer
+  // behavior).
+  function realStorePanes() {
+    return configureStore({ reducer: { panes: panesReducer } })
+  }
+
+  function seedDeadAdjudicablePane(store: ReturnType<typeof realStorePanes>) {
+    store.dispatch(initLayout({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        shell: 'system',
+        createRequestId: 'cr-old',
+        status: 'running',
+        terminalId: 't-old',
+        sessionRef: { provider: 'claude', sessionId: 'sess-gone' },
+      },
+    }))
+  }
+
+  function leafTerminalContent(store: ReturnType<typeof realStorePanes>): TerminalPaneContent {
+    const layout = store.getState().panes.layouts['tab1'] as { type: 'leaf'; content: TerminalPaneContent }
+    return layout.content
+  }
+
+  it('a dead verdict for replaced content cannot latch the replacement (Replace pane keeps the paneId, re-keys createRequestId)', () => {
+    const store = realStorePanes()
+    seedDeadAdjudicablePane(store)
+
+    // A reconcile request goes out, carrying the OLD content's identity.
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].createRequestId).toBe('cr-old')
+
+    // While the verdict is in flight, the user resolves the dead-looking
+    // pane through existing chrome: Replace pane keeps the paneId, swaps
+    // in the type picker, and the user's selection lands NEW terminal
+    // content with a NEW createRequestId (the PaneContainer flow).
+    store.dispatch(replacePane({ tabId: 'tab1', paneId: 'p1' }))
+    store.dispatch(updatePaneContent({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        shell: 'system',
+        createRequestId: 'cr-new',
+        status: 'creating',
+      },
+    }))
+
+    // The OLD request's dead verdict arrives. RED today: the verdict keys
+    // only on (tabId, paneId), so the latch + dead-copy mint land on the
+    // NEW content — and the new-create stand-down (keyed on the latch)
+    // blocks the replacement from ever starting, breaking the requested
+    // resolution through existing pane chrome.
+    foldVerdicts(store.dispatch, req, deadResultFor(req))
+
+    const content = leafTerminalContent(store)
+    expect(content.createRequestId).toBe('cr-new')
+    expect(content.restoreError).toBeUndefined()
+    expect(content.reconcileNotice).toBeUndefined()
+    expect(content.status).toBe('creating')
+    expect(content.terminalId).toBeUndefined()
+  })
+
+  it('the same fold still latches + mints the pane the verdict describes (the guard is an exact-identity check)', () => {
+    const store = realStorePanes()
+    seedDeadAdjudicablePane(store)
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    foldVerdicts(store.dispatch, req, deadResultFor(req))
+    const content = leafTerminalContent(store)
+    expect(content.createRequestId).toBe('cr-old')
+    expect(content.restoreError).toMatchObject({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'durable_artifact_missing',
+    })
+    expect(isDeadSessionReconcileNotice(content.reconcileNotice)).toBe(true)
+  })
+})
+
+describe('deadSessionReconcileNoticeFor', () => {
+  it('maps ONLY the known-missing reason family to the disk-loss copy; everything else gets the generic copy', async () => {
+    const { deadSessionReconcileNoticeFor } = await import('@/lib/pane-reconcile')
+    // The server's deleted-file reasons (and the legacy TS spelling) claim
+    // the disk loss.
+    expect(deadSessionReconcileNoticeFor('session_not_on_disk')).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
+    expect(deadSessionReconcileNoticeFor('session_file_missing')).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
+    // The present-but-unresumable reason...
+    expect(deadSessionReconcileNoticeFor('respawn_exhausted')).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
+    // ...and any UNKNOWN reason (a future server's new code, a missing
+    // reason field) must not claim the file is gone — honesty is the
+    // generic "could not be resumed" copy.
+    expect(deadSessionReconcileNoticeFor(undefined)).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
+    expect(deadSessionReconcileNoticeFor('some_future_dead_reason')).toBe(DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted)
   })
 })
 

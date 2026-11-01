@@ -332,6 +332,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                 };
                 let stored_genesis = upsert.genesis.stored_value();
                 let w = FreshAgentBindingWrite {
+                    collaboration_mode: upsert.settings.collaboration_mode.as_deref(),
                     genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
                         stored_genesis.as_ref(),
                         upsert.genesis.is_clear(),
@@ -451,6 +452,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
             return None;
         }
         let s = FreshAgentSettings {
+            collaboration_mode: row.collaboration_mode,
             model: row.model,
             sandbox: row.sandbox,
             permission_mode: row.permission_mode,
@@ -825,6 +827,94 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_complete_codex_defaults_survive_the_actual_ledger_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = FreshAgentSettings {
+            model: Some("provider-current".into()),
+            effort: None,
+            sandbox: Some("read-only".into()),
+            permission_mode: Some("untrusted".into()),
+            cwd: Some("/workspace/project".into()),
+            collaboration_mode: Some("plan".into()),
+            plugins: None,
+        };
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            root.path().into(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
+        sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
+            name_transition: None,
+            provider: "codex".into(),
+            session_id: "settings-ledger".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(11),
+            observed_generation: Some(3),
+            authoritative: false,
+            settings: settings.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sink.load_settings("codex", "settings-ledger"),
+            Some(settings.clone())
+        );
+        drop(sink);
+        drop(ledger);
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            root.path().into(),
+        )));
+        let recovered = LedgerIdentitySink::new(ledger.clone(), None);
+        assert_eq!(
+            recovered.load_settings("codex", "settings-ledger"),
+            Some(settings)
+        );
+        let row = ledger.load_binding("codex", "settings-ledger").unwrap();
+        assert_eq!((row.owner_epoch, row.owner_generation), (Some(11), Some(3)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task008_settings_a_work_mode_only_record_is_recoverable() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            root.path().into(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger, None);
+        sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
+            name_transition: None,
+            provider: "codex".into(),
+            session_id: "mode-only".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            settings: FreshAgentSettings {
+                collaboration_mode: Some("plan".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+        assert!(sink.was_recorded("codex", "mode-only"));
+        assert_eq!(
+            sink.load_settings("codex", "mode-only")
+                .unwrap()
+                .collaboration_mode
+                .as_deref(),
+            Some("plan")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn writes_through_to_ledger_and_reads_back() {
         let tmp = tempfile::tempdir().unwrap();
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
@@ -846,6 +936,7 @@ mod tests {
 
             authoritative: false,
             settings: FreshAgentSettings {
+                collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
                 permission_mode: Some("on-request".into()),
@@ -1243,6 +1334,7 @@ mod tests {
             .expect("seed write (codex)");
 
         let settings = FreshAgentSettings {
+            collaboration_mode: None,
             model: None,
             sandbox: None,
             permission_mode: None,

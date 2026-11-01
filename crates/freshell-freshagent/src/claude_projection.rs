@@ -540,20 +540,21 @@ impl ClaudeTranscriptProjector {
         projector.finish_with(subagents)
     }
 
-    /// Project one raw JSONL line; malformed and blank lines are skipped.
-    pub(crate) fn push_line(&mut self, line: &str) {
+    /// Project one raw JSONL line; return whether it held a readable record.
+    pub(crate) fn push_line(&mut self, line: &str) -> bool {
         let line = line.trim();
         if line.is_empty() {
-            return;
+            return false;
         }
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
-            return;
+            return false;
         };
         // Every line, before any display filtering: the indexer's definition
         // sees (and dedupes) them all.
         self.usage.push(&obj, line);
         self.note_line_uuid(&obj);
         self.push_value(&obj);
+        true
     }
 
     /// Project one parsed transcript line (display content only; token usage

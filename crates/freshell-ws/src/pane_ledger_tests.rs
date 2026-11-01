@@ -283,6 +283,7 @@ fn write_provenance_at(
 
 fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider,
         session_id,
@@ -313,6 +314,7 @@ fn fa_write_fenced<'a>(
     generation: u64,
 ) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider,
         session_id,
@@ -346,6 +348,7 @@ fn fa_write_target<'a>(
     generation: u64,
 ) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider,
         session_id,
@@ -2960,6 +2963,7 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
     // The other lanes keep their existing disabled policy (silent no-op).
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: GenesisWrite::Keep,
             provider: "claude",
             session_id: "sid",
@@ -4800,6 +4804,7 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
     // index load sees the forged rows — the actual post-crash boot shape.
     for (sid, at) in [("th-old", 1_000i64), ("th-new", 2_000i64)] {
         let row = BindingRow {
+            collaboration_mode: None,
             genesis: None,
             ledger_version: LEDGER_VERSION,
             provider: "codex".into(),
@@ -4931,6 +4936,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: GenesisWrite::Keep,
             provider: "codex",
             session_id: "thread-1",
@@ -4967,6 +4973,7 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
     let root = temp_root("fresh-agent-upsert");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider: "opencode",
         session_id: "ses_abc",
@@ -5018,6 +5025,7 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
     let root = temp_root("fresh-agent-supersedes");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider: "codex",
         session_id: "old-thread",
@@ -5085,6 +5093,7 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
     let root = temp_root("fresh-agent-req-id");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider: "codex",
         session_id: "thread-1",
@@ -5135,6 +5144,7 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
     let root = temp_root("fresh-agent-settings-recorded");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        collaboration_mode: None,
         genesis: GenesisWrite::Keep,
         provider: "opencode",
         session_id: "ses_full",
@@ -5187,6 +5197,7 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            collaboration_mode: None,
             genesis: GenesisWrite::Keep,
             provider: "codex",
             session_id: "new-thread",
@@ -8496,6 +8507,7 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
         live_terminal_id: Option<&str>,
     ) -> BindingRow {
         BindingRow {
+            collaboration_mode: None,
             genesis: None,
             ledger_version: LEDGER_VERSION,
             provider: "claude".to_string(),

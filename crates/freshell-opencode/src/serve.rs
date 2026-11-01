@@ -429,6 +429,34 @@ impl ServeError {
     }
 }
 
+/// Bounded API responses use an absolute timeout. WebSocket observers renew
+/// their quiet window only while the native session confirms busy/retry.
+#[derive(Clone, Copy, Debug)]
+pub enum IdleWait {
+    Timeout(Duration),
+    WhileActive(Duration),
+}
+
+impl From<Duration> for IdleWait {
+    fn from(timeout: Duration) -> Self {
+        Self::Timeout(timeout)
+    }
+}
+
+impl IdleWait {
+    fn renew(self, deadline: Pin<&mut tokio::time::Sleep>) {
+        if let Self::WhileActive(timeout) = self {
+            deadline.reset(tokio::time::Instant::now() + timeout);
+        }
+    }
+}
+
+enum IdlePoll {
+    Running,
+    Settled,
+    Pending,
+}
+
 // ── config / deps ────────────────────────────────────────────────────────────────
 
 /// Timing knobs, defaulted to the reference values (`serve-manager.ts:12-14,121-123`).
@@ -1221,6 +1249,34 @@ impl OpencodeServeManager {
         dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
         timeout_override: Option<Duration>,
     ) -> Result<Value, ServeError> {
+        self.json_request_over_base_with_status(
+            method,
+            path,
+            body,
+            not_found_value,
+            base,
+            discard_on_timeout,
+            dispatch_witnesses,
+            timeout_override,
+        )
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Status-preserving form used by callers that need to distinguish an empty
+    /// successful response from the documented 404-as-empty fallback.
+    #[allow(clippy::too_many_arguments)]
+    async fn json_request_over_base_with_status(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+        not_found_value: Option<Value>,
+        base: String,
+        discard_on_timeout: DiscardOnTimeout,
+        dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
+        timeout_override: Option<Duration>,
+    ) -> Result<(Value, u16), ServeError> {
         let url = format!("{base}{path}");
         let timeout = timeout_override.unwrap_or_else(|| self.config().request_timeout);
         let method_str = format!("{method:?}").to_uppercase();
@@ -1278,7 +1334,7 @@ impl OpencodeServeManager {
         if !resp.ok() && resp.status != 204 {
             if resp.status == 404 {
                 if let Some(value) = not_found_value {
-                    return Ok(value);
+                    return Ok((value, resp.status));
                 }
             }
             return Err(ServeError::Http {
@@ -1289,9 +1345,10 @@ impl OpencodeServeManager {
             });
         }
         if resp.status == 204 {
-            return Ok(Value::Null);
+            return Ok((Value::Null, resp.status));
         }
-        resp.json()
+        let status = resp.status;
+        resp.json().map(|value| (value, status))
     }
 
     /// `createSession({title?, parentID?, directory?})` (`serve-manager.ts:337-346`).
@@ -1462,11 +1519,25 @@ impl OpencodeServeManager {
         route: &Route,
         base: &str,
     ) -> Result<Value, ServeError> {
+        self.list_messages_at_with_status(id, route, base)
+            .await
+            .map(|(messages, _)| messages)
+    }
+
+    /// `listMessages` with the native HTTP status preserved for safe
+    /// transcript-read diagnostics. The 404 fallback remains an empty array,
+    /// with status 404 distinguishing it from a successful empty page.
+    pub async fn list_messages_at_with_status(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<(Value, u16), ServeError> {
         let path = with_route(
             &format!("/session/{}/message", encode_path_segment(id)),
             route,
         );
-        self.json_request_over_base(
+        self.json_request_over_base_with_status(
             HttpMethod::Get,
             &path,
             None,
@@ -1555,6 +1626,33 @@ impl OpencodeServeManager {
         route: &Route,
     ) -> Result<Option<Value>, ServeError> {
         Ok(self.get_session_status_map(route).await?.get(id).cloned())
+    }
+
+    /// Read a session's current status from an already captured daemon. Snapshot
+    /// reads must never start a replacement daemon or discard one on timeout.
+    pub async fn get_session_status_at(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<Option<Value>, ServeError> {
+        let path = with_route("/session/status", route);
+        let value = self
+            .json_request_over_base(
+                HttpMethod::Get,
+                &path,
+                None,
+                None,
+                base.to_string(),
+                DiscardOnTimeout::No,
+                &[],
+                None,
+            )
+            .await?;
+        let map = value.as_object().ok_or_else(|| {
+            ServeError::Decode("OpenCode session status map must be an object".into())
+        })?;
+        Ok(map.get(id).cloned())
     }
 
     /// `abort(id, route)` (`serve-manager.ts:399-401`).
@@ -1869,14 +1967,21 @@ impl OpencodeServeManager {
 
     /// [`once_idle`](Self::once_idle) driven from a pre-obtained receiver — so a caller
     /// (or a test) can subscribe deterministically BEFORE dispatching events.
+    /// Bounded API reads pass a duration; native turn observers use
+    /// [`IdleWait::WhileActive`] to renew on confirmed busy/retry activity.
     pub async fn await_idle(
         &self,
         session_id: &str,
         mut rx: broadcast::Receiver<SessionSignal>,
-        timeout: Duration,
+        wait: impl Into<IdleWait> + Send,
         route: Route,
     ) -> Result<(), ServeError> {
-        let deadline = Instant::now() + timeout;
+        let wait = wait.into();
+        let timeout = match wait {
+            IdleWait::Timeout(timeout) | IdleWait::WhileActive(timeout) => timeout,
+        };
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
         let mut observed_activity = false;
         let mut idle_status_polls: u32 = 0;
         let mut poll = tokio::time::interval(self.config().idle_poll_interval);
@@ -1884,16 +1989,21 @@ impl OpencodeServeManager {
         poll.tick().await; // consume the immediate first tick
 
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ServeError::IdleTimeout {
-                    session_id: session_id.to_string(),
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-
             tokio::select! {
                 biased;
+                _ = &mut deadline => {
+                    tracing::warn!(
+                        session_id,
+                        timeout_ms = timeout.as_millis() as u64,
+                        observed_activity,
+                        wait = ?wait,
+                        "opencode.turn.idle_wait_timed_out"
+                    );
+                    return Err(ServeError::IdleTimeout {
+                        session_id: session_id.to_string(),
+                        timeout_ms: timeout.as_millis() as u64,
+                    });
+                }
                 signal = rx.recv() => {
                     match signal {
                         Ok(SessionSignal::Lost) => {
@@ -1904,30 +2014,30 @@ impl OpencodeServeManager {
                                 return Ok(());
                             }
                             if event_shows_running_status_activity(&event) {
+                                wait.renew(deadline.as_mut());
                                 observed_activity = true;
                                 idle_status_polls = 0;
-                                if self.check_status_idle(session_id, &route, &mut observed_activity, &mut idle_status_polls).await {
-                                    return Ok(());
+                                match self.check_status_idle(session_id, &route, &mut observed_activity, &mut idle_status_polls).await {
+                                    IdlePoll::Settled => return Ok(()),
+                                    IdlePoll::Running => wait.renew(deadline.as_mut()),
+                                    IdlePoll::Pending => {}
                                 }
                             }
                         }
-                        // Lagged: some events dropped — the status-poll fallback below
-                        // is exactly the safety net for a missed idle. Closed: emitter
-                        // gone — fall through to poll + timeout.
+                        // Lagged events use the status-poll fallback. A closed
+                        // emitter has no future idle edge and cannot be observed.
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(ServeError::SidecarLost { session_id: session_id.to_string() });
+                        }
                     }
                 }
                 _ = poll.tick() => {
-                    if self.check_status_idle(session_id, &route, &mut observed_activity, &mut idle_status_polls).await {
-                        return Ok(());
+                    match self.check_status_idle(session_id, &route, &mut observed_activity, &mut idle_status_polls).await {
+                        IdlePoll::Settled => return Ok(()),
+                        IdlePoll::Running => wait.renew(deadline.as_mut()),
+                        IdlePoll::Pending => {}
                     }
-                }
-                _ = tokio::time::sleep(remaining) => {
-                    return Err(ServeError::IdleTimeout {
-                        session_id: session_id.to_string(),
-                        timeout_ms: timeout.as_millis() as u64,
-                    });
                 }
             }
         }
@@ -1935,15 +2045,15 @@ impl OpencodeServeManager {
 
     /// `checkStatusMap` (`serve-manager.ts:471-496`): busy/retry marks activity; after
     /// activity, an idle-or-absent status counts toward `required_idle_status_polls`.
-    /// Returns `true` when the idle threshold is reached. Poll errors reset the counter
-    /// (and are swallowed, matching the reference's warn-once fallback).
+    /// Report running separately so only confirmed busy/retry can renew a quiet
+    /// window. Poll errors reset the counter without renewing the deadline.
     async fn check_status_idle(
         &self,
         session_id: &str,
         route: &Route,
         observed_activity: &mut bool,
         idle_status_polls: &mut u32,
-    ) -> bool {
+    ) -> IdlePoll {
         match self.get_session_status_map(route).await {
             Ok(statuses) => {
                 let status = statuses.get(session_id);
@@ -1951,21 +2061,21 @@ impl OpencodeServeManager {
                 if is_running_status_type(status_type) {
                     *observed_activity = true;
                     *idle_status_polls = 0;
-                    return false;
+                    return IdlePoll::Running;
                 }
                 if *observed_activity && (status.is_none() || is_idle_status_type(status_type)) {
                     *idle_status_polls += 1;
                     if *idle_status_polls >= self.config().required_idle_status_polls {
-                        return true;
+                        return IdlePoll::Settled;
                     }
-                    return false;
+                    return IdlePoll::Pending;
                 }
                 *idle_status_polls = 0;
-                false
+                IdlePoll::Pending
             }
             Err(_) => {
                 *idle_status_polls = 0;
-                false
+                IdlePoll::Pending
             }
         }
     }
@@ -1998,7 +2108,7 @@ impl OpencodeServeManager {
         text: &str,
         model: Option<&str>,
         effort: Option<&str>,
-        timeout: Duration,
+        wait: impl Into<IdleWait> + Send,
         route: Route,
         accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -2009,7 +2119,7 @@ impl OpencodeServeManager {
             model,
             effort,
             None,
-            timeout,
+            wait.into(),
             route,
             accepted_witness,
             dispatched_witness,
@@ -2028,11 +2138,12 @@ impl OpencodeServeManager {
         model: Option<&str>,
         effort: Option<&str>,
         message_id: Option<&str>,
-        timeout: Duration,
+        wait: impl Into<IdleWait> + Send,
         route: Route,
         accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
+        let wait = wait.into();
         let rx = self.subscribe(session_id);
         let body = build_prompt_body_with_message_id(text, model, effort, message_id);
         self.prompt_async(
@@ -2043,7 +2154,7 @@ impl OpencodeServeManager {
             dispatched_witness,
         )
         .await?;
-        self.await_idle(session_id, rx, timeout, route).await
+        self.await_idle(session_id, rx, wait, route).await
     }
 
     /// Shut down: stop future starts, discard the running sidecar (kill + stop SSE via
@@ -2480,6 +2591,42 @@ mod tests {
         assert!(body.get("variant").is_none(), "empty effort omitted");
     }
 
+    #[tokio::test]
+    async fn list_messages_at_with_status_preserves_the_native_http_status() {
+        let http = Arc::new(RecordingHttp::new());
+        let manager = started_recording_manager(Arc::clone(&http)).await;
+
+        let (messages, status) = manager
+            .list_messages_at_with_status("ses_diagnostic", &None, "http://127.0.0.1:4312")
+            .await
+            .expect("the native message list succeeds");
+
+        assert_eq!(status, 200);
+        assert_eq!(messages, json!([]));
+        let request = http
+            .recorded()
+            .into_iter()
+            .find(|(_, url, _)| url.contains("/session/ses_diagnostic/message"))
+            .expect("the message read was dispatched");
+        assert_eq!(request.0, "GET");
+    }
+
+    #[tokio::test]
+    async fn list_messages_at_with_status_keeps_the_empty_fallback_marked_as_not_found() {
+        let mut response = RecordingHttp::new();
+        response.message_status = 404;
+        response.message_body = br#"{"error":"not found"}"#.to_vec();
+        let manager = started_recording_manager(Arc::new(response)).await;
+
+        let (messages, status) = manager
+            .list_messages_at_with_status("ses_missing_messages", &None, "http://127.0.0.1:4312")
+            .await
+            .expect("the documented 404 fallback is still a successful empty page");
+
+        assert_eq!(messages, json!([]));
+        assert_eq!(status, 404);
+    }
+
     // ── compact (POST /session/:id/summarize) + get_config (GET /config) ────────
 
     /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
@@ -2497,10 +2644,14 @@ mod tests {
         summarize_pending: bool,
         fork_status: u16,
         fork_body: Vec<u8>,
+        message_status: u16,
+        message_body: Vec<u8>,
         config_body: Vec<u8>,
         config_pending: bool,
         revert_status: u16,
         prompt_pending: bool,
+        status_body: Vec<u8>,
+        status_pending: bool,
     }
 
     impl RecordingHttp {
@@ -2512,10 +2663,14 @@ mod tests {
                 summarize_pending: false,
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
+                message_status: 200,
+                message_body: b"[]".to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
                 config_pending: false,
                 revert_status: 200,
                 prompt_pending: false,
+                status_body: b"{}".to_vec(),
+                status_pending: false,
             }
         }
 
@@ -2555,6 +2710,18 @@ mod tests {
             ));
             if req.url.contains("/global/health") {
                 return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            if req.url.contains("/session/status") {
+                if self.status_pending {
+                    return Box::pin(std::future::pending());
+                }
+                let body = self.status_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/message") {
+                let status = self.message_status;
+                let body = self.message_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/summarize") {
                 if self.summarize_pending {
@@ -3115,6 +3282,70 @@ mod tests {
             mgr.base_url().await.is_some(),
             "the running entry must survive a config read timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn captured_session_status_reads_the_given_daemon_without_starting_one() {
+        let http = Arc::new(RecordingHttp {
+            status_body: br#"{"ses_live":{"type":"busy"},"ses_other":{"type":"idle"}}"#.to_vec(),
+            ..RecordingHttp::new()
+        });
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(FakeSpawner),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        let status = manager
+            .get_session_status_at(
+                "ses_live",
+                &Some("/work dir".into()),
+                "http://127.0.0.1:12345",
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, Some(json!({"type":"busy"})));
+        assert!(
+            manager.base_url().await.is_none(),
+            "a read must not start a daemon"
+        );
+        let requests = http.recorded();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(
+            requests[0].1,
+            "http://127.0.0.1:12345/session/status?directory=%2Fwork%20dir"
+        );
+        assert!(requests[0].2.is_none());
+    }
+
+    #[tokio::test]
+    async fn captured_session_status_timeout_does_not_kill_the_shared_daemon() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            status_pending: true,
+            ..RecordingHttp::new()
+        });
+        let manager = started_recording_manager_counting_kills(
+            http,
+            ServeConfig {
+                request_timeout: Duration::from_millis(50),
+                ..ServeConfig::default()
+            },
+            killed.clone(),
+        )
+        .await;
+        let base = manager.base_url().await.unwrap();
+        let error = manager
+            .get_session_status_at("ses_live", &None, &base)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServeError::RequestTimeout { .. }));
+        assert_eq!(killed.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.base_url().await, Some(base));
     }
 
     // ── fork (POST /session/:id/fork) ────────────────────────────────────────

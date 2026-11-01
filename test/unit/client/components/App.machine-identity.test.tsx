@@ -36,7 +36,6 @@ vi.mock('@/components/TerminalInterestReporter', () => ({ TerminalInterestReport
 vi.mock('@/components/AuthRequiredModal', () => ({
   AuthRequiredModal: () => <div data-testid="auth-required-modal" />,
 }))
-vi.mock('@/components/DeadSessionPanel', () => ({ DeadSessionPanel: () => null }))
 vi.mock('@/components/ReconcileWarmingBanner', () => ({ ReconcileWarmingBanner: () => null }))
 vi.mock('@/components/SetupWizard', () => ({ SetupWizard: () => null }))
 vi.mock('@/components/RecoveryOfferPanel', () => ({ RecoveryOfferPanel: () => null }))

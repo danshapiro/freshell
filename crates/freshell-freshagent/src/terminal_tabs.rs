@@ -789,7 +789,9 @@ fn codex_launch_error_response(
     use freshell_codex::launch_lifecycle::CodexLaunchError;
     let status = match &error {
         CodexLaunchError::Config(_) => StatusCode::BAD_REQUEST,
-        CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        CodexLaunchError::AppServerStart(_)
+        | CodexLaunchError::ProxyStart(_)
+        | CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Restore-class-only variants. The REST door is Interactive by
         // construction, so these are defensively mapped, mirroring
         // spawn_gate_error_response's QueueFull -> 429.
@@ -1233,7 +1235,7 @@ pub(crate) async fn spawn_terminal_pane(
     body: &Value,
     tab_id: &str,
     pane_id: &str,
-) -> Result<TerminalSpawnResult, Response> {
+) -> Result<TerminalSpawnResult, Box<Response>> {
     spawn_terminal_pane_with_handoff(state, body, tab_id, pane_id, None).await
 }
 
@@ -1262,7 +1264,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     tab_id: &str,
     pane_id: &str,
     handoff: Option<&HandoffToken>,
-) -> Result<TerminalSpawnResult, Response> {
+) -> Result<TerminalSpawnResult, Box<Response>> {
     let mode = body
         .get("mode")
         .and_then(Value::as_str)
@@ -1279,14 +1281,16 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                  {{\"agent\":\"opencode\"}} for the fresh-agent path, or open an issue if you \
                  need this mode."
             ),
-        ));
+        )
+        .into());
     }
 
     let Some(registry) = state.terminal_registry.clone() else {
         return Err(fail_json(
             StatusCode::SERVICE_UNAVAILABLE,
             "terminal registry not wired on this server".to_string(),
-        ));
+        )
+        .into());
     };
     // Freeze the launch lane before the coordinator's pre-spawn witness is
     // registered. Its cancel target and the eventual registry row must use
@@ -1320,7 +1324,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             return Err(fail_json(
                 StatusCode::BAD_REQUEST,
                 format!("cwd \"{dir}\" does not exist"),
-            ));
+            )
+            .into());
         }
     }
 
@@ -1415,11 +1420,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         } else {
             format!("The saved {mode} session {blocked} could not be verified for recovery.")
         };
-        return Err(crate::fail_json_code(
-            StatusCode::CONFLICT,
-            "RECOVERY_BLOCKED",
-            message,
-        ));
+        return Err(
+            crate::fail_json_code(StatusCode::CONFLICT, "RECOVERY_BLOCKED", message).into(),
+        );
     }
     if let Some(stale) = rest_outcome.stale_session_id.as_deref() {
         // b8ke ext r16 F3: a DEFINITIVELY MISSING exact-resume target no
@@ -1448,7 +1451,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 "The durable session {stale} is gone. No replacement was started — \
                  start a fresh conversation explicitly if you want a new session."
             ),
-        ));
+        )
+        .into());
     }
 
     // Fresh-claude preallocation (kata hbsa): WS parity. The WS door's
@@ -1516,7 +1520,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             return Err(fail_json(
                 StatusCode::BAD_REQUEST,
                 "Amplifier terminals require the default system shell on a unix host (cwd is part of the session identity contract).".to_string(),
-            ));
+            ).into());
         }
         if resume_session_id
             .as_deref()
@@ -1531,7 +1535,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     "Invalid amplifier sessionRef '{}': synthetic terminal placeholder ids are not resumable sessions.",
                     resume_session_id.as_deref().unwrap_or_default()
                 ),
-            ));
+            ).into());
         }
         // Launcher-assigned identity: a fresh (non-restore) create mints the
         // session UUID up front. Legacy persisted panes with NO resume id
@@ -1558,7 +1562,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 return Err(fail_json(
                     StatusCode::CONFLICT,
                     format!("Amplifier session {requested} is already open in a live terminal."),
-                ));
+                )
+                .into());
             }
             // ONE effective spawn cwd (F4). The falsified path this closes:
             // cwd=None used to flow into build_cli_spawn_spec → spec.cwd =
@@ -1576,7 +1581,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     return Err(fail_json(
                         StatusCode::BAD_REQUEST,
                         "Amplifier requires a resolvable working directory (cwd is part of the session identity contract).".to_string(),
-                    ));
+                    ).into());
                 }
             };
             // A10/B2 guard (validated falsification): REST's is_dir check
@@ -1594,13 +1599,14 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     format!(
                         "Amplifier working directory \"{raw_effective_cwd}\" must be an absolute path."
                     ),
-                ));
+                ).into());
             };
             if !std::path::Path::new(&effective_cwd).is_dir() {
                 return Err(fail_json(
                     StatusCode::BAD_REQUEST,
                     format!("Amplifier working directory \"{effective_cwd}\" does not exist."),
-                ));
+                )
+                .into());
             }
             let ensured = freshell_sessions::amplifier_stub::resolve_amplifier_home()
                 .ok_or_else(|| {
@@ -1643,7 +1649,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                                             .as_deref()
                                             .unwrap_or("an unknown directory")
                                     ),
-                                ));
+                                ).into());
                             }
                         }
                     }
@@ -1660,7 +1666,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     return Err(fail_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to pre-create amplifier session {requested}: {detail}"),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1939,7 +1946,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                             "SESSION_RESERVED",
                             "A lifecycle operation is in flight for this session; retry after it settles"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
                     freshell_ownership::AttachGuardOutcome::StaleGeneration { .. } => {
                         tracing::warn!(target: "freshell_freshagent::terminal_tabs",
@@ -1957,7 +1964,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                                  refresh and retry. (session {})",
                                 locator.session_id
                             ),
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -2018,7 +2026,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         (StatusCode::CONFLICT, Json(stale_body)).into_response()
                     }
                     _ => unreachable!("the refused arms are exhaustive above"),
-                });
+                }.into());
             }
         }
     }
@@ -2055,7 +2063,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 live_sid,
                 Some(&owner_terminal_id),
                 owner_fields.as_ref(),
-            ));
+            )
+            .into());
         }
 
         // kata b8ke Task 10 (REST-door D7 parity, the WS door's Task 13b
@@ -2086,11 +2095,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         &ownership.observe(&mode, live_sid),
                     )
                 });
-                return Err(fail_json_restore_unavailable(
-                    live_sid,
-                    None,
-                    owner_fields.as_ref(),
-                ));
+                return Err(
+                    fail_json_restore_unavailable(live_sid, None, owner_fields.as_ref()).into(),
+                );
             }
         }
 
@@ -2141,7 +2148,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     live_sid,
                     Some(&terminal_id),
                     owner_fields.as_ref(),
-                ));
+                )
+                .into());
             }
             SessionRefClaim::Held { .. } | SessionRefClaim::ExpiredNeedsKill { .. } => {
                 tracing::warn!(
@@ -2156,11 +2164,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         &ownership.observe(&mode, live_sid),
                     )
                 });
-                return Err(fail_json_restore_unavailable(
-                    live_sid,
-                    None,
-                    owner_fields.as_ref(),
-                ));
+                return Err(
+                    fail_json_restore_unavailable(live_sid, None, owner_fields.as_ref()).into(),
+                );
             }
         }
     }
@@ -2243,7 +2249,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         Err(join_err) => Err(fail_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("terminal create task panicked: {join_err}"),
-        )),
+        )
+        .into()),
     }
 }
 
@@ -2332,7 +2339,9 @@ struct GatedSettleInputs {
 /// held from before the PTY fork until every settle step (meta, lease bind,
 /// codex adopt, pane bookkeeping) completed — the same spawn-to-settled
 /// scope the WS door pins with `hold_permit_across`.
-async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnResult, Response> {
+async fn settle_gated_create(
+    inputs: GatedSettleInputs,
+) -> Result<TerminalSpawnResult, Box<Response>> {
     // D-C-R (2026-07-30): the spawn-gate permit is now acquired BELOW, after
     // the (possibly ~long) codex managed plan, so codex planning never holds a
     // server-wide spawn permit. Declared first so it drops last (RAII scope:
@@ -2468,7 +2477,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             use freshell_opencode::serve::PortAllocator as _;
             match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
                 Ok(ep) => Some(ep),
-                Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e)),
+                Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e).into()),
             }
         } else {
             None
@@ -2516,7 +2525,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 .await
             {
                 Ok(launch) => Some(launch),
-                Err(error) => return Err(codex_launch_error_response(error)),
+                Err(error) => return Err(codex_launch_error_response(error).into()),
             }
         } else {
             None
@@ -2540,7 +2549,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     return Err(fail_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "managed Codex terminal setup did not match its spawn id".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 let CodexManagedLaunchSetup {
                     terminal_id: _,
@@ -2566,7 +2576,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     ) {
                         Ok(injection) => injection,
                         Err(error) => {
-                            return Err(fail_json(StatusCode::BAD_REQUEST, error.message))
+                            return Err(fail_json(StatusCode::BAD_REQUEST, error.message).into())
                         }
                     }
                 };
@@ -2645,7 +2655,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         };
         let launch = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
             Ok(l) => l,
-            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message())),
+            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message()).into()),
         };
 
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
@@ -2805,7 +2815,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
                     let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
                 }
-                return Err(spawn_gate_error_response(err, rest_gate.timeout));
+                return Err(spawn_gate_error_response(err, rest_gate.timeout).into());
             }
         }
     }
@@ -2951,7 +2961,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     "Amplifier session {} is already open in a live terminal.",
                     resume_session_id.as_deref().unwrap_or_default()
                 ),
-            ));
+            )
+            .into());
         }
         // A stub written for a spawn that never happened is pure litter.
         if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
@@ -2977,7 +2988,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return Err(fail_json(StatusCode::BAD_REQUEST, message));
+        return Err(fail_json(StatusCode::BAD_REQUEST, message).into());
     }
 
     // D8: arm the lease's TTL kill path -- record the just-spawned child's pid
@@ -3008,7 +3019,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .await
         {
             registry.kill(&terminal_id);
-            return Err(fail_json(StatusCode::INTERNAL_SERVER_ERROR, message));
+            return Err(fail_json(StatusCode::INTERNAL_SERVER_ERROR, message).into());
         }
     }
 
@@ -3093,7 +3104,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         "the terminal target's durable recovery registration failed; \
                          the spawned terminal was reaped: {reg_err}"
                     ),
-                ));
+                )
+                .into());
             }
             // The REST create rung keeps its documented degradation policy
             // (a create is never blocked by durability degradation); the
@@ -3163,7 +3175,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     "Session {} is still running on the server.",
                     locator.session_id
                 ),
-            ));
+            )
+            .into());
         }
     }
 
@@ -3254,7 +3267,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         "Session {} is still running on the server.",
                         locator.session_id
                     ),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -3352,7 +3366,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                             "Session {} is still running on the server.",
                             locator.session_id
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -3565,7 +3580,7 @@ async fn create_terminal_tab(
             // (`layoutStore.closeTab(createdTabId)`, `router.ts:824-830`) —
             // no phantom tab survives a failed spawn.
             state.layout.close_tab(&tab_id);
-            return resp;
+            return *resp;
         }
     };
     let TerminalSpawnResult {
@@ -3938,32 +3953,10 @@ pub(crate) async fn wait_for(
         );
     };
 
-    let raw_pattern = params.get("pattern").or_else(|| params.get("p"));
-    let pattern = match raw_pattern {
-        Some(p) => match fancy_regex::Regex::new(p) {
-            Ok(re) => Some(re),
-            Err(_) => return fail_json(StatusCode::BAD_REQUEST, "invalid pattern".to_string()),
-        },
-        None => None,
+    let (pattern, deadline) = match wait_pattern(&params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
     };
-    if pattern.is_none() {
-        // Slice 1 scope: `stable`/`exit`/`prompt` fallback modes are deferred.
-        return fail_json(
-            StatusCode::BAD_REQUEST,
-            "wait-for requires `pattern` in this Rust port slice (stable/exit/prompt \
-             are deferred -- see docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8)"
-                .to_string(),
-        );
-    }
-    let pattern = pattern.expect("checked above");
-
-    let timeout_secs = params
-        .get("T")
-        .or_else(|| params.get("timeout"))
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(30.0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
 
     loop {
         let text = registry
@@ -3985,6 +3978,45 @@ pub(crate) async fn wait_for(
     }
 }
 
+#[allow(clippy::result_large_err)]
+pub(crate) fn wait_pattern(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(fancy_regex::Regex, std::time::Instant), Response> {
+    let raw_pattern = params.get("pattern").or_else(|| params.get("p"));
+    let pattern = match raw_pattern {
+        Some(p) => match fancy_regex::Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(_) => {
+                return Err(fail_json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid pattern".to_string(),
+                ))
+            }
+        },
+        None => None,
+    };
+    if pattern.is_none() {
+        // Slice 1 scope: `stable`/`exit`/`prompt` fallback modes are deferred.
+        return Err(fail_json(
+            StatusCode::BAD_REQUEST,
+            "wait-for requires `pattern` in this Rust port slice (stable/exit/prompt \
+             are deferred -- see docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8)"
+                .to_string(),
+        ));
+    }
+    let pattern = pattern.expect("checked above");
+
+    let timeout_secs = params
+        .get("T")
+        .or_else(|| params.get("timeout"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(30.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
+
+    Ok((pattern, deadline))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Slice 1 route tests (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8.1)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4000,6 +4032,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::Router;
+    use freshell_terminal::registry::{
+        ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
+        ManagedTerminalFuture, ManagedTerminalInputError,
+    };
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
@@ -4133,7 +4169,7 @@ mod tests {
     /// sandbox etc.) is an INPUT error → 400; any other launch failure (runtime/proxy
     /// IO, planner shutdown) → 500.
     #[test]
-    fn rest_codex_launch_error_maps_config_to_400_and_failed_to_500() {
+    fn rest_codex_launch_error_keeps_config_and_runtime_failures_on_their_existing_statuses() {
         use freshell_codex::launch_lifecycle::CodexLaunchError;
         use freshell_codex::launch_plan::CodexLaunchConfigError;
         let config =
@@ -4141,10 +4177,14 @@ mod tests {
                 message: "Invalid Codex sandbox setting \"x\".".to_string(),
             }));
         assert_eq!(config.status(), StatusCode::BAD_REQUEST);
-        let failed = codex_launch_error_response(CodexLaunchError::Failed(
-            "codex app-server WS never came up".to_string(),
-        ));
-        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for failure in [
+            CodexLaunchError::AppServerStart("local readiness failure".into()),
+            CodexLaunchError::ProxyStart("local proxy failure".into()),
+            CodexLaunchError::Failed("unclassified local failure".into()),
+        ] {
+            let response = codex_launch_error_response(failure);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     /// `router.ts:177`: `resumeSessionId: opts.resumeSessionId ? (plan.sessionId ??
@@ -7322,6 +7362,138 @@ if (args.includes('app-server')) {{
 
     struct UnusedManagedController;
 
+    struct CapturingManagedController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+
+    impl ManagedTerminalController for CapturingManagedController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(request);
+                Err("captured managed launch without spawning".into())
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            data: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            UnusedManagedController.input(terminal, data)
+        }
+
+        fn resize<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            cols: u16,
+            rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.resize(terminal, cols, rows)
+        }
+
+        fn stop<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.stop(terminal)
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            after_seq: i64,
+            max_bytes: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            UnusedManagedController.read_output(terminal, after_seq, max_bytes)
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_managed_codex_model_preserves_explicit_selection_and_exact_resume() {
+        for (model, resume) in [
+            (Some("gpt-5.6-luna"), false),
+            (Some("gpt-5.2-codex"), false),
+            (None, false),
+            (Some("gpt-5.6-luna"), true),
+            (Some("gpt-5.2-codex"), true),
+        ] {
+            let mut spec = managed_codex_cli_spec();
+            spec.effort_args = Some(vec![
+                "-c".into(),
+                "model_reasoning_effort=\"{{effort}}\"".into(),
+            ]);
+            let state = state_with_registry()
+                .with_cli_commands(Arc::new(vec![spec]))
+                .with_resume_probe(probe_answering(
+                    freshell_platform::resume_gate::ResumeExistence::Present,
+                    true,
+                ));
+            let registry = state.terminal_registry.clone().unwrap();
+            let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+            registry.set_managed_controller(Some(controller.clone()));
+            let mut body = json!({"mode":"codex", "cwd":std::env::temp_dir(), "effort":"low"});
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if resume {
+                body["sessionRef"] = json!({"provider":"codex", "sessionId":"owned-native-root"});
+            }
+            let (status, response) = post(app(state), "/api/tabs", body, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", response["message"]);
+            assert!(response["message"]
+                .as_str()
+                .unwrap()
+                .contains("captured managed launch"));
+            let request = controller
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual REST managed launch request");
+            assert_eq!(request.provider_model.as_deref(), model);
+            assert_eq!(request.provider_reasoning_effort.as_deref(), Some("low"));
+            let args = &request.spec.args;
+            let models: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(models, model.into_iter().collect::<Vec<_>>());
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_effort=\"low\""]));
+            assert_eq!(
+                request.resume_session_id.as_deref(),
+                resume.then_some("owned-native-root")
+            );
+            assert_eq!(args.iter().any(|arg| arg == "resume"), resume);
+            if resume {
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair == ["resume", "owned-native-root"]));
+            }
+            assert!(
+                registry.directory().is_empty(),
+                "capture spawns no provider"
+            );
+        }
+    }
+
     impl freshell_terminal::registry::ManagedTerminalController for UnusedManagedController {
         fn lookup_terminal<'a>(
             &'a self,
@@ -7351,8 +7523,15 @@ if (args.includes('app-server')) {{
             &'a self,
             _: freshell_terminal::registry::ManagedTerminalDescriptor,
             _: String,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unexpected managed input".into()) })
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<(), ManagedTerminalInputError>,
+        > {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unexpected managed input".into(),
+                ))
+            })
         }
 
         fn resize<'a>(

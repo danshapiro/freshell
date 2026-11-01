@@ -371,7 +371,7 @@ export type TerminalPaneContent = {
   restoreError?: RestoreError
   /** Initial working directory */
   initialCwd?: string
-  /** One-shot user-visible reconcile notice (corrected identity, fresh-by-reason, duplicate ignored). Rendered then cleared by TerminalView. */
+  /** User-visible reconcile notice. NON-DEAD copies (corrected identity, fresh-by-reason, duplicate ignored, invalid reason) are one-shot: rendered by TerminalView's create/attach anchors, then cleared. A DEAD-SESSION copy (the fold's dead arm, matched by category in `lib/dead-session-notice.ts`) is the RESIDENT durable copy source for the pane's in-buffer death explanation: it survives TerminalView unmounts, is never consumed at a write, and is cleared with the dead latch by the recovery folds (applyReconcileAttach / resetPaneForReconcileCreate). Never persisted (stripped in persistMiddleware). */
   reconcileNotice?: string
   /** The pane-close failure surface (delta-r7-r3 / focused-episode-7 round 2
    * Finding F2): set by the close gate when the server does NOT confirm the
@@ -470,6 +470,12 @@ export type FreshAgentPendingLocalEcho = {
   requestId: string
   text: string
   submittedTurnId?: string
+  /** Turn keys that existed when the message was sent — the send-time
+   * boundary, persisted WITH the echo so a reloaded pane can tell earlier
+   * rows (every landed user row is inside the set) from later ones (a key
+   * outside the set landed after the send). Records persisted before the
+   * field existed rehydrate without it and read as "no boundary". */
+  previousTurnKeys?: string[]
 }
 
 export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentPendingLocalEcho | undefined {
@@ -477,12 +483,20 @@ export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentP
   const record = value as Record<string, unknown>
   if (typeof record.requestId !== 'string' || record.requestId.length === 0) return undefined
   if (typeof record.text !== 'string' || record.text.length === 0) return undefined
+  // The send boundary rides the persisted record (client-side pane content
+  // only — no wire schema). Keep even an EMPTY list: it is the positive
+  // claim that nothing predated the send (a first message), distinct from
+  // the field's absence (a legacy record the pane cannot place in time).
+  const previousTurnKeys = Array.isArray(record.previousTurnKeys)
+    ? record.previousTurnKeys.filter((key): key is string => typeof key === 'string')
+    : undefined
   return {
     requestId: record.requestId,
     text: record.text,
     ...(typeof record.submittedTurnId === 'string' && record.submittedTurnId.length > 0
       ? { submittedTurnId: record.submittedTurnId }
       : {}),
+    ...(previousTurnKeys ? { previousTurnKeys } : {}),
   }
 }
 
@@ -495,6 +509,8 @@ export type FreshAgentPaneContent = {
   status: SdkSessionStatus
   resumeSessionId?: string
   sessionRef?: SessionLocator
+  /** Parent-scoped display selection; never a child runtime identity. */
+  observedChildThreadId?: string
   /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
   serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */
@@ -511,6 +527,9 @@ export type FreshAgentPaneContent = {
   model?: string
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  collaborationMode?: 'default' | 'plan'
+  /** A stated native default differs from an older pane inheriting provider defaults. */
+  effortIsNativeDefault?: boolean
   effort?: string
   /** Effort levels for the current model as known at selection time (static
    * or probed catalog), stamped by the settings selector's model switch. An
@@ -624,22 +643,6 @@ export type RestoreFallbackAttempt = {
 }
 
 /**
- * One pane awaiting user adjudication after the server reported its
- * session dead in a pane.reconcile verdict. Council rule 12: dead_session
- * is a UI state, not a deletion — the pane stays until the user decides.
- */
-export type DeadSessionEntry = {
-  tabId: string
-  paneId: string
-  title: string
-  mode: string
-  /** Absent = terminal (backwards compatible). */
-  kind?: 'terminal' | 'fresh-agent'
-  sessionRef?: { provider: string; sessionId: string }
-  reason?: string
-}
-
-/**
  * Slice-level banner state while reconcile-driven creates are warming.
  * Ephemeral — must never be persisted.
  */
@@ -704,11 +707,6 @@ export interface PanesState {
    * Must never be persisted.
    */
   restoreFallbackAttemptsByPane: Record<string, Record<string, RestoreFallbackAttempt>>
-  /**
-   * Batched dead-session adjudication list from pane.reconcile verdicts.
-   * Ephemeral UI state — must never be persisted.
-   */
-  deadSessionAdjudication?: DeadSessionEntry[]
   /**
    * Reconcile warming banner state while reconcile-driven creates run.
    * Ephemeral UI state — must never be persisted.

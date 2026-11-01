@@ -9,15 +9,18 @@ expired credential, or a failed cleanup is **not** by itself proof of loss.
 
 Loss certification and cleanup only ever apply to providers the capability
 manifest marks `certificationState: "certified"` with managed and durable
-recovery enabled. Today that is OpenCode; managed shell is certified for
-isolation but is intrinsically non-resumable and never produces a durable-soul
-loss certificate.
+recovery enabled, or fresh modes whose corresponding release policy admits
+durable recovery. Managed shell is certified for isolation but is intrinsically
+non-resumable and never produces a durable-soul loss certificate.
 
-Claude, Codex, and Amplifier are `pending_live_provider_certification`. They
-run on their legacy paths, are never adopted as managed souls, and therefore
-never appear in an incident, a loss notice, or a cleanup authority. If you see
-one of them named in a managed incident, that is a defect — capture the
-incident and stop, do not clean up.
+The candidate enables terminal Claude/Codex/OpenCode and
+Freshclaude/Freshcodex/Freshopencode. This repair checks ordinary use in the
+four Codex/OpenCode modes; Claude live behavior remains unverified by explicit
+agreement. Native recovery campaigns are not acceptance gates for this repair.
+Read the actual candidate's release policy when determining which modes may
+produce incidents. Managed Amplifier and Kilroy remain disabled; ordinary
+legacy CLI integrations are unaffected. If a release-disabled mode appears in
+a managed incident, capture the incident and investigate before cleanup.
 
 ## Meaning of `lost`
 
@@ -141,22 +144,46 @@ improvise destructive cleanup.
 
 ## Restore from backup
 
-A managed-default migration creates and verifies a consistent registry backup
-before changing routing policy. To restore:
+A transition into managed-default creates and verifies a consistent registry
+backup before changing routing policy. A dry-run `backupPath` creates nothing,
+and applying the same already-default mode creates no new backup. The helper
+runs after registry opening, so it cannot protect the old schema from an
+upgrade. Before any candidate opener, follow the
+[pre-upgrade backup and isolated drill](managed-runtime-rollout.md#upgrade-an-existing-installation-while-preserving-stores).
+
+Preserve upgraded state and prefer a compatible fix-forward. Old binaries may
+refuse an upgraded schema. Restoring older state requires its verified
+old-schema backup with matching provider/session stores, configuration, and
+artifacts/image; refuse restoration that would discard later writes or changed
+user intent. A routing rollback is not a schema down-migration.
+
+For a separately requested restore:
 
 1. Stop only the exact test/staging supervisor or use the approved production
-   maintenance procedure. The live self-hosted server must never be restarted
-   without explicit approval.
-2. Preserve the current registry and incident directory separately.
-3. Verify the backup hash/size recorded by the migration plan.
-4. Restore the registry as one SQLite unit, including WAL state as captured by
-   the backup API; do not copy a live database file with a generic file copy.
-5. Start in `legacy` or `managed-opt-in`, run the read-only repair audit, and
-   inspect inventory before enabling managed-default again.
+   maintenance procedure through its actual owner. Production restore,
+   writer quiescence, and supervisor/server restart require a concrete packet
+   and the separate exact **APPROVED**.
+2. Preserve the current registry, provider/session stores, configuration, and
+   incident directory separately. Confirm that no later writes or stopped
+   intent will be lost before replacing anything.
+3. Verify recorded backup hash/size, SQLite integrity/schema, and actual
+   old-build readability. Keep private directories `0700` and files `0600`.
+4. Restore the consistent snapshot with its matching stores and artifacts.
+   SQLite online backup or `VACUUM INTO` captures a coherent database; never
+   independently copy a live DB and WAL or mix them with an older snapshot.
+5. Start the recorded compatible supervisor first, verify control readiness,
+   then the owning server. Inspect inventory/history metadata and stopped intent
+   before any separately requested routing change. Do not prompt existing
+   conversations as a restore check.
 
 Legacy metadata is an import source, never kill authority. Rollback changes
 routing policy; it does not erase managed souls, incidents, views, or ownership
 records and does not mass-stop runtimes.
+
+This repaired deployment preserves stores without automatically importing
+existing sessions, choosing duplicate owners, or withdrawing historical
+notices. Those operations are outside this repair and require a separate
+request; they are not prerequisites or promised follow-up work.
 
 ## Escalation checklist
 

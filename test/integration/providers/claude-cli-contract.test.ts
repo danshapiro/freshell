@@ -66,6 +66,16 @@ function results(result: ScenarioResult, session: string) {
   return messagesOf(result, session).filter(isResult)
 }
 
+function expectSuccessfulClose(result: ScenarioResult, session: string, uuid: string) {
+  const events = eventsOf(result, session)
+  const close = at(events, event => event.k === 'close')
+  const terminal = events.slice(0, close).filter(event => event.k === 'msg')
+    .map(event => event.m).filter(message => isResult(message) || message.type === 'command_lifecycle' || isState('idle')(message))
+    .slice(-3)
+  expect(terminal.map(message => isResult(message) ? 'result' : message.state)).toEqual(['result', 'completed', 'idle'])
+  expect(terminal[1].command_uuid).toBe(uuid)
+}
+
 describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback provider)`, () => {
   it('the pinned SDK and its bundled CLI are installed and report the pinned versions', async () => {
     const pinned = await resolvePinnedClaude(REPO_ROOT)
@@ -141,6 +151,7 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
 
   it('T4: a fresh boot with an id whose transcript exists is refused: "Session ID X is already in use." and exit code 1', async () => {
     const r = await real('session-in-use')
+    expectSuccessfulClose(r, 'seed', 'u1')
     const events = eventsOf(r, 'S')
     expect(r.observations.rejected.stderr).toContain('Session ID X is already in use.')
     expect(r.observations.rejected.childExit).toEqual({ code: 1, signal: null })
@@ -515,6 +526,9 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     })
     expect(results(r, 'S').map((m) => m.subtype)).toEqual(['success'])
     expect(results(r, 'M').map((m) => m.subtype)).toEqual(['success'])
+    for (const [session, uuid] of [['S', 'u1'], ['M', 'u2']]) {
+      expectSuccessfulClose(r, session, uuid)
+    }
   }, SCENARIO_TIMEOUT)
 })
 

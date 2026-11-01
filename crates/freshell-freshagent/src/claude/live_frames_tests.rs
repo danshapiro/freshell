@@ -126,6 +126,7 @@ impl Drop for ClaudeEnvReset {
 
 fn create_msg(request_id: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        collaboration_mode: None,
         pane_id: None,
         naming_handle: None,
         observed_epoch: None,
@@ -171,6 +172,7 @@ fn configure_msg(session_id: &str, permission_mode: &str) -> FreshAgentConfigure
         cwd: None,
         request_id: Some("live-frames-configure".to_string()),
         settings: freshell_protocol::FreshAgentSendSettings {
+            collaboration_mode: None,
             cwd: None,
             model: None,
             permission_mode: Some(permission_mode.to_string()),
@@ -441,6 +443,7 @@ async fn a_send_that_changes_the_permission_mode_broadcasts_metadata_stating_it(
     let mut session = LiveSession::start(Some("plan")).await;
     let mut send = send_msg(&session.pane, "[]");
     send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+        collaboration_mode: None,
         cwd: None,
         model: None,
         permission_mode: Some("acceptEdits".to_string()),

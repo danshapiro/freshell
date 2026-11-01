@@ -1,7 +1,9 @@
-import { execFileSync, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { performance } from 'node:perf_hooks'
+import { describe, expect, it, vi } from 'vitest'
+import { EXTERNAL_DESCRIPTOR_KEYS, EXTERNAL_SELECTION_KEYS } from '../../../../scripts/testing/runtime-external-browser.js'
 import { LOCAL_ONLY_SPECS } from '../../../e2e-browser/playwright.config.js'
 import { CLOUD_SKIP_SPECS, CLOUD_SKIP_TITLES } from '../../../e2e-browser/playwright.cloud.config.js'
 import { createE2eServerHandle } from '../../../e2e-browser/helpers/external-target.js'
@@ -27,8 +29,26 @@ function cleanEnvironment(overrides: Record<string, string> = {}): NodeJS.Proces
   delete env.FRESHELL_SMOKE
   for (const key of ['FRESHELL_E2E_EXTERNAL_FIXTURE_KIND', 'FRESHELL_MANAGED_ENVIRONMENT_FIXTURE',
     'FRESHELL_CODE_CHECKPOINT_FIXTURE', 'FRESHELL_E2E_TARGET_URL', 'FRESHELL_E2E_TARGET_WS_URL',
-    'FRESHELL_E2E_TARGET_TOKEN', 'FRESHELL_E2E_TARGET_TIMEOUT_MS']) delete env[key]
+    'FRESHELL_E2E_TARGET_TOKEN', 'FRESHELL_E2E_TARGET_TIMEOUT_MS', ...EXTERNAL_DESCRIPTOR_KEYS, ...EXTERNAL_SELECTION_KEYS,
+    'FRESHELL_RUNTIME_EXTERNAL_SPEC', 'FRESHELL_RUNTIME_EXTERNAL_GREP']) delete env[key]
   return { ...env, ...overrides }
+}
+
+function runDiscovery(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 40_000) {
+  const started = performance.now()
+  const result = spawnSync(process.execPath, args, {
+    cwd: projectRoot, env, encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL',
+  })
+  const durationMs = Math.round(performance.now() - started)
+  if (result.error || result.signal) {
+    const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT'
+    const failure = timedOut ? `timed out after ${timeoutMs}ms` : 'failed'
+    const context = `CI=${env.CI ?? 'unset'}, elapsed=${durationMs}ms, signal=${result.signal}`
+    console.error(JSON.stringify({ severity: 'error', event: 'playwright.discovery.failed',
+      args, ci: env.CI ?? null, timeoutMs, durationMs, signal: result.signal, error: result.error?.message }))
+    throw new Error(`Playwright discovery ${failure}: ${args.join(' ')} (${context})\n${result.stderr}`, { cause: result.error })
+  }
+  return { ...result, durationMs }
 }
 
 function resolvedConfig(configPath: string, env: NodeJS.ProcessEnv): ResolvedProject[] {
@@ -50,12 +70,9 @@ loadConfigFromFile(process.argv[2]).then((config) => {
   process.exitCode = 1
 })
 `
-  const output = execFileSync(process.execPath, ['-e', script, configLoader, configPath], {
-    cwd: projectRoot,
-    env,
-    encoding: 'utf8',
-  })
-  return JSON.parse(output) as ResolvedProject[]
+  const result = runDiscovery(['-e', script, configLoader, configPath], env)
+  if (result.status !== 0) throw new Error(`Playwright config resolution failed:\n${result.stdout}\n${result.stderr}`)
+  return JSON.parse(result.stdout) as ResolvedProject[]
 }
 
 function listedProjects(
@@ -63,25 +80,27 @@ function listedProjects(
   configPath = playwrightConfig,
   selectors: string[] = [],
 ): { output: string; labels: string[]; tests: number; files: number } {
-  const output = execFileSync(process.execPath, [
+  const result = runDiscovery([
     playwrightCli,
     'test',
     '--config', configPath,
     '--list',
     ...selectors,
-  ], {
-    cwd: projectRoot,
-    env,
-    encoding: 'utf8',
-  })
+  ], env)
+  if (result.status !== 0) throw new Error(`Playwright list failed:\n${result.stdout}\n${result.stderr}`)
+  const output = result.stdout
   const total = output.match(/Total: (\d+) tests? in (\d+) files?/)
   if (!total) throw new Error(`Playwright list output did not include a total:\n${output}`)
-  return {
+  const listed = {
     output,
     labels: [...new Set([...output.matchAll(/^\s*\[([^\]]+)] ›/gm)].map((match) => match[1]))],
     tests: Number(total[1]),
     files: Number(total[2]),
   }
+  console.info(JSON.stringify({ severity: 'info', event: 'playwright.discovery.listed',
+    config: path.basename(configPath), ci: env.CI ?? null, selectors, durationMs: result.durationMs,
+    projects: listed.labels, tests: listed.tests, files: listed.files }))
+  return listed
 }
 
 // Playwright --list roster lines have the exact shape
@@ -96,6 +115,21 @@ function listedSpecFiles(output: string): Set<string> {
 }
 
 describe('browser selection non-vacuity', () => {
+  it('bounds a stalled discovery subprocess and identifies its command', () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(() => runDiscovery(['-e', 'setTimeout(() => {}, 1000)'], cleanEnvironment(), 50))
+        .toThrow(/Playwright discovery timed out after 50ms.*-e/)
+      expect(errorLog).toHaveBeenCalledTimes(1)
+      expect(JSON.parse(errorLog.mock.calls[0][0] as string)).toMatchObject({
+        severity: 'error', event: 'playwright.discovery.failed', timeoutMs: 50,
+        error: expect.stringContaining('ETIMEDOUT'),
+      })
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
   it('discovers the managed external cases only through their paired dedicated Cloud project', () => {
     const spec = 'managed-provider-environment-external.spec.ts'
     const ordinary = listedProjects(cleanEnvironment(), cloudConfig)
@@ -112,8 +146,8 @@ describe('browser selection non-vacuity', () => {
     expect(selected.files).toBe(1)
     expect([...listedSpecFiles(selected.output)]).toEqual([spec])
     // The source exists now: ordinary projects still cannot execute it.
-    const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
-      '--list', '--project=chromium', spec], { cwd: projectRoot, env: paired, encoding: 'utf8' })
+    const ordinaryExplicit = runDiscovery([playwrightCli, 'test', '--config', cloudConfig,
+      '--list', '--project=chromium', spec], paired)
     expect(ordinaryExplicit.status).toBe(1)
   }, 90_000)
 
@@ -135,8 +169,8 @@ describe('browser selection non-vacuity', () => {
     expect(selected.tests).toBe(5)
     expect(selected.files).toBe(1)
     expect([...listedSpecFiles(selected.output)]).toEqual([spec])
-    const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
-      '--list', '--project=chromium', spec], { cwd: projectRoot, env: paired, encoding: 'utf8' })
+    const ordinaryExplicit = runDiscovery([playwrightCli, 'test', '--config', cloudConfig,
+      '--list', '--project=chromium', spec], paired)
     expect(ordinaryExplicit.status).toBe(1)
   }, 90_000)
 
@@ -144,13 +178,15 @@ describe('browser selection non-vacuity', () => {
     const env = cleanEnvironment({ FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'managed-environment',
       FRESHELL_E2E_TARGET_URL: 'https://fixture.invalid', FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token',
       ...(pairing === 'mismatched' ? { FRESHELL_CODE_CHECKPOINT_FIXTURE: '{}' } : {}) })
-    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig, '--list',
-      '--project=chromium-external-target', 'managed-provider-environment-external.spec.ts'],
-      { cwd: projectRoot, env, encoding: 'utf8' })
+    const listed = runDiscovery([playwrightCli, 'test', '--config', cloudConfig, '--list',
+      '--project=chromium-external-target', 'managed-provider-environment-external.spec.ts'], env)
     expect(listed.status).toBe(1)
     expect(`${listed.stdout}\n${listed.stderr}`).toContain('matching fixture pair')
   })
 
+  // Two full discovery scans import every browser spec. Their measured cloud
+  // runtime exceeds the generic 30s unit-test budget; each child remains bounded
+  // at 40s; the outer budget also allows discovery and assertion overhead.
   it('selects a non-vacuous Chromium lane and all CI application projects', () => {
     const chromium = listedProjects(cleanEnvironment())
     expect(chromium.labels).toEqual(['chromium'])
@@ -190,9 +226,14 @@ describe('browser selection non-vacuity', () => {
     expect(ci.labels).toEqual(['chromium', 'firefox', 'webkit'])
     const retiredProjectNames = [`legacy${'-chromium'}`, `rust${'-chromium'}`]
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
-  })
+    // Two full-roster --list passes (base lane + the 3-project CI lane) ran
+    // ~25-30 s in cloud shards and one loaded shard (job
+    // freshell-vitest-5be2481fa684-quhpuc, 2026-10-30) pushed the heavier
+    // pass past the 30 s default and failed the suite — the same headroom
+    // reason the single-spec siblings above carry 90_000.
+  }, 180_000)
 
-  it('creates Rust fixtures and selects the supported cloud projects', async () => {
+  it('creates Rust fixtures and resolves the supported cloud projects', async () => {
     const server = await createE2eServerHandle({})
     expect(server).toBeInstanceOf(RustServer)
     expect(typeof server.start).toBe('function')
@@ -212,7 +253,11 @@ describe('browser selection non-vacuity', () => {
     expect(cloudProjects.map((project) => project.name)).toEqual(['chromium'])
     expect(new Set(CLOUD_SKIP_SPECS).size).toBe(CLOUD_SKIP_SPECS.length)
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
+  })
 
+  // Each discovery launches and joins a real Playwright child. Keep the
+  // independent selection contracts within their own test deadline.
+  it('discovers cloud cases while excluding local-only specs and titles', () => {
     const cloud = listedProjects(cleanEnvironment(), cloudConfig)
     expect(cloud.labels).toEqual(['chromium'])
     expect(cloud.output).toContain('[chromium]')
@@ -230,7 +275,9 @@ describe('browser selection non-vacuity', () => {
     for (const title of CLOUD_SKIP_TITLES) {
       expect(cloud.output, `cloud lane must not list excluded title: ${title.source}`).not.toMatch(title)
     }
+  })
 
+  it('intersects mixed positional file selectors with cloud exclusions', () => {
     // Explicit positional file args are an INTERSECTION with testIgnore,
     // never a bypass (Playwright 1.58.2 cliFileMatcher semantics): a mixed
     // focused invocation must keep its cloud-legal member and silently drop
@@ -243,20 +290,24 @@ describe('browser selection non-vacuity', () => {
     expect(mixed.output).toContain('host-stats-pane.spec.ts')
     expect(mixed.output).not.toContain('truly-idle-alerting')
     expect(mixed.files).toBe(1)
+  })
 
+  it('rejects positional file selectors containing only cloud exclusions', () => {
     // An ALL-skip focused invocation fails LOUDLY (exit 1, "No tests
     // found") instead of silently reading as a green zero-test run — a
     // vacuous focused cloud proof can never masquerade as coverage.
-    const allSkip = spawnSync(process.execPath, [
+    const allSkip = runDiscovery([
       playwrightCli,
       'test',
       '--config', cloudConfig,
       '--list',
       'test/e2e-browser/specs/truly-idle-alerting.spec.ts',
-    ], { cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8' })
+    ], cleanEnvironment())
     expect(allSkip.status).toBe(1)
     expect(`${allSkip.stdout}\n${allSkip.stderr}`).toContain('No tests found')
+  })
 
+  it('discovers the supported migrated Rust browser cases', () => {
     const migrated = listedProjects(cleanEnvironment(), cloudConfig, [
       'test/e2e-browser/specs/server-build-mismatch-rust.spec.ts',
       'test/e2e-browser/specs/tabs-client-retire.spec.ts',
@@ -273,4 +324,68 @@ describe('browser selection non-vacuity', () => {
     expect(() => assertRustServerInfo({ runtime: 'node', commit: 'abcdef0' })).toThrow(/runtime must be "rust"/)
     expect(() => assertRustServerInfo({ runtime: 'rust' })).toThrow(/provenance/)
   })
+})
+
+describe('owned managed external browser selection', () => {
+  const fixtureSpec = 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts'
+  const external = {
+    FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+    FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws',
+    FRESHELL_E2E_TARGET_TOKEN: 'private-listing-token',
+    FRESHELL_RUNTIME_EXTERNAL_RUN_ID: 'b8c53aab-d4f8-4153-bb7d-0873a7dcce90',
+    FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: 'a'.repeat(40),
+    FRESHELL_RUNTIME_EXTERNAL_SPEC: fixtureSpec,
+  }
+
+  function expectExternalFixtureCase(title: string) {
+    const grep = `${title}$`
+    const listed = listedProjects(cleanEnvironment({ ...external,
+      FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1', FRESHELL_RUNTIME_EXTERNAL_GREP: grep,
+    }), cloudConfig, ['--project=chromium-external-target', fixtureSpec, '--grep', grep])
+    expect(listed.labels).toEqual(['chromium-external-target'])
+    expect(listed.tests).toBe(1)
+    expect(listed.files).toBe(1)
+    expect(listedSpecFiles(listed.output)).toEqual(new Set([path.basename(fixtureSpec)]))
+    expect(listed.output).toContain(title)
+  }
+
+  it('positively lists the requested owned external managed case on the Cloud project', () => {
+    expectExternalFixtureCase('all modes share activation and exact-native recovery without provider access')
+  })
+
+  it('positively lists the owned external managed History case independently', () => {
+    expectExternalFixtureCase('completed owned native fixture history opens its existing browser pane')
+  })
+
+  it('fails before selection when an external managed descriptor lacks the exact fixture opt-in', () => {
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--project=chromium-external-target', '--list', fixtureSpec], {
+      cwd: projectRoot, env: cleanEnvironment(external), encoding: 'utf8',
+    })
+    expect(listed.status).not.toBe(0)
+    expect(`${listed.stdout}${listed.stderr}`).toContain('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST')
+  })
+
+  it('does not count an external grep matching no requested cases', () => {
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--project=chromium-external-target', '--list', fixtureSpec, '--grep', 'absent managed scenario'], {
+      cwd: projectRoot, env: cleanEnvironment({ ...external, FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }), encoding: 'utf8',
+    })
+    expect(listed.status).not.toBe(0)
+    expect(`${listed.stdout}${listed.stderr}`).toMatch(/No tests found/)
+  })
+  it('selects the actual topology smoke only with its owned external project', () => {
+    const spec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
+    const absent = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig, '--list', spec], {
+      cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8',
+    })
+    expect(absent.status).not.toBe(0)
+    expect(`${absent.stdout}${absent.stderr}`).toMatch(/No tests found/)
+    const selected = listedProjects(cleanEnvironment({ ...external, FRESHELL_RUNTIME_EXTERNAL_SPEC: spec }), cloudConfig,
+      ['--project=chromium-external-target', spec, '--grep', 'actual managed external topology and finite owner facts'])
+    expect(selected.tests).toBe(1)
+    expect(selected.files).toBe(1)
+    expect(selected.output).toContain('actual managed external topology and finite owner facts')
+  })
+
 })

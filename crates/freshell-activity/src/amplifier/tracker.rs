@@ -240,6 +240,8 @@ impl AmplifierActivityTracker {
                     session_id,
                     at,
                     completion_seq: seq,
+                    outcome: None,
+                    outcome_update: false,
                 });
                 effects
             }

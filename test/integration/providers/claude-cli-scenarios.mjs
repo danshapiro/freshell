@@ -116,7 +116,7 @@ function createInput() {
   }
 }
 
-class Session {
+export class Session {
   constructor(ctx, label, { options = {}, env = {}, permissions } = {}) {
     this.ctx = ctx
     this.label = label
@@ -311,8 +311,29 @@ class Session {
     return this.child?.pid
   }
 
-  async close() {
-    if (!this.closed) this.ctx.trace.add({ s: this.label, k: 'close' })
+  close() {
+    this.closing ??= this.closeAfterSuccessfulDrain()
+    return this.closing
+  }
+
+  async closeAfterSuccessfulDrain() {
+    // A successful result is followed by command completion and the queue's
+    // idle frame on a later pipe delivery. Keep that tail inside the capture.
+    // Cancellation/error results and deliberate mid-turn closes retain their
+    // immediate-close semantics; they do not promise this successful drain.
+    const resultAt = this.frames.findLastIndex((m) => m.type === 'result' && !m.parent_tool_use_id)
+    const result = this.frames[resultAt]
+    const startedAt = this.frames.findLastIndex((m) => !m.parent_tool_use_id && (
+      (m.type === 'command_lifecycle' && m.state === 'started')
+      || (m.type === 'system' && (m.subtype === 'init' || (m.subtype === 'session_state_changed' && m.state === 'running')))))
+    let drainError
+    if (result?.subtype === 'success' && result.is_error === false
+      && (result.terminal_reason === undefined || result.terminal_reason === 'completed') && startedAt < resultAt) {
+      const drained = await this.waitFor((m) => isStateIdle(m) && this.frames.indexOf(m) > resultAt,
+        10_000, 'successful result idle')
+      if (!drained) drainError = new Error(`successful result for session ${result.session_id} did not reach idle within 10000ms`)
+    }
+    this.ctx.trace.add({ s: this.label, k: 'close' })
     this.closed = true
     this.input.end()
     try { this.query.close() } catch { /* already closed */ }
@@ -321,6 +342,7 @@ class Session {
       this.child.kill('SIGKILL')
       await Promise.race([new Promise((resolve) => this.child.once('exit', resolve)), sleep(3000)])
     }
+    if (drainError) throw drainError
   }
 }
 
@@ -372,7 +394,7 @@ function transcriptShape(lines) {
   }))
 }
 
-const SCENARIOS = {
+export const SCENARIOS = {
   /** T1 T2 T3 T7 T8: fresh boot with our session id, settings before the first prompt, two turns. */
   async boot(ctx) {
     const X = ctx.uuid('X')
@@ -389,13 +411,14 @@ const SCENARIOS = {
     const resultAt = Date.now()
     const appeared = await ctx.pollTranscript(X, 4000)
     const msAfterResult = appeared ? Date.now() - resultAt : null
-    const assistantUuid = s.messages((m) => m.type === 'assistant' && !m.parent_tool_use_id).at(-1)?.uuid
-    ctx.need(assistantUuid, 'first turn assistant UUID')
-    // Appearance can be a valid partial flush. Compare the first turn's
-    // shape only once the assistant we already observed is durable.
-    const completed = await ctx.pollTranscript(X, 4000, 1, (lines) => lines.some((line) => line.type === 'assistant' && line.uuid === assistantUuid))
-    ctx.need(completed, 'first turn assistant in durable transcript')
-    ctx.observe('transcriptAfterFirstResult', { msAfterResult, shape: transcriptShape(completed) })
+    const assistantUuid = ctx.need(s.messages(message => message.type === 'assistant' && !message.parent_tool_use_id).at(-1)?.uuid, 'first-turn assistant UUID')
+    // File appearance can precede the final assistant append. Preserve that
+    // timing observation, but compare history only once this exact turn saved.
+    const saved = ctx.need(
+      await ctx.pollTranscript(X, 4000, 1, lines => lines.some(line => line.type === 'assistant' && line.uuid === assistantUuid)),
+      `first-turn assistant ${assistantUuid} saved for session ${X} within 4000ms`,
+    )
+    ctx.observe('transcriptAfterFirstResult', { msAfterResult, shape: transcriptShape(saved) })
     s.push('second prompt', 'u2')
     await s.waitForResults(2)
     await s.waitForCount(isStateIdle, 2, 3000, 'idle')
@@ -864,6 +887,21 @@ const SCENARIOS = {
 
 export const SCENARIO_NAMES = Object.keys(SCENARIOS)
 
+/** Poll until the saved lines satisfy the requested count and optional predicate. */
+export async function pollTranscript(fixture, trace, id, ms, minLines = 1, predicate) {
+  const started = Date.now()
+  while (Date.now() - started <= ms) {
+    const lines = await fixture.readTranscript(id)
+    if (lines && lines.length >= minLines && (!predicate || predicate(lines))) {
+      trace.add({ k: 'transcript-seen', id, lines: lines.length })
+      return lines
+    }
+    await sleep(50)
+  }
+  trace.add({ k: 'transcript-missing', id })
+  return null
+}
+
 /** Load the `query` export of the target. */
 async function loadTarget(target, repoRoot) {
   if (target === 'real') {
@@ -920,20 +958,7 @@ export async function runScenario(target, name, { repoRoot = DEFAULT_REPO_ROOT }
       return value
     },
     files: () => fixture.transcripts(),
-    /** Poll until the saved lines satisfy the requested count and optional predicate. */
-    async pollTranscript(id, ms, minLines = 1, predicate) {
-      const started = Date.now()
-      while (Date.now() - started <= ms) {
-        const lines = await fixture.readTranscript(id)
-        if (lines && lines.length >= minLines && (!predicate || predicate(lines))) {
-          trace.add({ k: 'transcript-seen', id, lines: lines.length })
-          return lines
-        }
-        await sleep(50)
-      }
-      trace.add({ k: 'transcript-missing', id })
-      return null
-    },
+    pollTranscript: (...args) => pollTranscript(fixture, trace, ...args),
   }
   let failure
   try {

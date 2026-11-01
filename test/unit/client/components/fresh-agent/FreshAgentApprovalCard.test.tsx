@@ -97,4 +97,72 @@ describe('FreshAgentApprovalCard', () => {
     for (const button of screen.getAllByRole('button')) expect(button).toBeDisabled()
   })
 
+  it('identifies native stdin writes and sends only the offered native decisions', () => {
+    const onAlwaysAllow = vi.fn()
+    const { onRespond } = renderCard({
+      requestId: 'stdin-approval',
+      toolName: 'Bash',
+      native: { kind: 'writeStdin', command: 'python interactive.py', availableDecisions: ['accept', 'cancel'] },
+    }, { onAlwaysAllow })
+    const card = within(screen.getByRole('alert', { name: 'Permission request for Bash' }))
+
+    expect(card.getByText('Write to a running command')).toBeVisible()
+    expect(card.getAllByRole('button').map((button) => button.textContent)).toEqual(['Allow', 'Stop'])
+    expect(card.queryByRole('button', { name: /always allow/i })).not.toBeInTheDocument()
+    fireEvent.click(card.getByRole('button', { name: 'Allow', exact: true }))
+    fireEvent.click(card.getByRole('button', { name: 'Stop', exact: true }))
+
+    expect(onRespond.mock.calls).toEqual([[{ nativeDecision: 'accept' }], [{ nativeDecision: 'cancel' }]])
+    expect(onAlwaysAllow).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'permissions',
+      toolName: 'Additional permissions',
+      details: { permissions: { fileSystem: { entries: [
+        { path: { type: 'path', path: '/srv/reports' }, access: 'read' },
+        { path: { type: 'path', path: '/srv/output' }, access: 'write' },
+      ] }, network: { enabled: true } } },
+      offered: ['accept', 'decline'],
+      actions: [{ label: 'Allow', decision: 'accept' }, { label: 'Decline', decision: 'decline' }],
+    },
+    {
+      name: 'additionalPermissions',
+      toolName: 'Bash',
+      details: { additionalPermissions: { fileSystem: { entries: [
+        { path: { type: 'path', path: '/var/cache/build' }, access: 'write' },
+        { path: { type: 'glob_pattern', pattern: '/srv/private/**' }, access: 'deny' },
+      ] }, network: { enabled: false } } },
+      offered: ['accept', 'cancel', { acceptWithExecpolicyAmendment: { execpolicyAmendment: ['build'] } }],
+      actions: [{ label: 'Allow', decision: 'accept' }, { label: 'Stop', decision: 'cancel' }],
+    },
+    {
+      name: 'grantRoot',
+      toolName: 'Edit',
+      details: { path: '/srv/generated' },
+      offered: ['acceptForSession', 'decline'],
+      actions: [{ label: 'Allow for this session', decision: 'acceptForSession' }, { label: 'Decline', decision: 'decline' }],
+    },
+  ])('renders requested $name details and preserves native action callbacks', ({ name, toolName, details, offered, actions }) => {
+    const onAlwaysAllow = vi.fn()
+    const nativeDetails = name === 'grantRoot' ? { grantRoot: details.path } : details
+    const { onRespond } = renderCard({
+      requestId: `detail-${name}`,
+      toolName,
+      native: { ...nativeDetails, availableDecisions: offered },
+    }, { onAlwaysAllow })
+    const card = within(screen.getByRole('alert', { name: `Permission request for ${toolName}` }))
+    const preview = card.getByText((_content, element) => element?.tagName === 'PRE')
+
+    expect(preview).toBeVisible()
+    expect(JSON.parse(preview.textContent ?? '')).toEqual(details)
+    expect(card.getAllByRole('button').map((button) => button.textContent)).toEqual(actions.map((action) => action.label))
+    expect(card.queryByRole('button', { name: /always allow/i })).not.toBeInTheDocument()
+    for (const action of actions) fireEvent.click(card.getByRole('button', { name: action.label, exact: true }))
+
+    expect(onRespond.mock.calls).toEqual(actions.map((action) => [{ nativeDecision: action.decision }]))
+    expect(onAlwaysAllow).not.toHaveBeenCalled()
+  })
+
 })

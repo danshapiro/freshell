@@ -3,6 +3,19 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSourceRuntime {
+    #[default]
+    Tui,
+    AppServer,
+}
+impl NativeSourceRuntime {
+    fn is_tui(&self) -> bool {
+        *self == Self::Tui
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodexInputManifest {
@@ -11,6 +24,8 @@ pub struct CodexInputManifest {
     pub cwd: PathBuf,
     pub codex_home: PathBuf,
     pub named_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "NativeSourceRuntime::is_tui")]
+    pub native_source_runtime: NativeSourceRuntime,
 }
 impl CodexInputManifest {
     pub fn validate(&self) -> Result<(), &'static str> {

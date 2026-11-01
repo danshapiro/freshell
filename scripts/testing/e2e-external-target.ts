@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { externalCloudMetadata } from './runtime-external-browser.js'
 
 export const EXTERNAL_TARGET_SPECS = {
   'managed-environment': 'managed-provider-environment-external.spec.ts',
@@ -86,19 +87,50 @@ export function resolvePairedExternalFixture(
   return { kind, spec: EXTERNAL_TARGET_SPECS[kind], targetUrl, targetToken, fixture: value } as PairedExternalFixture
 }
 
-export function validateExternalSelection(args: string[], env: NodeJS.ProcessEnv = process.env) {
+function selectionOptionValues(args: string[], name: string): (string | undefined)[] {
+  return args.flatMap((arg, index) => arg.startsWith(`${name}=`) ? [arg.slice(name.length + 1)]
+    : arg === name ? [args[index + 1]] : [])
+}
+
+function validateExternalProject(args: string[]): void {
+  const projects = selectionOptionValues(args, '--project')
+  if (projects.length !== 1 || projects[0] !== 'chromium-external-target') fail('dedicated project selection')
+}
+
+type ExternalSelection = { family: 'paired'; fixture: PairedExternalFixture }
+  | { family: 'runtime'; metadata: Record<string, string> }
+
+export function validateExternalSelection(args: string[], env: NodeJS.ProcessEnv = process.env): ExternalSelection | undefined {
+  const pairedRequested = ['FRESHELL_E2E_EXTERNAL_FIXTURE_KIND', 'FRESHELL_MANAGED_ENVIRONMENT_FIXTURE',
+    'FRESHELL_CODE_CHECKPOINT_FIXTURE'].some(name => env[name] !== undefined)
+  const runtimeRequested = ['FRESHELL_RUNTIME_EXTERNAL_RUN_ID', 'FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA',
+    'FRESHELL_RUNTIME_EXTERNAL_SPEC', 'FRESHELL_RUNTIME_EXTERNAL_GREP'].some(name => env[name] !== undefined)
+    || (!pairedRequested && ['FRESHELL_E2E_TARGET_URL', 'FRESHELL_E2E_TARGET_WS_URL',
+      'FRESHELL_E2E_TARGET_TOKEN'].some(name => env[name] !== undefined))
+  if (runtimeRequested) {
+    if (pairedRequested) fail('fixture family')
+    const metadata = externalCloudMetadata(env)
+    if (!metadata.FRESHELL_RUNTIME_EXTERNAL_SPEC) fail('owned runtime descriptor')
+    validateExternalProject(args)
+    // The Cloud launcher normalizes other value flags to --name=value. Keep
+    // every positional selector so an extra path or regexp cannot broaden it.
+    const specs = args.filter((arg, index) => !arg.startsWith('-') && !['--project', '--grep'].includes(args[index - 1]))
+    if (specs.length !== 1 || specs[0] !== metadata.FRESHELL_RUNTIME_EXTERNAL_SPEC) fail('owned runtime spec selection')
+    const greps = selectionOptionValues(args, '--grep')
+    const expectedGrep = metadata.FRESHELL_RUNTIME_EXTERNAL_GREP
+    if (expectedGrep === undefined ? greps.length !== 0 : greps.length !== 1 || greps[0] !== expectedGrep) fail('owned runtime grep selection')
+    return { family: 'runtime', metadata }
+  }
   const paired = resolvePairedExternalFixture(env, externalFixtureRequested(args))
   if (!paired) return
-  const projects = args.flatMap((arg, index) => arg.startsWith('--project=') ? [arg.slice('--project='.length)]
-    : arg === '--project' ? [args[index + 1]] : [])
-  if (projects.length !== 1 || projects[0] !== 'chromium-external-target') fail('dedicated project selection')
+  validateExternalProject(args)
   const externalSpecs = args.filter(arg => Object.values(EXTERNAL_TARGET_SPECS).some(spec => path.basename(arg) === spec))
   if (externalSpecs.some(arg => path.basename(arg) !== paired.spec)) fail('matching spec selection')
-  return paired
+  return { family: 'paired', fixture: paired }
 }
 
 export function appendExternalTargetEnvironment(file: string, args: string[], env: NodeJS.ProcessEnv = process.env): void {
-  if (!validateExternalSelection(args, env)) return
+  if (validateExternalSelection(args, env)?.family !== 'paired') return
   const names = ['FRESHELL_E2E_TARGET_URL', 'FRESHELL_E2E_TARGET_WS_URL', 'FRESHELL_E2E_TARGET_TOKEN',
     'FRESHELL_E2E_TARGET_TIMEOUT_MS', 'FRESHELL_E2E_EXTERNAL_FIXTURE_KIND',
     'FRESHELL_MANAGED_ENVIRONMENT_FIXTURE', 'FRESHELL_CODE_CHECKPOINT_FIXTURE']
@@ -111,7 +143,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   try {
     const [operation, ...args] = process.argv.slice(2)
     if (operation === 'validate') validateExternalSelection(args)
-    else if (operation === 'append-env') {
+    else if (operation === 'cloud-metadata') {
+      const selected = validateExternalSelection(args)
+      if (selected?.family === 'runtime') {
+        for (const [key, value] of Object.entries(selected.metadata)) process.stdout.write(`${key}: ${JSON.stringify(value)}\n`)
+      }
+    } else if (operation === 'append-env') {
       const [file, ...selectors] = args
       if (!file) fail('private env file')
       appendExternalTargetEnvironment(file, selectors)

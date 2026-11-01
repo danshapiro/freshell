@@ -21,7 +21,6 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 //   50*0.2 = 10 centered at tops 28.3̅3 / 95 / 161.6̅7; each BUTTON is the
 //   hit box — 2x the line (20px) centered on the line at tops 23.3̅3 / 90 /
 //   156.6̅7, left -3, width 18 — with an inner paint span at the LINE rect
-//   band: height = 248 * 0.2 = 49.6, top = 0.5 * (200 - 49.6) = 75.2
 const SCROLL_TOP = 376
 const SCROLL_HEIGHT = 1000
 const CLIENT_HEIGHT = 248
@@ -183,6 +182,14 @@ class CapturingResizeObserver {
 describe('FreshAgentTranscript minimap rail', () => {
   afterEach(() => { vi.unstubAllGlobals(); cleanup() })
 
+  it('keeps prompt markers without a second scrollbar-shaped viewport band', () => {
+    setupScrollableTranscript()
+
+    const minimap = screen.getByRole('group', { name: 'Transcript minimap' })
+    expect(within(minimap).getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(3)
+    expect(screen.queryByTestId('transcript-minimap-viewport')).not.toBeInTheDocument()
+  })
+
   it('renders one tick per user turn, evenly spaced with 2x-height hit boxes and centered paint spans', () => {
     setupScrollableTranscript()
 
@@ -209,31 +216,6 @@ describe('FreshAgentTranscript minimap rail', () => {
     expect(paint).toHaveAttribute('aria-hidden', 'true')
     expect(topOf(paint as HTMLElement)).toBeCloseTo(5, 5)
     expect(heightOf(paint as HTMLElement)).toBeCloseTo(10, 5)
-  })
-
-  it('renders the visible-region band at the proportional scroll position', () => {
-    setupScrollableTranscript()
-
-    const band = screen.getByTestId('transcript-minimap-viewport')
-    expect(band).toHaveAttribute('aria-hidden', 'true')
-    expect(topOf(band)).toBeCloseTo(75.2, 5)
-    expect(heightOf(band)).toBeCloseTo(49.6, 5)
-  })
-
-  it('moves the visible-region band when the scroller scrolls', () => {
-    const { scroller, userTurns } = setupScrollableTranscript()
-    expect(topOf(screen.getByTestId('transcript-minimap-viewport'))).toBeCloseTo(75.2, 5)
-
-    // Scroll to the very top; re-mock rects consistently (offsets 0/300/450
-    // relative to scrollTop 0).
-    mockScroll(scroller, 0, SCROLL_HEIGHT, CLIENT_HEIGHT)
-    mockRect(scroller, 0)
-    mockRect(userTurns[0], 0)
-    mockRect(userTurns[1], 300)
-    mockRect(userTurns[2], 450)
-    fireEvent.scroll(scroller)
-
-    expect(topOf(screen.getByTestId('transcript-minimap-viewport'))).toBeCloseTo(0, 5)
   })
 
   it('clicking a tick scrolls that prompt into view', () => {
@@ -331,7 +313,6 @@ describe('FreshAgentTranscript minimap rail', () => {
     fireEvent.scroll(scroller)
 
     expect(screen.queryByRole('button', { name: /Jump to prompt:/ })).not.toBeInTheDocument()
-    expect(screen.queryByTestId('transcript-minimap-viewport')).not.toBeInTheDocument()
   })
 
   it('hides the rail and its measurement work when showTranscriptMinimap is false', () => {
@@ -348,7 +329,6 @@ describe('FreshAgentTranscript minimap rail', () => {
     // on (this suite's canonical mocks) — the setting, not geometry, hid it.
     expect(screen.queryByRole('group', { name: 'Transcript minimap' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Jump to prompt:/ })).not.toBeInTheDocument()
-    expect(screen.queryByTestId('transcript-minimap-viewport')).not.toBeInTheDocument()
     // "And its work": the unmounted rail registered no ResizeObserver
     // subscriptions (fresh elements cannot have stale entries in the shared
     // per-target callback map).
@@ -371,7 +351,6 @@ describe('FreshAgentTranscript minimap rail', () => {
     const ticks = screen.getAllByRole('button', { name: /Jump to prompt:/ })
     expect(ticks).toHaveLength(1)
     expect(ticks[0]).toHaveAttribute('aria-label', 'Jump to prompt: First user message here')
-    expect(screen.getByTestId('transcript-minimap-viewport')).toBeInTheDocument()
   })
 
   it('re-measures when an article resizes (disclosure toggle) with no signature change', async () => {

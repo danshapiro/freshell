@@ -297,9 +297,69 @@ pub(super) trait HelperObjects: Send + 'static {
     async fn remove(&mut self, backend: &DockerEngineBackend) -> Result<(), BackendError>;
 }
 
+#[async_trait]
+impl<O: HelperObjects> HelperObjects for Option<O> {
+    fn names(&self) -> Vec<String> {
+        self.as_ref().map(HelperObjects::names).unwrap_or_default()
+    }
+
+    async fn settle(&mut self, deadline: Instant) -> bool {
+        match self {
+            Some(objects) => objects.settle(deadline).await,
+            None => true,
+        }
+    }
+
+    async fn remove(&mut self, backend: &DockerEngineBackend) -> Result<(), BackendError> {
+        if let Some(objects) = self {
+            objects.remove(backend).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Keep the same helper ownership through caller cancellation, including
+/// cancellation while cleanup is awaiting Docker. Drop hands it to the
+/// existing exact-name reaper rather than abandoning a detached create.
+pub(super) struct HelperOwner<O: HelperObjects> {
+    backend: DockerEngineBackend,
+    helper: &'static str,
+    objects: Option<O>,
+}
+
+impl<O: HelperObjects> HelperOwner<O> {
+    pub(super) fn new(backend: &DockerEngineBackend, helper: &'static str, objects: O) -> Self {
+        Self {
+            backend: backend.clone(),
+            helper,
+            objects: Some(objects),
+        }
+    }
+
+    pub(super) fn objects_mut(&mut self) -> &mut O {
+        self.objects.as_mut().expect("helper objects remain owned")
+    }
+
+    pub(super) fn into_objects(mut self) -> O {
+        self.objects.take().expect("helper objects remain owned")
+    }
+}
+
+impl<O: HelperObjects> Drop for HelperOwner<O> {
+    fn drop(&mut self) {
+        if let Some(objects) = self.objects.take() {
+            if !objects.names().is_empty() {
+                self.backend
+                    .reap_helper_objects(self.helper, objects, Deferred::CallerCancelled);
+            }
+        }
+    }
+}
+
 /// Why an attempt's objects went to the background reaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Deferred {
+    CallerCancelled,
     /// A create was still unanswered when the caller's wait ended.
     CreateUnanswered,
     /// Every create answered, but removing the objects ran out of time or
@@ -310,6 +370,7 @@ pub(super) enum Deferred {
 impl Deferred {
     fn as_str(self) -> &'static str {
         match self {
+            Self::CallerCancelled => "caller_cancelled",
             Self::CreateUnanswered => "create_unanswered",
             Self::RemovalUnconfirmed => "removal_unconfirmed",
         }
@@ -333,6 +394,7 @@ pub(super) struct HelperContainer {
     create: InFlightCreate,
     /// Docker may hold an object under `name` because of this create.
     attempted: bool,
+    exchange_directory: Option<native_auth::ExchangeDirectory>,
 }
 
 impl HelperContainer {
@@ -343,7 +405,16 @@ impl HelperContainer {
             expected,
             create: InFlightCreate::default(),
             attempted: false,
+            exchange_directory: None,
         }
+    }
+
+    pub(super) fn with_exchange_directory(
+        mut self,
+        directory: native_auth::ExchangeDirectory,
+    ) -> Self {
+        self.exchange_directory = Some(directory);
+        self
     }
 
     /// Docker has not answered this helper's create yet.
@@ -483,12 +554,13 @@ impl DockerEngineBackend {
     pub(super) async fn release_helper_objects<T, O: HelperObjects>(
         &self,
         helper: &'static str,
-        mut objects: O,
+        objects: O,
         deadlines: HelperDeadlines,
         result: Result<T, HelperFailure>,
     ) -> Result<T, HelperFailure> {
-        if !objects.settle(deadlines.settle).await {
-            self.reap_helper_objects(helper, objects, Deferred::CreateUnanswered);
+        let mut owner = HelperOwner::new(self, helper, objects);
+        if !owner.objects_mut().settle(deadlines.settle).await {
+            self.reap_helper_objects(helper, owner.into_objects(), Deferred::CreateUnanswered);
             // Every create answered before an attempt could succeed.
             return result.and_then(|_| {
                 Err(BackendError::Unavailable(format!(
@@ -497,18 +569,22 @@ impl DockerEngineBackend {
                 .into())
             });
         }
-        let removed = tokio::time::timeout_at(deadlines.removal_deadline(), objects.remove(self))
-            .await
-            .unwrap_or_else(|_| {
-                Err(BackendError::Unavailable(format!(
-                    "{helper} cleanup timed out"
-                )))
-            });
+        let removed = tokio::time::timeout_at(
+            deadlines.removal_deadline(),
+            owner.objects_mut().remove(self),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(BackendError::Unavailable(format!(
+                "{helper} cleanup timed out"
+            )))
+        });
         if let Err(error) = removed {
             // The objects stay ours until their absence is confirmed.
-            self.reap_helper_objects(helper, objects, Deferred::RemovalUnconfirmed);
+            self.reap_helper_objects(helper, owner.into_objects(), Deferred::RemovalUnconfirmed);
             return Err(error.into());
         }
+        drop(owner.into_objects());
         result
     }
 

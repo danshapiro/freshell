@@ -112,7 +112,7 @@ pub(crate) async fn rename_through_authority(
     input: RenameNameInput,
     identity: &TerminalIdentityRegistry,
     index: Option<&freshell_sessions::directory_index::SessionIndex>,
-) -> Result<freshell_protocol::session_names::SessionNameUpdate, Response> {
+) -> Result<freshell_protocol::session_names::SessionNameUpdate, Box<Response>> {
     let target = input.target.clone();
     match admission::rename(sink, input, identity, index).await {
         Ok(update) => Ok(update),
@@ -127,7 +127,7 @@ pub(crate) async fn rename_through_authority(
                 class = %error.code(),
                 "session_names.operation_failed: {error}"
             );
-            Err(name_error_response(&error, &target))
+            Err(name_error_response(&error, &target).into())
         }
     }
 }
@@ -370,7 +370,7 @@ async fn rename_session_name(
     .await
     {
         Ok(update) => Json(serde_json::to_value(&update).unwrap_or(Value::Null)).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 

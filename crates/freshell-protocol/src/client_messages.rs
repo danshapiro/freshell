@@ -116,6 +116,8 @@ pub enum ClientMessage {
     FreshAgentApprovalRespond(FreshAgentApprovalRespond),
     #[serde(rename = "freshAgent.question.respond")]
     FreshAgentQuestionRespond(FreshAgentQuestionRespond),
+    #[serde(rename = "freshAgent.elicitation.respond")]
+    FreshAgentElicitationRespond(FreshAgentElicitationRespond),
     #[serde(rename = "freshAgent.kill")]
     FreshAgentKill(FreshAgentKill),
     #[serde(rename = "freshAgent.recovery.stop")]
@@ -188,8 +190,11 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
 /// the generated frozen inventory remains unchanged. The antigravity
 /// activity list request (plan Task 8) joins it — same additive pattern as
 /// the amplifier family's promotion path.
-pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 2] =
-    ["freshAgent.recovery.stop", "antigravity.activity.list"];
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 3] = [
+    "freshAgent.recovery.stop",
+    "freshAgent.elicitation.respond",
+    "antigravity.activity.list",
+];
 
 // --- hello ------------------------------------------------------------------
 
@@ -874,12 +879,19 @@ pub struct ModelSelection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentCreate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
     pub request_id: String,
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    /// Absent preserves saved effort; null selects the provider's default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub effort: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_restore_context: Option<LegacyRestoreContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -920,7 +932,7 @@ pub struct FreshAgentCreate {
     pub tab_id: Option<String>,
     /// G19: the creating pane's id. With `tab_id` it is the pane context the
     /// agent's Freshell MCP acts for (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`).
-    /// Additive optional.
+    /// It also binds managed view intent. Additive optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): the pane's
@@ -980,13 +992,20 @@ pub struct FreshAgentImage {
     pub media_type: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentSendSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub collaboration_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    pub cwd: Option<String>,
+    /// Absent leaves the selection alone; null clears the Freshell override.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub effort: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Free string.
@@ -1103,6 +1122,37 @@ pub struct FreshAgentQuestionRespond {
     pub request_id: StringOrNumber,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// An MCP elicitation reply is a native control response, never model text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentElicitationRespond {
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
+    pub request_id: StringOrNumber,
+    pub action: ElicitationAction,
+    pub content: Option<BTreeMap<String, ElicitationValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitationAction {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ElicitationValue {
+    String(String),
+    Number(serde_json::Number),
+    Boolean(bool),
+    Strings(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

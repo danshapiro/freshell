@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use crate::common::{
     AgentProvider, AmplifierActivityRecord, AntigravityActivityRecord, ClaudeActivityRecord,
     CodexActivityRecord, CodexDurability, ErrorCode, FreshAgentCheckpointWorkspace,
-    OpencodeActivityRecord, SessionLocator, SessionType, TerminalMetaRecord,
+    OpencodeActivityRecord, SessionLocator, SessionType, TerminalMetaRecord, TerminalTurnOutcome,
     TurnCompletionSnapshot,
+};
 };
 use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
@@ -1338,6 +1339,8 @@ pub struct FreshAgentAttentionMark {
     pub last_turn_complete_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_waiting_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_question_available_at: Option<i64>,
 }
 
 /// One `ready.runtimeOwners` replay record (kata b8ke reconnect-owner
@@ -1889,6 +1892,8 @@ pub struct TerminalTurnComplete {
     pub terminal_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TerminalTurnOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -3,13 +3,15 @@ import { MessageCircleQuestion } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 type FreshAgentQuestion = {
-  requestId: string
+  requestId?: string
   questions: Array<{
     id?: string
     question: string
     header: string
     options: Array<{ label: string; description: string }>
     multiSelect: boolean
+    isOther?: boolean
+    isSecret?: boolean
   }>
 }
 
@@ -24,16 +26,17 @@ function SingleSelectQuestion({
   onSelect: (answer: string) => void
   disabled?: boolean
 }) {
-  const [showOther, setShowOther] = useState(false)
+  const nativeFreeEntry = question.options.length === 0 && (question.isOther !== undefined || question.isSecret !== undefined)
+  const [showOther, setShowOther] = useState(nativeFreeEntry)
   const [otherText, setOtherText] = useState('')
   const otherInputRef = useRef<HTMLInputElement>(null)
   const submitOther = () => {
-    if (!disabled && otherText.trim()) onSelect(otherText.trim())
+    if (!disabled && otherText.trim()) onSelect(question.isOther !== undefined || question.isSecret !== undefined ? otherText : otherText.trim())
   }
 
   useEffect(() => {
-    if (showOther) otherInputRef.current?.focus()
-  }, [showOther])
+    if (showOther && !nativeFreeEntry) otherInputRef.current?.focus()
+  }, [showOther, nativeFreeEntry])
 
   return (
     <div className="fresh-agent-question-block space-y-2" role="group" aria-label={question.header}>
@@ -61,7 +64,7 @@ function SingleSelectQuestion({
             ) : null}
           </button>
         ))}
-        <button
+        {!nativeFreeEntry && question.isOther !== false ? <button
           type="button"
           onClick={() => setShowOther(true)}
           disabled={disabled}
@@ -74,13 +77,14 @@ function SingleSelectQuestion({
           aria-pressed={answer !== undefined && !question.options.some((option) => option.label === answer)}
         >
           Other
-        </button>
+        </button> : null}
       </div>
       {showOther ? (
         <div className="fresh-agent-question-other flex items-center gap-2">
           <input
             ref={otherInputRef}
-            type="text"
+            type={question.isSecret ? 'password' : 'text'}
+            autoComplete="off"
             aria-label={question.question}
             disabled={disabled}
             value={otherText}

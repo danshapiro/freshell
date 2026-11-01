@@ -1,37 +1,188 @@
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
+import type { FreshAgentSessionType } from '@shared/fresh-agent.js'
 
-async function installPane(page: Page, provider: 'claude' | 'codex') {
-  const sessionType = provider === 'claude' ? 'freshclaude' : 'freshcodex'
-  const sessionId = 'd4430000-0000-4444-8444-000000000001'
-  const model = provider === 'claude' ? 'opus[1m]' : FRESHCODEX_DEFAULT_MODEL
-  await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({
-    json: {
-      sessionType, provider, sessionId, threadId: sessionId,
-      revision: 1, latestTurnId: null, status: 'idle',
-      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
-      settings: { model, effort: 'low' },
-      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      pendingApprovals: [], pendingQuestions: [], turns: [],
-      extensions: provider === 'claude' ? { claude: { liveSessionId: sessionId, cliSessionId: sessionId } } : {},
-    },
-  }))
-  await page.evaluate(({ sessionType, provider, sessionId, model }) => {
+const codexCatalog = {
+  ok: true, sessionType: 'freshcodex', runtimeProvider: 'codex', status: 'fresh', fetchedAt: 1234,
+  models: [{ id: 'provider-current', displayName: 'Provider Current', provider: 'codex',
+    supportsEffort: true, supportedEffortLevels: ['none', 'ultra'], defaultEffort: 'ultra',
+    inputModalities: ['text', 'image'], supportsAdaptiveThinking: false }],
+}
+
+test('Codex discovers only the bound runtime and preserves search and exact settings across rebind', async ({ freshellPage, page, terminal, harness }) => {
+  await terminal.waitForTerminal()
+  let releaseOld!: () => void
+  const oldHeld = new Promise<void>((resolve) => { releaseOld = resolve })
+  const contexts: URLSearchParams[] = []
+  await page.route('**/api/fresh-agent/model-capabilities/freshcodex**', async (route) => {
+    const query = new URL(route.request().url()).searchParams
+    contexts.push(query)
+    if (contexts.length === 1) {
+      await oldHeld
+      await route.fulfill({ json: { ...codexCatalog, models: [{ ...codexCatalog.models[0], id: 'stale-model', displayName: 'Stale Provider' }] } })
+    } else await route.fulfill({ json: codexCatalog })
+  })
+  await installPane(page, 'freshcodex')
+  await page.getByRole('button', { name: /^Model:.*change model$/ }).click()
+  const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+  await expect.poll(() => contexts.length).toBe(1)
+  await dialog.getByRole('searchbox').fill('provider')
+  await page.evaluate(() => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
     const state = harness.getState()
     const tabId = state.tabs.activeTabId!
     const paneId = state.panes.activePane[tabId]
-    harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+    harness.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId,
+      updates: { sessionId: 'replacement-native', sessionRef: { provider: 'codex', sessionId: 'replacement-native' } } } })
+  })
+  await dialog.getByRole('option', { name: 'Provider Current', exact: true }).click()
+  releaseOld()
+  await expect(dialog.getByRole('searchbox')).toHaveValue('provider')
+  await expect(dialog.getByRole('option', { name: 'Stale Provider' })).toHaveCount(0)
+  await expect.poll(() => contexts.length).toBe(2)
+  expect(contexts[0].get('sessionId')).toBe('d4430000-0000-4444-8444-000000000001')
+  expect(contexts[1].get('sessionId')).toBe('replacement-native')
+  await dialog.getByRole('button', { name: 'Use Provider Current · ultra' }).click()
+  await expect.poll(() => page.evaluate(() => {
+    const state = window.__FRESHELL_TEST_HARNESS__!.getState()
+    const layout = state.panes.layouts[state.tabs.activeTabId!]
+    return layout?.type === 'leaf' ? { model: layout.content.model, effort: layout.content.effort } : null
+  })).toEqual({ model: 'provider-current', effort: 'ultra' })
+  await harness.receiveWsMessage({
+    type: 'freshAgent.event', sessionType: 'freshcodex', provider: 'codex', sessionId: 'replacement-native',
+    event: { type: 'freshAgent.session.metadata', sessionId: 'replacement-native', model: 'provider-current', effort: 'ultra' },
+  })
+  await expect(page.getByRole('button', { name: 'Model: Provider Current ultra — change model', exact: true })).toBeVisible()
+})
+
+test('Codex picker waits for ordinary create and shows honest failure with exact saved input', async ({ freshellPage, page, terminal, harness }) => {
+  const createFrames: Array<Record<string, unknown>> = []
+  let routedSocketCount = 0
+  await page.routeWebSocket('**/ws', socket => {
+    routedSocketCount += 1
+    const upstream = socket.connectToServer()
+    socket.onMessage(data => {
+      const message = JSON.parse(String(data)) as Record<string, unknown>
+      if (typeof message.type === 'string' && message.type.startsWith('freshAgent.')) {
+        if (message.type === 'freshAgent.create') createFrames.push(message)
+        return // Exercise real client decisions without launching a provider.
+      }
+      upstream.send(data)
+    })
+    upstream.onMessage(data => socket.send(data))
+  })
+  // WebSocket routing takes effect in a replacement document.
+  await page.reload()
+  await harness.waitForHarness()
+  await harness.waitForConnection()
+  await expect.poll(() => routedSocketCount).toBeGreaterThan(0)
+  await terminal.waitForTerminal()
+  const contexts: Record<string, string>[] = []
+  await page.route('**/api/fresh-agent/model-capabilities/freshcodex**', async route => {
+    contexts.push(Object.fromEntries(new URL(route.request().url()).searchParams))
+    await route.fulfill({ json: codexCatalog })
+  })
+  const creates = () => createFrames.map(frame => ({ requestId: frame.requestId, model: frame.model, effort: frame.effort }))
+  // The saved model already has a display name, so only the open picker
+  // needs a catalog lookup after ordinary creation binds the runtime.
+  const begin = (requestId: string) => installPane(page, 'freshcodex', {
+    requestId, model: 'saved-custom', effort: 'xhigh', label: 'Saved Custom',
+  })
+  const open = async () => {
+    await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+    await page.getByRole('button', { name: /saved-custom.*Change/ }).click()
+  }
+  const firstRequest = 'model-dialog-codex-ack-create'
+  await begin(firstRequest)
+  await expect.poll(creates).toEqual([{ requestId: firstRequest, model: 'saved-custom', effort: 'xhigh' }])
+  await open()
+  const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+  await expect(dialog.getByRole('status')).toContainText(/waiting.*runtime/i)
+  await dialog.getByRole('textbox', { name: 'Exact model ID' }).fill('staged-custom')
+  await dialog.getByRole('textbox', { name: 'Reasoning effort' }).fill('ultra')
+  await dialog.getByRole('searchbox').fill('provider')
+  expect(contexts).toHaveLength(0)
+  expect(await creates()).toHaveLength(1)
+  await page.evaluate(requestId => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    if (!harness.receiveWsMessage) throw new Error('Public receive-message fixture is required')
+    harness.receiveWsMessage({ type: 'freshAgent.created', requestId,
+      sessionId: 'acknowledged-native', sessionRef: { provider: 'codex', sessionId: 'acknowledged-native' },
+      sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' })
+  }, firstRequest)
+  await expect(dialog.getByRole('option', { name: 'Provider Current', exact: true })).toBeVisible()
+  await expect(dialog.getByRole('searchbox')).toHaveValue('provider')
+  await expect(dialog.getByRole('button', { name: 'Use staged-custom · ultra' })).toBeEnabled()
+  expect(contexts).toEqual([{ sessionId: 'acknowledged-native',
+    sessionRef: JSON.stringify({ provider: 'codex', sessionId: 'acknowledged-native' }), cwd: '/tmp' }])
+  expect(await creates()).toHaveLength(1)
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.keyboard.press('Escape')
+
+  const failedRequest = 'model-dialog-codex-failed-create'
+  await begin(failedRequest)
+  await expect.poll(creates).toEqual([
+    { requestId: firstRequest, model: 'saved-custom', effort: 'xhigh' },
+    { requestId: failedRequest, model: 'saved-custom', effort: 'xhigh' },
+  ])
+  await open()
+  await expect(dialog.getByRole('status')).toContainText(/waiting.*runtime/i)
+  await dialog.getByRole('searchbox').fill('saved')
+  await page.evaluate(requestId => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    if (!harness.receiveWsMessage) throw new Error('Public receive-message fixture is required')
+    harness.receiveWsMessage({ type: 'freshAgent.create.failed', requestId,
+      code: 'FRESH_AGENT_CREATE_FAILED', message: 'Controlled create failure', retryable: false })
+  }, failedRequest)
+  await expect(dialog.getByRole('status')).toContainText(/catalog unavailable/i)
+  await expect(dialog.getByRole('searchbox')).toHaveValue('saved')
+  await dialog.getByRole('searchbox').fill('')
+  await expect(dialog.getByRole('button', { name: 'Use Saved Custom · xhigh', exact: true })).toBeEnabled()
+  expect(contexts).toHaveLength(1)
+  expect(await creates()).toHaveLength(2)
+})
+
+async function installPane(
+  page: Page,
+  sessionType: FreshAgentSessionType,
+  creation?: { requestId: string; model: string; effort: string; label?: string },
+) {
+  const provider = sessionType === 'freshcodex' ? 'codex' : sessionType === 'freshopencode' ? 'opencode' : 'claude'
+  const sessionId = creation ? undefined : provider === 'opencode' ? 'ses_model_dialog' : 'd4430000-0000-4444-8444-000000000001'
+  const model = creation?.model ?? (provider === 'claude' ? 'opus[1m]' : provider === 'codex' ? FRESHCODEX_DEFAULT_MODEL : 'openai/gpt-6-luna')
+  const modelLabel = creation?.label ? { modelId: model, label: creation.label } : undefined
+  const effort = creation?.effort ?? 'low'
+  const createRequestId = creation?.requestId ?? `model-dialog-${sessionType}`
+  await page.route('**/api/fresh-agent/threads/**', route => {
+    const requestedSessionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').at(-1)!)
+    return route.fulfill({ json: {
+      sessionType, provider, sessionId: requestedSessionId, threadId: requestedSessionId,
+      revision: 1, latestTurnId: null, status: 'idle',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
+      settings: { model, effort },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      pendingApprovals: [], pendingQuestions: [], turns: [],
+      extensions: provider === 'claude' ? { claude: { liveSessionId: requestedSessionId, cliSessionId: requestedSessionId } } : {},
+    } })
+  })
+  await page.evaluate(({ sessionType, provider, sessionId, model, modelLabel, effort, createRequestId }) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId!
+    const paneId = state.panes.activePane[tabId]
+    // Bound panes use the harness hold; the create scenario routes actual
+    // lifecycle frames so the ordinary create decision can run.
+    harness.setFreshAgentNetworkEffectsSuppressed(paneId, sessionId !== undefined)
     harness.dispatch({ type: 'panes/updatePaneContent', payload: {
       tabId, paneId, content: {
-        kind: 'fresh-agent', sessionType, provider, sessionId,
-        sessionRef: { provider, sessionId }, resumeSessionId: sessionId,
-        createRequestId: `model-dialog-${provider}`, status: 'idle',
-        model, effort: 'low', initialCwd: '/tmp', settingsDismissed: true,
+        kind: 'fresh-agent', sessionType, provider,
+        ...(sessionId ? { sessionId, sessionRef: { provider, sessionId }, resumeSessionId: sessionId } : {}),
+        createRequestId, status: sessionId ? 'idle' : 'creating',
+        model, ...(modelLabel ? { modelLabel } : {}), effort, initialCwd: '/tmp', settingsDismissed: true,
       },
     } })
-  }, { sessionType, provider, sessionId, model })
+  }, { sessionType, provider, sessionId, model, modelLabel, effort, createRequestId })
 }
 
 test('Claude model search survives catalog loading and remembers a selected thinking level', async ({ freshellPage, page, terminal }) => {
@@ -46,7 +197,7 @@ test('Claude model search survives catalog loading and remembers a selected thin
         supportedEffortLevels: ['low', 'medium', 'high'], supportsAdaptiveThinking: false }],
     } })
   })
-  await installPane(page, 'claude')
+  await installPane(page, 'freshclaude')
   await page.getByRole('button', { name: /^Model:.*change model$/ }).click()
   const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
   await expect(dialog.getByRole('button', { name: 'Use Claude Opus 5 (1M context) · low' })).toBeVisible()
@@ -64,13 +215,19 @@ test('Claude model search survives catalog loading and remembers a selected thin
 
 test('Codex cancels a staged model change and preserves its current thinking level', async ({ freshellPage, page, terminal }) => {
   await terminal.waitForTerminal()
-  await installPane(page, 'codex')
+  await page.route('**/api/fresh-agent/model-capabilities/freshcodex**',route=>route.fulfill({json:{...codexCatalog,models:[
+    {id:FRESHCODEX_DEFAULT_MODEL,displayName:'GPT-6 Astra',provider:'codex',supportsEffort:true,supportedEffortLevels:['low','high','xhigh'],defaultEffort:'high',supportsAdaptiveThinking:false},
+    ...codexCatalog.models,
+  ]}}))
+  await installPane(page, 'freshcodex')
   const chip = page.getByRole('button', { name: /^Model:.*change model$/ })
+  await expect(chip).toHaveAccessibleName('Model: GPT-6 Astra low — change model')
   await chip.click()
   const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
   await expect(dialog.getByRole('button', { name: 'Use GPT-6 Astra · low' })).toBeVisible()
-  await dialog.getByRole('option', { name: /GPT-5.6 Sol/ }).click()
+  await dialog.getByRole('option', { name: 'Provider Current', exact:true }).click()
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await expect(chip).toHaveAccessibleName('Model: GPT-6 Astra low — change model')
   await chip.click()
   await dialog.getByRole('button', { name: 'Use GPT-6 Astra · low' }).click()
   await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
@@ -81,3 +238,32 @@ test('Codex cancels a staged model change and preserves its current thinking lev
   await expect(permissions).toHaveValue('never')
   await expect(permissions.getByRole('option', { name: 'Never ask', exact: true })).toBeAttached()
 })
+
+for (const { sessionType, provider, model, label, shortLabel } of [
+  { sessionType: 'freshclaude', provider: 'claude', model: 'opus[1m]', label: 'Claude Opus 5 (1M context)', shortLabel: 'Claude Opus 5' },
+  { sessionType: 'freshcodex', provider: 'codex', model: FRESHCODEX_DEFAULT_MODEL, label: 'GPT-6 Astra', shortLabel: 'GPT-6 Astra' },
+  { sessionType: 'freshopencode', provider: 'opencode', model: 'openai/gpt-6-luna', label: 'GPT-6-Luna', shortLabel: 'GPT-6-Luna' },
+  { sessionType: 'kilroy', provider: 'claude', model: 'opus[1m]', label: 'Claude Opus 5 (1M context)', shortLabel: 'Claude Opus 5' },
+] as const) {
+  test(`${sessionType} model dropdown shows thinking in wide and compact panes`, async ({ freshellPage, page, terminal }) => {
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await terminal.waitForTerminal()
+    await page.route('**/api/fresh-agent/model-capabilities/**', route => route.fulfill({ json: {
+      ok: true, sessionType, runtimeProvider: provider, status: 'fresh', fetchedAt: Date.now(),
+      models: [{ id: model, displayName: label, provider, supportsEffort: true,
+        supportedEffortLevels: ['low', 'max'], supportsAdaptiveThinking: false }],
+    } }))
+    await installPane(page, sessionType)
+    const chip = page.getByRole('button', { name: `Model: ${label} low — change model`, exact: true })
+    await expect(chip).toBeVisible()
+    await expect(chip.getByText(`${label} low`, { exact: true }).filter({ visible: true })).toBeVisible()
+    await expect(chip).toHaveAttribute('title', `${model} · effort low`)
+
+    await page.setViewportSize({ width: 480, height: 800 })
+    await expect(chip.getByText(`${shortLabel} low`, { exact: true }).filter({ visible: true })).toBeVisible()
+    await chip.click()
+    const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+    await expect(dialog).toBeVisible()
+    await expect(dialog.getByRole('button', { name: `Use ${label} · low`, exact: true })).toBeVisible()
+  })
+}

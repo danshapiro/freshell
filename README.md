@@ -123,11 +123,19 @@ The service is standalone and independent of Electron.
 
 ### Fresh agents
 
-Freshclaude, Freshcodex, and Freshopencode share a chat interface with tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
+Freshclaude, Freshcodex, and Freshopencode share a chat interface with live tool output, attachments, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Freshcodex lists models offered by its running Codex installation and also accepts an exact custom model ID. Changes apply to your next message; the picker remembers recent choices for each project. **Default** removes Freshell’s thinking-level override; Codex may still use its own configuration or a choice retained from earlier turns.
 
-In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. In Freshcodex, “Always allow” lasts until the pane reloads.
+In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. Freshcodex shows the decisions offered by Codex for each request, including “Allow for this session” when available.
 
-You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
+Freshcodex settings separate **Build or Plan**, **File access**, and approval policy. “Never ask” does not expand file or network access. Incompatible model, effort, or provider settings produce a diagnostic instead of silently broadening access.
+
+Questions that await an answer pause the requested work. Async questions let Codex continue; replying sends an ordinary contextual message, and its status confirms delivery rather than completion of the requested work. MCP prompts offer explicit accept, decline, and cancel actions. Opening a linked page does not accept its prompt. Secret answers stay masked.
+
+You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages.
+
+Codex child conversations open read-only inside their parent. Available history can include live or saved output; ephemeral child history can be unavailable. Output labels distinguish retained, saved, interrupted, and truncated content, so a reload does not imply that every streamed byte was saved.
+
+Use `/undo` to roll back Codex conversation turns without changing files; Codex has no `/redo`. **Rewind code to here** restores a message’s code checkpoint separately. `!command` runs a shell command in the conversation’s working directory and sends its output to the agent.
 
 ### Session switching and recovery
 
@@ -136,6 +144,13 @@ Reopening a session in another mode keeps the same provider session and conversa
 **Force clear** repairs stale ownership bookkeeping only. It does not stop a running writer or start a replacement. If freshell cannot confirm that the old writer has stopped, the session remains blocked and the recovery message explains that you must stop and reopen it explicitly.
 
 **Stop and reopen** is available only when freshell can confirm the old writer and its owned child processes have stopped. The new mode starts only after that confirmation. On platforms where freshell cannot establish that proof, the request is refused before changing the session, and the existing session remains usable. The current atomic handoff implementation supports this operation when the Freshell server runs on Linux; Windows and macOS receive the explicit refusal and can still use clear-only bookkeeping repair.
+
+Managed runtime is opt-in for Claude, Codex, and OpenCode in terminal and
+fresh-agent modes. Live checks in this repair cover the four Codex/OpenCode
+modes; Claude remains unverified. Back up existing session stores before
+upgrading. Existing sessions are not automatically imported and may need to be
+moved manually. Managed Amplifier and Kilroy remain disabled; ordinary legacy
+CLI integrations remain available.
 
 ## Stream Deck
 
@@ -232,14 +247,15 @@ Freshell indexes local session history and can launch terminals for these coding
 | **Amplifier** | Yes | Yes | `~/.amplifier` |
 
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
-OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
+OpenCode sessions are discovered directly from OpenCode's local session database, so you can resume a selected session from freshell on demand. Freshell does not import existing sessions automatically at startup or during runtime transitions.
 
 OpenCode permissions are controlled by the OpenCode configuration for the OS user running freshell. Freshell does not set `OPENCODE_PERMISSION` or pass `--dangerously-skip-permissions` for OpenCode sessions; OS filesystem permissions remain the hard boundary.
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
-Managed Amplifier sessions use the configured bundle, provider, model, and
-plugins. If the provider needs a secret, give Freshell a private OneCLI grant
+The unreleased managed Amplifier adapter uses the configured bundle, provider,
+model, and plugins. For a separately authorized qualification, supply a private
+OneCLI grant
 through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
 the provider child when the session starts.
@@ -312,12 +328,13 @@ turning it off removes the server from Freshclaude and Kilroy agents started or
 resumed after the change, with no restart. Terminal panes do not follow the
 switch yet.
 
-With fresh agents enabled, the CLI and MCP client can create Freshclaude or
-Kilroy tabs, split them into panes, send prompts, and capture their conversation
-as plain text. These operations also work without an open browser. Use
-`agent: "claude"` or `agent: "kilroy"` with MCP `new-tab` and `split-pane`, or
-`--agent claude` / `--agent kilroy` with the CLI. Both support resuming a saved
-Claude conversation through `resume`.
+With fresh agents enabled, the CLI and MCP client can create Freshclaude,
+Kilroy, or Freshcodex tabs, split them into panes, send prompts, capture their
+conversation as plain text, and wait for an output pattern. These operations
+also work without an open browser. Use `agent: "claude"`, `agent: "kilroy"`, or
+`agent: "codex"` with MCP `new-tab` and `split-pane`, or `--agent claude`,
+`--agent kilroy`, or `--agent codex` with the CLI. Both support resuming a saved
+conversation through `resume`; Freshcodex uses its canonical Codex session ID.
 
 ### Rust server scope
 

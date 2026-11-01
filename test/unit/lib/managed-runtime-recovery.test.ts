@@ -35,6 +35,8 @@ import type { PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import type { SessionNameRef } from '@shared/session-names'
 
+import { ManagedRuntimeInventorySnapshotSchema } from '@shared/managed-runtime'
+
 function soul(overrides: Partial<ManagedRuntimeSoul> = {}): ManagedRuntimeSoul {
   return {
     soulId: 'soul-one',
@@ -107,6 +109,17 @@ function snapshot(
   }
 }
 
+describe('managed runtime inventory contract', () => {
+  it('accepts the recovery state written by a completed stopped data repair', () => {
+    const inventory = snapshot([soul({ desiredState: 'stopped' })], [])
+    inventory.souls[0]!.recoveryState =
+      'data_repair_complete' as unknown as ManagedRuntimeSoul['recoveryState']
+
+    expect(ManagedRuntimeInventorySnapshotSchema.parse(inventory).souls[0]?.recoveryState)
+      .toBe('data_repair_complete')
+  })
+})
+
 function baseState() {
   return {
     tabs: {
@@ -148,7 +161,6 @@ function baseState() {
       closingPanes: {},
       refreshRequests: {},
       restoreFallbackAttemptsByPane: {},
-      deadSessionAdjudication: [],
       reconcilePendingPanes: {},
     },
     managedRuntime: {
