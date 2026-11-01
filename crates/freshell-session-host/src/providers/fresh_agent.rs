@@ -10252,24 +10252,33 @@ export function query({ prompt, options }) {
             serde_json::from_value(context)
                 .expect("prepared native policy descriptor must survive the protocol boundary"),
         );
-        assert_eq!(
-            create_request_for_profile(&profile)
-                .permission_mode
-                .as_deref(),
-            Some("untrusted")
-        );
-        assert!(
-            profile.permission_mode.is_none(),
-            "inherited policy must remain distinguishable from explicit settings"
-        );
-        let replayed: FreshAgentProfile =
-            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
-        assert_eq!(
-            create_request_for_profile(&replayed)
-                .permission_mode
-                .as_deref(),
-            Some("untrusted")
-        );
+        for permission_mode in [None, Some("default".to_string())] {
+            profile.permission_mode = permission_mode.clone();
+            assert_eq!(
+                create_request_for_profile(&profile)
+                    .permission_mode
+                    .as_deref(),
+                Some("untrusted")
+            );
+            assert_eq!(
+                send_settings_for_profile(&profile)
+                    .permission_mode
+                    .as_deref(),
+                Some("untrusted")
+            );
+            assert_eq!(
+                profile.permission_mode, permission_mode,
+                "inherited policy must remain distinguishable from explicit settings"
+            );
+            let replayed: FreshAgentProfile =
+                serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+            assert_eq!(
+                create_request_for_profile(&replayed)
+                    .permission_mode
+                    .as_deref(),
+                Some("untrusted")
+            );
+        }
         profile.permission_mode = Some("never".into());
         assert_eq!(
             create_request_for_profile(&profile)
@@ -11143,29 +11152,46 @@ export function query({ prompt, options }) {
             "Codex send settings must keep using its provider default"
         );
 
-        let mut explicit = profile;
-        explicit.permission_mode = Some("on-request".into());
-        assert_eq!(
-            create_request_for_profile(&explicit)
-                .permission_mode
-                .as_deref(),
-            Some("on-request")
-        );
-        assert_eq!(
-            send_settings_for_profile(&explicit)
-                .permission_mode
-                .as_deref(),
-            Some("on-request")
-        );
+        for policy in ["untrusted", "on-failure", "on-request", "never"] {
+            let mut explicit = profile.clone();
+            explicit.permission_mode = Some(policy.into());
+            assert_eq!(
+                create_request_for_profile(&explicit)
+                    .permission_mode
+                    .as_deref(),
+                Some(policy)
+            );
+            assert_eq!(
+                send_settings_for_profile(&explicit)
+                    .permission_mode
+                    .as_deref(),
+                Some(policy)
+            );
+        }
 
-        let claude = parity_profile(FreshProvider::Claude);
-        assert_eq!(
-            create_request_for_profile(&claude)
-                .permission_mode
-                .as_deref(),
-            Some("default"),
-            "Claude's existing default mode remains unchanged"
-        );
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Opencode,
+            FreshProvider::Kilroy,
+        ] {
+            let mut other = parity_profile(if provider == FreshProvider::Kilroy {
+                FreshProvider::Claude
+            } else {
+                provider.clone()
+            });
+            other.provider = provider;
+            assert_eq!(
+                create_request_for_profile(&other)
+                    .permission_mode
+                    .as_deref(),
+                Some("default"),
+                "non-Codex provider defaults remain unchanged"
+            );
+            assert_eq!(
+                send_settings_for_profile(&other).permission_mode.as_deref(),
+                Some("default")
+            );
+        }
     }
 
     #[tokio::test]
