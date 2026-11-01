@@ -15,6 +15,16 @@ Filtered by what the push changes (diff between the remote refs being updated an
 
 Cost when warm: fmt ~5s, typecheck ~1-2 min, clippy ~2-5 min on a warm target dir (first run in a fresh checkout is a cold build — longer). The test lane adds only the affected crates' tests — e.g. a `freshell-freshagent` change tests freshagent plus its dependents (~3-4 min warm); a client-only push pays nothing.
 
+For a Rust push that needs process isolation, set `FRESHELL_RUST_TEST_SANDBOX=1`. The hook keeps its existing plan and sends only the selected Cargo test command through the pushing worktree's `scripts/sandbox-test.sh --runtime-suite`; fmt, Clippy, and typecheck keep their normal routes. Sandbox or Cargo failures still block the push, with no host-test fallback. The default is unset, so ordinary pushes do not require Docker.
+
+When validating an unmerged hook from a worktree, use command-scoped Git config so the shared hook owner remains untouched:
+
+```bash
+FRESHELL_RUST_TEST_SANDBOX=1 git \
+  -c "core.hooksPath=$(git rev-parse --show-toplevel)/scripts/hooks" \
+  push origin <branch>
+```
+
 Routing lives in `scripts/hooks/pre-push`; the crate→package targeting logic is `scripts/hooks/rust-test-targets.ts`, unit-tested in `test/unit/scripts/rust-test-targets.test.ts` (which also exercises the hook end-to-end against real git ranges in debug mode).
 
 **Manager selection (pnpm vs npm):** `core.hooksPath` points at the main checkout's hook copy, so the shared hook runs against pnpm-era and npm-era branches alike. The typecheck manager is selected from the PUSHING worktree (`scripts/hooks/prepush-manager.ts`): the `packageManager` field is authoritative; a legacy npm lock without the field selects npm. pnpm-era trees run `pnpm run --silent typecheck` (pnpm forwards args directly — no npm-style `--` separator); npm-era trees keep `npm run --silent typecheck` and their nvm PATH recovery. The same selection rule feeds the missing-manager remediation: a missing pnpm is reported as `npm install --global pnpm@10.34.5`, a missing npm still triggers the automatic nvm loader.

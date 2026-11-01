@@ -80,22 +80,23 @@ async fn capture_from_peer(
     }
 }
 
-async fn channel_session(id: &str) -> (FreshCodexState, freshell_codex::ChannelPeer) {
+async fn channel_session(id: &str) -> (FreshCodexState, freshell_codex::ChannelPeer, String) {
     let (state, _) = super::tests::state_with_bus();
     let (transport, peer) = freshell_codex::new_channel_transport();
     let (client, notifs) =
         CodexAppServerClient::connect_with_timeout(transport, Duration::from_millis(200));
+    let ownership_id = format!("task009-owner-{id}-{}", uuid::Uuid::new_v4());
     super::tests::insert_fake_session_with_real_consumer(
         &state,
         id,
         Arc::new(client),
         Arc::new(StdMutex::new(None)),
         notifs,
-        super::tests::spawn_sleeper(),
-        &format!("task009-owner-{id}"),
+        super::tests::spawn_sleeper_with_owner(&ownership_id),
+        &ownership_id,
     )
     .await;
-    (state, peer)
+    (state, peer, ownership_id)
 }
 
 fn send(id: &str, request: &str) -> FreshAgentSend {
@@ -123,7 +124,7 @@ async fn initialize(peer: &freshell_codex::ChannelPeer) {
 
 async fn typed_send_receipt(response: &str) {
     let session = format!("task009-send-{response}");
-    let (state, peer) = channel_session(&session).await;
+    let (state, peer, ownership_id) = channel_session(&session).await;
     let submitting = {
         let state = state.clone();
         let session = session.clone();
@@ -169,11 +170,7 @@ async fn typed_send_receipt(response: &str) {
                     submitted_turn_id.as_str(),
                     incarnation_id.as_str()
                 ),
-                (
-                    session.as_str(),
-                    "native-9",
-                    format!("task009-owner-{session}").as_str()
-                )
+                (session.as_str(), "native-9", ownership_id.as_str())
             );
             assert_eq!(facts[0].settlement, None, "acceptance is not settlement");
         }
@@ -201,7 +198,7 @@ async fn typed_send_receipt(response: &str) {
                 (
                     session.as_str(),
                     "request-9",
-                    format!("task009-owner-{session}").as_str(),
+                    ownership_id.as_str(),
                     "CODEX_DELIVERY_AMBIGUOUS"
                 )
             );
@@ -234,7 +231,7 @@ async fn task009_rest_lane_typed_timeout_stays_ambiguous() {
 #[tokio::test]
 async fn task009_rest_lane_private_settlement_ignores_idle_and_stop_ack_and_names_actual_evidence()
 {
-    let (state, peer) = channel_session("task009-events").await;
+    let (state, peer, ownership_id) = channel_session("task009-events").await;
     let mut events = state.subscribe_turn_events();
     let submitting = {
         let state = state.clone();
@@ -294,7 +291,7 @@ async fn task009_rest_lane_private_settlement_ignores_idle_and_stop_ack_and_name
         matches!(settled, Ok(Ok(CodexTurnEvent::Settled {
         session_id, turn_id, incarnation_id, request_ids,
         outcome: NativeSettlement::Interrupted, source: CodexSettlementSource::NativeNotification,
-    })) if session_id == "task009-events" && turn_id.as_deref() == Some("native-events") && incarnation_id == "task009-owner-task009-events" && request_ids == ["request-events"]),
+    })) if session_id == "task009-events" && turn_id.as_deref() == Some("native-events") && incarnation_id == ownership_id && request_ids == ["request-events"]),
         "matching native terminal must publish its typed evidence"
     );
 }
@@ -333,7 +330,7 @@ async fn task009_rest_lane_typed_create_and_adoption_distinguish_cleanup_authori
 
 #[tokio::test]
 async fn task009_rest_lane_http_same_id_steers_wait_for_one_actual_terminal() {
-    let (state, peer) = channel_session("task009-http-steer").await;
+    let (state, peer, _) = channel_session("task009-http-steer").await;
     let (router, pane) = http_pane(state.clone(), "task009-http-steer");
     let mut frames = state.broadcast_tx.subscribe();
     let first_router = router.clone();
@@ -409,7 +406,7 @@ async fn task009_rest_lane_http_same_id_steers_wait_for_one_actual_terminal() {
 
 #[tokio::test]
 async fn task009_rest_lane_http_uncertainty_keeps_native_request_receipt_and_never_replays() {
-    let (state, peer) = channel_session("task009-http-uncertain").await;
+    let (state, peer, _) = channel_session("task009-http-uncertain").await;
     let (router, pane) = http_pane(state.clone(), "task009-http-uncertain");
     let uri = format!("/api/panes/{pane}/send-keys");
     let submitting = tokio::spawn(async move {
@@ -447,7 +444,7 @@ async fn task009_rest_lane_http_uncertainty_keeps_native_request_receipt_and_nev
 
 #[tokio::test]
 async fn task009_rest_lane_capture_preserves_native_output_and_bounds_utf8_separately() {
-    let (state, peer) = channel_session("task009-capture").await;
+    let (state, peer, _) = channel_session("task009-capture").await;
     let mut events = state.subscribe_turn_events();
     let submitting = {
         let state = state.clone();
@@ -530,7 +527,7 @@ async fn task009_rest_lane_capture_preserves_native_output_and_bounds_utf8_separ
 #[tokio::test]
 async fn task009_rest_lane_socket_loss_does_not_settle_until_the_owned_process_exits() {
     let _process_fixture = crate::session_lease::process_fixture::lock().await;
-    let (state, peer) = channel_session("task009-owned-exit").await;
+    let (state, peer, _) = channel_session("task009-owned-exit").await;
     let (router, pane) = http_pane(state.clone(), "task009-owned-exit");
     let mut events = state.subscribe_turn_events();
     let mut frames = state.broadcast_tx.subscribe();
@@ -636,7 +633,7 @@ async fn task009_rest_lane_old_cleanup_receipt_cannot_stop_a_resumed_incarnation
 
 #[tokio::test]
 async fn task009_rest_lane_http_deadline_returns_only_native_admission_as_approximate() {
-    let (state, peer) = channel_session("task009-deadline").await;
+    let (state, peer, _) = channel_session("task009-deadline").await;
     let (router, pane) = http_pane(state.clone(), "task009-deadline");
     let uri = format!("/api/panes/{pane}/send-keys");
     let submitting = tokio::spawn(async move {
@@ -796,7 +793,7 @@ async fn task009_rest_lane_abandon_only_stops_the_runtime_its_create_established
 
 #[tokio::test]
 async fn task009_rest_lane_http_startup_stop_waits_for_native_terminal_and_blocks_later_start() {
-    let (state, peer) = channel_session("task009-startup-stop").await;
+    let (state, peer, _) = channel_session("task009-startup-stop").await;
     let (router, pane) = http_pane(state.clone(), "task009-startup-stop");
     let first_uri = format!("/api/panes/{pane}/send-keys");
     let first_router = router.clone();
