@@ -4631,14 +4631,20 @@ mod tests {
             })
             .map(|capability| capability.provider)
             .collect();
-        assert_eq!(deferred, ["claude", "codex", "amplifier"]);
+        // Main's durable-souls work promoted claude and codex to certified;
+        // amplifier is the only provider still pending live certification.
+        // The load-bearing invariant for THIS test: antigravity is in NONE of
+        // these lists (fully blocked, NotApplicable).
+        assert_eq!(deferred, ["amplifier"]);
 
         let certified_durable: Vec<_> = PROVIDER_CAPABILITIES
             .iter()
             .filter(|capability| durable_souls_certified(capability.provider))
             .map(|capability| capability.provider)
             .collect();
-        assert_eq!(certified_durable, ["opencode"]);
+        // Main's durable-souls work certified claude and codex alongside
+        // opencode. Antigravity must never appear here (fully blocked).
+        assert_eq!(certified_durable, ["claude", "opencode", "codex"]);
 
         // The qualification policy rejects antigravity (the gemini rejection
         // model, qualification_policy.rs).
