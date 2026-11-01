@@ -189,6 +189,7 @@ mod uncertain_launch {
                                 native_identity: None,
                                 state: CommandState::ProviderAcked,
                                 claude_fork: None,
+                                native_identity: None,
                                 native_session_id: Some(current.native_session_id.clone()),
                             }
                         }
