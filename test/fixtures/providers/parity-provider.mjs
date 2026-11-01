@@ -244,7 +244,7 @@ async function runProvider() {
     claude: 'plugins/parity-environment', codex: 'skills/parity-environment',
     opencode: 'plugins/parity-environment', amplifier: 'bundles/parity-environment',
   }[provider]
-  const execution = spawnSync(path.join(providerHome, environmentRelative, 'command'), [], { encoding: 'utf8' })
+  const execution = spawnSync(path.join(providerHome, environmentRelative, 'command'), [], { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' })
   if (execution.error || execution.status !== 0) throw new Error('selected executable/dependency/resource consumer failed')
   const selectedEnvironment = JSON.parse(execution.stdout)
   const selectedConfigReferences = provider === 'opencode'

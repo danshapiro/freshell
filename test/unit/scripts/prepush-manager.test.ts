@@ -168,7 +168,7 @@ describe('pre-push hook execution contract (git runs hooks without a shell)', ()
   })
 
   it('stays parseable by bash', () => {
-    const res = spawnSync('bash', ['-n', hookPath], { encoding: 'utf-8' })
+    const res = spawnSync('bash', ['-n', hookPath], { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf-8' })
     expect(res.status, res.stderr).toBe(0)
   })
 })

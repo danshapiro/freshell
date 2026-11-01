@@ -35,8 +35,10 @@ function stampFromBuildScript(
   const env = { ...process.env }
   if (buildCommit === undefined) delete env.FRESHELL_BUILD_COMMIT
   else env.FRESHELL_BUILD_COMMIT = buildCommit
-  execFileSync('cargo', ['build', '--quiet'], { cwd: project, env, stdio: 'pipe' })
+  execFileSync('cargo', ['build', '--quiet'], { timeout: 120_000, killSignal: 'SIGKILL', cwd: project, env, stdio: 'pipe' })
   return execFileSync(path.join(project, 'target/debug/stamp-override-check'), [], {
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
     cwd: project,
     encoding: 'utf8',
   }).trim()

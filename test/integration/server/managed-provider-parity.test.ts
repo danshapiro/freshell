@@ -387,7 +387,7 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     // capturing dependencies from a shared /tmp/node_modules directory.
     workspace = path.join(webHome, 'workspace')
     fs.mkdirSync(workspace)
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     onecli = fakeOnecliGrants(providers)
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     xdgConfigHome = path.join(webHome, 'custom-xdg')

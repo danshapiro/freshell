@@ -31,7 +31,7 @@ it('executes file and package TUI entrypoints while observing the selected proje
     const consumer = `import { observeOpenCodeParitySelection } from ${JSON.stringify(pathToFileURL(path.resolve('test/fixtures/providers/parity-provider.mjs')).href)};
 process.stdout.write(JSON.stringify(await observeOpenCodeParitySelection(...process.argv.slice(1), { command: 'actual-mcp', args: ['argument'] })));`
     const inspect = () => {
-      const child = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { encoding: 'utf8' })
+      const child = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' })
       expect(child.error).toBeUndefined()
       expect(child.status, child.stderr).toBe(0)
       return JSON.parse(child.stdout)
@@ -58,7 +58,8 @@ process.stdout.write(JSON.stringify(await observeOpenCodeParitySelection(...proc
     await fs.writeFile(projected, JSON.stringify(configuredBridge))
     expect(JSON.parse(inspect().projectedProjectConfig)).toEqual(configuredBridge)
     await fs.unlink(entry)
-    const missing = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { encoding: 'utf8' })
+    const missing = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' })
+    expect(missing.error).toBeUndefined()
     expect(missing.status).not.toBe(0)
   } finally { await fs.rm(directory, { recursive: true, force: true }) }
 })
@@ -182,7 +183,7 @@ it('executes selected OpenCode resources after fixture readability preparation',
   try {
     writeProviderParityEnvironment(directory, '.opencode/plugins/parity')
     makeProviderParityResourcesReadable(path.join(directory, '.opencode'))
-    const execution = spawnSync(path.join(directory, '.opencode/plugins/parity/command'), [], { encoding: 'utf8' })
+    const execution = spawnSync(path.join(directory, '.opencode/plugins/parity/command'), [], { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' })
     expect(execution.error).toBeUndefined()
     expect(execution.status, execution.stderr).toBe(0)
     expect(JSON.parse(execution.stdout)).toEqual({ dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201 })
@@ -196,7 +197,7 @@ it('executes complete selected parity resources inside an ESM workspace', async 
     const home = path.join(workspace, '.codex')
     const selected = 'skills/parity-environment'
     writeProviderParityEnvironment(home, selected)
-    const execution = spawnSync(path.join(home, selected, 'command'), [], { encoding: 'utf8' })
+    const execution = spawnSync(path.join(home, selected, 'command'), [], { timeout: 30_000, killSignal: 'SIGKILL', encoding: 'utf8' })
     expect(execution.error).toBeUndefined()
     expect(execution.status, execution.stderr).toBe(0)
     expect(JSON.parse(execution.stdout)).toEqual({
@@ -213,7 +214,7 @@ it('executes the isolated parity command from a different controller directory',
     const workspace = path.join(directory, 'workspace')
     writeProviderParityEnvironment(workspace, '.')
     await fs.rename(path.join(workspace, 'command'), path.join(workspace, 'parity-codex'))
-    const execution = spawnSync(providerParityCommands(workspace).CODEX_CMD, [], { cwd: directory, encoding: 'utf8' })
+    const execution = spawnSync(providerParityCommands(workspace).CODEX_CMD, [], { timeout: 30_000, killSignal: 'SIGKILL', cwd: directory, encoding: 'utf8' })
     expect(execution.error).toBeUndefined()
     expect(execution.status, execution.stderr).toBe(0)
     expect(JSON.parse(execution.stdout)).toEqual({ dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201 })
