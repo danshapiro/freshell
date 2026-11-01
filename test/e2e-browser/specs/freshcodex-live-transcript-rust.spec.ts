@@ -476,6 +476,13 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
     const forwarded = starts[1].params.input.find((item: any) => item.type === 'text').text
     expect(forwarded).toContain(`in ${cwd}. Output:`)
     expect(forwarded).toContain(`${cwd}\ncommand-output-canary`)
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabId!)
+      const findPane = (node: any): any => node?.type === 'leaf'
+        ? (node.id === paneId ? node : undefined)
+        : node?.children?.map(findPane).find(Boolean)
+      return findPane(layout)?.content?.status ?? null
+    }, { timeout: 30_000, message: 'the command turn settles before conversation undo' }).toBe('idle')
     await composer.fill('/undo')
     await composer.press('Enter')
     await expect(composer).toHaveValue(forwarded, { timeout: 30_000 })
