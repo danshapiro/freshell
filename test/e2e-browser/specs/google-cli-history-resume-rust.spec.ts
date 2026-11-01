@@ -958,17 +958,17 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
 
         // ── Part B: the resume attempt itself (the create door the plan's
         // scenario describes) ────────────────────────────────────────────
-        // A deliberate restore create carrying the deleted sessionRef goes
-        // through the CREATE door, where the antigravity resume gate is
-        // DEFERRED by design (Task 7: never a typed SESSION_MISSING
-        // refusal, never a substituted fresh id): the CLI launches with the
-        // ADJACENT `--conversation <deleted id>` pair, the fake's OWN
-        // missing-store error surfaces in its output stream, and the
-        // process dies non-zero. Driven through the spec-owned raw WS
-        // client, attached to the spawned terminal so the error bytes and
-        // the exit code are captured directly.
-        let ws: WebSocket | null = null
-        try {
+          // A deliberate restore create carrying the deleted sessionRef goes
+          // through the CREATE door, where the antigravity resume gate is
+          // DEFERRED by design (Task 7: never a typed SESSION_MISSING
+          // refusal, never a substituted fresh id): the CLI launches with the
+          // ADJACENT `--conversation <deleted id>` pair, the fake's OWN
+          // missing-store error surfaces in its output stream, and the
+          // process dies non-zero. Driven through the spec-owned raw WS
+          // client, attached to the spawned terminal so the error bytes and
+          // the exit code are captured directly.
+          let ws: WebSocket | null = null
+          try {
           ws = await connectAndHello(info.wsUrl, info.token)
           // A persistent frame collector: everything this connection
           // receives from here on (the created reply, the attach replay,
@@ -1010,30 +1010,116 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
           const resumeTerminalId: string = created.terminalId
           expect(resumeTerminalId).toBeTruthy()
 
-          ws.send(JSON.stringify({
-            type: 'terminal.attach',
-            terminalId: resumeTerminalId,
-            requestId: 'att-agy-deleted-store',
-            intent: 'viewport_hydrate',
-            cols: 120,
-            rows: 30,
-          }))
+          // ATTACH WITH THE REAL CLIENT'S RECOVERY DISCIPLINE. The spawned
+          // fake dies within its first milliseconds (the missing store is
+          // the scenario's point), and the crash auto-resume lane then
+          // holds the session for a respawn cycle: a one-shot attach that
+          // lands inside that window is bounced with
+          // `error{SESSION_RESERVED, retryAfterMs}` — whose message
+          // explicitly says "retry after it settles" — and the pane's
+          // terminal may be REPLACED (a new terminal, same sessionRef —
+          // the bounded respawn cycle the tail invariants below already
+          // tolerate). The production client retries the bounce and folds
+          // `terminal.replaced` into the pane; this spec-owned client
+          // does the same, bounded: attach to the pane's CURRENT terminal
+          // until output streams (the respawned fakes print the SAME
+          // missing-store error, so every respawn is another chance to
+          // observe it), following replaced folds along the way. (A
+          // one-shot attach raced the recovery cycle and lost on the
+          // contended cloud runners — a pre-existing spec flake, proven
+          // by parent-commit cloud runs failing the same poll.)
+          const attachDeadline = Date.now() + 30_000
+          let currentTerminalId: string = resumeTerminalId
+          const chainIds = new Set<string>([resumeTerminalId])
+          let attached = false
+          for (let attempt = 0; !attached && Date.now() < attachDeadline; attempt += 1) {
+            const attachRequestId = `att-agy-deleted-store-${attempt}`
+            ws.send(JSON.stringify({
+              type: 'terminal.attach',
+              terminalId: currentTerminalId,
+              requestId: attachRequestId,
+              intent: 'viewport_hydrate',
+              cols: 120,
+              rows: 30,
+            }))
+            const outcome = await new Promise<'output' | 'bounce' | 'replaced' | 'timeout'>((resolve) => {
+              const timer = setInterval(() => {
+                const replaced = collected.find((m) => m?.type === 'terminal.replaced' && m?.oldTerminalId === currentTerminalId)
+                if (replaced) {
+                  clearInterval(timer)
+                  currentTerminalId = String(replaced.newTerminalId)
+                  chainIds.add(currentTerminalId)
+                  resolve('replaced')
+                  return
+                }
+                const bounce = collected.find((m) => m?.type === 'error' && m?.requestId === attachRequestId && m?.code === 'SESSION_RESERVED')
+                if (bounce) {
+                  clearInterval(timer)
+                  resolve('bounce')
+                  return
+                }
+                const out = collected.find((m) => (m?.type === 'terminal.output' || m?.type === 'terminal.output.batch') && m?.terminalId === currentTerminalId)
+                if (out) {
+                  clearInterval(timer)
+                  resolve('output')
+                  return
+                }
+                if (Date.now() > attachDeadline) {
+                  clearInterval(timer)
+                  resolve('timeout')
+                }
+              }, 50)
+            })
+            if (outcome === 'output') {
+              attached = true
+            } else if (outcome === 'bounce') {
+              // The server's bounce names a settle budget; poll well
+              // inside it and retry (a poll, never a fixed wait).
+              await new Promise((resolve) => setTimeout(resolve, 300))
+            }
+            // 'replaced' loops immediately with the new terminal id;
+            // 'timeout' exits the loop and fails the assertion below.
+          }
+          expect(attached, 'the deleted-store resume terminal (or one of its bounded auto-resume replacements) never streamed output to this client').toBe(true)
 
           // The fake's OWN missing-store error surfaces in the resumed
           // terminal's output stream (the attach delivers the retained
           // tail even if the child already died), and the CLI then dies
           // NON-ZERO — both delivered to this attached client.
           const errorNeedle = `agy: conversation ${boundId} not found`
+          // The poll's value on a miss is the collected-frame summary, so
+          // a failure names exactly what this attached client saw.
+          const summarizeCollected = () => collected.map((m) => {
+            if (m?.type === 'terminal.output' || m?.type === 'terminal.output.batch') {
+              return `${m.type}:${String(m?.data ?? '').slice(0, 200)}`
+            }
+            const detail = JSON.stringify({
+              type: m?.type,
+              code: m?.code,
+              message: m?.message,
+              status: m?.status,
+              exitCode: m?.exitCode,
+              terminalId: m?.terminalId,
+            })
+            return detail.slice(0, 400)
+          }).join(' | ')
           await expect.poll(async () => {
             const joined = collected
               .filter((m) => m?.type === 'terminal.output' || m?.type === 'terminal.output.batch')
               .map((m) => String(m?.data ?? ''))
               .join('')
               .replace(/[\r\n]/g, '')
-            return joined.includes(errorNeedle)
+            return joined.includes(errorNeedle) ? true : summarizeCollected()
           }, { timeout: 45_000 }).toBe(true)
+          // The CLI dies NON-ZERO: the exit frame is delivered to this
+          // ATTACHED client for a terminal in the followed chain (the
+          // original when the attach won the race, else one of its
+          // bounded replacements — every spawn carries the SAME deleted
+          // id and dies the SAME non-zero death).
           await expect.poll(async () => {
-            const exit = collected.find((m) => m?.type === 'terminal.exit' && m?.terminalId === resumeTerminalId)
+            const exit = collected.find(
+              (m) => m?.type === 'terminal.exit' && chainIds.has(String(m?.terminalId)) && typeof m?.exitCode === 'number',
+            )
             return exit ? exit.exitCode : null
           }, { timeout: 30_000 }).toBe(1)
         } finally {
