@@ -2043,7 +2043,8 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input'))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
-      expect(screen.getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeInTheDocument()
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)
+      expect(screen.getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeVisible()
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
       expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
@@ -13993,7 +13994,8 @@ describe('FreshAgentView', () => {
     await waitFor(() => expect(composer).toHaveValue(provider === 'codex' ? 'please keep this\nnewer draft' : 'please keep this'))
     expect(screen.getByText(message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
       ? `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`
-      : `Message not sent: ${reason}`)).toBeInTheDocument()
+      : `Message not sent: ${reason}`)).toBeVisible()
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
   })
 
@@ -14714,6 +14716,22 @@ describe('FreshAgentView transcript font size', () => {
       })
     })
 
+    it('funnels typing from transcript buttons while preserving their navigation keys', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const toggle = document.createElement('button')
+      toggle.textContent = 'Transcript control'
+      scroller.append(toggle)
+      toggle.focus()
+      const before = scroller.scrollTop
+      const arrow = createEvent.keyDown(toggle, { key: 'ArrowDown' })
+      fireEvent(toggle, arrow)
+      expect(arrow.defaultPrevented).toBe(false)
+      expect(scroller.scrollTop).toBe(before)
+      fireEvent.keyDown(toggle, { key: 'x' })
+      expect(screen.getByRole('textbox', {name: 'Chat message input'})).toHaveValue('x')
+      expect(root).toContainElement(toggle)
+    })
+
     it('does not regress the plain-text key funnel into the composer', async () => {
       const { root } = await setupScrollablePane(500)
       const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
@@ -15407,7 +15425,7 @@ describe('FreshAgentView /model slash command', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByRole('status', { name: 'Agent notices' })).toHaveTextContent('Model catalog unavailable — try again')
+    expect(await screen.findByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Model catalog unavailable — try again')
     expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
   })
 })
@@ -17595,8 +17613,7 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     }))))
 
     const card = await screen.findByRole('status', { name: 'Agent notices' })
-    fireEvent.click(within(card).getByText('Notice details'))
-    expect(card).toHaveTextContent(/being reopened/i)
+    expect(within(card).getByText(/being reopened/i)).toBeVisible()
     expect(within(card).queryByRole('button')).toBeNull()
     // Not the cross-kind divergence card, not the fenced recovery card.
     expect(document.querySelector('[data-agent-error="handoff"]')).toBeNull()
@@ -18723,7 +18740,7 @@ describe('!command shell escape (exec route)', () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent(/was not sent/)
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(/was not sent/)
     })
     expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
   })
@@ -18769,10 +18786,13 @@ describe('diff panel view wiring (ekc6)', () => {
     // not show the missing-prerequisite "Diff unavailable" copy the
     // initialCwd-only wiring produced for resumed/API-created panes.
     const changes = await screen.findByRole('button', { name: /^Diffs:/ })
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    // Pane activation schedules composer focus; finish that before moving
+    // keyboard focus to Changes, or the activation frame can steal Space.
+    await waitFor(() => expect(composer).toHaveFocus())
     changes.focus()
     await userEvent.keyboard(' ')
     const trigger = await screen.findByRole('button', { name: 'Diff: README.md' })
-    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
     const originalText = (composer as HTMLTextAreaElement).value
     trigger.focus()
     await userEvent.keyboard(' ')

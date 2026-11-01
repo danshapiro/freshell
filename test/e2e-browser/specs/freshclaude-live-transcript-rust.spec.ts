@@ -207,10 +207,7 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
         // The summary request fails (APIERR in the compaction's instructions).
         const failure = 'Error during compaction: API Error: 400 local provider error'
         await lane.send(pane, '/compact APIERR:400')
-        const notices = pane.paneRoot.getByRole('status', { name: 'Agent notices' })
-        await expect(notices, 'the grouped notice summary').toBeVisible({ timeout: 30_000 })
-        await notices.locator('summary').click()
-        await expect(notices.getByText(failure, { exact: true }), 'the expanded notice').toBeVisible()
+        await expect(pane.paneRoot.getByRole('alert').filter({ hasText: failure }), 'the visible compaction failure').toBeVisible({ timeout: 30_000 })
         await expect(pane.paneRoot.getByRole('note', { name: 'Agent error' }).filter({ hasText: failure }), 'the durable command error').toHaveCount(1, { timeout: 30_000 })
         await lane.waitForIdle(pane)
         await expect(pane.paneRoot.getByText('Context compaction', { exact: true })).toHaveCount(1)

@@ -564,3 +564,59 @@ test('managed live recovery suppresses stale ended and stuck entries while curre
   const replacements = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.().filter(frame => typeof frame === 'object' && frame !== null && 'type' in frame && ['freshAgent.create', 'pane.reconcile.request'].includes(String(frame.type))))
   expect(replacements ?? []).toEqual([])
 })
+
+for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
+  test(`expanded diagnostics keep recovery, requests and diffs reachable at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+    await fitRoot(page, size)
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
+      event: { type: 'freshAgent.notice', level: 'info', code: 'diagnostic-test', message: 'Routine context '.repeat(100) },
+    }))
+    const stack = page.getByRole('group', { name: 'Agent requests and status' })
+    await stack.getByText('Notice details', {exact: true}).click()
+    await stack.getByText('Agent could not start', {exact: true}).click()
+    const body = stack.locator('[data-agent-error="create"] .fresh-agent-diagnostic-body')
+    await body.scrollIntoViewIfNeeded()
+    const geometry = await body.evaluate(el => {
+      const rect = el.getBoundingClientRect(); const stack = el.closest('.fresh-agent-top-stack')!.getBoundingClientRect()
+      return { width: rect.width, stackWidth: stack.width, visibleHeight: Math.min(rect.bottom, stack.bottom) - Math.max(rect.top, stack.top) }
+    })
+    expect(geometry.width).toBeGreaterThanOrEqual(geometry.stackWidth * .7)
+    expect(geometry.visibleHeight).toBeGreaterThanOrEqual(44)
+    await hitAndClick(stack.getByRole('button', { name: 'Dismiss', exact: true }))
+    await hitAndClick(stack.getByRole('button', { name: 'Yes', exact: true }))
+    await hitAndClick(stack.getByRole('button', { name: 'Allow tool use', exact: true }))
+    await hitAndClick(stack.getByRole('button', { name: 'Diffs: 30 changed files' }))
+    await expect(page.getByRole('dialog', {name: 'Changes'})).toBeVisible()
+    await page.keyboard.press('Escape')
+    await stack.getByText('Notice details', {exact: true}).click()
+    await assertUsefulSpace(page)
+  })
+}
+
+test('Changes closes on programmatic and keyboard tab switches', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  const original = await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!
+    const tabId = h.getState().tabs.activeTabId!
+    h.dispatch({type: 'tabs/addTab', payload: {id: 'compact-other-tab', title: 'Other tab'}})
+    h.dispatch({type: 'panes/initLayout', payload: {tabId: 'compact-other-tab', paneId: 'compact-other-pane', content: {kind: 'picker'}}})
+    h.dispatch({type: 'tabs/setActiveTab', payload: tabId})
+    return tabId
+  })
+  for (const keyboard of [false, true]) {
+    await page.getByRole('button', {name: 'Diffs: 30 changed files'}).click()
+    await expect(page.getByRole('dialog', {name: 'Changes'})).toBeVisible()
+    if (keyboard) await page.keyboard.press('Control+Shift+]')
+    else await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.dispatch({type:'tabs/setActiveTab',payload:'compact-other-tab'}))
+    await expect.poll(() => page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getState().tabs.activeTabId)).toBe('compact-other-tab')
+    await expect(page.getByRole('dialog', {name: 'Changes'})).toHaveCount(0)
+    await page.evaluate(tabId => window.__FRESHELL_TEST_HARNESS__!.dispatch({type:'tabs/setActiveTab',payload:tabId}), original)
+    await expect(page.getByRole('button', {name: 'Diffs: 30 changed files'})).toHaveAttribute('aria-expanded','false')
+  }
+})

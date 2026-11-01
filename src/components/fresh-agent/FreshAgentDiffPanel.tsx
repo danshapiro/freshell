@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { ChevronRight, MessageSquarePlus } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -226,11 +226,15 @@ type DiffPanelProps = {
   onComment?: (text: string) => void
   paneRoot?: HTMLElement | null
   scopeKey?: string
+  hidden?: boolean
 }
 
-function ScopedDiffPanel({ diffs, cwd, onComment, paneRoot }: DiffPanelProps) {
+function ScopedDiffPanel({ diffs, cwd, onComment, paneRoot, hidden }: DiffPanelProps) {
   const [open, setOpen] = useState(false)
   const [fallbackRoot, setFallbackRoot] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    if (hidden) setOpen(false)
+  }, [hidden])
   if (diffs.length === 0) return null
   const count = changedFileCount(diffs)
   const countLabel = count === null ? 'file count unavailable' : `${count} changed file${count === 1 ? '' : 's'}`
@@ -253,7 +257,7 @@ function ScopedDiffPanel({ diffs, cwd, onComment, paneRoot }: DiffPanelProps) {
       >
         <span>Diffs</span><span>{countLabel}</span>
       </button>
-      {open ? (
+      {open && !hidden ? (
         <FreshAgentDiffDrawer paneRoot={paneRoot ?? fallbackRoot} onClose={() => setOpen(false)}>
           <div className="fresh-agent-diff-list space-y-1">
             {diffs.map((diff) => (

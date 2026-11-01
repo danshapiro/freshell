@@ -127,7 +127,7 @@ Freshclaude, Freshcodex, and Freshopencode share a chat interface with live tool
 
 Fresh Agent panels stay compact above the conversation. Diffs shows the changed-file count and opens Changes at the side. Requests keep their answer buttons visible; open Command or Request details for long arguments. Routine notices share a status row, and errors expand to show diagnostics and recovery actions. Pending requests scroll within a bounded area, with their count always visible.
 
-In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. Freshcodex shows the decisions offered by Codex for each request, including “Allow for this session” when available.
+In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card or under Permission changes for long lists (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. Freshcodex shows the decisions offered by Codex for each request, including “Allow for this session” when available.
 
 Freshcodex settings separate **Build or Plan**, **File access**, and approval policy. “Never ask” does not expand file or network access. Incompatible model, effort, or provider settings produce a diagnostic instead of silently broadening access.
 

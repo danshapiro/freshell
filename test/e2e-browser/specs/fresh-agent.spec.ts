@@ -1184,7 +1184,7 @@ test.describe('Fresh Agent', () => {
     const questionBackground = await freshcodexRoot.locator('.fresh-agent-question-card').first()
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(questionBackground).toBe('rgb(251, 250, 247)')
-    const diffBackground = await diffPanel
+    const diffBackground = await changes
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(diffBackground).toBe('rgb(251, 250, 247)')
     await changes.getByRole('button', { name: 'Close', exact: true }).click()

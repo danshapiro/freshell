@@ -388,7 +388,8 @@ describe('provider notices (transcript-live D6)', () => {
       message: 'Error during compaction: API Error: 400 prompt is too long',
     })
 
-    expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Error during compaction: API Error: 400 prompt is too long')
+    expect(screen.getByRole('alert')).toHaveTextContent('Error during compaction: API Error: 400 prompt is too long')
+    expect(screen.getByRole('alert')).toBeVisible()
     expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
     expect(store.getState().freshAgent.sessions[KEY].status).toBe('running')
     expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
@@ -409,7 +410,8 @@ describe('provider notices (transcript-live D6)', () => {
       rateLimit: { status: 'rejected', resetsAt, rateLimitType: 'five_hour' },
     })
 
-    const banner = screen.getByRole('status', { name: 'Agent notices' })
+    const banner = screen.getByRole('alert')
+    expect(banner).toBeVisible()
     expect(banner).toHaveTextContent('You have reached your Claude usage limit.')
     expect(banner).toHaveTextContent(expectedTime)
   })
@@ -421,12 +423,14 @@ describe('provider notices (transcript-live D6)', () => {
     const notice = { type: 'freshAgent.notice', level: 'warning', code: 'INFORMATIONAL', message: 'Hook feedback: lint failed' }
 
     deliver(store, notice)
-    expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
     await advance(10_000)
     expect(screen.queryByText('Hook feedback: lint failed')).not.toBeInTheDocument()
 
     deliver(store, notice)
-    expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
   })
 })
 

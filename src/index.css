@@ -1676,3 +1676,36 @@ body {
   .fresh-agent-top-stack .fresh-agent-notices summary,
   .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
 }
+
+/* Expanded diagnostics use the full bounded stack width. The stack can scroll
+   as a whole, so neither diagnostics nor requests can squeeze out other controls. */
+.fresh-agent-pane .fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) > * {
+  flex: 0 0 auto;
+  min-height: 0;
+  overflow: visible;
+}
+.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) > .fresh-agent-top-stack-scroll {
+  min-height: 44px;
+  max-height: 10rem;
+  overflow: auto;
+}
+.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) .fresh-agent-request-count {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--fresh-agent-panel-surface, hsl(var(--background)));
+}
+.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) .fresh-agent-diagnostic-body {
+  min-height: 44px;
+}
+.fresh-agent-notice-summary { margin-left: .5rem; }
+.fresh-agent-top-stack:has(> .fresh-agent-notices details[open], > .fresh-agent-errors details[open]) summary {
+  white-space: normal;
+}
+.fresh-agent-errors > [role="alert"] { overflow-wrap: anywhere; }

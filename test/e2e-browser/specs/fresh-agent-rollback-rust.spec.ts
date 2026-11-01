@@ -548,15 +548,18 @@ function composerLocator(page: Page) {
   return page.locator('[data-context="fresh-agent"]').last().getByRole('textbox', { name: 'Chat message input' })
 }
 
-/** Type a slash command into the composer and commit it with Enter. */
+/** Show the requested feedback in its semantic notice channel. */
 async function showNotice(page: Page, text: string | RegExp): Promise<void> {
-  const notices = page.getByRole('status', { name: 'Agent notices' })
-  await expect(notices.getByText(text)).toHaveCount(1, { timeout: 30_000 })
-  if (!(await notices.locator('details').evaluate(node => node.hasAttribute('open')))) {
-    await notices.locator('summary').click()
+  const entry = page.locator('[data-agent-error="notice"], [data-agent-notice="notice"]').filter({ hasText: text })
+  await expect(entry).toHaveCount(1, { timeout: 30_000 })
+  const disclosure = entry.locator('xpath=ancestor::details[1]')
+  if (await disclosure.count() && !(await disclosure.evaluate(node => node.hasAttribute('open')))) {
+    await disclosure.locator('summary').click()
   }
+  await expect(entry).toBeVisible()
 }
 
+/** Type a slash command into the composer and commit it with Enter. */
 async function typeSlash(page: Page, text: string): Promise<void> {
   const composer = composerLocator(page)
   await composer.fill(text)
@@ -877,7 +880,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // Typed /redo never reaches the wire: the composer's reserved-name
       // interception answers with the pinned codex undo-only copy.
       await typeSlash(page, '/redo')
-      const notices = page.getByRole('status', { name: 'Agent notices' })
+      const notices = page.getByRole('region', { name: 'Agent errors' })
       await expect(notices).toBeVisible({ timeout: 15_000 })
       await showNotice(page, /Redo is not available for Codex sessions/)
       await expect(

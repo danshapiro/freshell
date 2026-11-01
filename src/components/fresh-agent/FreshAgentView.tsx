@@ -1270,7 +1270,10 @@ export function FreshAgentView({
   }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNoticeState] = useState<{ text: string; level: 'info' | 'warning' | 'error' } | null>(null)
+  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning') => {
+    setNoticeState(current => text === null ? null : current?.text === text && current.level === level ? current : { text, level })
+  }, [])
   const deliveryNoticeRef = useRef<string | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
@@ -1279,7 +1282,7 @@ export function FreshAgentView({
     if (managedStopped) closeModelDialog()
   }, [closeModelDialog, managedStopped])
   // /model with a dead catalog opens the shared notice, not an empty dialog.
-  const handleModelCatalogUnavailable = useCallback(() => setNotice(FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE), [])
+  const handleModelCatalogUnavailable = useCallback(() => setNotice(FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE), [setNotice])
   // Optimistic echo of the just-sent user message: the transcript renders
   // snapshot turns only, which left a 2-10s blank gap after send
   // (live-test finding). Cleared when a snapshot containing the turn lands.
@@ -2555,7 +2558,7 @@ export function FreshAgentView({
       sendRollback(direction, 'step')
       return
     }
-  }, [appStore, descriptor?.label, sendFork, sendFreshAgentMessage, sendRollback, handleStartNewConversation])
+  }, [appStore, descriptor?.label, setNotice, sendFork, sendFreshAgentMessage, sendRollback, handleStartNewConversation])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -3526,7 +3529,7 @@ export function FreshAgentView({
             setLocalEcho(null) // a pending optimistic echo must not survive a rollback
             if (typeof ack.removedPromptText === 'string') {
               composerRef.current?.replaceText(ack.removedPromptText) // decision 4: overwrite refill
-              setNotice(UNDO_REFILL_NOTICE)
+              setNotice(UNDO_REFILL_NOTICE, 'info')
             }
           }
           // A redone ack leaves the composer alone — the server kept prompt truth.
@@ -3592,7 +3595,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, setNotice, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) {
@@ -4574,8 +4577,8 @@ export function FreshAgentView({
   useEffect(() => {
     if (!liveNotice || liveNotice.seq <= shownNoticeSeqRef.current) return
     shownNoticeSeqRef.current = liveNotice.seq
-    setNotice(formatFreshAgentNotice(liveNotice))
-  }, [liveNotice])
+    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level)
+  }, [liveNotice, setNotice])
   // The session's permission mode converges onto the pane (transcript-live
   // §4.4): when the server states a new mode — the CLI left plan mode after an
   // approved ExitPlanMode, or another device changed it — the pane adopts it,
@@ -4773,10 +4776,10 @@ export function FreshAgentView({
   }, [effectiveStatus, hidden, isBusy, lifecycleBlocked, ownerDivergence, paneContent.sessionId, requestSnapshotRefresh])
 
   useEffect(() => {
-    if (!notice || notice === deliveryNoticeRef.current) return
+    if (!notice || notice.text === deliveryNoticeRef.current) return
     const timer = window.setTimeout(() => setNotice(null), 6000)
     return () => window.clearTimeout(timer)
-  }, [notice])
+  }, [notice, setNotice])
 
   /** Core outgoing-message path shared by direct sends and queue flushes. */
   const sendUserText = useCallback((text: string) => {
@@ -4921,9 +4924,9 @@ export function FreshAgentView({
         setQueuedMessages((queue) => [...queue, body])
       })
       .catch((error: unknown) => {
-        setNotice(error instanceof Error ? `Shell command failed: ${error.message}` : 'Shell command failed')
+        setNotice(error instanceof Error ? `Shell command failed: ${error.message}` : 'Shell command failed', 'error')
       })
-  }, [])
+  }, [setNotice])
 
   /** Rewind the working tree to the checkpoint taken when a user turn was
    * sent. Conversation history is untouched — this is the code half of
@@ -4962,7 +4965,7 @@ export function FreshAgentView({
         ...(restoreWorkspace ? { workspace: restoreWorkspace } : {}),
         id: checkpointId,
       }))
-      .then(() => setNotice(`Code rewound to before: "${label}"`))
+      .then(() => setNotice(`Code rewound to before: "${label}"`, 'info'))
       .catch((error: unknown) => {
         if (error && typeof error === 'object') {
           const details = (error as { details?: unknown }).details
@@ -4972,7 +4975,7 @@ export function FreshAgentView({
             return
           }
         }
-        setNotice(error instanceof Error ? `Rewind failed: ${error.message}` : 'Rewind failed')
+        setNotice(error instanceof Error ? `Rewind failed: ${error.message}` : 'Rewind failed', 'error')
       })
 
     // An exact checkpoint ID came from the settled outcome, which is the
@@ -5033,7 +5036,7 @@ export function FreshAgentView({
         // turning a transient API failure into a permanent missing target.
         setNotice('Could not check the saved code checkpoint list. Try again.')
       })
-  }, [getCheckpointAvailability, publishCheckpointAvailability, snapshot?.turns])
+  }, [getCheckpointAvailability, publishCheckpointAvailability, setNotice, snapshot?.turns])
 
   // Task 6 (freshopencode TUI parity): the delegation block's "Open session"
   // link resumes the child durable session in its own pane, like the sidebar
@@ -5119,7 +5122,7 @@ export function FreshAgentView({
         scrollTranscriptByKey(event, transcriptRef.current)
         return
       }
-      if (isInteractiveTarget(event.target)) return
+      if (isEditableTarget(event.target) || (event.target instanceof Element && event.target.closest('.fresh-agent-top-stack') && isInteractiveTarget(event.target))) return
       if (!isPlainTextKey(event)) return
       event.preventDefault()
       composerRef.current?.appendText(event.key)
@@ -5154,11 +5157,12 @@ export function FreshAgentView({
     const requestCount = pendingApprovals.length + (snapshot?.pendingElicitations?.length ?? 0) + pendingQuestions.length + (isManagedRuntimeRecoveryDecision(paneContent.recoverySummary) ? 1 : 0)
     const routineNotices = [
       ...(isRestoring ? [{ id: 'restoring', text: 'Restoring session...' }] : []),
-      ...(paneContent.reconcileNotice ? [{ id: 'reconciliation', text: paneContent.reconcileNotice }] : []),
-      ...(notice ? [{ id: 'notice', text: notice }] : []),
-      ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…' }] : []),
+      ...(paneContent.reconcileNotice ? [{ id: 'reconciliation', text: paneContent.reconcileNotice, prominent: true }] : []),
+      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text }] : []),
+      ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
     const visibleErrors: FreshAgentError[] = [
+      ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: notice.text, level: notice.level, content: null }] : []),
     { id: 'create', summary: 'Agent could not start', content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
@@ -5338,7 +5342,7 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null) },
-    ].filter(entry => Boolean(entry.content))
+    ].filter(entry => entry.id === 'notice' || Boolean(entry.content))
     const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
       provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
       ...(runtimeOwnerEpoch !== undefined && runtimeOwnerGeneration !== undefined ? { observedEpoch: runtimeOwnerEpoch, observedGeneration: runtimeOwnerGeneration } : {}),
@@ -5437,6 +5441,7 @@ export function FreshAgentView({
               <FreshAgentDiffPanel
                 diffs={projectedDiffs}
                 paneRoot={paneRootElement}
+                hidden={hidden}
                 scopeKey={liveSessionKey}
                 // Same resolution as the !command exec escape: the pane's
                 // starting directory, falling back to the LIVE session cwd
@@ -5705,6 +5710,7 @@ export function FreshAgentView({
     stripModelTooltip,
     handleModelCatalogUnavailable,
     notice,
+    setNotice,
     ownerDivergence,
     attachTerminalOwnerHere,
     paneContent,

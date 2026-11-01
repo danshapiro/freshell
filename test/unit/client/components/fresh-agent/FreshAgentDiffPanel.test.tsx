@@ -303,4 +303,16 @@ describe('FreshAgentDiffPanel', () => {
       await screen.findByText(/No uncommitted changes for this file/)
     })
   })
+
+  it('dismisses Changes when its pane becomes hidden and keeps it closed on reveal', async () => {
+   const user = userEvent.setup()
+   const props = { diffs: [{id: 'one', path: '/repo/one.ts'}], scopeKey: 'one' }
+   const {rerender} = render(<FreshAgentDiffPanel {...props} hidden={false} />)
+   await user.click(screen.getByRole('button', {name: 'Diffs: 1 changed file'}))
+   expect(screen.getByRole('dialog', {name: 'Changes'})).toBeVisible()
+   rerender(<FreshAgentDiffPanel {...props} hidden />)
+   expect(screen.queryByRole('dialog', {name: 'Changes'})).not.toBeInTheDocument()
+   rerender(<FreshAgentDiffPanel {...props} hidden={false} />)
+   expect(screen.queryByRole('dialog', {name: 'Changes'})).not.toBeInTheDocument()
+  })
 })

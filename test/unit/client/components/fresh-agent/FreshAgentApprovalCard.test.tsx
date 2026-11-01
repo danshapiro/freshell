@@ -159,8 +159,11 @@ describe('FreshAgentApprovalCard', () => {
     const card = within(screen.getByRole('alert', { name: `Permission request for ${toolName}` }))
     const preview = card.getByText((_content, element) => element?.tagName === 'PRE')
 
-    expect(preview).not.toBeVisible()
-    fireEvent.click(card.getByText('Request details'))
+    const verbose = JSON.stringify(details).length > 240
+    if (verbose) {
+      expect(preview).not.toBeVisible()
+      fireEvent.click(card.getByText('Request details'))
+    }
     expect(preview).toBeVisible()
     expect(JSON.parse(preview.textContent ?? '')).toEqual(details)
     expect(card.getAllByRole('button').map((button) => button.textContent)).toEqual(actions.map((action) => action.label))
@@ -209,4 +212,14 @@ it('collapses a verbose Edit preview while retaining the path and decisions', as
  expect(onRespond).not.toHaveBeenCalled()
  await user.click(screen.getByRole('button',{name:'Deny tool use'}))
  expect(onRespond).toHaveBeenCalledWith({behavior:'deny',message:'Denied by user',interrupt:false})
+})
+
+it('shows a short native permission scope before the user answers', () => {
+ const { onRespond } = renderCard({ requestId: 'short-scope', toolName: 'Additional permissions', native: { cwd: '/srv/output', permissions: { network: true }, availableDecisions: ['accept', 'decline'] } })
+ const preview = screen.getByText((_text, node) => node?.tagName === 'PRE')
+ expect(preview).toBeVisible()
+ expect(preview).toHaveTextContent('/srv/output')
+ expect(preview).toHaveTextContent('network')
+ fireEvent.click(screen.getByRole('button', {name: 'Allow', exact: true}))
+ expect(onRespond).toHaveBeenCalledWith({nativeDecision: 'accept'})
 })

@@ -435,9 +435,24 @@ it.each([['stuck','Agent appears stuck'],['exited','Session ended']] as const)('
  expect(error).toBeVisible()
  expect(error.closest('[aria-label="Pending requests"]')).toBeNull()
  const requests=screen.getByRole('region',{name:'Pending requests'})
- fireEvent.scroll(requests,{target:{scrollTop:500}})
- expect(error).toBeVisible()
  fireEvent.click(within(requests).getAllByRole('button',{name:'Allow tool use'})[0])
  expect(responds()).toContainEqual(expect.objectContaining({requestId:'request-0',decision:{behavior:'allow'}}))
  expect(error).toBeVisible()
+})
+
+it.each([['info', 'routine body'], ['warning', 'rate limit body'], ['error', 'compaction failure body']] as const)('preserves the provider %s notice level without inferring from text', async (level, message) => {
+ serve(CLAUDE, [])
+ const store = createStore(CLAUDE)
+ await mount(store)
+ act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...CLAUDE, event: {type: 'freshAgent.notice', level, code: 'provider-notice', message} }))
+ const text = screen.getByText(message)
+ if (level === 'info') {
+  expect(text).not.toBeVisible()
+  fireEvent.click(screen.getByText('Notice details'))
+  expect(text).toBeVisible()
+  expect(text.closest('[role="status"]')).not.toBeNull()
+ } else {
+  expect(text).toBeVisible()
+  expect(text.closest('[role="alert"]')).not.toBeNull()
+ }
 })

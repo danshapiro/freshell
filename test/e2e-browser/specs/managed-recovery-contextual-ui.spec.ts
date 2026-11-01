@@ -455,7 +455,7 @@ test('fresh-agent: automatic recovery reads actual saved Codex history without c
   expect(content).toMatchObject({ sessionId: SESSION_ID, sessionRef: { provider: 'codex', sessionId: SESSION_ID },
     resumeSessionId: SESSION_ID, createRequestId: CREATE_REQUEST_ID, recoverySummary: { recoveryState: 'recovering' } })
   await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
-  await expect(page.getByText('Restoring session...', { exact: true })).toBeHidden()
+  await expect(page.locator('[data-agent-notice="restoring"]')).toHaveCount(0)
   await expect(page.locator('[data-agent-error="close"] summary')).toBeVisible()
   await page.locator('[data-agent-error="close"] summary').click()
   await expect(page.getByText('Close failed: Previous close was not confirmed', { exact: true })).toBeVisible()
