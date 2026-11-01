@@ -440,6 +440,26 @@ pub(crate) mod wire_support {
             .map(|(_, v)| v.as_str())
     }
 
+    async fn read_until_buffered(
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+        buf: &mut Vec<u8>,
+        needle: &[u8],
+    ) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(pos) = find_subslice(buf, needle) {
+                let end = pos + needle.len();
+                return buf.drain(..end).collect();
+            }
+            let mut tmp = [0u8; 8192];
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return std::mem::take(buf);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
     impl Wire {
         pub(crate) fn new(stream: tokio::net::TcpStream) -> Self {
             Self {
@@ -456,19 +476,7 @@ pub(crate) mod wire_support {
         /// Read until `needle` (inclusive) and return it, retaining any
         /// over-read bytes in the buffer.
         pub(crate) async fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
-            use tokio::io::AsyncReadExt;
-            loop {
-                if let Some(pos) = find_subslice(&self.buf, needle) {
-                    let end = pos + needle.len();
-                    return self.buf.drain(..end).collect();
-                }
-                let mut tmp = [0u8; 8192];
-                let n = self.stream.read(&mut tmp).await.unwrap();
-                if n == 0 {
-                    return std::mem::take(&mut self.buf);
-                }
-                self.buf.extend_from_slice(&tmp[..n]);
-            }
+            read_until_buffered(&mut self.stream, &mut self.buf, needle).await
         }
 
         pub(crate) async fn read_n(&mut self, n: usize) -> Vec<u8> {
@@ -585,28 +593,64 @@ pub(crate) mod wire_support {
 
     /// Send verbatim request bytes and read the full framed response.
     pub(crate) async fn raw_exchange(port: u16, request: &[u8]) -> RawResponse {
+        raw_exchange_with_early_rejection(port, request, None).await
+    }
+
+    pub(super) async fn raw_exchange_with_early_rejection(
+        port: u16,
+        request: &[u8],
+        expected_rejection: Option<u16>,
+    ) -> RawResponse {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            use tokio::io::AsyncWriteExt;
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
-            let mut wire = Wire::new(stream);
-            wire.write_all(request).await;
-            let head = wire.read_until(b"\r\n\r\n").await;
+            let mut buf = Vec::new();
+            // HTTP permits a final rejection before the request body finishes.
+            // Read it while uploading rather than requiring a complete upload
+            // before observing a server that has already closed its read side.
+            let (written, head) = {
+                let (mut reader, mut writer) = stream.split();
+                tokio::join!(
+                    writer.write_all(request),
+                    read_until_buffered(&mut reader, &mut buf, b"\r\n\r\n")
+                )
+            };
+            let mut wire = Wire { stream, buf };
+            assert!(head.ends_with(b"\r\n\r\n"), "complete HTTP response head");
             let (status_line, headers) = parse_head(&head);
             let body =
                 if header_values(&headers, "transfer-encoding").any(|v| v.contains("chunked")) {
                     wire.read_chunked().await
                 } else if let Some(cl) = header_values(&headers, "content-length").next() {
-                    wire.read_n(cl.parse().expect("content-length integer"))
-                        .await
+                    let expected = cl.parse().expect("content-length integer");
+                    let body = wire.read_n(expected).await;
+                    assert_eq!(body.len(), expected, "complete framed response body");
+                    body
                 } else {
                     wire.read_to_eof().await
                 };
-            RawResponse {
+            let response = RawResponse {
                 status_line,
                 headers,
                 body,
+            };
+            if let Err(error) = written {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "request upload failed: {error}"
+                );
+                assert_eq!(
+                    Some(response.status_code()),
+                    expected_rejection,
+                    "upload closed before the explicitly expected HTTP rejection: {error}"
+                );
             }
+            response
         })
         .await
         .expect("exchange timed out")
@@ -816,11 +860,15 @@ mod lb_probes {
         )
         .into_bytes();
         req.extend_from_slice(&big);
-        let resp = raw_exchange(port, &req).await;
+        let resp = wire_support::raw_exchange_with_early_rejection(port, &req, Some(413)).await;
         assert_eq!(
             resp.status_code(),
             413,
             "Bytes extraction must hit axum's 2 MiB DefaultBodyLimit"
+        );
+        assert!(
+            !resp.body.is_empty(),
+            "body-limit rejection carries a response body"
         );
 
         let body_app = Router::new().route(
