@@ -354,13 +354,20 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
     .await;
     assert_eq!(settled["terminalId"], serde_json::json!(current_tid));
     assert_eq!(settled["exitCode"], serde_json::json!(1));
-    assert_eq!(spawn_count(&count_file), 3, "original plus exactly two retries");
+    assert_eq!(
+        spawn_count(&count_file),
+        3,
+        "original plus exactly two retries"
+    );
     assert_eq!(
         registry.newest_by_create_request_id(create_request_id),
         Some(current_tid.clone()),
     );
     assert_eq!(
-        registry.probe(&current_tid).expect("newest row remains").status,
+        registry
+            .probe(&current_tid)
+            .expect("newest row remains")
+            .status,
         freshell_protocol::TerminalRunStatus::Exited,
     );
 }

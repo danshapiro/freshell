@@ -26,10 +26,13 @@ afterEach(() => {
 })
 
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-preflight-'))
+  const root = fs.mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'freshell-build-preflight-'))
   owned.push(root)
   execFileSync('git', ['init', '--quiet', root], { timeout: 30_000, killSignal: 'SIGKILL' })
   execFileSync('git', ['-C', root, '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'], { timeout: 30_000, killSignal: 'SIGKILL' })
+  const manifestPath = path.join(root, 'docs/development/runtime-provider-capabilities.json')
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true })
+  fs.copyFileSync(path.resolve(import.meta.dirname, '../../../../docs/development/runtime-provider-capabilities.json'), manifestPath)
   const cargo = path.join(root, 'cargo.cjs')
   fs.writeFileSync(cargo, `const fs = require('node:fs'), path = require('node:path');
 const args = process.argv.slice(2);
@@ -56,6 +59,32 @@ for (let i=0; i<args.length; i++) if (args[i] === '-p') {
   const command = { program: process.execPath, args: [cargo] }
   const rows = () => fs.existsSync(env.BUILD_LOG) ? fs.readFileSync(env.BUILD_LOG, 'utf8').trim().split('\n').map(row => JSON.parse(row) as string[]) : []
   return { root, project, command, rows }
+}
+
+async function installMiseFixture(f: ReturnType<typeof fixture>) {
+  const mise = path.join(f.root, '.local/bin/mise')
+  fs.mkdirSync(path.dirname(mise), { recursive: true })
+  fs.writeFileSync(mise, `#!${process.execPath}
+const { execFileSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (args[0] !== 'exec' || args[1] !== 'rust@1.96.0' || args[2] !== '--') {
+  throw new Error('wrong compiler selection');
+}
+if (args[3] === 'rustc' && args[4] === '--version') {
+  process.stdout.write('rustc fixture-host-version\\n');
+} else {
+  if (args[3] !== 'cargo' || args[4] !== 'build' || !args.includes('--locked')) {
+    throw new Error('unexpected or unlocked build');
+  }
+  execFileSync(process.execPath, [${JSON.stringify(f.command.args[0])}, ...args], { stdio: 'inherit' });
+}
+`, { mode: 0o755 })
+  vi.spyOn(os, 'homedir').mockReturnValue(f.root)
+  vi.stubEnv('CARGO_TARGET_DIR', f.project.config.env.CARGO_TARGET_DIR)
+  vi.stubEnv('BUILD_LOG', f.project.config.env.BUILD_LOG)
+  const { execFileSync: execute } = await vi.importActual<typeof import('node:child_process')>('node:child_process')
+  childFixture.execute = (program, args, options) => program === 'docker'
+    ? 'fixture client/server' : execute(program, args, options)
 }
 
 function snapshotExecutables(files: string[]) {
@@ -151,6 +180,12 @@ describe('managed runtime build preparation before suite startup', () => {
 
   it('uses the prepared executables in the actual runtime and browser rig build methods without invoking Cargo again', async () => {
     const f = fixture()
+    const manifestPath = path.join(f.root, 'docs/development/runtime-provider-capabilities.json')
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true })
+    const manifest = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname,
+      '../../../../docs/development/runtime-provider-capabilities.json'), 'utf8'))
+    manifest.providers.find((provider: { provider: string }) => provider.provider === 'claude').certificationState = 'pending_live_provider_certification'
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest))
     const teardown = await setupRuntimeBuildPreflight(f.project, { command: f.command })
     vi.stubEnv(RUNTIME_BUILD_MANIFEST_ENV, f.project.config.env[RUNTIME_BUILD_MANIFEST_ENV])
     const runtime = new RuntimeHarness(f.root, undefined, 2)
@@ -207,32 +242,18 @@ describe('managed runtime build preparation before suite startup', () => {
 
   it('builds default runtime artifacts with the exact reported mise command and labels the host version', async () => {
     const f = fixture()
+    await installMiseFixture(f)
     const runtime = new RuntimeHarness(f.root, undefined, 2)
-    const builds: string[][] = []
-    childFixture.execute = (program, args) => {
-      if (program === 'docker') return 'fixture client/server'
-      if (!program.endsWith('/mise')) throw new Error('unexpected builder')
-      if (args.includes('rustc')) return 'rustc fixture-host-version\n'
-      // This builder refuses a different compiler selection, before producing artifacts.
-      if (args[1] !== 'rust@1.96.0' || !args.includes('--locked')) throw new Error('wrong compiler or unlocked build')
-      builds.push(args)
-      const target = path.join(f.root, 'target', args.includes('--release') ? 'release' : 'debug')
-      fs.mkdirSync(target, { recursive: true })
-      for (const binary of ['freshell-supervisor', 'freshell-session-host']) {
-        fs.writeFileSync(path.join(target, binary), `#!/bin/sh\n# ${args.includes('--release') ? 'release' : 'test'}\n`, { mode: 0o755 })
-      }
-      return ''
-    }
     const methods = runtime as unknown as { buildBinaries(): void; collectBuildInfo(): any }
     methods.buildBinaries()
     const receipt = methods.collectBuildInfo()
     expect(receipt.build.source).toBe('mise')
     expect(receipt.build.hostMiseRustc).toBe('rustc fixture-host-version')
     expect(receipt).not.toHaveProperty('rustc')
-    expect(builds).toHaveLength(2)
-    for (const args of builds) expect(args.slice(0, 4)).toEqual(receipt.build.command.args)
-    expect(fs.readFileSync(runtime.testHostBinary, 'utf8')).toContain('# test')
-    expect(fs.readFileSync(runtime.releaseHostBinary, 'utf8')).toContain('# release')
+    expect(f.rows()).toHaveLength(2)
+    for (const args of f.rows()) expect(args.slice(0, 4)).toEqual(receipt.build.command.args)
+    expect(fs.readFileSync(runtime.testHostBinary, 'utf8')).toContain('# debug:freshell-supervisor/runtime-test-faults')
+    expect(fs.readFileSync(runtime.releaseHostBinary, 'utf8')).toContain('# release:default')
     fs.rmSync(runtime.buildDir, { recursive: true, force: true })
   })
 
@@ -240,24 +261,22 @@ describe('managed runtime build preparation before suite startup', () => {
     { enabledProviders: ['opencode'], feature: 'managed-runtime-v1' },
     { enabledProviders: ['codex'], feature: 'managed-provider-qualification' },
     { enabledProviders: ['codex'], fixtureFreshAgentModes: ['freshcodex'], feature: 'managed-fresh-agent-fixtures' },
-  ])('builds the selected browser server with the exact locked compiler: $feature', selection => {
+  ])('builds the selected browser server with the exact locked compiler: $feature', async selection => {
     const f = fixture()
+    await installMiseFixture(f)
+    if (selection.feature === 'managed-provider-qualification') {
+      const manifestPath = path.join(f.root, 'docs/development/runtime-provider-capabilities.json')
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      manifest.providers.find((provider: { provider: string }) => provider.provider === 'codex').certificationState = 'pending_live_provider_certification'
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+    }
     const rig = new ManagedRuntimeBrowserRig(f.root, 2, {}, {}, 'test', selection)
     fs.mkdirSync(rig.runtime.buildDir, { recursive: true })
-    const builds: string[][] = []
-    childFixture.execute = (program, args) => {
-      if (!program.endsWith('/mise') || args[1] !== 'rust@1.96.0' || !args.includes('--locked')) {
-        throw new Error('browser selected a different compiler or unlocked build')
-      }
-      builds.push(args)
-      const target = path.join(f.root, 'target/release')
-      fs.mkdirSync(target, { recursive: true })
-      fs.writeFileSync(path.join(target, 'freshell-server'), `#!/bin/sh\n# ${args[args.indexOf('--features') + 1]}\n`, { mode: 0o755 })
-      return ''
-    }
     const server = (rig as unknown as { buildManagedServer(): string }).buildManagedServer()
-    expect(fs.readFileSync(server, 'utf8')).toContain(`# ${selection.feature}`)
-    expect(builds).toHaveLength(1)
+    expect(fs.readFileSync(server, 'utf8')).toContain(`# release:${selection.feature}`)
+    expect(f.rows()).toHaveLength(1)
+    expect(f.rows()[0].slice(0, 5)).toEqual(['exec', 'rust@1.96.0', '--', 'cargo', 'build'])
+    expect(f.rows()[0]).toContain('--locked')
     fs.rmSync(rig.runtime.buildDir, { recursive: true, force: true })
   })
 

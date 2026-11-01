@@ -203,7 +203,10 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
             })
     })
     .await;
-    assert!(pending, "first submit must finish its snapshot before writing the rollout");
+    assert!(
+        pending,
+        "first submit must finish its snapshot before writing the rollout"
+    );
 
     // 2c. NOW write the rollout the locator must find. payload.cwd must
     //     match the terminal's cwd (the value send_create passed).
@@ -225,9 +228,11 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     // race that Enter into the tracker's queued-submit branch. The application
     // pong acknowledges dispatch of every preceding frame on this socket;
     // registry.input captures its activity timestamp synchronously.
-    ws.send(WsMessage::Text(serde_json::json!({ "type": "ping" }).to_string()))
-        .await
-        .expect("send second-submit ordering receipt");
+    ws.send(WsMessage::Text(
+        serde_json::json!({ "type": "ping" }).to_string(),
+    ))
+    .await
+    .expect("send second-submit ordering receipt");
 
     // Retain BOTH receipts in one drain: adoption can arrive before the pong,
     // and separate wait_for_frame calls would discard that earlier frame.

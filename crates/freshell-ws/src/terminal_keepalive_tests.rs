@@ -46,9 +46,8 @@ impl TickSource {
 // Same watchdog as the existing real-socket handshake helper. This bounds
 // transport failure; cycle advancement is entirely explicit below.
 const IO_WATCHDOG: Duration = Duration::from_secs(5);
-type Client = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Client =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn send_frame(client: &mut Client, frame: ClientMessage) {
     tokio::time::timeout(IO_WATCHDOG, client.send(frame))
@@ -124,7 +123,9 @@ async fn wire_pongs_keep_the_connection_alive_across_four_manual_cycles() {
         .expect("bind owned loopback listener");
     let addr = listener.local_addr().expect("owned listener address");
     let listener_task = tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("serve owned websocket fixture");
+        axum::serve(listener, router)
+            .await
+            .expect("serve owned websocket fixture");
     });
     let _owner = OwnedServer {
         listener: listener_task.abort_handle(),
@@ -149,12 +150,19 @@ async fn wire_pongs_keep_the_connection_alive_across_four_manual_cycles() {
         ),
     )
     .await;
-    for kind in ["ready", "settings.updated", "perf.logging", "terminal.inventory"] {
+    for kind in [
+        "ready",
+        "settings.updated",
+        "perf.logging",
+        "terminal.inventory",
+    ] {
         assert_eq!(next_json(&mut client).await["type"], kind);
     }
 
     for cycle in 0..4 {
-        ticks.send(()).expect("connection owns its manual tick source");
+        ticks
+            .send(())
+            .expect("connection owns its manual tick source");
         let payload = match next_frame(&mut client).await {
             ClientMessage::Ping(payload) => payload,
             other => panic!("cycle {cycle}: expected a server protocol Ping, got {other:?}"),
@@ -163,13 +171,22 @@ async fn wire_pongs_keep_the_connection_alive_across_four_manual_cycles() {
         // The application ping follows the protocol Pong on the same stream.
         // run_loop handles frames serially, so this reply proves the REAL
         // inbound Message::Pong arm ran before the next tick is released.
-        send_frame(&mut client, ClientMessage::Text(r#"{"type":"ping"}"#.into())).await;
+        send_frame(
+            &mut client,
+            ClientMessage::Text(r#"{"type":"ping"}"#.into()),
+        )
+        .await;
         assert_eq!(next_json(&mut client).await["type"], "pong");
     }
     // A fifth ping proves that the fourth Pong, too, retired its own cycle.
     // Removing inbound Pong handling closes the connection on tick two.
-    ticks.send(()).expect("connection still owns the manual source");
-    assert!(matches!(next_frame(&mut client).await, ClientMessage::Ping(_)));
+    ticks
+        .send(())
+        .expect("connection still owns the manual source");
+    assert!(matches!(
+        next_frame(&mut client).await,
+        ClientMessage::Ping(_)
+    ));
 
     send_frame(&mut client, ClientMessage::Close(None)).await;
     tokio::time::timeout(IO_WATCHDOG, done_rx)

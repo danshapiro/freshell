@@ -796,6 +796,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           <div
             ref={combinedRef}
             data-testid="tab-strip"
+            role="tablist"
+            aria-label="Workspace tabs"
             className={cn(
               "flex items-end gap-0.5 pt-px flex-1 min-w-0",
               multirowTabs

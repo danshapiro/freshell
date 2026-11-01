@@ -12,14 +12,19 @@ async fn tool_listing(url: &str, mcp: bool) -> Value {
     } else {
         command.args(["tools/freshell-cli/index.ts", "list-terminals"]);
     }
+    // A prebuilt test binary retains its compiler's source path. Runtime-suite
+    // execution owns the same repository at the sandbox's /workspace mount.
+    let workspace = if std::env::var("FRESHELL_SANDBOX_MODE").as_deref() == Ok("runtime-suite") {
+        Path::new("/workspace")
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+    };
     command
-        .current_dir(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap(),
-        )
+        .current_dir(workspace)
         .env("FRESHELL_URL", url)
         .env("FRESHELL_TOKEN", "synthetic-directory-token")
         .kill_on_drop(true);
@@ -77,6 +82,8 @@ async fn directory_fixture_with_retry(
         "recoveryAttemptId":"recovery-directory-retained"
     })).unwrap();
     let mut control_view = view.clone();
+    let dependency_repaired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control_dependency_repaired = dependency_repaired.clone();
     let (stop_control, mut control_stop) = tokio::sync::oneshot::channel();
     let control = tokio::spawn(async move {
         loop {
@@ -102,6 +109,8 @@ async fn directory_fixture_with_retry(
                 }
                 AdminCommand::TerminalReadOutput(read) => {
                     AdminResult::TerminalOutput(RuntimeOutputBatch {
+                        codex_activity: None,
+                        opencode_activity: None,
                         incarnation_id: incarnation.clone(),
                         terminal_id: "directory-retained".into(),
                         stream_epoch: "directory-epoch".into(),
@@ -127,14 +136,16 @@ async fn directory_fixture_with_retry(
                     })
                 }
                 AdminCommand::Recover(request) => {
-                    if request.trigger == RecoveryTrigger::ManualRetry {
+                    let ready = request.trigger == RecoveryTrigger::ManualRetry
+                        && control_dependency_repaired.load(Ordering::SeqCst);
+                    if ready {
                         control_view.recovery_state = RecoveryState::Live;
                         control_view.launch_state = LaunchState::Running;
                         control_view.cleanup_state = CleanupState::None;
                         control_view.recovery_reason = None;
                     }
                     AdminResult::Recovery(RecoveryResult {
-                        outcome: if request.trigger == RecoveryTrigger::ManualRetry {
+                        outcome: if ready {
                             RecoveryOutcome::AlreadyLive
                         } else {
                             outcome
@@ -148,9 +159,26 @@ async fn directory_fixture_with_retry(
                         incident_id: control_view.incident_id.clone(),
                     })
                 }
-                AdminCommand::TerminalInput(_) => AdminResult::TerminalInput {
-                    state: CommandState::Completed,
-                },
+                AdminCommand::TerminalInput(_) => {
+                    if control_view.recovery_state != RecoveryState::Live {
+                        write_frame(
+                            &mut peer,
+                            &AdminReply {
+                                request_id: request.request_id,
+                                result: Err(RuntimeError::new(
+                                    RuntimeErrorCode::RecoveryBlocked,
+                                    "the fixture dependency remains unavailable",
+                                )),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        continue;
+                    }
+                    AdminResult::TerminalInput {
+                        state: CommandState::Completed,
+                    }
+                }
                 other => panic!("unexpected managed directory command {other:?}"),
             };
             write_frame(
@@ -232,6 +260,9 @@ async fn directory_fixture_with_retry(
         let initial = registry
             .managed_input("directory-retained", "blocked bytes".into())
             .await;
+        // Input is also an explicit retry signal. Keep the original dependency
+        // unavailable for that attempt, then repair it before the HTTP retry.
+        dependency_repaired.store(true, Ordering::SeqCst);
         // Retain the result, and assert after both fixtures have actually joined.
         let response = client
             .post(format!("{url}/api/runtime/souls/{soul}/retry"))

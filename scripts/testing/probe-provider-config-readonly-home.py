@@ -232,6 +232,8 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--indexed-inputs", action="store_true")
     parser.add_argument("--receipt-dir", type=Path)
+    parser.add_argument("--copier-test-binary", type=Path)
+    parser.add_argument("--host-test-binary", type=Path)
     args = parser.parse_args()
     security = json.loads(docker("info", "--format", "{{json .SecurityOptions}}").stdout)
     if "name=rootless" not in security:
@@ -245,6 +247,11 @@ def main():
             raise RuntimeError("indexed fixture requires an existing receipt directory")
         indexed_inputs_probe(image, binary, binary_sha256, args.receipt_dir)
         return
+    binary_parent = args.binary.resolve(strict=True).parent
+    copier_test = (args.copier_test_binary or binary_parent / "freshell-provider-config-platform-tests").resolve(strict=True)
+    host_test = (args.host_test_binary or binary_parent / "freshell-provider-config-host-tests").resolve(strict=True)
+    test_hashes = {"copierTestSha256": hashlib.sha256(copier_test.read_bytes()).hexdigest(),
+                   "hostTestSha256": hashlib.sha256(host_test.read_bytes()).hexdigest()}
     owned_name = "freshell-config-probe-" + uuid.uuid4().hex
     label = "com.freshell.provider-config-probe=" + owned_name
     with tempfile.TemporaryDirectory(prefix=owned_name) as temporary:
@@ -304,6 +311,8 @@ def main():
                 "--mount", f"type=volume,src={owned_name},dst=/home/freshell/provider",
                 "--mount", f"type=bind,src={stage},dst=/probe-stage,readonly",
                 "--mount", f"type=bind,src={binary},dst=/runtime/freshell-session-host,readonly",
+                "--mount", f"type=bind,src={copier_test},dst=/runtime/copier-tests,readonly",
+                "--mount", f"type=bind,src={host_test},dst=/runtime/host-tests,readonly",
                 "--entrypoint", "/bin/sh", image, "-ceu", r'''
 home=/home/freshell/provider
 mkdir "$home/skills"
@@ -313,7 +322,41 @@ printf '["skills","skills/old.sh"]' > "$home/.freshell-config-projection.json"
 chmod 700 "$home" "$home/skills"
 chmod 640 "$home/skills/provider-sibling"
 chown -R 65534:0 "$home"
-setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- /bin/sh -ceu '
+selected=3
+executed=0
+passed=0
+failed=0
+run_group() {
+  phase="$1"
+  script="$2"
+  executed=$((executed + 1))
+  if setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- /bin/sh -ceu '
+    home=/home/freshell/provider
+    export HOME="$home" TMPDIR="$home"
+    test "$(id -u)" = 65534
+    test "$(id -g)" = 0
+    test "$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status)" = 0000000000000000
+    home_dev=$(stat -c %d "$home")
+    temp_dev=$(stat -c %d /tmp)
+    test "$home_dev" != "$temp_dev"
+    printf "{\"phase\":\"%s\",\"uid\":65534,\"gid\":0,\"capabilities\":0,\"homeDevice\":%s,\"tmpDevice\":%s}\n" "$1" "$home_dev" "$temp_dev"
+    if touch /home/freshell/config-probe-outside-home 2>/dev/null; then exit 1; fi
+    exec /bin/sh -ceu "$2"
+  ' probe "$phase" "$script"; then
+    passed=$((passed + 1))
+    printf '{"group":"%s","outcome":"passed"}\n' "$phase"
+  else
+    failed=$((failed + 1))
+    printf '{"group":"%s","outcome":"failed"}\n' "$phase"
+  fi
+}
+run_group initial '
+failed_tests=0
+/runtime/host-tests --exact tests::created_path_ownership::initial_home_becomes_private_before_handoff_and_refresh_keeps_its_inode || failed_tests=1
+/runtime/host-tests --exact pty::managed_opencode_adoption_tests::adoption_expectation_is_provider_owned_private_and_removed_with_gate || failed_tests=1
+exit "$failed_tests"
+'
+run_group exact_resume '
 home=/home/freshell/provider
 test "$(id -u)" = 65534
 test "$(id -g)" = 0
@@ -354,7 +397,15 @@ for attempt in 1 2 3; do
 done
 test -z "$(find "$home" -maxdepth 1 -name ".freshell-copy-*" -print)"
 '
-printf 'readonly-home-provider-helper PASS uid=65534 gid=0 caps=0 stable-home retained-sibling executable-resource stale-removed failed-refresh-preserved retry nested-codex-alias-three-resumes\n'
+run_group rollback_fault '
+failed_tests=0
+/runtime/copier-tests --exact provider_environment::tests::publication_failure_after_first_replacement_restores_original_inodes || failed_tests=1
+/runtime/host-tests --exact tests::created_path_ownership::bootstrap_late_publication_failure_restores_replacements_and_removes_only_new_paths || failed_tests=1
+exit "$failed_tests"
+'
+printf '{"selected":%s,"executed":%s,"passed":%s,"failed":%s,"skipped":0}\n' "$selected" "$executed" "$passed" "$failed"
+test "$executed" = "$selected"
+test "$failed" = 0
 '''
             )
             inspection = json.loads(docker("inspect", owned_name).stdout)[0]
@@ -362,14 +413,25 @@ printf 'readonly-home-provider-helper PASS uid=65534 gid=0 caps=0 stable-home re
             assert not inspection["HostConfig"]["Privileged"]
             assert inspection["HostConfig"]["CapDrop"] == ["ALL"]
             assert {cap.removeprefix("CAP_") for cap in inspection["HostConfig"]["CapAdd"]} == {"CHOWN", "SETUID", "SETGID"}
-            assert len(inspection["Mounts"]) == 3
+            assert len(inspection["Mounts"]) == 5
             assert all("docker.sock" not in mount["Destination"] for mount in inspection["Mounts"])
-            print(json.dumps({"probe": owned_name, "image": image, "binarySha256": binary_sha256, "rootless": True,
+            print(json.dumps({"probe": owned_name, "image": image, "binarySha256": binary_sha256, **test_hashes, "rootless": True,
                               "readOnlyRootfs": True, "capAdd": inspection["HostConfig"]["CapAdd"], "mounts": inspection["Mounts"]}), flush=True)
             outcome = docker("start", "--attach", owned_name, check=False)
             print(outcome.stdout, end="", flush=True)
             print(outcome.stderr, end="", flush=True)
             state = json.loads(docker("inspect", owned_name).stdout)[0]["State"]
+            fatal = [json.loads(line) for line in outcome.stderr.splitlines()
+                     if line.startswith('{') and json.loads(line).get("event") == "session_host.fatal"]
+            if not fatal or any(record.get("severity") != "error" for record in fatal):
+                raise RuntimeError("The real selected-resource worker failure must emit structured error severity")
+            groups = [json.loads(line) for line in outcome.stdout.splitlines() if line.startswith('{')]
+            summary = next((record for record in groups if "selected" in record), None)
+            if summary is None or summary["selected"] != 3 or summary["executed"] != 3 or summary["skipped"] != 0:
+                raise RuntimeError("Native probe did not execute all three mandatory groups")
+            # Unit binaries must positively execute each exact behavior, not silently match zero tests.
+            if outcome.stdout.count("running 1 test") != 4:
+                raise RuntimeError("Native probe unit selections did not each execute exactly one behavior")
             if state["ExitCode"] != 0:
                 raise RuntimeError(f"Provider helper container exited {state['ExitCode']}")
         finally:

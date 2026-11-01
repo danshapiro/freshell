@@ -180,7 +180,9 @@ function findRollout(threadId) {
  * metadata pair the server's rollout parser reads for the first-message
  * fallback and generation arming. */
 function appendUserRecords(rolloutPath, text) {
-  const prompt = String(text ?? '').trim()
+  const prompt = (Array.isArray(text)
+    ? text.map(part => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
+    : String(text ?? '')).trim()
   if (!rolloutPath || prompt.length === 0) return
   const now = new Date().toISOString()
   const lines = [
@@ -319,6 +321,21 @@ wss.on('connection', (socket) => {
               : {}),
           },
         })
+        break
+      }
+      case 'thread/turns/list': {
+        const threadId = message.params?.threadId ?? activeThreadId
+        const rolloutPath = threadRollouts.get(threadId)
+        // A prospective thread has no native history until its first real
+        // turn materializes the deferred rollout. Snapshot startup must see
+        // an actual empty page, never the unknown-method {} response.
+        if (rolloutPath && !fs.existsSync(rolloutPath)) {
+          respond({ data: [], nextCursor: null })
+        } else {
+          // This fixture exercises naming, not committed-history paging.
+          // Do not silently present a materialized conversation as empty.
+          respondError('turn history paging is unavailable for a materialized fixture rollout')
+        }
         break
       }
       case 'thread/name/set': {

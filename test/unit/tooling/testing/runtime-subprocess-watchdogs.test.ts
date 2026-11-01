@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const child = vi.hoisted(() => ({ execFileSync: vi.fn(), spawnSync: vi.fn(), spawn: vi.fn() }))
+const child = vi.hoisted(() => ({ execFile: vi.fn(), execFileSync: vi.fn(), spawnSync: vi.fn(), spawn: vi.fn() }))
 vi.mock('node:child_process', () => ({ ...child, default: child }))
 vi.mock('../../../setup/manager-command.js', () => ({
   resolveManagerExecFileCommand: () => ({ command: 'fixture-manager', args: ['run', 'build:tools'] }),
@@ -23,12 +23,35 @@ const containerId = 'b'.repeat(64)
 const timedOut = () => Object.assign(new Error('fixture subprocess watchdog expired'), { code: 'ETIMEDOUT' })
 const interrupted = (error: Error) => ({ error, status: null, signal: 'SIGKILL', stdout: '', stderr: '' })
 
+function gitResult(args: string[], options?: { encoding?: string }): string | Buffer {
+  const command = args.join(' ')
+  let value: string
+  if (command === 'rev-parse HEAD' || command === 'rev-parse --verify HEAD') value = `${revision}\n`
+  else if (command === 'status --porcelain'
+    || command === 'status --porcelain=v1 -z --untracked-files=all'
+    || command === 'diff --no-ext-diff --no-textconv --binary HEAD --') value = ''
+  else throw new Error(`unexpected Git probe in watchdog fixture: ${command}`)
+  return options?.encoding ? value : Buffer.from(value)
+}
+
+function cargoWorkerCalls() {
+  return child.execFileSync.mock.calls.filter(([, args]) =>
+    args.some((arg: string) => arg.endsWith('/runtime-cargo-artifacts-worker.mjs')))
+}
+
+function cargoWorkerRequest(call: unknown[]) {
+  const args = call[1] as string[]
+  return JSON.parse(args[args.length - 1])
+}
+
 beforeEach(() => {
   vi.resetAllMocks()
   vi.stubEnv('FRESHELL_RUNTIME_TEST_BUILD_MANIFEST', '')
   vi.stubEnv('FRESHELL_E2E_RUST_SERVER_BIN', '')
-  child.execFileSync.mockImplementation((program: string, args: string[]) => {
-    if (program === 'git' && args.join(' ') === 'rev-parse HEAD') return `${revision}\n`
+  vi.stubEnv('CARGO_TARGET_DIR', '')
+  vi.stubEnv('FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST', undefined)
+  child.execFileSync.mockImplementation((program: string, args: string[], options?: { encoding?: string }) => {
+    if (program === 'git') return gitResult(args, options)
     throw new Error(`unexpected executable in watchdog fixture: ${program}`)
   })
   child.spawnSync.mockImplementation(() => { throw new Error('unexpected synchronous child in watchdog fixture') })
@@ -54,7 +77,16 @@ function harness(phase: 1 | 2 = 1): RuntimeHarness {
 }
 
 function rig(): ManagedRuntimeBrowserRig {
-  const browser = new ManagedRuntimeBrowserRig(temporaryRoot(), 2, {}, {}, 'test', { enabledProviders: ['codex'] })
+  const root = temporaryRoot()
+  // Qualification state is an input to the builder, independent of the
+  // repository's current live-provider certification campaign.
+  const manifest = path.join(root, 'docs/development/runtime-provider-capabilities.json')
+  fs.mkdirSync(path.dirname(manifest), { recursive: true })
+  fs.writeFileSync(manifest, JSON.stringify({
+    certification: {},
+    providers: [{ provider: 'codex', certificationState: 'pending_live_provider_certification', qualificationReady: true }],
+  }))
+  const browser = new ManagedRuntimeBrowserRig(root, 2, {}, {}, 'test', { enabledProviders: ['codex'] })
   ownedDirectories.push(browser.runtime.testRoot)
   return browser
 }
@@ -101,15 +133,23 @@ describe('runtime synchronous subprocess watchdogs', () => {
       runtime.imageRef = `sha256:${'c'.repeat(64)}`
       runtime.testSupervisorBinary = path.join(runtime.buildDir, 'supervisor')
       runtime.testHostBinary = path.join(runtime.buildDir, 'host')
-      runtime.broker = { proxySocketPath: path.join(runtime.testRoot, 'docker.sock') } as typeof runtime.broker
+      runtime.broker = {
+        proxySocketPath: path.join(runtime.testRoot, 'docker.sock'),
+        historyHelperNames: () => [], settleForwarded: async () => true,
+        awaitPendingRequests: async () => [], receipts: () => [],
+        initialProviderVolumeCreations: () => [], receiptIds: () => new Set(),
+        candidateVolumeNames: () => [], eventsSnapshot: () => [], unsafeAttempts: () => [],
+      } as unknown as typeof runtime.broker
       fs.mkdirSync(runtime.buildDir, { recursive: true })
       fs.writeFileSync(path.join(runtime.buildDir, 'retained-build'), 'owned evidence')
       child.execFileSync.mockImplementation((program: string, args: string[]) => {
         if (program !== 'docker') throw new Error('unexpected executable')
         if (args[0] === 'volume') {
           if (resource === 'supervisor-volume' && args[1] === 'create') throw error
+          if (args[1] === 'ls') return ''
           return `${args[2]}\n`
         }
+        if (args[0] === 'ps') return ''
         if (args[0] === 'run') throw error
         throw new Error('unexpected Docker operation')
       })
@@ -149,17 +189,25 @@ describe('runtime synchronous subprocess watchdogs', () => {
     })
 
     expect(() => (runtime as unknown as { buildBinaries(): void }).buildBinaries()).toThrow(error)
-    const calls = child.execFileSync.mock.calls.filter(([program]) => program.endsWith('/mise'))
-    expect(calls).toHaveLength(2)
-    expect(calls[0][2]).toMatchObject({ timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
-    expect(calls[1][2]).toMatchObject({ timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL' })
+    const probes = child.execFileSync.mock.calls.filter(([program]) => program.endsWith('/mise'))
+    expect(probes).toHaveLength(1)
+    expect(probes[0][2]).toMatchObject({ timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
+    const builds = cargoWorkerCalls()
+    expect(builds).toHaveLength(1)
+    expect(cargoWorkerRequest(builds[0])).toMatchObject({
+      command: expect.stringMatching(/[/\\]mise$/), args: expect.arrayContaining(['cargo', 'build']),
+      timeoutMs: SYNC_BUILD_TIMEOUT_MS,
+    })
     expect(fs.existsSync(runtime.testSupervisorBinary)).toBe(false)
   })
 
   it('bounds the owned Docker image build without treating interruption as success', () => {
     const runtime = harness(2)
     const error = timedOut()
-    child.execFileSync.mockImplementation(() => { throw error })
+    child.execFileSync.mockImplementation((program: string, args: string[], options?: { encoding?: string }) => {
+      if (program === 'git') return gitResult(args, options)
+      throw error
+    })
     expect(() => (runtime as unknown as { ensureRuntimeImage(): void }).ensureRuntimeImage()).toThrow(error)
     expect(child.execFileSync).toHaveBeenLastCalledWith('docker', expect.arrayContaining(['build']), expect.objectContaining({
       timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL',
@@ -171,12 +219,18 @@ describe('runtime synchronous subprocess watchdogs', () => {
     'bounds the managed Cargo build and rejects interrupted output: %s', method => {
       const browser = rig()
       const error = timedOut()
-      child.execFileSync.mockImplementation(() => { throw error })
+      child.execFileSync.mockImplementation((program: string, args: string[], options?: { encoding?: string }) => {
+        if (program === 'git') return gitResult(args, options)
+        throw error
+      })
       const builders = browser as unknown as { buildManagedServer(): string; buildQualificationSupervisor(): string }
       expect(() => builders[method]()).toThrow(error)
-      expect(child.execFileSync).toHaveBeenLastCalledWith(expect.stringMatching(/[/\\]mise$/), expect.arrayContaining(['cargo', 'build']), expect.objectContaining({
-        timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL',
-      }))
+      const builds = cargoWorkerCalls()
+      expect(builds).toHaveLength(1)
+      expect(cargoWorkerRequest(builds[0])).toMatchObject({
+        command: expect.stringMatching(/[/\\]mise$/), args: expect.arrayContaining(['cargo', 'build']),
+        timeoutMs: SYNC_BUILD_TIMEOUT_MS,
+      })
     },
   )
 
@@ -199,11 +253,14 @@ describe('runtime synchronous subprocess watchdogs', () => {
     fs.mkdirSync(path.dirname(bin), { recursive: true })
     fs.writeFileSync(bin, 'stale artifact')
     const error = timedOut()
-    child.spawnSync.mockReturnValue(interrupted(error))
-    expect(() => ensureRustServerBuilt(root)).toThrow(error)
-    expect(child.spawnSync).toHaveBeenCalledExactlyOnceWith('cargo', expect.arrayContaining(['build', '--locked']), expect.objectContaining({
-      timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL',
-    }))
+    child.execFileSync.mockImplementation(() => { throw error })
+    expect(() => ensureRustServerBuilt(root)).toThrow(expect.objectContaining({ cause: error }))
+    const builds = cargoWorkerCalls()
+    expect(builds).toHaveLength(1)
+    expect(cargoWorkerRequest(builds[0])).toMatchObject({
+      command: 'cargo', args: expect.arrayContaining(['build', '--locked']), timeoutMs: SYNC_BUILD_TIMEOUT_MS,
+    })
+    expect(fs.readdirSync(path.join(root, '.runtime-build'))).toEqual([])
   })
 
   it('does not report an empty owned descendant tree when ps times out', () => {
@@ -238,14 +295,18 @@ describe('runtime synchronous subprocess watchdogs', () => {
   it('retains web-server cleanup failure while still settling the managed runtime', async () => {
     const browser = rig()
     const error = timedOut()
+    child.execFileSync.mockImplementation((program: string, args: string[]) => {
+      if (program === 'docker' && (args[0] === 'ps' || args.join(' ') === 'volume ls --format {{.Name}}')) return ''
+      throw new Error(`unexpected cleanup command: ${program} ${args.join(' ')}`)
+    })
     browser.web = { stop: vi.fn().mockRejectedValue(error) } as unknown as typeof browser.web
     fs.mkdirSync(browser.runtime.buildDir, { recursive: true })
     fs.writeFileSync(path.join(browser.runtime.buildDir, 'retained-build'), 'owned evidence')
     const cleanup = vi.spyOn(browser.runtime, 'cleanup')
     const result = await browser.stop()
-    expect(cleanup).toHaveBeenCalledExactlyOnceWith([`web server: ${String(error)}`])
+    expect(cleanup).toHaveBeenCalledExactlyOnceWith([`web stop: ${error.message}`])
     expect(result.ok).toBe(false)
-    expect(result.errors.join('\n')).toContain(`web server: ${String(error)}`)
+    expect(result.errors).toEqual([`web stop: ${error.message}`])
     const receipt = JSON.parse(fs.readFileSync(path.join(browser.runtime.evidenceDir, 'cleanup.json'), 'utf8'))
     expect(receipt.ok).toBe(false)
     expect(receipt.errors).toEqual(result.errors)

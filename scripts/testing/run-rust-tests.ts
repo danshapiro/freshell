@@ -14,6 +14,10 @@ const SANDBOX_TOKIO_WORKER_THREADS = 2
 // All worktrees mount at /workspace; choose the namespace on the host first.
 const SANDBOX_TARGET_DIRECTORY = `/freshell-test-artifacts/targets/${createHash('sha256').update(PROJECT_ROOT).digest('hex').slice(0, 12)}`
 
+export function shouldRunProviderCrashRecoveryGate(platform: NodeJS.Platform, forwardedArgs: readonly string[]): boolean {
+  return platform !== 'win32' && forwardedArgs.length === 0
+}
+
 function log(severity: 'info' | 'error', event: string, fields: Record<string, unknown> = {}): void {
   const stream = severity === 'error' ? process.stderr : process.stdout
   stream.write(`${JSON.stringify({ severity, event, timestamp: new Date().toISOString(), ...fields })}\n`)
@@ -90,12 +94,23 @@ owned_tmp="$(mktemp -d /freshell-test-artifacts/.freshell-rust-tests-XXXXXXXX)"
 owned_runtime_tmp="$owned_tmp"
 runner_pid=
 remove_owned_temps() {
+  # Transfer fixtures deliberately seal ready directories. Restore only owner
+  # directory writes within our two roots; never follow links to other data.
+  for directory in "$owned_tmp" "$owned_runtime_tmp"; do
+    # Signal cleanup can run before EXIT cleanup; an absent root is settled.
+    if [ -d "$directory" ]; then
+      find -P "$directory" -type d -uid "$(id -u)" -exec chmod u+w -- {} + || return 1
+    fi
+  done
   rm -rf -- "$owned_tmp" "$owned_runtime_tmp"
 }
 cleanup() {
   status=$?
   trap - EXIT
-  remove_owned_temps || { [ "$status" -ne 0 ] || status=1; }
+  remove_owned_temps || {
+    printf '{"severity":"error","event":"rust_test_temp_cleanup_failed"}\\n' >&2
+    [ "$status" -ne 0 ] || status=1
+  }
   exit "$status"
 }
 interrupt() {
@@ -149,7 +164,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     ...process.env,
     FRESHELL_SERVER_BIN: binary,
   }
-  return runChild(cargo, ['test', '--workspace', '--locked', ...forwarded], env)
+  const testExitCode = await runChild(cargo, ['test', '--workspace', '--locked', ...forwarded], env)
+  if (testExitCode !== 0 || !shouldRunProviderCrashRecoveryGate(process.platform, forwarded)) return testExitCode
+
+  // The destructive provider-recovery parents stay ignored in ordinary host
+  // Cargo runs. Schedule their exact selector in the disposable runtime suite
+  // after the full workspace run so the normal Rust gate covers crash recovery.
+  if (process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite') {
+    return runChild(process.execPath, [
+      '--import', 'tsx', path.join(PROJECT_ROOT, 'scripts/testing/provider-crash-recovery-tests.ts'),
+    ], env)
+  }
+  return runChild('bash', [
+    'scripts/sandbox-test.sh',
+    '--runtime-suite',
+    'pnpm exec tsx scripts/testing/provider-crash-recovery-tests.ts',
+  ], env)
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

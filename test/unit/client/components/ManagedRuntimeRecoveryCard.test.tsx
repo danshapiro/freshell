@@ -1,7 +1,13 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
 import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
-import { ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
+import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
+import { buildReconcileRequest, foldVerdicts } from '@/lib/pane-reconcile'
+import { DEAD_SESSION_RECONCILE_NOTICES } from '@/lib/dead-session-notice'
+import panesReducer, { initLayout } from '@/store/panesSlice'
+import type { TerminalPaneContent } from '@/store/paneTypes'
+import type { AppDispatch, RootState } from '@/store/store'
 
 function summary(recoveryState: ManagedRuntimeRecoverySummary['recoveryState']): ManagedRuntimeRecoverySummary {
   return {
@@ -70,6 +76,93 @@ describe('ManagedRuntimeRecoveryCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
     expect(await screen.findByRole('status')).toHaveTextContent('Provider is unavailable')
     expect(screen.getByRole('alert')).toBeInTheDocument()
+  })
+
+  it('resumes a repaired conversation through retry and prevents duplicate activation', async () => {
+    let resolveRetry!: () => void
+    const onRetry = vi.fn(() => new Promise<void>((resolve) => { resolveRetry = resolve }))
+    const onStartFresh = vi.fn()
+    const recoverySummary = summary('data_repair_complete')
+    render(
+      <>{isManagedRuntimeRecoveryDecision(recoverySummary)
+        ? <ManagedRuntimeRecoveryCard recoverySummary={recoverySummary} onRetry={onRetry} onStartFresh={onStartFresh} />
+        : null}</>,
+    )
+
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent(/restored conversation is ready to resume/i)
+    const resumeButton = screen.getByRole('button', { name: 'Resume restored session' })
+    fireEvent.click(resumeButton)
+    expect(resumeButton).toBeDisabled()
+    fireEvent.click(resumeButton)
+    expect(onRetry).toHaveBeenCalledTimes(1)
+    expect(onStartFresh).not.toHaveBeenCalled()
+
+    resolveRetry()
+    await waitFor(() => expect(resumeButton).toBeEnabled())
+  })
+
+  it('keeps a repaired conversation card and shows resume failures without calling start-fresh', async () => {
+    const onRetry = vi.fn().mockRejectedValue(new Error('The restored conversation has not resumed yet. Try again.'))
+    const onStartFresh = vi.fn()
+    render(
+      <ManagedRuntimeRecoveryCard
+        recoverySummary={summary('data_repair_complete')}
+        onRetry={onRetry}
+        onStartFresh={onStartFresh}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume restored session' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('The restored conversation has not resumed yet. Try again.')
+    expect(screen.getByRole('alert')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).not.toHaveTextContent(/could not be recovered|lost/i)
+    expect(onRetry).toHaveBeenCalledTimes(1)
+    expect(onStartFresh).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('preserves a repaired managed Resume decision beside legacy reconciliation: %s', async (withLegacy) => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    const managed: TerminalPaneContent = {
+      kind: 'terminal', mode: 'opencode', shell: 'system', status: 'exited',
+      createRequestId: 'managed-repaired-request', soulId: 'repaired-soul', viewIntentId: 'retained-view',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_volume_only' },
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'data_repair_complete',
+        durabilityState: 'resume_captured', allocationState: 'allocated' },
+    }
+    store.dispatch(initLayout({ tabId: 'managed-tab', paneId: 'managed', content: managed }))
+    if (withLegacy) store.dispatch(initLayout({
+      tabId: 'legacy-tab', paneId: 'legacy', content: {
+        kind: 'terminal', mode: 'claude', shell: 'system', createRequestId: 'legacy-missing-request',
+        sessionRef: { provider: 'claude', sessionId: 'gone' },
+      },
+    }))
+    const before = store.getState().panes.layouts['managed-tab']
+    const request = buildReconcileRequest(store.getState() as unknown as RootState)
+    expect(request?.panes.map(pane => pane.paneKey) ?? []).toEqual(withLegacy ? ['legacy-tab:legacy'] : [])
+    if (request) foldVerdicts(store.dispatch as AppDispatch, request, {
+      type: 'pane.reconcile.result', reconcileId: request.reconcileId,
+      bootId: 'boot', serverInstanceId: 'server',
+      verdicts: request.panes.map(pane => ({
+        paneKey: pane.paneKey, verdict: 'dead_session', reason: 'session_not_on_disk', sessionRef: pane.sessionRef,
+      })),
+    })
+    expect(store.getState().panes.layouts['managed-tab']).toEqual(before)
+    if (withLegacy) {
+      const legacy = store.getState().panes.layouts['legacy-tab']
+      expect(legacy).toMatchObject({ type: 'leaf', content: {
+        restoreError: { reason: 'durable_artifact_missing' },
+        reconcileNotice: DEAD_SESSION_RECONCILE_NOTICES.missing,
+      } })
+    }
+    const onRetry = vi.fn().mockResolvedValue(undefined)
+    const onStartFresh = vi.fn()
+    render(<ManagedRuntimeRecoveryCard recoverySummary={managed.recoverySummary}
+      onRetry={onRetry} onStartFresh={onStartFresh} />)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume restored session' }))
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1))
+    expect(onStartFresh).not.toHaveBeenCalled()
   })
 
   it('renders neutral lost copy and waits for an explicit start-new click', () => {

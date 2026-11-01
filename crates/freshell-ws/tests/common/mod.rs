@@ -785,13 +785,8 @@ pub async fn spawn_server_with_specs_hub_and_state(
     delays: Vec<u64>,
     identity_grace_delays: Vec<u64>,
 ) -> (String, freshell_terminal::TerminalRegistry, WsState) {
-    spawn_server_with_specs_hub_and_state_inner(
-        cli_commands,
-        delays,
-        identity_grace_delays,
-        None,
-    )
-    .await
+    spawn_server_with_specs_hub_and_state_inner(cli_commands, delays, identity_grace_delays, None)
+        .await
 }
 
 /// Retry-exhaustion fixtures hold real children until their generation's

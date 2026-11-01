@@ -15,6 +15,7 @@
 // (PinnedClaudeMissingError): nothing here is ever skipped.
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -29,6 +30,7 @@ const HARNESS = path.join(__dirname, 'claude-permission-contract.mjs')
 type Frame = Record<string, any>
 interface ScenarioReceipt {
   failure?: string
+  cleanupFailure?: string
   fixtureRemoved: boolean
   sidecarExit?: { code: number | null; signal: string | null }
   frames: Frame[]
@@ -63,7 +65,7 @@ const ACCEPT_EDITS = { type: 'setMode', mode: 'acceptEdits', destination: 'sessi
 
 describe(`Claude permission suggestions and plan approvals over the pinned CLI ${PINNED_CLI_VERSION} and a local provider`, () => {
   beforeAll(async () => {
-    child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+    child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
       cwd: REPO_ROOT,
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -177,12 +179,77 @@ describe(`Claude permission suggestions and plan approvals over the pinned CLI $
 // containment: cleanup failures surface through the receipt
 // (fixtureRemoved=false), never as a crash that eats it.
 describe('Claude permission contract harness survives a fixture-cleanup failure', () => {
+  it('retains the fixture when the sidecar reports an unclean exit', async () => {
+    const fixturePrefix = `freshell-claude-perm-unclean-${randomUUID()}`
+    const fixtureParent = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-unclean-receipt-'))
+    let child: ChildProcess | undefined
+    let closed = Promise.resolve()
+    let stdout = ''
+    let stderr = ''
+    try {
+      child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT], {
+        cwd: REPO_ROOT,
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          LANG: 'C.UTF-8',
+          TMPDIR: fixtureParent,
+          FRESHELL_CLAUDE_PERMISSION_FIXTURE_PREFIX: fixturePrefix,
+          FRESHELL_CLAUDE_PERMISSION_TEST_UNCLEAN_EXIT_SCENARIO: 'plan-empty',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      const harness = child
+      closed = new Promise<void>((resolve) => harness.once('close', () => resolve()))
+      harness.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
+      harness.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          harness.kill('SIGTERM')
+          reject(new Error(`the unclean-exit harness run timed out; stderr=${stderr.slice(-2000)}`))
+        }, 200_000)
+        timer.unref()
+        harness.once('error', (error) => {
+          clearTimeout(timer)
+          reject(error)
+        })
+        harness.once('close', (code, signal) => {
+          clearTimeout(timer)
+          resolve({ code, signal })
+        })
+      })
+
+      const lines = stdout.trim().split('\n').filter(Boolean)
+      expect(lines, `the receipt must survive an unclean sidecar exit; stderr tail: ${stderr.slice(-2000)}`).toHaveLength(1)
+      const uncleanReceipt = JSON.parse(lines[0]!) as Receipt
+      expect(uncleanReceipt.scenarios['plan-empty']).toMatchObject({
+        fixtureRemoved: false,
+        cleanupFailure: expect.stringContaining('sidecar did not complete a clean shutdown'),
+        sidecarExit: { code: 1, signal: null },
+      })
+      expect(uncleanReceipt.scenarios['plan-empty']!.failure, 'only the synthetic unclean exit failed').toBe(uncleanReceipt.scenarios['plan-empty']!.cleanupFailure)
+      const uncleanEvents = stderr.split('\n').flatMap((line) => {
+        try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
+      }).filter((event) => event.event === 'sidecar.unclean_exit' && event.scenario === 'plan-empty')
+      expect(uncleanEvents).toHaveLength(1)
+      const event = uncleanEvents[0]!
+      expect(event).toMatchObject({ exitCode: 1, signal: null })
+      expect(typeof event.fixtureRoot).toBe('string')
+      expect(typeof event.sidecarPid).toBe('number')
+      await expect(fs.stat(event.fixtureRoot as string)).resolves.toBeDefined()
+      expect(exit).toEqual({ code: 1, signal: null })
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await closed
+      await fs.rm(fixtureParent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    }
+  }, 220_000)
+
   it('still prints one receipt line reporting fixtureRemoved=false for every scenario instead of crashing', async () => {
     // Fail the removal itself after the harness has joined every owned writer.
     // A private parent contains both the retained fixtures and our final cleanup.
     const fixtureParent = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-cleanup-receipt-'))
 
-    const child = spawn(process.execPath, [HARNESS, REPO_ROOT, '--fail-fixture-removal'], {
+    const child = spawn(process.execPath, ['--import', 'tsx', HARNESS, REPO_ROOT, '--fail-fixture-removal'], {
       cwd: REPO_ROOT,
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8', TMPDIR: fixtureParent },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -213,10 +280,17 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
       const sabotagedReceipt = JSON.parse(lines[0]!) as Receipt
       expect(Object.keys(sabotagedReceipt.scenarios)).toHaveLength(8)
       for (const name of Object.keys(sabotagedReceipt.scenarios)) {
-        expect(sabotagedReceipt.scenarios[name]!.failure, `${name}: only cleanup was forced to fail; ${stderr.slice(-2000)}`).toBeUndefined()
-        expect(sabotagedReceipt.scenarios[name]!.sidecarExit, name).toEqual({ code: 0, signal: null })
-        expect(sabotagedReceipt.scenarios[name]!.fixtureRemoved, `${name}: the receipt reports the cleanup failure`).toBe(false)
+        const scenario = sabotagedReceipt.scenarios[name]!
+        expect(scenario.sidecarExit, name).toEqual({ code: 0, signal: null })
+        expect(scenario.fixtureRemoved, `${name}: the receipt reports the cleanup failure`).toBe(false)
+        expect(scenario.cleanupFailure, `${name}: the receipt explains the injected cleanup failure`).toBe('fixture cleanup failed: injected fixture removal failure')
+        expect(scenario.failure, `${name}: only cleanup was forced to fail; ${stderr.slice(-2000)}`).toBe(scenario.cleanupFailure)
       }
+      const cleanupEvents = stderr.split('\n').flatMap((line) => {
+        try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
+      }).filter((event) => event.event === 'fixture.cleanup_failed')
+      expect(cleanupEvents).toHaveLength(8)
+      expect(cleanupEvents.every((event) => typeof event.fixtureRoot === 'string' && typeof event.sidecarPid === 'number')).toBe(true)
       expect(exit.code).toBe(1)
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')

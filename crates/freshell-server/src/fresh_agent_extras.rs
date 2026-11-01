@@ -865,14 +865,17 @@ mod tests {
             // SAFETY: stderr owns a live pipe descriptor. F_DUPFD_CLOEXEC
             // atomically gives this test an independently owned read end.
             let raw = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-            assert!(raw >= 0, "duplicate diff stderr: {}", std::io::Error::last_os_error());
+            assert!(
+                raw >= 0,
+                "duplicate diff stderr: {}",
+                std::io::Error::last_os_error()
+            );
             // SAFETY: fcntl returned a fresh descriptor whose ownership is
             // transferred exactly once into this OwnedFd.
             let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-            let pipe = tokio::process::ChildStderr::from_std(
-                std::process::ChildStderr::from(owned),
-            )
-            .expect("register the diff-driver settlement pipe");
+            let pipe =
+                tokio::process::ChildStderr::from_std(std::process::ChildStderr::from(owned))
+                    .expect("register the diff-driver settlement pipe");
             *self.driver_exit_pipe.lock().unwrap() = Some(pipe);
         }
 
@@ -924,8 +927,12 @@ mod tests {
             // cancellation/kill branch, not a fabricated diff or error.
             // The FIFO remains held, so normal completion is an error.
             let result = tokio::time::timeout(std::time::Duration::ZERO, &mut future).await;
-            assert!(result.is_err(), "blocked diff completed instead of timing out");
-            self.expired.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                result.is_err(),
+                "blocked diff completed instead of timing out"
+            );
+            self.expired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             result
         }
     }
