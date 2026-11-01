@@ -62,6 +62,8 @@ describe('FreshAgentDiffPanel', () => {
     ['rename source distinct from destination', [{ id: 'native', diff: 'diff --git a/old b/new\nrename from old\nrename to new\ndiff --git a/old b/old\n+++ /dev/null' }], '2 changed files'],
     ['binary headers', [{ id: 'native', diff: 'diff --git a/a.png b/a.png\nBinary files a/a.png and b/a.png differ\ndiff --git a/b.png b/b.png\nGIT binary patch\nliteral 1\nA' }], '2 changed files'],
     ['unquoted spaces', [{ id: 'native', diff: 'diff --git a/has spaces.ts b/has spaces.ts\n@@ -1 +1 @@\n-x\n+y' }], '1 changed file'],
+    ['unquoted delimiter-like spaces', [{ id: 'native', diff: 'diff --git a/one b/shared.ts b/one b/shared.ts\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/two b/shared.ts b/two b/shared.ts\n@@ -1 +1 @@\n-old\n+new' }], '2 changed files'],
+    ['ambiguous unequal unquoted paths', [{ id: 'native', diff: 'diff --git a/old b/shared.ts b/new b/shared.ts\n@@ -1 +1 @@\n-old\n+new' }], 'file count unavailable'],
     ['quoted and UTF-8 octal paths', [{ id: 'native', diff: 'diff --git "a/has spaces.ts" "b/has spaces.ts"\n@@ -1 +1 @@\n-x\n+y\ndiff --git "a/\\303\\251.ts" "b/\\303\\251.ts"\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/é.ts b/é.ts\n@@ -1 +1 @@\n-x\n+y' }], '2 changed files'],
     ['hunk content resembling headers', [{ id: 'native', diff: 'diff --git a/a b/a\n@@ -1,3 +1,3 @@\n --- a/fake\n +++ b/fake\n+diff --git a/fake b/fake\n+rename to fake' }], '1 changed file'],
     ['overlapping structured and native paths', [{ id: 'a', path: '/repo/a' }, { id: 'native', diff: 'diff --git a/a b/a\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b b/b\n@@ -1 +1 @@\n-x\n+y' }], '1 changed file'],

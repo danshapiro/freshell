@@ -23,6 +23,26 @@ function decodeGitPath(value: string): string | null {
   } catch { return null }
 }
 
+/** Resolve builder header pairs without guessing at spaces inside filenames. */
+function patchHeaderPaths(pair: string): { source: string; destination: string } | null {
+  const tokenPattern = /^(?:"(?:\\.|[^"\\])*"|[ab]\/[^"\n]+)$/
+  const candidates: { source: string; destination: string }[] = []
+  // Unquoted builder paths may contain the separator itself. Consider every
+  // valid split, preferring the equal-path pair emitted for ordinary edits.
+  for (const separator of pair.matchAll(/ (?=b\/|")/g)) {
+    const sourceToken = pair.slice(0, separator.index)
+    const destinationToken = pair.slice(separator.index + 1)
+    if (!tokenPattern.test(sourceToken) || !tokenPattern.test(destinationToken)) continue
+    const source = decodeGitPath(sourceToken)
+    const destination = decodeGitPath(destinationToken)
+    if (source?.startsWith('a/') && destination?.startsWith('b/')) {
+      candidates.push({ source: source.slice(2), destination: destination.slice(2) })
+    }
+  }
+  const equalPaths = candidates.filter(({ source, destination }) => source === destination)
+  return equalPaths.length === 1 ? equalPaths[0] : candidates.length === 1 ? candidates[0] : null
+}
+
 /** Supplied patches establish cardinality only when each file has an actual header. */
 function patchPaths(patch: string): string[] | null {
   if (!patch.trim()) return []
@@ -31,13 +51,10 @@ function patchPaths(patch: string): string[] | null {
   const paths: string[] = []
   for (const block of blocks.slice(1)) {
     const [pair, ...lines] = block.split('\n')
-    const match = pair.match(/^("(?:\\.|[^"\\])*"|a\/.+) ("(?:\\.|[^"\\])*"|b\/.+)$/)
-    if (!match) return null
-    let source = decodeGitPath(match[1])
-    let destination = decodeGitPath(match[2])
-    if (!source?.startsWith('a/') || !destination?.startsWith('b/')) return null
-    source = source.slice(2)
-    destination = destination.slice(2)
+    const resolved = patchHeaderPaths(pair)
+    if (!resolved) return null
+    let source: string | null = resolved.source
+    let destination: string | null = resolved.destination
     for (const line of lines) {
       // Everything after a hunk or binary body is content, never a path.
       if (line.startsWith('@@') || line === 'GIT binary patch' || line.startsWith('Binary files ')) break
