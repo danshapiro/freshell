@@ -281,11 +281,11 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       preRestartTabIds.push(codexResume.data.tabId)
 
       const codexResumeWait = await mcp.callFreshellAction('wait-for', {
-        target: codexResumePaneId, pattern: 'codex> ', timeout: 20,
+        target: codexResumePaneId, pattern: `codex: resumed session ${codexSessionId}`, timeout: 20,
       })
-      expect(codexResumeWait.data.matched).toBe(true)
+      expect(codexResumeWait.data.matched, JSON.stringify(codexResumeWait)).toBe(true)
       const codexResumeCapture: string = await mcp.callFreshellAction('capture-pane', { target: codexResumePaneId, S: -200 })
-      expect(codexResumeCapture).toContain('codex> ')
+      expect(codexResumeCapture).toContain(`codex: resumed session ${codexSessionId}`)
 
       const codexArgvLines = await readArgvLines(codexArgLog)
       expect(codexArgvLines.some((e) => e.argv.includes('--remote'))).toBe(true)
