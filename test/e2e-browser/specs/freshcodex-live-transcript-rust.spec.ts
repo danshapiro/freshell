@@ -455,8 +455,11 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
       return checkpointOutcomes.length
     }, { timeout: 30_000, message: 'the first accepted turn has a settled checkpoint outcome' }).toBe(1)
     expect(checkpointOutcomes[0].status, JSON.stringify(checkpointOutcomes)).toBe('available')
-    await expect(firstTurn.getByRole('status', { name: 'Code rewind available for this message' })).toBeVisible({ timeout: 30_000 })
     await expect(pane.getByText('Fixture turn', { exact: true })).toHaveCount(1, { timeout: 30_000 })
+    // The current UI exposes checkpoint availability through the hover action,
+    // not the removed status badge. Require the actual affordance to be usable.
+    await firstTurn.hover()
+    await expect(firstTurn.getByRole('button', { name: 'Rewind code to here', exact: true })).toBeEnabled({ timeout: 30_000 })
     const command = "pwd; printf 'after command\\n' > state.txt; printf command-output-canary"
     const executed = page.waitForResponse(response => response.url().includes('/api/fresh-agent/exec') && response.request().method() === 'POST')
     await composer.fill(`!${command}`)
