@@ -1655,15 +1655,11 @@ impl Registry {
             if existing_digest != payload_digest {
                 return Err(RegistryError::RequestConflict);
             }
-            if state != "running" {
-                return Ok(None);
-            }
-            let running: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id WHERE s.soul_id=?1 AND s.desired_state='running' AND i.incarnation_id=?2 AND i.launch_state='running')",
-                params![soul_id.as_str(), incarnation],
-                |row| row.get(0),
+            let succeeded: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id WHERE i.incarnation_id=?1 AND a.soul_id=?2 AND a.verdict='succeeded' AND a.finished_at IS NOT NULL)",
+                params![incarnation, soul_id.as_str()], |row| row.get(0),
             )?;
-            if !running {
+            if !succeeded || state == "reopen_prepared" {
                 return Ok(None);
             }
             let incarnation = IncarnationId::parse(incarnation)
@@ -1721,14 +1717,14 @@ impl Registry {
                 ));
             }
 
-            let addressed: (String, String, String) = tx.query_row(
+            let addressed: (String, String, String, bool) = tx.query_row(
                 &format!(
-                    "SELECT incarnation_id,launch_state,cleanup_state FROM incarnations WHERE soul_id=?1 ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1"
+                    "SELECT incarnation_id,launch_state,cleanup_state,(docker_daemon_id IS NULL AND container_id IS NULL AND grant_id IS NULL) FROM incarnations WHERE soul_id=?1 ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1"
                 ),
                 params![soul_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).optional()?.ok_or_else(|| RegistryError::InvalidState("Reopen has no addressable incarnation".into()))?;
-            let prior_incarnation_id = IncarnationId::parse(addressed.0)
+            let mut prior_incarnation_id = IncarnationId::parse(addressed.0)
                 .map_err(|_| RegistryError::Integrity("invalid Reopen prior incarnation id".into()))?;
             if addressed.1 != "stopped" || addressed.2 != "verified_empty" {
                 return Err(RegistryError::InvalidState(
@@ -1751,9 +1747,24 @@ impl Registry {
 
             let mut context = load_recovery_context(&tx, installation, &soul_id)?;
             if context.prior_handle.incarnation_id() != &prior_incarnation_id {
-                return Err(RegistryError::InvalidState(
-                    "Reopen prior incarnation changed".into(),
-                ));
+                // A verified-empty replacement that never acquired a backend
+                // identity has no worker to resume. Keep its cleanup receipt,
+                // and use the last owned incarnation's saved launch context.
+                let retired_reopen: bool = addressed.3 && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commands WHERE incarnation_id=?1 AND state='reopen_failed')",
+                    [prior_incarnation_id.as_str()], |row| row.get(0),
+                )?;
+                if !retired_reopen {
+                    return Err(RegistryError::InvalidState("Reopen prior incarnation changed".into()));
+                }
+                prior_incarnation_id = context.prior_handle.incarnation_id().clone();
+            }
+            if context.resume_spec.is_none() && context.native_session_id.is_some() {
+                context.resume_spec = crate::resume_catalog::exact_resume_candidate(&context, None)
+                    .map_err(|_| RegistryError::InvalidState("saved native identity has no exact resume workload".into()))?;
+                if context.resume_spec.is_none() {
+                    return Err(RegistryError::InvalidState("saved native identity has no exact resume workload".into()));
+                }
             }
             if let Some(resume) = context.resume_spec.as_ref() {
                 if resume.provider_session.provider != context.provider
@@ -1762,6 +1773,10 @@ impl Registry {
                         != Some(resume.provider_session.native_session_id.as_str())
                 {
                     return Err(RegistryError::NativeIdentityConflict);
+                }
+                if let Some(terminal) = context.terminal.as_ref() {
+                    freshell_agent_runtime::prepare_terminal_for_resume(terminal, resume)
+                        .map_err(|_| RegistryError::InvalidState("saved exact resume workload is invalid".into()))?;
                 }
             }
             let attempt_id = RecoveryAttemptId::new();
@@ -1889,6 +1904,64 @@ impl Registry {
             Ok(())
         })
         .await
+    }
+
+    /// Record pending cleanup or settle only this failed Reopen's replacement.
+    /// Release authority only after owned-runtime verification, or after this
+    /// transaction proves no backend identity or grant was committed.
+    pub(crate) async fn settle_failed_reopen(
+        &self,
+        prepared: PreparedLaunch,
+        attempt: RecoveryAttemptId,
+        verified_outcome: Option<StopOutcome>,
+        pending_capability: Option<(String, String)>,
+    ) -> Result<StopOutcome, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (uncreated, generation): (bool, u64) = tx.query_row(
+                "SELECT (docker_daemon_id IS NULL AND container_id IS NULL AND grant_id IS NULL),execution_generation FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2 AND launch_nonce=?3 AND recovery_attempt_id=?4 AND EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=incarnations.incarnation_id AND c.state IN ('reopen_prepared','stopped','reopen_cleanup_pending','reopen_failed'))",
+                params![prepared.incarnation_id.as_str(), prepared.soul_id.as_str(), prepared.launch_nonce.as_str(), attempt.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            let outcome = match verified_outcome {
+                Some(outcome) => outcome,
+                None if uncreated => StopOutcome::VerifiedEmpty,
+                None => StopOutcome::BlockedOwnership,
+            };
+            let empty = outcome == StopOutcome::VerifiedEmpty;
+            let now = now_millis();
+            tx.execute(
+                "UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4",
+                params![if empty { "stopped" } else { "stopping" }, if empty { "verified_empty" } else if outcome == StopOutcome::BlockedOwnership { "blocked_ownership" } else { "termination_unconfirmed" }, now, prepared.incarnation_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE commands SET state=?1,updated_at=?2 WHERE incarnation_id=?3 AND state IN ('reopen_prepared','stopped','reopen_cleanup_pending')",
+                params![if empty { "reopen_failed" } else { "reopen_cleanup_pending" }, now, prepared.incarnation_id.as_str()],
+            )?;
+            if empty {
+                tx.execute("DELETE FROM writer_claims WHERE incarnation_id=?1", [prepared.incarnation_id.as_str()])?;
+                tx.execute("DELETE FROM admission_reservations WHERE incarnation_id=?1", [prepared.incarnation_id.as_str()])?;
+                tx.execute("UPDATE recovery_attempts SET verdict='reopen_failed',finished_at=?1 WHERE attempt_id=?2 AND verdict='replacement_prepared'", params![now, attempt.as_str()])?;
+                tx.execute("UPDATE souls SET recovery_attempt_id=NULL,updated_at=?1 WHERE soul_id=?2 AND desired_state='stopped' AND intent_revision=?3 AND recovery_attempt_id=?4", params![now, prepared.soul_id.as_str(), prepared.intent_revision, attempt.as_str()])?;
+            }
+            // The current stopped intent owns cleanup of its exact latest
+            // replacement, including when a newer Stop interrupted startup.
+            // Record a real no-runtime proof for an uncreated replacement so
+            // retry does not need an invented Docker ownership handle.
+            let current_revision: Option<u64> = tx.query_row(
+                "SELECT intent_revision FROM souls s WHERE soul_id=?1 AND desired_state='stopped' AND ?2=(SELECT incarnation_id FROM incarnations WHERE soul_id=s.soul_id ORDER BY created_at DESC,rowid DESC LIMIT 1)",
+                params![prepared.soul_id.as_str(), prepared.incarnation_id.as_str()], |row| row.get(0),
+            ).optional()?;
+            if let Some(revision) = current_revision {
+                let revoke_pending = empty && pending_capability.is_some();
+                tx.execute(
+                    "INSERT INTO ordinary_stops(soul_id,incarnation_id,intent_revision,execution_generation,outcome,capability_endpoint,capability_grant_id,revoke_pending,settled,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(soul_id,incarnation_id,intent_revision) DO UPDATE SET outcome=excluded.outcome,capability_endpoint=excluded.capability_endpoint,capability_grant_id=excluded.capability_grant_id,revoke_pending=excluded.revoke_pending,settled=excluded.settled,updated_at=excluded.updated_at",
+                    params![prepared.soul_id.as_str(),prepared.incarnation_id.as_str(),revision,generation,stop_outcome_name(outcome),pending_capability.as_ref().map(|value| &value.0),pending_capability.as_ref().map(|value| &value.1),revoke_pending,empty && !revoke_pending,now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(outcome)
+        }).await
     }
 
     /// Commit the successful Reopen only after the replacement is live and
@@ -5097,6 +5170,13 @@ fn mark_stop_outcome_in_tx(
     let now = now_millis();
     conn.execute("UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4", params![launch_state,cleanup_state,now,incarnation.as_str()])?;
     if outcome == StopOutcome::VerifiedEmpty {
+        // A failed Reopen can leave this exact Stop for startup or a later
+        // request to finish. Its journal must settle with the verified-empty
+        // authority, before the pending command state is retired below.
+        conn.execute(
+            "UPDATE recovery_attempts SET verdict='reopen_failed',finished_at=?1 WHERE attempt_id=(SELECT recovery_attempt_id FROM incarnations WHERE incarnation_id=?2) AND verdict='replacement_prepared' AND finished_at IS NULL AND EXISTS(SELECT 1 FROM commands WHERE incarnation_id=?2 AND state='reopen_cleanup_pending')",
+            params![now, incarnation.as_str()],
+        )?;
         conn.execute(
             "DELETE FROM writer_claims WHERE incarnation_id=?1",
             [incarnation.as_str()],

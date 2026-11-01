@@ -18,9 +18,21 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
+    run_with(
+        std::env::args().collect(),
+        |root, hint| Registry::open(root, hint).map_err(|error| error.to_string()),
+        |version| println!("{version}"),
+    )
+    .await
+}
+
+async fn run_with(
+    args: Vec<String>,
+    open_registry: impl FnOnce(&std::path::Path, Option<InstallationId>) -> Result<Registry, String>,
+    report_schema: impl FnOnce(&str),
+) -> Result<(), String> {
     if let Some(version) = schema_version_command(&args) {
-        println!("{version}");
+        report_schema(&version);
         return Ok(());
     }
     freshell_agent_runtime::process_qualification_policy()?;
@@ -73,7 +85,7 @@ async fn run() -> Result<(), String> {
     if control_secret.len() < 16 {
         return Err("control secret too short".into());
     }
-    let registry = Registry::open(&registry_root, installation_hint).map_err(|e| e.to_string())?;
+    let registry = open_registry(&registry_root, installation_hint)?;
     let lifecycle_log = runtime_root
         .parent()
         .unwrap_or(&runtime_root)
@@ -133,22 +145,43 @@ fn schema_version_command(args: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::schema_version_command;
+    use super::run_with;
     use freshell_supervisor::registry::SCHEMA_VERSION;
 
-    #[test]
-    fn schema_version_command_does_not_open_registry() {
+    async fn assert_schema_dispatch_is_read_only() {
         let directory = tempfile::tempdir().unwrap();
         let registry_root = directory.path().join("registry");
-
-        let output =
-            schema_version_command(&["freshell-supervisor".into(), "schema-version".into()])
-                .expect("the schema-version command is available before the registry is opened");
-
-        assert_eq!(output, SCHEMA_VERSION.to_string());
+        let opened = std::cell::Cell::new(false);
+        let output = std::cell::RefCell::new(String::new());
+        let result = run_with(
+            vec!["freshell-supervisor".into(), "schema-version".into()],
+            |_, hint| {
+                opened.set(true);
+                freshell_supervisor::registry::Registry::open(&registry_root, hint)
+                    .map_err(|error| error.to_string())
+            },
+            |version| *output.borrow_mut() = version.into(),
+        )
+        .await;
+        assert!(result.is_ok(), "schema command dispatch failed: {result:?}");
+        assert_eq!(*output.borrow(), SCHEMA_VERSION.to_string());
+        assert!(
+            !opened.get(),
+            "schema command must dispatch before registry opening"
+        );
         assert!(
             !registry_root.exists(),
             "schema reporting must not create the registry"
         );
+    }
+
+    #[tokio::test]
+    async fn schema_version_command_does_not_open_registry() {
+        assert_schema_dispatch_is_read_only().await;
+    }
+
+    #[tokio::test]
+    async fn schema_version_startup_dispatch_never_opens_registry() {
+        assert_schema_dispatch_is_read_only().await;
     }
 }
