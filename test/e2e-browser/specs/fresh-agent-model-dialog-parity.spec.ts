@@ -56,17 +56,34 @@ test('Codex discovers only the bound runtime and preserves search and exact sett
   await expect(page.getByRole('button', { name: 'Model: Provider Current ultra — change model', exact: true })).toBeVisible()
 })
 
-test('Codex picker waits for ordinary create and shows honest failure with exact saved input', async ({ freshellPage, page, terminal }) => {
+test('Codex picker waits for ordinary create and shows honest failure with exact saved input', async ({ freshellPage, page, terminal, harness }) => {
+  const createFrames: Array<Record<string, unknown>> = []
+  let routedSocketCount = 0
+  await page.routeWebSocket('**/ws', socket => {
+    routedSocketCount += 1
+    const upstream = socket.connectToServer()
+    socket.onMessage(data => {
+      const message = JSON.parse(String(data)) as Record<string, unknown>
+      if (typeof message.type === 'string' && message.type.startsWith('freshAgent.')) {
+        if (message.type === 'freshAgent.create') createFrames.push(message)
+        return // Exercise real client decisions without launching a provider.
+      }
+      upstream.send(data)
+    })
+    upstream.onMessage(data => socket.send(data))
+  })
+  // WebSocket routing takes effect in a replacement document.
+  await page.reload()
+  await harness.waitForHarness()
+  await harness.waitForConnection()
+  await expect.poll(() => routedSocketCount).toBeGreaterThan(0)
   await terminal.waitForTerminal()
   const contexts: Record<string, string>[] = []
   await page.route('**/api/fresh-agent/model-capabilities/freshcodex**', async route => {
     contexts.push(Object.fromEntries(new URL(route.request().url()).searchParams))
     await route.fulfill({ json: codexCatalog })
   })
-  const creates = () => page.evaluate(() =>
-    (window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.() ?? [])
-      .filter((frame: any) => frame?.type === 'freshAgent.create')
-      .map((frame: any) => ({ requestId: frame.requestId, model: frame.model, effort: frame.effort })))
+  const creates = () => createFrames.map(frame => ({ requestId: frame.requestId, model: frame.model, effort: frame.effort }))
   // The saved model already has a display name, so only the open picker
   // needs a catalog lookup after ordinary creation binds the runtime.
   const begin = (requestId: string) => installPane(page, 'freshcodex', {
@@ -154,7 +171,9 @@ async function installPane(
     const state = harness.getState()
     const tabId = state.tabs.activeTabId!
     const paneId = state.panes.activePane[tabId]
-    harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+    // Bound panes use the harness hold; the create scenario routes actual
+    // lifecycle frames so the ordinary create decision can run.
+    harness.setFreshAgentNetworkEffectsSuppressed(paneId, sessionId !== undefined)
     harness.dispatch({ type: 'panes/updatePaneContent', payload: {
       tabId, paneId, content: {
         kind: 'fresh-agent', sessionType, provider,
