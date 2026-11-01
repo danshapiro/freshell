@@ -1171,6 +1171,42 @@ impl FreshAgentTransport for HostedTransport {
                                 acceptance_ambiguous: true,
                             });
                         }
+                        {
+                            let mut identity =
+                                self.native_identity.lock().expect("native identity lock");
+                            if identity.pending
+                                || identity
+                                    .root
+                                    .as_deref()
+                                    .is_some_and(|root| root != session_id)
+                            {
+                                return Err(DispatchFailure {
+                                    message: "native identity source changed after acceptance"
+                                        .into(),
+                                    acceptance_ambiguous: true,
+                                });
+                            }
+                            if native != session_id {
+                                // Only the typed native turn-start acceptance can
+                                // settle a recovered root. Later Started frames
+                                // still cannot revive the retired producer.
+                                identity
+                                    .begin(false)
+                                    .and_then(|_| {
+                                        identity.acknowledge(
+                                            &native,
+                                            Some(json!({"source":"native_turn_start_ack",
+                                                "requestId":request_id.as_str(),
+                                                "nativeSessionId":native,
+                                                "incarnationId":incarnation_id})),
+                                        )
+                                    })
+                                    .map_err(|message| DispatchFailure {
+                                        message,
+                                        acceptance_ambiguous: true,
+                                    })?;
+                            }
+                        }
                         *current = Some(native.clone());
                         if let Some(profile) = self.profile.lock().expect("profile lock").as_mut() {
                             profile.native_session_id = Some(native.clone());
@@ -4180,6 +4216,11 @@ await import(parameters.source)
             .await
             .is_err());
         assert!(actor.read_events(0, 256).await.events.iter().all(|entry| !matches!(&entry.event,AgentEvent::Started{native_session_id} if native_session_id != &native)),"historical Started must not re-key durable inventory after a trusted command transition");
+        assert_eq!(fixture.transport.current_native_id().await.unwrap(), native);
+        let proof = actor.observed_native_identity_evidence().await.unwrap();
+        assert_eq!(proof["nativeSessionId"], native);
+        assert_eq!(proof["providerEvidence"]["source"], "native_turn_start_ack");
+        assert_eq!(proof["providerEvidence"]["requestId"], "recover-native");
         let snapshot = actor.snapshot().await.unwrap();
         assert_eq!(snapshot["threadId"], native);
         actor
@@ -6784,7 +6825,17 @@ await import(parameters.source)
                 .observed_native_identity_evidence()
                 .await
                 .ok_or("initial evidence missing")?;
+            // The first verified native read releases completed event buffers.
+            // Settle that read before comparing complete snapshots around a
+            // refused operation, while proving its transcript stayed exact.
+            let first_snapshot = actor.snapshot().await.map_err(|error| error.to_string())?;
             let snapshot = actor.snapshot().await.map_err(|error| error.to_string())?;
+            if first_snapshot["turns"] != snapshot["turns"] {
+                return Err(format!(
+                    "settling native history changed turn bodies: {}",
+                    json!({"before":first_snapshot["turns"],"after":snapshot["turns"]})
+                ));
+            }
             if snapshot["capabilities"]["undo"] != true {
                 return Err("controlled live conversation must support Undo".into());
             }
@@ -7016,8 +7067,12 @@ await import(parameters.source)
                 {
                     return Err("rejected rollback erased unchanged native host observation".into());
                 }
-                if actor.snapshot().await.map_err(|error| error.to_string())? != snapshot {
-                    return Err("rejected rollback changed native snapshot".into());
+                let after = actor.snapshot().await.map_err(|error| error.to_string())?;
+                if after != snapshot {
+                    return Err(format!(
+                        "rejected rollback changed native snapshot: {}",
+                        json!({"before":snapshot,"after":after})
+                    ));
                 }
                 let capture = actor
                     .capture(4096)
