@@ -189,9 +189,21 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     //     would be captured by the re-snapshot and permanently excluded).
     common::send_input(&mut ws, &terminal_id, "\r").await;
 
-    // 2b. Let that first window resolve with zero candidates (deadline 2 s +
-    //     150 ms sweep, with margin).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The pending activity receipt follows the first-submit re-snapshot.
+    // Waiting for it prevents the fixture rollout from entering known_files
+    // when input processing is delayed, without betting on a three-second
+    // scheduling margin. The second Enter below reopens a window if the
+    // first one resolved while this test was descheduled.
+    let pending = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["terminalId"] == terminal_id.as_str() && row["phase"] == "pending"
+                })
+            })
+    })
+    .await;
+    assert!(pending, "first submit must finish its snapshot before writing the rollout");
 
     // 2c. NOW write the rollout the locator must find. payload.cwd must
     //     match the terminal's cwd (the value send_create passed).
@@ -203,30 +215,43 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     )
     .unwrap();
 
-    // 2d. Second Enter: a later Enter re-opens a resolved window WITHOUT
-    //     re-snapshotting (Task 2's later_enter_reopen_keeps_the_first_submit_snapshot),
-    //     so the file written in 2c is deterministically the sole new candidate.
+    // 2d. If the first window resolved before the file was written, a second
+    // Enter reopens it without re-snapshotting. If still pending or already
+    // bound, the same input is harmless to locator adoption.
     common::send_input(&mut ws, &terminal_id, "\r").await;
 
-    // 3. The locator sweep resolves and the adoption tail must emit
-    //    codex.activity.updated with the sessionId. Collect frames by
-    //    scanning (never drop-on-mismatch); the 10 s budget covers the ~2 s
-    //    Enter-anchored deadline + 150 ms sweep.
-    let bound = wait_for_frame(&mut ws, |v| {
-        v["type"] == "codex.activity.updated"
-            && v["upsert"]
-                .as_array()
-                .map(|u| {
-                    u.iter().any(|r| {
-                        r["terminalId"] == terminal_id.as_str() && r["sessionId"] == THREAD
-                    })
+    // The first locator window may already have adopted the rollout before
+    // the second Enter is handled. A later task_started timestamp must not
+    // race that Enter into the tracker's queued-submit branch. The application
+    // pong acknowledges dispatch of every preceding frame on this socket;
+    // registry.input captures its activity timestamp synchronously.
+    ws.send(WsMessage::Text(serde_json::json!({ "type": "ping" }).to_string()))
+        .await
+        .expect("send second-submit ordering receipt");
+
+    // Retain BOTH receipts in one drain: adoption can arrive before the pong,
+    // and separate wait_for_frame calls would discard that earlier frame.
+    let saw_bound = std::cell::Cell::new(false);
+    let saw_input_receipt = std::cell::Cell::new(false);
+    let bound_and_dispatched = wait_for_frame(&mut ws, |v| {
+        if v["type"] == "pong" {
+            saw_input_receipt.set(true);
+        }
+        if v["type"] == "codex.activity.updated"
+            && v["upsert"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["terminalId"] == terminal_id.as_str() && row["sessionId"] == THREAD
                 })
-                .unwrap_or(false)
+            })
+        {
+            saw_bound.set(true);
+        }
+        saw_bound.get() && saw_input_receipt.get()
     })
     .await;
     assert!(
-        bound,
-        "expected codex.activity.updated carrying the locator-resolved sessionId"
+        bound_and_dispatched,
+        "expected locator identity and second-submit dispatch before task_started"
     );
 
     // 4. The adoption tail also attached the rollout to the status watcher
