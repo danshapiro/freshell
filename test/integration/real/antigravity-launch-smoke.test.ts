@@ -7,6 +7,16 @@
 //   otherwise, never fails. This is the "actually launch the real CLI" proof:
 //   it spawns the binary and asserts the version shape the Task 1 real-binary
 //   probe recorded (`agy --version` prints a bare semver, e.g. `1.4.10`).
+// - "rejects a bare -i" also always runs when available (round 6, whole-
+//   delta review Major): the argv probes (2026-11-01, binaries v1.4.10 AND
+//   v1.4.12, receipts in the plan's Provider Contract Record) proved
+//   `-i`/`--prompt-interactive` TAKE A PROMPT VALUE — a bare `-i` exits 2
+//   at flag parse (`flag needs an argument: -i`), BEFORE any TTY, auth, or
+//   store work. Freshell panes therefore launch BARE (the manifest ships no
+//   static args); this smoke is the early warning that a future CLI version
+//   changed that argv shape (re-open the launch-contract record if it ever
+//   fails). It runs with a disposable HOME for hygiene parity with the
+//   probe, bounded by a timeout, and performs no authenticated operation.
 // - "completes a headless turn" is opt-in: it makes a real model call and is
 //   DOUBLE-gated by FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 AND a Google API
 //   key in the env. It skips (never fails) otherwise, and never runs in the
@@ -23,6 +33,9 @@
 //
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
@@ -55,6 +68,29 @@ describe('antigravity real launch smoke', () => {
     // The real binary prints a bare version ("1.4.10" — Task 1 probe,
     // contract-probe.md), not a product name, so assert that exact shape.
     expect(stdout.trim()).toMatch(/^\d+\.\d+(\.\d+)?/)
+  }, 30_000)
+
+  itIfAvailable('rejects a bare -i exactly as the round-6 argv probes recorded', async () => {
+    // `flag needs an argument: -i` + usage on stderr, exit 2, at flag
+    // parse — before any TTY/auth/store work. Disposable HOME for hygiene
+    // parity with the probe; bounded timeout; no authenticated operation.
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agy-smoke-home-'))
+    try {
+      const res = await execFileAsync(agyCommand, ['-i'], {
+        env: { ...process.env, HOME: tmpHome },
+        timeout: 20_000,
+      }).then(
+        (r) => ({ code: 0, stderr: String(r.stderr ?? '') }),
+        (err: NodeJS.ErrnoException & { code?: number | string; stderr?: string }) => ({
+          code: typeof err.code === 'number' ? err.code : -1,
+          stderr: String(err.stderr ?? ''),
+        }),
+      )
+      expect(res.code, `agy -i stderr: ${res.stderr}`).toBe(2)
+      expect(res.stderr).toContain('flag needs an argument: -i')
+    } finally {
+      await fs.rm(tmpHome, { recursive: true, force: true }).catch(() => {})
+    }
   }, 30_000)
 
   const runTurn = available && realEnabled && hasProviderKey

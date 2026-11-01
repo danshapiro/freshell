@@ -141,6 +141,19 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   `clean_exit`, never a respawn).
 /// - When `AGY_ARGV_CAPTURE` is set, appends `"$@"` (space-joined) as one
 ///   row per invocation (O_APPEND — atomic for single lines).
+/// - Argv VALIDATION mirrors the probed real binary's parser (round 6;
+///   argv probes 2026-11-01 against v1.4.10 AND v1.4.12, receipts in the
+///   plan's Provider Contract Record): `-i`/`--prompt-interactive` take a
+///   PROMPT VALUE — a bare one exits 2 (`flag needs an argument: -i`),
+///   and `-i --conversation <id>` exits 2 with the loud misparse error —
+///   so this fake rejects those shapes exactly like the real binary and a
+///   manifest regression breaks the suite's launches visibly instead of
+///   silently substituting a fresh conversation. The parser-legal
+///   `-i <prompt>` shape is accepted; the auto-run initial turn is not
+///   modeled (no scenario drives it). Headless/continue spellings
+///   (`-p`/`--print`/`--prompt`/`-c`/`--continue`) are refused with the
+///   fake's own labeled error — legal binary shapes, never legal pane
+///   launches.
 ///
 /// Prompt texts driven through this fake avoid JSON metacharacters (the
 /// fixture records are hand-serialized in sh).
@@ -157,12 +170,41 @@ now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 if [ -n "$AGY_ARGV_CAPTURE" ]; then
   printf '%s\n' "$*" >> "$AGY_ARGV_CAPTURE"
 fi
-# Honor the manifest's adjacent --conversation <id> resume pair.
+# Argv validation + the manifest's adjacent --conversation <id> resume pair.
+# The validation mirrors the probed binary (see the doc comment above): a
+# value-taking flag followed by another flag is the loud-misparse shape;
+# a value-taking flag at the END of argv is the missing-argument shape.
 prev=""
 for arg in "$@"; do
-  if [ "$prev" = "--conversation" ]; then CONV="$arg"; fi
+  case "$prev" in
+    -i|--prompt-interactive)
+      case "$arg" in
+        -*)
+          printf 'Error: -i took "%s" as its prompt, so the intended prompt was left as an argument and ignored.\n' "$arg" >&2
+          exit 2
+          ;;
+        *) ;; # parser-legal `-i <prompt>`: accepted, the auto-run turn is not modeled
+      esac
+      ;;
+    --conversation)
+      case "$arg" in
+        -*) printf 'flag needs an argument: -conversation\n' >&2; exit 2 ;;
+        *) CONV="$arg" ;;
+      esac
+      ;;
+  esac
+  case "$arg" in
+    -p|--print|--prompt|-c|--continue)
+      printf 'fake-agy: refusing the %s pane-launch shape (headless/continue is never a pane launch)\n' "$arg" >&2
+      exit 2
+      ;;
+  esac
   prev="$arg"
 done
+case "$prev" in
+  -i|--prompt-interactive) printf 'flag needs an argument: -i\n' >&2; exit 2 ;;
+  --conversation) printf 'flag needs an argument: -conversation\n' >&2; exit 2 ;;
+esac
 transcript_of() { printf '%s/%s/.system_generated/logs/transcript.jsonl' "$AGY_BRAIN" "$CONV"; }
 TRANSCRIPT="$(transcript_of)"
 if [ ! -f "$TRANSCRIPT" ]; then
@@ -228,7 +270,10 @@ done
 /// (`extensions/antigravity/freshell.json`, whose field mapping
 /// `antigravity_launch_e2e.rs` already pins) with the ONE test-only
 /// override the suite needs — `default_cmd` points at the fake `agy`
-/// (written once by the suite and removed in its cleanup block).
+/// (written once by the suite and removed in its cleanup block). The
+/// manifest ships NO static args (bare `agy` is the interactive default;
+/// a fixed bare `-i` exits 2 on the probed binaries), so `base_args` is
+/// empty here too.
 fn antigravity_fake_spec(
     home: &std::path::Path,
     argv_capture: &std::path::Path,
@@ -245,7 +290,7 @@ fn antigravity_fake_spec(
         label: "Antigravity CLI".to_string(),
         env_var: None,
         default_cmd: fake_agy.to_string_lossy().into_owned(),
-        base_args: vec!["-i".to_string()],
+        base_args: Vec::new(),
         base_env,
         resume_args: Some(vec![
             "--conversation".to_string(),

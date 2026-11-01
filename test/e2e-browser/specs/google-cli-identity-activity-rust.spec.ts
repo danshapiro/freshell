@@ -972,7 +972,13 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
           const idx = row.argv.indexOf('--conversation')
           expect(row.argv[idx + 1], `the ADJACENT pair names the bound conversation: ${JSON.stringify(row.argv)}`).toBe(boundId)
         }
-        expect(rows.every((row) => row.argv.includes('-i')), 'every spawn stays interactive').toBe(true)
+        // Every spawn stays interactive — BARE (the probed binaries
+        // v1.4.10+v1.4.12 start interactive with no launch flag; `-i`
+        // takes a prompt VALUE and a bare one exits 2), so the prompt-
+        // taking and headless spellings never appear on any row.
+        expect(rows.every((row) => !row.argv.includes('-i')), 'no spawn carries the prompt-taking -i').toBe(true)
+        expect(rows.every((row) => !row.argv.includes('--prompt-interactive')), 'no spawn carries --prompt-interactive').toBe(true)
+        expect(rows.every((row) => !row.argv.includes('-p') && !row.argv.includes('--print') && !row.argv.includes('--prompt')), 'no spawn carries a headless spelling').toBe(true)
 
         // The respawned CLI really RESUMED the bound conversation (the
         // fake's marker, in the respawned pane's own buffer). The

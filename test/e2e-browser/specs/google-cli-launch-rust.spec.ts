@@ -32,8 +32,11 @@ import type { Page } from '@playwright/test'
  *   2. REST: `POST /api/tabs {mode:'antigravity', cwd}` creates the pane
  *      (request shape: donor sidebar-registry-sync-rust.spec.ts:275);
  *   3. argv: the fake's argv log (FAKE_AGY_TERMINAL_ARGV_LOG) proves the
- *      manifest-compiled launch contract end-to-end — `-i` present, the
- *      headless `-p`/`--print`/`--prompt` spellings NEVER present
+ *      manifest-compiled launch contract end-to-end — BARE `agy` is the
+ *      interactive default (no prompt-taking `-i`/`--prompt-interactive`:
+ *      the probed real binaries v1.4.10+v1.4.12 require a prompt VALUE for
+ *      those, and a bare one exits 2 on every launch), the headless
+ *      `-p`/`--print`/`--prompt` spellings NEVER present
  *      (cli_launch_goldens.rs G-AN1), and `--model <m>` ONLY when a
  *      model setting was configured (`codingCli.providers.antigravity
  *      .model` seeds the settings segment, G-AN3; the unconfigured
@@ -197,15 +200,21 @@ function findModeLeaves(layout: any, mode: string): any[] {
 /**
  * The interactive-launch argv contract every fresh antigravity spawn must
  * satisfy (the G-AN goldens, asserted here end-to-end through the fake's
- * argv log): `-i` present, the headless print spellings never present,
- * and never the weaker `--continue` cache mechanism (Global Constraint 2).
+ * argv log; the fake itself argv-validates the same shapes and dies with
+ * the binary's own exit-2 errors if they regress): NO prompt-taking
+ * `-i`/`--prompt-interactive` (bare `agy` is the interactive default on
+ * the probed binaries; those flags take a prompt VALUE and a bare one
+ * exits 2), the headless print spellings never present, and never the
+ * weaker `--continue` cache mechanism (Global Constraint 2).
  */
-function expectInteractiveAntigravityArgv(argv: string[]): void {
-  expect(argv, `argv: ${JSON.stringify(argv)}`).toContain('-i')
-  expect(argv).not.toContain('-p')
-  expect(argv).not.toContain('--print')
-  expect(argv).not.toContain('--prompt')
-  expect(argv).not.toContain('--continue')
+function expectBareInteractiveAntigravityArgv(argv: string[]): void {
+  const label = `argv: ${JSON.stringify(argv)}`
+  expect(argv, label).not.toContain('-i')
+  expect(argv, label).not.toContain('--prompt-interactive')
+  expect(argv, label).not.toContain('-p')
+  expect(argv, label).not.toContain('--print')
+  expect(argv, label).not.toContain('--prompt')
+  expect(argv, label).not.toContain('--continue')
 }
 
 /**
@@ -321,7 +330,7 @@ async function fetchTabCount(info: { baseUrl: string; token: string }): Promise<
 test.describe('Google CLI launch (Rust): antigravity first-class, gemini preserved', () => {
   test.setTimeout(150_000)
 
-  test('scenario 1 (picker): the Antigravity CLI tile launches an interactive antigravity pane (agy -i, never -p)', async ({ page }) => {
+  test('scenario 1 (picker): the Antigravity CLI tile launches an interactive antigravity pane (bare interactive agy, never -p)', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-google-cli-launch-'))
     const agyArgLog = path.join(sharedRoot, 'fake-agy-terminal-argv.jsonl')
     try {
@@ -361,13 +370,13 @@ test.describe('Google CLI launch (Rust): antigravity first-class, gemini preserv
           return typeof buffer === 'string' && buffer.includes('agy> ')
         }, { timeout: 20_000 }).toBe(true)
 
-        // argv contract (G-AN1): interactive `-i`, never the headless
+        // argv contract (G-AN1): BARE interactive (no prompt-taking `-i`), never the headless
         // spellings, no model (none configured), never `--continue`.
         await expect.poll(async () => (await readArgvLog(agyArgLog)).length, { timeout: 15_000 })
           .toBeGreaterThan(0)
         const entries = await readArgvLog(agyArgLog)
         expect(entries.length).toBe(1)
-        expectInteractiveAntigravityArgv(entries[0].argv)
+        expectBareInteractiveAntigravityArgv(entries[0].argv)
         expect(entries[0].argv).not.toContain('--model')
       } finally {
         await server.stop().catch(() => {})
@@ -440,7 +449,7 @@ test.describe('Google CLI launch (Rust): antigravity first-class, gemini preserv
           .toBeGreaterThan(0)
         const entries = await readArgvLog(agyArgLog)
         expect(entries.length).toBe(1)
-        expectInteractiveAntigravityArgv(entries[0].argv)
+        expectBareInteractiveAntigravityArgv(entries[0].argv)
         expect(entries[0].argv).not.toContain('--model')
       } finally {
         await server.stop().catch(() => {})
@@ -502,7 +511,7 @@ test.describe('Google CLI launch (Rust): antigravity first-class, gemini preserv
         const entries = await readArgvLog(agyArgLog)
         expect(entries.length).toBe(1)
         const argv = entries[0].argv
-        expectInteractiveAntigravityArgv(argv)
+        expectBareInteractiveAntigravityArgv(argv)
         // G-AN3: the manifest's modelArgs template applies as the ADJACENT
         // pair `--model <configured value>`, verbatim.
         const modelIdx = argv.indexOf('--model')
@@ -657,7 +666,7 @@ test.describe('Google CLI launch (Rust): antigravity first-class, gemini preserv
           .toBeGreaterThan(0)
         const entries = await readArgvLog(agyArgLog)
         expect(entries.length).toBe(1)
-        expectInteractiveAntigravityArgv(entries[0].argv)
+        expectBareInteractiveAntigravityArgv(entries[0].argv)
         expect(entries[0].argv).not.toContain('--model')
       } finally {
         await server.stop().catch(() => {})
@@ -712,7 +721,7 @@ test.describe('Google CLI launch (Rust): antigravity first-class, gemini preserv
 
         // LEGACY SHAPE PIN: the gemini manifest (extensions/gemini/
         // freshell.json) carries no `args` — the launched gemini process
-        // received an EMPTY argv. Antigravity's `-i` (and its resume/
+        // received an EMPTY argv. Antigravity's launch templates (its resume/
         // model templates) must never bleed into the gemini launch.
         await expect.poll(async () => (await readLaunchLedger(geminiLedger)).length, { timeout: 15_000 })
           .toBeGreaterThan(0)

@@ -8,10 +8,14 @@
 //! (`crates/freshell-server/src/extensions.rs:197-223`) — with ONE test-only
 //! override: `default_cmd` points at an argv-capturing `#!/bin/sh` shim (the
 //! manifest ships `agy`, which no test host has on PATH). The argv rows the
-//! real in-process server spawns therefore pin the manifest's `-i`
-//! interactive flag and the exact adjacent `--conversation <id>` resume pair
-//! (never `--continue`), and an unknown-mode create is rejected with the
-//! valid-mode list naming `antigravity`.
+//! real in-process server spawns therefore pin the manifest's launch shape
+//! against the PROBED binary's argv contract (round 6: real pinned binaries
+//! v1.4.10 AND v1.4.12 probed 2026-11-01 — bare `agy` is the interactive
+//! default; `-i`/`--prompt-interactive` take a prompt VALUE and a bare one
+//! exits 2; the headless `-p` spellings never appear; the exact adjacent
+//! `--conversation <id>` resume pair, never `--continue`), and an
+//! unknown-mode create is rejected with the valid-mode list naming
+//! `antigravity`.
 //!
 //! Raw-WS integration against an in-process axum server on an ephemeral
 //! loopback port (the shared `common` harness convention; the
@@ -155,13 +159,72 @@ async fn wait_capture_rows(capture: &std::path::Path, want: usize) -> Vec<String
     }
 }
 
+/// The PROBED-binary argv contract (mirrors
+/// `cli_launch_goldens.rs::assert_probed_agy_argv_contract`; receipts in
+/// the plan's Provider Contract Record): a pane launch must never carry
+/// the prompt-taking `-i`/`--prompt-interactive` (bare -> the real binary
+/// exits 2), never the headless `-p`/`--print`/`--prompt`, never
+/// `--continue`, and a resume row must carry `--conversation <id>` as an
+/// adjacent pair while a fresh row must not resume at all.
+fn assert_probed_agy_argv_contract(argv: &[&str], expected_resume_id: Option<&str>) {
+    let is_flag = |a: &str| a.starts_with('-') && a.len() > 1;
+    let mut saw_resume = false;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i] {
+            "-i" | "--prompt-interactive" => panic!(
+                "prompt-taking interactive flag on a pane launch (the real binary \
+                 requires a value; bare exits 2): {argv:?}"
+            ),
+            "-p" | "--print" | "--prompt" => panic!("headless spelling on a pane launch: {argv:?}"),
+            "-c" | "--continue" => panic!("weaker continue mechanism on a pane launch: {argv:?}"),
+            "--conversation" => {
+                let id = argv
+                    .get(i + 1)
+                    .unwrap_or_else(|| panic!("--conversation without an adjacent id: {argv:?}"));
+                assert!(
+                    !is_flag(id),
+                    "a flag where the conversation id belongs: {argv:?}"
+                );
+                assert_eq!(
+                    expected_resume_id,
+                    Some(*id),
+                    "resume argv must carry the exact id adjacently: {argv:?}"
+                );
+                saw_resume = true;
+                i += 2;
+                continue;
+            }
+            "--model" | "--effort" => {
+                let value = argv
+                    .get(i + 1)
+                    .unwrap_or_else(|| panic!("{argv:?}: {} without a value", argv[i]));
+                assert!(
+                    !is_flag(value),
+                    "a flag where a settings value belongs: {argv:?}"
+                );
+                i += 2;
+                continue;
+            }
+            other => panic!(
+                "unmodeled flag or positional residue {other:?} (the misparse shape): {argv:?}"
+            ),
+        }
+    }
+    assert_eq!(
+        saw_resume,
+        expected_resume_id.is_some(),
+        "resume happens exactly when a sessionRef was given: {argv:?}"
+    );
+}
+
 /// The plan's Task-3 argv proof over the real create route: a fresh
-/// `mode:"antigravity"` create spawns the manifest's static `-i` (never the
-/// headless `-p`, never a `--conversation` pair); a provider-matched
-/// `sessionRef` resume create spawns the exact adjacent
-/// `--conversation conv-9` pair (never `--continue`); and an unknown-mode
-/// create (`antigravityy`) is rejected with `Invalid terminal mode` listing
-/// `antigravity` as valid.
+/// `mode:"antigravity"` create spawns BARE `agy` (the interactive default
+/// on the probed binaries — never a prompt-taking `-i`, never the headless
+/// `-p`, never a `--conversation` pair); a provider-matched `sessionRef`
+/// resume create spawns the exact adjacent `--conversation conv-9` pair
+/// (never `--continue`); and an unknown-mode create (`antigravityy`) is
+/// rejected with `Invalid terminal mode` listing `antigravity` as valid.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 async fn antigravity_launch_argv_is_manifest_template_driven() {
@@ -187,20 +250,11 @@ async fn antigravity_launch_argv_is_manifest_template_driven() {
     let fresh_rows = wait_capture_rows(&capture, 1).await;
     assert_eq!(fresh_rows.len(), 1, "fresh argv row: {fresh_rows:?}");
     let fresh_argv: Vec<&str> = fresh_rows[0].split_whitespace().collect();
+    assert_probed_agy_argv_contract(&fresh_argv, None);
     assert!(
-        fresh_argv.contains(&"-i"),
-        "fresh row carries the manifest's interactive flag: {:?}",
-        fresh_rows[0]
-    );
-    assert!(
-        !fresh_argv.contains(&"-p"),
-        "fresh row never uses the headless print flag: {:?}",
-        fresh_rows[0]
-    );
-    assert!(
-        !fresh_argv.contains(&"--conversation"),
-        "fresh row never resumes: {:?}",
-        fresh_rows[0]
+        fresh_argv.is_empty(),
+        "an unconfigured fresh launch is BARE agy (interactive by default — \
+         probed; a static `-i` would exit 2 on every launch): {fresh_rows:?}"
     );
 
     // Resume create: provider-matched sessionRef (the frozen client's only
@@ -232,11 +286,7 @@ async fn antigravity_launch_argv_is_manifest_template_driven() {
         "resume id is the ADJACENT argument: {:?}",
         resume_rows[1]
     );
-    assert!(
-        !resume_argv.contains(&"--continue"),
-        "resume row never uses the weaker continue mechanism: {:?}",
-        resume_rows[1]
-    );
+    assert_probed_agy_argv_contract(&resume_argv, Some("conv-9"));
 
     // Unknown-mode create: rejected with the valid list naming antigravity.
     ws.send(WsMessage::Text(

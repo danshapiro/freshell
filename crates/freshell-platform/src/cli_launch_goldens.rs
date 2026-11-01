@@ -1292,13 +1292,20 @@ fn amplifier_manifest_matches_legacy_cli_block() {
 // provider-matched sessionRef.
 //
 // Contract facts pinned here (Provider Contract Record, plan doc
-// docs/plans/2026-10-29-google-cli-first-class-support.md): fresh launch =
-// `agy -i` (`-i`/`--prompt-interactive` interactive; `-p`/`--print`/
-// `--prompt` is the HEADLESS spelling and must never appear), resume =
-// `--conversation <id>` (adjacent pair, never the weaker `--continue`
-// cache mechanism — Global Constraint 2), and model/effort pass through
-// `--model`/`--effort` verbatim (the effort enum is model-dependent; the
-// manifest template NEVER hardcodes an enum).
+// docs/plans/2026-10-29-google-cli-first-class-support.md; round-6 argv
+// probes against real pinned binaries v1.4.10 AND v1.4.12, 2026-11-01 —
+// receipts verbatim in the Contract Record): fresh launch is BARE — `agy`
+// with no launch flag is the interactive default on a TTY; `-i`/
+// `--prompt-interactive` TAKE A PROMPT VALUE, so a bare `-i` makes the real
+// binary exit 2 (`flag needs an argument: -i`) and `agy -i --conversation
+// <id>` exits 2 with the LOUD misparse error (`Error: -i took
+// "--conversation" as its prompt, ...`) — the manifest must therefore ship
+// NO static args, and a resume argv must never be interpretable as
+// prompt-taking. `-p`/`--print`/`--prompt` is the HEADLESS spelling and must
+// never appear; resume = `--conversation <id>` (adjacent pair, never the
+// weaker `--continue` cache mechanism — Global Constraint 2); and model/
+// effort pass through `--model`/`--effort` verbatim (the effort enum is
+// model-dependent; the manifest template NEVER hardcodes an enum).
 
 fn antigravity_manifest_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1400,22 +1407,117 @@ fn resolve_antigravity(
         .map(|launch| launch.expect("antigravity spec is present"))
 }
 
-/// G-AN1 — antigravity fresh launch: the manifest's static `args` seed the
-/// interactive prompt flag (`-i`), and the headless print flags (`-p` /
-/// `--print` / `--prompt`) must never appear on an interactive pane.
+/// The PROBED-binary argv contract every antigravity pane launch must
+/// satisfy (round-6 fix, whole-delta review round 6 Major): mirror the
+/// value-taking/boolean flag rules the real `agy` parser enforces (argv
+/// probes 2026-11-01, binaries v1.4.10 AND v1.4.12, receipts in the
+/// Provider Contract Record):
+/// - `-i`/`--prompt-interactive` TAKE A PROMPT VALUE — bare, or followed by
+///   another flag, the real binary EXITS 2 (`flag needs an argument: -i`;
+///   `-i --conversation x` → the loud misparse error). Freshell never sends
+///   a seeded initial prompt, so these spellings must never appear at all.
+/// - `-p`/`--print`/`--prompt` (headless) and `-c`/`--continue` (the
+///   weaker resume mechanism, Global Constraint 2) must never appear.
+/// - `--conversation` must appear ONLY on a resume, as an ADJACENT pair
+///   with the exact session id — the pair a value-taking parser reads as
+///   resume, never as prompt residue.
+/// - No positional residue: every remaining arg is a consumed
+///   `--model`/`--effort` value pair. A stray positional is the misparse
+///   residue shape (`-i` swallowing a flag) and must fail loudly here.
+fn assert_probed_agy_argv_contract(argv: &[String], expected_resume_id: Option<&str>) {
+    let is_flag = |a: &String| a.starts_with('-') && a.len() > 1;
+    let mut i = 0;
+    let mut saw_resume = false;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "-i" | "--prompt-interactive" => panic!(
+                "antigravity argv pins a prompt-taking interactive flag {arg:?}: the real \
+                 binary requires a prompt value (bare -> exit 2; followed by a flag -> \
+                 the loud misparse error) — panes launch BARE (probed v1.4.10+v1.4.12): \
+                 {argv:?}"
+            ),
+            "-p" | "--print" | "--prompt" => panic!(
+                "antigravity argv carries the headless spelling {arg:?} — never legal on a \
+                 pane launch: {argv:?}"
+            ),
+            "-c" | "--continue" => panic!(
+                "antigravity argv carries the weaker continue mechanism {arg:?} (Global \
+                 Constraint 2): {argv:?}"
+            ),
+            "--conversation" => {
+                let id = argv.get(i + 1).unwrap_or_else(|| {
+                    panic!(
+                        "--conversation without an adjacent id (flag needs an argument): {argv:?}"
+                    )
+                });
+                assert!(
+                    !is_flag(id),
+                    "a flag where the conversation id belongs: {argv:?}"
+                );
+                assert_eq!(
+                    expected_resume_id,
+                    Some(id.as_str()),
+                    "resume argv must carry the exact id adjacently: {argv:?}"
+                );
+                saw_resume = true;
+                i += 2;
+                continue;
+            }
+            "--model" | "--effort" => {
+                let value = argv.get(i + 1).unwrap_or_else(|| {
+                    panic!("{arg} without an adjacent value (flag needs an argument): {argv:?}")
+                });
+                assert!(
+                    !is_flag(value),
+                    "a flag where a {arg} value belongs: {argv:?}"
+                );
+                i += 2;
+                continue;
+            }
+            other => {
+                if is_flag(&other.to_string()) {
+                    panic!("antigravity argv carries an unmodeled flag {other:?}: {argv:?}");
+                }
+                panic!(
+                    "antigravity argv carries positional residue {other:?} — the misparse \
+                     shape (a swallowed flag leaves its value stranded): {argv:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        saw_resume,
+        expected_resume_id.is_some(),
+        "resume argv must carry --conversation exactly once; fresh argv must not: {argv:?}"
+    );
+}
+
+/// G-AN1 — antigravity fresh launch is BARE: `agy` with no launch flag is
+/// the interactive default on a TTY (probed v1.4.10+v1.4.12: bare `agy`
+/// starts the full interactive TUI; the prompt-taking `-i` spellings and
+/// the headless print spellings must never appear on an interactive pane).
 #[test]
-fn antigravity_fresh_launch_uses_interactive_prompt_flag() {
+fn antigravity_fresh_launch_is_bare_interactive_by_default() {
     let launch = resolve_antigravity(&antigravity_inputs(None, LaunchIntent::Start), &env_of(&[]))
         .expect("registered");
     assert_eq!(launch.command, "agy");
-    assert!(launch.args.contains(&"-i".to_string()));
-    assert!(!launch.args.iter().any(|a| a == "-p"));
+    assert_probed_agy_argv_contract(&launch.args, None);
+    assert!(
+        launch.args.is_empty(),
+        "an unconfigured fresh launch is exactly `agy` (no static args — a fixed bare \
+         `-i` would exit 2 on EVERY launch): {:?}",
+        launch.args
+    );
 }
 
 /// G-AN2 — antigravity resume: the manifest's `resumeArgs` template yields
 /// the ADJACENT pair `--conversation <id>` (first-occurrence substitution,
 /// rev 2.1 pin), and the weaker `--continue` cache mechanism must never be
 /// used (Global Constraint 2 — no silent replacement of the conversation).
+/// The resolved argv must never be interpretable as prompt-taking: with
+/// the probed parser, `--conversation` is read as the resume pair, not as
+/// residue of a swallowed prompt flag.
 #[test]
 fn antigravity_resume_uses_conversation_flag_adjacent_pair() {
     let launch = resolve_antigravity(
@@ -1430,6 +1532,21 @@ fn antigravity_resume_uses_conversation_flag_adjacent_pair() {
         .expect("resume flag");
     assert_eq!(launch.args[i + 1], "conv-1234");
     assert!(!launch.args.iter().any(|a| a == "--continue"));
+    assert_probed_agy_argv_contract(&launch.args, Some("conv-1234"));
+}
+
+/// G-AN2b — the review's forbidden failure mode, pinned: a resume argv
+/// carrying model+effort (the full settings segment) must still parse as a
+/// pure resume under the probed binary's rules — no prompt-taking flag
+/// precedes `--conversation`, so the resume can never degrade into a fresh
+/// seeded-prompt conversation.
+#[test]
+fn antigravity_resume_with_settings_is_never_prompt_taking() {
+    let mut inputs = antigravity_inputs(Some("conv-9"), LaunchIntent::Resume);
+    inputs.model = Some("m");
+    inputs.effort = Some("e");
+    let launch = resolve_antigravity(&inputs, &env_of(&[])).expect("registered");
+    assert_probed_agy_argv_contract(&launch.args, Some("conv-9"));
 }
 
 /// G-AN3 — the manifest's `modelArgs`/`effortArgs` templates apply in the
@@ -1477,7 +1594,16 @@ fn antigravity_manifest_matches_launch_templates() {
     let cli = &json["cli"];
     assert_eq!(cli["command"], "agy");
     assert_eq!(cli["envVar"], "ANTIGRAVITY_CMD");
-    assert_eq!(cli["args"], serde_json::json!(["-i"]));
+    // NO static launch args (round 6): bare `agy` is the interactive
+    // default on the probed binaries (v1.4.10+v1.4.12), while a fixed bare
+    // `-i` exits 2 on every launch (`flag needs an argument: -i`) — the
+    // manifest must not pin any `args`.
+    assert!(
+        cli["args"].is_null(),
+        "the manifest must not pin static launch args (bare agy is the interactive \
+         default; a bare -i breaks every launch — probed): {}",
+        cli["args"]
+    );
     assert_eq!(
         cli["resumeArgs"],
         serde_json::json!(["--conversation", "{{sessionId}}"])

@@ -47,9 +47,27 @@
 //   error; else `agy: resumed conversation <id>` and the existing transcript
 //   continues (a session_start {source:"resume"} record is appended — the
 //   resumed.sanitized.jsonl shape).
-// - argv mirrored to FAKE_AGY_TERMINAL_ARGV_LOG as JSONL (so specs can prove
-//   `-i` present, `-p` absent, `--conversation <id>` adjacent, `--continue`
-//   NEVER).
+// - argv mirrored to FAKE_AGY_TERMINAL_ARGV_LOG as JSONL (so specs can
+//   prove the launch shape: NO prompt-taking `-i` (panes launch BARE),
+//   no headless `-p`, `--conversation <id>` adjacent, `--continue` NEVER).
+// - argv VALIDATION mirrors the REAL binary's parser (whole-delta review
+//   round 6, Major; argv probes 2026-11-01 against real pinned binaries
+//   v1.4.10 AND v1.4.12, receipts in the plan's Provider Contract Record):
+//   the real `agy` requires a VALUE for `-i`/`--prompt-interactive` — a
+//   bare `-i` exits 2 with `flag needs an argument: -i`, and
+//   `-i --conversation <id>` exits 2 with the LOUD misparse error
+//   `Error: -i took "--conversation" as its prompt, ...` (the CLI never
+//   silently substitutes). This fake reproduces those exact rejections, so
+//   a manifest regression (a static bare `-i` again) kills every launch
+//   HERE the same way the real binary would — the pane dies with the
+//   greppable error and the spec fails, instead of a silent fresh
+//   conversation. `--conversation` without an adjacent id is rejected the
+//   same way. The headless/continue spellings (`-p`/`--print`/`--prompt`/
+//   `-c`/`--continue`) are legal BINARY shapes but never legal PANE-launch
+//   shapes; this terminal fake refuses them with its own labeled error
+//   (it models no headless mode). `-i <prompt>` (the parser-legal seeded
+//   shape) is ACCEPTED but the auto-run initial turn is not modeled — no
+//   spec drives it; Freshell never sends it.
 //
 // Per submitted line (a "turn") the default program runs, in order:
 //   busy marker → user_message record → assistant_message record → bare BEL
@@ -104,6 +122,65 @@ function appendArgvLog() {
   fs.appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, t: Date.now(), argv })}\n`)
 }
 appendArgvLog()
+
+// ── argv validation (mirrors the probed real binary's parser; see the ──────
+// header comment for the probe receipts). Runs BEFORE any store wiring, the
+// same way the real CLI's flag parse precedes its home/store init.
+function looksLikeFlag(token) {
+  return typeof token === 'string' && token.startsWith('-') && token.length > 1
+}
+
+function rejectLaunch(binaryShapedMessage, fakeDetail) {
+  process.stderr.write(`${binaryShapedMessage}\r\n`)
+  process.stderr.write(`fake-agy-terminal: ${fakeDetail}\r\n`)
+  exitWith(2)
+}
+
+const VALUE_TAKING = new Set(['-i', '--prompt-interactive'])
+for (let i = 0; i < argv.length; i += 1) {
+  const token = argv[i]
+  if (VALUE_TAKING.has(token)) {
+    const next = argv[i + 1]
+    if (next === undefined) {
+      rejectLaunch('flag needs an argument: -i', 'a bare prompt-taking interactive flag never starts a pane (the real binary exits 2 the same way)')
+    }
+    if (looksLikeFlag(next)) {
+      rejectLaunch(
+        `Error: -i took "${next}" as its prompt, so the intended prompt was left as an argument and ignored.`,
+        'the misparse shape the real binary rejects with exit 2 (a resume must never degrade into a seeded fresh prompt)',
+      )
+    }
+    // Parser-legal `-i <prompt>`: accepted; the auto-run initial turn is
+    // not modeled (documented in the header).
+    i += 1
+  } else if (token === '--conversation') {
+    const next = argv[i + 1]
+    if (next === undefined || looksLikeFlag(next)) {
+      rejectLaunch('flag needs an argument: -conversation', 'the resume pair must carry the conversation id adjacently')
+    }
+    i += 1
+  } else if (token === '--model' || token === '--effort') {
+    const next = argv[i + 1]
+    if (next === undefined || looksLikeFlag(next)) {
+      rejectLaunch(`flag needs an argument: ${token.slice(2)}`, 'the settings pair must carry its value adjacently')
+    }
+    i += 1
+  } else if (token === '-p' || token === '--print' || token === '--prompt' || token === '-c' || token === '--continue') {
+    rejectLaunch(
+      `fake-agy-terminal: refusing the ${token} pane-launch shape`,
+      'headless/continue spellings are legal binary shapes but never legal pane launches',
+    )
+  } else if (looksLikeFlag(token)) {
+    // Other pass-through flags: the binary accepts a wider bool-flag set
+    // than this fake models (--agent, --settings, ...) — pass through like
+    // the binary's parser.
+  } else {
+    rejectLaunch(
+      `fake-agy-terminal: unexpected positional "${token}"`,
+      'positional residue is the misparse shape (a swallowed flag strands its value)',
+    )
+  }
+}
 
 // Deterministic exits: schedule through the event loop (the fixture engine's
 // crash discipline) so pending stdout/stderr writes flush before the exit.

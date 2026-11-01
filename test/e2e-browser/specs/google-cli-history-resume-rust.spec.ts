@@ -826,7 +826,10 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         // INVARIANTS are absolute: every resume row names the exact bound
         // id (nothing else was ever resumable, and a substitution would
         // fail here), `--continue` never appears, and every spawn stays
-        // interactive.
+        // interactive — BARE (the probed binaries v1.4.10+v1.4.12 start
+        // interactive with no launch flag; `-i` takes a prompt VALUE and
+        // a bare one exits 2), so no prompt-taking or headless spelling
+        // ever appears.
         await expect.poll(async () => (await readArgvLog(fixture.agyArgLog)).length, { timeout: 20_000 }).toBeGreaterThanOrEqual(4)
         const rows = await readArgvLog(fixture.agyArgLog)
         expectNoContinueAnywhere(rows)
@@ -837,7 +840,11 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
           expect(row.argv[conversationIdx + 1], `the ADJACENT pair names the exact bound id: ${JSON.stringify(row.argv)}`).toBe(boundId)
         }
         for (const row of rows) {
-          expect(row.argv, `fresh spawns stay interactive: ${JSON.stringify(row.argv)}`).toContain('-i')
+          expect(row.argv, `fresh spawns stay interactive (bare): ${JSON.stringify(row.argv)}`).not.toContain('-i')
+          expect(row.argv, `no prompt-taking interactive flag: ${JSON.stringify(row.argv)}`).not.toContain('--prompt-interactive')
+          expect(row.argv, `no headless spelling: ${JSON.stringify(row.argv)}`).not.toContain('-p')
+          expect(row.argv, `no headless spelling: ${JSON.stringify(row.argv)}`).not.toContain('--print')
+          expect(row.argv, `no headless spelling: ${JSON.stringify(row.argv)}`).not.toContain('--prompt')
         }
       } finally {
         await server.stop().catch(() => {})
