@@ -159,10 +159,11 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       // layout hint. Exercise a real user rename before asserting permanence.
       const renamed = await (await fetch(`${info.baseUrl}/api/tabs/${codex.data.tabId}`, {
         method: 'PATCH', headers: auth,
-        body: JSON.stringify({ name: 'work', nameIntent: 'user' }),
+        body: JSON.stringify({ name: 'work', nameIntent: 'user',
+          expectedNameRef: { kind: 'session', provider: 'codex', sessionId: SESSION_ID } }),
       })).json()
       expect(renamed.status, JSON.stringify(renamed)).toBe('ok')
-      expect(renamed.data.sessionName.outcome.applied, JSON.stringify(renamed)).toBe(true)
+      expect(renamed.data?.sessionName?.outcome?.applied, JSON.stringify(renamed)).toBe(true)
       const shell = await (await fetch(`${info.baseUrl}/api/tabs`, { method: 'POST', headers: auth,
         body: JSON.stringify({ mode: 'shell', name: 'sh' }) })).json()
       expect(shell.data.tabId).toBeTruthy()
