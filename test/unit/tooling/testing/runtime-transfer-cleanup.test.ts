@@ -63,15 +63,15 @@ describe('finite transfer ownership', () => {
     transport.calls.length = 0
     transport.containers.clear()
     transport.volumes.clear()
-    // A broken mock must fail closed rather than ever reach an ambient daemon.
-    await fs.writeFile(path.join(directory, 'docker'), '#!/bin/sh\necho unexpected real Docker invocation >&2\nexit 97\n', { mode: 0o700 })
-    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
     try {
+      // A broken mock must fail closed rather than ever reach an ambient daemon.
+      await fs.writeFile(path.join(directory, 'docker'), '#!/bin/sh\necho unexpected real Docker invocation >&2\nexit 97\n', { mode: 0o700 })
+      vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
       // Keep the real checkout and file admission boundaries. Only Docker IO
       // and the policy clock are controlled; no daemon or live resources exist.
-      execFileSync('git', ['init', '--quiet'], { cwd: directory })
+      execFileSync('git', ['init', '--quiet'], { cwd: directory, timeout: 10_000 })
       execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-        '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'Transfer fixture'], { cwd: directory })
+        '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'Transfer fixture'], { cwd: directory, timeout: 10_000 })
       const schema = path.join(directory, 'schema.sql'), migration = path.join(directory, 'migrations.json')
       await fs.writeFile(schema, '-- owned synthetic schema\n')
       await fs.writeFile(migration, '[]')
