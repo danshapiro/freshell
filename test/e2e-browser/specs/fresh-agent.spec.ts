@@ -85,12 +85,9 @@ function toolTurn(turnId: string, calls: Array<[string, string]>) {
   }
 }
 
-/** Seed the active freshcodex pane with a routed idle snapshot carrying the
- * given turns (the shared seeding flow of the strip/caption specs: freshcodex
- * picker flow, routed snapshot, leaf-walk + panes/updatePaneContent dispatch).
- * Mirrors the setup of the 'style setting persists per Fresh Agent pane type
- * and applies serif rendering' test (below), minus the style filter and
- * style-specific seeded content. */
+/** Seed transcript-rendering state directly, with its snapshot route installed
+ * before mounting. These assertions exercise activity rendering; provider
+ * discovery and asynchronous directory suggestions are covered separately. */
 async function seedCollapsePane(
   page: Parameters<typeof openPanePicker>[0],
   terminal: { waitForTerminal: () => Promise<void> },
@@ -99,14 +96,6 @@ async function seedCollapsePane(
 ) {
   await terminal.waitForTerminal()
   await enableClaudeAndCodex(page)
-
-  const picker = await openPanePicker(page)
-  await suppressFreshAgentNetworkForActivePane(page)
-  await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
-  await page.getByRole('option').first().click()
-  // The picker selection lands in the panes store a beat before/after the
-  // fresh-agent pane mounts; wait for the pane before seeding its session.
-  await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 10_000 })
 
   const lastTurnId = (turns[turns.length - 1] as { id?: string } | undefined)?.id ?? ''
   await page.route(`**/api/fresh-agent/threads/freshcodex/codex/${sessionId}*`, async (route) => {
@@ -133,7 +122,36 @@ async function seedCollapsePane(
       }),
     })
   })
-  await pointActiveFreshcodexLeafAtSession(page, sessionId)
+  await page.evaluate((currentSessionId) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness) throw new Error('Freshell test harness is unavailable')
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId
+    const paneId = tabId ? state.panes.activePane[tabId] : undefined
+    if (!tabId || !paneId) throw new Error('No active pane to seed')
+    harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+    harness.dispatch({
+      type: 'panes/updatePaneContent',
+      payload: {
+        tabId,
+        paneId,
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: `req-collapse-${currentSessionId}`,
+          sessionId: currentSessionId,
+          sessionRef: { provider: 'codex', sessionId: currentSessionId },
+          resumeSessionId: currentSessionId,
+          status: 'idle',
+          model: 'gpt-5.4-flash',
+          effort: 'high',
+          settingsDismissed: true,
+        },
+      },
+    })
+  }, sessionId)
+  await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 10_000 })
 }
 
 async function pointActiveFreshcodexLeafAtSession(page: any, sessionId: string) {
