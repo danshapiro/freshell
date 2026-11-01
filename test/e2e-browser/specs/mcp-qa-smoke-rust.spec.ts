@@ -17,10 +17,9 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
  * Slice-1/3a/3b REST surface now supports: shell, amplifier (fresh + resume),
  * opencode (fresh), codex (fresh + resume-via-sessionRef), browser, editor,
  * and the Slice-3b-2 pane-lifecycle routes (split/resize/swap/respawn/select/
- * has-tab/kill-pane/kill-tab). One server boot, sequential actions, ONE
- * `server.restart()` at the very end -- see that section's comment for why
- * the post-restart assertions are deliberately negative (documenting a real
- * gap, not fabricating persistence that does not exist).
+ * has-tab/kill-pane/kill-tab). One server boot, sequential actions, and one
+ * restart at the end verifies persisted tab layouts, terminal scrollback
+ * teardown, and a fresh command through the same MCP process.
  *
  *
  * No browser `page` needed -- like `mcp-bridge-rust.spec.ts`, this drives pure
@@ -33,7 +32,7 @@ const __dirname = path.dirname(__filename)
 
 const FAKE_AMPLIFIER_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-amplifier-cli.mjs')
 const FAKE_OPENCODE_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode-terminal.mjs')
-const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
+const FAKE_CODEX_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-terminal.mjs')
 
 /**
  * Install a fake CLI fixture as an executable named `execName` in a
@@ -56,6 +55,15 @@ async function readArgvLines(logPath: string): Promise<Array<{ argv: string[] }>
   const raw = await fs.readFile(logPath, 'utf8').catch(() => '')
   if (!raw.trim()) return []
   return raw.trim().split('\n').map((line) => JSON.parse(line) as { argv: string[] })
+}
+
+async function readCodexRequestLines(logPath: string): Promise<Array<{ method: string; params?: { threadId?: string } }>> {
+  const raw = await fs.readFile(logPath, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  })
+  if (!raw.trim()) return []
+  return raw.trim().split('\n').map((line) => JSON.parse(line) as { method: string; params?: { threadId?: string } })
 }
 
 test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
@@ -81,7 +89,9 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
     // A Rust codex terminal starts its app-server sidecar from CODEX_CMD
     // before it starts the terminal. This shim keeps the terminal fixture for
     // the TUI path and supplies the required long-lived app-server fixture.
-    const fakeCodexPath = await installDualRoleCodexCli(binDir, FAKE_CODEX_CLI_SOURCE)
+    const fakeCodexPath = await installDualRoleCodexCli(binDir, FAKE_CODEX_TERMINAL_SOURCE, {
+      FAKE_CODEX_TERMINAL_ARGV_LOG: codexArgLog,
+    })
 
     const server = new RustServer({
       verbose: false,
@@ -91,7 +101,6 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
         OPENCODE_CMD: fakeOpencodePath,
         FAKE_OPENCODE_TERMINAL_ARGV_LOG: opencodeArgLog,
         CODEX_CMD: fakeCodexPath,
-        FAKE_CODEX_ARGV_LOG: codexArgLog,
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ appendRequestLogPath: codexRequestLog }),
       },
       setupHome: async (homeDir) => {
@@ -126,9 +135,9 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       },
     })
 
-    // Tab ids created before the final restart -- checked for non-persistence
-    // (see the "restart" section at the bottom).
-    const preRestartTabIds: string[] = []
+    // IDs returned by the mode matrix; shellTabId is explicitly killed before
+    // restart and must not be included in the persisted live tab set.
+    const createdTabIds: string[] = []
 
     try {
       await mcp.initialize()
@@ -143,7 +152,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       expect(shellTab.status).toBe('ok')
       const shellTabId: string = shellTab.data.tabId
       const shellPaneId: string = shellTab.data.paneId
-      preRestartTabIds.push(shellTabId)
+      createdTabIds.push(shellTabId)
 
       const shellMarker = `MCP-QA-SMOKE-SHELL-${randomUUID()}`
       const shellSend = await mcp.callFreshellAction('send-keys', {
@@ -176,7 +185,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       const amplifierFresh = await mcp.callFreshellAction('new-tab', { mode: 'amplifier', cwd: sharedRoot })
       expect(amplifierFresh.status).toBe('ok')
       const amplifierFreshPaneId: string = amplifierFresh.data.paneId
-      preRestartTabIds.push(amplifierFresh.data.tabId)
+      createdTabIds.push(amplifierFresh.data.tabId)
 
       const amplifierFreshWait = await mcp.callFreshellAction('wait-for', {
         target: amplifierFreshPaneId, pattern: 'amplifier> ', timeout: 20,
@@ -220,7 +229,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       }, { timeout: 30_000 }).toBe('ok')
       expect(amplifierResume.status).toBe('ok')
       const amplifierResumePaneId: string = amplifierResume.data.paneId
-      preRestartTabIds.push(amplifierResume.data.tabId)
+      createdTabIds.push(amplifierResume.data.tabId)
 
       const amplifierResumeWait = await mcp.callFreshellAction('wait-for', {
         target: amplifierResumePaneId, pattern: 'amplifier: resumed session', timeout: 20,
@@ -245,7 +254,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       expect(opencodeFresh.status).toBe('ok')
       const opencodeFreshPaneId: string = opencodeFresh.data.paneId
       const opencodeTabId: string = opencodeFresh.data.tabId
-      preRestartTabIds.push(opencodeTabId)
+      createdTabIds.push(opencodeTabId)
 
       const opencodeFreshWait = await mcp.callFreshellAction('wait-for', {
         target: opencodeFreshPaneId, pattern: 'opencode> ', timeout: 20,
@@ -269,7 +278,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       const codexFresh = await mcp.callFreshellAction('new-tab', { mode: 'codex', cwd: sharedRoot })
       expect(codexFresh.status).toBe('ok')
       const codexFreshPaneId: string = codexFresh.data.paneId
-      preRestartTabIds.push(codexFresh.data.tabId)
+      createdTabIds.push(codexFresh.data.tabId)
       const codexFreshWait = await mcp.callFreshellAction('wait-for', { target: codexFreshPaneId, pattern: 'codex> ', timeout: 20 })
       expect(codexFreshWait.data.matched).toBe(true)
 
@@ -278,7 +287,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       })
       expect(codexResume.status, JSON.stringify(codexResume)).toBe('ok')
       const codexResumePaneId: string = codexResume.data.paneId
-      preRestartTabIds.push(codexResume.data.tabId)
+      createdTabIds.push(codexResume.data.tabId)
 
       const codexResumeWait = await mcp.callFreshellAction('wait-for', {
         target: codexResumePaneId, pattern: `codex: resumed session ${codexSessionId}`, timeout: 20,
@@ -289,8 +298,16 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
 
       const codexArgvLines = await readArgvLines(codexArgLog)
       expect(codexArgvLines.some((e) => e.argv.includes('--remote'))).toBe(true)
-      const codexRequests = (await fs.readFile(codexRequestLog, 'utf8')).trim().split('\n')
-        .map(line => JSON.parse(line) as { method: string; params?: { threadId?: string } })
+      // The fake terminal prints its argv-derived resume marker immediately;
+      // its real proxy handshake runs asynchronously. Wait for that native
+      // request to reach the fake app-server before reading its request log.
+      const readResumeRequestCount = async () => (await readCodexRequestLines(codexRequestLog)).filter(request => (
+        request.method === 'thread/resume' && request.params?.threadId === codexSessionId
+      )).length
+      await expect.poll(readResumeRequestCount, {
+        message: `fake Codex app-server receives thread/resume for ${codexSessionId}`,
+      }).toBe(1)
+      const codexRequests = await readCodexRequestLines(codexRequestLog)
       expect(codexRequests.filter(request => request.method === 'thread/resume'
         && request.params?.threadId === codexSessionId)).toHaveLength(1)
 
@@ -310,14 +327,14 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       expect(browserTab.status).toBe('ok')
       const browserTabId: string = browserTab.data.tabId
       const browserPaneId: string = browserTab.data.paneId
-      preRestartTabIds.push(browserTabId)
+      createdTabIds.push(browserTabId)
 
       const editorFilePath = path.join(sharedRoot, 'mcp-qa-smoke-editor-target.txt')
       await fs.writeFile(editorFilePath, 'mcp qa smoke editor content\n')
       const editorTab = await mcp.callFreshellAction('new-tab', { editor: editorFilePath })
       expect(editorTab.status).toBe('ok')
       const editorTabId: string = editorTab.data.tabId
-      preRestartTabIds.push(editorTabId)
+      createdTabIds.push(editorTabId)
 
       const browserPanes = await mcp.callFreshellAction('list-panes', { target: browserTabId })
       expect(browserPanes.status).toBe('ok')
@@ -388,39 +405,62 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       expect(hasTabAfterKill.data.exists).toBe(false)
 
       // -----------------------------------------------------------------
-      // 7. RESTART -- ONE `server.restart()` for the whole suite. The
-      //    Slice-1/3a/3b agent-API registry (`FreshAgentState.tabs` /
-      //    `terminal_panes` / `content_panes` / `pane_tabs`, all
-      //    `Arc<Mutex<HashMap<..>>>` in `crates/freshell-freshagent/src/lib.rs`)
-      //    is IN-PROCESS MEMORY ONLY -- there is no durable backing store for
-      //    it (unlike the browser client's own localStorage-persisted layout,
-      //    which this suite never touches since it drives pure REST/MCP with
-      //    no browser). A fresh server process after `restart()` therefore
-      //    starts with EMPTY maps: every tab/pane id minted above is gone,
-      //    and every PTY the terminal registry owned is gone too (the Rust
-      //    server's own graceful-shutdown Drop path kills them). This is the
-      //    CURRENT, real, honest behavior -- not a bug this suite is
-      //    pretending doesn't exist, and not persistence this suite is
-      //    fabricating. It matches the MCP tool's own advertised contract
-      //    (`freshell-tool.ts`'s `INSTRUCTIONS`: "Tab and pane IDs are
-      //    ephemeral... If the Freshell server restarts... previously
-      //    returned IDs may no longer exist").
-      // -----------------------------------------------------------------
+      // 7. RESTART. The Rust server persists LayoutStore snapshots under the
+      //    fixture HOME and flushes pending writes during graceful shutdown.
+      //    The tab/pane layouts remain available, while terminal processes
+      //    and their in-memory scrollback are shut down with the old server.
+      //    Read the live tab list after kill-tab so the expected set excludes
+      //    the shell tab explicitly closed above.
+      const tabsBeforeRestart = await mcp.callFreshellAction('list-tabs')
+      expect(tabsBeforeRestart.status).toBe('ok')
+      const tabIdsBeforeRestart = (tabsBeforeRestart.data.tabs as Array<{ id: string }>).map((t) => t.id)
+      const expectedTabIdsBeforeRestart = createdTabIds.filter((tabId) => tabId !== shellTabId)
+      expect([...tabIdsBeforeRestart].sort()).toEqual([...expectedTabIdsBeforeRestart].sort())
+      expect(tabIdsBeforeRestart).not.toContain(shellTabId)
+
       if (!server.restart) throw new Error('RustServer does not implement restart()')
       await server.restart()
 
       const listTabsAfterRestart = await mcp.callFreshellAction('list-tabs')
       expect(listTabsAfterRestart.status).toBe('ok')
-      const postRestartTabIds = new Set((listTabsAfterRestart.data.tabs as Array<{ id: string }>).map((t) => t.id))
-      for (const tabId of preRestartTabIds) {
-        expect(postRestartTabIds.has(tabId)).toBe(false)
-      }
+      const postRestartTabIds = (listTabsAfterRestart.data.tabs as Array<{ id: string }>).map((t) => t.id)
+      expect([...postRestartTabIds].sort()).toEqual([...tabIdsBeforeRestart].sort())
+      expect(postRestartTabIds).not.toContain(shellTabId)
 
-      // A stale pane id from before the restart is genuinely gone (the PTY
-      // died with the old process) -- capture-pane 404s, it does not return
-      // stale/blank data silently.
+      // The pane layout remains, but graceful server shutdown killed its
+      // terminal process; capture cannot return that process's old scrollback.
+      const persistedPanes = await mcp.callFreshellAction('list-panes', { target: amplifierFresh.data.tabId })
+      expect(persistedPanes.status).toBe('ok')
+      expect((persistedPanes.data.panes as Array<{ id: string }>).map((pane) => pane.id))
+        .toContain(amplifierFreshPaneId)
       const captureAfterRestart = await mcp.callFreshellAction('capture-pane', { target: amplifierFreshPaneId })
       expect(captureAfterRestart.error).toBeTruthy()
+
+      // The same retained MCP process must reach the new server instance and
+      // its fresh terminal registry, rather than serving cached list data.
+      const postRestartShell = await mcp.callFreshellAction('new-tab', { mode: 'shell', cwd: sharedRoot })
+      expect(postRestartShell.status).toBe('ok')
+      expect(tabIdsBeforeRestart).not.toContain(postRestartShell.data.tabId)
+      const postRestartMarker = `MCP-QA-SMOKE-RESTART-${randomUUID()}`
+      const postRestartSend = await mcp.callFreshellAction('send-keys', {
+        target: postRestartShell.data.paneId,
+        keys: `echo ${postRestartMarker}\r`,
+        literal: true,
+      })
+      expect(postRestartSend.status).toBe('ok')
+      const postRestartWait = await mcp.callFreshellAction('wait-for', {
+        target: postRestartShell.data.paneId, pattern: postRestartMarker, timeout: 20,
+      })
+      expect(postRestartWait.status).toBe('ok')
+      expect(postRestartWait.data.matched).toBe(true)
+      const postRestartCapture = await mcp.callFreshellAction('capture-pane', {
+        target: postRestartShell.data.paneId, S: -200,
+      })
+      expect(postRestartCapture).toContain(postRestartMarker)
+      const tabsAfterRestartCommand = await mcp.callFreshellAction('list-tabs')
+      expect(tabsAfterRestartCommand.status).toBe('ok')
+      expect((tabsAfterRestartCommand.data.tabs as Array<{ id: string }>).map((t) => t.id))
+        .toContain(postRestartShell.data.tabId)
     } finally {
       await mcp.close()
       await server.stop()
