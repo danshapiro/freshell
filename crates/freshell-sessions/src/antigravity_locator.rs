@@ -138,13 +138,78 @@ pub const ANTIGRAVITY_WINDOW_MS: i64 = 2_000;
 /// never pin a window forever or bind an UNRELATED future conversation
 /// (the hazard needs a same-cwd transcript receiving an identical prompt
 /// text within the lifetime). Chosen as 30× the 2 s window: long enough
-/// to cover a CLI cold start plus a short unattended stall (the sweep's
-/// 150 ms cadence gives ~400 retries), short enough to sit well inside
+/// to cover a CLI cold start plus a short unattended stall (the round-6
+/// backoff lane spaces those retries out — ~46 walks per unmatched
+/// submit at the production 150 ms sweep, see
+/// [`ANTIGRAVITY_PENDING_RESCAN_CAP_MS`] — while keeping full-lifetime
+/// coverage), short enough to sit well inside
 /// the 120 s busy deadman — "awaiting the first record" ends before
 /// "turn wedged" semantics begin. Beyond it the honest degradation is
 /// the user re-submitting (the next Enter re-opens the window — the pane
 /// self-heals on its next prompt).
 pub const ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS: i64 = 60_000;
+
+/// The pending-retry BACKOFF LANE (whole-delta review round 6, Minor 1):
+/// a submit that matched nothing stays pending for the full
+/// [`ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS`], and pre-fix the 150 ms
+/// production sweep (`LOCATOR_SWEEP_INTERVAL`, freshell-server main.rs)
+/// re-walked the WHOLE brain tree on every tick — ~387 walks per
+/// unmatched submit (a slash command, an approval answer), growing with
+/// conversation history. The lane bounds that cost with a stepped
+/// rescan delay that is a PURE FUNCTION of the submit's age:
+///
+/// | age since the submit's Enter | rescan delay |
+/// |---|---|
+/// | < 4 s | 150 ms (the sweep's own cadence — the FAST head) |
+/// | < 6 s | 300 ms |
+/// | < 10 s | 600 ms |
+/// | < 20 s | 1.2 s |
+/// | < 40 s | 2.4 s |
+/// | ≥ 40 s | 5 s (the cap) |
+///
+/// Why this shape: the common quick-start case (the CLI writes its user
+/// record within ~1–2 s of the submit) keeps the FULL 150 ms cadence for
+/// the first ~4 s, so a promptly-written record binds on the very next
+/// sweep tick with zero added latency; only submits that stay unmatched
+/// — which are exactly the submits that will probably NEVER match (slash
+/// commands, approval answers) — pay the stretched spacing. 60 s TOTAL
+/// COVERAGE IS PRESERVED BY CONSTRUCTION: the lane stretches the retry
+/// interval but never cancels it before the lifetime bound, so a record
+/// the CLI writes at ANY age before expiry is found within one cap
+/// interval (worst-case discovery latency 5 s, only for submits older
+/// than 40 s — already 2/3 through their lifetime). A NEWER
+/// `note_submit` always resets the lane (its `last_scan` restarts at the
+/// window). Total walks per unmatched submit at the production 150 ms
+/// sweep: ~46 (vs ~387 pre-fix).
+pub const ANTIGRAVITY_PENDING_RESCAN_CAP_MS: i64 = 5_000;
+
+/// The fast head's bound: submits younger than this keep the sweep's own
+/// 150 ms cadence.
+pub const ANTIGRAVITY_PENDING_FAST_LANE_MS: i64 = 4_000;
+
+/// The walk-count bound per unmatched submit over its full lifetime at
+/// the production 150 ms sweep (~46 by the schedule above; the pin
+/// carries headroom for schedule tuning without ever re-approaching the
+/// pre-fix flat-cadence ~387).
+pub const ANTIGRAVITY_PENDING_MAX_WALKS_PER_LIFETIME: u64 = 60;
+
+/// The stepped rescan delay for a pending submit of `age_ms` (see
+/// [`ANTIGRAVITY_PENDING_RESCAN_CAP_MS`]'s table).
+fn pending_rescan_delay(age_ms: i64) -> i64 {
+    if age_ms < ANTIGRAVITY_PENDING_FAST_LANE_MS {
+        150
+    } else if age_ms < 6_000 {
+        300
+    } else if age_ms < 10_000 {
+        600
+    } else if age_ms < 20_000 {
+        1_200
+    } else if age_ms < 40_000 {
+        2_400
+    } else {
+        ANTIGRAVITY_PENDING_RESCAN_CAP_MS
+    }
+}
 
 /// Bounded BACKWARD tolerance for the recency rule (whole-delta review
 /// round 3, Major 1; whole-delta review round 4, Minor 1 moved the
@@ -216,6 +281,13 @@ struct Armed {
     /// re-opens. A zero-match evaluation leaves it `false`: the submit is
     /// PENDING and later ticks retry it (whole-delta review round 2).
     resolved: bool,
+    /// When the lane last WALKED the tree for this window (round 6,
+    /// Minor 1): `None` until the window's first scan (at the window
+    /// bound), then stamped on every lane-legal scan. The next rescan is
+    /// due once `pending_rescan_delay(age)` has elapsed since it. Reset
+    /// to `None` by every `note_submit` (a new window starts at the
+    /// fast head).
+    last_scan_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -280,6 +352,7 @@ impl AntigravityLocator {
                 cwd_normalized: normalize_cwd(cwd),
                 submit: None,
                 resolved: false,
+                last_scan_ms: None,
             },
         );
         true
@@ -305,12 +378,10 @@ impl AntigravityLocator {
         };
         armed.submit = Some(CapturedSubmit { text, at_ms });
         armed.resolved = false;
+        // A NEW window restarts the backoff lane at its fast head (the
+        // lane is per-window, not per-pane).
+        armed.last_scan_ms = None;
         true
-    }
-
-    fn due(&self, armed: &Armed, now_ms: i64) -> bool {
-        matches!(&armed.submit, Some(s)
-            if !armed.resolved && now_ms >= s.at_ms + self.window_ms)
     }
 
     /// One evaluation pass over every due armed pane. Candidates are the
@@ -326,32 +397,72 @@ impl AntigravityLocator {
     /// conversation claimed by two panes in the same tick is refused for
     /// BOTH (the codex locator's same-tick cross-claim defense). `tick()`
     /// drains.
+    ///
+    /// The retry cost of a PENDING submit is bounded by the backoff lane
+    /// (round 6, Minor 1; [`pending_rescan_delay`]): the FIRST scan runs
+    /// at the window bound as before, and later rescans are due only
+    /// once the lane's stepped delay (a pure function of the submit's
+    /// age) has elapsed since the last walk. The walk itself is shared —
+    /// one per tick that has at least one lane-due pane — and only the
+    /// lane-due panes evaluate against it, so a pane's per-file probe
+    /// cost also stays on its own lane. A pane past its pending lifetime
+    /// resolves WITHOUT a walk (the observing tick is the end).
     pub fn tick(&self, now_ms: i64) -> Vec<AntigravityLocated> {
+        let mut scan_ids: Vec<String> = Vec::new();
         {
-            let inner = self.inner.lock().unwrap();
-            if !inner.armed.values().any(|a| self.due(a, now_ms)) {
+            let mut inner = self.inner.lock().unwrap();
+            for (terminal_id, armed) in inner.armed.iter_mut() {
+                let Some(submit) = &armed.submit else {
+                    continue;
+                };
+                if armed.resolved {
+                    continue;
+                }
+                // The pending submit's bounded lifetime: a submit that
+                // never matched is DROPPED once the lifetime elapses
+                // (never pinning a window, never binding an unrelated
+                // future conversation). Resolving at expiry needs NO
+                // walk — this tick observes the end and the pane goes
+                // quiet (zero fs cost again).
+                if now_ms >= submit.at_ms + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS {
+                    armed.resolved = true;
+                    continue;
+                }
+                if now_ms < submit.at_ms + self.window_ms {
+                    continue;
+                }
+                let lane_due = match armed.last_scan_ms {
+                    // The window's FIRST scan: always due at the window
+                    // bound (unchanged from the pre-lane behavior).
+                    None => true,
+                    // The backoff lane: the next rescan waits out the
+                    // stepped delay for the submit's CURRENT age.
+                    Some(last) => now_ms - last >= pending_rescan_delay(now_ms - submit.at_ms),
+                };
+                if lane_due {
+                    armed.last_scan_ms = Some(now_ms);
+                    scan_ids.push(terminal_id.clone());
+                }
+            }
+            if scan_ids.is_empty() {
                 return Vec::new(); // zero fs cost while no window is due
             }
         }
         let transcripts = self.scan_transcripts();
         let mut inner = self.inner.lock().unwrap();
 
-        // Pass 1: per-pane candidate evaluation.
+        // Pass 1: per-pane candidate evaluation — ONLY the panes the lane
+        // admitted this tick (a pane piggybacking another pane's walk
+        // without being lane-due keeps its own lane for its next scan).
         let mut claims: Vec<(String, AntigravityLocated)> = Vec::new();
-        for (terminal_id, armed) in inner.armed.iter_mut() {
+        for terminal_id in &scan_ids {
+            let Some(armed) = inner.armed.get_mut(terminal_id) else {
+                continue;
+            };
             let Some(submit) = armed.submit.clone() else {
                 continue;
             };
-            if armed.resolved || now_ms < submit.at_ms + self.window_ms {
-                continue;
-            }
-            // The pending submit's bounded lifetime: a submit that never
-            // matched is DROPPED once the lifetime elapses (never pinning
-            // a window, never binding an unrelated future conversation);
-            // this tick is the one that observes the expiry, after which
-            // `due()` stops considering the pane (zero fs cost again).
-            if now_ms >= submit.at_ms + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS {
-                armed.resolved = true;
+            if armed.resolved {
                 continue;
             }
             let mut matches: Vec<AntigravityLocated> = Vec::new();
@@ -399,10 +510,11 @@ impl AntigravityLocator {
                 });
             }
             match matches.len() {
-                // Zero matches: the submit STAYS PENDING — a later tick
-                // retries it (the review's late-write case). Only the
-                // lifetime bound (checked above) or a NEWER `note_submit`
-                // (which replaces the window) ends the retry.
+                // Zero matches: the submit STAYS PENDING — a later
+                // lane-legal tick retries it (the review's late-write
+                // case). Only the lifetime bound (checked above) or a
+                // NEWER `note_submit` (which replaces the window and
+                // resets the lane) ends the retry.
                 0 => {} // keep watching (pending; the next Enter re-opens)
                 1 => {
                     armed.resolved = true;
@@ -1112,10 +1224,132 @@ mod tests {
             "the superseded pending window never binds: {located:?}"
         );
         // The live window's own conversation (written at/after B) binds.
+        // (Round 6: the tick times below follow the PRODUCTION sweep's
+        // 150 ms cadence — B's window opened at submit_b + WINDOW + 1,
+        // and the backoff lane's fast-head delay is one sweep interval,
+        // so the binding tick is one sweep later. The pre-lane test
+        // ticked +1/+2 ms apart, a shape the real sweep can't produce.)
         write_transcript(&root, "conv-b", cwd, &[("re-typed prompt", submit_b + 500)]);
-        let located = locator.tick(submit_b + ANTIGRAVITY_WINDOW_MS + 2);
+        let located = locator.tick(submit_b + ANTIGRAVITY_WINDOW_MS + 151);
         assert_eq!(located.len(), 1, "the newest submit's window binds");
         assert_eq!(located[0].conversation_id, "conv-b");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whole-delta review round 6, Minor 1 — the pending-retry cost is
+    /// BOUNDED. A submit that never matches (a slash command, an approval
+    /// answer) stays pending for the full 60 s lifetime, and pre-fix the
+    /// 150 ms production sweep re-walked the WHOLE brain tree on every
+    /// tick (~387 walks per such submit, growing with conversation
+    /// history). The backoff LANE bounds the walk count while preserving
+    /// the full-lifetime coverage: the first scan runs at the window as
+    /// before, retries then space out on a stepped schedule (150 ms while
+    /// the submit is younger than ~4 s — the common quick-start case
+    /// where the CLI writes its user record promptly — doubling steps up
+    /// to a 5 s cap), and the lane NEVER stops before the lifetime ends,
+    /// so a record written at ANY age still binds (within one cap
+    /// interval). This test simulates the production sweep EXACTLY (a
+    /// tick every 150 ms across the whole lifetime) and pins the walk
+    /// bound.
+    #[test]
+    fn an_unmatched_submit_retries_on_a_bounded_backoff_lane() {
+        let (locator, root) = locator_for("backoff-lane");
+        let cwd = "/tmp/agy-backoff-lane";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        // A slash command never produces a matching user record — the
+        // review's worst case.
+        assert!(locator.note_submit("t1", "/help", T0));
+        // The production sweep's exact cadence, run across the full
+        // lifetime plus a 1 s tail.
+        let mut now = T0 + ANTIGRAVITY_WINDOW_MS + 1;
+        while now <= T0 + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS + 1_000 {
+            assert!(locator.tick(now).is_empty());
+            now += 150;
+        }
+        let walks = locator.fs_scan_count();
+        assert!(walks > 1, "the pending submit keeps retrying: {walks}");
+        assert!(
+            walks <= ANTIGRAVITY_PENDING_MAX_WALKS_PER_LIFETIME,
+            "the backoff lane bounds the retry cost (~46 walks per unmatched \
+             submit at the 150 ms sweep, vs ~387 at the pre-fix flat cadence): \
+             {walks}"
+        );
+        // The pane resolved at expiry (the lifetime bound), so the lane is
+        // quiet afterwards: further ticks cost zero walks.
+        let before = locator.fs_scan_count();
+        assert!(locator.tick(now + 10_000).is_empty());
+        assert_eq!(
+            locator.fs_scan_count(),
+            before,
+            "an expired pending submit never walks again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The lane's FAST head: a YOUNG pending window keeps scanning at the
+    /// sweep's own 150 ms cadence (the common quick-start case), so a
+    /// record the CLI writes just after the first scan binds on the very
+    /// next sweep tick.
+    #[test]
+    fn a_young_pending_window_keeps_the_fast_sweep_cadence() {
+        let (locator, root) = locator_for("fast-lane");
+        let cwd = "/tmp/agy-fast-lane";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        assert!(locator.note_submit("t1", "quick start prompt", T0));
+        assert!(locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1).is_empty());
+        assert_eq!(locator.fs_scan_count(), 1);
+        assert!(locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 151).is_empty());
+        assert_eq!(
+            locator.fs_scan_count(),
+            2,
+            "a young pending window retries at the sweep cadence"
+        );
+        // The CLI's record lands between the scans; the NEXT 150 ms tick
+        // binds it.
+        write_transcript(
+            &root,
+            "conv-quick",
+            cwd,
+            &[("quick start prompt", T0 + ANTIGRAVITY_WINDOW_MS + 100)],
+        );
+        let located = locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 301);
+        assert_eq!(located.len(), 1, "the quick-start bind is not delayed");
+        assert_eq!(located[0].conversation_id, "conv-quick");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The lane's COVERAGE: a record written LATE in the lifetime (the
+    /// slow-startup / auth-flow shape) still binds within one cap
+    /// interval — the backoff stretches the retry spacing, it never
+    /// cancels the retry before the lifetime ends.
+    #[test]
+    fn a_record_written_late_in_the_lifetime_still_binds_within_the_cap() {
+        let (locator, root) = locator_for("late-coverage");
+        let cwd = "/tmp/agy-late-coverage";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t1", cwd);
+        assert!(locator.note_submit("t1", "slow auth flow prompt", T0));
+        // The first due scan matches nothing; the submit stays pending.
+        assert!(locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1).is_empty());
+        // The CLI finally writes its user record at age 50 s.
+        write_transcript(
+            &root,
+            "conv-late",
+            cwd,
+            &[("slow auth flow prompt", T0 + 50_000)],
+        );
+        // The next lane tick (one 5 s cap interval later, the lane's
+        // worst-case discovery latency for an old submit) binds it —
+        // 60 s total coverage is preserved.
+        let located = locator.tick(T0 + 50_000 + ANTIGRAVITY_PENDING_RESCAN_CAP_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "a record written at age 50 s still binds within one cap interval"
+        );
+        assert_eq!(located[0].conversation_id, "conv-late");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -57,20 +57,37 @@
 //!   //     COMPLETENESS: the pane does not bind from an uncertain submit
 //!   //     and never poisons the association with a wrong guess — the
 //!   //     next clean submit binds (the pane self-heals).
-//!   //   - Pasted text arrives CR-separated (xterm.js
+//!   //   - Pasted text OUTSIDE a bracketed-paste envelope (a CLI that
+//!   //     never enables the mode) arrives CR-separated (xterm.js
 //!   //     `prepareTextForTerminal` converts pasted `\r?\n` to `\r`
 //!   //     before the bytes reach the PTY), so a pasted multi-line blob
 //!   //     still flushes per line and its LAST line is the live capture
 //!   //     — `classify_input`'s "the LAST pasted line remains
-//!   //     evaluable" stance; a paste-frame-aware capture is deferred
-//!   //     until a real binary proves the recorded form of a pasted blob
-//!   //     (the A2 blocker). The newline byte the CLI writes INSIDE its
+//!   //     evaluable" stance. The newline byte the CLI writes INSIDE its
 //!   //     recorded multi-line user text is likewise fixture-validated
 //!   //     only. The modeled key set itself is the candidate contract:
 //!   //     a real binary may bind keys differently (A2) — an imperfect
 //!   //     model degrades toward not-binding (a wrong modeled text just
 //!   //     fails the locator's exact match), and the KNOWABLE wrong-guess
 //!   //     class is removed by the uncertain marking.
+//!   //   - BRACKETED PASTE (whole-delta review round 6, Minor 2; the
+//!   //     probed real CLI ENABLES bracketed paste on startup — `CSI
+//!   //     ?2004h` observed in the round-6 PTY probe receipts, binaries
+//!   //     v1.4.10 AND v1.4.12 — so xterm.js wraps pastes in
+//!   //     `ESC[200~ … ESC[201~` and the pasted newlines arrive as CR):
+//!   //     on `CSI 200~` the capture enters a PASTE state that
+//!   //     suppresses ALL flushes (a pasted CR joins the buffer as
+//!   //     inline newline content — the CLI's own reading of pasted
+//!   //     newlines is a Stage-1 unknown, never guessed); on `CSI 201~`
+//!   //     it exits and the WHOLE paste is ONE UNCERTAIN submit, never
+//!   //     Clean. The uncertainty MARK persists past the paste (the
+//!   //     real line still contains the pasted text the model cannot
+//!   //     reconstruct), so the first post-paste Enter also flushes
+//!   //     Uncertain; the capture self-heals on the next clean line.
+//!   //     A nested `200~` inside an open paste is a no-op (the bytes
+//!   //     are paste content — the same ambiguity the CLI's own parser
+//!   //     sees), and a STRAY `201~` without an open paste stays in the
+//!   //     unmodelable set (mark uncertain, never flush).
 //!
 //! - The association lives ON the hub (a `HubInner` slot, set once at
 //!   boot) rather than a `WsState` field: its whole input feed IS the
@@ -111,8 +128,8 @@ pub enum CapturedSubmit {
 }
 
 /// Per-pane line-editor capture: the modeled buffer + cursor, the
-/// uncertainty mark, the ESC-sequence parser state, and the submits
-/// flushed at Enter bytes (drained by the sweep).
+/// uncertainty mark, the bracketed-paste state, the ESC-sequence parser
+/// state, and the submits flushed at Enter bytes (drained by the sweep).
 #[derive(Debug, Default)]
 struct PaneCapture {
     /// The modeled line (chars, cursor-indexed — a `Vec<char>` keeps
@@ -125,6 +142,12 @@ struct PaneCapture {
     /// the next Enter flushes UNCERTAIN (see the module header's
     /// uncertain set).
     uncertain: bool,
+    /// Inside a bracketed-paste envelope (`CSI 200~` seen, `CSI 201~`
+    /// pending): ALL flushes are suppressed (a pasted CR joins the
+    /// buffer as inline newline content) and the envelope END flushes
+    /// the whole paste as ONE UNCERTAIN submit (round 6, Minor 2 — see
+    /// the module header).
+    paste: bool,
     /// The ESC-sequence parser state — ON the pane, because input
     /// arrives as arbitrary chunks and a sequence can split across
     /// `note_input_tagged` calls.
@@ -164,9 +187,13 @@ enum EscEdit {
     CursorEnd,
     /// Delete — deletes the char at the cursor.
     Delete,
-    /// Any other sequence (Up/Down history recall, word-jumps, paste
-    /// frames, mouse tracking, ...): unmodelable — the capture goes
-    /// uncertain.
+    /// `CSI 200~` — a bracketed-paste envelope OPENS (round 6, Minor 2).
+    PasteStart,
+    /// `CSI 201~` — the envelope CLOSES (flushes the whole paste as ONE
+    /// Uncertain submit when a paste was open).
+    PasteEnd,
+    /// Any other sequence (Up/Down history recall, word-jumps, mouse
+    /// tracking, ...): unmodelable — the capture goes uncertain.
     Unmodelable,
 }
 
@@ -179,6 +206,8 @@ fn classify_esc_sequence(seq: &[char]) -> EscEdit {
         ['H'] | ['1', '~'] => EscEdit::CursorHome,
         ['F'] | ['4', '~'] => EscEdit::CursorEnd,
         ['3', '~'] => EscEdit::Delete,
+        ['2', '0', '0', '~'] => EscEdit::PasteStart,
+        ['2', '0', '1', '~'] => EscEdit::PasteEnd,
         _ => EscEdit::Unmodelable,
     }
 }
@@ -246,7 +275,10 @@ impl AntigravityAssociation {
     /// newline at the cursor; Backspace deletes left of the cursor;
     /// Delete deletes at the cursor; Left/Right/Home/End move the cursor;
     /// Ctrl+C clears the buffer and is NOT a submit; every other control
-    /// or ESC sequence marks the capture uncertain.
+    /// or ESC sequence marks the capture uncertain. Inside a bracketed-
+    /// paste envelope (`CSI 200~` … `CSI 201~`, round 6) ALL flushes are
+    /// suppressed — a pasted CR is inline content — and the envelope
+    /// close flushes the WHOLE paste as ONE UNCERTAIN submit.
     pub fn note_input_tagged(&self, terminal_id: &str, data: &str, at_ms: i64) -> (bool, bool) {
         let mut panes = self.panes.lock().unwrap();
         let Some(pane) = panes.get_mut(terminal_id) else {
@@ -290,12 +322,53 @@ impl AntigravityAssociation {
                                 pane.buffer.remove(pane.cursor);
                             }
                         }
+                        // The bracketed-paste envelope (round 6, Minor 2;
+                        // module header): the OPEN marks the capture
+                        // uncertain (the CLI's reading of the pasted blob
+                        // is a Stage-1 unknown) and suppresses flushes; a
+                        // NESTED open inside an ongoing paste is paste
+                        // content (a no-op — the same ambiguity the CLI's
+                        // own parser sees).
+                        EscEdit::PasteStart => {
+                            pane.paste = true;
+                            pane.uncertain = true;
+                        }
+                        // The CLOSE flushes the WHOLE paste as ONE
+                        // UNCERTAIN submit (never Clean) when a paste was
+                        // open; the uncertainty MARK persists past the
+                        // flush (the real line still contains the pasted
+                        // text), so the first post-paste Enter also
+                        // flushes Uncertain. A STRAY close (no open
+                        // paste) is unmodelable, like before.
+                        EscEdit::PasteEnd => {
+                            if pane.paste {
+                                pane.paste = false;
+                                pane.buffer.clear();
+                                pane.cursor = 0;
+                                pane.submits.push_back(CapturedSubmit::Uncertain { at_ms });
+                                flushed = true;
+                            } else {
+                                pane.uncertain = true;
+                            }
+                        }
                         EscEdit::Unmodelable => pane.uncertain = true,
                     }
                     continue;
                 }
             }
             match ch {
+                '\r' if pane.paste => {
+                    // A CR INSIDE a bracketed-paste envelope is CONTENT
+                    // (the CLI's own reading of pasted newlines is a
+                    // Stage-1 unknown, never guessed): join the buffer as
+                    // an inline newline, never a mid-paste flush (the
+                    // whole paste flushes ONE Uncertain submit at the
+                    // envelope close).
+                    if pane.buffer.len() < MAX_LINE_BUFFER_CHARS {
+                        pane.buffer.insert(pane.cursor, '\n');
+                        pane.cursor += 1;
+                    }
+                }
                 '\r' => {
                     // Enter: flush the FULL modeled line (multi-line
                     // payloads included) as one submit — CLEAN when the
@@ -1200,6 +1273,106 @@ mod tests {
                 }
             )],
             "the raw buffer is captured verbatim (trimmed at the locator)"
+        );
+    }
+
+    /// Whole-delta review round 6, Minor 2 — the bracketed-paste envelope.
+    /// The probed real CLI ENABLES bracketed paste on startup (`CSI ?2004h`
+    /// observed in the round-6 PTY probe receipts, binaries v1.4.10 AND
+    /// v1.4.12), so xterm.js wraps pastes in `ESC[200~ … ESC[201~` and the
+    /// pasted newlines arrive as CR. Pre-fix, the first pasted CR flushed
+    /// an UNCERTAIN submit and CLEARED the mark, so every later pasted line
+    /// flushed CLEAN and went to the locator — the knowable wrong-guess
+    /// class the uncertain marking exists to remove. The envelope is now
+    /// PARSED: on `CSI 200~` the capture enters a paste state that
+    /// suppresses ALL flushes (a pasted CR joins the buffer as inline
+    /// newline content); on `CSI 201~` it exits and the WHOLE paste is ONE
+    /// UNCERTAIN submit (never Clean — the CLI's interpretation of a
+    /// pasted blob is a Stage-1 unknown). The uncertainty MARK persists
+    /// past the paste (the real line still contains the pasted text), so
+    /// the first post-paste Enter also flushes Uncertain; the capture
+    /// self-heals on the next clean typed line.
+    #[test]
+    fn bracketed_paste_suppresses_mid_paste_flushes_and_flushes_one_uncertain() {
+        let (association, _home) = association_for("bracketed-paste");
+        association.note_created("t1", "antigravity");
+        // The paste envelope arrives in arbitrary chunks; the pasted blob
+        // carries CRs (xterm.js converts pasted newlines to CR).
+        assert!(
+            !association.note_input("t1", "typed\u{1b}[200~pasted ", 1_000),
+            "the envelope start never flushes"
+        );
+        assert!(
+            !association.note_input("t1", "line one\rpasted line two", 1_001),
+            "a CR INSIDE the paste is content, never a mid-paste flush"
+        );
+        assert!(
+            association.note_input("t1", "\u{1b}[201~", 1_002),
+            "the envelope end flushes the whole paste as ONE submit"
+        );
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![("t1".to_string(), CapturedSubmit::Uncertain { at_ms: 1_002 })],
+            "the whole paste is exactly ONE UNCERTAIN submit (never Clean)"
+        );
+        // The uncertainty MARK persists past the paste: the real line still
+        // contains the pasted text the model cannot reconstruct, so the
+        // first post-paste Enter flushes Uncertain (never a clean
+        // wrong-guess), and the capture self-heals on the NEXT clean line.
+        assert!(association.note_input("t1", "typed after\r", 2_000));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![("t1".to_string(), CapturedSubmit::Uncertain { at_ms: 2_000 })],
+            "the first post-paste Enter flushes Uncertain — the pasted text \
+             is still on the real line"
+        );
+        assert!(association.note_input("t1", "clean again\r", 3_000));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![(
+                "t1".to_string(),
+                CapturedSubmit::Clean {
+                    text: "clean again".to_string(),
+                    at_ms: 3_000
+                }
+            )],
+            "the capture self-heals on the next clean typed line"
+        );
+    }
+
+    /// The paste envelope split across chunks — the ESC-sequence parser
+    /// state lives ON the pane, so an envelope marker split mid-sequence is
+    /// still recognized (a call-local parser would corrupt it into literal
+    /// content).
+    #[test]
+    fn a_paste_envelope_split_across_chunks_still_bounds_one_uncertain_flush() {
+        let (association, _home) = association_for("paste-split");
+        association.note_created("t1", "antigravity");
+        assert!(!association.note_input("t1", "\u{1b}", 1_000));
+        assert!(!association.note_input("t1", "[20", 1_001));
+        assert!(!association.note_input("t1", "0~line one\r", 1_002));
+        assert!(!association.note_input("t1", "line two\u{1b}[2", 1_003));
+        assert!(association.note_input("t1", "01~", 1_004));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![("t1".to_string(), CapturedSubmit::Uncertain { at_ms: 1_004 })],
+            "a split envelope still produces exactly ONE Uncertain flush at the end"
+        );
+    }
+
+    /// A STRAY end marker (a `CSI 201~` with no open paste) is an
+    /// unmodelable escape sequence — the pre-fix behavior (mark uncertain,
+    /// never flush) is preserved.
+    #[test]
+    fn a_stray_paste_end_marker_marks_uncertain_and_never_flushes() {
+        let (association, _home) = association_for("stray-paste-end");
+        association.note_created("t1", "antigravity");
+        assert!(!association.note_input("t1", "ab\u{1b}[201~", 1_000));
+        assert!(association.note_input("t1", "\r", 1_001));
+        assert_eq!(
+            association.take_pending_submits(),
+            vec![("t1".to_string(), CapturedSubmit::Uncertain { at_ms: 1_001 })],
+            "a stray end marker is unmodelable — the next Enter flushes Uncertain"
         );
     }
 
