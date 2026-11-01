@@ -25,25 +25,25 @@ Implement the three-stage Freshagent multi-device robustness proposal so one ser
 
 **Tech Stack:** Rust/Axum/Tokio/SQLite, existing native Codex/Claude/Kilroy/OpenCode adapters, TypeScript/React/Redux, Zod protocol generation, Cargo/Vitest/Playwright, pnpm 10.34.5.
 
-**Preparation status:** The external draft and writer self-review were completed before the user resumed this run. The dedicated worktree is now `.worktrees/freshagent-multiple-devices` on `the-usual/freshagent-multiple-devices`, based at `6b1c961baf8301dc7ebf8d5fdca7105fbfca9cdb`. The base suite previously exited 1 because `managed-provider-qualification` could not compile `crates/freshell-server/src/managed_provider_bootstrap.rs` (`mcp_enabled` is undefined at lines 123/128; the Codex pattern at line 372 omits `approval_default`). The complete receipt remains in the baseline ledger. The user explicitly resumed after that failure was reported, so continue while treating only reproduced base failures as pre-existing. Do not add an unrelated baseline repair task. This committed plan is the implementation contract for the three stages below; source and review corrections supersede its code drafts once execution begins.
+**Preparation status:** The external draft and writer self-review were completed before the user resumed this run. The dedicated worktree is now `.worktrees/freshagent-multiple-devices` on `the-usual/freshagent-multiple-devices`, based at `6b1c961baf8301dc7ebf8d5fdca7105fbfca9cdb`. The base suite previously exited 1 because `managed-provider-qualification` could not compile `crates/freshell-server/src/managed_provider_bootstrap.rs` (`mcp_enabled` is undefined at lines 123/128; the Codex pattern at line 372 omits `approval_default`). The complete receipt remains in the baseline ledger. These errors affect every server build with `managed-runtime-v1`, including `managed-fresh-agent-fixtures`, not only the qualification lane. The user explicitly resumed after that failure was reported. The small bootstrap repair below is required setup for the requested managed coverage and is therefore in scope; preserve the original base failure rather than waive the managed acceptance rows. This committed plan is the implementation contract for the three stages below; source and review corrections supersede its code drafts once execution begins.
 
-## Load-bearing outcome: FAILED/non-converged
+## Load-bearing outcome: viable plan; implementation and verification pending
 
-The requested independent Stage 2 recheck again found no complete supported route that preserves ordinary Stop while preventing a delayed control captured for turn A from interrupting native successor B. Pinned Codex 0.164.0 checks the target before submitting a generic core interrupt; its internal conditional primitive is not exposed through the public app-server protocol. The pinned Claude/Kilroy SDK 0.3.237 / CLI 2.1.237 interrupt handler aborts its current controller without comparing a captured turn. OpenCode 1.18.21 selects current session work before its runner cancels that work. Managed control epochs do not add the missing native condition. Provider input queues, runner locks, lifecycle acknowledgments and hook callbacks were reconsidered; none established an externally usable barrier covering queued and autonomous successors across all required routes. This is static source analysis, not a reproduced live race or proof that every future provider solution is impossible. Blanket refusal or converting normal busy sends into server follow-ups would change required behavior and cannot clear the finding.
+Fresh Eyes round 1 found that the previous FAILED/non-converged conclusion imposed a provider-internal atomic cancellation guarantee beyond the requested single server authority. The corrected contract checks the device's captured source and owner turn under existing server submission serialization immediately before native adapter invocation. A delayed request for settled A is rejected when B is current, with zero native interrupt. Codex retains its native turnId; Claude/Kilroy reuse the turn ledger; OpenCode adds an owner activity generation to its existing drive/daemon lifecycle. Task 14 specifies those mappings and preserves ordinary Stop and provider busy-send behavior. Native work may change inside a provider after an admitted operation is sent; the existing provider API limitation remains, and the plan does not promise an atomic compare inside that provider.
 
-Do not implement Tasks 1–16 or mark the complete request viable under this unresolved contract; no implementation task has started (0/16). Reopening requires both a concrete target-safe native operation/barrier for every required route (LB-9) and a source-backed lifecycle discriminator that can identify and settle the captured turn, including commandless and absorbed-command cases (LB-8). Unknown targets and explicit gaps contain uncertainty; they are not substitutes for the normal supported Stop, streaming-join and follow-up cases. The recheck also carries earlier binding, snapshot, settings, receipt and send-fence corrections into their actual tasks. Evidence and execution limits are in `reports/load-bearing-recheck-astra.md` under `.worktrees/.the-usual-logs/freshagent-multiple-devices/`; earlier reports and the coordinator-owned ledger remain historical evidence. Prepared dependencies, images and runtime files remain unverified.
+Tasks 1–7 have no dependency on the Stage 3 turn-control design and can proceed in their stage order, including the required managed compile setup. Task 14 must establish the target and settlement evidence consumed by Task 15; accepted follow-ups remain tied to their captured target during bounded unknown settlement. A failure of either task leaves that required Stage 3 behavior incomplete and cannot be reported as full success. No implementation task has started (0/16); prepared dependencies, images and runtime files remain unverified. Earlier binding, snapshot, settings, receipt and send-fence corrections remain in force. The historical load-bearing reports retain their source observations; `reports/plan-remediation-astra-round-1.md` under `.worktrees/.the-usual-logs/freshagent-multiple-devices/` records the corrected scope and plan decisions.
 
 ## Global Constraints
 
 1. Execute only in the verified dedicated worktree `.worktrees/freshagent-multiple-devices` on `the-usual/freshagent-multiple-devices`, with immutable base `6b1c961baf8301dc7ebf8d5fdca7105fbfca9cdb`. Preserve the recorded base-gate failure and any later same-base receipt; do not rewrite a failed baseline as green. Main and unrelated work remain untouched.
-2. The user lifted the earlier pause after the plan, and load-bearing validation continued. It ended FAILED/non-converged before implementation because no inspected supported route for the pinned providers establishes target-safe ordinary Stop; do not continue Tasks 1–16 under that unresolved contract. Do not deploy, restart the live port-3001 server, create a PR, or merge. Keep unrelated baseline compile repairs outside this feature branch; compare final failures against the recorded base before classifying them as pre-existing.
+2. Continue the three stages in the task order below after plan review. Scope delayed-control safety to the serialized server dispatch boundary; keep any task-specific target/settlement failure local to Tasks 14–15, while requiring it to be resolved before full completion. Do not deploy, restart the live port-3001 server, create a PR, or merge. Repair the managed bootstrap compile defects because they prevent required managed verification; unrelated baseline failures stay documented separately and cannot waive an acceptance-matrix row.
 3. Node >=22.5, Rust stable/workspace minimum 1.96, exactly pnpm 10.34.5; reuse installed dependencies and prepared runtime files. Use `pnpm install --frozen-lockfile` only when needed. NodeNext/ESM relative TypeScript imports end in `.js`.
 4. Keep the default in-process Freshagent path and the optional managed Freshagent path working. Do not enable a managed feature flag to evade default-path work. Managed terminal support alone is not managed Freshagent support. Provider findings apply to the inspected repository pins, not an arbitrary CODEX_CMD, CLAUDE_CMD/SDK-module or OpenCode executable override; unknown capabilities need operation-specific handling and cannot be used to claim the pinned defaults are supported.
 5. Preserve one native writer, owner epoch/generation, operation tickets, provider leases, terminal-liveness checks, handoff fences, send logical-attempt fences, and provider-native busy/attention behavior. Never use browser presence or a durable terminal ID as proof of process liveness.
 6. Reuse `freshell-agent-runtime/src/host_actor.rs`, the managed **Freshagent** journal. `freshell-session-host/src/command_journal.rs` and `output_journal.rs` belong to PTYs and are outside this feature. `freshell-freshagent` already depends on `freshell-agent-runtime`, so provider-neutral bookkeeping can live there without a new ownership service. Extract the platform-aware atomic replacement contract to `freshell-platform` for the new default and managed state writes; add the direct dependency needed by `freshell-agent-runtime` and verify the crate graph remains acyclic.
 7. Follow [test sandbox guidance](../development/test-sandbox.md), [pre-push gate](../development/pre-push-gate.md), [self-hosted launch runbook](../development/self-hosted-launch-runbook.md), and [Windows build instructions](../development/windows-electron-build.md) rather than duplicating operational procedures. Do not restart the live port-3001 server. No new deployment script or production migration command is needed.
 8. Use red/green/refactor behavioral tests, including meaningful integration and independent-device browser evidence. Do not test prose, generated source text, hashes, or static configuration by string matching. Never weaken or skip a behavior test to obtain green.
-9. The configured Vitest and browser backends are `cloud`; preserve them. Agent broad gates set `GCLOUD_ROBOT_REQUIRE=1` and `FRESHELL_RUST_TEST_SANDBOX=1`. A broken cloud lane must be repaired, not silently replaced by local. Required repository-classified local-only managed fixtures are a separate supplemental gate, not a fallback.
+9. The configured Vitest and browser backends are `cloud`; preserve them. Agent broad gates set `GCLOUD_ROBOT_REQUIRE=1` and `FRESHELL_RUST_TEST_SANDBOX=1`. A broken cloud lane must be repaired, not silently replaced by local. Required repository-classified local-only managed fixtures are a separate supplemental gate, not a fallback. Server managed proxy/bootstrap Cargo selectors explicitly enable `--features managed-runtime-v1`; record positive selected/executed counts for each required module/provider. A compile failure or zero-match run cannot satisfy a red behavioral regression or green acceptance gate.
 10. Tests use their existing worktree and configured result paths. Disposable files go in `.test-tmp/`; retained diagnosis in `test-results/`. Stop only task-owned verified processes, record external temporary paths, and clean them after each run. No broad kill patterns, live provider session, or prior repaired conversation is test input.
 11. End-user documentation belongs in `README.md`; update `docs/index.html` only for the resulting major UI actions. Agent documentation is this plan. Logs are structured JSONL with severity and request/source/order identifiers; never log prompt, draft, approval answer, or credential contents.
 
@@ -58,8 +58,8 @@ The stage-2 ledger and its independent validation reports govern these ten decis
 5. Receipts must distinguish request write, provider acceptance, completion and possible delivery; controls that finish a turn must remain dispatchable, and uncertain sends must not be replayed.
 6. A stable durable conversation/store identity must survive materialization aliases, rekey and restart while a true fork receives a new identity. Serialize alias resolve-or-create before admission/recovery; unreadable or conflicting identity is not Missing. Atomic replacement alone does not serialize competing reservations.
 7. All send ingress must reference one durable send-effect fence; receipt/order storage may describe its outcome but must never grant a second native dispatch permit.
-8. Provider lifecycle must identify owner/native turns independently of one-to-one client commands, including commandless turns and multiple commands absorbed into one turn. Codex native IDs are available; an exact Claude/OpenCode discriminator and settlement association remain unresolved. Do not invent identity from command order, a message ID or an uncorrelated busy/idle observation. This prerequisite remains open independently of LB-9.
-9. A delayed interrupt must be fenced where the provider can still affect the native turn, including work already queued or autonomously started.
+8. Expose source-scoped owner turns independently of one-to-one client commands. Reuse Codex native turn IDs, Claude/Kilroy ledger starts/results/idle and prestart membership, and OpenCode owner activity generations correlated with drive/daemon settlement. Task 14 defines zero-to-many membership, commandless activity, duplicate/trailing events and uncertain settlement. These are server-observed turn boundaries, not invented native IDs; Task 15 waits on the captured owner target and never retargets accepted work.
+9. Under owner submission serialization, compare the captured source/turn after any server-side admission wait and before invoking the native interrupt adapter or mutating Stop state. Recheck server-controlled retries against the original target. Preserve the provider API and its existing behavior after dispatch; no provider-internal atomic cancellation guarantee or blanket Stop refusal is required.
 10. Existing cloud-legal default and local Docker managed fixtures must provide positive independent desktop/mobile cases and native request audits for the required interleavings without live providers.
 
 The ledger records each claim's evidence, method, fallback and status. Static-only findings are acceptable when the proposed behavior does not yet exist or execution would require unsafe setup; missing execution is recorded as a gap rather than inferred as proof.
@@ -86,6 +86,7 @@ The map covers files introduced or materially modified. Existing nearby inline t
 | New `crates/freshell-agent-runtime/src/reconciliation.rs`, `reconciliation_tests.rs`, existing `lib.rs`, `host_actor.rs` and `host_actor_tests.rs`; `crates/freshell-agent-runtime/Cargo.toml`; new `crates/freshell-platform/src/atomic_file.rs` and platform tests | Shared bounded event/receipt/settings/queue bookkeeping and atomic retained presentation; one platform-aware atomic replacement helper used by managed and default state writes. |
 | New `crates/freshell-freshagent/src/session_reconciliation.rs`; `claude.rs`, `claude_edges.rs`, `claude_projection.rs`, `claude_snapshot.rs`, `codex.rs`, `codex/projection.rs`, `codex/controls.rs`, `opencode_ws.rs`, `snapshot.rs`, `lib.rs`; `crates/freshell-opencode/src/serve.rs`, `events.rs`, `transport.rs` | Default owners stamp canonical events and retain native-keyed overlays; durable command state; provider-native submission/target/decision integration; instance-stream readiness, payload and loss signaling. |
 | `crates/freshell-server/src/main.rs` | Inject the existing isolated-home state root into default reconciliation owners; no production restart or launch change. |
+| `crates/freshell-server/src/managed_provider_bootstrap.rs` | Required managed compile setup: reuse optional MCP capability preparation and preserve Codex approval defaults; exercise the existing feature-gated bootstrap tests. |
 | `crates/freshell-freshagent/src/rest_lane.rs`, `rest_lane_sync.rs`, `claude_rest_lane.rs`, `codex_rest_lane.rs`, `crates/freshell-server/src/fresh_agent_proxy_rest.rs` | HTTP/CLI/MCP-facing ingress uses the same command admission and receipt authority as WebSocket ingress. |
 | `crates/freshell-ws/src/terminal.rs`, `hosted_fresh_agent.rs`, `checkpoint_barrier.rs`; new `crates/freshell-ws/src/freshagent_delivery.rs` | Requester context, connection-scoped interest, bounded sync delivery and checkpoint linkage. |
 | `crates/freshell-server/src/fresh_agent_proxy.rs`, `checkpoints.rs` | Managed gateway preserves source/sequence/watermark; existing logical-attempt checkpoint store stays authoritative. |
@@ -110,15 +111,23 @@ The map covers files introduced or materially modified. Existing nearby inline t
 8. `CommandMeta = {commandId, expectedSource?}`; sends reuse `checkpointIntent.logicalAttemptId` and request aliases. `CommandReceipt = {commandId, payloadDigest, acceptedOrder, state, effectiveSettingsRevision?, submittedTurnId?, providerAckId?, result?}`. States distinguish queued/accepted, dispatching, provider-acknowledged, completed/cancelled, rejected and ambiguous. Missing, expired and store-unreadable lookup are distinct. Detailed receipt retention is bounded; compact dedup/expiry metadata is explicitly added where required to keep stable lookup, but is not a native send permit. The existing send-effect fence remains the only authority that may permit a send; receipt records reference its outcome. No lazy archive lookup is promised.
    Keep at most 4096 detailed settled receipts in active owner state and 128 unresolved admitted commands; refuse additional admission with typed backpressure before native effect rather than dropping unresolved state. Define and test the compact lookup/expiry representation alongside the single send-fence crash policy in Tasks 8–12. Do not evict or duplicate the existing send-effect fence merely to bound the in-memory receipt projection. Accepted queue payload has the separate Task 15 128-entry/4MiB cap.
 9. Under existing owner submission serialization, admission checks source/fences/preconditions and same-ID digest, persists acceptance/order/payload before native effect, and invokes eligible commands in accepted order. The release boundary and receipt evidence are provider-specific: Codex correlated start/steer response, Claude correlated native queued/started lifecycle, and OpenCode bounded HTTP dispatch/response with no inferred native FIFO admission. Record actual dispatch order separately: a follow-up waiting for turn completion cannot block an interrupt or approval targeting that active turn. Streaming response duration does not hold the submission gate. Typed no-dispatch refusal may be retried only under its proven safe policy; possible native delivery is ambiguous and never automatically resent under the old or a newly minted ID. Provider acknowledgment requires correlated native acceptance, not checkpoint capture, a wire write or `dispatch_started`. Existing send checkpoint outcomes retain their separate rewind meaning.
-10. `SettingsState` separates versioned desired values from effective values, per-field certainty and application scope (`current`, `next-turn`, `unknown`); explicit edits use `expectedSettingsRevision` and patch semantics (absent preserves, `effort: null` selects Default). Ordinary modern sends carry no cached settings and cannot restore stale view state over newer shared defaults. Report effective settings/revision only at a provider boundary that can establish them; represent partial or uncertain explicit edits honestly. `TurnTarget` uses a source-scoped owner turn identity with native identity when available, membership for zero-to-many associated commands, and explicit prestart/unknown states. Validate a delayed control's captured target at the native effect boundary; never infer that one client command names every native turn.
+10. `SettingsState` separates versioned desired values from effective values, per-field certainty and application scope (`current`, `next-turn`, `unknown`); explicit edits use `expectedSettingsRevision` and patch semantics (absent preserves, `effort: null` selects Default). Ordinary modern sends carry no cached settings and cannot restore stale view state over newer shared defaults. Report effective settings/revision only at a provider boundary that can establish them; represent partial or uncertain explicit edits honestly. `TurnTarget` uses a source-scoped owner turn identity with native identity when available, membership for zero-to-many associated commands, and explicit prestart/unknown states. Validate a delayed control's captured target under owner submission serialization immediately before native adapter invocation; never infer that one client command names every native turn. Provider-internal progress after dispatch remains subject to the existing native operation's semantics.
 11. Native decisions claim Pending -> Dispatching atomically before awaiting a write; response digest/result and winning receipt persist. Opposite/duplicate losers get requester-scoped typed outcomes, not shared session errors. Unknown delivery stays ambiguous. Shared membership and resolution still broadcast. Unsupported provider features remain typed unsupported.
 12. Unsent drafts stay in the local view. Pressing Send with follow-up intent immediately accepts a durable server command `delivery: 'after-current-turn'`; its queue is shared and survives reload/detach. Queued payload and accepted order persist; settings are resolved by shared authority at actual dispatch, not frozen by the submitting view. Normal `delivery: 'native'` preserves Codex steering, Claude native busy acceptance and OpenCode's compact-only FIFO and ordinary busy-send behavior. Cancellation succeeds only before Dispatching.
 
 ### Task order
 
-Stage 1 is Tasks 1–3, Stage 2 is Tasks 4–7, and Stage 3 is Tasks 8–16. Execute in numeric order; each task consumes the preceding committed interfaces. Task 8 is shared bookkeeping, not a switch to managed Freshagent. Each implementation stage earns actual two-device browser and Rust/provider evidence before the next stage; the final matrix ties the stages together. Plan code is a pre-implementation draft: once execution starts, source and review corrections supersede its code blocks; task intent and the User Request remain authoritative.
+Stage 1 is Tasks 1–3, Stage 2 is Tasks 4–7, and Stage 3 is Tasks 8–16. Execute in numeric order, completing the managed compile setup before the first managed gate; each task consumes the preceding committed interfaces. Tasks 1–7 are independent of Tasks 14–15, so later control/follow-up uncertainty does not stop their work. Task 15 specifically depends on Task 14's implemented and verified target/settlement mapping; full completion requires both. Task 8 is shared bookkeeping, not a switch to managed Freshagent. Each implementation stage earns actual two-device browser and Rust/provider evidence before the next stage; the final matrix ties the stages together. Plan code is a pre-implementation draft: once execution starts, source and review corrections supersede its code blocks; task intent and the User Request remain authoritative.
 
 ---
+
+## Required setup: restore managed bootstrap compilation
+
+**Files:** `crates/freshell-server/src/managed_provider_bootstrap.rs` and its existing inline tests. This is a prerequisite for the managed gates, not a new provider feature or a waiver of the recorded base failure.
+
+- [ ] Preserve the baseline compile receipt and add behavioral coverage for Codex launch context with and without an MCP capability, plus preservation of an existing `approval_default` when attaching a capability. Reuse the existing managed Codex context test. Run `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 managed_provider_bootstrap"`; initially record the known compile failure separately from behavioral red/green results.
+- [ ] Initialize Codex TUI/sidecar MCP arguments empty in the base preparation, as for the no-capability path. Use the existing final `with_managed_mcp_reference` call to populate them only when a capability is supplied. Make its Codex match preserve fields it does not change, including `approval_default`. Do not introduce another MCP-enabled flag or change grant selection.
+- [ ] Repeat that focused command green with positive bootstrap test counts; also run `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"` with positive counts. Refactor away only the duplicate/broken argument preparation. Commit the source and behavioral tests together with `git add crates/freshell-server/src/managed_provider_bootstrap.rs` and `git commit -m "fix(server): restore managed provider bootstrap compilation"`.
 
 ## Stage 1: Separate view lifetime and repair durable identity
 
@@ -138,7 +147,7 @@ The helper covers freshclaude, kilroy, freshcodex and freshopencode. Its audit
 records actual received native operations, source/owner, command identity when
 carried, settings/options, decision digest, and affected native work when the
 provider exposes it. Native turn IDs are optional evidence, not fixture-minted
-substitutes for the missing provider contract. Keep dispatch counts separate
+substitutes for a provider capability it does not expose. Keep dispatch counts separate
 from accepted/started/completed counts. Desktop/mobile each contain an
 independent context/page; boot/turn holds and release hooks operate on the
 native fixture, and cleanup owns only that fixture's resources.
@@ -153,6 +162,13 @@ freshAgent.kill and recovery-stop counts stay zero. Repeat sessionRef-only,
 last-pane/tab cleanup and failed-detach compensation. Explicit Terminate agent
 must still await the existing kill acknowledgment and stop the shared session.
 
+fresh-agent-view-attachment.test.ts: exercise detachFreshAgentView with two
+attachments to the same locator. Only an acknowledgment matching requestId and
+viewId settles A; unrelated/old acknowledgments leave it pending and cannot
+settle B. Duplicate matching acknowledgments are harmless. A typed failure,
+disconnect or fixed timeout rejects and releases its listener/timer so pane
+cleanup can compensate; none sends Kill or removes shared session state.
+
 Browser helper: factor owned RustServer/machine-registration flow from
 handoff-two-device-rust.spec.ts and provider fixtures from
 fresh-agent-control-rust.spec.ts. Create independent contexts with desktop
@@ -161,16 +177,25 @@ fresh-agent-control-rust.spec.ts. Create independent contexts with desktop
  deviceScaleFactor:2.75,isMobile:true,hasTouch:true}. Assert distinct nonempty
 freshell.device-id.v2 and independent localStorage. Use real server/adapters.
 
-For every mode, test name starts 'stage1 close': hold a streaming native turn,
-open the same locator on both devices, close mobile's view, release more
-native output, and assert desktop receives it, runtime/native boot count=1,
-native terminate count=0 and one transcript row per native message. Then use
-explicit Terminate agent and assert one native stop and desktop stopped state.
+For every mode, test name starts 'stage1 close': hold native work, open the
+same locator on both devices, close mobile's view, release that work, and assert
+desktop receives its resulting output, runtime/native boot count=1, native
+terminate count=0 and one transcript row per native message. Claude/Kilroy and
+Codex can hold streaming output. For OpenCode use the existing
+FAKE_OPENCODE_HOLD_PROMPT_GATE_PATH and FAKE_OPENCODE_DEFER_PROMPT_ROWS_TO_GATE=1:
+observe the prompt_async audit/busy status, close mobile, release the gate, and
+assert desktop receives the newly persisted rows/idle through the real adapter.
+No OpenCode live delta support is needed here; Task 9 separately adds and tests
+that fixture behavior. Reuse these gates for Task 2 close/cancel/switch coverage.
+Then use explicit Terminate agent and assert one native stop and desktop stopped
+state.
 ```
 
 - [ ] **Step 2: Run and verify the intended failure**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/panes/PaneContainer.test.tsx -t 'shared session' --config config/vitest/vitest.config.ts`
+
+Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/lib/fresh-agent-view-attachment.test.ts --config config/vitest/vitest.config.ts`
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts --grep 'stage1 close'`
 
@@ -203,6 +228,8 @@ pnpm run contract:generate; never hand-edit generated JSON.
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/panes/PaneContainer.test.tsx -t 'shared session' --config config/vitest/vitest.config.ts`
 
+Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/lib/fresh-agent-view-attachment.test.ts --config config/vitest/vitest.config.ts`
+
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts --grep 'stage1 close'`
 
 Expected PASS in all four selected browser modes.
@@ -217,7 +244,7 @@ Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/component
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --lib hosted_fresh_agent"`
 
-Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server fresh_agent_proxy"`
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"`
 
 Run the Step 2 browser command and `pnpm run typecheck`; expected PASS. Routing/protocol callers are included because every hosted command now receives requester context.
 
@@ -499,7 +526,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagen
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_claude_observers"`
 
-Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server fresh_agent_proxy"`
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"`
 
 Run: `pnpm run typecheck`; expected PASS, plus Step 4 browser selector. These cover all attach dispatch callers and managed gateway routing.
 
@@ -1073,7 +1100,7 @@ with typed requester result and no shared session error.
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices sync_requester_gap"`
 
-Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server fresh_agent_proxy"`
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"`
 
 Expected FAIL: attach replays globally, sequence is discarded, live/replay race loses/duplicates events, or capture head is misrepresented.
 
@@ -1108,7 +1135,7 @@ Legacy raw dispatch still uses safe requester attach behavior from Stage 2.
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices sync_requester_gap"`
 
-Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server fresh_agent_proxy"`
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"`
 
 Expected PASS with explicit replay/live insertion barriers and source-preserving managed results.
 
@@ -1122,7 +1149,7 @@ Run: `pnpm run contract:generate`
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices"`
 
-Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server fresh_agent_proxy"`
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"`
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-runtime-protocol -p freshell-runtime-client -p freshell-session-host -p freshell-supervisor"`
 
@@ -1380,7 +1407,7 @@ git commit -m "feat(freshagent): persist ordered command outcomes across all ing
 ### Task 13: Settings edits are versioned and stale ordinary sends cannot revert them
 
 **Files:**
-- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated contract outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/session_reconciliation.rs`, `identity_sink.rs`, `claude.rs`, `codex.rs`, `opencode_ws.rs`, `crates/freshell-supervisor/src/lib.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `src/lib/fresh-agent-configure.ts`, `fresh-agent-settings-convergence.ts`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/store/freshAgentSlice.ts`.
+- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated contract outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/session_reconciliation.rs`, `identity_sink.rs`, `claude.rs`, `codex.rs`, `opencode_ws.rs`, `crates/freshell-supervisor/src/lib.rs`, `crates/freshell-supervisor/src/service.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `src/lib/fresh-agent-configure.ts`, `fresh-agent-settings-convergence.ts`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/store/freshAgentSlice.ts`.
 - Test: runtime/provider owner tests, `crates/freshell-supervisor/src/fresh_agent_configure_tests.rs`, `test/unit/client/lib/fresh-agent-settings-convergence.test.ts`, view/store tests and two-device browser/Rust suites.
 
 **Interfaces:**
@@ -1488,16 +1515,16 @@ Run Step 4 commands and `pnpm run typecheck`; expected PASS, preserving all exis
 - [ ] **Step 7: Commit**
 
 ```bash
-git add shared/ws-protocol.ts shared/fresh-agent-contract.ts crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-agent-runtime/src/reconciliation.rs crates/freshell-agent-runtime/src/reconciliation_tests.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-freshagent/src/session_reconciliation.rs crates/freshell-freshagent/src/identity_sink.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-supervisor/src/lib.rs crates/freshell-supervisor/src/fresh_agent_configure_tests.rs crates/freshell-runtime-protocol/src/fresh_agent_ops.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-session-host/src/providers/fresh_agent.rs src/lib/fresh-agent-configure.ts src/lib/fresh-agent-settings-convergence.ts src/components/fresh-agent/FreshAgentView.tsx src/store/freshAgentSlice.ts test/unit/client/lib/fresh-agent-settings-convergence.test.ts test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx crates/freshell-ws/tests/freshagent_multiple_devices.rs test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
+git add shared/ws-protocol.ts shared/fresh-agent-contract.ts crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-agent-runtime/src/reconciliation.rs crates/freshell-agent-runtime/src/reconciliation_tests.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-freshagent/src/session_reconciliation.rs crates/freshell-freshagent/src/identity_sink.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-supervisor/src/lib.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/fresh_agent_configure_tests.rs crates/freshell-runtime-protocol/src/fresh_agent_ops.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-session-host/src/providers/fresh_agent.rs src/lib/fresh-agent-configure.ts src/lib/fresh-agent-settings-convergence.ts src/components/fresh-agent/FreshAgentView.tsx src/store/freshAgentSlice.ts test/unit/client/lib/fresh-agent-settings-convergence.test.ts test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx crates/freshell-ws/tests/freshagent_multiple_devices.rs test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
 git commit -m "feat(freshagent): version settings edits and capture server send defaults"
 ```
 
 ### Task 14: Delayed controls target one turn and shared decisions resolve atomically
 
-**Status: blocked by the Stage 2 LB-8/LB-9 findings above.** Exact turn lifecycle correlation remains open for Claude/OpenCode, and no inspected complete cross-provider route establishes the required native target check. Codex's pinned public interrupt path is targetless after admission; Claude/Kilroy and OpenCode expose session-scoped cancellation without an expected-turn argument; the managed host dispatches a generic actor/provider interrupt. Do not implement these as generic interrupts plus caller-side checks, and do not treat blanket `UnsupportedTarget` as completion. This task can resume only after all required provider paths expose and independently validate a native target-conditional operation or equivalent barrier. Atomic shared approval/question decisions are not by themselves a substitute for the missing ordinary Stop behavior.
+**Status: planned; depends on Tasks 9 and 12.** Implement server-owned turn targeting before native adapter invocation on both default and managed routes. Source-backed mappings below reuse existing provider lifecycle tracking. Positive current-target Stop and stale-target rejection are required for all four modes. Task 15 depends on this task's target/settlement evidence. Provider-internal progress after an admitted operation is dispatched remains an existing operation limitation; it is not an extra atomicity gate on Tasks 1–7 or this task.
 
 **Files:**
-- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/claude.rs`, `claude_edges.rs`, `claude/stop.rs`, `claude_turns.rs`, `crates/freshell-claude-sidecar/index.mjs`, `codex.rs`, `codex/controls.rs`, `opencode_ws.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-supervisor/src/lib.rs`, `src/components/fresh-agent/FreshAgentView.tsx`.
+- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/claude.rs`, `claude_edges.rs`, `claude/stop.rs`, `claude_turns.rs`, `codex.rs`, `codex/controls.rs`, `opencode_ws.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-supervisor/src/lib.rs`, `src/components/fresh-agent/FreshAgentView.tsx`.
 - Test: `crates/freshell-freshagent/src/codex/controls/tests.rs`, managed actor tests, existing `crates/freshell-ws/tests/freshagent_claude_approvals.rs`, `freshagent_control_reply.rs`, two-device Rust/browser tests and view unit tests.
 
 **Interfaces:**
@@ -1512,11 +1539,16 @@ until A finishes and desktop starts B. Release: B is not interrupted; mobile
 gets stale-target receipt. Also target accepted pre-start command A, hold native
 acceptance, then cancel/settle A and start B: delayed stop still cannot hit B.
 Current-target user Stop preserves silent attention policy/native target latch.
-Also delay consumption INSIDE the native scheduler after its admission/check,
-finish A and start an already-native-queued or autonomous B before releasing the
-control. Audit the actual canceled native work, not just the request payload.
-Run the equivalent route through the managed host. A fake that checks a target
-when the pinned native implementation does not is not qualifying evidence.
+Hold the device frame before server delivery, then repeat with it waiting at
+the server admission gate: let the owner observe A settled and B current before
+releasing A's control. Assert zero adapter/native interrupt calls, a stable
+requester stale-target receipt, and B continuing to completion. Cover commandless
+B, absorbed commands, and duplicate/trailing A lifecycle events in the owner
+mapping. Delay a Claude prestart reissue until its original target settles;
+it must not reselect B. Run the same tests through gateway/host/provider and
+verify expectedSource/expectedTurn survive every hop. Current-target Stop must
+still invoke the provider's existing API and preserve its ordinary behavior;
+fixtures must not invent an unsupported provider-native conditional interrupt.
 
 Rust 'atomic_decisions': opposite A/B approval/question answers arrive while
 first stdin/native RPC is held. Exactly one callback/native decision, one
@@ -1544,28 +1576,63 @@ Expected FAIL: delayed interrupt chooses current turn B, Claude double-writes de
 
 ```text
 Include current TurnTarget in retained presentation and events, using a
-source-scoped owner turn identity independent of a client command. Associate
-zero or many accepted commands and add nativeTurnId when provider lifecycle
-supplies one. Represent prestart and unidentifiable/unknown targets explicitly.
-Mint an owner turn generation only at a source-backed lifecycle start and settle
-that same target only from correlated terminal evidence. Codex native IDs can
-supply this; Claude/OpenCode lifecycle mapping still requires independent
-validation. Busy/idle guesses, native prompt IDs and command order do not prove
-an exact turn. Unknown/prestart targets get bounded resync or typed no-effect
-refusal before any native cancellation, never a fabricated identity.
-Composer captures the exact target when user clicks Stop/answers, alongside
-expected source. Validate the captured target at the provider's native effect
-boundary after admission wait, not only at frame receipt. A settled/mismatched
-target yields a persisted requester stale-target no-op receipt. Never select
-whatever turn is current when a delayed interrupt finally dispatches. Carry the
-same target through managed operations and sidecar/native consumption. Remove
-Claude's blind same-session Stop reissue; a retry must enforce the original
-target at the same proven native boundary. Permission cancellation is also a
-native effect and must not run before that check. An already issued uncertain
-control is Ambiguous, never a no-effect StaleTarget/UnsupportedTarget refusal.
-Provider hooks or queue locks qualify only if they cover every successor and
-remain effective through the correlated cancellation effect; no such route is
-established for this plan. Do not ship caller-side checks as its substitute.
+source-scoped owner turn generation, optional nativeTurnId, zero-to-many command
+membership, and explicit prestart/unknown states. Allocate and settle under the
+existing provider owner lock; reuse its lifecycle, not one turn per client send.
+
+Codex: correlate the native turnId and completed-turn evidence already tracked by
+the adapter/proxy. Preserve turn/interrupt{threadId,turnId} and its submission-only
+acknowledgment; interruption acknowledgment alone is not turn settlement.
+Claude/Kilroy: extend claude_turns' turn_open/command phases and Stop latch with
+an owner generation. Opening Running/RequiresAction/TurnEvidence/content or a
+Started/Replayed command establishes the active generation if none is open;
+absorbed commands join it. A commandless CLI turn gets its own generation.
+Result/Idle retire the current generation and Started membership as the ledger
+already does, while Accepted/Queued commands retain stable prestart identities.
+Promoting a prestart identity records its membership in the resulting generation,
+so Stop and follow-ups can resolve that original target without retargeting.
+Use the existing result/lifecycle/idle ordering and duplicate suppression; test
+trailers after settlement and queued successors explicitly.
+OpenCode: add a source-scoped monotonic activity generation to OpencodeSession.
+Reserve it on idle-to-dispatch/prestart work, or on observed daemon running when
+there is no active generation. Ordinary overlapping busy sends join its command
+membership; replacing the latest turn_task handle does not replace the target.
+Associate drive tasks, settlement callbacks and status-recovery attempts with
+that generation. Reuse await_idle, observe_daemon_running and the session-locked
+conclude_idle_observation activity checks to settle the captured generation;
+preserve abort-in-flight/orphan guards and compact FIFO eligibility. Distinguish
+target settlement from the existing quiescence gate on idle publication: queued
+follow-ups waiting for that target must not prevent its settlement. Record the
+target end before draining eligible entries; never require their queue empty
+as proof that their prerequisite ended. An ordered
+running-to-idle observation or bounded authoritative status recovery supplies
+owner settlement evidence; ignore obsolete source/generation callbacks and
+trailing idle that conflicts with current drive/activity. Do not label a prompt
+message ID or overwritten task handle as a native turn ID. Lost/lagged lifecycle
+evidence becomes Unknown until bounded refresh settles it, never a fabricated
+completion. Tasks 9/14 test source replacement, overlapping sends, trailing idle
+and commandless daemon activity. This maps the server-observed activity boundary;
+it cannot distinguish an unobserved provider-internal successor atomically.
+
+Composer captures the target and expected source when the user clicks Stop or
+answers a decision. Carry both unchanged through server queues and managed
+operations to the same provider owner used by the default route. Immediately
+before native adapter invocation, under existing owner submission serialization,
+compare source and target to current authoritative state and reserve dispatch.
+Any persisted admission wait precedes this final comparison. A mismatch/settled
+target gets a persisted requester StaleTarget receipt with zero native call and
+no Stop latch/attention/permission mutation. Do not release the submission gate
+between the final comparison and adapter invocation; retain short state locks
+only for compare/reservation, not native I/O. Current matching targets use the
+existing provider API. Known prestart targets retain provider-supported Stop
+latching; unknown targets get finite resync/typed no-effect refusal rather than
+blanket refusal for ordinary turns. Server-controlled delayed retries, including
+Claude's existing prestart reissue, must revalidate the original source/target;
+preserve that behavior when the same target remains eligible, never reselect B.
+An already dispatched control with uncertain delivery is Ambiguous, not a claimed
+no-effect refusal. Native execution may progress after invocation; preserve its
+existing semantics without claiming an internal atomic compare or hiding this
+residual behind a stronger fixture API.
 
 Reuse Claude native_dispatches checked reservation: under session/control lock,
 claim Pending->Dispatching and persist command/response digest before await.
@@ -1610,12 +1677,14 @@ Expected PASS and nonzero modes/cases; include existing client view/reconciliati
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/freshell-freshagent/src/claude/stop.rs crates/freshell-freshagent/src/claude_turns.rs crates/freshell-claude-sidecar/index.mjs
+git add crates/freshell-freshagent/src/claude/stop.rs crates/freshell-freshagent/src/claude_turns.rs
 git add shared/ws-protocol.ts shared/fresh-agent-contract.ts crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-agent-runtime/src/reconciliation.rs crates/freshell-agent-runtime/src/reconciliation_tests.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-agent-runtime/src/host_actor_tests.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/claude_edges.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/controls.rs crates/freshell-freshagent/src/codex/controls/tests.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-runtime-protocol/src/fresh_agent_ops.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-supervisor/src/lib.rs src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/freshagent_claude_approvals.rs crates/freshell-ws/tests/freshagent_control_reply.rs test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
 git commit -m "feat(freshagent): fence delayed controls and atomically resolve shared decisions"
 ```
 
 ### Task 15: Submitted follow-ups are durable server-ordered commands
+
+**Status: planned; depends on Task 14's verified owner target and settlement mapping**, as well as Tasks 12–13. If that mapping fails for a required route, this task remains incomplete with Task 14; it does not block independent Stage 1/2 work. Accepted follow-ups survive bounded unknown settlement without dropping or changing their captured target.
 
 **Files:**
 - Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/session_reconciliation.rs`, `claude.rs`, `codex.rs`, `opencode_ws.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-supervisor/src/lib.rs`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/store/freshAgentSlice.ts`.
@@ -1644,6 +1713,10 @@ enforces <=128 accepted entries and <=4MiB retained payload per session, using
 existing protected payload lifecycle; refusal keeps unsent text local. A stop
 or approval can dispatch while an earlier follow-up is ineligible. Test stale
 source/expected turn and owner replacement preserve settled command identities.
+Lose A's settlement evidence after Q1 is accepted: bounded reconciliation ends
+in visible waiting/unknown, preserving Q1's payload, order and afterTurn across
+reload. An unrelated B idle cannot release or retarget Q1. Recover authoritative
+settlement for A and drain Q1 once; timeout alone never means A completed.
 
 Existing normal busy sends retain Codex native steer, Claude native acceptance,
 OpenCode's compact-only FIFO and ordinary busy-send behavior. Browser
@@ -1669,14 +1742,19 @@ Persist its payload reference/order before acknowledgment; publish shared queue
 event. Only then clear the submitted local composer. An admission refusal leaves
 text as an unsent local draft; ambiguous effect never does.
 
-Admission captures a proven target or returns a bounded explicit refusal with
-the unsent draft intact; it cannot promise normal follow-up support while all
-provider targets remain Unknown. After acceptance, retain the exact afterTurn
-across reconnect/recovery. Owner drain selects entries by acceptedOrder only
-after correlated evidence proves that prerequisite settled. Generic idle from
-another or unknown turn cannot release them. On missing lifecycle evidence,
-retain the accepted command/payload and expose its waiting/unknown state while
-bounded reconciliation runs; never retarget it to whichever turn is current.
+Admission captures Task 14's current owner target, including a known prestart
+identity and its later generation association. If the owner is already settled,
+accept the follow-up as eligible under the same serialized check. An unknown
+current target gets bounded reconciliation/explicit refusal with the unsent draft
+intact; normal Claude/OpenCode activity uses the mapped target, not blanket
+Unknown. After acceptance, retain the exact afterTurn across reconnect/recovery.
+Owner drain selects entries by acceptedOrder after that target's settlement,
+using Task 14's provider lifecycle/authoritative idle evidence. An uncorrelated
+idle for another/unknown generation cannot release them. If evidence is missing,
+retain accepted command/payload/order and expose waiting/unknown while bounded
+reconciliation runs. Its timeout settles the refresh outcome, not the queued
+command: keep it queryable and cancellable while awaiting evidence, never drop
+or retarget it to whichever turn is current.
 Atomically transition Queued->Dispatching and persist dispatch fence before invoking existing provider send. Do not redrive a Dispatching record on
 restart unless existing native idempotency/correlated evidence proves safety;
 otherwise keep Ambiguous and expose query. Reuse managed protected payload store
@@ -1863,7 +1941,7 @@ Each browser row runs two independent device contexts against one test-owned ser
 | Replay gaps/duplicates/stale source or snapshot | 8–11,16 | `stage3 gap reconnect`; actual dropped/reordered server frames, converged cursor/text/controls | Contiguous fold, bounded ring/page/reset, source adoption, immutable chunk watermark, Codex inner revisions retained |
 | Concurrent native sends and ordered effects | 12–13,15 | `stage3 settings/followups`; exact audited native request order/options/rows | Same-ID dedup; cross-WS/REST total admission and eligible dispatch order; preserve provider busy send/compact FIFO |
 | Stale settings never revert newer defaults | 13,15 | `stage3 settings/followups`; both headers N+1, old edit conflict, queued send does not carry stale values | Native partial/uncertain configure outcome, effort null/absent, provider-specific effective settings at dispatch |
-| Delayed interrupt cannot stop a new turn | 14 | `stage3 controls`; actual native successor B keeps running after delayed A control, on default and managed routes | Target checked atomically at native consumption or proven provider-owned barrier; delay after native admission, queued/autonomous successors, prestart/unknown targets and silent attention behavior |
+| Device-delayed interrupt cannot stop the server's new turn | 14 | `stage3 controls`; hold A control until server observes A settled/B current, then release; B continues on default and managed routes, zero native interrupt | Source/owner target checked under submission serialization immediately before adapter invocation, including admission waits/reissues; Codex native ID, Claude ledger and OpenCode generation; prestart/unknown targets and silent attention behavior |
 | Atomic approval/question/elicitation winner | 14,16 | `stage3 controls`; one native response, shared resolution, harmless losing view | Pending->Dispatching before await, response digest/result, ambiguous crash, native source validation; unsupported OpenCode asserted |
 | Accepted follow-ups survive submitter removal | 15–16 | `stage3 followups/reload outcomes`; shared order, no duplicate native send, cancel race | Persisted payload/order/proven turn prerequisite, unknown-settlement retention, settings resolved at dispatch, CAS cancel, once-only drain, queued reopen, bounded backpressure |
 | Unsent drafts remain local | 2,15–16 | Type on A without Send: B sees no draft/queue/native call; A draft survives unrelated peer update | No draft in server payload/receipt logs; unknown accepted send never restored as safely unsent |
@@ -1873,5 +1951,5 @@ Each browser row runs two independent device contexts against one test-owned ser
 
 1. For each task record red command/result, green command/result, refactor, impacted suites and focused commit in the usual execution record when execution is later authorized. A precise patch draft may be corrected during implementation; source becomes authoritative after execution begins. Do not rewrite this plan's code blocks to mirror fixes.
 2. Preserve first-failure traces/native audit rows needed to diagnose a run, and counts showing all selected providers/flavors actually executed. Use the standard coordinator and existing configured outputs. Do not put dependency/worktree copies in results. Stop task-owned background processes and remove disposable files after each run.
-3. The original load-bearing pass and the requested independent recheck both ended FAILED/non-converged before implementation. LB-9 has no inspected complete supported target-safe ordinary Stop route; LB-8's exact Claude/OpenCode lifecycle discriminator remains an independent unverified prerequisite. The plan was not advanced to implementation or the post-implementation delta review. Preserve the immutable base record and the earlier failed baseline receipt; later same-base results may add evidence but never erase that failure. If a different base is ever needed, establish its provenance and baseline separately rather than rewriting this run's `base_ref`.
-4. Implementation completion requires every acceptance-matrix row and affected suite genuinely green apart from only those failures reproduced and enumerated at the immutable base, no unresolved substantiated review finding, and a clean focused branch. A push or PR is outside this workflow unless separately requested; repository rules require explicit approval before PR creation. No merge, deployment, production restart, or live repair is authorized.
+3. The original load-bearing pass and independent recheck historically ended FAILED/non-converged before implementation. Fresh Eyes round 1 and this remediation correct their overstrict native-atomicity requirement: Tasks 14–15 use the server-owned source/turn and settlement boundaries above. This is a viable implementation plan, not executed proof; normal Stop, stale rejection and accepted follow-ups must earn all required default/managed evidence. Preserve the immutable base record and the earlier failed baseline receipt; the required managed bootstrap repair does not erase that failure. If a different base is ever needed, establish its provenance and baseline separately rather than rewriting this run's `base_ref`.
+4. Implementation completion requires every acceptance-matrix row and its necessary gates genuinely green with positive executed counts, no unresolved substantiated review finding, and a clean focused branch. Unrelated suite failures reproduced and enumerated at the immutable base may be reported separately, but cannot waive requested managed/default coverage or any acceptance row. The managed bootstrap compile repair and feature-enabled proxy tests are mandatory. A push or PR is outside this workflow unless separately requested; repository rules require explicit approval before PR creation. No merge, deployment, production restart, or live repair is authorized.
