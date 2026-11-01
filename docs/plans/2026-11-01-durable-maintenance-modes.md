@@ -218,8 +218,8 @@ Use these exact red commands and confirm each executes the named new test and fa
 
 ~~~bash
 cargo test -p freshell-supervisor --bin freshell-supervisor tests::schema_version_command_does_not_open_registry -- --exact
-cargo test -p freshell-supervisor --bin freshell-supervisor service::tests::reopen_success_replay_returns_same_incarnation_before_revision_validation -- --exact
-cargo test -p freshell-supervisor --bin freshell-supervisor service::tests::reopen_uses_frozen_legacy_callback_actions -- --exact
+cargo test -p freshell-supervisor --lib service::tests::reopen_success_replay_returns_same_incarnation_before_revision_validation -- --exact
+cargo test -p freshell-supervisor --lib service::tests::reopen_uses_frozen_legacy_callback_actions -- --exact
 cargo test -p freshell-runtime-client --test supervisor_admin_legacy_peer admin_cli_preserves_frozen_v2_wire_contract -- --exact
 ~~~
 
