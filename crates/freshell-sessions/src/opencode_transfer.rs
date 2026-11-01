@@ -6006,6 +6006,8 @@ mod workspace_metadata_test_hooks {
         pub fail_drain_join: bool,
         #[cfg(target_os = "linux")]
         pub drainer_tids: Vec<u32>,
+        #[cfg(target_os = "linux")]
+        pub inherited_pipe_targets: BTreeSet<PathBuf>,
     }
     thread_local! { pub(super) static STATE: RefCell<State> = RefCell::new(State::default()); }
     pub(super) fn spawned(pid: u32) {
@@ -6020,6 +6022,8 @@ mod workspace_metadata_test_hooks {
             let tid = unsafe { libc::syscall(libc::SYS_gettid) };
             let children = fs::read_to_string(format!("/proc/self/task/{tid}/children"))
                 .expect("owned test thread children");
+            let inherited_pipe_targets =
+                STATE.with(|state| state.borrow().inherited_pipe_targets.clone());
             let mut workspace = 0;
             let mut bodies = 0;
             let mut pipes = 0;
@@ -6040,7 +6044,10 @@ mod workspace_metadata_test_hooks {
                     pipes += entries
                         .filter_map(Result::ok)
                         .filter_map(|entry| fs::read_link(entry.path()).ok())
-                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
+                        .filter(|target| {
+                            target.to_string_lossy().starts_with("pipe:")
+                                && !inherited_pipe_targets.contains(target)
+                        })
                         .count();
                 }
             }
@@ -9811,20 +9818,28 @@ mod native_source_inventory_tests {
             fs::write(path, replacement).unwrap();
         };
         corrupt(&stores[1]);
-        // Native Git sorts pack candidates by mtime before alternate order.
-        // Give the disposable packs one stable timestamp so this regression
-        // executes184's two opposite selected-copy orders deterministically.
-        for store in &stores {
-            for entry in fs::read_dir(store.join("pack")).unwrap() {
-                File::open(entry.unwrap().path())
-                    .unwrap()
-                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
-                    .unwrap();
-            }
-        }
         let native = fixture.store.parent().unwrap();
         let workspace = fixture.dir.path().join("workspace/.git/objects");
         for reversed in [false, true] {
+            // Native Git prioritizes newer packs. Equal mtimes leave the
+            // duplicate selection dependent on its tie order, so make the
+            // chosen valid/corrupt copy explicit in each scenario.
+            let preferred = if reversed { &stores[1] } else { &stores[4] };
+            for (index, store) in stores.iter().enumerate() {
+                let priority = if store == preferred {
+                    100
+                } else {
+                    index as u64
+                };
+                for entry in fs::read_dir(store.join("pack")).unwrap() {
+                    File::open(entry.unwrap().path())
+                        .unwrap()
+                        .set_modified(
+                            std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + priority),
+                        )
+                        .unwrap();
+                }
+            }
             let mut ordered = stores.clone();
             if reversed {
                 ordered.swap(1, 4);
@@ -9839,6 +9854,16 @@ mod native_source_inventory_tests {
             .unwrap();
             let qualified = qualified_snapshot_stores(native, &workspace).unwrap();
             assert_eq!(qualified, ordered);
+            let selected = fixture_git(native, &["cat-file", "blob", &late_id], None);
+            assert_eq!(
+                selected.as_bytes(),
+                if reversed {
+                    b"owned alternate 2".as_slice()
+                } else {
+                    body.as_slice()
+                },
+                "native Git must select the scenario's explicitly preferred duplicate"
+            );
             snapshot_reuse_test_hooks::STATE.with(|state| {
                 *state.borrow_mut() = snapshot_reuse_test_hooks::State {
                     aggregate_disabled: true,
@@ -12783,6 +12808,15 @@ mod native_source_inventory_tests {
             workspace_metadata_test_hooks::STATE.with(|state| {
                 *state.borrow_mut() = workspace_metadata_test_hooks::State {
                     legacy,
+                    // Cargo or CI can pass unrelated pipe descriptors to Git.
+                    // Count only pipe identities created by this export, while
+                    // still counting every new endpoint in its owned children.
+                    inherited_pipe_targets: fs::read_dir("/proc/self/fd")
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| fs::read_link(entry.path()).ok())
+                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
+                        .collect(),
                     barrier: Some(Box::new(move |phase, _| {
                         if phase == "before_query" {
                             let actual = fs::read_dir("/proc/self/task")
