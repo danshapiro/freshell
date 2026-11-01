@@ -29,16 +29,16 @@ Implement the three-stage Freshagent multi-device robustness proposal so one ser
 
 ## Load-bearing outcome: FAILED/non-converged
 
-Stage 2 found that no inspected supported route for the pinned provider paths establishes both ordinary Stop and the guarantee that a delayed control captured for turn A cannot interrupt native successor B. For pinned Codex 0.164.0, the public app-server interrupt path discards the target before a generic core interrupt. Claude/Kilroy's pinned SDK 0.3.237 and OpenCode 1.18.21 expose session-scoped interrupt/cancellation without an expected-turn argument; this review did not establish their full native effect scheduling. The managed Freshagent host carries a soul/control epoch but dispatches a generic actor/provider interrupt without a separate turn-target barrier. Codex's internal conditional primitive is not exposed through the public app-server protocol. Local locks, rechecks, receipts, or test mocks do not establish the requested native boundary. Blanket refusal removes requested ordinary Stop and is not an acceptable substitute. This finding is limited to the inspected supported routes and versions; the complete three-stage request cannot safely proceed under the evidence available here.
+The requested independent Stage 2 recheck again found no complete supported route that preserves ordinary Stop while preventing a delayed control captured for turn A from interrupting native successor B. Pinned Codex 0.164.0 checks the target before submitting a generic core interrupt; its internal conditional primitive is not exposed through the public app-server protocol. The pinned Claude/Kilroy SDK 0.3.237 / CLI 2.1.237 interrupt handler aborts its current controller without comparing a captured turn. OpenCode 1.18.21 selects current session work before its runner cancels that work. Managed control epochs do not add the missing native condition. Provider input queues, runner locks, lifecycle acknowledgments and hook callbacks were reconsidered; none established an externally usable barrier covering queued and autonomous successors across all required routes. This is static source analysis, not a reproduced live race or proof that every future provider solution is impossible. Blanket refusal or converting normal busy sends into server follow-ups would change required behavior and cannot clear the finding.
 
-Do not implement Task 14's interrupt path or mark this plan complete. No implementation task has started (0/16). Reopen the plan only when every required provider path has a concrete, source-backed target-conditional operation or provider-owned barrier, followed by independent validation and native-boundary tests. The LB-9 review is static source analysis; no live race was executed. See `reports/load-bearing-strategist-lb9-alternatives.md`, `reports/load-bearing-validator-LB-9-Codex-0.164.0.md`, and the run ledger under `.worktrees/.the-usual-logs/freshagent-multiple-devices/`.
+Do not implement Tasks 1–16 or mark the complete request viable under this unresolved contract; no implementation task has started (0/16). Reopening requires both a concrete target-safe native operation/barrier for every required route (LB-9) and a source-backed lifecycle discriminator that can identify and settle the captured turn, including commandless and absorbed-command cases (LB-8). Unknown targets and explicit gaps contain uncertainty; they are not substitutes for the normal supported Stop, streaming-join and follow-up cases. The recheck also carries earlier binding, snapshot, settings, receipt and send-fence corrections into their actual tasks. Evidence and execution limits are in `reports/load-bearing-recheck-astra.md` under `.worktrees/.the-usual-logs/freshagent-multiple-devices/`; earlier reports and the coordinator-owned ledger remain historical evidence. Prepared dependencies, images and runtime files remain unverified.
 
 ## Global Constraints
 
 1. Execute only in the verified dedicated worktree `.worktrees/freshagent-multiple-devices` on `the-usual/freshagent-multiple-devices`, with immutable base `6b1c961baf8301dc7ebf8d5fdca7105fbfca9cdb`. Preserve the recorded base-gate failure and any later same-base receipt; do not rewrite a failed baseline as green. Main and unrelated work remain untouched.
 2. The user lifted the earlier pause after the plan, and load-bearing validation continued. It ended FAILED/non-converged before implementation because no inspected supported route for the pinned providers establishes target-safe ordinary Stop; do not continue Tasks 1–16 under that unresolved contract. Do not deploy, restart the live port-3001 server, create a PR, or merge. Keep unrelated baseline compile repairs outside this feature branch; compare final failures against the recorded base before classifying them as pre-existing.
 3. Node >=22.5, Rust stable/workspace minimum 1.96, exactly pnpm 10.34.5; reuse installed dependencies and prepared runtime files. Use `pnpm install --frozen-lockfile` only when needed. NodeNext/ESM relative TypeScript imports end in `.js`.
-4. Keep the default in-process Freshagent path and the optional managed Freshagent path working. Do not enable a managed feature flag to evade default-path work. Managed terminal support alone is not managed Freshagent support.
+4. Keep the default in-process Freshagent path and the optional managed Freshagent path working. Do not enable a managed feature flag to evade default-path work. Managed terminal support alone is not managed Freshagent support. Provider findings apply to the inspected repository pins, not an arbitrary CODEX_CMD, CLAUDE_CMD/SDK-module or OpenCode executable override; unknown capabilities need operation-specific handling and cannot be used to claim the pinned defaults are supported.
 5. Preserve one native writer, owner epoch/generation, operation tickets, provider leases, terminal-liveness checks, handoff fences, send logical-attempt fences, and provider-native busy/attention behavior. Never use browser presence or a durable terminal ID as proof of process liveness.
 6. Reuse `freshell-agent-runtime/src/host_actor.rs`, the managed **Freshagent** journal. `freshell-session-host/src/command_journal.rs` and `output_journal.rs` belong to PTYs and are outside this feature. `freshell-freshagent` already depends on `freshell-agent-runtime`, so provider-neutral bookkeeping can live there without a new ownership service. Extract the platform-aware atomic replacement contract to `freshell-platform` for the new default and managed state writes; add the direct dependency needed by `freshell-agent-runtime` and verify the crate graph remains acyclic.
 7. Follow [test sandbox guidance](../development/test-sandbox.md), [pre-push gate](../development/pre-push-gate.md), [self-hosted launch runbook](../development/self-hosted-launch-runbook.md), and [Windows build instructions](../development/windows-electron-build.md) rather than duplicating operational procedures. Do not restart the live port-3001 server. No new deployment script or production migration command is needed.
@@ -51,14 +51,14 @@ Do not implement Task 14's interrupt path or mark this plan complete. No impleme
 
 The stage-2 ledger and its independent validation reports govern these ten decisions. Source-backed corrections below are already applied: remove acceptance-time private settings restoration, make replay gaps explicit, describe receipt retention as new behavior rather than an existing actor facility, use platform-aware atomic replacement, and use the local Docker managed fixture route. Routine selector spelling and generic correctness of code not yet written are task verification, not additional assumptions.
 
-1. Binding mutation must be fenced to the exact current ownership operation across cancellation, durable writes and Live publication; choose a safe synchronous guard or exact-operation repair.
+1. Binding mutation uses exact-operation prepare/write/commit-or-repair for both Starting and Handoff. Persist the originating operation ID in the binding and repair fence, retain monotonic epoch/generation stale-write protection, and keep failed cleanup fenced. A restored prior owner can share the failed handoff's generation, so that pair alone cannot identify its row.
 2. Codex, Claude/Kilroy and OpenCode need provider-specific stable identities and versions for one-time merging of live output with durable history during continuous output. For pinned OpenCode 1.18.21, continuous joins require the instance `/event` route and its `server.connected` readiness barrier, retaining part bases/deltas in the shared owner; missing delta prefixes, reconnects or local lag require an affected-part gap until a full replacement. This is an implementation contract, not evidence that a target-safe interrupt exists. See `reports/load-bearing-validator-LB-2-OpenCode-streaming.md` and `reports/load-bearing-strategist-lb2-opencode-assumptions.md`.
 3. Managed capture must pair retained presentation with its real event watermark across provider-to-actor loss and coalescing, or return an explicit gap/reset.
-4. Shared settings edits must report known effective values after success, partial application, refusal or uncertain native response while preserving each provider's busy behavior.
+4. Shared settings edits report evidence-backed effective fields separately from desired/staged values, with explicit partial or unknown outcomes after failure or lost response; preserve each provider's busy behavior.
 5. Receipts must distinguish request write, provider acceptance, completion and possible delivery; controls that finish a turn must remain dispatchable, and uncertain sends must not be replayed.
-6. A stable durable conversation/store identity must survive materialization aliases, rekey and restart while a true fork receives a new identity.
+6. A stable durable conversation/store identity must survive materialization aliases, rekey and restart while a true fork receives a new identity. Serialize alias resolve-or-create before admission/recovery; unreadable or conflicting identity is not Missing. Atomic replacement alone does not serialize competing reservations.
 7. All send ingress must reference one durable send-effect fence; receipt/order storage may describe its outcome but must never grant a second native dispatch permit.
-8. Provider lifecycle must identify owner/native turns independently of one-to-one client commands, including commandless turns and multiple commands absorbed into one turn.
+8. Provider lifecycle must identify owner/native turns independently of one-to-one client commands, including commandless turns and multiple commands absorbed into one turn. Codex native IDs are available; an exact Claude/OpenCode discriminator and settlement association remain unresolved. Do not invent identity from command order, a message ID or an uncorrelated busy/idle observation. This prerequisite remains open independently of LB-9.
 9. A delayed interrupt must be fenced where the provider can still affect the native turn, including work already queued or autonomously started.
 10. Existing cloud-legal default and local Docker managed fixtures must provide positive independent desktop/mobile cases and native request audits for the required interleavings without live providers.
 
@@ -84,7 +84,7 @@ The map covers files introduced or materially modified. Existing nearby inline t
 | `crates/freshell-ws/src/reconcile_freshagent.rs`, `lib.rs`, `src/lib/pane-reconcile.ts`, `src/store/panesSlice.ts` | Pure per-view reconcile from canonical runtime/recovery facts; multiple same-session views retain their locator. |
 | `src/lib/fresh-agent-snapshot-scheduler.ts`, `src/lib/fresh-agent-reveal-freshness.ts`, new `src/lib/fresh-agent-refresh.ts` | Scheduler-owned read timeout and per-view non-extendable refresh deadline. |
 | New `crates/freshell-agent-runtime/src/reconciliation.rs`, `reconciliation_tests.rs`, existing `lib.rs`, `host_actor.rs` and `host_actor_tests.rs`; `crates/freshell-agent-runtime/Cargo.toml`; new `crates/freshell-platform/src/atomic_file.rs` and platform tests | Shared bounded event/receipt/settings/queue bookkeeping and atomic retained presentation; one platform-aware atomic replacement helper used by managed and default state writes. |
-| New `crates/freshell-freshagent/src/session_reconciliation.rs`; `claude.rs`, `claude_edges.rs`, `claude_projection.rs`, `claude_snapshot.rs`, `codex.rs`, `codex/projection.rs`, `codex/controls.rs`, `opencode_ws.rs`, `snapshot.rs`, `lib.rs` | Default owners stamp canonical events and retain native-keyed overlays; durable command state; provider-native submission/target/decision integration. |
+| New `crates/freshell-freshagent/src/session_reconciliation.rs`; `claude.rs`, `claude_edges.rs`, `claude_projection.rs`, `claude_snapshot.rs`, `codex.rs`, `codex/projection.rs`, `codex/controls.rs`, `opencode_ws.rs`, `snapshot.rs`, `lib.rs`; `crates/freshell-opencode/src/serve.rs`, `events.rs`, `transport.rs` | Default owners stamp canonical events and retain native-keyed overlays; durable command state; provider-native submission/target/decision integration; instance-stream readiness, payload and loss signaling. |
 | `crates/freshell-server/src/main.rs` | Inject the existing isolated-home state root into default reconciliation owners; no production restart or launch change. |
 | `crates/freshell-freshagent/src/rest_lane.rs`, `rest_lane_sync.rs`, `claude_rest_lane.rs`, `codex_rest_lane.rs`, `crates/freshell-server/src/fresh_agent_proxy_rest.rs` | HTTP/CLI/MCP-facing ingress uses the same command admission and receipt authority as WebSocket ingress. |
 | `crates/freshell-ws/src/terminal.rs`, `hosted_fresh_agent.rs`, `checkpoint_barrier.rs`; new `crates/freshell-ws/src/freshagent_delivery.rs` | Requester context, connection-scoped interest, bounded sync delivery and checkpoint linkage. |
@@ -109,10 +109,10 @@ The map covers files introduced or materially modified. Existing nearby inline t
 7. `freshAgent.sync` takes `{requestId, viewId, locator, cursor?, maxEvents?, maxBytes?, commandIds?}`. Clamp page requests to 256 events / 256 KiB and receipt IDs to 128 using existing frame-size validation. Reply only to requester with source, retainedFrom/head, events, receipts, nextCursor, explicit gaps where sequences are unavailable, optional captured snapshot and its watermark/resetRequired. Snapshot chunks share an immutable capture ID/watermark and are applied only when complete; a partial/expired capture is retried or finitely failed, never displayed as complete. Register interest before capture; buffer live suffix through its head, then deliver only greater sequences. Advance a cursor only across returned events, explicitly irrelevant ranges or declared gaps. Overflow/eviction yields explicit gap/reset, never provider termination.
 8. `CommandMeta = {commandId, expectedSource?}`; sends reuse `checkpointIntent.logicalAttemptId` and request aliases. `CommandReceipt = {commandId, payloadDigest, acceptedOrder, state, effectiveSettingsRevision?, submittedTurnId?, providerAckId?, result?}`. States distinguish queued/accepted, dispatching, provider-acknowledged, completed/cancelled, rejected and ambiguous. Missing, expired and store-unreadable lookup are distinct. Detailed receipt retention is bounded; compact dedup/expiry metadata is explicitly added where required to keep stable lookup, but is not a native send permit. The existing send-effect fence remains the only authority that may permit a send; receipt records reference its outcome. No lazy archive lookup is promised.
    Keep at most 4096 detailed settled receipts in active owner state and 128 unresolved admitted commands; refuse additional admission with typed backpressure before native effect rather than dropping unresolved state. Define and test the compact lookup/expiry representation alongside the single send-fence crash policy in Tasks 8–12. Do not evict or duplicate the existing send-effect fence merely to bound the in-memory receipt projection. Accepted queue payload has the separate Task 15 128-entry/4MiB cap.
-9. Under existing owner submission serialization, admission checks source/fences/preconditions and same-ID digest, persists acceptance/order/payload before native effect, and dispatches eligible commands in accepted order to each provider's proven acceptance boundary. Record actual dispatch order separately: a follow-up waiting for turn completion cannot block an interrupt or approval targeting that active turn. Streaming response duration does not hold the submission gate. Typed no-dispatch refusal may be retried only under its proven safe policy; possible native delivery is ambiguous and never automatically resent under the old or a newly minted ID. Provider acknowledgment requires correlated native acceptance, not checkpoint capture, a wire write or `dispatch_started`. Existing send checkpoint outcomes retain their separate rewind meaning.
-10. `SettingsState = {revision, values, certainty}`; explicit edits use `expectedSettingsRevision` and patch semantics (absent preserves, `effort: null` selects Default). Ordinary modern sends carry no cached settings and cannot restore stale view state over newer shared defaults. Report effective settings/revision only at a provider boundary that can establish them; represent partial or uncertain explicit edits honestly. `TurnTarget` uses a source-scoped owner turn identity with native identity when available, membership for zero-to-many associated commands, and explicit prestart/unknown states. Validate a delayed control's captured target at the native effect boundary; never infer that one client command names every native turn.
+9. Under existing owner submission serialization, admission checks source/fences/preconditions and same-ID digest, persists acceptance/order/payload before native effect, and invokes eligible commands in accepted order. The release boundary and receipt evidence are provider-specific: Codex correlated start/steer response, Claude correlated native queued/started lifecycle, and OpenCode bounded HTTP dispatch/response with no inferred native FIFO admission. Record actual dispatch order separately: a follow-up waiting for turn completion cannot block an interrupt or approval targeting that active turn. Streaming response duration does not hold the submission gate. Typed no-dispatch refusal may be retried only under its proven safe policy; possible native delivery is ambiguous and never automatically resent under the old or a newly minted ID. Provider acknowledgment requires correlated native acceptance, not checkpoint capture, a wire write or `dispatch_started`. Existing send checkpoint outcomes retain their separate rewind meaning.
+10. `SettingsState` separates versioned desired values from effective values, per-field certainty and application scope (`current`, `next-turn`, `unknown`); explicit edits use `expectedSettingsRevision` and patch semantics (absent preserves, `effort: null` selects Default). Ordinary modern sends carry no cached settings and cannot restore stale view state over newer shared defaults. Report effective settings/revision only at a provider boundary that can establish them; represent partial or uncertain explicit edits honestly. `TurnTarget` uses a source-scoped owner turn identity with native identity when available, membership for zero-to-many associated commands, and explicit prestart/unknown states. Validate a delayed control's captured target at the native effect boundary; never infer that one client command names every native turn.
 11. Native decisions claim Pending -> Dispatching atomically before awaiting a write; response digest/result and winning receipt persist. Opposite/duplicate losers get requester-scoped typed outcomes, not shared session errors. Unknown delivery stays ambiguous. Shared membership and resolution still broadcast. Unsupported provider features remain typed unsupported.
-12. Unsent drafts stay in the local view. Pressing Send with follow-up intent immediately accepts a durable server command `delivery: 'after-current-turn'`; its queue is shared and survives reload/detach. Queued payload and accepted order persist; settings are resolved by shared authority at actual dispatch, not frozen by the submitting view. Normal `delivery: 'native'` preserves Codex steering, Claude native busy acceptance and OpenCode compact/send FIFO. Cancellation succeeds only before Dispatching.
+12. Unsent drafts stay in the local view. Pressing Send with follow-up intent immediately accepts a durable server command `delivery: 'after-current-turn'`; its queue is shared and survives reload/detach. Queued payload and accepted order persist; settings are resolved by shared authority at actual dispatch, not frozen by the submitting view. Normal `delivery: 'native'` preserves Codex steering, Claude native busy acceptance and OpenCode's compact-only FIFO and ordinary busy-send behavior. Cancellation succeeds only before Dispatching.
 
 ### Task order
 
@@ -134,20 +134,14 @@ Stage 1 is Tasks 1–3, Stage 2 is Tasks 4–7, and Stage 3 is Tasks 8–16. Exe
 - Produces: `detachFreshAgentView(ws, attachment): Promise<void>`; optional `viewId` on attach/create routes; requester `freshAgent.detached`; explicit “Terminate agent” action. No runtime refcount or ownership registry.
 - Produces test helper `withTwoDeviceSession(mode, body): Promise<void>` for the four modes, yielding `{desktop, mobile, native, session, frames, close}`. `desktop/mobile` contain separate contexts/pages, `native` exposes actual fixture audit rows and deterministic boot/turn release, `session` is the actual canonical durable locator. Extend this declared helper in later tasks rather than inventing separate rigs.
 
-```ts
-type DeviceMode = 'freshclaude' | 'kilroy' | 'freshcodex' | 'freshopencode'
-type NativeAudit = {
-  boots: Array<{ runtimeId: string; sessionId: string }>
-  submissions: Array<{ commandId?: string; nativeTurnId: string; options: unknown }>
-  decisions: Array<{ nativeRequestId: string; responseDigest: string }>
-  interrupts: Array<{ nativeTurnId: string }>
-  stops: Array<{ runtimeId: string }>
-}
-// Derive audit rows from actual received native RPCs, never browser frame counts.
-// desktop/mobile: {context: BrowserContext, page: Page} from Playwright.
-// native.audit(): Promise<NativeAudit>; native.holdBoot()/releaseBoot(): Promise<void>;
-// native.holdTurn()/releaseTurn(): Promise<void>; close(): Promise<void>.
-```
+The helper covers freshclaude, kilroy, freshcodex and freshopencode. Its audit
+records actual received native operations, source/owner, command identity when
+carried, settings/options, decision digest, and affected native work when the
+provider exposes it. Native turn IDs are optional evidence, not fixture-minted
+substitutes for the missing provider contract. Keep dispatch counts separate
+from accepted/started/completed counts. Desktop/mobile each contain an
+independent context/page; boot/turn holds and release hooks operate on the
+native fixture, and cleanup owns only that fixture's resources.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -339,6 +333,11 @@ Cancel/supersede the exact ticket, install a newer terminal/agent binding and
 release. Assert no old Bound resurrection/retirement of the newer row. Test
 native resume failure, wrong native identity, ledger I/O error: close only the
 partial runtime and never answer success/commit an unbound Live replacement.
+Run both write/cancel orderings for Starting and Handoff, including a restored
+prior Freshagent at the failed handoff's generation but a different ownership
+ID. Its row and newer rows survive; only the failed operation's orphan is
+retired. Hold/fail the repair write and assert the claim stays fenced with no
+new launch or successful Live publication.
 
 Codex regression resume_of_a_never_recorded_session_is_silent_and_writes_no_defaults_row
 now asserts an identity row exists and no settings record/defaults exist.
@@ -365,14 +364,20 @@ replacement. Derive claims only from the operation's captured ticket, never
 from whichever owner happens to be current later. Ordinary settings refreshes
 carry no takeover authority. Keep provenance tri-state/assertion-time rules.
 
-Production LedgerIdentitySink runs exact claim validation and ledger mutation
-inside the registry's synchronous operation guard in spawn_blocking, with
-documented ownership->ledger lock order. Combine binding write and commit_live
-under that guard when the registry supports it. If combined commit cannot be
-expressed, extend the existing failed-transition repair so cancellation after
-write conditionally repairs only this operation's stamped row, before exposing
-Live; never use a precheck followed by an unguarded write. No await/provider I/O
-while holding these locks. Preserve existing parked-closure cancellation tests.
+Extend the existing transition repair rather than assume a synchronous registry
+guard exists. Carry provider/key/operation ID/epoch/generation through the claim,
+upsert, durable row and repair fence; the restored prior owner's ownership ID
+must remain distinct even when its generation equals the failed handoff's.
+Keep the exact Starting/Handoff claim fenced while its write is pending. Commit
+Live only after the binding write succeeds and the exact claim still matches.
+On cancellation or refused commit, install durable repair protection against
+late writes and retire only that operation's row before releasing its claim.
+A failed repair remains fenced and returns failure; it cannot become successful
+Live or release another launch. Keep monotonic stale-write protection separately
+from exact-operation retirement. Legacy rows without an operation ID are not
+assumed to belong to the failed transition. Do not re-lock commit_live from
+inside a registry guard or hold the global registry mutex across ledger I/O.
+Preserve and extend the production parked-closure cancellation tests.
 
 Only a valid current Freshagent Starting/Handoff claim may replace a terminal
 row after existing liveness/ownership admission excludes a real live writer.
@@ -854,7 +859,13 @@ existing provider-event ingestion updates retained projection before publishing.
 `read_events` no longer drops the lock then samples a new `retained_state`
 against an old head. If bridge loss or coalescing means the actor cannot prove
 continuity, return an explicit gap/reset instead of assigning a later projection
-to an earlier cursor.
+to an earlier cursor. Tasks 9–10 extend provider retained capture to
+Claude/Kilroy and OpenCode as well as Codex through this actor capture contract. A recovery capture must carry its actual provider
+source/watermark and establish the provider-to-actor coverage boundary before
+later deltas fold; discard already-covered input only from that proven boundary.
+A delayed/coalesced recovery image cannot inherit the actor's earlier head.
+Normal managed streaming joins must get complete retained state on all modes;
+permanent None/gap responses are not acceptable normal-path coverage.
 Prepare durable/native bases outside lock and commit validated native IDs/
 history-generation plus overlay under lock. Capture tokens paginate the frozen
 value; expire/dispose by view deadline without blocking new native events.
@@ -906,12 +917,12 @@ git commit -m "feat(freshagent): share reconciliation state and capture atomic a
 
 **Files:**
 - Create: `crates/freshell-freshagent/src/session_reconciliation.rs`.
-- Modify: `crates/freshell-freshagent/src/lib.rs`, `claude.rs`, `claude_edges.rs`, `claude_projection.rs`, `claude_snapshot.rs`, `codex.rs`, `codex/projection.rs`, `opencode_ws.rs`, `snapshot.rs`, `crates/freshell-server/src/main.rs`, `crates/freshell-ws/tests/freshagent_multiple_devices.rs`, `tests/common/multiple_devices.rs`.
+- Modify: `crates/freshell-freshagent/src/lib.rs`, `claude.rs`, `claude_edges.rs`, `claude_projection.rs`, `claude_snapshot.rs`, `codex.rs`, `codex/projection.rs`, `opencode_ws.rs`, `snapshot.rs`, `crates/freshell-opencode/src/serve.rs`, `events.rs`, `transport.rs`, `crates/freshell-server/src/main.rs`, `crates/freshell-ws/tests/freshagent_multiple_devices.rs`, `tests/common/multiple_devices.rs`, and the existing OpenCode native event fixture.
 
 **Interfaces:**
 - Consumes: Task 8 generic reconciliation state and Task 3 durable session identity/owner claim; existing Codex transcript projection and Claude/OpenCode native event accumulators.
 - Produces: owner-local `reconcile_snapshot(locator) -> Result<SnapshotCapture<FreshAgentPresentation>>`, `read_reconciliation(cursor, limits)`, and `publish_committed(event)` whose record is stamped before broadcasting. Default command persistence is scoped to the durable provider identity/alias record and its stable store ID, not a process/global or browser key.
-- Produces: default `with_reconciliation_root(PathBuf)` initialization and `DefaultReconciliationStore::open(root, stableStoreId)`, reusing Task 8's platform-aware atomic replacement/protected-payload helpers. Resolve `stableStoreId` from a durable provider-scoped identity/alias record that survives pre/post-materialization aliases, rekey and restart while assigning true forks a distinct ID; never derive the store key from whichever locator arrived in the current request. Resolve the exact identity and alias transaction under LB-6 before implementation. Inject root from the server's existing isolated home. Managed actors retain their existing state directory/file. No new ownership lock or second send dispatch-fence store is introduced.
+- Produces: default `with_reconciliation_root(PathBuf)` initialization and `DefaultReconciliationStore::open(root, stableStoreId)`, reusing Task 8's platform-aware atomic replacement/protected-payload helpers. Resolve `stableStoreId` from a durable provider-scoped identity/alias record that survives pre/post-materialization aliases, rekey and restart while assigning true forks a distinct ID; never derive the store key from whichever locator arrived in the current request. Serialize resolve-or-create with existing ownership coordination before recovery or command admission, persist the selected alias mapping before publishing it, and reject unreadable/conflicting identity. Reopen a partially published reservation by its same stable ID; do not assume separate alias/state files commit atomically. Inject root from the server's existing isolated home. Managed actors retain their existing state directory/file. No new ownership lock or second send dispatch-fence store is introduced.
 - OpenCode streaming contract for pinned 1.18.21: use one owner subscription to the instance `/event` route, bind it to the authoritative session directory/workspace and subscription generation, and await that generation's `server.connected` readiness before dispatch. Do not treat `/global/event` readiness as sufficient. Retain native per-part full bases, deltas, final replacements and removals in the same owner commit as the outer event watermark. Do not infer a total order across unrelated native producers. Reconnect, EOF, malformed relevant input, local broadcast loss, incompatible part identity, removal during active deltas, or an unknown lifecycle invalidates affected coverage; report a bounded source-scoped gap with unknown native extent until a trustworthy full replacement arrives. Native deltas have no replay cursor, so do not synthesize a precise missing native sequence.
 
 - [ ] **Step 1: Add red provider integration tests**
@@ -928,6 +939,10 @@ Also exercise store resolution: open concurrently by old/new materialization
 aliases, persist a rekey, restart, query/admit through both aliases and observe
 one store; fork and verify a separate store. The test must prove one owner/store
 without treating a native terminal ID or current locator hash as stable identity.
+Hold competing alias reservations and crash between alias/state publication;
+prove reopen selects the same reserved store. Unreadable/conflicting maps refuse
+admission rather than creating a second store. Exercise both default and managed
+lookup through old/new aliases without changing the managed persistence owner.
 
 Exercise status, settings, controls, errors, attention, materialization,
 transcript invalidator, completion and queue/receipt event families. Every
@@ -969,9 +984,14 @@ consumer sends and claude_edges, not only top-level broadcast helpers. Keep
 the before-publication checkpoint observer hook, avoiding reentrant owner locks.
 
 Codex retains projectionId/historyGeneration/revision/read fences as its inner
-transcript authority. Claude/Kilroy overlay uses runtime+turn+native message+
-block keys and full current block values. OpenCode reduces one known per-part
-lifecycle: full start value, awaited deltas, then a final full replacement.
+transcript authority. Claude/Kilroy overlay uses proven native message/block identity and full current
+block values within the owner source. An unknown turn identity does not prevent
+retaining a keyed live block. Do not retire a live row from mtime, display order
+or same-kind positional matching alone; require an exact UUID/message/block
+association. If legacy input lacks enough identity, return an explicit affected
+coverage/reset state instead of displaying speculative duplicate rows. Exercise
+repeated same-kind blocks and missing UUIDs alongside normal streaming joins.
+OpenCode reduces one known per-part lifecycle: full start value, awaited deltas, then a final full replacement.
 Exact message/part identities are mandatory; native timestamps and cross-source
 ordering are not merge keys. A removal tombstones its part, and unknown fields,
 incompatible identities or a delta after finalization invalidate that affected
@@ -979,8 +999,8 @@ continuity rather than recreating speculative text. On `/event` reconnect, EOF,
 malformed relevant input or local `Lagged/Lost`, clear readiness and mark
 affected active parts incomplete until a trustworthy full replacement arrives.
 Represent this as a source-scoped outer discontinuity with unknown native extent;
-the native stream has no sequence to narrow the missing interval. Durable reads are prepared outside the lock;
-merge only source/history-compatible results, removing overlay entries only
+the native stream has no sequence to narrow the missing interval. Durable reads
+are prepared outside the lock; merge only source/history-compatible results, removing overlay entries only
 when durable native IDs/versions prove inclusion. An active stream's overlay
 is never discarded because disk is late. Snapshot reads copy current retained
 base+overlay+metadata and cursor without awaiting disk or waiting for idle.
@@ -1015,6 +1035,7 @@ Expected PASS; include all existing provider event/attention tests with `pnpm ru
 - [ ] **Step 7: Commit**
 
 ```bash
+git add crates/freshell-opencode/src/serve.rs crates/freshell-opencode/src/events.rs crates/freshell-opencode/src/transport.rs test/e2e-browser/fixtures/fake-opencode.cjs
 git add crates/freshell-freshagent/src/session_reconciliation.rs crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/claude_edges.rs crates/freshell-freshagent/src/claude_projection.rs crates/freshell-freshagent/src/claude_snapshot.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/projection.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-freshagent/src/snapshot.rs crates/freshell-server/src/main.rs crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/common/multiple_devices.rs
 git commit -m "feat(freshagent): retain atomic sequenced state in default provider owners"
 ```
@@ -1075,7 +1096,9 @@ hold owner locks while serializing/sending. Oversized unsupported snapshot parts
 produce finite typed error, retaining saved client content, never false coverage.
 
 Extend existing managed host/admin operation variants to sync/query/capture.
-Actor allocates source/order, gateway only relays. Poller forward_polled_event
+Complete the provider capture/recovery bridge contract from Tasks 8–9 for all
+four modes, including held/lost/coalesced bridge input and later deltas. Actor
+allocates source/order, gateway only relays. Poller forward_polled_event
 keeps AgentJournalEvent.sequence/source instead of forwarding event.event alone.
 Attach catch-up is requester-only; actual canonical live events remain shared.
 Legacy raw dispatch still uses safe requester attach behavior from Stage 2.
@@ -1238,7 +1261,10 @@ persisted admission, otherwise known or ambiguous, never safe-to-resend. Expire
 detailed receipt data and verify the compact lookup representation still routes
 send retries through the existing send-effect fence; receipt storage never
 grants dispatch permission. Store failure refuses before effect; unreadable
-query is typed error. Same-ID compact/rollback/fork/decision/kill never effect twice.
+query is typed error. Explicitly cover absent barrier, durable read/write failure
+and old/new native aliases across ordinary WS, checkpointed WS, REST and managed
+host. Two request IDs for one logicalAttemptId invoke one native send. A sidecar
+write alone and OpenCode 204 cannot promote a receipt to ProviderAcked. Same-ID compact/rollback/fork/decision/kill never effect twice.
 
 Browser 'stage3 lost acknowledgment': drop real acceptance frame, reconnect,
 query existing command ID, show pending/accepted/ambiguous outcome, no automatic
@@ -1255,35 +1281,53 @@ Expected FAIL: no queryable non-send outcome/order, checkpoint capture mislabele
 
 - [ ] **Step 3: Production patch**
 
-```rust
-// Algorithm inside the existing per-session owner, not a new service.
-// The store transaction and source checks run before a native await.
-match state.lookup(command.id())? {
-    Some(receipt) => return receipt.require_same_digest(command.digest()),
-    None => state.validate_source_and_preconditions(&command)?,
-}
-let receipt = state.allocate_acceptance(command.id(), command.digest())?;
-store.persist_acceptance(&receipt, command.retained_payload())?;
-// An eligible command later obtains the existing native submission gate,
-// persists Dispatching + dispatchOrder, and invokes the native boundary once.
-```
+Command admission first resolves the durable conversation and existing receipt,
+checks the digest/source/preconditions, then persists new acceptance/order and
+payload. Eligible dispatch separately consults the sole durable send-effect
+authority; the queryable receipt and its Dispatching state never authorize a
+native send by themselves. The following decisions define that boundary.
 
 ```text
 Implement these operations in shared bookkeeping and owner adapters. Do not
-hold the short state lock across provider await. Submission serialization lasts
-through correlated native acceptance, not model completion. acceptedOrder is
-total server admission order; dispatchOrder records eligible native order.
+hold the short state lock across provider await. Submission serialization uses
+each provider's actual short boundary, never model completion. Codex may acknowledge start/steer with a native ID. Claude releases
+on its correlated UUID queued/started lifecycle, not sidecar stdin completion.
+OpenCode releases on the bounded HTTP dispatch/response path and records only
+serve-response-observed for 204; detached prompt persistence/native scheduling
+remain unproven until separate correlated evidence arrives. A timeout after
+possible delivery stays Ambiguous with no redrive, and does not block controls
+needed to settle the active turn. Do not promise native FIFO or one turn per
+command where the provider absorbs or loosely handles busy input. acceptedOrder
+is total server admission order; dispatchOrder records eligible native order.
 Deferred queue entries do not block a target-valid interrupt/approval; their
 later drain still respects accepted order. Native busy sends retain provider
 admission rules instead of becoming implicit follow-ups.
 
-Sends use logicalAttemptId as commandId and request-ID aliases. Reference the
-existing checkpoints StoredCheckpointOutcome/dispatch fence rather than create
-a parallel send-effect journal. The current checkpoint before-publication hook
-can carry provider evidence, but existing `FreshAgentSendAccepted` signals are
-not uniformly correlated native acceptance. Add provider-specific correlation
-before advancing ProviderAcked; store a proven submitted turn ID before
-publishing. Existing rewind/checkpoint outcome stays separately visible.
+Sends use logicalAttemptId as commandId and request-ID aliases. Bind one durable
+send-effect authority to the resolved stable conversation identity: extend the
+existing checkpoint dispatch fence for default routes and retain the managed
+actor's durable dispatch fence for managed routes. All ingress for that owner
+must consult the same authority; managed gateway/checkpoint bookkeeping and
+queryable receipts reference its decision and cannot grant a separate permit.
+Retain historical fences and aliases before admitting modern retries; a changed
+wire locator or transport request ID must not create a new effect key. Do not
+change which authority owns an existing conversation without preserving its
+previous dispatched/ambiguous identities.
+
+Replace void barrier-and-forward with a typed durable permit/outcome contract.
+Ordinary WS and REST must use it as well as checkpointed sends. Remove optional
+barrier fallthrough and process-local forwarding after durable read/write
+failure from these paths: unavailable authority refuses before effect. Persist
+admission, then obtain/persist the sole effect permit, then dispatch; a crash
+between these writes does not make a receipt into a send permit. Managed actor
+request-ID dedup must resolve the same logical command and digest before its
+transport dispatch. Preserve its journal and protected payload storage.
+
+The checkpoint before-publication hook can carry provider evidence, but capture
+success, dispatch_started, a pipe write, and OpenCode 204 are not ProviderAcked.
+Persist a native turn ID only when proven; leave it absent otherwise rather
+than inventing one to publish an acknowledgment. Existing rewind/checkpoint
+outcome stays separately visible.
 
 Every mutating provider/REST/managed entry routes admission before effects.
 Expose optional commandId in REST request contract; callers without it receive
@@ -1341,7 +1385,7 @@ git commit -m "feat(freshagent): persist ordered command outcomes across all ing
 
 **Interfaces:**
 - Consumes: Task 12 admission/source/order, durable identity settings Keep/Replace from Task 3.
-- Produces: `Configure{commandId,expectedSettingsRevision,edits}`, authoritative `SettingsState{revision,values,certainty}` and typed `SettingsConflict{currentRevision,currentValues}`. Explicit null Default effort remains distinct from absent. Modern normal Send omits cached full settings; all actual settings changes use the shared versioned edit operation.
+- Produces: `Configure{commandId,expectedSettingsRevision,edits}`, authoritative settings with distinct desired values and effective values/certainty/scope, and typed `SettingsConflict` carrying the current revision and both projections. Explicit null Default effort remains distinct from absent. Modern normal Send omits cached full settings; all actual settings changes use the shared versioned edit operation.
 
 - [ ] **Step 1: Add failing behavior tests**
 
@@ -1354,7 +1398,10 @@ command returns the same result/revision. Test a provider that applies one field
 before refusing the next: the receipt and converged settings show the known
 partial effect without claiming the whole patch succeeded. A lost/uncertain
 native result is marked uncertain until a safe readback/reconcile; it does not
-pretend that no field changed. A delayed metadata/snapshot with N cannot
+pretend that no field changed. Cover Claude busy refusal, Codex/OpenCode next-turn
+staging and managed refusal retaining desired values. Readback absence settles
+with uncertainty rather than hanging or claiming the desired patch took effect.
+A delayed metadata/snapshot with N cannot
 overwrite N+1. Test absent vs effort:null and each provider's supported/create-only fields.
 
 Client settings tests execute actual emitted frames: ordinary modern send has
@@ -1376,19 +1423,27 @@ Expected FAIL: no server revision conflict, full-cache ordinary send reverts set
 - [ ] **Step 3: Production patch**
 
 ```text
-Persist settings values/revision/certainty with the owning reconciliation state. Initialize
-from genuinely recovered settings without inventing defaults for identity-only
+Persist desired settings and effective values/certainty/scope with one
+monotonically versioned owner record. Initialize from genuinely recovered settings without inventing defaults for identity-only
 rows; if no record exists use provider's real default snapshot as revision 0,
 not a fabricated durable historical edit. Configure admission validates expected
-committed revision and provider capabilities. Serialize native configure through
-existing submission gate. Commit a fully applied result atomically; if the
-provider reports partial values, publish a failed/partially-applied receipt and
-advance the authoritative effective-settings record according to the revision
-policy established under LB-4. If delivery is uncertain, mark the settings
-uncertain and reconcile by a proven readback before claiming a value or allowing
-a dependent edit to overwrite it. A pending configure reserves its base revision: another edit
-is a typed conflict/pending result, never two independent N->N+1 writes. Receipt
-persists applied or refused outcome. No revision increment for duplicate/no-op.
+committed revision and provider capabilities. Serialize native configure through the existing submission gate.
+Claude preserves busy refusal and reports correlated partial setter values;
+Codex/OpenCode success stages next-turn defaults without claiming to change the
+current turn. Managed refusal may preserve desired settings for a later send
+and must not imply no change. Advance the record revision when authoritative
+intent, known effective fields or certainty changes, including partial/unknown
+outcomes; duplicate commands and genuine no-ops do not advance it. A pending
+configure reserves its base revision, so another edit returns conflict/pending.
+
+After a lost native response, retain prior values only as last-known, mark the
+affected effective fields unknown, and publish a bounded uncertain outcome.
+A proven readback may reconcile it; do not assume one exists for every provider
+or wait indefinitely. Dependent operations receive a typed bounded refusal if
+they require unknown values; normal provider-native busy sends and independently
+known fields retain their supported behavior. Recovery or a later proven setter
+result may restore certainty. Never publish the whole requested patch as
+applied after a partial failure, or add per-send private settings restoration.
 
 On default-path resume, load existing reconciliation settings/revision first;
 only a session with no modern record falls back to identity_sink.load_settings.
@@ -1439,10 +1494,10 @@ git commit -m "feat(freshagent): version settings edits and capture server send 
 
 ### Task 14: Delayed controls target one turn and shared decisions resolve atomically
 
-**Status: blocked by the Stage 2 LB-9 failure above.** No inspected supported provider route establishes the required native target check. Codex's pinned public interrupt path is targetless after admission; Claude/Kilroy and OpenCode expose session-scoped cancellation without an expected-turn argument; the managed host dispatches a generic actor/provider interrupt. Do not implement these as generic interrupts plus caller-side checks, and do not treat blanket `UnsupportedTarget` as completion. This task can resume only after all required provider paths expose and independently validate a native target-conditional operation or equivalent barrier. Atomic shared approval/question decisions are not by themselves a substitute for the missing ordinary Stop behavior.
+**Status: blocked by the Stage 2 LB-8/LB-9 findings above.** Exact turn lifecycle correlation remains open for Claude/OpenCode, and no inspected complete cross-provider route establishes the required native target check. Codex's pinned public interrupt path is targetless after admission; Claude/Kilroy and OpenCode expose session-scoped cancellation without an expected-turn argument; the managed host dispatches a generic actor/provider interrupt. Do not implement these as generic interrupts plus caller-side checks, and do not treat blanket `UnsupportedTarget` as completion. This task can resume only after all required provider paths expose and independently validate a native target-conditional operation or equivalent barrier. Atomic shared approval/question decisions are not by themselves a substitute for the missing ordinary Stop behavior.
 
 **Files:**
-- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/claude.rs`, `claude_edges.rs`, `codex.rs`, `codex/controls.rs`, `opencode_ws.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-supervisor/src/lib.rs`, `src/components/fresh-agent/FreshAgentView.tsx`.
+- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `server_messages.rs`, four generated outputs, `crates/freshell-agent-runtime/src/reconciliation.rs`, `host_actor.rs`, `crates/freshell-freshagent/src/claude.rs`, `claude_edges.rs`, `claude/stop.rs`, `claude_turns.rs`, `crates/freshell-claude-sidecar/index.mjs`, `codex.rs`, `codex/controls.rs`, `opencode_ws.rs`, `crates/freshell-runtime-protocol/src/fresh_agent_ops.rs`, `crates/freshell-runtime-client/src/lib.rs`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-supervisor/src/lib.rs`, `src/components/fresh-agent/FreshAgentView.tsx`.
 - Test: `crates/freshell-freshagent/src/codex/controls/tests.rs`, managed actor tests, existing `crates/freshell-ws/tests/freshagent_claude_approvals.rs`, `freshagent_control_reply.rs`, two-device Rust/browser tests and view unit tests.
 
 **Interfaces:**
@@ -1457,6 +1512,11 @@ until A finishes and desktop starts B. Release: B is not interrupted; mobile
 gets stale-target receipt. Also target accepted pre-start command A, hold native
 acceptance, then cancel/settle A and start B: delayed stop still cannot hit B.
 Current-target user Stop preserves silent attention policy/native target latch.
+Also delay consumption INSIDE the native scheduler after its admission/check,
+finish A and start an already-native-queued or autonomous B before releasing the
+control. Audit the actual canceled native work, not just the request payload.
+Run the equivalent route through the managed host. A fake that checks a target
+when the pinned native implementation does not is not qualifying evidence.
 
 Rust 'atomic_decisions': opposite A/B approval/question answers arrive while
 first stdin/native RPC is held. Exactly one callback/native decision, one
@@ -1487,11 +1547,25 @@ Include current TurnTarget in retained presentation and events, using a
 source-scoped owner turn identity independent of a client command. Associate
 zero or many accepted commands and add nativeTurnId when provider lifecycle
 supplies one. Represent prestart and unidentifiable/unknown targets explicitly.
+Mint an owner turn generation only at a source-backed lifecycle start and settle
+that same target only from correlated terminal evidence. Codex native IDs can
+supply this; Claude/OpenCode lifecycle mapping still requires independent
+validation. Busy/idle guesses, native prompt IDs and command order do not prove
+an exact turn. Unknown/prestart targets get bounded resync or typed no-effect
+refusal before any native cancellation, never a fabricated identity.
 Composer captures the exact target when user clicks Stop/answers, alongside
 expected source. Validate the captured target at the provider's native effect
 boundary after admission wait, not only at frame receipt. A settled/mismatched
 target yields a persisted requester stale-target no-op receipt. Never select
-whatever turn is current when a delayed interrupt finally dispatches.
+whatever turn is current when a delayed interrupt finally dispatches. Carry the
+same target through managed operations and sidecar/native consumption. Remove
+Claude's blind same-session Stop reissue; a retry must enforce the original
+target at the same proven native boundary. Permission cancellation is also a
+native effect and must not run before that check. An already issued uncertain
+control is Ambiguous, never a no-effect StaleTarget/UnsupportedTarget refusal.
+Provider hooks or queue locks qualify only if they cover every successor and
+remain effective through the correlated cancellation effect; no such route is
+established for this plan. Do not ship caller-side checks as its substitute.
 
 Reuse Claude native_dispatches checked reservation: under session/control lock,
 claim Pending->Dispatching and persist command/response digest before await.
@@ -1536,6 +1610,7 @@ Expected PASS and nonzero modes/cases; include existing client view/reconciliati
 - [ ] **Step 7: Commit**
 
 ```bash
+git add crates/freshell-freshagent/src/claude/stop.rs crates/freshell-freshagent/src/claude_turns.rs crates/freshell-claude-sidecar/index.mjs
 git add shared/ws-protocol.ts shared/fresh-agent-contract.ts crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-agent-runtime/src/reconciliation.rs crates/freshell-agent-runtime/src/reconciliation_tests.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-agent-runtime/src/host_actor_tests.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/claude_edges.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/codex/controls.rs crates/freshell-freshagent/src/codex/controls/tests.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-runtime-protocol/src/fresh_agent_ops.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-supervisor/src/lib.rs src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/freshagent_claude_approvals.rs crates/freshell-ws/tests/freshagent_control_reply.rs test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
 git commit -m "feat(freshagent): fence delayed controls and atomically resolve shared decisions"
 ```
@@ -1571,7 +1646,8 @@ or approval can dispatch while an earlier follow-up is ineligible. Test stale
 source/expected turn and owner replacement preserve settled command identities.
 
 Existing normal busy sends retain Codex native steer, Claude native acceptance,
-OpenCode compact/send FIFO. Browser 'stage3 followups' proves shared queue,
+OpenCode's compact-only FIFO and ordinary busy-send behavior. Browser
+'stage3 followups' proves shared queue,
 view-local unsent draft invisibility, order/settings/native-count after submitter
 reload, conditional cancel and no duplicate transcript rows for all modes.
 ```
@@ -1593,9 +1669,15 @@ Persist its payload reference/order before acknowledgment; publish shared queue
 event. Only then clear the submitted local composer. An admission refusal leaves
 text as an unsent local draft; ambiguous effect never does.
 
-Owner drain selects eligible queued entries by acceptedOrder after afterTurn
-settles. Atomically transition Queued->Dispatching and persist dispatch fence
-before invoking existing provider send. Do not redrive a Dispatching record on
+Admission captures a proven target or returns a bounded explicit refusal with
+the unsent draft intact; it cannot promise normal follow-up support while all
+provider targets remain Unknown. After acceptance, retain the exact afterTurn
+across reconnect/recovery. Owner drain selects entries by acceptedOrder only
+after correlated evidence proves that prerequisite settled. Generic idle from
+another or unknown turn cannot release them. On missing lifecycle evidence,
+retain the accepted command/payload and expose its waiting/unknown state while
+bounded reconciliation runs; never retarget it to whichever turn is current.
+Atomically transition Queued->Dispatching and persist dispatch fence before invoking existing provider send. Do not redrive a Dispatching record on
 restart unless existing native idempotency/correlated evidence proves safety;
 otherwise keep Ambiguous and expose query. Reuse managed protected payload store
 and default session metadata store; no browser drain leader or second queue.
@@ -1653,7 +1735,7 @@ git commit -m "feat(freshagent): accept and order shared follow-ups on the serve
 
 **Files:**
 - Create: `src/lib/fresh-agent-pending-commands.ts`, `test/unit/client/lib/fresh-agent-pending-commands.test.ts`.
-- Modify: `src/components/fresh-agent/FreshAgentView.tsx`, `src/lib/fresh-agent-ws.ts`, `src/store/freshAgentSlice.ts`, `test/e2e-browser/helpers/fresh-agent-multiple-devices.ts`, `specs/fresh-agent-multiple-devices-rust.spec.ts`, `specs/runtime-fresh-agent-fixture-rust.spec.ts`, managed fixture helper `test/e2e-browser/helpers/managed-runtime.ts`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-server/src/fresh_agent_proxy_tests.rs`, `crates/freshell-ws/tests/freshagent_multiple_devices.rs`, `README.md`, `docs/index.html`.
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx`, `src/lib/fresh-agent-ws.ts`, `src/store/freshAgentSlice.ts`, `test/e2e-browser/helpers/fresh-agent-multiple-devices.ts`, `specs/fresh-agent-multiple-devices-rust.spec.ts`, `specs/runtime-fresh-agent-fixture-rust.spec.ts`, managed fixture helper `test/e2e-browser/helpers/managed-runtime.ts`, `scripts/testing/runtime-sandbox.ts`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-server/src/fresh_agent_proxy_tests.rs`, `crates/freshell-ws/tests/freshagent_multiple_devices.rs`, `README.md`, `docs/index.html`.
 
 **Interfaces:**
 - Consumes: all prior tasks' negotiated receipts/sync/queue/settings/target state and the existing local Docker managed fixture route.
@@ -1682,7 +1764,11 @@ Extend managed fixture spec to the same independent desktop/mobile helper,
 positive cases for all four modes: cold open/shared startup, streaming join,
 detach/reload, missed ack/gap, settings conflict, turn target/decision winner
 where supported, accepted queue/reload. Count host instances/native transport
-effects and inspect source/order/watermark preservation. Provider integration
+effects and inspect source/order/watermark preservation. Extend the existing
+FixtureNativeState/audit output beyond dispatch/completion totals to retain
+correlated command/source/decision/interrupt evidence; never infer affected
+native target from a browser frame or a fake's invented conditional operation.
+Provider integration
 tests also drive production native adapters: fixture-only UI agreement cannot
 replace those. Add native transport count assertions to existing host/proxy
 tests, not a second production test RPC. Complete all matrix rows below.
@@ -1755,6 +1841,7 @@ Expected PASS with full matrix evidence. Broad check includes cloud-excluded `te
 - [ ] **Step 7: Commit**
 
 ```bash
+git add scripts/testing/runtime-sandbox.ts
 git add src/lib/fresh-agent-pending-commands.ts src/components/fresh-agent/FreshAgentView.tsx src/lib/fresh-agent-ws.ts src/store/freshAgentSlice.ts test/unit/client/lib/fresh-agent-pending-commands.test.ts test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts test/e2e-browser/helpers/managed-runtime.ts crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-server/src/fresh_agent_proxy_tests.rs crates/freshell-ws/tests/freshagent_multiple_devices.rs README.md docs/index.html
 git commit -m "feat(freshagent): recover pending outcomes and verify independent device flows"
 ```
@@ -1776,9 +1863,9 @@ Each browser row runs two independent device contexts against one test-owned ser
 | Replay gaps/duplicates/stale source or snapshot | 8–11,16 | `stage3 gap reconnect`; actual dropped/reordered server frames, converged cursor/text/controls | Contiguous fold, bounded ring/page/reset, source adoption, immutable chunk watermark, Codex inner revisions retained |
 | Concurrent native sends and ordered effects | 12–13,15 | `stage3 settings/followups`; exact audited native request order/options/rows | Same-ID dedup; cross-WS/REST total admission and eligible dispatch order; preserve provider busy send/compact FIFO |
 | Stale settings never revert newer defaults | 13,15 | `stage3 settings/followups`; both headers N+1, old edit conflict, queued send does not carry stale values | Native partial/uncertain configure outcome, effort null/absent, provider-specific effective settings at dispatch |
-| Delayed interrupt cannot stop a new turn | 14 | `stage3 controls`; native target A stale while B keeps running | Expected dispatch/native turn recheck at submission, pre-start target and silent attention behavior |
+| Delayed interrupt cannot stop a new turn | 14 | `stage3 controls`; actual native successor B keeps running after delayed A control, on default and managed routes | Target checked atomically at native consumption or proven provider-owned barrier; delay after native admission, queued/autonomous successors, prestart/unknown targets and silent attention behavior |
 | Atomic approval/question/elicitation winner | 14,16 | `stage3 controls`; one native response, shared resolution, harmless losing view | Pending->Dispatching before await, response digest/result, ambiguous crash, native source validation; unsupported OpenCode asserted |
-| Accepted follow-ups survive submitter removal | 15–16 | `stage3 followups/reload outcomes`; shared order, no duplicate native send, cancel race | Persisted payload/order/turn target, settings resolved at dispatch, CAS cancel, once-only drain, queued reopen, bounded backpressure |
+| Accepted follow-ups survive submitter removal | 15–16 | `stage3 followups/reload outcomes`; shared order, no duplicate native send, cancel race | Persisted payload/order/proven turn prerequisite, unknown-settlement retention, settings resolved at dispatch, CAS cancel, once-only drain, queued reopen, bounded backpressure |
 | Unsent drafts remain local | 2,15–16 | Type on A without Send: B sees no draft/queue/native call; A draft survives unrelated peer update | No draft in server payload/receipt logs; unknown accepted send never restored as safely unsent |
 | Both legacy/default and managed paths stay valid | 1–16 | Cloud D spec positively executes four modes; separate M fixture script positively executes four modes | Legacy unwrapped parse/behavior, direct owner adapters and existing managed journal/operations, native audits on each path |
 
@@ -1786,5 +1873,5 @@ Each browser row runs two independent device contexts against one test-owned ser
 
 1. For each task record red command/result, green command/result, refactor, impacted suites and focused commit in the usual execution record when execution is later authorized. A precise patch draft may be corrected during implementation; source becomes authoritative after execution begins. Do not rewrite this plan's code blocks to mirror fixes.
 2. Preserve first-failure traces/native audit rows needed to diagnose a run, and counts showing all selected providers/flavors actually executed. Use the standard coordinator and existing configured outputs. Do not put dependency/worktree copies in results. Stop task-owned background processes and remove disposable files after each run.
-3. This run completed the committed-plan work and load-bearing validation, then failed/non-converged before implementation because LB-9 has no inspected supported target-safe ordinary Stop route for the pinned providers. The plan was not advanced to implementation or the post-implementation delta review. Preserve the immutable base record and the earlier failed baseline receipt; later same-base results may add evidence but never erase that failure. If a different base is ever needed, establish its provenance and baseline separately rather than rewriting this run's `base_ref`.
+3. The original load-bearing pass and the requested independent recheck both ended FAILED/non-converged before implementation. LB-9 has no inspected complete supported target-safe ordinary Stop route; LB-8's exact Claude/OpenCode lifecycle discriminator remains an independent unverified prerequisite. The plan was not advanced to implementation or the post-implementation delta review. Preserve the immutable base record and the earlier failed baseline receipt; later same-base results may add evidence but never erase that failure. If a different base is ever needed, establish its provenance and baseline separately rather than rewriting this run's `base_ref`.
 4. Implementation completion requires every acceptance-matrix row and affected suite genuinely green apart from only those failures reproduced and enumerated at the immutable base, no unresolved substantiated review finding, and a clean focused branch. A push or PR is outside this workflow unless separately requested; repository rules require explicit approval before PR creation. No merge, deployment, production restart, or live repair is authorized.
