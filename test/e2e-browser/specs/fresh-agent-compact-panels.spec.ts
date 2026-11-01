@@ -568,6 +568,9 @@ test('managed live recovery suppresses stale ended and stuck entries while curre
 for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
   test(`expanded diagnostics keep recovery, requests and diffs reachable at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
     void freshellPage
+    // Start the phone at its real viewport so sidebar collapse finishes before
+    // fitting pane geometry; a desktop-to-phone resize changes both widths.
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
     await terminal.waitForTerminal()
     await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
     // Set width first: phone chrome wraps and changes the available height.
