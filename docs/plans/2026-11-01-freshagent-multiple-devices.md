@@ -34,22 +34,29 @@ Implement the three-stage Freshagent multi-device robustness proposal so one ser
 3. Node >=22.5, Rust stable/workspace minimum 1.96, exactly pnpm 10.34.5; reuse installed dependencies and prepared runtime files. Use `pnpm install --frozen-lockfile` only when needed. NodeNext/ESM relative TypeScript imports end in `.js`.
 4. Keep the default in-process Freshagent path and the optional managed Freshagent path working. Do not enable a managed feature flag to evade default-path work. Managed terminal support alone is not managed Freshagent support.
 5. Preserve one native writer, owner epoch/generation, operation tickets, provider leases, terminal-liveness checks, handoff fences, send logical-attempt fences, and provider-native busy/attention behavior. Never use browser presence or a durable terminal ID as proof of process liveness.
-6. Reuse `freshell-agent-runtime/src/host_actor.rs`, the managed **Freshagent** journal. `freshell-session-host/src/command_journal.rs` and `output_journal.rs` belong to PTYs and are outside this feature. `freshell-freshagent` already depends on `freshell-agent-runtime`; sharing bookkeeping there is acyclic and requires no new ownership service.
+6. Reuse `freshell-agent-runtime/src/host_actor.rs`, the managed **Freshagent** journal. `freshell-session-host/src/command_journal.rs` and `output_journal.rs` belong to PTYs and are outside this feature. `freshell-freshagent` already depends on `freshell-agent-runtime`, so provider-neutral bookkeeping can live there without a new ownership service. Extract the platform-aware atomic replacement contract to `freshell-platform` for the new default and managed state writes; add the direct dependency needed by `freshell-agent-runtime` and verify the crate graph remains acyclic.
 7. Follow [test sandbox guidance](../development/test-sandbox.md), [pre-push gate](../development/pre-push-gate.md), [self-hosted launch runbook](../development/self-hosted-launch-runbook.md), and [Windows build instructions](../development/windows-electron-build.md) rather than duplicating operational procedures. Do not restart the live port-3001 server. No new deployment script or production migration command is needed.
 8. Use red/green/refactor behavioral tests, including meaningful integration and independent-device browser evidence. Do not test prose, generated source text, hashes, or static configuration by string matching. Never weaken or skip a behavior test to obtain green.
 9. The configured Vitest and browser backends are `cloud`; preserve them. Agent broad gates set `GCLOUD_ROBOT_REQUIRE=1` and `FRESHELL_RUST_TEST_SANDBOX=1`. A broken cloud lane must be repaired, not silently replaced by local. Required repository-classified local-only managed fixtures are a separate supplemental gate, not a fallback.
 10. Tests use their existing worktree and configured result paths. Disposable files go in `.test-tmp/`; retained diagnosis in `test-results/`. Stop only task-owned verified processes, record external temporary paths, and clean them after each run. No broad kill patterns, live provider session, or prior repaired conversation is test input.
 11. End-user documentation belongs in `README.md`; update `docs/index.html` only for the resulting major UI actions. Agent documentation is this plan. Logs are structured JSONL with severity and request/source/order identifiers; never log prompt, draft, approval answer, or credential contents.
 
-## Resume prerequisites and assumptions to validate later
+## Load-bearing decisions to validate before implementation
 
-These are bounded checks for the workflow's load-bearing-validation stage after the plan commit and before independent plan review and execution. They are pending, not completed evidence.
+The stage-2 ledger and its independent validation reports govern these ten decisions. Source-backed corrections below are already applied: remove acceptance-time private settings restoration, make replay gaps explicit, describe receipt retention as new behavior rather than an existing actor facility, use platform-aware atomic replacement, and use the local Docker managed fixture route. Routine selector spelling and generic correctness of code not yet written are task verification, not additional assumptions.
 
-1. Confirm the ownership registry can expose an operation-bound synchronous commit guard with lock order `ownership -> pane ledger`, including cancellation repair, without a dependency cycle. Exercise the production blocking sink at its existing before/after-validation parking points; merely compiling a proof type is insufficient. Task 3 supplies the fallback of extending the existing transition-repair machinery if a synchronous combined commit cannot fit the registry API.
-2. Confirm each native provider's authoritative snapshot/turn accumulator and native-acceptance boundary. Codex uses its existing projection fences; Claude/Kilroy and OpenCode need a retained immutable live overlay. Prove capture during a continuous stream, not a retry-until-quiet algorithm. Managed `read_events` currently samples head before an awaited retained-state read and is not an atomic snapshot.
-3. Confirm native per-turn settings behavior, including settings accepted while busy. Task 13 defines explicit private native-setting restoration/dirty-state handling when a provider lacks independent per-turn overrides; verify captured request options and the newer committed defaults, not only UI labels.
-4. Confirm `pnpm run test:runtime:fresh-agent-fixtures` actually creates the existing external managed fixture target and executes all four modes with nonzero counts. The script explicitly selects the repository's local-only Docker/supervisor lane. Keep the new default-path two-device spec cloud legal. Provider qualification via `test:runtime:fresh-agent-qualification` is a separate live-provider opt-in, not evidence supplied by deterministic fixtures and is not needed when deterministic fixtures establish the contract.
-5. Confirm all named focused selectors and fixture audit fields against their implemented tests before execution; zero tests, skipped modes, and filtered-out managed cases are failures of the gate. Confirm prepared artifacts match source when build inputs change. No dependency or package-manager change is planned.
+1. Binding mutation must be fenced to the exact current ownership operation across cancellation, durable writes and Live publication; choose a safe synchronous guard or exact-operation repair.
+2. Codex, Claude/Kilroy and OpenCode need provider-specific stable identities and versions for one-time merging of live output with durable history during continuous output.
+3. Managed capture must pair retained presentation with its real event watermark across provider-to-actor loss and coalescing, or return an explicit gap/reset.
+4. Shared settings edits must report known effective values after success, partial application, refusal or uncertain native response while preserving each provider's busy behavior.
+5. Receipts must distinguish request write, provider acceptance, completion and possible delivery; controls that finish a turn must remain dispatchable, and uncertain sends must not be replayed.
+6. A stable durable conversation/store identity must survive materialization aliases, rekey and restart while a true fork receives a new identity.
+7. All send ingress must reference one durable send-effect fence; receipt/order storage may describe its outcome but must never grant a second native dispatch permit.
+8. Provider lifecycle must identify owner/native turns independently of one-to-one client commands, including commandless turns and multiple commands absorbed into one turn.
+9. A delayed interrupt must be fenced where the provider can still affect the native turn, including work already queued or autonomously started.
+10. Existing cloud-legal default and local Docker managed fixtures must provide positive independent desktop/mobile cases and native request audits for the required interleavings without live providers.
+
+The ledger records each claim's evidence, method, fallback and status. Static-only findings are acceptable when the proposed behavior does not yet exist or execution would require unsafe setup; missing execution is recorded as a gap rather than inferred as proof.
 
 ## File responsibilities and interfaces
 
@@ -70,7 +77,7 @@ The map covers files introduced or materially modified. Existing nearby inline t
 | New `crates/freshell-freshagent/src/session_recovery.rs`, provider modules `claude/recovery.rs`, `claude/attach.rs`, `codex.rs`, `opencode_ws.rs` | Existing provider ensure paths share one in-flight operation/result/budget per canonical session; requester attach results. |
 | `crates/freshell-ws/src/reconcile_freshagent.rs`, `lib.rs`, `src/lib/pane-reconcile.ts`, `src/store/panesSlice.ts` | Pure per-view reconcile from canonical runtime/recovery facts; multiple same-session views retain their locator. |
 | `src/lib/fresh-agent-snapshot-scheduler.ts`, `src/lib/fresh-agent-reveal-freshness.ts`, new `src/lib/fresh-agent-refresh.ts` | Scheduler-owned read timeout and per-view non-extendable refresh deadline. |
-| New `crates/freshell-agent-runtime/src/reconciliation.rs`, `reconciliation_tests.rs`, existing `lib.rs`, `host_actor.rs` and `host_actor_tests.rs` | Shared bounded event/receipt/settings/queue bookkeeping and atomic retained presentation, with managed persistence in the existing actor state. |
+| New `crates/freshell-agent-runtime/src/reconciliation.rs`, `reconciliation_tests.rs`, existing `lib.rs`, `host_actor.rs` and `host_actor_tests.rs`; `crates/freshell-agent-runtime/Cargo.toml`; new `crates/freshell-platform/src/atomic_file.rs` and platform tests | Shared bounded event/receipt/settings/queue bookkeeping and atomic retained presentation; one platform-aware atomic replacement helper used by managed and default state writes. |
 | New `crates/freshell-freshagent/src/session_reconciliation.rs`; `claude.rs`, `claude_edges.rs`, `claude_projection.rs`, `claude_snapshot.rs`, `codex.rs`, `codex/projection.rs`, `codex/controls.rs`, `opencode_ws.rs`, `snapshot.rs`, `lib.rs` | Default owners stamp canonical events and retain native-keyed overlays; durable command state; provider-native submission/target/decision integration. |
 | `crates/freshell-server/src/main.rs` | Inject the existing isolated-home state root into default reconciliation owners; no production restart or launch change. |
 | `crates/freshell-freshagent/src/rest_lane.rs`, `rest_lane_sync.rs`, `claude_rest_lane.rs`, `codex_rest_lane.rs`, `crates/freshell-server/src/fresh_agent_proxy_rest.rs` | HTTP/CLI/MCP-facing ingress uses the same command admission and receipt authority as WebSocket ingress. |
@@ -91,15 +98,15 @@ The map covers files introduced or materially modified. Existing nearby inline t
 2. `FreshAgentSource = {incarnation: string, ownerEpoch: number, ownerGeneration: number}` and `FreshAgentCursor = {source: FreshAgentSource, sequence: number}` use safe integer validation. A source identifies one runtime event producer. A durable locator, native materialization alias and Codex projection ID retain their existing meanings. Rekeying a native/presentation ID within a runtime preserves source/commands; replacing the runtime changes source but not durable command IDs.
 3. `freshAgentReconciliationV1` is additive negotiated capability. New fields on existing messages are optional for old callers; modern envelopes/replies are sent only to negotiated connections. Without negotiation, preserve legacy payload parsing/provider-native semantics, with the requested close, safe binding, shared recovery and requester isolation fixes still active. One global event cannot be both an unwrapped legacy frame and a modern wrapped frame applied by the same connection.
 4. Modern `freshAgent.attached` / `freshAgent.attach.failed` carry `requestId`, `viewId`, canonical locator and full current authority. Failure includes typed code, retryable, recovery operation ID and retry floor when relevant. Modern `freshAgent.detach` / `freshAgent.detached` remove/ack only that connection's view interest. Disconnect drops only that connection's interests. Shared termination remains the explicit existing Kill operation, later command-receipted in Task 12.
-5. Shared `ReconciliationState` owns a bounded sequenced ring, retained presentation projection, settings revision, command lookup/tombstones and accepted queue. Defaults reuse managed limits: 4096 events / 4 MiB. A committed presentation mutation and its event sequence are one synchronous owner-state mutation before publication. Do not sequence events by subsequently watching the global broadcast bus.
+5. Shared `ReconciliationState` owns a bounded sequenced event window, retained presentation projection, settings revision, command lookup and accepted queue. Defaults reuse managed limits: 4096 events / 4 MiB. The modern replay window is always an honest contiguous suffix or carries explicit gap/reset metadata; pending decisions live in captured control state, not by preserving interior events in a false suffix. A committed presentation mutation and its event sequence are one synchronous owner-state mutation before publication. Do not sequence events by subsequently watching the global broadcast bus.
 6. `capture_snapshot() -> SnapshotCapture` freezes presentation/settings/controls/queue/receipts and its exact cursor under that same short state lock. Native/durable reads happen outside it; validate their native/history generation when merging. Retain keyed live overlays until durable native IDs confirm inclusion. Copy immutable references/values without awaited RPC, filesystem or socket work inside the lock. Capture succeeds while output continues; neither repeated head sampling nor waiting for quiet establishes correctness. Serialize a captured snapshot in bounded pages; one active capture per view, replacing/disposal on new capture, detach or deadline. Existing provider history paging/retention limits remain in force; do not introduce an unbounded all-history copy.
-7. `freshAgent.sync` takes `{requestId, viewId, locator, cursor?, maxEvents?, maxBytes?, commandIds?}`. Clamp page requests to 256 events / 256 KiB and receipt IDs to 128 using existing frame-size validation. Reply only to requester with source, retainedFrom/head, events, receipts, nextCursor, optional captured snapshot and its watermark/resetRequired. Snapshot chunks share an immutable capture ID/watermark and are applied only when complete; a partial/expired capture is retried or finitely failed, never displayed as complete. Register interest before capture; buffer live suffix through its head, then deliver only greater sequences. Overflow/eviction yields explicit gap/reset, never provider termination.
-8. `CommandMeta = {commandId, expectedSource?}`; sends reuse `checkpointIntent.logicalAttemptId` and request aliases. `CommandReceipt = {commandId, payloadDigest, acceptedOrder, state, effectiveSettingsRevision?, submittedTurnId?, providerAckId?, result?}`. States distinguish queued/accepted, dispatching, provider-acknowledged, completed/cancelled, rejected and ambiguous. Missing, expired/tombstoned and store-unreadable lookup are distinct. Detailed retention is bounded; dedup tombstones prevent an expired receipt from authorizing native resend.
-   Keep at most 4096 detailed settled receipts in active owner state and 128 unresolved admitted commands; refuse additional admission with typed backpressure before native effect rather than dropping unresolved state. Compact settled details using the existing journal/checkpoint tombstone lifecycle, retain command ID/digest/native-delivery fence on disk, and query older records lazily. Do not evict a dedup fence merely to bound the in-memory projection. Accepted queue payload has the separate Task 15 128-entry/4MiB cap.
-9. Under existing owner submission serialization, admission checks source/fences/preconditions and same-ID digest, persists acceptance/order/payload before native effect, and dispatches eligible commands in accepted order to the provider's acceptance boundary. Record actual dispatch order separately: a follow-up waiting for turn completion cannot block an interrupt or approval targeting that active turn. Streaming response duration does not hold the submission gate. Typed no-dispatch refusal may be retried under its existing safe policy; possible native delivery is ambiguous and never automatically resent under the old or a newly minted ID. Provider acknowledgment requires correlated native acceptance, not checkpoint capture or `dispatch_started`. Existing send checkpoint outcomes retain their separate rewind meaning.
-10. `SettingsState = {revision, values}`; explicit edits use `expectedSettingsRevision` and patch semantics (absent preserves, `effort: null` selects Default). Ordinary modern sends carry no cached settings. Accepted follow-ups store effective settings/revision once; dispatch cannot overwrite newer committed session defaults. `TurnTarget = {dispatchCommandId, nativeTurnId?}` names accepted pre-start and native-started turns. Validate a delayed control's captured target at native dispatch, never retarget it to the current turn.
+7. `freshAgent.sync` takes `{requestId, viewId, locator, cursor?, maxEvents?, maxBytes?, commandIds?}`. Clamp page requests to 256 events / 256 KiB and receipt IDs to 128 using existing frame-size validation. Reply only to requester with source, retainedFrom/head, events, receipts, nextCursor, explicit gaps where sequences are unavailable, optional captured snapshot and its watermark/resetRequired. Snapshot chunks share an immutable capture ID/watermark and are applied only when complete; a partial/expired capture is retried or finitely failed, never displayed as complete. Register interest before capture; buffer live suffix through its head, then deliver only greater sequences. Advance a cursor only across returned events, explicitly irrelevant ranges or declared gaps. Overflow/eviction yields explicit gap/reset, never provider termination.
+8. `CommandMeta = {commandId, expectedSource?}`; sends reuse `checkpointIntent.logicalAttemptId` and request aliases. `CommandReceipt = {commandId, payloadDigest, acceptedOrder, state, effectiveSettingsRevision?, submittedTurnId?, providerAckId?, result?}`. States distinguish queued/accepted, dispatching, provider-acknowledged, completed/cancelled, rejected and ambiguous. Missing, expired and store-unreadable lookup are distinct. Detailed receipt retention is bounded; compact dedup/expiry metadata is explicitly added where required to keep stable lookup, but is not a native send permit. The existing send-effect fence remains the only authority that may permit a send; receipt records reference its outcome. No lazy archive lookup is promised.
+   Keep at most 4096 detailed settled receipts in active owner state and 128 unresolved admitted commands; refuse additional admission with typed backpressure before native effect rather than dropping unresolved state. Define and test the compact lookup/expiry representation alongside the single send-fence crash policy in Tasks 8–12. Do not evict or duplicate the existing send-effect fence merely to bound the in-memory receipt projection. Accepted queue payload has the separate Task 15 128-entry/4MiB cap.
+9. Under existing owner submission serialization, admission checks source/fences/preconditions and same-ID digest, persists acceptance/order/payload before native effect, and dispatches eligible commands in accepted order to each provider's proven acceptance boundary. Record actual dispatch order separately: a follow-up waiting for turn completion cannot block an interrupt or approval targeting that active turn. Streaming response duration does not hold the submission gate. Typed no-dispatch refusal may be retried only under its proven safe policy; possible native delivery is ambiguous and never automatically resent under the old or a newly minted ID. Provider acknowledgment requires correlated native acceptance, not checkpoint capture, a wire write or `dispatch_started`. Existing send checkpoint outcomes retain their separate rewind meaning.
+10. `SettingsState = {revision, values, certainty}`; explicit edits use `expectedSettingsRevision` and patch semantics (absent preserves, `effort: null` selects Default). Ordinary modern sends carry no cached settings and cannot restore stale view state over newer shared defaults. Report effective settings/revision only at a provider boundary that can establish them; represent partial or uncertain explicit edits honestly. `TurnTarget` uses a source-scoped owner turn identity with native identity when available, membership for zero-to-many associated commands, and explicit prestart/unknown states. Validate a delayed control's captured target at the native effect boundary; never infer that one client command names every native turn.
 11. Native decisions claim Pending -> Dispatching atomically before awaiting a write; response digest/result and winning receipt persist. Opposite/duplicate losers get requester-scoped typed outcomes, not shared session errors. Unknown delivery stays ambiguous. Shared membership and resolution still broadcast. Unsupported provider features remain typed unsupported.
-12. Unsent drafts stay in the local view. Pressing Send with follow-up intent immediately accepts a durable server command `delivery: 'after-current-turn'`; its queue is shared and survives reload/detach. Normal `delivery: 'native'` preserves Codex steering, Claude native busy acceptance and OpenCode compact/send FIFO. Cancellation succeeds only before Dispatching.
+12. Unsent drafts stay in the local view. Pressing Send with follow-up intent immediately accepts a durable server command `delivery: 'after-current-turn'`; its queue is shared and survives reload/detach. Queued payload and accepted order persist; settings are resolved by shared authority at actual dispatch, not frozen by the submitting view. Normal `delivery: 'native'` preserves Codex steering, Claude native busy acceptance and OpenCode compact/send FIFO. Cancellation succeeds only before Dispatching.
 
 ### Task order
 
@@ -766,12 +773,13 @@ git commit -m "fix(freshagent): bound visible refresh and shared snapshot reads"
 ### Task 8: Share the existing actor's bookkeeping and make managed captures atomic
 
 **Files:**
-- Create: `crates/freshell-agent-runtime/src/reconciliation.rs`, `reconciliation_tests.rs`.
-- Modify: `crates/freshell-agent-runtime/src/lib.rs`, `host_actor.rs`, `host_actor_tests.rs`, `crates/freshell-runtime-protocol/src/lib.rs`, `fresh_agent_ops.rs`, `port/contract/managed-runtime.schema.json`.
+- Create: `crates/freshell-agent-runtime/src/reconciliation.rs`, `reconciliation_tests.rs`, `crates/freshell-platform/src/atomic_file.rs` and platform-specific atomic replacement tests.
+- Modify: `crates/freshell-agent-runtime/Cargo.toml`, `crates/freshell-agent-runtime/src/lib.rs`, `host_actor.rs`, `host_actor_tests.rs`, `crates/freshell-platform/Cargo.toml`, `crates/freshell-platform/src/lib.rs`, `crates/freshell-runtime-protocol/src/lib.rs`, `fresh_agent_ops.rs`, `crates/freshell-server/src/checkpoints.rs`, `port/contract/managed-runtime.schema.json`.
 
 **Interfaces:**
-- Consumes: existing managed `PersistedActorState`, `AgentJournalEvent`, `AgentEventBatch`, command payload/digest/tombstone storage and provider-native checked dispatch.
-- Produces shared `ReconciliationState<P>` (P is the retained presentation), `Source`, `Cursor`, `SnapshotCapture<P>`, `CommandReceipt`, `SettingsState`, `AcceptedFollowup` and `ReceiptLookup::{Found,Missing,Expired,Unreadable}`. `record_event(event, mutate_projection)` and `capture_snapshot()` share one owner lock/commit boundary. Existing managed state stays the only managed command store.
+- Consumes: existing managed `PersistedActorState`, `AgentJournalEvent`, `AgentEventBatch`, protected payload storage and provider-native checked dispatch.
+- Produces shared `ReconciliationState<P>` (P is the retained presentation), `Source`, `Cursor`, `SnapshotCapture<P>`, `CommandReceipt`, `SettingsState`, `AcceptedFollowup` and `ReceiptLookup::{Found,Missing,Expired,Unreadable}`. `record_event(event, mutate_projection)` and `capture_snapshot()` share one owner lock/commit boundary. Existing managed state stays the managed persistence owner; this adds bounded detailed receipts and compact lookup metadata required by the validated retention and send-fence policy, not another native send permit.
+- Produces a reusable `freshell-platform::atomic_file::publish_durable(temp, destination, durability_root)` contract for already-staged, file-synced content. It atomically replaces the destination and applies platform-appropriate durability (sync the relevant parent-directory chain through `durability_root` on Unix; write-through replacement on Windows). The actor/default callers retain their staging-file permissions and sync policy; the checkpoint publisher reuses its existing durable root. This preserves rather than weakens each caller's current durability boundary.
 - `CommandReceipt` additionally records optional `dispatchOrder` for the actual native boundary; `acceptedOrder` remains total admission order. Deferred follow-ups are ineligible until their captured turn boundary settles and do not block a later eligible interrupt/decision. Eligible native submissions use the existing serialization gate; queued follow-ups dispatch in accepted order.
 
 - [ ] **Step 1: Add failing runtime tests**
@@ -784,13 +792,18 @@ contains exactly the effects through its cursor, never a later effect or a
 missing earlier effect. Verify snapshot paging uses that same immutable capture
 while later events append; no mutex is held across transport retained_state.
 
-Other core tests: event 4096/4MiB eviction gives exact retained bounds/reset;
-same command ID+digest returns its receipt, different digest conflicts; 100
-concurrent admissions have unique increasing acceptedOrder; native dispatch
-order is unique; persistence reopen at queued/dispatching/provider-acked states
-doesn't dispatch twice; expired record gives tombstone, unreadable store isn't
-Missing. Legacy persisted actor states migrate without claiming new native
-acceptance, and old Dispatching becomes conservative ambiguous on recovery.
+Other core tests: event 4096/4MiB eviction returns an honest contiguous suffix
+or explicit exact gaps/reset; pending decisions remain in the captured control
+projection without creating holes in that suffix. Same command ID+digest
+returns its receipt, different digest conflicts; 100 concurrent admissions
+have unique increasing acceptedOrder; native dispatch order is unique.
+Persistence reopen at queued/dispatching/provider-acked states does not dispatch
+twice and consults the existing send-effect fence rather than granting authority
+from a receipt. Bounded detailed receipt expiry is distinguishable from Missing;
+unreadable store is not Missing. Legacy persisted actor states migrate without
+claiming new native acceptance, and old Dispatching becomes conservative
+ambiguous on recovery. Platform tests verify atomic replacement on supported
+native targets; do not copy POSIX parent-directory fsync into Windows code.
 
 Managed host_actor test: hold transport.retained_state while a new event arrives.
 Current read_events pairs an earlier head with later state; require the returned
@@ -808,29 +821,44 @@ Expected FAIL because atomic capture/receipt query behavior is missing, or manag
 - [ ] **Step 3: Production patch**
 
 ```text
-Move the actor's existing bounded event, command digest/state, settings and
-pending decision bookkeeping into reconciliation.rs; actor persistence embeds
-this state and keeps its existing protected payload-file lifecycle. No second
-managed journal and no PTY journal changes. Version the persisted state
-additively with defaults for old entries; preserve dispatch tombstones and
-possible-native-delivery ambiguity. Atomic writes retain current semantics.
+Move the actor's event, command digest/state, settings and pending decision
+bookkeeping into reconciliation.rs; actor persistence embeds this state and
+keeps its existing protected payload-file lifecycle. No second managed journal
+and no PTY journal changes. Version persisted state additively with defaults
+for old entries; preserve possible-native-delivery ambiguity. Add bounded
+detailed receipt retention and compact expiry/dedup metadata according to the
+validated stable-ID policy. For sends, receipt metadata is only a queryable
+reference to the existing send-effect fence; it cannot create a second permit
+or authorize a resend. Do not claim a generic actor tombstone/compaction or
+lazy archive facility already exists.
+
+Extract the platform-aware atomic replacement behavior into freshell-platform
+as `publish_durable(temp, destination, durability_root)` and use it for these
+state writes and the existing checkpoint publisher. Keep current file staging,
+permissions and sync behavior; preserve Windows write-through replacement and
+Unix parent-directory chain sync to the caller's durability root. Add the
+required dependency/features and verify there is no crate cycle; no broad
+migration of unrelated atomic writers is included.
 
 record_event applies its projection mutation and allocates/appends sequence
 under the same owner-state lock, then returns the sequenced event for publication
 after release. capture_snapshot clones immutable retained presentation plus
 settings/controls/queue/receipt projection and cursor under that lock. The actor's
-existing provider-event ingestion updates retained projection before publishing;
-read_events
-no longer drops the lock then samples a new retained_state against an old head.
+existing provider-event ingestion updates retained projection before publishing.
+`read_events` no longer drops the lock then samples a new `retained_state`
+against an old head. If bridge loss or coalescing means the actor cannot prove
+continuity, return an explicit gap/reset instead of assigning a later projection
+to an earlier cursor.
 Prepare durable/native bases outside lock and commit validated native IDs/
 history-generation plus overlay under lock. Capture tokens paginate the frozen
 value; expire/dispose by view deadline without blocking new native events.
 
 Expose AgentEventBatch's actual snapshot watermark/source separately from head.
-Preserve existing managed event limits and command states; add typed receipt
-result, accepted/dispatch order and query distinctions. Store errors refuse
-new native effects. Never interpret checkpoint success/dispatch_started as
-ProviderAcked. Generate the managed schema from its authority.
+Preserve existing managed event limits and native command states; add typed
+receipt result, accepted/dispatch order and query distinctions with the new
+bounded detailed/compact lookup policy. Store errors refuse new native effects.
+Never interpret checkpoint success/dispatch_started as ProviderAcked. Generate
+the managed schema from its authority.
 ```
 
 - [ ] **Step 4: Green**
@@ -838,6 +866,8 @@ ProviderAcked. Generate the managed schema from its authority.
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-agent-runtime --lib reconciliation"`
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-agent-runtime --lib host_actor"`
+
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-platform atomic_file"`
 
 Expected PASS with continuous-stream interleaving and crash-reopen dispatch counts asserted.
 
@@ -851,6 +881,8 @@ Run: `pnpm run contract:generate`
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-agent-runtime"`
 
+Run: `pnpm run test:sandbox "cargo test --locked -p freshell-platform"`
+
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-runtime-protocol"`
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-session-host fresh_agent"`
@@ -860,7 +892,7 @@ Expected PASS. All actor/transport callers are impacted by snapshot and persiste
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/freshell-agent-runtime/src/reconciliation.rs crates/freshell-agent-runtime/src/reconciliation_tests.rs crates/freshell-agent-runtime/src/lib.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-agent-runtime/src/host_actor_tests.rs crates/freshell-runtime-protocol/src/lib.rs crates/freshell-runtime-protocol/src/fresh_agent_ops.rs port/contract/managed-runtime.schema.json
+git add crates/freshell-agent-runtime/Cargo.toml crates/freshell-agent-runtime/src/reconciliation.rs crates/freshell-agent-runtime/src/reconciliation_tests.rs crates/freshell-agent-runtime/src/lib.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-agent-runtime/src/host_actor_tests.rs crates/freshell-platform/Cargo.toml crates/freshell-platform/src/lib.rs crates/freshell-platform/src/atomic_file.rs crates/freshell-platform/src/atomic_file_tests.rs crates/freshell-server/src/checkpoints.rs crates/freshell-runtime-protocol/src/lib.rs crates/freshell-runtime-protocol/src/fresh_agent_ops.rs port/contract/managed-runtime.schema.json
 git commit -m "feat(freshagent): share reconciliation state and capture atomic actor snapshots"
 ```
 
@@ -872,8 +904,8 @@ git commit -m "feat(freshagent): share reconciliation state and capture atomic a
 
 **Interfaces:**
 - Consumes: Task 8 generic reconciliation state and Task 3 durable session identity/owner claim; existing Codex transcript projection and Claude/OpenCode native event accumulators.
-- Produces: owner-local `reconcile_snapshot(locator) -> Result<SnapshotCapture<FreshAgentPresentation>>`, `read_reconciliation(cursor, limits)`, and `publish_committed(event)` whose record is stamped before broadcasting. Default command persistence is scoped to the existing durable session metadata, not a process/global or browser key.
-- Produces: default `with_reconciliation_root(PathBuf)` initialization and `DefaultReconciliationStore::open(root, canonicalLocator)`, reusing Task 8's extracted atomic persistence/protected-payload helpers. Inject root from the server's existing isolated home; the exact additive location is `<home>/.freshell/fresh-agent-state/<provider>/<sha256(canonical durable locator)>/fresh-agent-state.json`, with payload files in that session directory. Managed actors retain their existing state directory/file. No new ownership lock or second send dispatch-fence store is introduced.
+- Produces: owner-local `reconcile_snapshot(locator) -> Result<SnapshotCapture<FreshAgentPresentation>>`, `read_reconciliation(cursor, limits)`, and `publish_committed(event)` whose record is stamped before broadcasting. Default command persistence is scoped to the durable provider identity/alias record and its stable store ID, not a process/global or browser key.
+- Produces: default `with_reconciliation_root(PathBuf)` initialization and `DefaultReconciliationStore::open(root, stableStoreId)`, reusing Task 8's platform-aware atomic replacement/protected-payload helpers. Resolve `stableStoreId` from a durable provider-scoped identity/alias record that survives pre/post-materialization aliases, rekey and restart while assigning true forks a distinct ID; never derive the store key from whichever locator arrived in the current request. Resolve the exact identity and alias transaction under LB-6 before implementation. Inject root from the server's existing isolated home. Managed actors retain their existing state directory/file. No new ownership lock or second send dispatch-fence store is introduced.
 
 - [ ] **Step 1: Add red provider integration tests**
 
@@ -884,6 +916,11 @@ its state includes every pre-watermark delta once although disk is behind.
 After disk catches up, capture merges matching native message/block/part IDs
 without duplicate text/rows. Producer continues through both reads; no quiet
 window is permitted. Cover freshclaude, kilroy, freshcodex and freshopencode.
+
+Also exercise store resolution: open concurrently by old/new materialization
+aliases, persist a rekey, restart, query/admit through both aliases and observe
+one store; fork and verify a separate store. The test must prove one owner/store
+without treating a native terminal ID or current locator hash as stable identity.
 
 Exercise status, settings, controls, errors, attention, materialization,
 transcript invalidator, completion and queue/receipt event families. Every
@@ -903,11 +940,12 @@ Expected FAIL: no stamped default presentation/capture, disk lag loses live text
 
 ```text
 Embed the shared reconciliation state in each existing default session owner.
-Use existing runtime identity/ownership source; if none is public, mint one UUID
-at registration and retain it across native/presentation alias changes. Persist
-receipt/settings/accepted payload state alongside durable session metadata;
-the bounded transient ring belongs to this runtime source. Native replacement
-keeps command tombstones and accepted queue but creates a fresh event source.
+Implement the stable store identity and durable alias/rekey behavior selected
+under LB-6. It must survive concurrent open, restart and native materialization;
+a true fork gets a new identity and store. Persist receipt/settings/accepted
+payload state alongside durable session metadata; the bounded transient ring
+belongs to this runtime source. Native replacement keeps stable command lookup
+and accepted queue but creates a fresh event source.
 
 At every producing boundary, first mutate retained presentation+append event
 in one synchronous owner commit, release lock, then publish. Include direct
@@ -1169,12 +1207,14 @@ one transcript row; changed payload under that ID conflicts only to requester.
 Repeat semantic operations with effect counters. Server admission/order includes
 concurrent WS plus actual REST ingress, so headless calls cannot bypass it.
 
-Crash/reopen at before acceptance persistence, after dispatch fence before RPC,
-after native delivery before receipt, after persisted provider ack before WS
-publication. Query gives Missing only before persisted admission, otherwise
-known or ambiguous, never safe-to-resend. Drop detailed record: tombstone/expired
-still suppresses dispatch. Store failure refuses before effect; unreadable query
-is typed error. Same-ID compact/rollback/fork/decision/kill never effect twice.
+Crash/reopen at before acceptance persistence, after existing send-fence update
+and before native RPC, after native delivery before receipt, and after persisted
+provider acknowledgment before WS publication. Query gives Missing only before
+persisted admission, otherwise known or ambiguous, never safe-to-resend. Expire
+detailed receipt data and verify the compact lookup representation still routes
+send retries through the existing send-effect fence; receipt storage never
+grants dispatch permission. Store failure refuses before effect; unreadable
+query is typed error. Same-ID compact/rollback/fork/decision/kill never effect twice.
 
 Browser 'stage3 lost acknowledgment': drop real acceptance frame, reconnect,
 query existing command ID, show pending/accepted/ambiguous outcome, no automatic
@@ -1215,10 +1255,11 @@ admission rules instead of becoming implicit follow-ups.
 
 Sends use logicalAttemptId as commandId and request-ID aliases. Reference the
 existing checkpoints StoredCheckpointOutcome/dispatch fence rather than create
-a parallel send-effect journal. Receipt updates follow existing checkpoint
-before-publication observer of native acceptance/materialization/turn identity.
-Only correlated native evidence advances ProviderAcked; store submittedTurnId
-before publishing. Existing rewind/checkpoint outcome stays separately visible.
+a parallel send-effect journal. The current checkpoint before-publication hook
+can carry provider evidence, but existing `FreshAgentSendAccepted` signals are
+not uniformly correlated native acceptance. Add provider-specific correlation
+before advancing ProviderAcked; store a proven submitted turn ID before
+publishing. Existing rewind/checkpoint outcome stays separately visible.
 
 Every mutating provider/REST/managed entry routes admission before effects.
 Expose optional commandId in REST request contract; callers without it receive
@@ -1246,7 +1287,7 @@ Expected PASS with actual submit/effect counters.
 
 - [ ] **Step 5: Refactor**
 
-Use one admission/lookup adapter per owner; remove overlapping new receipt state. Preserve existing checkpoint tombstone lifecycle and managed payload persistence. Keep typed result errors separate from shared session errors.
+Use one admission/lookup adapter per owner; remove overlapping receipt state. Preserve the existing send-effect fence and managed payload persistence, and retain only the new bounded receipt/compact lookup representation selected by the shared retention policy. Keep typed result errors separate from shared session errors.
 
 - [ ] **Step 6: Impacted verification**
 
@@ -1276,18 +1317,21 @@ git commit -m "feat(freshagent): persist ordered command outcomes across all ing
 
 **Interfaces:**
 - Consumes: Task 12 admission/source/order, durable identity settings Keep/Replace from Task 3.
-- Produces: `Configure{commandId,expectedSettingsRevision,edits}`, committed `SettingsState{revision,values}` and typed `SettingsConflict{currentRevision,currentValues}`. Explicit null Default effort remains distinct from absent. Modern normal Send omits cached full settings; intentional per-send edits include a revision.
+- Produces: `Configure{commandId,expectedSettingsRevision,edits}`, authoritative `SettingsState{revision,values,certainty}` and typed `SettingsConflict{currentRevision,currentValues}`. Explicit null Default effort remains distinct from absent. Modern normal Send omits cached full settings; all actual settings changes use the shared versioned edit operation.
 
 - [ ] **Step 1: Add failing behavior tests**
 
 ```text
 Rust 'settings_revision': start both devices at N. A submits supported explicit
-edit and native acceptance commits N+1. B ordinary Send using its stale display
+edit; a fully applied edit commits N+1. B ordinary Send using its stale display
 must use current server settings, not revert A. B edit with expected N returns
 conflict/current N+1 only to B, native configure count unchanged. Duplicate A
-command returns same revision. Rejecting native configure never announces an
-applied revision. A delayed metadata/snapshot with N cannot overwrite N+1.
-Test absent vs effort:null and each provider's supported/create-only fields.
+command returns the same result/revision. Test a provider that applies one field
+before refusing the next: the receipt and converged settings show the known
+partial effect without claiming the whole patch succeeded. A lost/uncertain
+native result is marked uncertain until a safe readback/reconcile; it does not
+pretend that no field changed. A delayed metadata/snapshot with N cannot
+overwrite N+1. Test absent vs effort:null and each provider's supported/create-only fields.
 
 Client settings tests execute actual emitted frames: ordinary modern send has
 no settings cache, explicit editor change has expected revision and only edits;
@@ -1308,13 +1352,17 @@ Expected FAIL: no server revision conflict, full-cache ordinary send reverts set
 - [ ] **Step 3: Production patch**
 
 ```text
-Persist settings values/revision with the owning reconciliation state. Initialize
+Persist settings values/revision/certainty with the owning reconciliation state. Initialize
 from genuinely recovered settings without inventing defaults for identity-only
 rows; if no record exists use provider's real default snapshot as revision 0,
 not a fabricated durable historical edit. Configure admission validates expected
 committed revision and provider capabilities. Serialize native configure through
-existing submission gate, then atomically commit values/revision+event only on
-native acceptance. A pending configure reserves its base revision: another edit
+existing submission gate. Commit a fully applied result atomically; if the
+provider reports partial values, publish a failed/partially-applied receipt and
+advance the authoritative effective-settings record according to the revision
+policy established under LB-4. If delivery is uncertain, mark the settings
+uncertain and reconcile by a proven readback before claiming a value or allowing
+a dependent edit to overwrite it. A pending configure reserves its base revision: another edit
 is a typed conflict/pending result, never two independent N->N+1 writes. Receipt
 persists applied or refused outcome. No revision increment for duplicate/no-op.
 
@@ -1326,23 +1374,12 @@ history defaults. If a post-commit mirror write fails, log/retry the mirror and
 preserve the authoritative modern revision; a restart cannot reload stale mirror
 values over that newer record. Managed profile/settings stay in its actor state.
 
-A modern ordinary send captures current committed server settings at admission;
-its effectiveSettingsRevision and values are immutable command metadata.
-Explicit intentional per-send edits validate expected revision and affect that
-turn only unless the user made a separate Configure. Preserve model/effort/
-permission capability rules. Remove full cached settings from modern composer
-send and use versioned patches for actual edits; legacy fallback remains gated.
-
-Provider adapter accepts an effective per-turn snapshot. Use native per-turn
-overrides where supported. Otherwise, under the native submission gate, privately
-apply captured options, submit through correlated native acceptance, and restore
-the latest committed defaults without publishing a settings edit/revision. If
-provider can't restore while busy, mark nativeSettingsDirty and apply the latest
-committed defaults at the next eligible native boundary before any following
-submit/configure. The authoritative defaults never regress to old captured values.
-Task 15 reuses this for accepted follow-ups. Native request audits prove this
-behavior; UI-only convergence is insufficient. Surface private configure/restore
-failure as typed command/provider state; never blindly resubmit a possible send.
+Modern ordinary sends carry no cached settings, so stale device state cannot
+revert newer shared values. Provider adapters retain their existing native busy
+behavior and use the provider's actual effective settings at its proven native
+dispatch boundary; report an effective revision only when that boundary can
+establish it. Native request audits prove actual settings behavior; UI-only
+convergence is insufficient. Never replay an old view's values through a send.
 ```
 
 - [ ] **Step 4: Green**
@@ -1384,7 +1421,7 @@ git commit -m "feat(freshagent): version settings edits and capture server send 
 
 **Interfaces:**
 - Consumes: Task 12 command receipt/source/dispatch boundary, Task 9 current native/dispatch turn projection, existing Claude checked native callback reservation/Codex control lock.
-- Produces: `Interrupt{commandId,expectedSource,expectedTurn,source}` and decisions with separate commandId, existing native requestId, expected native source/turn, response digest; typed StaleTarget/AlreadyResolved/Ambiguous results and shared membership/resolution projection.
+- Produces: `Interrupt{commandId,expectedSource,expectedTurn,source}` where `expectedTurn` is a source-scoped owner turn identity with optional native identity and explicit prestart/unknown state; decisions retain separate commandId, existing native requestId, expected native source/turn, response digest and winning receipt. Typed StaleTarget/AlreadyResolved/Ambiguous results and shared membership/resolution projection. A turn may have zero or multiple associated client commands.
 
 - [ ] **Step 1: Add red regressions**
 
@@ -1420,10 +1457,12 @@ Expected FAIL: delayed interrupt chooses current turn B, Claude double-writes de
 - [ ] **Step 3: Production patch**
 
 ```text
-Include current TurnTarget in retained presentation and events, representing
-dispatchCommandId before native start and adding nativeTurnId on acceptance.
-Composer captures it when user clicks Stop/answers, alongside expected source.
-Validate exact captured target/membership at the provider's native dispatch
+Include current TurnTarget in retained presentation and events, using a
+source-scoped owner turn identity independent of a client command. Associate
+zero or many accepted commands and add nativeTurnId when provider lifecycle
+supplies one. Represent prestart and unidentifiable/unknown targets explicitly.
+Composer captures the exact target when user clicks Stop/answers, alongside
+expected source. Validate the captured target at the provider's native effect
 boundary after admission wait, not only at frame receipt. A settled/mismatched
 target yields a persisted requester stale-target no-op receipt. Never select
 whatever turn is current when a delayed interrupt finally dispatches.
@@ -1482,8 +1521,8 @@ git commit -m "feat(freshagent): fence delayed controls and atomically resolve s
 - Test: core/actor/provider and WS two-device tests, FreshAgentView tests, browser helper/spec.
 
 **Interfaces:**
-- Consumes: Task 12 command admission/receipts, Task 13 captured effective settings and Task 14 turn target.
-- Produces: `Send.delivery: 'native' | 'after-current-turn'`; `AcceptedFollowup{commandId,acceptedOrder,afterTurn,effectiveSettingsRevision,effectiveSettings,payloadRef,state}`; conditional ordered `CancelQueued{commandId,targetCommandId}`. Accepted queue is authoritative shared state, drafts stay local.
+- Consumes: Task 12 command admission/receipts, Task 13 shared settings authority and Task 14 source-scoped turn target.
+- Produces: `Send.delivery: 'native' | 'after-current-turn'`; `AcceptedFollowup{commandId,acceptedOrder,afterTurn,payloadRef,state}`; conditional ordered `CancelQueued{commandId,targetCommandId}`. Accepted queue is authoritative shared state, drafts stay local; effective settings are resolved and reported only at the actual provider dispatch boundary when known.
 
 - [ ] **Step 1: Add failing behavior tests**
 
@@ -1491,9 +1530,11 @@ git commit -m "feat(freshagent): fence delayed controls and atomically resolve s
 Rust 'accepted_followups': hold native turn A. Desktop submits Q1 then mobile
 Q2 as after-current-turn. Both immediately see server receipts/queue order;
 reload/close the submitter and reopen owner persistence before release. Exactly
-one Q1 then Q2 native submission occurs after A, ordered by acceptedOrder, with
-captured settings at each acceptance. Configure newer defaults before drain:
-Q1/Q2 requests keep captured options, committed settings stay newer throughout.
+one Q1 then Q2 native submission occurs after A, ordered by acceptedOrder.
+Configure newer shared defaults before drain: each native request follows the
+provider's existing busy-send/effective-settings behavior and neither view's
+stale cached values may revert the committed settings. Receipts report the
+effective revision only if provider evidence establishes it.
 
 Cancel Q2 while queued: one cancelled receipt, no Q2 native call. Race cancel
 after Dispatching: returns current receipt and never claims successful cancel.
@@ -1522,9 +1563,9 @@ Expected FAIL: queue belongs to React view, reload loses submitted work, devices
 ```text
 When user chooses follow-up and presses Send, immediately send an admitted
 command with after-current-turn, captured current TurnTarget and stable ID.
-Persist its payload reference/settings/order before acknowledgment; publish
-shared queue event. Only then clear the submitted local composer. An admission
-refusal leaves text as an unsent local draft; ambiguous effect never does.
+Persist its payload reference/order before acknowledgment; publish shared queue
+event. Only then clear the submitted local composer. An admission refusal leaves
+text as an unsent local draft; ambiguous effect never does.
 
 Owner drain selects eligible queued entries by acceptedOrder after afterTurn
 settles. Atomically transition Queued->Dispatching and persist dispatch fence
@@ -1535,13 +1576,15 @@ and default session metadata store; no browser drain leader or second queue.
 
 Wire OpenCode pending_sends to these accepted entries so existing compact FIFO
 drains them, not a parallel new queue. Native delivery mode continues provider
-busy semantics; follow-up is explicit. Use Task 13 native effective-settings
-adapter; never call public Configure with old queued settings or decrement the
-committed revision. Later settings changes do not rewrite accepted payloads.
+busy semantics; follow-up is explicit. Do not freeze settings at admission or
+call Configure with old queued settings. Resolve provider settings at actual
+dispatch under the shared settings authority; later settings changes do not
+rewrite accepted payloads or move the committed revision backward.
 
 CancelQueued is itself admitted/ordered and CASes target only while Queued;
-otherwise returns target's current receipt. Release payload retention only per
-existing settled-command/tombstone lifecycle. Limit admission to 128 entries /
+otherwise returns target's current receipt. Release payload retention using the
+new bounded receipt/compact lookup policy from Task 8, while retaining the
+existing send-effect fence. Limit admission to 128 entries /
 4MiB retained queued payload; typed backpressure before acceptance, no silent
 drop/eviction. Render accepted queue from canonical store on all devices and
 remove React queuedMessages auto-send effect. Keep unsent drafts per local view.
@@ -1553,7 +1596,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagen
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts --grep 'stage3 followups'`
 
-Expected PASS with exact Q1/Q2 native options/order/counts; repeat Step 2 client command green.
+Expected PASS with exact Q1/Q2 payload/order/native counts and provider-supported effective-settings evidence; queued work does not replay stale view values. Repeat Step 2 client command green.
 
 - [ ] **Step 5: Refactor**
 
@@ -1587,7 +1630,7 @@ git commit -m "feat(freshagent): accept and order shared follow-ups on the serve
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx`, `src/lib/fresh-agent-ws.ts`, `src/store/freshAgentSlice.ts`, `test/e2e-browser/helpers/fresh-agent-multiple-devices.ts`, `specs/fresh-agent-multiple-devices-rust.spec.ts`, `specs/runtime-fresh-agent-fixture-rust.spec.ts`, managed fixture helper `test/e2e-browser/helpers/managed-runtime.ts`, `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-server/src/fresh_agent_proxy_tests.rs`, `crates/freshell-ws/tests/freshagent_multiple_devices.rs`, `README.md`, `docs/index.html`.
 
 **Interfaces:**
-- Consumes: all prior tasks' negotiated receipts/sync/queue/settings/target state and existing managed external-target fixture script.
+- Consumes: all prior tasks' negotiated receipts/sync/queue/settings/target state and the existing local Docker managed fixture route.
 - Produces: bounded device-local unresolved-command ID recovery (no prompt content), startup query and honest unknown result presentation; combined default/managed acceptance evidence and user documentation.
 
 - [ ] **Step 1: Add final failing behavior regressions**
@@ -1703,13 +1746,13 @@ Each browser row runs two independent device contexts against one test-owned ser
 | Attach acknowledgment/failure requester isolation | 4,10 | `stage2 requester`; peer stream/error unaffected and no global replay | Running/idle/cold/malformed/reserved/failure sink assertions, hosted one poller |
 | Shared recovery budget and owner refresh | 5–7 | `stage2 shared failure/stale authority`; one attempt per cohort, legal second view retains identity | Three real failures exhaust; observer/reconcile zero cost; full new epoch/generation; canceled waiter survives |
 | Dead historical terminal binding repair/live exclusion | 3,5 | `stage1 dead binding`; send/configure work after shared reopen; live twin refuses | Production sink parked cancellation, unstamped/stamped rows, identity-only Keep settings, true live terminal zero extra launch |
-| Missed ack/query and possible native delivery | 12,16 | `stage3 lost acknowledgment/reload outcomes`; stable command receipt/turn, native submit=1 | Admission/dispatch/native/receipt crash boundaries, tombstone/unreadable distinction, no new-ID resend |
+| Missed ack/query and possible native delivery | 12,16 | `stage3 lost acknowledgment/reload outcomes`; stable command receipt/turn, native submit=1 | Admission/dispatch/native/receipt crash boundaries, compact expired/unreadable distinction, no new-ID resend |
 | Replay gaps/duplicates/stale source or snapshot | 8–11,16 | `stage3 gap reconnect`; actual dropped/reordered server frames, converged cursor/text/controls | Contiguous fold, bounded ring/page/reset, source adoption, immutable chunk watermark, Codex inner revisions retained |
 | Concurrent native sends and ordered effects | 12–13,15 | `stage3 settings/followups`; exact audited native request order/options/rows | Same-ID dedup; cross-WS/REST total admission and eligible dispatch order; preserve provider busy send/compact FIFO |
-| Stale settings never revert newer defaults | 13,15 | `stage3 settings/followups`; both headers N+1, old edit conflict, old queue captures its options | Native configure refusal/no revision, effort null/absent, per-turn capture/private restore/native dirty state |
+| Stale settings never revert newer defaults | 13,15 | `stage3 settings/followups`; both headers N+1, old edit conflict, queued send does not carry stale values | Native partial/uncertain configure outcome, effort null/absent, provider-specific effective settings at dispatch |
 | Delayed interrupt cannot stop a new turn | 14 | `stage3 controls`; native target A stale while B keeps running | Expected dispatch/native turn recheck at submission, pre-start target and silent attention behavior |
 | Atomic approval/question/elicitation winner | 14,16 | `stage3 controls`; one native response, shared resolution, harmless losing view | Pending->Dispatching before await, response digest/result, ambiguous crash, native source validation; unsupported OpenCode asserted |
-| Accepted follow-ups survive submitter removal | 15–16 | `stage3 followups/reload outcomes`; shared order, no duplicate native send, cancel race | Persisted payload/settings/turn target, CAS cancel, once-only drain, queued reopen, bounded backpressure |
+| Accepted follow-ups survive submitter removal | 15–16 | `stage3 followups/reload outcomes`; shared order, no duplicate native send, cancel race | Persisted payload/order/turn target, settings resolved at dispatch, CAS cancel, once-only drain, queued reopen, bounded backpressure |
 | Unsent drafts remain local | 2,15–16 | Type on A without Send: B sees no draft/queue/native call; A draft survives unrelated peer update | No draft in server payload/receipt logs; unknown accepted send never restored as safely unsent |
 | Both legacy/default and managed paths stay valid | 1–16 | Cloud D spec positively executes four modes; separate M fixture script positively executes four modes | Legacy unwrapped parse/behavior, direct owner adapters and existing managed journal/operations, native audits on each path |
 
