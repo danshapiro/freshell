@@ -840,32 +840,47 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   })
 
   test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page }) => {
-    // Give the simulator's real local /compact operation enough wall time for
-    // the UI's compacting state to be observed.
-    // 20x keeps the 500 ms simulated /compact window observable without
-    // stretching the 600 ms SDK boot to 30 seconds (50x). At that scale the
-    // pane did not reach its initial ready state before the test's 30 second
-    // setup bound under cloud scheduling.
-    const lane = await bootClaudeLane(page, 'freshclaude', { FRESHELL_CLAUDE_SIM_TIME_SCALE: '20' })
+    const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, ['connected', 'idle'])
       const durableBefore = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
 
-      // Warm the session with one ordinary turn.
+      // Initial idle is not completion of a prompt that has only been sent.
+      // Require the exact warm-up conversation to reach the real snapshot
+      // before /compact can overtake it at the sidecar command boundary.
       await sendComposerText(page, 'warm-up turn')
+      await expect.poll(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshclaude', 'claude', durableBefore)
+        return { status: snapshot?.status,
+          warmup: snapshot?.turns?.some((turn: any) => turn.role === 'user' && turn.summary === 'warm-up turn') ?? false,
+          reply: snapshot?.turns?.some((turn: any) => turn.role === 'assistant' && turn.summary === 'ok') ?? false }
+      }, { timeout: 15_000, message: 'warm-up turn and its answer settle before compaction' })
+        .toEqual({ status: 'idle', warmup: true, reply: true })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
 
-      // The compact gesture: typed slash text, executed by the composer.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
-      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact focus the diff')
-      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
-
-      // The real local command exposes the compacting state while it works.
-      await expect(page.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute(
-        'data-state',
-        'active',
-        { timeout: 15_000 },
-      )
+      const activeSelector = '[data-testid="fresh-agent-thinking-bar"][data-state="active"]'
+      await expect(paneRoot.locator(activeSelector)).toHaveCount(0)
+      // Record the real DOM transition before acting. The observer retains
+      // a short-lived active state even if Playwright is scheduled afterward;
+      // no simulator slowdown or sleep creates an observation window.
+      const activity = await paneRoot.evaluateHandle((element, selector) => {
+        const state = { seen: false }
+        const observer = new MutationObserver(() => {
+          if (element.querySelector(selector)) state.seen = true
+        })
+        observer.observe(element, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-state'] })
+        return { state, disconnect: () => observer.disconnect() }
+      }, activeSelector)
+      try {
+        await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact focus the diff')
+        await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
+        await expect.poll(() => activity.evaluate(value => value.state.seen),
+          { timeout: 15_000, message: 'compaction renders its active thinking bar' }).toBe(true)
+      } finally {
+        await activity.evaluate(value => value.disconnect())
+        await activity.dispose()
+      }
       // The CLI ledger records the exact local command text and durable id.
       const compactSend = await waitForSimRow(
         lane.simLedger,
