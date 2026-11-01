@@ -243,26 +243,37 @@ through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
 the provider child when the session starts.
 
-Antigravity CLI support launches `agy` panes, indexes native conversation
-history, binds one conversation identity per pane, and shows busy and
-turn-completion state — with these recorded limitations. Freshell's view of
-Antigravity's on-disk conversation format follows Google's documented store,
-but it has not yet been validated against a pinned real `agy` binary, so the
-transcript record schema and the store's authority remain candidate contracts
-until that probe runs. Freshell installs no Antigravity hooks and writes no
-Antigravity configuration anywhere; identity and activity are read-only views
-over the CLI's own files. Managed execution, durable recovery, live
+Antigravity CLI support launches `agy` panes (with no launch flags — the
+real CLI starts interactive by default, as probed against pinned binaries
+1.4.10 and 1.4.12), indexes native conversation history, binds one
+conversation identity per pane, and shows busy and turn-completion
+state — with these recorded limitations. Freshell's view of Antigravity's
+on-disk conversation format follows Google's documented store, but the
+transcript record schema and the store's authority have not been
+validated against a real authenticated `agy` session, so they remain
+candidate contracts. Freshell installs no Antigravity hooks and writes no
+Antigravity configuration anywhere; identity and activity are read-only
+views over the CLI's own files. Managed execution, durable recovery, live
 qualification, and a pinned runtime image for Antigravity are not built — the
 runtime capability row is fully blocked and records why. Renaming a
 conversation works inside Freshell but is never written back to the
-Antigravity CLI itself (native rename is unsupported). An approval or
+Antigravity CLI itself (native rename is unsupported). Binding a pane to
+its conversation depends on Freshell rebuilding the typed prompt from
+keystrokes: prompts entered through history recall (Up/Down), Tab
+completion, bracketed paste, or keys Freshell does not model never bind,
+and the pane binds again on its next clean typed prompt. On a resumed or
+restored pane, busy and turn-completion state only appear after the first
+clean typed submit — turns before that show no busy state and no
+completion bell. An approval or
 question is only marked separately when the transcript tailer can prove it;
 today terminal Antigravity panes show only the broader busy/idle state and
 have no waiting-for-approval attention signal (the same treatment as other
 terminal CLI panes). Resuming passes the conversation
-id to `agy` verbatim without Freshell-side validation for now, so a stale
-resume id surfaces the CLI's own error in the pane; enabling the validated
-resume gate is deferred until real-binary transcript evidence exists.
+id to `agy` verbatim without Freshell-side validation for now; the real CLI
+(probed) prints a warning for an unknown conversation id and continues into
+a fresh interactive session rather than failing, so a stale resume id is
+not caught for you — enabling the validated resume
+gate is deferred until real-binary transcript evidence exists.
 
 ### Standalone CLI and MCP client
 

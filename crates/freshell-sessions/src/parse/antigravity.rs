@@ -169,6 +169,17 @@ pub fn parse_antigravity_session_content(content: &str) -> Option<ParsedSessionM
                 }
                 fold_ts(&mut meta, obj.get("at"));
                 if let Some(usage) = obj.get("usage") {
+                    // Whole-delta review round 6, Nit 1: this takes the
+                    // LAST assistant envelope, not an accumulated total —
+                    // whether the candidate schema's per-message `usage`
+                    // is per-message or cumulative is a Stage-1 UNKNOWN
+                    // (the A2 schema blocker; recorded in the plan's
+                    // Provider Contract Record "real-binary follow-up"
+                    // row). Under a per-message reading a multi-turn
+                    // conversation reports only the final message's
+                    // envelope; a real authenticated session must settle
+                    // the semantics before this projection may be called
+                    // a total.
                     meta.token_usage =
                         parse_antigravity_token_envelope(usage).or(meta.token_usage.take());
                 }
