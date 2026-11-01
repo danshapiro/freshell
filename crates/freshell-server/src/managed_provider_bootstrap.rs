@@ -121,16 +121,8 @@ pub(crate) fn provider_launch_context_from_home_at_with_selected_roots(
             &["config.toml", "AGENTS.md", "skills", "rules"][..],
             ProviderPreparation::Codex {
                 approval_default: None,
-                tui_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
-                sidecar_args: if mcp_enabled {
-                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
-                } else {
-                    Vec::new()
-                },
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
             },
         ),
         "opencode" => (
@@ -656,6 +648,21 @@ mod tests {
     #[test]
     fn managed_codex_provider_context_renders_tui_and_sidecar_mcp() {
         let workspace = tempfile::tempdir().unwrap();
+        let without_capability =
+            provider_launch_context_for_managed("codex", workspace.path(), None).unwrap();
+        let ProviderPreparation::Codex {
+            approval_default,
+            tui_args,
+            sidecar_args,
+        } = &without_capability.preparation
+        else {
+            panic!("Codex preparation missing");
+        };
+        assert!(approval_default.is_none());
+        assert!(tui_args.is_empty());
+        assert!(sidecar_args.is_empty());
+        without_capability.validate("codex").unwrap();
+
         let capability = freshell_runtime_protocol::McpCapabilityReference {
             grant_id: "grant-fixture".into(),
             endpoint: "http://host.docker.internal:3001".into(),
