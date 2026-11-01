@@ -121,6 +121,17 @@ use crate::opencode_locator::normalize_cwd;
 use crate::provider_layout::{AntigravityLayout, ProviderLayout};
 use crate::time::parse_timestamp_ms;
 
+/// The per-terminal rate-limit window for the
+/// `antigravity_association_unmatched` warn (round 7, Minor 1): a
+/// misconfigured pane (an un-armed capture feed, a never-matching
+/// schema) would otherwise warn on EVERY Enter; one line per terminal
+/// per window keeps the failure diagnosable without burying the log.
+/// Sized to the pending lifetime's own cadence — a genuinely unmatched
+/// armed submit can expire at most once per
+/// [`ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS`], so the window never
+/// hides a DISTINCT failure, only bursts.
+pub const ANTIGRAVITY_UNMATCHED_LOG_INTERVAL_MS: i64 = 60_000;
+
 /// Submit-anchored evaluation window: a pane's captured submit is
 /// evaluated at (or after) `submit_at + WINDOW_MS` — the CLI writes the
 /// user record when it processes the prompt, so the window gives it a
@@ -301,6 +312,11 @@ pub struct AntigravityLocator {
     window_ms: i64,
     inner: Mutex<Inner>,
     fs_scan_count: AtomicU64,
+    /// The per-terminal last-emission timestamps of the
+    /// `antigravity_association_unmatched` warn (round 7, Minor 1) —
+    /// a SEPARATE mutex from `inner` so the tick's armed-loop can emit
+    /// without borrowing conflicts. Cleaned by [`Self::disarm`].
+    unmatched_log_ms: Mutex<HashMap<String, i64>>,
 }
 
 /// Normalize a prompt text for comparison: trim + bound. The trim is
@@ -309,6 +325,17 @@ pub struct AntigravityLocator {
 /// normalization on both sides.
 fn normalize_prompt_text(text: &str) -> String {
     text.trim().chars().take(MAX_SUBMIT_COMPARE_CHARS).collect()
+}
+
+/// The `antigravity_association_unmatched` fingerprint (round 7, Minor
+/// 1): the first 12 hex chars of the normalized submit's sha256 — a
+/// CONTENT-FREE correlation key (Global Constraint 7 forbids prompt
+/// contents in logs; the prefix still lets an operator recognize the
+/// same never-matching prompt across lines). Same sha2 version the
+/// ws/server crates already pin.
+fn submit_fingerprint(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))[..12].to_string()
 }
 
 impl AntigravityLocator {
@@ -322,6 +349,7 @@ impl AntigravityLocator {
             window_ms,
             inner: Mutex::new(Inner::default()),
             fs_scan_count: AtomicU64::new(0),
+            unmatched_log_ms: Mutex::new(HashMap::new()),
         }
     }
 
@@ -360,13 +388,19 @@ impl AntigravityLocator {
 
     pub fn disarm(&self, terminal_id: &str) {
         self.inner.lock().unwrap().armed.remove(terminal_id);
+        self.unmatched_log_ms.lock().unwrap().remove(terminal_id);
     }
 
     /// Record the pane's captured submit line (the association feeds the
     /// hub's flushed line here) and open the evaluation window anchored at
     /// the Enter. REPLACES any in-flight window (see module doc). `false`
     /// for an un-armed pane or an empty (normalized-empty) line — an empty
-    /// line can never match a user record's text.
+    /// line can never match a user record's text. An un-armed pane's false
+    /// return is LOGGED (round 7, Minor 1): the pane is tagged antigravity
+    /// but its capture feed never armed (e.g. no registry cwd), so every
+    /// submit is being dropped — a diagnosable misconfiguration, never a
+    /// silent one. An empty line stays silent (a bare Enter is normal
+    /// user behavior, not a failure).
     pub fn note_submit(&self, terminal_id: &str, line_text: &str, at_ms: i64) -> bool {
         let text = normalize_prompt_text(line_text);
         if text.is_empty() {
@@ -374,6 +408,8 @@ impl AntigravityLocator {
         }
         let mut inner = self.inner.lock().unwrap();
         let Some(armed) = inner.armed.get_mut(terminal_id) else {
+            drop(inner);
+            self.warn_unmatched(terminal_id, &text, at_ms, "not_armed");
             return false;
         };
         armed.submit = Some(CapturedSubmit { text, at_ms });
@@ -423,8 +459,12 @@ impl AntigravityLocator {
                 // (never pinning a window, never binding an unrelated
                 // future conversation). Resolving at expiry needs NO
                 // walk — this tick observes the end and the pane goes
-                // quiet (zero fs cost again).
+                // quiet (zero fs cost again). The drop is LOGGED
+                // (round 7, Minor 1): pre-fix this was the silent
+                // path — a clean submit that matched nothing for its
+                // whole lifetime vanished without a trace.
                 if now_ms >= submit.at_ms + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS {
+                    self.warn_unmatched(terminal_id, &submit.text, now_ms, "expired");
                     armed.resolved = true;
                     continue;
                 }
@@ -560,6 +600,43 @@ impl AntigravityLocator {
         located
     }
 
+    /// Emit the rate-limited `antigravity_association_unmatched` WARN
+    /// (round 7, Minor 1) — one line per terminal per
+    /// [`ANTIGRAVITY_UNMATCHED_LOG_INTERVAL_MS`]. Carries the terminal
+    /// id, the reason (`expired` — a pending window that matched nothing
+    /// for its whole lifetime; `not_armed` — a submit on a pane whose
+    /// capture feed never armed), and a content-free submit FINGERPRINT
+    /// (a sha256 prefix): Global Constraint 7 forbids prompt CONTENT in
+    /// logs, and the prefix still correlates repeat failures of the same
+    /// prompt across lines. `at_ms` is the emission domain's timestamp
+    /// (the submit's Enter time on the not_armed path, the observing
+    /// tick's time on expiry) — pure, never a wall clock.
+    fn warn_unmatched(&self, terminal_id: &str, text: &str, at_ms: i64, reason: &str) {
+        let Ok(mut lane) = self.unmatched_log_ms.lock() else {
+            return; // a poisoned lane never blocks the locator's work
+        };
+        if let Some(last) = lane.get(terminal_id) {
+            if at_ms - last < ANTIGRAVITY_UNMATCHED_LOG_INTERVAL_MS {
+                return;
+            }
+        }
+        lane.insert(terminal_id.to_string(), at_ms);
+        drop(lane);
+        tracing::warn!(
+            target: "freshell_sessions::antigravity_locator",
+            terminal_id = %terminal_id,
+            fingerprint = %submit_fingerprint(text),
+            reason = reason,
+            event = "antigravity_association_unmatched",
+            "antigravity_association_unmatched: a clean captured submit matched \
+             no transcript and was dropped — likely causes: the candidate \
+             record schema mismatching (the A2 blocker), the store root not \
+             holding the conversation (see antigravity_store_root_resolved), \
+             or no session_start workspacePath matching the pane's cwd; the \
+             pane re-arms on its next clean submit"
+        );
+    }
+
     fn scan_transcripts(&self) -> Vec<PathBuf> {
         self.fs_scan_count.fetch_add(1, Ordering::SeqCst);
         fn walk(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
@@ -611,8 +688,12 @@ struct TranscriptSummary {
     /// The FIRST `session_start` record's `conversationId` (the parser's
     /// determinism rule — later ownership records never reassign it).
     conversation_id: String,
-    /// That ownership record's `workspacePaths` (verbatim; compared
-    /// normalized).
+    /// The `workspacePaths` of EVERY `session_start` record across the
+    /// bounded head+tail windows (round 7, Minor 2: a resumed
+    /// conversation appends later records — usually near the file's end
+    /// — whose workspaces must still match the pane's cwd; the parser's
+    /// first-record-as-primary display rule is untouched). Compared
+    /// normalized.
     workspace_paths: Vec<String>,
     /// The LATEST user-authored record's text (normalized+bounded the same
     /// way the captured submit was).
@@ -634,8 +715,14 @@ struct TranscriptSummary {
 fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
     use std::io::{Read, Seek, SeekFrom};
 
-    // Ownership record: first complete JSON line with type session_start
-    // and a non-empty conversationId (bounded head window).
+    // Ownership id + workspace paths from the head window. The id is
+    // the FIRST `session_start` record's `conversationId` (the
+    // parser's determinism rule — later ownership records never
+    // reassign it). The workspacePaths are collected from EVERY
+    // `session_start` record in the window (round 7, Minor 2): a
+    // resumed conversation appends later `session_start` records whose
+    // workspaces must still match the pane's cwd; the parser's
+    // first-record-as-primary DISPLAY rule is untouched.
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = Vec::new();
     {
@@ -652,20 +739,18 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
         if obj.get("type").and_then(|v| v.as_str()) != Some("session_start") {
             continue;
         }
-        let id = obj
-            .get("conversationId")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty());
+        if let Some(paths) = obj.get("workspacePaths").and_then(|v| v.as_array()) {
+            for path in paths.iter().filter_map(|p| p.as_str()) {
+                workspace_paths.push(path.to_string());
+            }
+        }
         if conversation_id.is_none() {
-            if let Some(id) = id {
+            if let Some(id) = obj
+                .get("conversationId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
                 conversation_id = Some(id.to_string());
-                if let Some(paths) = obj.get("workspacePaths").and_then(|v| v.as_array()) {
-                    workspace_paths = paths
-                        .iter()
-                        .filter_map(|p| p.as_str().map(str::to_string))
-                        .collect();
-                }
-                break;
             }
         }
     }
@@ -698,6 +783,18 @@ fn probe_transcript(path: &Path) -> Option<TranscriptSummary> {
             .get("at")
             .or_else(|| obj.get("startedAt"))
             .and_then(parse_timestamp_ms);
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_start") {
+            // Round 7, Minor 2: a resumed conversation's LATER
+            // `session_start` records land at the file's END — usually
+            // far past the head window — so their `workspacePaths` are
+            // collected HERE too (the pane-cwd match considers every
+            // record; the first-record id rule is decided above).
+            if let Some(paths) = obj.get("workspacePaths").and_then(|v| v.as_array()) {
+                for path in paths.iter().filter_map(|p| p.as_str()) {
+                    workspace_paths.push(path.to_string());
+                }
+            }
+        }
         if obj.get("type").and_then(|v| v.as_str()) == Some("user_message") {
             if let Some(text) = obj.get("text").and_then(serde_json::Value::as_str) {
                 // Text and its OWN timestamp move together: recency is
@@ -1058,6 +1155,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Round 7, Minor 2: the pane-cwd match considers EVERY
+    /// `session_start` record's `workspacePaths`, not only the FIRST
+    /// one. A resumed conversation APPENDS a later `session_start`
+    /// record (`resumed.sanitized.jsonl`'s `{source:"resume"}` shape)
+    /// whose `workspacePaths` name the RESUME cwd — which can differ
+    /// from the first record's workspace (a CLI/MCP resume with a
+    /// different `cwd`, an in-CLI `/resume` across workspaces). Pre-fix
+    /// the head probe `break`ed at the first ownership record, so a
+    /// pane whose cwd matched only a LATER record never bound (no
+    /// activity lane, no in-CLI-switch rebind). The parser's
+    /// first-record-as-primary DISPLAY rule is untouched — only the
+    /// LOCATOR's match widens.
+    ///
+    /// Both directions: (a) a first-record workspace match still binds
+    /// (pinned); (b) an ONLY-later-record workspace match now binds
+    /// (the round-7 fix). The later record sits PAST the 64 KiB head
+    /// window (a >64 KiB filler user record precedes it — the realistic
+    /// resumed shape: the resume lands at the END of a long
+    /// conversation), so (b) proves the TAIL window's collection.
+    #[test]
+    fn a_later_session_start_workspace_still_matches_the_pane_cwd() {
+        // (a) FIRST-record match: pinned behavior, later record present.
+        let (locator_a, root_a) = locator_for("later-start-first");
+        let first_cwd = "/tmp/agy-later-first";
+        let resumed_cwd = "/tmp/agy-later-resumed";
+        std::fs::create_dir_all(first_cwd).unwrap();
+        std::fs::create_dir_all(resumed_cwd).unwrap();
+        write_resumed_transcript(
+            &root_a,
+            "conv-later-a",
+            first_cwd,
+            resumed_cwd,
+            "first-record prompt",
+        );
+        locator_a.arm("t1", first_cwd);
+        assert!(locator_a.note_submit("t1", "first-record prompt", T0));
+        let located = locator_a.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "a first-record workspace match still binds with a later session_start present"
+        );
+        assert_eq!(located[0].conversation_id, "conv-later-a");
+
+        // (b) ONLY-later-record match: the round-7 fix. The pane's cwd
+        // appears in NO record but the LATER session_start.
+        let (locator_b, root_b) = locator_for("later-start-only");
+        write_resumed_transcript(
+            &root_b,
+            "conv-later-b",
+            first_cwd,
+            resumed_cwd,
+            "later-record prompt",
+        );
+        locator_b.arm("t1", resumed_cwd);
+        assert!(locator_b.note_submit("t1", "later-record prompt", T0));
+        let located = locator_b.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "a workspace appearing only in a LATER session_start record binds the pane"
+        );
+        assert_eq!(located[0].conversation_id, "conv-later-b");
+        assert_eq!(
+            located[0].terminal_id, "t1",
+            "the later-record match attributes the conversation to the pane"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_a);
+        let _ = std::fs::remove_dir_all(&root_b);
+    }
+
+    /// The resumed-conversation transcript shape for
+    /// [`a_later_session_start_workspace_still_matches_the_pane_cwd`]:
+    /// an original `session_start` (workspace `first_cwd`), a >64 KiB
+    /// filler user record (pushing the resume past the head window), a
+    /// LATER `session_start {source:"resume"}` (workspace
+    /// `resumed_cwd`), and the matching latest user record.
+    fn write_resumed_transcript(
+        root: &Path,
+        conv: &str,
+        first_cwd: &str,
+        resumed_cwd: &str,
+        latest_prompt: &str,
+    ) -> PathBuf {
+        let path = root
+            .join(conv)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A single >64 KiB JSON string line (no metacharacters — 'x's).
+        let filler = "x".repeat(70 * 1024);
+        let body = format!(
+            concat!(
+                r#"{{"type":"session_start","conversationId":"{conv}","workspacePaths":["{first}"],"startedAt":{t0}}}"#,
+                "\n",
+                r#"{{"type":"user_message","conversationId":"{conv}","text":"{filler}","at":{t0a}}}"#,
+                "\n",
+                r#"{{"type":"session_start","conversationId":"{conv}","workspacePaths":["{resumed}"],"startedAt":{t0b},"source":"resume"}}"#,
+                "\n",
+                r#"{{"type":"user_message","conversationId":"{conv}","text":"{latest}","at":{t0c}}}"#,
+                "\n",
+            ),
+            conv = conv,
+            first = first_cwd,
+            resumed = resumed_cwd,
+            filler = filler,
+            latest = latest_prompt,
+            t0 = T0,
+            t0a = T0 + 100,
+            t0b = T0 + 200,
+            t0c = T0 + 500,
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
     #[test]
     fn a_later_enter_replaces_the_in_flight_window() {
         let (locator, root) = locator_for("reopen");
@@ -1192,6 +1407,161 @@ mod tests {
             located.is_empty(),
             "an expired pending submit never binds a much-later write: {located:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Round 7, Minor 1: a clean submit that never binds must leave a
+    /// diagnosable trace. Pre-fix both silent paths — the pending
+    /// lifetime's expiry (`armed.resolved = true; continue;`) and
+    /// `note_submit`'s false return for an UN-ARMED pane (e.g. no
+    /// registry cwd) — dropped the submit with no log line, so the most
+    /// likely real failure modes (the candidate schema mismatching, a
+    /// wrong store root, a cwd mismatch) were invisible. The fix emits
+    /// a rate-limited `antigravity_association_unmatched` WARN carrying
+    /// the terminal id, the reason, and a content-free submit
+    /// FINGERPRINT (a sha256 prefix — Global Constraint 7 forbids
+    /// prompt CONTENT in logs, so the full prompt never appears).
+    ///
+    /// The expiry callsite is fired by this module's other tests without
+    /// a subscriber (the tracing callsite interest cache is
+    /// process-wide), so the capture is isolated in a child process
+    /// exactly like
+    /// `antigravity::tests::parse_failures_emit_antigravity_parse_failed_events`.
+    #[test]
+    fn unmatched_submits_emit_rate_limited_warn_events() {
+        const CHILD_ENV: &str = "FRESHELL_ANTIGRAVITY_UNMATCHED_LOG_CAPTURE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "antigravity_locator::tests::unmatched_submits_emit_rate_limited_warn_events",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated unmatched-submit log capture failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone)]
+        struct Capture(Arc<StdMutex<Vec<BTreeMap<String, String>>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Fields(BTreeMap<String, String>);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.insert(field.name().into(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().into(), value.into());
+                    }
+                }
+                let mut fields = Fields(BTreeMap::new());
+                event.record(&mut fields);
+                if event.metadata().level() == &tracing::Level::WARN
+                    && fields.0.get("event").map(String::as_str)
+                        == Some("antigravity_association_unmatched")
+                {
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // (1) A NORMAL BIND produces NO unmatched event.
+        let (locator, root) = locator_for("unmatched-bind");
+        let cwd = "/tmp/agy-unmatched-bind";
+        std::fs::create_dir_all(cwd).unwrap();
+        locator.arm("t-bind", cwd);
+        write_transcript(&root, "conv-bind", cwd, &[("binding prompt", T0)]);
+        assert!(locator.note_submit("t-bind", "binding prompt", T0));
+        let located = locator.tick(T0 + ANTIGRAVITY_WINDOW_MS + 1);
+        assert_eq!(located.len(), 1, "the pane binds its own conversation");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a normal bind emits no unmatched event"
+        );
+
+        // (2) EXPIRY: an armed pane's submit matches nothing for its
+        // whole lifetime → exactly one WARN carrying the terminal id,
+        // reason=expired, and a non-empty fingerprint.
+        let unmatched_prompt = "never binds anywhere secret prompt";
+        locator.arm("t1", "/tmp/agy-unmatched-expiry");
+        assert!(locator.note_submit("t1", unmatched_prompt, T0));
+        let expiry_tick = T0 + ANTIGRAVITY_PENDING_SUBMIT_LIFETIME_MS + 1;
+        assert!(locator.tick(expiry_tick).is_empty());
+        {
+            let captured = events.lock().unwrap();
+            assert_eq!(
+                captured.len(),
+                1,
+                "the unmatched expiry emits exactly one warn: {captured:?}"
+            );
+            let event = &captured[0];
+            assert_eq!(event.get("terminal_id").map(String::as_str), Some("t1"));
+            assert_eq!(event.get("reason").map(String::as_str), Some("expired"));
+            let fingerprint = event.get("fingerprint").cloned().unwrap_or_default();
+            assert!(
+                !fingerprint.is_empty(),
+                "the event carries the submit fingerprint: {event:?}"
+            );
+            assert!(
+                !event.values().any(|v| v.contains(unmatched_prompt)),
+                "the full prompt text never appears in any field (privacy): {event:?}"
+            );
+        }
+
+        // (3) The note_submit FALSE path (an UN-ARMED pane — e.g. no
+        // registry cwd): its own per-terminal lane emits on its first
+        // submit…
+        assert!(!locator.note_submit("t9", "unarmed pane prompt", expiry_tick + 100));
+        assert_eq!(
+            events.lock().unwrap().len(),
+            2,
+            "the un-armed note_submit false path emits its own event"
+        );
+        {
+            let captured = events.lock().unwrap();
+            let event = &captured[1];
+            assert_eq!(event.get("terminal_id").map(String::as_str), Some("t9"));
+            assert_eq!(event.get("reason").map(String::as_str), Some("not_armed"));
+        }
+        // …and the RATE LIMIT coalesces a burst: a second un-armed submit
+        // 100 ms later on the SAME pane emits nothing.
+        assert!(!locator.note_submit("t9", "unarmed pane prompt again", expiry_tick + 200));
+        assert_eq!(
+            events.lock().unwrap().len(),
+            2,
+            "the per-terminal rate limit coalesces the burst"
+        );
+        // Past the 60 s lane window the pane may warn again (the
+        // operator sees at most one line per terminal per window).
+        assert!(!locator.note_submit("t9", "unarmed pane prompt third", expiry_tick + 60_300));
+        assert_eq!(
+            events.lock().unwrap().len(),
+            3,
+            "the lane re-arms after its window"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

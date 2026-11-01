@@ -49,6 +49,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
 # equivalent) -- same version already used by `freshell-ws`.
 tracing = "0.1"
+# The antigravity locator's `antigravity_association_unmatched` fingerprint
+# (round 7, Minor 1): a sha256 PREFIX of the captured submit — content-free
+# log correlation (Global Constraint 7 forbids prompt contents in logs).
+# Same version already pinned by `freshell-ws` and `freshell-server`.
+sha2 = "0.10"
 # Session-directory project grouping follows the shared git-root resolution
 # used by terminal metadata, so linked worktree sessions group under their
 # parent repository while preserving the checkout as `cwd`.
