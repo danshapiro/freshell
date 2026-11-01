@@ -413,6 +413,10 @@ test('requests remain clickable and native disclosures use keyboard defaults', a
   void freshellPage
   await terminal.waitForTerminal()
   await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
+    event: { type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message: 'Provider settings updated' },
+  }))
   for (const label of ['Notice details', 'Command details']) {
     const summary = page.locator('summary').filter({ hasText: label }).first()
     await summary.scrollIntoViewIfNeeded(); await summary.focus()
@@ -448,6 +452,32 @@ test('native decisions remain outside long command previews', async ({ freshellP
   await expect(request.getByRole('button', { name: 'Allow', exact: true })).toBeVisible()
   await hitAndClick(request.getByRole('button', { name: 'Allow', exact: true }))
   await expect(request.getByRole('button', { name: 'Allow for this session', exact: true })).toHaveCount(0)
+})
+
+test('native permission scopes stay compact above reachable answers', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const permissions = { fileSystem: { entries: [
+    { path: { type: 'path', path: '/srv/reports' }, access: 'read' },
+    { path: { type: 'path', path: '/srv/output' }, access: 'write' },
+  ] }, network: { enabled: true } }
+  await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'mono', theme: 'light', snapshot: {
+    pendingApprovals: [{ requestId: 'native-scope', toolName: 'Additional permissions', native: { permissions, availableDecisions: ['accept', 'decline'] } }],
+    pendingQuestions: [], pendingElicitations: [],
+  } })
+  await fitRoot(page, { width: 1100, height: 700 })
+  const request = page.getByRole('alert', { name: 'Permission request for Additional permissions' })
+  await expect(request.locator('pre')).toBeVisible()
+  await expect(request.locator('pre')).toHaveText(JSON.stringify({ permissions }))
+  const allow = request.getByRole('button', { name: 'Allow', exact: true })
+  const bounds = await allow.evaluate(el => {
+    const button = el.getBoundingClientRect(); const viewport = el.closest('.fresh-agent-top-stack-scroll')!.getBoundingClientRect()
+    return { top: button.top, bottom: button.bottom, visibleTop: viewport.top, visibleBottom: viewport.bottom }
+  })
+  expect(bounds.top).toBeGreaterThanOrEqual(bounds.visibleTop)
+  expect(bounds.bottom).toBeLessThanOrEqual(bounds.visibleBottom)
+  await hitAndClick(allow)
+  await assertUsefulSpace(page)
 })
 
 test('Claude plan feedback stays outside the long plan preview', async ({ freshellPage, page, terminal }) => {
@@ -647,3 +677,31 @@ test('short panes keep warning summary text readable', async ({ freshellPage, pa
   expect(geometry.visibleHeight).toBeGreaterThanOrEqual(geometry.lineHeight)
   await assertUsefulSpace(page)
 })
+
+for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
+  test(`wrapped delivery instructions expand fully at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+    const message = 'Delivery uncertain (send-7): the native response was lost. Check the conversation before sending again.'
+    await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
+      event: { type: 'freshAgent.notice', level: 'warning', code: 'DELIVERY_UNCERTAIN', message },
+    }), message)
+    const summary = page.locator('[data-agent-error="notice"] summary')
+    await expect(summary).toHaveAccessibleName(message)
+    await hitAndClick(summary)
+    await expect(summary.locator('..')).toHaveAttribute('open', '')
+    await summary.scrollIntoViewIfNeeded()
+    const readable = await summary.evaluate(el => {
+      const viewport = el.closest('.fresh-agent-top-stack-content')!.getBoundingClientRect()
+      const range = document.createRange(); range.selectNodeContents(el.querySelector('[role="alert"]')!)
+      return [...range.getClientRects()].every(rect => rect.left >= viewport.left && rect.right <= viewport.right + 1 && rect.top >= viewport.top && rect.bottom <= viewport.bottom + 1)
+    })
+    expect(readable).toBe(true)
+    await assertUsefulSpace(page)
+  })
+}

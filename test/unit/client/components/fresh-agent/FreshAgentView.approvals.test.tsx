@@ -376,6 +376,7 @@ it('keeps keyboard disclosure activation out of the composer', async () => {
  const store=createStore(CLAUDE)
  store.dispatch(mergePaneContent({tabId:'tab-1',paneId:'pane-1',updates:{reconcileNotice:'Settings updated',closeError:'A diagnostic with recovery information'}}))
  await mount(store)
+ act(() => handleFreshAgentMessage(store.dispatch, {type:'freshAgent.event',...CLAUDE,event:{type:'freshAgent.notice',level:'info',code:'SETTINGS_UPDATED',message:'Provider settings updated'}}))
 
  const composer=screen.getByRole('textbox',{name:'Chat message input'})
  fireEvent.change(composer,{target:{value:'Keep this draft'}})

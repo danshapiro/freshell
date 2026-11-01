@@ -1271,6 +1271,7 @@ export function FreshAgentView({
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNoticeState] = useState<{ text: string; level: 'info' | 'warning' | 'error' } | null>(null)
+  const [noticeExpanded, setNoticeExpanded] = useState(false)
   const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning') => {
     setNoticeState(current => text === null ? null : current?.text === text && current.level === level ? current : { text, level })
   }, [])
@@ -4776,10 +4777,15 @@ export function FreshAgentView({
   }, [effectiveStatus, hidden, isBusy, lifecycleBlocked, ownerDivergence, paneContent.sessionId, requestSnapshotRefresh])
 
   useEffect(() => {
-    if (!notice || notice.text === deliveryNoticeRef.current) return
+    if (!notice) {
+      setNoticeExpanded(false)
+      return
+    }
+    if (notice.level === 'info') setNoticeExpanded(false)
+    if (noticeExpanded || notice.text === deliveryNoticeRef.current) return
     const timer = window.setTimeout(() => setNotice(null), 6000)
     return () => window.clearTimeout(timer)
-  }, [notice, setNotice])
+  }, [notice, noticeExpanded, setNotice])
 
   /** Core outgoing-message path shared by direct sends and queue flushes. */
   const sendUserText = useCallback((text: string) => {
@@ -5166,7 +5172,7 @@ export function FreshAgentView({
       ? `${notice.text.slice(0, 160)}…${notice.text === deliveryNoticeRef.current ? ' Check the conversation before sending again.' : ''}`
       : notice?.text
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null }] : []),
+      ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
     { id: 'create', summary: 'Agent could not start', content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner

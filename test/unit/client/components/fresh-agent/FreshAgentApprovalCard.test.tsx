@@ -160,6 +160,9 @@ describe('FreshAgentApprovalCard', () => {
     const preview = card.getByText((_content, element) => element?.tagName === 'PRE')
 
     expect(preview).toBeVisible()
+    // A compact native scope must not grow into dozens of formatting lines
+    // above the answer buttons.
+    expect(preview.textContent).toBe(JSON.stringify(details))
     expect(JSON.parse(preview.textContent ?? '')).toEqual(details)
     expect(card.getAllByRole('button').map((button) => button.textContent)).toEqual(actions.map((action) => action.label))
     expect(card.queryByRole('button', { name: /always allow/i })).not.toBeInTheDocument()

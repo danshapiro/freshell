@@ -374,6 +374,24 @@ describe('FreshAgentView live transcript (transcript-live D5)', () => {
 })
 
 describe('provider notices (transcript-live D6)', () => {
+  it('keeps expanded provider diagnostics until the user finishes reading', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    const message = 'Provider could not complete the turn. '.repeat(20)
+    deliver(store, { type: 'freshAgent.notice', level: 'error', code: 'PROVIDER_FAILED', message })
+    const summary = screen.getByRole('alert').closest('summary')!
+    fireEvent.click(summary)
+    await advance(0)
+    expect(summary.closest('details')).toHaveAttribute('open')
+    await advance(10_000)
+    expect(screen.getByText(message.trim())).toBeVisible()
+    fireEvent.click(summary)
+    await advance(0)
+    await advance(6_001)
+    expect(screen.queryByText(message.trim())).not.toBeInTheDocument()
+  })
+
   it('shows a notice in the pane banner without ending the running turn', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()

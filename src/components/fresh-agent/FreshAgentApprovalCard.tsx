@@ -73,6 +73,8 @@ function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprova
     ...(native.additionalPermissions ? { additionalPermissions: native.additionalPermissions } : {}),
     ...(native.grantRoot ? { path: native.grantRoot } : {}),
   }
+  const compactDetails = JSON.stringify(details)
+  const detailsText = isVerbose(compactDetails) ? JSON.stringify(details, null, 2) : compactDetails
   return (
     <div role="alert" aria-label={`Permission request for ${approval.toolName ?? 'Tool'}`} className="fresh-agent-approval-card rounded-md border border-amber-500/50 p-3 space-y-2">
       <p className="font-medium">{native.kind === 'writeStdin' ? 'Write to a running command' : approval.toolName}</p>
@@ -83,8 +85,8 @@ function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprova
         <pre className="fresh-agent-approval-preview whitespace-pre-wrap text-xs">{native.command}</pre>
       </Preview> : null}
       {Object.keys(details).length ? (
-        <Preview text={JSON.stringify(details)}>
-          <pre className="fresh-agent-approval-preview whitespace-pre-wrap text-xs">{JSON.stringify(details, null, 2)}</pre>
+        <Preview text={detailsText}>
+          <pre className="fresh-agent-approval-preview whitespace-pre-wrap text-xs">{detailsText}</pre>
         </Preview>
       ) : null}
       {approval.toolName === 'Additional permissions' ? <p className="text-xs">Allow the requested permissions for this turn.</p> : null}
