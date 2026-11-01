@@ -570,7 +570,9 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     void freshellPage
     await terminal.waitForTerminal()
     await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
-    await fitRoot(page, size)
+    // Set width first: phone chrome wraps and changes the available height.
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
     await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
       type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
       event: { type: 'freshAgent.notice', level: 'info', code: 'diagnostic-test', message: 'Routine context '.repeat(100) },
@@ -584,6 +586,8 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
       const rect = el.getBoundingClientRect(); const stack = el.closest('.fresh-agent-top-stack')!.getBoundingClientRect()
       return { width: rect.width, stackWidth: stack.width, visibleHeight: Math.min(rect.bottom, stack.bottom) - Math.max(rect.top, stack.top) }
     })
+    console.log(JSON.stringify({ event: 'expanded_diagnostic_geometry', severity: 'INFO', size, ...geometry }))
+    if (geometry.width < geometry.stackWidth * .7 || geometry.visibleHeight < 44) await saveScreenshot(page, `test-results/compact-geometry-failure-expanded-${size.width}.png`)
     expect(geometry.width).toBeGreaterThanOrEqual(geometry.stackWidth * .7)
     expect(geometry.visibleHeight).toBeGreaterThanOrEqual(44)
     await hitAndClick(stack.getByRole('button', { name: 'Dismiss', exact: true }))
