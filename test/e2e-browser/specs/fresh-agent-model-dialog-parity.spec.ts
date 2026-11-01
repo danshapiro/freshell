@@ -67,7 +67,11 @@ test('Codex picker waits for ordinary create and shows honest failure with exact
     (window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.() ?? [])
       .filter((frame: any) => frame?.type === 'freshAgent.create')
       .map((frame: any) => ({ requestId: frame.requestId, model: frame.model, effort: frame.effort })))
-  const begin = (requestId: string) => installPane(page, 'freshcodex', { requestId, model: 'saved-custom', effort: 'xhigh' })
+  // The saved model already has a display name, so only the open picker
+  // needs a catalog lookup after ordinary creation binds the runtime.
+  const begin = (requestId: string) => installPane(page, 'freshcodex', {
+    requestId, model: 'saved-custom', effort: 'xhigh', label: 'Saved Custom',
+  })
   const open = async () => {
     await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
     await page.getByRole('button', { name: /saved-custom.*Change/ }).click()
@@ -117,7 +121,7 @@ test('Codex picker waits for ordinary create and shows honest failure with exact
   await expect(dialog.getByRole('status')).toContainText(/catalog unavailable/i)
   await expect(dialog.getByRole('searchbox')).toHaveValue('saved')
   await dialog.getByRole('searchbox').fill('')
-  await expect(dialog.getByRole('button', { name: /Use saved-custom.*xhigh/ })).toBeEnabled()
+  await expect(dialog.getByRole('button', { name: 'Use Saved Custom · xhigh', exact: true })).toBeEnabled()
   expect(contexts).toHaveLength(1)
   expect(await creates()).toHaveLength(2)
 })
@@ -125,11 +129,12 @@ test('Codex picker waits for ordinary create and shows honest failure with exact
 async function installPane(
   page: Page,
   sessionType: FreshAgentSessionType,
-  creation?: { requestId: string; model: string; effort: string },
+  creation?: { requestId: string; model: string; effort: string; label?: string },
 ) {
   const provider = sessionType === 'freshcodex' ? 'codex' : sessionType === 'freshopencode' ? 'opencode' : 'claude'
   const sessionId = creation ? undefined : provider === 'opencode' ? 'ses_model_dialog' : 'd4430000-0000-4444-8444-000000000001'
   const model = creation?.model ?? (provider === 'claude' ? 'opus[1m]' : provider === 'codex' ? FRESHCODEX_DEFAULT_MODEL : 'openai/gpt-6-luna')
+  const modelLabel = creation?.label ? { modelId: model, label: creation.label } : undefined
   const effort = creation?.effort ?? 'low'
   const createRequestId = creation?.requestId ?? `model-dialog-${sessionType}`
   await page.route('**/api/fresh-agent/threads/**', route => {
@@ -144,7 +149,7 @@ async function installPane(
       extensions: provider === 'claude' ? { claude: { liveSessionId: requestedSessionId, cliSessionId: requestedSessionId } } : {},
     } })
   })
-  await page.evaluate(({ sessionType, provider, sessionId, model, effort, createRequestId }) => {
+  await page.evaluate(({ sessionType, provider, sessionId, model, modelLabel, effort, createRequestId }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
     const state = harness.getState()
     const tabId = state.tabs.activeTabId!
@@ -155,10 +160,10 @@ async function installPane(
         kind: 'fresh-agent', sessionType, provider,
         ...(sessionId ? { sessionId, sessionRef: { provider, sessionId }, resumeSessionId: sessionId } : {}),
         createRequestId, status: sessionId ? 'idle' : 'creating',
-        model, effort, initialCwd: '/tmp', settingsDismissed: true,
+        model, ...(modelLabel ? { modelLabel } : {}), effort, initialCwd: '/tmp', settingsDismissed: true,
       },
     } })
-  }, { sessionType, provider, sessionId, model, effort, createRequestId })
+  }, { sessionType, provider, sessionId, model, modelLabel, effort, createRequestId })
 }
 
 test('Claude model search survives catalog loading and remembers a selected thinking level', async ({ freshellPage, page, terminal }) => {
