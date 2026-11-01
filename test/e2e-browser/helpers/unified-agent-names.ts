@@ -692,8 +692,11 @@ export async function sendFirstMessage(
     // the wrong session.
     const paneRoot = page.locator(`[data-pane-id="${handle.paneId}"] [data-context="fresh-agent"], [data-pane-id="${handle.paneId}"][data-context="fresh-agent"]`).first()
     const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled({ timeout: 30_000 })
     await composer.fill(text)
-    await paneRoot.getByRole('button', { name: 'Send' }).click()
+    const send = paneRoot.getByRole('button', { name: 'Send' })
+    await expect(send).toBeEnabled({ timeout: 30_000 })
+    await send.click()
     return
   }
   // Terminal modes: the pane's own PTY. The create already spawned the fake

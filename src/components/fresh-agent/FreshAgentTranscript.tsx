@@ -27,7 +27,7 @@ import { FreshAgentTranscriptMinimap } from './FreshAgentTranscriptMinimap'
 import { deriveGlomTarget, measureTranscriptUserTurns, type TranscriptMeasurement } from './shared/transcript-measurement'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
-import { getFreshAgentDisplayTurnKey, reclassifyPtyNotificationTurns, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
+import { coalesceSyntheticToolResultTurns, getFreshAgentDisplayTurnKey, reclassifyPtyNotificationTurns, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
 function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
   switch (turn.role) {
@@ -466,43 +466,6 @@ export function buildTranscriptLayout(
   return { layouts, lineEndIndex, tail, tailCaption }
 }
 
-function isSyntheticToolResultTurn(turn: FreshAgentTurn): boolean {
-  return turn.role === 'user'
-    && turn.items.length > 0
-    && turn.items.every((item) => item.kind === 'tool_result')
-}
-
-function appendTurnItems(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
-  return {
-    ...previous,
-    id: `${previous.id}:${next.id}`,
-    summary: [previous.summary, next.summary].filter(Boolean).join('\n\n'),
-    // Echo only when BOTH sides are echo: an authored segment must never be
-    // laundered into a foldable caption, and an untagged side is conservative.
-    summaryKind: previous.summaryKind === 'echo' && next.summaryKind === 'echo' ? 'echo' : 'authored',
-    items: [...previous.items, ...next.items],
-    model: next.model ?? previous.model,
-    timestamp: next.timestamp ?? previous.timestamp,
-  }
-}
-
-function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
-  const coalesced: FreshAgentTurn[] = []
-  for (const turn of turns) {
-    const previous = coalesced[coalesced.length - 1]
-    if (isSyntheticToolResultTurn(turn)) {
-      if (previous?.role === 'assistant') {
-        coalesced[coalesced.length - 1] = appendTurnItems(previous, turn)
-      } else {
-        coalesced.push({ ...turn, role: 'tool' })
-      }
-      continue
-    }
-    coalesced.push(turn)
-  }
-  return coalesced
-}
-
 function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[] {
   const runningToolIds = rows
     .filter((row): row is Extract<ActivityRow, { type: 'tool' }> => row.type === 'tool' && row.tool.status === 'running')
@@ -925,7 +888,6 @@ export function FreshAgentTurnArticle({
   // coarse→fine pointer flip stops advertising/handling long-press even though
   // the instance persists for the article's lifetime.
   const longPress = !live && actions.onOpenActions ? longPressRef.current : null
-  const rewindAvailability = live ? undefined : actions.getRewindAvailability?.(actionTurn)
   if (live) {
     return (
       <article
@@ -1004,28 +966,6 @@ export function FreshAgentTurnArticle({
         getRewindAvailability={actions.getRewindAvailability}
         onOpenActions={actions.onOpenActions}
       />
-      {rewindAvailability ? (
-        <div
-          role={rewindAvailability.status === 'unavailable' ? 'note' : 'status'}
-          aria-label={rewindAvailability.status === 'unavailable'
-            ? 'Code rewind unavailable for this message'
-            : rewindAvailability.status === 'pending'
-              ? 'Saving code rewind checkpoint for this message'
-              : 'Code rewind available for this message'}
-          className={cn(
-            'px-1 pb-1 text-xs',
-            rewindAvailability.status === 'unavailable'
-              ? 'text-amber-700 dark:text-amber-400'
-              : 'text-muted-foreground',
-          )}
-        >
-          {rewindAvailability.status === 'unavailable'
-            ? `Code rewind unavailable for this message: ${rewindAvailability.reason}`
-            : rewindAvailability.status === 'pending'
-              ? 'Saving the code state from before this message.'
-              : 'Code rewind is available for this message.'}
-        </div>
-      ) : null}
       {showHeader ? (
         <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
           <span>{turnLabel}</span>

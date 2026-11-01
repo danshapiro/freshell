@@ -39,7 +39,7 @@ export type FreshAgentTranscriptMinimapProps = {
  * ChatGPT-style scroll minimap for the fresh-agent transcript: one tick per
  * user prompt, evenly spaced (each prompt gets an equal slot in the rail;
  * the line's height stays proportional to its turn's size), a hover/focus
- * prompt preview, click-to-jump, and a band marking the visible region.
+ * prompt preview, and click-to-jump.
  * Every tick's hover/click hit box is bigger than its painted line — 2x the
  * line height and 1.5x the rail width, centered on the line and clamped to
  * the uniform slot so adjacent hit boxes never overlap. Presentational on
@@ -64,8 +64,6 @@ export function FreshAgentTranscriptMinimap({
     if (measurement.scrollHeight <= measurement.clientHeight || railHeight <= 0) return null
     return computeMinimapLayout({
       scrollHeight: measurement.scrollHeight,
-      viewportHeight: measurement.clientHeight,
-      scrollTop: measurement.scrollTop,
       railHeight,
       landmarks: measurement.landmarks,
     })
@@ -198,12 +196,6 @@ export function FreshAgentTranscriptMinimap({
       role="group"
       aria-label="Transcript minimap"
     >
-      <div
-        data-testid="transcript-minimap-viewport"
-        aria-hidden="true"
-        className="pointer-events-none absolute right-0 w-full rounded-sm bg-foreground/10"
-        style={{ top: layout.viewport.top, height: layout.viewport.height }}
-      />
       {layout.ticks.map((tick) => {
         const firstLine = tick.label.split('\n')[0]
         // LONE sub-4px tick (dense-singleton run member): it never joined a

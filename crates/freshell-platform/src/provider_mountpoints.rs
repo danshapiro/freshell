@@ -4,6 +4,7 @@ use std::path::Path;
 
 const RESOURCE_ROOTS: &str = ".freshell/provider-roots";
 const RESOURCE_PLACEHOLDER_MANIFEST: &str = ".freshell/provider-resource-mountpoints.json";
+const ORDINARY_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
 const MAX_PLACEHOLDER_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -114,6 +115,7 @@ fn prepare_for_identity(
         return Err("provider HOME ownership changed");
     }
     let previous_resource_files = read_resource_placeholder_manifest(home, uid, gid)?;
+    let mut ordinary_projection = None;
     let mut retired = Vec::new();
     for relative in previous_resource_files.difference(&current_resource_files) {
         verify_owned_physical_parents(home, relative, uid, gid)?;
@@ -129,6 +131,18 @@ fn prepare_for_identity(
                     && metadata.is_file()
                     && metadata.uid() == uid
                     && metadata.gid() == gid => {
+                if ordinary_projection.is_none() {
+                    ordinary_projection = Some(read_ordinary_projection_manifest(home, uid, gid)?);
+                }
+                if ordinary_projection
+                    .as_ref()
+                    .is_some_and(|paths| paths.contains(relative))
+                {
+                    // Ordinary refresh populated this placeholder. Preserve its
+                    // bytes and inode until the replacement's existing projection
+                    // transaction retires the old managed leaf after mounting.
+                    continue;
+                }
                 return Err(
                     "retired provider resource mountpoint is not empty; retain inputs and reprepare",
                 )
@@ -239,6 +253,32 @@ fn prepare_for_identity(
         }
     }
     result
+}
+
+#[cfg(unix)]
+fn read_ordinary_projection_manifest(
+    home: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let path = home.join(ORDINARY_PROJECTION_MANIFEST);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(_) => return Err("provider ordinary projection metadata unavailable"),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.len() > MAX_PLACEHOLDER_MANIFEST_BYTES
+    {
+        return Err("provider ordinary projection metadata changed or exceeds its profile");
+    }
+    let bytes =
+        std::fs::read(path).map_err(|_| "provider ordinary projection metadata unavailable")?;
+    serde_json::from_slice(&bytes).map_err(|_| "provider ordinary projection metadata invalid")
 }
 
 #[cfg(unix)]
@@ -586,6 +626,119 @@ mod tests {
         .expect_err("retirement must not delete nonempty provider data");
         assert!(error.contains("not empty"));
         assert_eq!(std::fs::read(&placeholder).unwrap(), b"provider-owned");
+    }
+
+    #[test]
+    fn provider_mountpoints_preserve_populated_retired_ordinary_files_for_refresh() {
+        use std::os::unix::fs::MetadataExt;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let old = Mountpoint {
+            relative_path: ".freshell/provider-roots/prior/source".into(),
+            directory: false,
+        };
+        prepare_for_identity(&home, std::slice::from_ref(&old), uid, gid).unwrap();
+        let file = home.join(&old.relative_path);
+        std::fs::write(&file, b"selected ordinary input").unwrap();
+        let inode = file.metadata().unwrap().ino();
+        let projection = serde_json::to_vec(&[&old.relative_path]).unwrap();
+        std::fs::write(home.join(ORDINARY_PROJECTION_MANIFEST), &projection).unwrap();
+        let current = Mountpoint {
+            relative_path: ".freshell/provider-roots/current/source".into(),
+            directory: false,
+        };
+
+        prepare_for_identity(&home, std::slice::from_ref(&current), uid, gid).unwrap();
+
+        assert_eq!(std::fs::read(&file).unwrap(), b"selected ordinary input");
+        assert_eq!(file.metadata().unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read(home.join(ORDINARY_PROJECTION_MANIFEST)).unwrap(),
+            projection
+        );
+        assert_eq!(
+            home.join(&current.relative_path).metadata().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn provider_mountpoints_refuse_untracked_or_invalid_retired_projection_files() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        for invalid in [
+            "untracked",
+            "invalid-json",
+            "manifest-directory",
+            "manifest-symlink",
+            "file-directory",
+            "file-symlink",
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            let old = Mountpoint {
+                relative_path: ".freshell/provider-roots/prior/source".into(),
+                directory: false,
+            };
+            prepare_for_identity(&home, std::slice::from_ref(&old), uid, gid).unwrap();
+            let file = home.join(&old.relative_path);
+            std::fs::write(&file, b"retained provider input").unwrap();
+            let before = std::fs::read(home.join(RESOURCE_PLACEHOLDER_MANIFEST)).unwrap();
+            let manifest = home.join(ORDINARY_PROJECTION_MANIFEST);
+            let projection = serde_json::to_vec(&[&old.relative_path]).unwrap();
+            match invalid {
+                "untracked" => std::fs::write(&manifest, b"[]").unwrap(),
+                "invalid-json" => std::fs::write(&manifest, b"not-json").unwrap(),
+                "manifest-directory" => std::fs::create_dir(&manifest).unwrap(),
+                "manifest-symlink" => {
+                    std::fs::write(home.join("other-manifest"), &projection).unwrap();
+                    symlink("other-manifest", &manifest).unwrap();
+                }
+                kind => {
+                    std::fs::write(&manifest, &projection).unwrap();
+                    std::fs::remove_file(&file).unwrap();
+                    if kind == "file-directory" {
+                        std::fs::create_dir(&file).unwrap();
+                    } else {
+                        std::fs::write(home.join("other-input"), b"retained provider input")
+                            .unwrap();
+                        symlink(home.join("other-input"), &file).unwrap();
+                    }
+                }
+            }
+            let metadata = std::fs::symlink_metadata(&file).unwrap();
+            let current = Mountpoint {
+                relative_path: ".freshell/provider-roots/current/source".into(),
+                directory: false,
+            };
+
+            assert!(
+                prepare_for_identity(&home, std::slice::from_ref(&current), uid, gid).is_err(),
+                "{invalid}"
+            );
+
+            assert_eq!(
+                std::fs::symlink_metadata(&file).unwrap().ino(),
+                metadata.ino(),
+                "{invalid}"
+            );
+            assert_eq!(
+                std::fs::read(home.join(RESOURCE_PLACEHOLDER_MANIFEST)).unwrap(),
+                before,
+                "{invalid}"
+            );
+            assert!(!home.join(&current.relative_path).exists(), "{invalid}");
+            if !metadata.is_dir() {
+                assert_eq!(
+                    std::fs::read(&file).unwrap(),
+                    b"retained provider input",
+                    "{invalid}"
+                );
+            }
+        }
     }
 
     #[test]

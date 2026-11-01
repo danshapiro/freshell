@@ -297,6 +297,8 @@ function makeThread(id, params = {}) {
 function makeThreadTurnsPage(params = {}) {
   const configuredTurns = Array.isArray(behavior.threadTurns)
     ? behavior.threadTurns
+    : behavior.recordTurns
+    ? loadRecordedTurns(params.threadId)
     : [makeTurn()]
   const orderedTurns = params.sortDirection === 'asc'
     ? configuredTurns.slice()
@@ -1004,6 +1006,25 @@ wss.on('connection', (socket) => {
           pending.resolve({ cancelled: true })
         }
       }
+      if (method === 'turn/start' && message.params?.threadId) {
+        // Accepted input is durable even while completion is delayed or the
+        // process is stopped. The delay below governs lifecycle notifications.
+        const { thread } = ensureDurableArtifact(message.params.threadId)
+        if (behavior.persistRolloutUserMessages) {
+          appendDurableUserMessage(thread, message.params)
+        }
+        const rolloutPath = thread.path
+        const rolloutParent = path.dirname(rolloutPath)
+        for (const [watchId, watchedPath] of watches) {
+          if (watchedPath !== rolloutPath && watchedPath !== rolloutParent) {
+            continue
+          }
+          broadcastNotification('fs/changed', {
+            watchId,
+            changedPaths: [rolloutPath],
+          })
+        }
+      }
       if (method === 'turn/start' && behavior.recordTurns && result?.turn?.id) {
         // recordTurns opt-in: a recorded turn closes with the real turn
         // lifecycle notifications (thread/status active → turn/started →
@@ -1130,23 +1151,6 @@ wss.on('connection', (socket) => {
         const watchId = message.params?.watchId
         if (watchId) {
           watches.delete(watchId)
-        }
-      }
-      if (method === 'turn/start' && message.params?.threadId) {
-        const { thread } = ensureDurableArtifact(message.params.threadId)
-        if (behavior.persistRolloutUserMessages) {
-          appendDurableUserMessage(thread, message.params)
-        }
-        const rolloutPath = thread.path
-        const rolloutParent = path.dirname(rolloutPath)
-        for (const [watchId, watchedPath] of watches) {
-          if (watchedPath !== rolloutPath && watchedPath !== rolloutParent) {
-            continue
-          }
-          broadcastNotification('fs/changed', {
-            watchId,
-            changedPaths: [rolloutPath],
-          })
         }
       }
       emitConfiguredNotifications(method)

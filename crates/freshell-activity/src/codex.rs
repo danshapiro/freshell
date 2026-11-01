@@ -38,7 +38,9 @@
 //!    `swallow_next_reconcile_clear`): whichever lane ends the physical
 //!    turn first arms the swallows for the other lanes' late echoes (the
 //!    key spaces are disjoint clock domains, so the turn-key alone cannot
-//!    dedupe them); a fresh pending submit disarms all three.
+//!    dedupe them); a fresh pending submit disarms stale BEL/reconcile
+//!    swallows and preserves a proxy swallow only while its saved outcome is
+//!    tied to that exact turn id.
 //! 2. **Zero-polling**: `next_deadline()` + one-shot hub timer instead of the
 //!    5s sweep (`ACTIVITY_SWEEP_MS`), same as [`crate::claude`].
 //! 3. **The busy-deadman self-heals instead of demoting** (kata namg): a
@@ -64,7 +66,7 @@
 
 use std::collections::HashMap;
 
-use freshell_protocol::{CodexActivityRecord, CodexPhase};
+use freshell_protocol::{CodexActivityRecord, CodexPhase, TerminalTurnOutcome};
 
 use crate::ledger::TurnCompletionLedger;
 use crate::signal::{
@@ -78,6 +80,43 @@ pub const PENDING_SNAPSHOT_GRACE_MS: i64 = 15_000;
 pub const BUSY_DEADMAN_MS: i64 = 120_000;
 
 pub type CodexEffect = TrackerEffect<CodexActivityRecord>;
+
+/// Ordered native turn observations from one managed Codex host. The enclosing
+/// output read supplies the terminal and source epoch; no provider bodies travel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActivityBatch {
+    pub retained_from_seq: u64,
+    pub head_seq: u64,
+    pub events: Vec<CodexActivityEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActivityEvent {
+    pub seq: u64,
+    pub at: i64,
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub status: Option<String>,
+    pub completed: bool,
+}
+
+impl CodexActivityBatch {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retained_from_seq == 0
+            || self.retained_from_seq > self.head_seq.saturating_add(1)
+            || self.head_seq.checked_sub(self.retained_from_seq - 1)
+                != Some(self.events.len() as u64)
+            || self.events.iter().enumerate().any(|(offset, event)| {
+                event.seq != self.retained_from_seq + offset as u64 || event.thread_id.is_empty()
+            })
+        {
+            return Err("invalid native Codex activity sequence");
+        }
+        Ok(())
+    }
+}
 
 /// Latest codex rollout task-event timestamps (epoch ms), folded from
 /// `event_msg` records: `task_started` / `task_complete` / `turn_aborted`.
@@ -110,6 +149,14 @@ fn max_ts(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 }
 
 #[derive(Debug)]
+struct PendingProxyOutcome {
+    turn_id: String,
+    session_id: Option<String>,
+    at: i64,
+    completion_seq: i64,
+}
+
+#[derive(Debug)]
 struct TerminalActivity {
     terminal_id: String,
     session_id: Option<String>,
@@ -134,9 +181,15 @@ struct TerminalActivity {
     /// `last_emitted_turn_key` alone cannot dedupe across lanes).
     swallow_next_bel: bool,
     /// S5.a third lane (proxy): one-shot -- another lane already ended this
-    /// physical turn; swallow its late proxy echo. Armed by BOTH
-    /// reconcile-initiated AND BEL-initiated clears (ledger A11).
+    /// physical turn, so suppress the duplicate state transition. If that
+    /// clear recorded a completion, preserve its identity for the late
+    /// proxy's completed/failed outcome. Armed by reconcile and BEL clears.
     swallow_next_proxy_complete: bool,
+    /// Turn id of the proxy event that the cross-lane swallow is waiting for.
+    swallowed_proxy_turn_id: Option<String>,
+    /// Completion already emitted by another lane, awaiting the proxy's
+    /// completed/failed status so the same sequence can be enriched.
+    pending_proxy_outcome: Option<PendingProxyOutcome>,
     /// S5.a third lane: one-shot -- a proxy-initiated clear already ended this
     /// physical turn; swallow the rollout reconcile echo of the same turn.
     swallow_next_reconcile_clear: bool,
@@ -265,6 +318,9 @@ impl CodexActivityTracker {
                     // survive (see bind_session).
                     existing.current_proxy_turn_id = None;
                     existing.last_proxy_started_at = None;
+                    existing.swallow_next_proxy_complete = false;
+                    existing.swallowed_proxy_turn_id = None;
+                    existing.pending_proxy_outcome = None;
                     // Task 7: nor may the old thread's approval pause state.
                     existing.pending_approvals.clear();
                     existing.resume_busy_after_approval = false;
@@ -289,6 +345,8 @@ impl CodexActivityTracker {
             last_cleared_at: None,
             swallow_next_bel: false,
             swallow_next_proxy_complete: false,
+            swallowed_proxy_turn_id: None,
+            pending_proxy_outcome: None,
             swallow_next_reconcile_clear: false,
             last_proxy_started_at: None,
             current_proxy_turn_id: None,
@@ -329,6 +387,9 @@ impl CodexActivityTracker {
         // echo / collides on last_emitted_turn_key.
         state.current_proxy_turn_id = None;
         state.last_proxy_started_at = None;
+        state.swallow_next_proxy_complete = false;
+        state.swallowed_proxy_turn_id = None;
+        state.pending_proxy_outcome = None;
         // Task 7: nor may the old thread's approval pause state.
         state.pending_approvals.clear();
         state.resume_busy_after_approval = false;
@@ -447,6 +508,7 @@ impl CodexActivityTracker {
                         .map(|pending| cleared_at >= pending)
                         .unwrap_or(false)
                 {
+                    let completion_start = completions.len();
                     transition_pending_after_turn_clear(
                         state,
                         at,
@@ -458,14 +520,16 @@ impl CodexActivityTracker {
                     // (armed regardless of whether the fold arrived as one
                     // batch or split batches -- batch-agnostic by design).
                     state.swallow_next_bel = true;
-                    // S5.a: and the proxy echo of the same physical turn.
-                    state.swallow_next_proxy_complete = true;
+                    // Suppress the proxy's duplicate transition while keeping
+                    // its provider result available to refine this completion.
+                    arm_proxy_completion_swallow(state, completions.get(completion_start));
                 } else if (state.phase == CodexPhase::Busy || state.phase == CodexPhase::Unknown)
                     && state
                         .accepted_start_at
                         .map(|accepted| cleared_at >= accepted)
                         .unwrap_or(false)
                 {
+                    let completion_start = completions.len();
                     transition_after_turn_clear(
                         state,
                         at,
@@ -474,8 +538,9 @@ impl CodexActivityTracker {
                         record,
                     );
                     state.swallow_next_bel = true;
-                    // S5.a: and the proxy echo of the same physical turn.
-                    state.swallow_next_proxy_complete = true;
+                    // Suppress the proxy's duplicate transition while keeping
+                    // its provider result available to refine this completion.
+                    arm_proxy_completion_swallow(state, completions.get(completion_start));
                 }
             }
         }
@@ -531,9 +596,22 @@ impl CodexActivityTracker {
         if state.phase == CodexPhase::Idle || state.phase == CodexPhase::Unknown || stale_busy {
             // A fresh pending turn starts here: any armed directed swallow
             // (CE1, generalized across the three lanes in S5.a) belongs to a
-            // PREVIOUS cleared turn and is stale.
+            // PREVIOUS cleared turn. BEL/reconcile swallows are stale, but a
+            // proxy swallow with a saved completion must remain until that
+            // exact turn id returns, or its outcome can be mistaken for this
+            // new pending turn.
+            let keep_proxy_outcome = state.swallow_next_proxy_complete
+                && state
+                    .swallowed_proxy_turn_id
+                    .as_deref()
+                    .zip(state.pending_proxy_outcome.as_ref())
+                    .is_some_and(|(turn_id, pending)| turn_id == pending.turn_id);
             state.swallow_next_bel = false;
-            state.swallow_next_proxy_complete = false;
+            if !keep_proxy_outcome {
+                state.swallow_next_proxy_complete = false;
+                state.swallowed_proxy_turn_id = None;
+                state.pending_proxy_outcome = None;
+            }
             state.swallow_next_reconcile_clear = false;
         }
         if state.pending_submit_at.is_none() {
@@ -603,13 +681,15 @@ impl CodexActivityTracker {
                 state.swallow_next_bel = false;
                 continue;
             }
+            let completion_start = completions.len();
             if !consume_turn_complete_signal(state, at, &mut self.ledger, &mut completions) {
                 break;
             }
-            // S5.a (A11): a BEL clear ended this physical turn -- swallow its
-            // late proxy echo (it could otherwise prematurely complete a
-            // queued follow-up submit that is now Pending).
-            state.swallow_next_proxy_complete = true;
+            // S5.a (A11): a BEL clear ended this physical turn -- suppress the
+            // late proxy transition (it could otherwise prematurely complete
+            // a queued follow-up submit), while retaining any completion for
+            // an outcome update.
+            arm_proxy_completion_swallow(state, completions.get(completion_start));
         }
         self.effects_after_transition(terminal_id, previous, completions)
     }
@@ -640,6 +720,8 @@ impl CodexActivityTracker {
         // Design invariant: a NEW proxy turn is beginning -- a stale directed
         // swallow must not eat THIS turn's completion.
         state.swallow_next_proxy_complete = false;
+        state.swallowed_proxy_turn_id = None;
+        state.pending_proxy_outcome = None;
         state.current_proxy_turn_id = turn_id.map(str::to_string);
         state.last_proxy_started_at = Some(at);
         state.last_observed_at = at;
@@ -654,8 +736,9 @@ impl CodexActivityTracker {
     }
 
     /// S5.a: proxy lane TurnCompleted. Real turn ends transition to Idle and
-    /// record exactly one completion; echoes of turns another lane already
-    /// ended are swallowed one-shot (CE1 generalized).
+    /// record exactly one completion. A late echo after a BEL/reconcile clear
+    /// does not transition again; it can refine that completion with the
+    /// provider outcome (CE1 generalized).
     ///
     /// Guard order (kata codex-turn-thread-scope):
     /// 1. thread scope -- foreign threads (sub-agents etc.) are ignored
@@ -697,7 +780,28 @@ impl CodexActivityTracker {
         state.current_proxy_turn_id = None;
         if state.swallow_next_proxy_complete {
             state.swallow_next_proxy_complete = false;
-            return Vec::new();
+            let swallowed_turn_id = state.swallowed_proxy_turn_id.take();
+            let pending = state.pending_proxy_outcome.take();
+            let outcome = match status {
+                Some("completed") => Some(TerminalTurnOutcome::Completed),
+                Some("failed") => Some(TerminalTurnOutcome::Failed),
+                _ => None,
+            };
+            return match (pending, outcome, swallowed_turn_id.as_deref(), turn_id) {
+                (Some(pending), Some(outcome), Some(expected), Some(completed))
+                    if expected == pending.turn_id && completed == pending.turn_id =>
+                {
+                    vec![TrackerEffect::TurnComplete {
+                        terminal_id: terminal_id.to_string(),
+                        session_id: pending.session_id,
+                        at: pending.at,
+                        completion_seq: pending.completion_seq,
+                        outcome: Some(outcome),
+                        outcome_update: true,
+                    }]
+                }
+                _ => Vec::new(),
+            };
         }
         // Task 7: an accepted terminal-status completion retires the turn's
         // approval pause state ONCE, BEFORE the phase match -- a turn that
@@ -769,7 +873,22 @@ impl CodexActivityTracker {
                 state.swallow_next_reconcile_clear = true;
             }
         }
-        self.effects_after_transition(terminal_id, previous, completions)
+        let outcome = match status {
+            Some("completed") => Some(TerminalTurnOutcome::Completed),
+            Some("failed") => Some(TerminalTurnOutcome::Failed),
+            _ => None,
+        };
+        let mut effects = self.effects_after_transition(terminal_id, previous, completions);
+        for effect in &mut effects {
+            if let TrackerEffect::TurnComplete {
+                outcome: completion_outcome,
+                ..
+            } = effect
+            {
+                *completion_outcome = outcome;
+            }
+        }
+        effects
     }
 
     /// Approval-request pause (managed lane). Thread-scoped like turn events;
@@ -880,6 +999,8 @@ impl CodexActivityTracker {
                 session_id,
                 at,
                 completion_seq,
+                outcome: None,
+                outcome_update: false,
             });
         }
         effects
@@ -983,6 +1104,29 @@ impl CodexActivityTracker {
             })
             .min()
     }
+}
+
+fn arm_proxy_completion_swallow(
+    state: &mut TerminalActivity,
+    completion: Option<&(Option<String>, i64, i64)>,
+) {
+    if state.swallow_next_proxy_complete {
+        // A second clear arrived before the old proxy echo. It belongs to a
+        // later turn and must not inherit the earlier turn's outcome slot.
+        state.pending_proxy_outcome = None;
+    } else {
+        let turn_id = state.current_proxy_turn_id.clone();
+        state.swallowed_proxy_turn_id = turn_id.clone();
+        state.pending_proxy_outcome = completion.and_then(|(session_id, at, completion_seq)| {
+            turn_id.map(|turn_id| PendingProxyOutcome {
+                turn_id,
+                session_id: session_id.clone(),
+                at: *at,
+                completion_seq: *completion_seq,
+            })
+        });
+    }
+    state.swallow_next_proxy_complete = true;
 }
 
 fn awaiting_fresh_snapshot(state: &TerminalActivity, at: i64) -> bool {
@@ -1928,6 +2072,25 @@ mod tests {
     }
 
     #[test]
+    fn proxy_completion_preserves_completed_and_failed_outcomes() {
+        for (status, expected) in [
+            ("completed", TerminalTurnOutcome::Completed),
+            ("failed", TerminalTurnOutcome::Failed),
+        ] {
+            let mut tracker = CodexActivityTracker::new();
+            tracker.track_terminal("t", Some("sess"), 1_000);
+            tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_000);
+            let effects =
+                tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some(status), 3_000);
+            let outcome = effects.iter().find_map(|effect| match effect {
+                TrackerEffect::TurnComplete { outcome, .. } => *outcome,
+                _ => None,
+            });
+            assert_eq!(outcome, Some(expected));
+        }
+    }
+
+    #[test]
     fn proxy_clear_swallows_the_late_pty_bel_echo() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
@@ -1947,24 +2110,216 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_clear_swallows_the_late_proxy_echo() {
+    fn reconcile_clear_enriches_its_completion_with_the_late_proxy_outcome() {
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 1_000);
-        tracker.note_input("t", "\r", 2_000);
+        tracker.reconcile_rollout(
+            "t",
+            &CodexTaskEvents {
+                latest_task_started_at: Some(2_000),
+                ..Default::default()
+            },
+            2_000,
+        );
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_100);
         // Rollout reconcile ends the turn first…
         let events = CodexTaskEvents {
             latest_task_completed_at: Some(2_500),
             ..Default::default()
         };
         let cleared = tracker.reconcile_rollout("t", &events, 3_000);
-        assert!(cleared
+        let (completion_seq, outcome, outcome_update) = cleared
             .iter()
-            .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
-        // …then the proxy echo of the same physical turn is swallowed one-shot.
-        let echo = tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 3_050);
-        assert!(!echo
+            .find_map(|effect| match effect {
+                TrackerEffect::TurnComplete {
+                    completion_seq,
+                    outcome,
+                    outcome_update,
+                    ..
+                } => Some((*completion_seq, *outcome, *outcome_update)),
+                _ => None,
+            })
+            .expect("reconciliation records the turn completion");
+        assert_eq!(outcome, None);
+        assert!(!outcome_update);
+
+        // The late proxy echo enriches the same completion identity; it must
+        // not create another completion or attention boundary.
+        let echo = tracker.note_proxy_turn_completed(
+            "t",
+            "sess",
+            Some("turn-1"),
+            Some("completed"),
+            3_050,
+        );
+        let update = echo
             .iter()
-            .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
+            .find_map(|effect| match effect {
+                TrackerEffect::TurnComplete {
+                    completion_seq,
+                    outcome,
+                    outcome_update,
+                    ..
+                } => Some((*completion_seq, *outcome, *outcome_update)),
+                _ => None,
+            })
+            .expect("late proxy result enriches the existing completion");
+        assert_eq!(
+            update,
+            (completion_seq, Some(TerminalTurnOutcome::Completed), true)
+        );
+        assert_eq!(completions(&echo), vec![completion_seq]);
+    }
+
+    #[test]
+    fn fresh_submit_keeps_a_cleared_turns_late_proxy_outcome_separate() {
+        for clear_with_bel in [false, true] {
+            let mut tracker = CodexActivityTracker::new();
+            tracker.track_terminal("t", Some("sess"), 1_000);
+            tracker.note_input("t", "\r", 2_000);
+            tracker.reconcile_rollout("t", &started(2_500), 2_600);
+            tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_700);
+
+            // Either independent lane can close turn 1 before the proxy
+            // reports its result.
+            let cleared = if clear_with_bel {
+                tracker.note_output("t", "\u{07}", 3_000)
+            } else {
+                tracker.reconcile_rollout(
+                    "t",
+                    &CodexTaskEvents {
+                        latest_task_completed_at: Some(3_000),
+                        ..Default::default()
+                    },
+                    3_000,
+                )
+            };
+            let first_completion_seq = completions(&cleared)
+                .first()
+                .copied()
+                .expect("the clearing lane records turn 1 completion");
+
+            // The user submits turn 2 before turn 1's delayed proxy result.
+            tracker.note_input("t", "\r", 3_100);
+            assert_eq!(tracker.list()[0].phase, CodexPhase::Pending);
+
+            let late_result = tracker.note_proxy_turn_completed(
+                "t",
+                "sess",
+                Some("turn-1"),
+                Some("completed"),
+                3_200,
+            );
+            let enriched = late_result
+                .iter()
+                .find_map(|effect| match effect {
+                    TrackerEffect::TurnComplete {
+                        completion_seq,
+                        outcome,
+                        outcome_update,
+                        ..
+                    } => Some((*completion_seq, *outcome, *outcome_update)),
+                    _ => None,
+                })
+                .expect("turn 1's late result enriches its saved completion");
+            assert_eq!(
+                enriched,
+                (
+                    first_completion_seq,
+                    Some(TerminalTurnOutcome::Completed),
+                    true
+                )
+            );
+            assert_eq!(tracker.list()[0].phase, CodexPhase::Pending);
+
+            tracker.note_proxy_turn_started("t", "sess", Some("turn-2"), 3_300);
+            let second_result = tracker.note_proxy_turn_completed(
+                "t",
+                "sess",
+                Some("turn-2"),
+                Some("completed"),
+                4_000,
+            );
+            assert_eq!(completions(&second_result), vec![first_completion_seq + 1]);
+        }
+    }
+
+    #[test]
+    fn bel_clear_enriches_its_completion_with_the_late_proxy_outcome() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 1_000);
+        tracker.reconcile_rollout(
+            "t",
+            &CodexTaskEvents {
+                latest_task_started_at: Some(2_000),
+                ..Default::default()
+            },
+            2_000,
+        );
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_100);
+
+        let cleared = tracker.note_output("t", "\u{07}", 3_000);
+        let completion_seq = completions(&cleared)
+            .first()
+            .copied()
+            .expect("BEL records the turn completion");
+        let echo =
+            tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some("failed"), 3_050);
+        let update = echo
+            .iter()
+            .find_map(|effect| match effect {
+                TrackerEffect::TurnComplete {
+                    completion_seq,
+                    outcome,
+                    outcome_update,
+                    ..
+                } => Some((*completion_seq, *outcome, *outcome_update)),
+                _ => None,
+            })
+            .expect("late proxy result enriches the existing completion");
+        assert_eq!(
+            update,
+            (completion_seq, Some(TerminalTurnOutcome::Failed), true)
+        );
+        assert_eq!(completions(&echo), vec![completion_seq]);
+    }
+
+    #[test]
+    fn queued_turn_bels_do_not_reuse_the_prior_proxy_outcome() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("sess"), 1_000);
+        tracker.note_input("t", "\r", 2_000);
+        tracker.reconcile_rollout("t", &started(2_500), 2_600);
+        tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_700);
+        tracker.note_input("t", "\r", 2_800); // queued turn 2
+
+        let first_bel = tracker.note_output("t", "\u{07}", 3_000);
+        assert!(
+            completions(&first_bel).is_empty(),
+            "queued turn remains pending"
+        );
+
+        let second_bel = tracker.note_output("t", "\u{07}", 3_500);
+        let later_completion = second_bel
+            .iter()
+            .find_map(|effect| match effect {
+                TrackerEffect::TurnComplete {
+                    completion_seq,
+                    outcome,
+                    outcome_update,
+                    ..
+                } => Some((*completion_seq, *outcome, *outcome_update)),
+                _ => None,
+            })
+            .expect("the queued turn completes on its own BEL");
+        assert_eq!(later_completion, (1, None, false));
+
+        let prior_turn_echo =
+            tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some("failed"), 3_600);
+        assert!(
+            prior_turn_echo.is_empty(),
+            "turn 1's late result cannot enrich turn 2's completion"
+        );
     }
 
     #[test]
@@ -2438,7 +2793,7 @@ mod tests {
     }
 
     /// Node parity: the in-flight proxy turn id is retired unconditionally
-    /// once the stale-id guard passes -- including swallowed echoes and the
+    /// once the stale-id guard passes -- including outcome updates and the
     /// Idle arm. A surviving id could wrongly drop a later real completion
     /// whose turn/started was missed (proxy reconnect / fork windows).
     #[test]
@@ -2455,7 +2810,8 @@ mod tests {
             latest_turn_aborted_reason: None,
         };
         tracker.reconcile_rollout("t1", &events, 3_100);
-        // First proxy echo of the same physical turn: swallowed one-shot.
+        // First proxy echo of the same physical turn: enrich the completion
+        // the rollout lane emitted before the provider result arrived.
         let first = tracker.note_proxy_turn_completed(
             "t1",
             "thread-1",
@@ -2463,7 +2819,19 @@ mod tests {
             Some("completed"),
             3_200,
         );
-        assert!(completions(&first).is_empty(), "swallowed echo is silent");
+        assert_eq!(
+            completions(&first),
+            vec![1],
+            "outcome update keeps the original sequence"
+        );
+        assert!(first.iter().any(|effect| matches!(
+            effect,
+            TrackerEffect::TurnComplete {
+                outcome: Some(TerminalTurnOutcome::Completed),
+                outcome_update: true,
+                ..
+            }
+        )));
         // Second echo lands in the Idle arm: still silent.
         let second = tracker.note_proxy_turn_completed(
             "t1",

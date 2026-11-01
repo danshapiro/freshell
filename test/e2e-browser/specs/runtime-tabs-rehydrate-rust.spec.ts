@@ -10,11 +10,9 @@
  */
 import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
-import fs from 'node:fs/promises'
-import path from 'node:path'
 
 import { test } from '../helpers/fixtures.js'
-import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
+import { type ManagedFixtureRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish, FreshCodexSavedHistoryMeasurementSchema, FreshCodexSavedHistoryPreservationSchema } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -167,7 +165,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
   test('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth', async ({ page }) => {
     test.setTimeout(900_000)
     const observerIntervalMs = 60_000
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
       FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
       // Exercise owned history before the supervisor's normal periodic recovery.
       FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: String(observerIntervalMs),
@@ -178,10 +176,14 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     const sent: any[] = []
     const received: any[] = []
     let heldHost: {containerId: string, incarnationId: string, pid: number} | undefined
+    let heldHandle: ReturnType<ManagedFixtureRig['exactRuntimeHandle']> | undefined
+    let historyEnclosure: ReturnType<ManagedFixtureRig['runtimeEnclosureHandle']> | undefined
     let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
     let profilingStarted = false
-    const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: [] }
-    const measurementErrors = measurement.errors as string[]
+    let releaseHeldSnapshot: (() => void) | undefined
+    const measurementErrors: FreshCodexHistoryMeasurementError[] = []
+    const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: measurementErrors }
+    const measurementFinish: FreshCodexHistoryMeasurementFinish = { errors: measurementErrors }
     // Keep only asset names and route classes, never auth queries or native text.
     const scriptLabel = (url: string) => {
       if (!url) return 'native-or-anonymous'
@@ -221,34 +223,26 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       ), 90_000)
       expect(view.containerId).toBeTruthy()
       expect(view.nativeSessionId).toBeTruthy()
-      const rolloutPath = `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${view.nativeSessionId}.jsonl`
-      const makeTranscript = (nativeId: string) => [
-        JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: '/workspace', model_provider: 'openai' } }),
-        ...Array.from({ length: 80 }, (_, index) => [
-          JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: `retained-${index}` } }),
-          JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: `Managed prompt ${index}` } }),
-          JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: `retained-${index}`,
-            last_agent_message: `${index === 79 ? 'Managed fixture saved answer' : `Managed retained answer ${index}`}\n${'x'.repeat(20_000)}` } }),
-        ]).flat(),
-      ].join('\n') + '\n'
-      const transcript = makeTranscript(view.nativeSessionId!)
-      expect(Buffer.byteLength(transcript)).toBeGreaterThan(1024 * 1024)
-      // Generate in the owned provider process, avoiding a multi-MiB argv value.
-      rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
-        `import fs from "node:fs"; import path from "node:path"; const makeTranscript = ${makeTranscript.toString()}; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], makeTranscript(process.argv[2]));`,
-        rolloutPath, view.nativeSessionId!])
-      const fixtureState = () => JSON.parse(rig.ownedProviderExec(view.containerId!, [
-        'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
-      ]))
-      const before = fixtureState()
-      const ownedSnapshot = await rig.runtime.adminOk(rig.supervisor, {
-        method: 'fresh_agent_read_snapshot', params: { soulId: view.soulId, expectedControlEpoch: await rig.controlEpoch() },
-      })
-      expect(ownedSnapshot.data.threadId).toBe(view.nativeSessionId)
-      const expectLargeRetainedHistory = (snapshot: any) => {
+      historyEnclosure = rig.runtimeEnclosureHandle(view)
+      const seededHistory = await rig.prepareFreshCodexSavedHistory(rig.exactRuntimeHandle(view))
+      expect(seededHistory.bytes).toBeGreaterThan(1024 * 1024)
+      const fixtureState = () => rig.fixtureNativeState(rig.exactRuntimeHandle(view))
+      const before = (await fixtureState())
+      const ownedSnapshot = await rig.freshCodexRetainedSnapshotFacts(rig.exactRuntimeHandle(view))
+      expect(ownedSnapshot.threadId).toBe(view.nativeSessionId)
+      expect(ownedSnapshot.bytes).toBeGreaterThan(1024 * 1024)
+      expect(ownedSnapshot.turnCount).toBe(160)
+      expect(ownedSnapshot.firstTurnId).toBe('retained-0:row-0')
+      expect(ownedSnapshot.lastTurnId).toBe('retained-79:row-1')
+      expect(ownedSnapshot.firstAnswerMatches).toBe(true)
+      expect(ownedSnapshot.lastAnswerMatches).toBe(true)
+      expect(ownedSnapshot.retentionAbsent).toBe(true)
+      let retainedTurns: any[] | undefined
+      const expectLargeRetainedHistory = (snapshot: any, additionalTurns = 0) => {
         expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeGreaterThan(1024 * 1024)
         // The native projection preserves each user/assistant row independently.
-        expect(snapshot.turns).toHaveLength(160)
+        expect(snapshot.turns).toHaveLength(160 + additionalTurns)
+        if (retainedTurns) expect(snapshot.turns.slice(0, 160)).toEqual(retainedTurns)
         expect(snapshot.turns[0].turnId).toBe('retained-0:row-0')
         expect(snapshot.turns[159].turnId).toBe('retained-79:row-1')
         const first = snapshot.turns[1].items.find((item: any) => item.text?.startsWith('Managed retained answer 0'))
@@ -257,12 +251,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         expect(last.text).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
         expect(snapshot.extensions.codex.nativeHistoryRetention).toBeUndefined()
       }
-      expectLargeRetainedHistory(ownedSnapshot.data)
       const initialSnapshot = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
         headers: { 'x-auth-token': info.token },
       })
       expect(initialSnapshot.ok).toBe(true)
-      expectLargeRetainedHistory(await initialSnapshot.json())
+      const initialHistory = await initialSnapshot.json()
+      expectLargeRetainedHistory(initialHistory)
+      retainedTurns = initialHistory.turns
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
@@ -297,8 +292,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
       }
       expect(sent.some((frame) => frame.type === 'freshAgent.attach' && frame.sessionId === original.sessionId)).toBe(true)
-      let release!: () => void
-      const held = new Promise<void>((resolve) => { release = resolve })
+      const held = new Promise<void>((resolve) => { releaseHeldSnapshot = resolve })
       let liveResponse: any
       await page.route('**/api/fresh-agent/threads/**', async (route) => {
         const actual = await route.fetch()
@@ -323,53 +317,52 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expect(page.getByTestId('managed-runtime-recovery-card')).toHaveCount(0)
       await expect(pane.getByRole('button', { name: 'Start new session' })).toHaveCount(0)
       await expectOriginalConversation()
-      expect(fixtureState().dispatchCount).toBe(before.dispatchCount)
-      release()
+      expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount)
+      releaseHeldSnapshot!()
       await expect(composer).toBeEnabled()
       await expect(composer).toHaveValue('Draft stays in this managed conversation')
+      const sentTurnBaseline = received.length
       await composer.press('Enter')
-      await expect.poll(() => fixtureState().completionCount, { timeout: 30_000 }).toBe(before.completionCount + 1)
-      expect(fixtureState().dispatchCount).toBe(before.dispatchCount + 1)
-      expect(fixtureState().nativeSessionId).toBe(view.nativeSessionId)
+      await expect.poll(async () => (await fixtureState()).completionCount, { timeout: 30_000 }).toBe(before.completionCount + 1)
+      await waitForValue('completed native fixture turn', () => received.slice(sentTurnBaseline).find(frame => {
+        const event = frame.type === 'freshAgent.event' ? frame.event : frame
+        return event?.type === 'freshAgent.turn.complete' && frame.sessionId === view.nativeSessionId
+      }), 30_000)
+      expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount + 1)
+      expect((await fixtureState()).nativeSessionId).toBe(view.nativeSessionId)
       const current = (await rig.inventory()).find((row) => row.soulId === view.soulId)
       expect(current).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
       await expectOriginalConversation()
       expect(sent.slice(baseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
-      const stableProviderState = fixtureState()
+      expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
+      const stableProviderState = (await fixtureState())
       // A tracked host can stop answering while its managed projection still says live.
       // Its saved source is the owned provider volume, never a coincident web-local file.
-      await page.unroute('**/api/fresh-agent/threads/**')
-      const wrongPath = `${info.homeDir}/.codex/sessions/rollout-${view.nativeSessionId}.jsonl`
-      await fs.mkdir(`${info.homeDir}/.codex/sessions`, { recursive: true })
-      const wrongTranscript = transcript.replaceAll('Managed fixture saved answer', 'Wrong web-local answer')
-      await fs.writeFile(wrongPath, wrongTranscript)
-      const lifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
-      const readLifecycle = async () => (await fs.readFile(lifecyclePath, 'utf8'))
-        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      // A send can start another snapshot while the fixture counters settle.
+      // Drain its real fetch/fulfill before removal continues in-flight routes.
+      await page.unrouteAll({ behavior: 'wait' })
+      await rig.prepareCoincidentFreshCodexHistory(rig.exactRuntimeHandle(view))
       // Finish healthy preparation before starting this owned controller's
       // first observation window. Its startup must reattach the original host.
-      const oldControllerId = rig.supervisor.containerId
+      const oldControllerId = (await rig.ownershipFacts()).supervisorContainerId
       const oldControlEpoch = await rig.controlEpoch()
       const controllerSentBaseline = sent.length
       const controllerRestartStartedAt = Date.now()
       await rig.restartSupervisor()
-      const controllerHealth = (await rig.runtime.adminOk(rig.supervisor, { method: 'health' })).data
+      const { controllerHealth, startupFinished, controllerReady } = await rig.freshCodexControllerStartupFacts(rig.exactRuntimeHandle(view))
       const reattached = (await rig.inventory()).find((row) => row.soulId === view.soulId)
+      if (!reattached) throw new Error('original managed soul was not reattached by its controller')
       expect(reattached).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
         incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId,
         desiredState: 'running', launchState: 'running', recoveryState: 'live' })
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
-      expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
+      expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
+      expect(await rig.coincidentFreshCodexHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
       await expectOriginalConversation()
       expect(sent.slice(controllerSentBaseline).filter((frame) => frame.type === 'freshAgent.create'
         || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      const restartedLifecycle = await readLifecycle()
-      const startupFinished = restartedLifecycle.filter((event) => event.event === 'supervisor.startup_scan.finished').at(-1)
-      const controllerReady = restartedLifecycle.filter((event) => event.event === 'supervisor.ready').at(-1)
       expect(Number.isFinite(startupFinished?.at)).toBe(true)
       expect(Number.isFinite(controllerReady?.at)).toBe(true)
       expect(startupFinished.at).toBeGreaterThanOrEqual(controllerRestartStartedAt)
@@ -378,22 +371,25 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(controllerReady.data).toMatchObject({ controlEpoch: controllerHealth.control_epoch,
         installationId: controllerHealth.installation_id })
       expect(controllerReady.data.controlEpoch).toBeGreaterThan(oldControlEpoch)
-      expect(rig.supervisor.containerId).not.toBe(oldControllerId)
-      const controllerReattachment = { oldControllerId, currentControllerId: rig.supervisor.containerId,
+      expect((await rig.ownershipFacts()).supervisorContainerId).not.toBe(oldControllerId)
+      const controllerReattachment = { oldControllerId, currentControllerId: (await rig.ownershipFacts()).supervisorContainerId,
         oldControlEpoch, currentControlEpoch: controllerReady.data.controlEpoch, controllerRestartStartedAt,
         controllerReady, startupFinished, reattached, completedAt: Date.now() }
-      rig.runtime.recordLifecycle('browser.owned_controller_reattached', controllerReattachment)
+      await rig.recordFreshCodexControllerReattachment(rig.exactRuntimeHandle(view), controllerReattachment)
       // The observer sleeps first, after startup reconciliation finishes.
       const firstObservationNotBefore = startupFinished.at + observerIntervalMs
       const holdRequestedAt = Date.now()
       expect(firstObservationNotBefore - holdRequestedAt,
         'owned history/read/reload must have a measured window before STOP').toBeGreaterThanOrEqual(55_000)
-      const pid = rig.runtime.ownedContainerHostPidExact(view.containerId!)
+      heldHandle = rig.exactRuntimeHandle(view)
+      const { pid } = await rig.holdRuntimeHost(heldHandle)
       heldHost = { containerId: view.containerId!, incarnationId: view.incarnationId, pid }
-      rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGSTOP', pid)
-      await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(true)
+      await expect.poll(async () => {
+        const state = await rig.ownedRuntimeHostState(rig.runtimeEnclosureHandle(view))
+        expect(state.pid).toBe(pid)
+        return state.stopped
+      }).toBe(true)
       const heldAt = Date.now()
-      rig.runtime.recordLifecycle('browser.owned_host_hold', { ...heldHost, state: 'T' })
       const unavailableBaseline = sent.length
       const unavailable = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
         headers: { 'x-auth-token': info.token },
@@ -405,110 +401,123 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(history.extensions.codex.ownerKind).toBe('vacant')
       expect(history.extensions.codex.statusFromLiveState).not.toBe(true)
       expect(history.capabilities.send).toBe(false)
-      expectLargeRetainedHistory(history)
+      expectLargeRetainedHistory(history, 2)
+      expect(history.turns.slice(160).map((turn: any) => turn.role)).toEqual(['user', 'assistant'])
+      expect(history.turns[161].items).toContainEqual(expect.objectContaining({ text: 'deterministic fixture completion' }))
       expect(JSON.stringify(history)).not.toContain('Wrong web-local answer')
       expect(sent.slice(unavailableBaseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       const reloadSentBaseline = sent.length
       const reloadReceivedBaseline = received.length
       cpuSession = await page.context().newCDPSession(page)
       await cpuSession.send('Profiler.enable')
-      measurement.browserBeforeReload = await page.evaluate(() => ({ timeOrigin: performance.timeOrigin, now: performance.now() }))
-      measurement.cpuStartRequestedAt = Date.now()
+      const browserBeforeReload = await page.evaluate(() => ({ timeOrigin: performance.timeOrigin, now: performance.now() }))
+      measurement.browserBeforeReload = browserBeforeReload
+      const cpuStartRequestedAt = Date.now()
+      measurement.cpuStartRequestedAt = cpuStartRequestedAt
+      measurementFinish.cpuStartRequestedAt = cpuStartRequestedAt
       await cpuSession.send('Profiler.start')
       profilingStarted = true
-      measurement.cpuStartedAt = Date.now()
-      rig.runtime.recordLifecycle('browser.saved_history_measurement.started', measurement)
+      const cpuStartedAt = Date.now()
+      measurement.cpuStartedAt = cpuStartedAt
+      measurementFinish.cpuStartedAt = cpuStartedAt
+      await rig.startFreshCodexSavedHistoryMeasurement(rig.exactRuntimeHandle(view), {
+        kind: 'owned-page saved-history diagnostic', errors: measurementErrors, browserBeforeReload, cpuStartRequestedAt, cpuStartedAt,
+      })
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
-      const bootstrap = await waitForValue('canonical reload reconciliation acknowledgement', () => {
-        const request = sent.slice(reloadSentBaseline).find((frame) => frame.type === 'pane.reconcile.request')
-        const result = received.slice(reloadReceivedBaseline).find((frame) => frame.type === 'pane.reconcile.result'
-          && frame.reconcileId === request?.reconcileId)
-        return request && result ? { request, result } : null
-      }, 30_000)
-      expect(bootstrap.request.panes).toEqual([expect.objectContaining({
-        paneKey: `${created.tabId}:${created.paneId}`, createRequestId: original.createRequestId,
-        sessionRef: original.sessionRef, kind: 'fresh-agent', mode: 'codex',
-      })])
-      if (bootstrap.result.verdicts.some((verdict: any) => ['fresh', 'respawn'].includes(verdict.verdict))) {
-        await waitForValue('same-request bootstrap create acknowledgement', () => received.slice(reloadReceivedBaseline)
-          .find((frame) => ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type)
-            && frame.requestId === original.createRequestId), 30_000)
-      }
-      const bootstrapLifecycle = () => sent.slice(reloadSentBaseline)
+      const reloadReady = await waitForValue('reloaded managed connection ready', () => received.slice(reloadReceivedBaseline)
+        .find((frame) => frame.type === 'ready'), 30_000)
+      expect(reloadReady.capabilities.managedRuntimeV1).toBe(true)
+      const reloadLifecycle = () => sent.slice(reloadSentBaseline)
         .filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')
-      const expectOnlyCanonicalBootstrap = () => {
-        const frames = bootstrapLifecycle()
-        expect(frames.filter((frame) => frame.type === 'pane.reconcile.request')).toEqual([bootstrap.request])
+      const expectManagedReload = () => {
+        const frames = reloadLifecycle()
+        expect(frames.filter((frame) => frame.type === 'pane.reconcile.request')).toHaveLength(0)
         const creates = frames.filter((frame) => frame.type === 'freshAgent.create')
         expect(creates.length).toBeLessThanOrEqual(1)
         for (const frame of creates) {
-          expect(frame).toMatchObject({ requestId: original.createRequestId, tabId: created.tabId,
-            provider: 'codex', sessionType: 'freshcodex' })
-          if (frame.sessionRef) expect(frame.sessionRef).toEqual(original.sessionRef)
+          // The create protocol also rebinds an existing native reference;
+          // it must reuse this exact request and cannot allocate a new soul.
+          expect(frame).toMatchObject({ requestId: original.createRequestId, tabId: created.tabId, paneId: created.paneId,
+            provider: 'codex', sessionType: 'freshcodex', sessionRef: original.sessionRef })
         }
       }
-      expectOnlyCanonicalBootstrap()
-      const settledLifecycleCount = bootstrapLifecycle().length
+      expectManagedReload()
       await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible({ timeout: 60_000 })
+      await expect(pane.getByText('deterministic fixture completion', { exact: true })).toBeVisible()
       await expect(composer).toBeDisabled()
       await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
       await expect(pane.getByText('Wrong web-local answer', { exact: false })).toHaveCount(0)
       await expectOriginalConversation()
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
-      expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
-      const managedReceipts = rig.runtime.broker.receipts().filter((receipt) => receipt.soulId === view.soulId)
-      expect(managedReceipts).toHaveLength(1)
-      expect(managedReceipts[0].containerId).toBe(view.containerId)
-      expect(rig.runtime.broker.eventsSnapshot().filter((event) => event.containerId === view.containerId
-        && event.method === 'POST' && event.url === `/v1.47/containers/${view.containerId}/start`)).toHaveLength(1)
-      const lifecycle = await readLifecycle()
-      const launches = lifecycle.filter((event) => event.event === 'supervisor.launch_running' && event.data.soulId === view.soulId)
+      expect(await rig.freshCodexSavedHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
+      expect(await rig.coincidentFreshCodexHistoryUnchanged(rig.exactRuntimeHandle(view))).toBe(true)
+      const ownership = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
+      expect(ownership.receiptContainerIds).toHaveLength(1)
+      expect(ownership.receiptContainerIds[0]).toBe(view.containerId)
+      expect(ownership.startCount).toBe(1)
+      const launches = ownership.launches
       expect(launches).toHaveLength(1)
       expect(launches[0].data).toMatchObject({ incarnationId: view.incarnationId, containerId: view.containerId, workerLaunchCount: 1 })
-      expectOnlyCanonicalBootstrap()
-      expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
+      expectManagedReload()
+      const settledReloadLifecycle = reloadLifecycle()
+      if (settledReloadLifecycle.some((frame) => frame.type === 'freshAgent.create')) {
+        const rebound = await waitForValue('existing managed bootstrap create acknowledgement', () => received.slice(reloadReceivedBaseline)
+          .find((frame) => frame.type === 'freshAgent.created' && frame.requestId === original.createRequestId), 30_000)
+        expect(rebound).toMatchObject({ sessionId: view.nativeSessionId, sessionRef: original.sessionRef })
+      }
       const historyEvidence = { source: 'owned provider-volume native history',
-        wrongSource: 'coincident web-local native history', heldHost, bootstrap: bootstrap.request,
-        bootstrapCreates: bootstrapLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
-        nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: fixtureState(),
+        wrongSource: 'coincident web-local native history', heldHost,
+        bootstrap: settledReloadLifecycle.find((frame) => frame.type === 'pane.reconcile.request') ?? null,
+        bootstrapCreates: settledReloadLifecycle.filter((frame) => frame.type === 'freshAgent.create'),
+        nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: (await fixtureState()),
         originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
-      rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', pid)
+      await rig.releaseRuntimeHost(rig.exactRuntimeHandle(view))
       const releasedAt = Date.now()
-      rig.runtime.recordLifecycle('browser.owned_host_release', heldHost)
       heldHost = undefined
-      await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(false)
+      await expect.poll(async () => {
+        const state = await rig.ownedRuntimeHostState(rig.runtimeEnclosureHandle(view))
+        expect(state.pid).toBe(pid)
+        return state.stopped
+      }).toBe(false)
       const resumedAt = Date.now()
       expect(resumedAt, 'exact owned host must resume before the first observer pass').toBeLessThan(firstObservationNotBefore)
       await expectOriginalConversation()
-      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+      expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expectOnlyCanonicalBootstrap()
-      expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
-      const targetSoulRecoveries = (await readLifecycle()).filter((event) => event.event === 'supervisor.runtime_observer.recovery_scheduled'
-        && event.data.soulId === view.soulId)
+      expectManagedReload()
+      expect(reloadLifecycle()).toHaveLength(settledReloadLifecycle.length)
+      const { targetSoulRecoveries } = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
       expect(targetSoulRecoveries).toHaveLength(0)
-      rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...historyEvidence,
+      await rig.publishFreshCodexSavedHistoryPreservation(rig.exactRuntimeHandle(view), FreshCodexSavedHistoryPreservationSchema.parse({ ...historyEvidence,
         observerWindow: { intervalMs: observerIntervalMs, controllerReattachment, startupFinished, firstObservationNotBefore,
-          holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } })
+          holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } }))
     } finally {
       measurement.finallyEnteredAt = Date.now()
       try {
-        if (heldHost) rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', heldHost.pid)
+        try {
+          releaseHeldSnapshot?.()
+          await page.unrouteAll({ behavior: 'wait' })
+        } finally {
+          if (heldHost && heldHandle) await rig.releaseRuntimeHost(heldHandle)
+        }
       } finally {
         try {
           // Resume the exact owned host before diagnostic extraction on failure.
           if (cpuSession) {
             try {
               if (profilingStarted) {
-                measurement.cpuStopRequestedAt = Date.now()
+                const cpuStopRequestedAt = Date.now()
+                measurement.cpuStopRequestedAt = cpuStopRequestedAt
+                measurementFinish.cpuStopRequestedAt = cpuStopRequestedAt
                 const { profile } = await cpuSession.send('Profiler.stop')
-                measurement.cpuStoppedAt = Date.now()
+                const cpuStoppedAt = Date.now()
+                measurement.cpuStoppedAt = cpuStoppedAt
+                measurementFinish.cpuStoppedAt = cpuStoppedAt
                 const nodes = new Map<number, any>(profile.nodes.map((node: any) => [node.id, node]))
                 const parents = new Map<number, number>()
                 for (const node of profile.nodes) for (const child of node.children ?? []) parents.set(child, node.id)
@@ -520,8 +529,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
                 const totals = new Map<number, { samples: number, durationMs: number }>()
                 const seconds = new Map<number, { durationMs: number, samples: number, idleMs: number }>()
                 let elapsedUs = 0
-                for (let index = 0; index < (profile.samples?.length ?? 0); index += 1) {
-                  const id = profile.samples[index]
+                const samples = profile.samples ?? []
+                for (let index = 0; index < samples.length; index += 1) {
+                  const id = samples[index]
                   const durationMs = (profile.timeDeltas?.[index] ?? 0) / 1000
                   const total = totals.get(id) ?? { samples: 0, durationMs: 0 }
                   total.samples += 1
@@ -555,60 +565,58 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
               try { await cpuSession.send('Profiler.disable') } catch { measurementErrors.push('owned CPU profiler disable failed') }
               try { await cpuSession.detach() } catch { measurementErrors.push('owned CDP detach failed') }
             }
-            try {
-              // Sanitize inside the owned page before returning audit data to Node.
-              measurement.audit = await page.evaluate((cutoffWallMs) => {
-                const snapshot = window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot()
-                const routeClass = (raw: unknown) => {
-                  if (typeof raw !== 'string') return undefined
-                  let pathname: string
-                  try { pathname = new URL(raw, location.origin).pathname } catch { return 'unknown-route' }
-                  if (pathname.startsWith('/api/fresh-agent/threads/')) return 'native-thread-snapshot'
-                  if (/^\/api\/runtime\/souls\/[^/]+\/history$/.test(pathname)) return 'owned-soul-history'
-                  if (pathname.startsWith('/assets/')) return `asset:${pathname.split('/').at(-1)}`
-                  return pathname.startsWith('/api/') ? 'other-api' : 'document-or-resource'
-                }
-                const requestRecords = (snapshot?.perfEvents ?? []).filter((entry) => entry.event === 'fresh_agent.snapshot_request')
-                const stages = ['refresh_requested', 'effect_skipped', 'request_captured', 'request_queued', 'run_started',
-                  'native_started', 'native_completed', 'native_failed', 'soul_started', 'outcome_received',
-                  'currentness_checked', 'identity_rejected', 'display_committed']
-                const triggers = ['identity', 'event', 'send-accepted', 'materialized', 'manual', 'poll', 'reconnect', 'reveal', 'idle-incomplete']
-                const allowed = { stage: stages, trigger: triggers, reason: ['no_thread', 'divergence', 'unmanaged_lost'],
-                  check: ['native-error', 'before-soul', 'outcome', 'error-fold'], source: ['direct', 'fallback'],
-                  fence: ['create', 'soul', 'revision', 'boot', 'owner', 'applied_serial', 'read_generation', 'recovery',
-                    'provider', 'session_type', 'thread', 'divergence'], errorKind: ['abort', 'error'],
-                  outcome: ['ok', 'error', 'coalesced', 'rate-limited', 'backoff'] }
-                const numericFields = ['timestamp', 'view', 'requestSerial', 'readGeneration', 'refreshSerial', 'appliedSerial',
-                  'currentGeneration', 'previousRows', 'rows', 'revision']
-                const booleanFields = ['requestReadOnly', 'hasSoul', 'ran', 'stale', 'historyOnly', 'live', 'vacant', 'accepted',
-                  'providerMatches', 'typeMatches', 'threadMatches', 'initialCapture', 'createChanged', 'soulChanged',
-                  'revisionChanged', 'bootChanged', 'ownerChanged', 'providerChanged', 'typeChanged', 'threadChanged',
-                  'paneSessionChanged', 'recoveryChanged', 'lostChanged', 'supervisorChanged', 'refreshChanged']
-                return { timeOrigin: performance.timeOrigin, extractedAtMs: performance.now(), available: Boolean(snapshot),
-                  cutoffWallMs, requestRecordCount: requestRecords.length, requestRecordsReturned: Math.min(2000, requestRecords.length),
-                  requestRecordsDropped: Math.max(0, requestRecords.length - 2000),
-                  requestRecords: requestRecords.slice(0, 2000).map((entry, sequence) => ({ sequence,
-                    ...Object.fromEntries(Object.entries(allowed).filter(([key, values]) => values.includes(String(entry[key])))
-                      .map(([key]) => [key, entry[key]])),
-                    ...Object.fromEntries(numericFields.filter((key) => typeof entry[key] === 'number' && Number.isFinite(entry[key]))
-                      .map((key) => [key, entry[key]])),
-                    ...Object.fromEntries(booleanFields.filter((key) => typeof entry[key] === 'boolean').map((key) => [key, entry[key]])) })),
-                  // The existing sink has no event timestamp: retain sequence and measured durations only.
-                  events: (snapshot?.perfEvents ?? []).flatMap((entry, sequence) => {
-                    if (!['perf.api_slow', 'perf.api_parse_slow', 'perf.longtask', 'perf.resource_slow'].includes(String(entry.event))) return []
-                    const numeric = Object.fromEntries(['status', 'durationMs', 'ttfbMs', 'bodyMs', 'parseMs', 'payloadChars',
-                      'startTime', 'transferSize', 'encodedBodySize', 'decodedBodySize']
-                      .filter((key) => typeof entry[key] === 'number').map((key) => [key, entry[key]]))
-                    return [{ sequence, event: entry.event, route: routeClass(entry.path ?? entry.name), ...numeric }]
-                  }) }
-              }, Number(measurement.finallyEnteredAt))
-            } catch { measurementErrors.push('owned perf audit extraction failed') }
-            rig.runtime.writeBrowserArtifact('saved-history-render-measurement', measurement)
-            rig.runtime.recordLifecycle('browser.saved_history_measurement.finished', {
-              cpuStartRequestedAt: measurement.cpuStartRequestedAt, cpuStartedAt: measurement.cpuStartedAt,
-              cpuStopRequestedAt: measurement.cpuStopRequestedAt, cpuStoppedAt: measurement.cpuStoppedAt,
-              errors: measurementErrors,
-            })
+          }
+          try {
+            // Sanitize inside the owned page before returning audit data to Node.
+            measurement.audit = await page.evaluate((cutoffWallMs) => {
+              const snapshot = window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot()
+              const routeClass = (raw: unknown) => {
+                if (typeof raw !== 'string') return undefined
+                let pathname: string
+                try { pathname = new URL(raw, location.origin).pathname } catch { return 'unknown-route' }
+                if (pathname.startsWith('/api/fresh-agent/threads/')) return 'native-thread-snapshot'
+                if (/^\/api\/runtime\/souls\/[^/]+\/history$/.test(pathname)) return 'owned-soul-history'
+                if (pathname.startsWith('/assets/')) return `asset:${pathname.split('/').at(-1)}`
+                return pathname.startsWith('/api/') ? 'other-api' : 'document-or-resource'
+              }
+              const requestRecords = (snapshot?.perfEvents ?? []).filter((entry) => entry.event === 'fresh_agent.snapshot_request')
+              const stages = ['refresh_requested', 'effect_skipped', 'request_captured', 'request_queued', 'run_started',
+                'native_started', 'native_completed', 'native_failed', 'soul_started', 'outcome_received',
+                'currentness_checked', 'identity_rejected', 'display_committed']
+              const triggers = ['identity', 'event', 'send-accepted', 'materialized', 'manual', 'poll', 'reconnect', 'reveal', 'idle-incomplete']
+              const allowed = { stage: stages, trigger: triggers, reason: ['no_thread', 'divergence', 'unmanaged_lost'],
+                check: ['native-error', 'before-soul', 'outcome', 'error-fold'], source: ['direct', 'fallback'],
+                fence: ['create', 'soul', 'revision', 'boot', 'owner', 'applied_serial', 'read_generation', 'recovery',
+                  'provider', 'session_type', 'thread', 'divergence'], errorKind: ['abort', 'error'],
+                outcome: ['ok', 'error', 'coalesced', 'rate-limited', 'backoff'] }
+              const numericFields = ['timestamp', 'view', 'requestSerial', 'readGeneration', 'refreshSerial', 'appliedSerial',
+                'currentGeneration', 'previousRows', 'rows', 'revision']
+              const booleanFields = ['requestReadOnly', 'hasSoul', 'ran', 'stale', 'historyOnly', 'live', 'vacant', 'accepted',
+                'providerMatches', 'typeMatches', 'threadMatches', 'initialCapture', 'createChanged', 'soulChanged',
+                'revisionChanged', 'bootChanged', 'ownerChanged', 'providerChanged', 'typeChanged', 'threadChanged',
+                'paneSessionChanged', 'recoveryChanged', 'lostChanged', 'supervisorChanged', 'refreshChanged']
+              return { timeOrigin: performance.timeOrigin, extractedAtMs: performance.now(), available: Boolean(snapshot),
+                cutoffWallMs, requestRecordCount: requestRecords.length, requestRecordsReturned: Math.min(2000, requestRecords.length),
+                requestRecordsDropped: Math.max(0, requestRecords.length - 2000),
+                requestRecords: requestRecords.slice(0, 2000).map((entry, sequence) => ({ sequence,
+                  ...Object.fromEntries(Object.entries(allowed).filter(([key, values]) => values.includes(String(entry[key])))
+                    .map(([key]) => [key, entry[key]])),
+                  ...Object.fromEntries(numericFields.filter((key) => typeof entry[key] === 'number' && Number.isFinite(entry[key]))
+                    .map((key) => [key, entry[key]])),
+                  ...Object.fromEntries(booleanFields.filter((key) => typeof entry[key] === 'boolean').map((key) => [key, entry[key]])) })),
+                // The existing sink has no event timestamp: retain sequence and measured durations only.
+                events: (snapshot?.perfEvents ?? []).flatMap((entry, sequence) => {
+                  if (!['perf.api_slow', 'perf.api_parse_slow', 'perf.longtask', 'perf.resource_slow'].includes(String(entry.event))) return []
+                  const numeric = Object.fromEntries(['status', 'durationMs', 'ttfbMs', 'bodyMs', 'parseMs', 'payloadChars',
+                    'startTime', 'transferSize', 'encodedBodySize', 'decodedBodySize']
+                    .filter((key) => typeof entry[key] === 'number').map((key) => [key, entry[key]]))
+                  return [{ sequence, event: entry.event, route: routeClass(entry.path ?? entry.name), ...numeric }]
+                }) }
+            }, Number(measurement.finallyEnteredAt))
+          } catch { measurementErrors.push('owned perf audit extraction failed') }
+          if (historyEnclosure) {
+            await rig.publishFreshCodexSavedHistoryMeasurement(historyEnclosure, FreshCodexSavedHistoryMeasurementSchema.parse(measurement))
+            await rig.finishFreshCodexSavedHistoryMeasurement(historyEnclosure, measurementFinish)
           }
         } finally {
           const cleanup = await rig.stop()
@@ -621,7 +629,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
   test('P4-G08: controller inventory reconstructs views without duplicating souls', async ({ page }) => {
     test.setTimeout(900_000)
 
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 4)
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 4)
     let oldClient: RawWsClient | undefined
     try {
       const info = await rig.start()
@@ -817,7 +825,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       if (!compatibilitySoul?.terminalCreateRequestId || !compatibilitySoul?.terminalId) {
         throw new Error('compatibility soul lacks durable terminal/create identity')
       }
-      const receiptCountBefore = rig.runtime.broker.receipts().length
+      const receiptCountBefore = (await rig.ownershipFacts()).receiptCount
       oldClient = await RawWsClient.connect(info.baseUrl, info.token)
       oldClient.send({
         type: 'terminal.create',
@@ -836,14 +844,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         'compatibility terminal.created',
       )
       expect(createdReply.terminalId).toBe(compatibilitySoul.terminalId)
-      expect(rig.runtime.broker.receipts()).toHaveLength(receiptCountBefore)
+      expect((await rig.ownershipFacts()).receiptCount).toBe(receiptCountBefore)
       expect(latestSoul(await rig.inventorySnapshot(), compatibilitySoulId)?.launchState).toBe('running')
 
       const finalState = await browserState(page)
       const receipt = {
         schemaVersion: 1,
         status: 'PASS',
-        candidateSha: rig.runtime.candidateSha,
         browser: {
           browserInteraction: true,
           coldStartAgents: initialSoulIds.length,
@@ -876,7 +883,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           ),
           stopAgentStopsRuntime: stopOutcome.soul.launchState === 'stopped',
           oldClientNoDuplicate: createdReply.terminalId === compatibilitySoul.terminalId
-            && rig.runtime.broker.receipts().length === receiptCountBefore,
+            && (await rig.ownershipFacts()).receiptCount === receiptCountBefore,
           initialSoulIds,
           expectedTabIds,
           expectedPaneIds,
@@ -886,9 +893,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       }
       expect(receipt.browser.focusObservations).toHaveLength(4)
       expect(receipt.browser.focusStable).toBe(true)
-      const receiptPath = rig.writePhase4BrowserReceipt(receipt)
-      // eslint-disable-next-line no-console
-      console.log(`[P4-G08] runtime tab rehydration receipt: ${receiptPath}`)
+      const published = await rig.publishPhase4BrowserReceipt(receipt.browser)
+      console.log(`[P4-G08] runtime tab rehydration receipt: ${published.artifactRef}`)
     } finally {
       oldClient?.close()
       const cleanup = await rig.stop()

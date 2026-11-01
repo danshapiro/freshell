@@ -1,9 +1,9 @@
 // src/components/fresh-agent/shared/transcript-minimap-layout.ts
 //
 // Pure geometry for the fresh-agent transcript minimap rail: maps measured
-// user-turn landmarks (content coordinates) onto tick rects inside the rail,
-// plus the band marking the currently visible region. Kept free of DOM and
-// React so it is exhaustively unit-testable without jsdom geometry mocks.
+// user-turn landmarks (content coordinates) onto tick rects inside the rail.
+// Kept free of DOM and React so it is exhaustively unit-testable without
+// jsdom geometry mocks.
 //
 // Placement is EVENLY SPACED: every prompt gets one uniform slot
 // (railHeight / prompt count) regardless of where it sits in the
@@ -11,8 +11,7 @@
 // height stays proportional to its turn's size (scale =
 // railHeight / scrollHeight, floored at the density-thinned minimum, capped
 // one pixel below the slot so adjacent lines keep a gap) and centers in its
-// slot. Only the viewport band remains proportional to scroll position —
-// it marks the real visible region of the content.
+// slot.
 
 /** Minimum rendered tick height, px — keeps every prompt clickable at sane
  * densities; under density the effective minimum thins below it (sub-pixel
@@ -60,11 +59,6 @@ export type MinimapTick = {
   height: number
 }
 
-export type MinimapViewportBand = {
-  top: number
-  height: number
-}
-
 export type MinimapCluster = {
   /** Rail-space top of the run's first member tick. */
   top: number
@@ -83,7 +77,6 @@ export type MinimapCluster = {
 
 export type MinimapLayout = {
   ticks: MinimapTick[]
-  viewport: MinimapViewportBand
   /** Clickability runs over the final laid-out ticks — ALL runs, singletons
    *  included (see the second pass at the end of computeMinimapLayout). */
   clusters: MinimapCluster[]
@@ -98,13 +91,11 @@ export type MinimapLayout = {
 
 export function computeMinimapLayout(input: {
   scrollHeight: number
-  viewportHeight: number
-  scrollTop: number
   railHeight: number
   landmarks: readonly MinimapLandmark[]
 }): MinimapLayout {
   if (input.scrollHeight <= 0 || input.railHeight <= 0) {
-    return { ticks: [], viewport: { top: 0, height: 0 }, clusters: [], railHeight: 0, slotHeight: 0 }
+    return { ticks: [], clusters: [], railHeight: 0, slotHeight: 0 }
   }
   const scale = input.railHeight / input.scrollHeight
   const sorted = [...input.landmarks].sort((a, b) => a.offsetTop - b.offsetTop || a.index - b.index)
@@ -160,19 +151,9 @@ export function computeMinimapLayout(input: {
     })
   }
 
-  const bandHeight = Math.min(
-    input.railHeight,
-    Math.max(MINIMAP_MIN_TICK_HEIGHT_PX, input.viewportHeight * scale),
-  )
-  const maxScroll = Math.max(0, input.scrollHeight - input.viewportHeight)
-  const clampedScrollTop = Math.min(Math.max(input.scrollTop, 0), maxScroll)
-  const fraction = maxScroll > 0 ? clampedScrollTop / maxScroll : 0
-  const bandTop = fraction * (input.railHeight - bandHeight)
-
   return {
     ticks,
     clusters,
-    viewport: { top: bandTop, height: bandHeight },
     railHeight: input.railHeight,
     slotHeight,
   }

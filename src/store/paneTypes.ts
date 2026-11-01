@@ -470,6 +470,12 @@ export type FreshAgentPendingLocalEcho = {
   requestId: string
   text: string
   submittedTurnId?: string
+  /** Turn keys that existed when the message was sent — the send-time
+   * boundary, persisted WITH the echo so a reloaded pane can tell earlier
+   * rows (every landed user row is inside the set) from later ones (a key
+   * outside the set landed after the send). Records persisted before the
+   * field existed rehydrate without it and read as "no boundary". */
+  previousTurnKeys?: string[]
 }
 
 export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentPendingLocalEcho | undefined {
@@ -477,12 +483,20 @@ export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentP
   const record = value as Record<string, unknown>
   if (typeof record.requestId !== 'string' || record.requestId.length === 0) return undefined
   if (typeof record.text !== 'string' || record.text.length === 0) return undefined
+  // The send boundary rides the persisted record (client-side pane content
+  // only — no wire schema). Keep even an EMPTY list: it is the positive
+  // claim that nothing predated the send (a first message), distinct from
+  // the field's absence (a legacy record the pane cannot place in time).
+  const previousTurnKeys = Array.isArray(record.previousTurnKeys)
+    ? record.previousTurnKeys.filter((key): key is string => typeof key === 'string')
+    : undefined
   return {
     requestId: record.requestId,
     text: record.text,
     ...(typeof record.submittedTurnId === 'string' && record.submittedTurnId.length > 0
       ? { submittedTurnId: record.submittedTurnId }
       : {}),
+    ...(previousTurnKeys ? { previousTurnKeys } : {}),
   }
 }
 

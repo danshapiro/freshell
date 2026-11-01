@@ -208,11 +208,46 @@ pub fn ensure_session(
         create_file_recorded,
     )
 }
+/// Initialize only a new seed using the exact selected global settings root.
+/// An existing native session is returned without rewriting its metadata.
+pub fn ensure_session_with_settings_home(
+    amplifier_home: &Path,
+    session_id: &str,
+    cwd: &str,
+    terminal_id: &str,
+    settings_home: &Path,
+) -> std::io::Result<EnsuredSession> {
+    ensure_session_with_selected_settings_writer(
+        amplifier_home,
+        session_id,
+        cwd,
+        terminal_id,
+        settings_home,
+        create_file_recorded,
+    )
+}
 fn ensure_session_with_writer(
     amplifier_home: &Path,
     session_id: &str,
     cwd: &str,
     terminal_id: &str,
+    write_file: impl FnMut(&Path, &[u8], &mut Vec<PathBuf>) -> std::io::Result<()>,
+) -> std::io::Result<EnsuredSession> {
+    ensure_session_with_selected_settings_writer(
+        amplifier_home,
+        session_id,
+        cwd,
+        terminal_id,
+        amplifier_home,
+        write_file,
+    )
+}
+fn ensure_session_with_selected_settings_writer(
+    amplifier_home: &Path,
+    session_id: &str,
+    cwd: &str,
+    terminal_id: &str,
+    settings_home: &Path,
     mut write_file: impl FnMut(&Path, &[u8], &mut Vec<PathBuf>) -> std::io::Result<()>,
 ) -> std::io::Result<EnsuredSession> {
     // Path-safety gate (defense in depth): the id is joined into
@@ -316,7 +351,7 @@ fn ensure_session_with_writer(
     // `resolve_amplifier_home()` = `$HOME/.amplifier` in production (with
     // the FRESHELL_AMPLIFIER_HOME test override), which is exactly where
     // the CLI reads its global settings.yaml.
-    if let Some(bundle) = crate::bundle_config::resolve_active_bundle(amplifier_home, &resolved) {
+    if let Some(bundle) = crate::bundle_config::resolve_active_bundle(settings_home, &resolved) {
         metadata["bundle"] = serde_json::Value::String(bundle);
     }
     let write_result: std::io::Result<()> = (|| {

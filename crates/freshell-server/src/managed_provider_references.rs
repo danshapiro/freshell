@@ -647,13 +647,14 @@ async fn prepare_managed_opencode_with_typed_publisher(
         })
         .map_err(str::to_string)?
     };
-    let base = crate::managed_provider_bootstrap::provider_launch_context_from_home_at_with_xdg(
+    let base = crate::managed_provider_bootstrap::provider_launch_context_from_home_at_with_selected_roots(
         "opencode",
         workspace,
         cwd,
         home,
         Some(xdg),
         None,
+        &resource_roots,
     )?
     .ok_or("OpenCode provider preparation unavailable")?;
     let selected = if let Some(sources) = selected_sources {
@@ -968,11 +969,25 @@ async fn prepare_managed_opencode_with_typed_publisher(
 
 /// Rebuild only a positively rejected, never-dispatched initial OpenCode input
 /// generation. Other failures retain their inputs for ownership reconciliation.
+/// Preserve the existing terminal-facing string error API.
 pub(crate) async fn launch_initial_opencode(
+    preparation: OpencodePreparation<'_>,
+    request_id: freshell_runtime_protocol::RequestId,
+    launch: freshell_runtime_protocol::LaunchRequest,
+) -> Result<freshell_runtime_protocol::LaunchResult, String> {
+    launch_initial_opencode_typed(preparation, request_id, launch)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Rebuild only a positively rejected, never-dispatched initial OpenCode input
+/// generation. Other failures retain their inputs for ownership reconciliation.
+pub(crate) async fn launch_initial_opencode_typed(
     preparation: OpencodePreparation<'_>,
     mut request_id: freshell_runtime_protocol::RequestId,
     mut launch: freshell_runtime_protocol::LaunchRequest,
-) -> Result<freshell_runtime_protocol::LaunchResult, String> {
+) -> Result<freshell_runtime_protocol::LaunchResult, freshell_runtime_client::ClientError> {
+    use freshell_runtime_client::ClientError;
     use freshell_runtime_protocol::RuntimeErrorCode;
     let mut retries = 0;
     loop {
@@ -997,11 +1012,12 @@ pub(crate) async fn launch_initial_opencode(
                             .and_then(|s| s.provider_launch_context.as_ref())
                     });
                 if let Some(capability) = context.and_then(|c| c.mcp_capability.as_ref()) {
-                    crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id)?;
+                    crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id)
+                        .map_err(ClientError::Protocol)?;
                 }
                 if retries == 2 {
                     tracing::warn!(event="provider.inputs.initial_replan.exhausted", provider="opencode", soul_id=%launch.soul_id, retries);
-                    return Err("OpenCode configuration reference selection kept changing; two pre-dispatch retries exhausted".into());
+                    return Err(ClientError::Protocol("OpenCode configuration reference selection kept changing; two pre-dispatch retries exhausted".into()));
                 }
                 retries += 1;
                 tracing::info!(event="provider.inputs.initial_replan", provider="opencode", soul_id=%launch.soul_id, retry=retries);
@@ -1024,7 +1040,7 @@ pub(crate) async fn launch_initial_opencode(
                     inline_edits: preparation.inline_edits.clone(),
                 })
                 .await
-                .map_err(|error| error.message)?;
+                .map_err(|error| ClientError::Protocol(error.message))?;
                 if let Some(terminal) = launch.terminal.as_mut() {
                     terminal.provider_secret_references = prepared.references;
                     terminal.provider_launch_context = Some(prepared.context);
@@ -1032,14 +1048,16 @@ pub(crate) async fn launch_initial_opencode(
                     fresh.provider_secret_references = prepared.references;
                     fresh.provider_launch_context = Some(prepared.context);
                 } else {
-                    return Err("initial OpenCode workload unavailable".into());
+                    return Err(ClientError::Protocol(
+                        "initial OpenCode workload unavailable".into(),
+                    ));
                 }
                 // A new approved generation has a different semantic payload.
                 // Keep the public creation/soul identity and use a fresh control
                 // request identity rather than replaying a rejected digest.
                 request_id = freshell_runtime_protocol::RequestId::new();
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error),
         }
     }
 }

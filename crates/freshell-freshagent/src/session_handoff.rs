@@ -4028,7 +4028,7 @@ impl SessionHandoffRunner {
                         // TARGET_BINDING_FAILED), never a Debug dump that
                         // would bury the code.
                         let status = resp.status();
-                        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        let bytes = axum::body::to_bytes((*resp).into_body(), usize::MAX)
                             .await
                             .unwrap_or_default();
                         let body: serde_json::Value =

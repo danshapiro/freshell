@@ -213,6 +213,26 @@ pub type SidecarLivenessProbe = std::sync::Arc<
         + Sync,
 >;
 
+/// The freshopencode WS lane's live-turn status probe -- `(session_id) -> the
+/// WS session record's turn-derived status` (`"running"` while the session's
+/// registered turn task is unfinished, `"idle"` when it is not), or `None`
+/// when this process's WS lane holds no record for the id. Registered
+/// set-once by `FreshOpencodeState::new` (which shares this state), so the
+/// durable snapshot route ([`FreshAgentState::get_opencode_snapshot`]) can
+/// preserve an active drive during dispatch and idle settlement. The route
+/// combines this with the owned daemon's native status, which can remain busy
+/// after a local observer ends. Unwired (no WS lane over this state, e.g. bare
+/// REST test rigs) contributes no local drive status. Precedent:
+/// [`SidecarLivenessProbe`] solves the same cross-lane liveness problem.
+pub type OpencodeTurnStatusProbe = std::sync::Arc<
+    dyn Fn(
+            &str,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<&'static str>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Handle pairing the shared gate with the permit-wait timeout
 /// (`CreateProtectConfig.spawn_timeout_ms`, resolved once in main.rs so both
 /// doors share one env snapshot).
@@ -2092,6 +2112,13 @@ pub struct FreshAgentState {
     panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
     /// The single lazily-started `opencode serve` client for this server process.
     opencode: SharedOpencodeManagerHandle,
+    /// The freshopencode WS lane's turn-status probe (see
+    /// [`OpencodeTurnStatusProbe`]): set-once by `FreshOpencodeState::new`
+    /// (which shares this state), consulted by
+    /// [`Self::get_opencode_snapshot`]'s live-status overlay so the durable
+    /// snapshot route combines active local drives with owned native activity
+    /// instead of reporting a hardcoded idle.
+    opencode_turn_status: Arc<std::sync::OnceLock<OpencodeTurnStatusProbe>>,
     /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
     /// requests never touch this web process's legacy provider manager.
     hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
@@ -2442,6 +2469,7 @@ impl FreshAgentState {
             checkpoint_event_sink: CheckpointEventSink::default(),
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
+            opencode_turn_status: Arc::new(std::sync::OnceLock::new()),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
             local_claude_rest: Arc::new(std::sync::OnceLock::new()),
             local_codex_rest: Arc::new(std::sync::OnceLock::new()),
@@ -2501,6 +2529,20 @@ impl FreshAgentState {
         persister: CheckpointEventPersister,
     ) -> Result<(), &'static str> {
         self.checkpoint_event_sink.set_persister(persister)
+    }
+
+    /// Wire the freshopencode WS lane's turn-status probe (set-once; called by
+    /// `FreshOpencodeState::new`, which shares this state -- production and
+    /// every test rig construct the WS lane exactly once per REST state, so a
+    /// collision means a second lane was built over one state and the FIRST
+    /// lane's records stay authoritative for the route).
+    pub(crate) fn set_opencode_turn_status_probe(
+        &self,
+        probe: OpencodeTurnStatusProbe,
+    ) -> Result<(), &'static str> {
+        self.opencode_turn_status
+            .set(probe)
+            .map_err(|_| "opencode turn status probe is already installed")
     }
 
     /// Side-effect-free coordinator read for `(provider, session_id)`
@@ -3348,14 +3390,21 @@ impl FreshAgentState {
         // to the serve path below and surfaces as a real
         // `OpencodeSnapshotError::NotFound` (404).
         if thread_id.starts_with(OPENCODE_PLACEHOLDER_PREFIX) {
-            return Ok(build_opencode_snapshot_json(
+            let mut snapshot = build_opencode_snapshot_json(
                 thread_id,
                 &json!({}),
                 &json!([]),
                 // A placeholder id never has a rollback record (rollback needs a
                 // materialized session).
                 None,
-            ));
+            );
+            // A placeholder the WS lane tracks can already be running its
+            // first turn (a pane that has not folded the materialized frame
+            // yet refetches by this id): the same record's turn-derived status
+            // applies to this arm too.
+            self.apply_opencode_ws_turn_status(thread_id, &mut snapshot)
+                .await;
+            return Ok(snapshot);
         }
 
         // b8ke focused review FR2: the daemon capture — ONE observation of
@@ -3395,11 +3444,68 @@ impl FreshAgentState {
             // re-lookup, never a spawn, never a kill.
             Err(_) => return self.opencode_disk_state_response(thread_id),
         };
-        let messages = match manager.list_messages_at(thread_id, &route, &base).await {
+        let (messages, message_status) = match manager
+            .list_messages_at_with_status(thread_id, &route, &base)
+            .await
+        {
             Ok(value) => value,
-            Err(ServeError::Http { status: 404, .. }) => json!([]),
+            Err(ServeError::Http { status: 404, .. }) => (json!([]), 404),
             Err(_) => return self.opencode_disk_state_response(thread_id),
         };
+
+        let message_rows = messages.as_array();
+        let user_message_count = message_rows
+            .into_iter()
+            .flatten()
+            .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+            .count();
+        let assistant_message_count = message_rows
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+            })
+            .count();
+        let assistant_text_bytes = message_rows
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+            })
+            .flat_map(|message| {
+                message
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::len)
+            .sum::<usize>();
+        if message_rows.is_none_or(Vec::is_empty) || message_status != 200 {
+            let info_id_matches = info.get("id").and_then(Value::as_str) == Some(thread_id);
+            let payload_kind = match &messages {
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                Value::String(_) => "string",
+                Value::Number(_) => "number",
+                Value::Bool(_) => "boolean",
+                Value::Null => "null",
+            };
+            tracing::info!(target: "freshell_freshagent::opencode",
+                session_id = %thread_id,
+                route_cwd_present = route.is_some(),
+                info_id_matches = info_id_matches,
+                message_http_status = message_status,
+                message_payload_kind = payload_kind,
+                message_rows = message_rows.map_or(0, Vec::len),
+                user_message_count,
+                assistant_message_count,
+                assistant_text_bytes,
+                "freshagent.opencode.native_transcript_read"
+            );
+        }
 
         // Kata 1wxv Task 5: the DURABLE rollback record (memory-fast sync read
         // over the ledger's write-through index) sources the marker bucket,
@@ -3422,6 +3528,11 @@ impl FreshAgentState {
         // replay.
         self.ensure_child_watchers(&manager, thread_id, &snapshot);
         attach_child_activity(&manager, &route, &mut snapshot).await;
+        // A current local drive covers dispatch/materialization before the native
+        // daemon reports busy, and remains running through its idle settlement.
+        // Native busy below also covers a daemon turn outliving its local observer.
+        self.apply_opencode_ws_turn_status(thread_id, &mut snapshot)
+            .await;
         if let Some(owner) = snapshot_owner {
             let status_result = manager
                 .get_session_status_at(thread_id, &route, &base)
@@ -3457,14 +3568,35 @@ impl FreshAgentState {
             if manager.base_url().await.as_deref() == Some(base.as_str())
                 && self.local_snapshot_owner(thread_id).await.as_ref() == Some(&owner)
             {
-                snapshot["status"] = json!(status);
+                if status == "running" || snapshot["status"] != "running" {
+                    snapshot["status"] = json!(status);
+                }
                 snapshot["extensions"]["opencode"]["statusFromLiveState"] = json!(true);
                 snapshot["extensions"]["opencode"]["ownerKind"] = json!("fresh-agent");
                 snapshot["extensions"]["opencode"]["ownerEpoch"] = json!(owner.epoch);
                 snapshot["extensions"]["opencode"]["ownerGeneration"] = json!(owner.generation);
             }
         }
+        native_history::retain_snapshot_display(PROVIDER, &mut snapshot);
         Ok(snapshot)
+    }
+
+    /// The live-status overlay for the opencode snapshot route: when this
+    /// process's freshopencode WS lane holds a session record for `thread_id`
+    /// (keyed by BOTH the placeholder and the durable `ses_*` id), the route
+    /// reports the record's turn-derived status (the probe is
+    /// [`crate::OpencodeTurnStatusProbe`], registered by
+    /// `FreshOpencodeState::new` over this shared state) -- instead of the
+    /// built snapshot's hardcoded idle. No WS record (e.g. a
+    /// REST-lane-materialized session) changes nothing; the route can still
+    /// obtain native status through its ownership-fenced daemon read.
+    async fn apply_opencode_ws_turn_status(&self, thread_id: &str, snapshot: &mut Value) {
+        let Some(probe) = self.opencode_turn_status.get() else {
+            return;
+        };
+        if let Some(status) = probe(thread_id).await {
+            snapshot["status"] = json!(status);
+        }
     }
 
     /// Ensure a live child→parent watcher exists for every child session this
@@ -4634,8 +4766,10 @@ pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Opt
 }
 
 /// Map saved session information and messages into the snapshot contract. Saved
-/// history defaults to idle; `get_opencode_snapshot` overlays current daemon status
-/// for a locally owned session after verifying its ownership is still current.
+/// history defaults to idle; `get_opencode_snapshot` overlays active local drives
+/// and current daemon status for a locally owned session after verifying its
+/// ownership is still current. An active drive covers dispatch and idle settlement;
+/// native busy also covers a daemon turn whose local observer already ended.
 fn build_opencode_snapshot_json(
     thread_id: &str,
     info: &Value,
@@ -4768,6 +4902,7 @@ fn build_opencode_snapshot_json(
         );
         snapshot["revision"] = json!(floored);
     }
+    native_history::retain_snapshot_display(PROVIDER, &mut snapshot);
     snapshot
 }
 
@@ -8168,6 +8303,42 @@ mod tests {
     use super::*;
     use crate::ownership_lane::OwnershipStamps;
 
+    #[test]
+    fn live_opencode_snapshot_retains_recent_history_and_native_rollback_controls() {
+        let text = "large ordinary tool output ".repeat(50_000);
+        let messages: Vec<_> = (0..32)
+            .map(|index| {
+                json!({"info":{"id":format!("msg-{index}"),"role":"assistant"},
+            "parts":[{"id":format!("part-{index}"),"type":"text","text":text}]})
+            })
+            .collect();
+        let messages = json!(messages);
+        assert!(serde_json::to_vec(&messages).unwrap().len() > 32 * 1024 * 1024);
+        let snapshot = build_opencode_snapshot_json(
+            "ses_live",
+            &json!({"id":"ses_live","time":{"updated":42}}),
+            &messages,
+            None,
+        );
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["threadId"], "ses_live");
+        assert_eq!(snapshot["revision"], 42);
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["undo"], true);
+        assert_eq!(
+            snapshot["turns"].as_array().unwrap().last().unwrap()["turnId"],
+            "msg-31"
+        );
+        assert_eq!(
+            snapshot["extensions"]["opencode"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_ne!(snapshot["extensions"]["opencode"]["ownerKind"], "vacant");
+    }
+
     fn state() -> FreshAgentState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
@@ -9371,6 +9542,58 @@ mod tests {
                 true
             );
             assert_eq!(snapshot["turns"][0]["items"][0]["status"], "running");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_combines_active_local_drives_with_native_status() {
+        for native_status in ["idle", "busy", "retry"] {
+            let state =
+                owned_opencode_snapshot_state(json!({"ses_live":{"type":native_status}})).await;
+            let local_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let running_probe = local_running.clone();
+            state
+                .set_opencode_turn_status_probe(Arc::new(move |_| {
+                    let running = running_probe.clone();
+                    Box::pin(async move {
+                        Some(if running.load(Ordering::SeqCst) {
+                            "running"
+                        } else {
+                            "idle"
+                        })
+                    })
+                }))
+                .unwrap();
+
+            let in_flight = state.get_opencode_snapshot("ses_live", None).await.unwrap();
+            assert_eq!(
+                in_flight["status"], "running",
+                "an active dispatch remains running while native status is {native_status}"
+            );
+            assert_eq!(
+                in_flight["extensions"]["opencode"]["statusFromLiveState"],
+                true
+            );
+
+            local_running.store(false, Ordering::SeqCst);
+            let settled = state.get_opencode_snapshot("ses_live", None).await.unwrap();
+            assert_eq!(
+                settled["status"],
+                if native_status == "idle" {
+                    "idle"
+                } else {
+                    "running"
+                },
+                "after the local drive settles, native {native_status} determines status"
+            );
+            assert_eq!(
+                settled["revision"], in_flight["revision"],
+                "activity changes do not require a history revision change"
+            );
+            assert_eq!(
+                settled["turns"][0]["items"][0]["status"], "running",
+                "stale running history does not determine session activity"
+            );
         }
     }
 

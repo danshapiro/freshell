@@ -17,6 +17,8 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
 const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
+// vitest-cloud.sh sets this only for the source-only Cloud Run image.
+const sourceOnlyCloudVitest = process.env.TEST_MODE === 'vitest'
 
 export default defineConfig({
   root: projectRoot,
@@ -42,7 +44,18 @@ export default defineConfig({
       // These integration trees own their own runtime/artifact setup.
       'test/integration/tooling/**',
       'test/integration/electron/**',
-      'test/e2e-browser/**',
+      // These suites require a local managed runtime and Git checkout. Their
+      // shared teardown helper is covered by source-only tooling unit tests.
+      ...(sourceOnlyCloudVitest ? [
+        'test/integration/server/fresh-agent-parity.test.ts',
+        'test/integration/server/managed-provider-parity.test.ts',
+      ] : []),
+      // This one helper executes the browser selection contract in Vitest.
+      // Every other browser file remains in its existing separate workflow.
+      'test/e2e-browser/!(helpers)/**',
+      'test/e2e-browser/*.ts',
+      'test/e2e-browser/helpers/!(selection-nonvacuity.test.ts)',
+      'test/e2e-browser/helpers/*/**',
       ...(realProviderContractsEnabled ? [] : ['test/integration/real/**']),
       // Electron tests run under config/vitest/vitest.electron.config.ts (node environment)
       'test/unit/electron/**',

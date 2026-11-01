@@ -16,6 +16,7 @@
 
 import { describe, expect, it } from 'vitest'
 import path from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
   canUseTool,
@@ -114,6 +115,18 @@ const canUseToolAnswers = (rows: LedgerRow[], toolName: string) =>
 function resolvedAnswer(harness: RealSidecar, toolName: string, n: number, label: string) {
   return harness.waitForLedger((row, rows) => canUseToolAnswers(rows, toolName).indexOf(row) === n - 1, label)
 }
+
+it('never auto-allows a late native callback after the session closes', async () => {
+  const rig = await startRealSidecar({ env: {
+    FRESHELL_CLAUDE_SDK_QUERY_MODULE: path.join(__dirname, 'fixtures', 'late-permission-query.mjs'),
+  } })
+  const sessionId = await rig.create()
+  rig.send({ type: 'send', sessionId, text: 'finish this owned query' })
+  await rig.waitFor('sdk.stream.ended')
+  expect(await rig.waitExit()).toMatchObject({ code: 3 })
+  expect(JSON.parse(readFileSync(path.join(rig.cwd, 'late-permission.json'), 'utf8')).behavior).toBe('deny')
+  expect(existsSync(path.join(rig.cwd, 'late-effect'))).toBe(false)
+})
 
 // ── case 1 ───────────────────────────────────────────────────────────────────
 describe('case 1: raisePermissionRequest parks and emits the request (the waiting edge is the server\'s)', () => {
@@ -353,6 +366,16 @@ describe('cases 6/7: canUseTool adapter preserves legacy ordering (sdk-bridge.ts
     expect(frames).toEqual([])
     expect(session.pendingPermissions?.size ?? 0).toBe(0)
     expect(session.pendingQuestions?.size ?? 0).toBe(0)
+  })
+
+  it('keeps a genuine managed native ask under bypass instead of overriding its policy', async () => {
+    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps({ permissionMode: 'bypassPermissions', nativeChannel: {} })
+    const pending = canUseTool({ session, emit, nanoid, nextMonotonic, sessionId: 'current',
+      toolName: 'Bash', input: { command: 'harmless' }, options: { toolUseID: 'toolu_current1', requestId: 'native-current' } })
+    const requested = frames.find((frame) => frame.type === 'sdk.permission.request')
+    expect(requested).toMatchObject({ nativeRequestId: 'native-current', toolUseID: 'toolu_current1' })
+    expect(respondPermission(session, requested!.requestId, { behavior: 'deny', message: 'User denied' })).toBe(true)
+    expect(await pending).toEqual({ behavior: 'deny', message: 'User denied' })
   })
 
   it('case 7: AskUserQuestion routes to the question path even under bypassPermissions', async () => {
