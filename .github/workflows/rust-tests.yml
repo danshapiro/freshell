@@ -82,7 +82,9 @@ jobs:
         # --features flag. A bare `cargo test -p freshell-codex` would skip
         # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
         # reports 38 tests; the same -p invocation reports 0).
-        run: cargo test --workspace --exclude freshell-tauri --locked
+        # Keep the gate red on any failure, but report failures in later
+        # crates in the same run instead of stopping at the first suite.
+        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
 
   gate:
     name: rust-gate
