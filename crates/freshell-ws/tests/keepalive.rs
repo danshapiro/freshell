@@ -157,40 +157,10 @@ async fn connect_and_complete_handshake(url: &str) -> TestWs {
     ws
 }
 
-/// **RED test for the actual defect**: today's `terminal::run()` sends NO
-/// server-initiated traffic at all, so this fails against the pre-fix code
-/// (zero `Ping` frames observed within several configured intervals). Legacy
-/// parity: `ws-handler.ts:745-755` pings every `pingIntervalMs` tick. A
-/// well-behaved client (this one) auto-replies pong on every read
-/// (`tungstenite` queues + flushes the pong automatically — see
-/// `protocol/mod.rs`'s `write()` doc: "upon receiving ping messages tungstenite
-/// queues pong replies automatically"), so surviving several consecutive
-/// cycles also proves the pong is being accepted and does NOT trip the
-/// missed-pong termination path.
-#[tokio::test]
-async fn idle_connection_receives_periodic_pings_and_survives_multiple_cycles() {
-    let ping_interval_ms = 30;
-    let (url, _broadcast_tx) = spawn_server(ping_interval_ms, 16).await;
-    let mut ws = connect_and_complete_handshake(&url).await;
-
-    let mut ping_count = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(ping_interval_ms * 8);
-    while tokio::time::Instant::now() < deadline && ping_count < 4 {
-        match tokio::time::timeout(Duration::from_millis(ping_interval_ms * 4), ws.next()).await {
-            Ok(Some(Ok(WsMessage::Ping(_)))) => ping_count += 1,
-            Ok(Some(Ok(_))) => {} // ignore any other frame type
-            Ok(Some(Err(err))) => panic!("unexpected ws error: {err}"),
-            Ok(None) => panic!("connection closed unexpectedly while awaiting keepalive pings"),
-            Err(_) => break, // timed out waiting — fall through to the count assertion
-        }
-    }
-
-    assert!(
-        ping_count >= 4,
-        "expected >= 4 server-initiated Ping frames across several keepalive cycles \
-         (legacy parity: ws-handler.ts:745-755), got {ping_count}"
-    );
-}
+// Healthy multi-cycle keepalive is exercised by the real-socket unit test
+// terminal::terminal_keepalive_tests::wire_pongs_keep_the_connection_alive_across_four_manual_cycles.
+// Its per-connection manual ticks preserve the actual Pong dispatch path
+// without racing a real peer against this fixture's 30 ms interval.
 
 /// **SAFE-10**: a slow broadcast consumer that falls behind past the
 /// channel's capacity (`RecvError::Lagged`) must NOT be left silently stale
