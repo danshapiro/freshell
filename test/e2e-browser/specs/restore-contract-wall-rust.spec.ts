@@ -106,17 +106,30 @@ async function readServerLogs(logsDir: string): Promise<string> {
   return combined
 }
 
-/** Dismiss the initial pane-type picker by choosing the first visible shell. */
+/** Settle the active tab's initial picker into a shell before adding panes. */
 async function selectShellIfPickerShowing(page: Page): Promise<void> {
-  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
-  if (!(await picker.isVisible().catch(() => false))) return
-  for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-    const option = picker.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-    if (await option.isVisible().catch(() => false)) {
-      await option.click({ force: true })
-      return
-    }
+  // Share the existing pane-render budget with active-tab readiness. A ready
+  // transport does not assert that the first-tab effect has completed.
+  const deadline = Date.now() + 30_000
+  const remaining = () => Math.max(1, deadline - Date.now())
+  let tabId = ''
+  await expect.poll(async () => {
+    tabId = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState().tabs.activeTabId ?? '')
+    return tabId
+  }, { timeout: remaining() }).not.toBe('')
+  const content = page.locator(`[data-tab-content-id="${tabId}"]`)
+  const picker = content.getByRole('toolbar', { name: /pane type picker/i })
+  const terminal = content.locator('.xterm').first()
+  await expect.poll(async () => await picker.isVisible() || await terminal.isVisible(), {
+    timeout: remaining(),
+  }).toBe(true)
+  if (await picker.isVisible()) {
+    // Enter uses the picker's supported activation path without racing its
+    // hover animation or accidentally selecting another tab's picker.
+    await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+      .first().press('Enter', { timeout: remaining() })
   }
+  await expect(terminal).toBeVisible({ timeout: remaining() })
 }
 
 /** Poll the in-page harness until the WS transport reports 'ready'. */
@@ -416,27 +429,127 @@ async function createFreshcodexPane(
   })
 }
 
-/** Send one chat turn in the last fresh-agent pane and wait for idle. */
+/** Send one turn and observe its accepted request plus a new completion edge. */
 async function sendFreshAgentTurn(
   page: Page,
   harness: TestHarness,
   tabId: string,
   text: string,
 ): Promise<void> {
-  const paneRoot = page.locator('[data-context="fresh-agent"]').last()
-  await expect
-    .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
-      timeout: 20_000,
-    })
-    .toBe('idle')
+  let paneId: string | undefined
+  await expect.poll(async () => {
+    const leaf = findFreshAgentLeaf(await harness.getPaneLayout(tabId))
+    paneId = leaf?.id
+    return Boolean(paneId && leaf?.content?.sessionId && leaf.content.status === 'idle')
+  }, { timeout: 20_000 }).toBe(true)
+  const paneRoot = page.locator(
+    `[data-tab-content-id="${tabId}"] [data-context="fresh-agent"][data-pane-id="${paneId}"]`,
+  )
   const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
   await composer.fill(text)
-  await paneRoot.getByRole('button', { name: 'Send' }).click()
-  await expect
-    .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
-      timeout: 30_000,
-    })
-    .toBe('idle')
+
+  // Install before Send: both busy and completion can happen between polls.
+  // Retain a receipt independently of the harness's bounded message history.
+  const receipt = await page.evaluateHandle(({ tabId, paneId, text }) => {
+    const harness = (window as any).__FRESHELL_TEST_HARNESS__
+    const findPane = (node: any): any => {
+      if (!node) return undefined
+      if (node.type === 'leaf') return node.id === paneId ? node : undefined
+      return (node.children ?? []).map(findPane).find(Boolean)
+    }
+    const currentContent = () => findPane(harness.getState().panes.layouts[tabId])?.content
+    const initial = currentContent()
+    if (!initial?.sessionId) throw new Error('Fresh-agent pane lost its live session before Send')
+    const { provider, sessionType } = initial
+    const aliases = new Set<string>([initial.sessionId])
+    if (initial.sessionRef?.sessionId) aliases.add(initial.sessionRef.sessionId)
+    if (initial.resumeSessionId) aliases.add(initial.resumeSessionId)
+    const materializations = new Map<string, string>()
+    const canonicalSessionId = (sessionId: string | undefined): string | undefined => {
+      const seen = new Set<string>()
+      while (sessionId && materializations.has(sessionId)) {
+        if (seen.has(sessionId)) throw new Error('Cyclic fresh-agent session materialization')
+        seen.add(sessionId)
+        sessionId = materializations.get(sessionId)
+      }
+      return sessionId
+    }
+    const requestIds = new Set<string>()
+    let acceptedSessionId: string | undefined
+    let baselineAt = -Infinity
+    const completions = new Map<string, number>()
+    const previousSent = harness.recordSentWsMessage
+    const previousReceived = harness.recordReceivedWsMessage
+    if (!previousSent || !previousReceived) throw new Error('Missing WS observation hooks')
+    const receipt = {
+      completed: false,
+      dispose: () => {
+        if (harness.recordSentWsMessage === recordSent) harness.recordSentWsMessage = previousSent
+        if (harness.recordReceivedWsMessage === recordReceived) harness.recordReceivedWsMessage = previousReceived
+      },
+    }
+    const updateReceipt = () => {
+      const accepted = canonicalSessionId(acceptedSessionId)
+      receipt.completed = Boolean(accepted && [...completions].some(
+        ([sessionId, at]) => canonicalSessionId(sessionId) === accepted && at > baselineAt,
+      ))
+    }
+    const recordSent = (msg: any) => {
+      previousSent(msg)
+      const current = currentContent()
+      if (msg.type !== 'freshAgent.send' || msg.text !== text
+        || msg.provider !== provider || msg.sessionType !== sessionType
+        || !current?.sessionId
+        || canonicalSessionId(msg.sessionId) !== canonicalSessionId(current.sessionId)) return
+      aliases.add(msg.sessionId)
+      if (requestIds.size === 0) {
+        const known = harness.getState().turnCompletion?.lastAtByTerminalId ?? {}
+        baselineAt = Math.max(-Infinity, ...[...aliases].map(
+          (sessionId) => known[`${provider}:${sessionId}`] ?? -Infinity,
+        ))
+      }
+      // A legitimate lost-session redrive gives this same user turn a new
+      // requestId. Accept its correlated reply, still scoped to this pane.
+      requestIds.add(msg.requestId)
+    }
+    const recordReceived = (msg: any) => {
+      previousReceived(msg)
+      if (msg.provider !== provider || msg.sessionType !== sessionType) return
+      // Materialization can precede acceptance, which may still name the
+      // old send-time handle. Keep the directed rekey so acceptance, output,
+      // and a React ref briefly lagging Redux resolve to this same session.
+      if (msg.type === 'freshAgent.session.materialized' && aliases.has(msg.previousSessionId)) {
+        aliases.add(msg.sessionId)
+        if (msg.previousSessionId !== msg.sessionId) materializations.set(msg.previousSessionId, msg.sessionId)
+      }
+      if (requestIds.size === 0) return
+      if (msg.type === 'freshAgent.send.accepted' && requestIds.has(msg.requestId)) {
+        acceptedSessionId = canonicalSessionId(msg.sessionId)
+        aliases.add(msg.sessionId)
+      }
+      if (msg.type === 'freshAgent.event' && msg.event?.type === 'freshAgent.turn.complete'
+        && typeof msg.event.at === 'number' && Number.isFinite(msg.event.at)) {
+        completions.set(msg.sessionId, Math.max(completions.get(msg.sessionId) ?? -Infinity, msg.event.at))
+      }
+      // A fast provider may complete before its accepted frame is processed;
+      // retain both receipts and correlate them regardless of delivery order.
+      updateReceipt()
+    }
+    harness.recordSentWsMessage = recordSent
+    harness.recordReceivedWsMessage = recordReceived
+    return receipt
+  }, { tabId, paneId, text })
+  try {
+    await paneRoot.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(async () => {
+      if (!await receipt.evaluate((value) => value.completed)) return false
+      const leaf = collectLeaves(await harness.getPaneLayout(tabId)).find((entry) => entry.id === paneId)
+      return leaf?.content?.status === 'idle'
+    }, { timeout: 30_000 }).toBe(true)
+  } finally {
+    await receipt.evaluate((value) => value.dispose())
+    await receipt.dispose()
+  }
 }
 
 // --- freshopencode fresh-agent helpers (donor:
@@ -1117,7 +1230,11 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
     const { server, harness, context, page } = await bootWall(browser, {
-      env: { CODEX_CMD: fakeCodexPath },
+      env: {
+        CODEX_CMD: fakeCodexPath,
+        // Keep this shared-helper caller on the same real completion contract.
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
+      },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
     })
     try {
@@ -1636,6 +1753,8 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         FAKE_CLAUDE_ARGV_LOG: claudeArgLog,
         CODEX_CMD: fakeCodexPath,
         FAKE_CODEX_ARGV_LOG: codexArgLog,
+        // Emit the real turn lifecycle consumed by sendFreshAgentTurn's receipt.
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
         OPENCODE_CMD: fakeOpencodePath,
         ...claudeSimulatorServerEnv({ ledgerPath: claudeSimLedger }),
       },
