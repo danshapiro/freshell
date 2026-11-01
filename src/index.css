@@ -1572,3 +1572,55 @@ body {
   border-left: 1px solid var(--fresh-agent-border, hsl(var(--border)));
   box-shadow: -8px 0 24px hsl(var(--foreground) / 0.1);
 }
+
+/* The pane owns the height budget shared by metadata and pending requests. */
+.fresh-agent-pane { container-type: size; }
+.fresh-agent-sidebar {
+  max-height: min(10cqh, max(0px, calc((100cqh - 240px) * .3)));
+}
+.fresh-agent-top-stack,
+.fresh-agent-style-serif .fresh-agent-top-stack,
+.fresh-agent-style-mono .fresh-agent-top-stack {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  min-height: 0;
+  min-width: 0;
+  max-height: min(35cqh, max(0px, calc(100cqh - 240px)));
+  gap: .25rem;
+  padding: .25rem .75rem;
+  overflow: hidden;
+}
+.fresh-agent-layout--with-sidebar .fresh-agent-top-stack {
+  max-height: min(25cqh, max(0px, calc((100cqh - 240px) * .7)));
+}
+.fresh-agent-top-stack:not(:has(.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors, .fresh-agent-diff-trigger)) { padding: 0; }
+.fresh-agent-top-stack-scroll {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  flex: 1 1 auto;
+}
+.fresh-agent-top-stack-scroll > * + * { margin-top: .25rem; }
+.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-diff-trigger { flex: 0 0 auto; }
+.fresh-agent-errors { min-height: 0; overflow: auto; flex: 0 1 auto; }
+.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors > details > summary { font-size: .75rem; }
+.fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; }
+.fresh-agent-top-stack summary:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+.fresh-agent-diagnostic-body, .fresh-agent-approval-preview, .fresh-agent-plan-body {
+  max-height: 10rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.fresh-agent-approval-card, .fresh-agent-plan-card { min-width: 0; overflow-wrap: anywhere; }
+.fresh-agent-top-stack .fresh-agent-approval-heading { flex-wrap: wrap; }
+.fresh-agent-style-serif .fresh-agent-top-stack > *, .fresh-agent-style-mono .fresh-agent-top-stack > * { margin-top: 0; margin-bottom: 0; }
+@container (min-width: 900px) {
+  .fresh-agent-sidebar { max-height: none; }
+  .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(35cqh, max(0px, calc(100cqh - 240px))); }
+}
+@container (max-height: 319px) {
+  .fresh-agent-top-stack { overflow: auto; }
+}

@@ -62,6 +62,12 @@ import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
+function expandDiagnosticForAction<T extends HTMLElement>(action: T): T {
+  const disclosure = action.closest<HTMLDetailsElement>('details[data-agent-error]')
+  if (disclosure && !disclosure.open) fireEvent.click(disclosure.querySelector('summary')!)
+  return action
+}
+
 describe('snapshot request audit', () => {
   const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
   const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
@@ -1227,9 +1233,10 @@ describe('stopped managed history', () => {
       soul: { soulId: content.soulId, intentRevision: 13 } })
     const store = mount({ ...content, status: 'exited' })
     await expectRenderedText('Saved native Codex answer')
+    fireEvent.click(screen.getByText('Session ended', { exact: true }))
     expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
     expectNoStarts()
-    fireEvent.click(screen.getByRole('button', { name: 'Start new session' }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Start new session' })))
     await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith(content.soulId, 12))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
     expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
@@ -1805,7 +1812,7 @@ describe('new conversation close acceptance', () => {
       sessionType: 'freshcodex', provider: 'codex', success: true })
     try {
       await expectRenderedText(historyText)
-      fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
+      fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Start new session', exact: true })))
       expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(1)
       expect(fixture.getContent().createRequestId).toBe(fixture.content.createRequestId)
       if (outcome === 'refused') act(() => { closing = fixture.startClose() })
@@ -1858,7 +1865,7 @@ describe('new conversation close acceptance', () => {
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(history.promise)
       act(() => fixture.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(reads))
-      fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
+      fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Start new session', exact: true })))
       await act(async () => fixture.emit({ type: 'freshAgent.killed', sessionId: fixture.content.sessionId,
         sessionType: 'freshcodex', provider: 'codex', success: true }))
       const replacement = fixture.getContent().createRequestId
@@ -1951,9 +1958,10 @@ describe('FreshAgentView', () => {
     await expectRenderedText('Saved conversation remains here')
     expect(screen.queryByText(/Close failed/)).toBeNull()
     await act(async () => { await store.dispatch(closeTab('tab-1')) })
+    fireEvent.click(await screen.findByText('Close failed', { exact: true }))
     const notice = await screen.findByText('Close failed: The pane could not be closed, so it was left open. Try again.')
     expect(notice.closest('[role="alert"]')).toBeInTheDocument()
-    expect(screen.queryByText(/Agent error:/)).toBeNull()
+    expect(document.querySelector('[data-agent-error="session"]')).toBeNull()
     expect(apiMock.updateManagedRuntimeViewVisibility).toHaveBeenCalled()
     expect(screen.getByText('Saved conversation remains here')).toBeInTheDocument()
     fireEvent.click(within(notice.closest('[role="alert"]') as HTMLElement).getByRole('button', { name: 'Dismiss' }))
@@ -12277,9 +12285,8 @@ describe('FreshAgentView', () => {
       expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
       expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
       expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Start new session' })).not.toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Restart sidecar and resume session' })).not.toBeInTheDocument()
+      expect(document.querySelector('[data-agent-error="ended"]')).toBeNull()
+      expect(document.querySelector('[data-agent-error="stuck"]')).toBeNull()
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(liveSnapshot)
       await act(async () => {
         handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
@@ -12349,7 +12356,7 @@ describe('FreshAgentView', () => {
     expect(getFreshAgentPaneContent(store)).toEqual(identity)
     expect(Object.values(store.getState().freshAgent.sessions).find((row) => row.sessionId === native.threadId)?.lost).toBe(true)
     expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Start new session' })).not.toBeInTheDocument()
+    expect(document.querySelector('[data-agent-error="ended"]')).toBeNull()
     expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
     expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
@@ -12457,7 +12464,7 @@ describe('FreshAgentView', () => {
     expect(composer).toHaveValue('Same conversation draft')
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
-    expect(screen.queryByRole('button', { name: 'Start new session' })).not.toBeInTheDocument()
+    expect(document.querySelector('[data-agent-error="ended"]')).toBeNull()
   })
 
   it.each([
@@ -12696,7 +12703,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
     act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
       event: { type: 'freshAgent.exit', code: 0 } }))
-    fireEvent.click(screen.getByRole('button', { name: 'Resume session', exact: true }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Resume session', exact: true })))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe('managed-live-manual-request'))
     expect(getFreshAgentPaneContent(store).sessionId).toBeUndefined()
     expect(getFreshAgentPaneContent(store).sessionRef).toEqual({ provider: 'codex', sessionId: locator.sessionId })
@@ -12829,7 +12836,7 @@ describe('FreshAgentView', () => {
       expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
       expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
     } else expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /restart sidecar and resume session/i })).not.toBeInTheDocument()
+    expect(document.querySelector('[data-agent-error="stuck"]')).toBeNull()
     const layout = store.getState().panes.layouts['tab-1']
     expect(layout?.type === 'leaf' && layout.content).toEqual(content)
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
@@ -13533,7 +13540,7 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    expect(await screen.findByRole('status')).toHaveTextContent('Your conversation has been kept')
+    expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent('Your conversation has been kept')
     expect(getFreshAgentPaneContent(store)).toEqual(content)
     expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
     expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
@@ -13600,7 +13607,7 @@ describe('FreshAgentView', () => {
       const retained = getFreshAgentPaneContent(store)
       wsMock.send.mockClear()
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-      expect(await screen.findByRole('status')).toHaveTextContent(outcome === 'http_failure' ? 'Server is unavailable' : 'Your conversation has been kept')
+      expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent(outcome === 'http_failure' ? 'Server is unavailable' : 'Your conversation has been kept')
       expect(getFreshAgentPaneContent(store)).toMatchObject(retained)
       expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
@@ -13863,9 +13870,10 @@ describe('FreshAgentView', () => {
       }))
     })
 
-    expect(await screen.findByRole('button', { name: 'Start new session' })).toBeVisible()
+    fireEvent.click(await screen.findByText('Session ended', { exact: true }))
+    expect(screen.getByRole('button', { name: 'Start new session' })).toBeVisible()
     wsMock.send.mockClear()
-    fireEvent.click(screen.getByRole('button', { name: 'Resume session' }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Resume session' })))
 
     await waitFor(() => {
       const pane = getFreshAgentPaneContent(store)
@@ -13904,11 +13912,11 @@ describe('FreshAgentView', () => {
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
     act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
       event: { type: 'freshAgent.status', sessionId: locator.sessionId, status: 'compacting' } }))
-    expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
+    expect(document.querySelector('[data-agent-error="ended"]')).toBeNull()
 
     act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
       event: { type: 'freshAgent.status', sessionId: locator.sessionId, status: 'exited' } }))
-    const resume = await screen.findByRole('button', { name: 'Resume session' })
+    const resume = expandDiagnosticForAction(await screen.findByRole('button', { name: 'Resume session' }))
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
     await waitFor(() => expect(getFreshAgentPaneContent(store).status).toBe('exited'))
 
@@ -14244,7 +14252,8 @@ describe('FreshAgentView', () => {
     )
 
     expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent('Stale restore revision')
+    fireEvent.click(screen.getByText('Conversation could not load', { exact: true }))
+    expect(screen.getByText('Stale restore revision')).toBeVisible()
   })
 
   it('renders restoreError pane and suppresses automatic freshAgent.create', () => {
@@ -15057,8 +15066,9 @@ describe('freshcodex wedged-sidecar notice', () => {
   it('renders the stuck notice with restart and start-new actions', async () => {
     const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
     dispatchStuck(store)
-    const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/appears stuck/i)
+    const alert = await screen.findByText('Agent appears stuck', { exact: true })
+    expect(alert).toBeVisible()
+    fireEvent.click(alert)
     expect(screen.getByRole('button', { name: /restart sidecar and resume session/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
   })
@@ -15076,8 +15086,8 @@ describe('freshcodex wedged-sidecar notice', () => {
     // installed after the last render would observe nothing.
     const dispatchSpy = vi.spyOn(store, 'dispatch')
     dispatchStuck(store)
-    await screen.findByRole('alert')
-    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    fireEvent.click(await screen.findByText('Agent appears stuck', { exact: true }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: /restart sidecar and resume session/i })))
     const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
     expect(sent).toMatchObject({
       sessionId: 'thread-stuck-1',
@@ -15397,7 +15407,7 @@ describe('FreshAgentView /model slash command', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Model catalog unavailable — try again')
+    expect(await screen.findByRole('status', { name: 'Agent notices' })).toHaveTextContent('Model catalog unavailable — try again')
     expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
   })
 })
@@ -17378,7 +17388,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
 
     act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
 
-    const alert = await screen.findByRole('alert')
+    const alert = (await screen.findByText('Session opened elsewhere', { exact: true })).closest('details') as HTMLElement
+    fireEvent.click(within(alert).getByText('Session opened elsewhere', { exact: true }))
     expect(alert).toHaveTextContent(/open as a terminal on another device/i)
     const attach = within(alert).getByRole('button', { name: /attach the terminal here/i })
 
@@ -17416,7 +17427,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       generation: 3,
     }))))
 
-    const alert = await screen.findByRole('alert')
+    const alert = (await screen.findByText('Session opened elsewhere', { exact: true })).closest('details') as HTMLElement
+    fireEvent.click(within(alert).getByText('Session opened elsewhere', { exact: true }))
     expect(alert).toHaveTextContent(/being reopened/i)
     // Round-3 F15: no Attach action until the committed owner event.
     expect(within(alert).queryByRole('button')).toBeNull()
@@ -17534,7 +17546,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
 
     // The divergence card renders through the alias chain (the pane's
     // canonical session resolves OLD → CANONICAL → the terminal owner).
-    const alert = await screen.findByRole('alert')
+    const alert = (await screen.findByText('Session opened elsewhere', { exact: true })).closest('details') as HTMLElement
+    fireEvent.click(within(alert).getByText('Session opened elsewhere', { exact: true }))
     expect(alert).toHaveTextContent(/open as a terminal on another device/i)
     const attach = within(alert).getByRole('button', { name: /attach the terminal here/i })
     fireEvent.click(attach)
@@ -17581,11 +17594,13 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       generation: 4,
     }))))
 
-    const card = await screen.findByTestId('fresh-agent-owner-transition-card')
+    const card = await screen.findByRole('status', { name: 'Agent notices' })
+    fireEvent.click(within(card).getByText('Notice details'))
     expect(card).toHaveTextContent(/being reopened/i)
     expect(within(card).queryByRole('button')).toBeNull()
     // Not the cross-kind divergence card, not the fenced recovery card.
-    expect(screen.queryByTestId('session-handoff-error-banner')).toBeNull()
+    expect(document.querySelector('[data-agent-error="handoff"]')).toBeNull()
+    expect(document.querySelector('[data-agent-error="owner"]')).toBeNull()
   })
 
   // b8ke ext r32 F3: a DIVERGED pane is a PURE OBSERVER while it still
@@ -17855,7 +17870,7 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     // THE DIVERGENCE: the session is handed to a terminal runtime while
     // the pane is busy with a queued message.
     act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
-    await screen.findByRole('alert')
+    await screen.findByText('Session opened elsewhere', { exact: true })
 
     // The composer is DISABLED — a pure observer with the attach action.
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
@@ -17902,7 +17917,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       </Provider>,
     )
 
-    const banner = await screen.findByRole('alert')
+    const banner = (await screen.findByText('Reopen failed', { exact: true })).closest('details') as HTMLElement
+    fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
     expect(banner).toHaveTextContent(/target runtime failed to start/i)
     const retry = within(banner).getByRole('button', { name: /retry reopening/i })
 
@@ -17946,7 +17962,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       </Provider>,
     )
 
-    const banner = await screen.findByRole('alert')
+    const banner = (await screen.findByText('Reopen failed', { exact: true })).closest('details') as HTMLElement
+    fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
     const retry = within(banner).getByRole('button', { name: /retry reopening/i })
 
     // The retry's handoff fails again — the pane stays; only the body is
@@ -18013,10 +18030,13 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       )
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
 
-      const banner = screen.getByRole('alert')
+      const banner = document.querySelector('[data-agent-error="handoff"]') as HTMLElement
+      fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
       const retry = within(banner).getByRole('button', { name: /retry reopening/i })
       fireEvent.click(retry)
 
+      fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
+      expect(retry).not.toBeVisible()
       // Synchronous: nothing sent on click itself (never a tight loop).
       expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
 
@@ -18082,7 +18102,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
         </Provider>,
       )
 
-      const banner = await screen.findByRole('alert')
+      const banner = (await screen.findByText('Reopen failed', { exact: true })).closest('details') as HTMLElement
+    fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
       expect(banner).toHaveTextContent(new RegExp(failure.message, 'i'))
       const retry = within(banner).getByRole('button', { name: /retry reopening/i })
 
@@ -18148,7 +18169,7 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       </Provider>,
     )
 
-    await screen.findByRole('alert')
+    await screen.findByText('Agent appears stuck', { exact: true })
     wsMock.send.mockClear()
 
     // The stuck card's Start-new action (the same startNewConversation
@@ -18212,9 +18233,9 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       </Provider>,
     )
 
-    await screen.findByRole('alert')
+    await screen.findByText('Agent appears stuck', { exact: true })
     wsMock.send.mockClear()
-    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: /restart sidecar and resume session/i })))
 
     // The recovery stop targets the durable sessionRef and waits for a
     // correlated confirmation before any new runtime starts.
@@ -18225,7 +18246,7 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       provider,
     })
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
-    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: /restart sidecar and resume session/i })))
     expect(wsMock.send.mock.calls.filter(([message]) => message.type === 'freshAgent.recovery.stop')).toHaveLength(1)
     const remintsBeforeAck = dispatchSpy.mock.calls
       .map(([action]) => action)
@@ -18277,9 +18298,9 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
         />
       </Provider>,
     )
-    await screen.findByRole('alert')
+    await screen.findByText('Agent appears stuck', { exact: true })
     wsMock.send.mockClear()
-    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: /restart sidecar and resume session/i })))
     const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
     expect(sent?.requestId).toEqual(expect.any(String))
     for (const handler of handlers) {
@@ -18318,11 +18339,11 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       kind: 'fresh-agent', sessionType, provider: 'claude', createRequestId: 'hosted-stuck',
       sessionRef: { provider: 'claude', sessionId: durable }, status: 'stuck',
     }} /></Provider>)
-    await screen.findByRole('alert')
+    await screen.findByText('Agent appears stuck', { exact: true })
     wsMock.send.mockClear()
     const creating = () => dispatchSpy.mock.calls.map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.status === 'creating')
-    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: /restart sidecar and resume session/i })))
     const stop = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
     expect(stop).toMatchObject({ sessionId: durable, sessionType, provider: 'claude' })
     emit({ type: 'freshAgent.recovery.stopped', requestId: stop.requestId,
@@ -18702,7 +18723,7 @@ describe('!command shell escape (exec route)', () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(/was not sent/)
+      expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent(/was not sent/)
     })
     expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
   })

@@ -1,7 +1,11 @@
+import userEvent from '@testing-library/user-event'
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { FreshAgentApprovalCard } from '@/components/fresh-agent/FreshAgentApprovalCard'
 import type { FreshAgentPendingApproval } from '@shared/fresh-agent-contract'
+
+afterEach(() => cleanup())
 
 const NPM_RULE = { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test *' }], behavior: 'allow', destination: 'localSettings' } as const
 const READ_RULE = { type: 'addRules', rules: [{ toolName: 'Read', ruleContent: '//etc/**' }], behavior: 'allow', destination: 'session' } as const
@@ -15,7 +19,7 @@ function renderCard(approval: FreshAgentPendingApproval, extra: { onAlwaysAllow?
 }
 
 describe('FreshAgentApprovalCard', () => {
-  afterEach(() => cleanup())
+
 
   it('previews the exact Bash command being approved', () => {
     renderCard({ requestId: 'req-1', toolName: 'Bash', input: { command: 'git push origin main' } })
@@ -155,6 +159,8 @@ describe('FreshAgentApprovalCard', () => {
     const card = within(screen.getByRole('alert', { name: `Permission request for ${toolName}` }))
     const preview = card.getByText((_content, element) => element?.tagName === 'PRE')
 
+    expect(preview).not.toBeVisible()
+    fireEvent.click(card.getByText('Request details'))
     expect(preview).toBeVisible()
     expect(JSON.parse(preview.textContent ?? '')).toEqual(details)
     expect(card.getAllByRole('button').map((button) => button.textContent)).toEqual(actions.map((action) => action.label))
@@ -165,4 +171,42 @@ describe('FreshAgentApprovalCard', () => {
     expect(onAlwaysAllow).not.toHaveBeenCalled()
   })
 
+})
+
+it('keeps answers visible while arguments are collapsed', async () => {
+ const user = userEvent.setup()
+ const { onRespond } = renderCard({ requestId: 'compact-command', toolName: 'Bash', decisionReason: 'Needs your permission', input: { command: 'printf '.repeat(500) } })
+ expect(screen.getByText('Needs your permission')).toBeVisible()
+ expect(screen.getByText('printf '.repeat(500), { normalizer: value => value })).not.toBeVisible()
+ expect(screen.getByRole('button', { name: 'Allow tool use' })).toBeVisible()
+ await user.click(screen.getByText('Command details'))
+ expect(screen.getByText('printf '.repeat(500), { normalizer: value => value })).toBeVisible()
+ await user.click(screen.getByRole('button', { name: 'Allow tool use' }))
+ expect(onRespond).toHaveBeenCalledExactlyOnceWith({ behavior: 'allow' })
+})
+
+it.each(['ls', 'printf '.repeat(100)])('exposes native commands with exact decisions: %s', async command => {
+ const user = userEvent.setup()
+ const {onRespond} = renderCard({requestId:'native-command',toolName:'Bash',native:{kind:'exec',command,availableDecisions:['accept','decline']}})
+ const preview=screen.getByText(command,{normalizer:value=>value})
+ if(command.length>240) {
+   expect(preview).not.toBeVisible()
+   expect(screen.getByText(`Bash: ${command.slice(0,80)}`,{normalizer:value=>value})).toBeVisible()
+   await user.click(screen.getByText('Command details'))
+ }
+ expect(preview).toBeVisible()
+ expect(onRespond).not.toHaveBeenCalled()
+ await user.click(screen.getByRole('button',{name:'Allow',exact:true}))
+ expect(onRespond).toHaveBeenCalledExactlyOnceWith({nativeDecision:'accept'})
+})
+it('collapses a verbose Edit preview while retaining the path and decisions', async () => {
+ const user=userEvent.setup()
+ const {onRespond}=renderCard({requestId:'edit-long',toolName:'Edit',blockedPath:'/src/large.ts',input:{file_path:'/src/large.ts',old_string:'old '.repeat(100),new_string:'new '.repeat(100)}})
+ expect(screen.getByRole('figure',{name:'diff view'})).not.toBeVisible()
+ expect(screen.getAllByText('/src/large.ts').some(element => !element.closest('details'))).toBe(true)
+ await user.click(screen.getByText('Request details'))
+ expect(screen.getByRole('figure',{name:'diff view'})).toBeVisible()
+ expect(onRespond).not.toHaveBeenCalled()
+ await user.click(screen.getByRole('button',{name:'Deny tool use'}))
+ expect(onRespond).toHaveBeenCalledWith({behavior:'deny',message:'Denied by user',interrupt:false})
 })

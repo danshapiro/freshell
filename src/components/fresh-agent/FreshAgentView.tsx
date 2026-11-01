@@ -1,3 +1,4 @@
+import { FreshAgentNoticeStack, type FreshAgentError } from './FreshAgentNoticeStack.js'
 import {
   forwardRef,
   useCallback,
@@ -1004,7 +1005,7 @@ function isPlainTextKey(event: ReactKeyboardEvent<HTMLElement>): boolean {
 function isInteractiveTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false
   return Boolean(target.closest(
-    'input, textarea, select, button, a[href], [contenteditable=""], [contenteditable="true"], [role="button"], [role="menuitem"]',
+    'input, textarea, select, button, summary, a[href], [contenteditable=""], [contenteditable="true"], [role="button"], [role="menuitem"]',
   ))
 }
 
@@ -5118,7 +5119,7 @@ export function FreshAgentView({
         scrollTranscriptByKey(event, transcriptRef.current)
         return
       }
-      if (isEditableTarget(event.target)) return
+      if (isInteractiveTarget(event.target)) return
       if (!isPlainTextKey(event)) return
       event.preventDefault()
       composerRef.current?.appendText(event.key)
@@ -5150,44 +5151,15 @@ export function FreshAgentView({
       })
     }
 
-    const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
-      provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
-      ...(runtimeOwnerEpoch !== undefined && runtimeOwnerGeneration !== undefined ? { observedEpoch: runtimeOwnerEpoch, observedGeneration: runtimeOwnerGeneration } : {}),
-    } : undefined
-    const closeChild = () => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: undefined } }))
-    return (
-      <FreshAgentObserveChildContext.Provider value={childParent ? { parent: childParent, onObserve: (action) => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: action.childThreadId } })) } : undefined}>
-      <div
-        ref={capturePaneRoot}
-        tabIndex={-1}
-        className={cn(
-          'fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden',
-          `fresh-agent-style-${activeStyle}`,
-        )}
-        data-context="fresh-agent"
-        data-style={activeStyle}
-        data-tab-id={tabId}
-        data-pane-id={paneId}
-        data-session-id={contextSessionId}
-        data-provider={paneContent.provider}
-        data-session-type={paneContent.sessionType}
-        style={{ '--fresh-transcript-font-size': `${terminalFontSize}px` } as CSSProperties}
-        onKeyDownCapture={handlePaneKeyDown}
-      >
-        {WatermarkIcon ? (
-          <WatermarkIcon
-            className="fresh-agent-watermark pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground"
-            aria-hidden="true"
-            data-testid="fresh-agent-watermark"
-          />
-        ) : null}
-        <div className={`${hasSidebarMetadata ? 'fresh-agent-layout--with-sidebar ' : ''}fresh-agent-layout relative z-10 min-h-0 flex-1`}>
-          <div className="fresh-agent-main flex min-h-0 flex-1 flex-col">
-            <div className="fresh-agent-top-stack space-y-2 px-3 pt-3">
-              {isRestoring ? (
-                <FreshAgentApprovalBanner text="Restoring session..." />
-              ) : null}
-              {pendingCreateFailure || paneContent.createError ? (
+    const requestCount = pendingApprovals.length + (snapshot?.pendingElicitations?.length ?? 0) + pendingQuestions.length + (isManagedRuntimeRecoveryDecision(paneContent.recoverySummary) ? 1 : 0)
+    const routineNotices = [
+      ...(isRestoring ? [{ id: 'restoring', text: 'Restoring session...' }] : []),
+      ...(paneContent.reconcileNotice ? [{ id: 'reconciliation', text: paneContent.reconcileNotice }] : []),
+      ...(notice ? [{ id: 'notice', text: notice }] : []),
+      ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…' }] : []),
+    ]
+    const visibleErrors: FreshAgentError[] = [
+    { id: 'create', summary: 'Agent could not start', content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
                     text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'}
@@ -5231,14 +5203,14 @@ export function FreshAgentView({
                     </button>
                   ) : null}
                 </div>
-              ) : null}
-              {visibleRestoreFailure ? (
+              ) : null) },
+    { id: 'restore', summary: 'Restore failed', content: (visibleRestoreFailure ? (
                 <FreshAgentApprovalBanner
                   text={visibleRestoreFailure}
                   onDismiss={() => dispatch(clearRestoreFailure(sessionRecordLocator))}
                 />
-              ) : null}
-              {visiblePaneRestoreFailure ? (
+              ) : null) },
+    { id: 'pane-restore', summary: 'Pane restore failed', content: (visiblePaneRestoreFailure ? (
                 <FreshAgentApprovalBanner
                   text={visiblePaneRestoreFailure}
                   onDismiss={() => dispatch(updatePaneContent({
@@ -5250,28 +5222,23 @@ export function FreshAgentView({
                     },
                   }))}
                 />
-              ) : null}
-              {visibleLoadError ? (
+              ) : null) },
+    { id: 'load', summary: 'Conversation could not load', content: (visibleLoadError ? (
                 <FreshAgentApprovalBanner text={visibleLoadError} onDismiss={() => setLoadError(null)} />
-              ) : null}
-              {paneContent.reconcileNotice ? (
-                <div role="status" className="px-3 py-1 text-xs text-amber-600 dark:text-amber-400">
-                  {paneContent.reconcileNotice}
-                </div>
-              ) : null}
-              {sessionErrorMessage ? (
+              ) : null) },
+    { id: 'session', summary: 'Agent error', content: (sessionErrorMessage ? (
                 <FreshAgentApprovalBanner
                   text={`Agent error: ${sessionErrorMessage}`}
                   onDismiss={() => dispatch(clearSessionError(sessionRecordLocator))}
                 />
-              ) : null}
-              {paneContent.closeError ? (
+              ) : null) },
+    { id: 'close', summary: 'Close failed', content: (paneContent.closeError ? (
                 <FreshAgentApprovalBanner
                   text={`Close failed: ${paneContent.closeError}`}
                   onDismiss={() => dispatch(clearPaneCloseError({ tabId, paneId }))}
                 />
-              ) : null}
-              {effectiveStatus === 'stuck' && !lifecycleBlocked && !managedRecoveryActive ? (
+              ) : null) },
+    { id: 'stuck', summary: 'Agent appears stuck', content: (effectiveStatus === 'stuck' && !lifecycleBlocked && !managedRecoveryActive ? (
                 <div
                   className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
                   role="alert"
@@ -5296,8 +5263,16 @@ export function FreshAgentView({
                     </button>
                   </div>
                 </div>
-              ) : null}
-              {ownerDivergence?.fencedReason !== undefined ? (
+              ) : null) },
+    { id: 'handoff', summary: 'Reopen failed', content: (paneContent.handoffError ? (
+                <SessionHandoffErrorBanner
+                  error={paneContent.handoffError}
+                  appStore={appStore}
+                  tabId={tabId}
+                  paneId={paneId}
+                />
+              ) : null) },
+    { id: 'owner', summary: ownerDivergence?.fencedReason !== undefined ? 'Session needs recovery' : 'Session opened elsewhere', content: (ownerDivergence?.fencedReason !== undefined ? (
                 <div
                   className="fresh-agent-fenced-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
                   role="alert"
@@ -5339,39 +5314,8 @@ export function FreshAgentView({
                     </button>
                   ) : null}
                 </div>
-              ) : ownerDivergence?.inProgress ? (
-                // b8ke focused round-5 R5-3: a SAME-KIND in-progress
-                // lifecycle transition (the ready-replay fold of
-                // starting/handoff/stopping, or a live handoff-started
-                // broadcast naming this pane's kind) is transition-blocked:
-                // the pane shows the transition state and suspends its
-                // normal polling/scheduling until the transition settles.
-                <div
-                  className="fresh-agent-transition-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
-                  role="alert"
-                  aria-label="Session transition in progress"
-                  data-testid="fresh-agent-owner-transition-card"
-                >
-                  <span>This conversation is being reopened elsewhere…</span>
-                </div>
-              ) : null}
-              {paneContent.handoffError ? (
-                <SessionHandoffErrorBanner
-                  error={paneContent.handoffError}
-                  appStore={appStore}
-                  tabId={tabId}
-                  paneId={paneId}
-                />
-              ) : null}
-              {isManagedRuntimeRecoveryDecision(paneContent.recoverySummary) ? (
-                <ManagedRuntimeRecoveryCard
-                  key={`${paneContent.createRequestId}:${paneContent.soulId}:${paneContent.recoverySummary?.recoveryState}`}
-                  recoverySummary={paneContent.recoverySummary}
-                  onRetry={retryManagedRecovery}
-                  onStartFresh={startNewConversation}
-                />
-              ) : null}
-              {!managedRecoveryActive && sessionEnded ? (
+              ) : null) },
+    { id: 'ended', summary: 'Session ended', content: (!managedRecoveryActive && sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
                   <div className="flex flex-wrap gap-2">
@@ -5393,8 +5337,45 @@ export function FreshAgentView({
                     </button>
                   </div>
                 </div>
-              ) : null}
-              {notice ? <FreshAgentApprovalBanner text={notice} /> : null}
+              ) : null) },
+    ].filter(entry => Boolean(entry.content))
+    const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
+      provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
+      ...(runtimeOwnerEpoch !== undefined && runtimeOwnerGeneration !== undefined ? { observedEpoch: runtimeOwnerEpoch, observedGeneration: runtimeOwnerGeneration } : {}),
+    } : undefined
+    const closeChild = () => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: undefined } }))
+    return (
+      <FreshAgentObserveChildContext.Provider value={childParent ? { parent: childParent, onObserve: (action) => dispatch(mergePaneContent({ tabId, paneId, updates: { observedChildThreadId: action.childThreadId } })) } : undefined}>
+      <div
+        ref={capturePaneRoot}
+        tabIndex={-1}
+        className={cn(
+          'fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden',
+          `fresh-agent-style-${activeStyle}`,
+        )}
+        data-context="fresh-agent"
+        data-style={activeStyle}
+        data-tab-id={tabId}
+        data-pane-id={paneId}
+        data-session-id={contextSessionId}
+        data-provider={paneContent.provider}
+        data-session-type={paneContent.sessionType}
+        style={{ '--fresh-transcript-font-size': `${terminalFontSize}px` } as CSSProperties}
+        onKeyDownCapture={handlePaneKeyDown}
+      >
+        {WatermarkIcon ? (
+          <WatermarkIcon
+            className="fresh-agent-watermark pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground"
+            aria-hidden="true"
+            data-testid="fresh-agent-watermark"
+          />
+        ) : null}
+        <div className={`${hasSidebarMetadata ? 'fresh-agent-layout--with-sidebar ' : ''}fresh-agent-layout relative z-10 min-h-0 flex-1`}>
+          <div className="fresh-agent-main flex min-h-0 flex-1 flex-col">
+            <div className="fresh-agent-top-stack" role="group" aria-label="Agent requests and status">
+              {requestCount > 0 ? <div className="fresh-agent-request-count" role="status">{requestCount} pending {requestCount === 1 ? 'request' : 'requests'}</div> : null}
+              <FreshAgentNoticeStack notices={routineNotices} errors={visibleErrors} />
+              {requestCount > 0 ? <div className="fresh-agent-top-stack-scroll" role="region" aria-label="Pending requests">
               {pendingApprovals.map((approval) => (
                 <FreshAgentApprovalCard
                   key={String(approval.requestId)}
@@ -5444,6 +5425,15 @@ export function FreshAgentView({
                   disabled={lifecycleBlocked || !paneContent.sessionId}
                 />
               ))}
+              {isManagedRuntimeRecoveryDecision(paneContent.recoverySummary) ? (
+                <ManagedRuntimeRecoveryCard
+                  key={`${paneContent.createRequestId}:${paneContent.soulId}:${paneContent.recoverySummary?.recoveryState}`}
+                  recoverySummary={paneContent.recoverySummary}
+                  onRetry={retryManagedRecovery}
+                  onStartFresh={startNewConversation}
+                />
+              ) : null}
+              </div> : null}
               <FreshAgentDiffPanel
                 diffs={projectedDiffs}
                 paneRoot={paneRootElement}
