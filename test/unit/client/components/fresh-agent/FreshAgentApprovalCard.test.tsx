@@ -159,11 +159,6 @@ describe('FreshAgentApprovalCard', () => {
     const card = within(screen.getByRole('alert', { name: `Permission request for ${toolName}` }))
     const preview = card.getByText((_content, element) => element?.tagName === 'PRE')
 
-    const verbose = JSON.stringify(details).length > 240
-    if (verbose) {
-      expect(preview).not.toBeVisible()
-      fireEvent.click(card.getByText('Request details'))
-    }
     expect(preview).toBeVisible()
     expect(JSON.parse(preview.textContent ?? '')).toEqual(details)
     expect(card.getAllByRole('button').map((button) => button.textContent)).toEqual(actions.map((action) => action.label))
@@ -222,4 +217,16 @@ it('shows a short native permission scope before the user answers', () => {
  expect(preview).toHaveTextContent('network')
  fireEvent.click(screen.getByRole('button', {name: 'Allow', exact: true}))
  expect(onRespond).toHaveBeenCalledWith({nativeDecision: 'accept'})
+})
+
+it('collapses a long native permission scope while keeping its exact scope and answer', () => {
+  const permissions = { directories: Array.from({ length: 50 }, (_, index) => `/srv/output/${index}`), network: true }
+  const { onRespond } = renderCard({ requestId: 'long-scope', toolName: 'Additional permissions', native: { permissions, availableDecisions: ['accept', 'decline'] } })
+  const preview = screen.getByText((_text, node) => node?.tagName === 'PRE')
+  expect(preview).not.toBeVisible()
+  fireEvent.click(screen.getByRole('button', { name: 'Allow', exact: true }))
+  expect(onRespond).toHaveBeenCalledWith({ nativeDecision: 'accept' })
+  fireEvent.click(screen.getByText('Request details'))
+  expect(preview).toBeVisible()
+  expect(JSON.parse(preview.textContent ?? '')).toEqual({ permissions })
 })
