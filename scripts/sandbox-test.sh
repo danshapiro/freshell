@@ -141,6 +141,7 @@ else
   CODEX_NATIVE_CONTRACT=0
   if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     case "${CMD}" in
+      'pnpm run test:vitest run test/integration/providers/codex-cli-contract.test.ts --config config/vitest/vitest.config.ts' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario all' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario model-effort-usage' | \
       'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe' | \
