@@ -26,7 +26,7 @@ Apply the smallest reliable fixes for the flaky supervisor lock timeout (`arnn`)
 
 ## Global Constraints
 
-- Work in `/home/dan/code/freshell/.worktrees/minimal-supervisor-cleanup` on `the-usual/minimal-supervisor-cleanup`, originally based on `7c3fd19511237be62485d03dda585eaf47d86eff` and now rebased onto `origin/main` at `5713b29ebd753608033598ea48faea707d64546d`.
+- Work in `/home/dan/code/freshell/.worktrees/minimal-supervisor-cleanup` on `the-usual/minimal-supervisor-cleanup`, originally based on `7c3fd19511237be62485d03dda585eaf47d86eff` and now rebased onto `origin/main` at `222d1f225`.
 - Use pnpm `10.34.5` and frozen-lockfile installs. Use repo-owned test runners rather than raw Vitest or Cargo.
 - Route Rust tests through `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust ...`; run process-kill test suites through `scripts/sandbox-test.sh`.
 - Keep the configured cloud Vitest backend. Do not substitute a local backend if the cloud path fails.
