@@ -357,12 +357,12 @@ test.describe('Freshopencode model + thinking selector', () => {
     await enableFreshClientsAndOpencode(page)
     await createFreshopencodePane(page, cwd)
 
-    const chip = (label: string) => page.getByRole('button', { name: `Model: ${label} — change model` })
+    const chip = (label: string, effort: string) => page.getByRole('button', { name: `Model: ${label} ${effort} — change model` })
 
     // The stubbed snapshot reports the PRE-change model in settings.model —
     // the stale live-session term the chip prefers over the staged pick (the
     // exact mask the live servers used to trap the chip on).
-    await expect(chip('GLM 5.2')).toBeVisible({ timeout: 15_000 })
+    await expect(chip('GLM 5.2', 'max')).toBeVisible({ timeout: 15_000 })
 
     // Commit DeepSeek V4 Pro · low through the shared dialog.
     const settings = await openFreshAgentSettings(page)
@@ -393,7 +393,7 @@ test.describe('Freshopencode model + thinking selector', () => {
 
     // Before the server answers, the chip still shows the stale snapshot's
     // live model — the staged pick is masked by the (stale) session truth.
-    await expect(chip('GLM 5.2')).toBeVisible({ timeout: 5_000 })
+    await expect(chip('GLM 5.2', 'low')).toBeVisible({ timeout: 5_000 })
 
     // The server's freshAgent.session.metadata broadcast states the applied
     // pair: the chip flips IMMEDIATELY, over the stale snapshot term.
@@ -409,12 +409,12 @@ test.describe('Freshopencode model + thinking selector', () => {
         effort: 'low',
       },
     })
-    await expect(chip('DeepSeek V4 Pro')).toBeVisible({ timeout: 10_000 })
-    await expect(chip('DeepSeek V4 Pro')).toHaveAttribute(
+    await expect(chip('DeepSeek V4 Pro', 'low')).toBeVisible({ timeout: 10_000 })
+    await expect(chip('DeepSeek V4 Pro', 'low')).toHaveAttribute(
       'title',
       'deepseek/deepseek-v4-pro · effort low',
     )
-    await expect(chip('GLM 5.2')).toHaveCount(0)
+    await expect(chip('GLM 5.2', 'low')).toHaveCount(0)
   })
 
   test('/model in the composer opens the same dialog', async ({
