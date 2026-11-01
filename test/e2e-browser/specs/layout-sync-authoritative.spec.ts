@@ -16,6 +16,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
+import { RawWsClient } from '../helpers/raw-clients.js'
 
 const LAYOUT_SYNC_DEBOUNCE_MS = 1000
 /** @dnd-kit/core's AbstractPointerSensor removes its post-drag document
@@ -257,137 +258,125 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
     expect(betaTree.type).toBe('leaf')
   })
 
-  test('ingested legacy agent-chat subtree is normalized server-side on read', async ({ freshellPage: _freshellPage, page, harness, serverInfo }) => {
+  test('ingested legacy agent-chat subtree is normalized server-side on read', async ({ serverInfo }) => {
     test.setTimeout(60_000)
-    await harness.waitForConnection()
-
-    const canonical = '11111111-1111-4111-8111-111111111111'
-    // ui.layout.sync is whole-snapshot last-write-wins and the REAL client in
-    // this page keeps emitting its own syncs (layoutMirrorMiddleware, 200ms
-    // debounce) on every tabs/panes-affecting Redux action — e.g. the
-    // terminal-spawn/boot burst after page load. Any such sync that lands
-    // The poll below therefore re-asserts the injection on every iteration,
-    // so the normalized read is observed from an iteration that is the last
-    // writer (converges once the client's boot burst settles, deterministically).
-    const injectLegacySync = () =>
-      page.evaluate(
-        ({ canonical }) => {
-          window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
-            type: 'ui.layout.sync',
-            tabs: [{ id: 'tab-legacy-remote', title: 'Remote legacy' }],
-            activeTabId: 'tab-legacy-remote',
-            layouts: {
-              'tab-legacy-remote': {
-                type: 'split',
-                id: 'split-legacy',
-                direction: 'horizontal',
-                sizes: [55, 45],
-                children: [
-                  {
-                    type: 'leaf',
-                    id: 'pane-legacy-agent',
-                    content: {
-                      kind: 'agent-chat',
-                      provider: 'claude',
-                      createRequestId: 'req-legacy-agent',
-                      status: 'idle',
-                      resumeSessionId: canonical,
-                    },
-                  },
-                  {
-                    type: 'leaf',
-                    id: 'pane-legacy-editor',
-                    content: { kind: 'editor', filePath: '/tmp/notes.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
-                  },
-                ],
-              },
-            },
-            activePane: { 'tab-legacy-remote': 'pane-legacy-agent' },
-            paneTitles: {},
-            paneTitleSetByUser: {},
-            timestamp: Date.now(),
-          })
-        },
-        { canonical },
-      )
-    await injectLegacySync()
-
-    let snapshot!: Snapshot
-    // Pane listing captured in the SAME poll iteration as the snapshot read —
-    // a re-fetch after the poll could race a fresh client sync (same LWW stomp).
-    let panes: any
-    let debugLast: unknown
-    const harnessHasSend = await page.evaluate(
-      () => typeof window.__FRESHELL_TEST_HARNESS__?.sendWsMessage,
-    )
+    const client = await RawWsClient.connect(serverInfo.wsUrl)
     try {
-      await expect
-        .poll(
-          async () => {
-            await injectLegacySync()
-            const data = await fetchWithAuth(
-              serverInfo,
-              `/api/layout/snapshot?tabId=${encodeURIComponent('tab-legacy-remote')}`,
-            ).catch((err) => ({ fetchError: String(err) }))
-            debugLast = data
-            const layout = (data as Snapshot | null)?.layouts?.['tab-legacy-remote']
-            if (!layout || JSON.stringify(layout).includes('"agent-chat"')) return false
-            // The pane listing must be validated in the SAME stomp-free
-            // iteration as the snapshot: a client sync landing BETWEEN the two
-            // fetches would erase the injected tab and return [] here.
-            const panesData: any = await fetchWithAuth(
-              serverInfo,
-              `/api/panes?tabId=${encodeURIComponent('tab-legacy-remote')}`,
-            ).catch(() => null)
-            const rows: any[] = panesData?.panes ?? []
-            const panesOk =
-              rows.length === 2
-              && rows[0]?.id === 'pane-legacy-agent' && rows[0]?.index === 0
-              && rows[0]?.kind === 'fresh-agent' && rows[0]?.title === 'Freshclaude'
-              && rows[1]?.id === 'pane-legacy-editor' && rows[1]?.index === 1
-              && rows[1]?.kind === 'editor' && rows[1]?.title === 'notes.md'
-            if (!panesOk) { debugLast = { data, panesData }; return false }
-            snapshot = data as Snapshot
-            panes = panesData
-            return true
+      const ready = client.nextJsonMessage('ready', 15_000)
+      client.hello(serverInfo.token)
+      await ready
+      const canonical = '11111111-1111-4111-8111-111111111111'
+      // This is a server-ingestion contract. One raw connection owns the
+      // synthetic legacy snapshot; no browser layout mirror can replace it
+      // between the snapshot and pane-list reads.
+      client.sendJson({
+        type: 'ui.layout.sync',
+        tabs: [{ id: 'tab-legacy-remote', title: 'Remote legacy' }],
+        activeTabId: 'tab-legacy-remote',
+        layouts: {
+          'tab-legacy-remote': {
+            type: 'split',
+            id: 'split-legacy',
+            direction: 'horizontal',
+            sizes: [55, 45],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-legacy-agent',
+                content: {
+                  kind: 'agent-chat',
+                  provider: 'claude',
+                  createRequestId: 'req-legacy-agent',
+                  status: 'idle',
+                  resumeSessionId: canonical,
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-legacy-editor',
+                content: { kind: 'editor', filePath: '/tmp/notes.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
+              },
+            ],
           },
-          { timeout: 15_000, intervals: [500, 1000, 2000] },
+        },
+        activePane: { 'tab-legacy-remote': 'pane-legacy-agent' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        timestamp: Date.now(),
+      })
+
+      let snapshot!: Snapshot
+      // ui.layout.sync has no acknowledgment; REST observation is the
+      // ingestion barrier. The fixture is sent once and remains authoritative.
+      let panes: any
+      let debugLast: unknown
+      try {
+        await expect
+          .poll(
+            async () => {
+              const data = await fetchWithAuth(
+                serverInfo,
+                `/api/layout/snapshot?tabId=${encodeURIComponent('tab-legacy-remote')}`,
+              ).catch((err) => ({ fetchError: String(err) }))
+              debugLast = data
+              const layout = (data as Snapshot | null)?.layouts?.['tab-legacy-remote']
+              if (!layout || JSON.stringify(layout).includes('"agent-chat"')) return false
+              // Both read surfaces must expose this same normalized fixture.
+              const panesData: any = await fetchWithAuth(
+                serverInfo,
+                `/api/panes?tabId=${encodeURIComponent('tab-legacy-remote')}`,
+              ).catch(() => null)
+              const rows: any[] = panesData?.panes ?? []
+              const panesOk =
+                rows.length === 2
+                && rows[0]?.id === 'pane-legacy-agent' && rows[0]?.index === 0
+                && rows[0]?.kind === 'fresh-agent' && rows[0]?.title === 'Freshclaude'
+                && rows[1]?.id === 'pane-legacy-editor' && rows[1]?.index === 1
+                && rows[1]?.kind === 'editor' && rows[1]?.title === 'notes.md'
+              if (!panesOk) { debugLast = { data, panesData }; return false }
+              snapshot = data as Snapshot
+              panes = panesData
+              return true
+            },
+            { timeout: 15_000, intervals: [500, 1000, 2000] },
+          )
+          .toBe(true)
+      } catch (err) {
+        const tabsNow = await fetchWithAuth(serverInfo, '/api/tabs').catch((e) => String(e))
+        throw new Error(
+          'normalized layout never appeared over REST. ' +
+            `GET /api/tabs=${JSON.stringify(tabsNow)} last snapshot read=${JSON.stringify(debugLast)} ` +
+            `cause=${err}`,
         )
-        .toBe(true)
-    } catch (err) {
-      const tabsNow = await fetchWithAuth(serverInfo, '/api/tabs').catch((e) => String(e))
-      throw new Error(
-        `normalized layout never appeared over REST. sendWsMessage=${harnessHasSend} ` +
-          `GET /api/tabs=${JSON.stringify(tabsNow)} last snapshot read=${JSON.stringify(debugLast)} ` +
-          `cause=${err}`,
-      )
+      }
+
+      // Byte-exact migrated content + derived seeded titles.
+      const tree = snapshot.layouts['tab-legacy-remote']
+      expect(tree.type).toBe('split')
+      expect(tree.sizes).toEqual([55, 45])
+      expect(tree.children![0].content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-legacy-agent',
+        sessionRef: { provider: 'claude', sessionId: canonical },
+      })
+      expect(tree.children![1].content).toMatchObject({ kind: 'editor', filePath: '/tmp/notes.md' })
+      expect(snapshot.paneTitles?.['tab-legacy-remote']).toEqual({
+        'pane-legacy-agent': 'Freshclaude',
+        'pane-legacy-editor': 'notes.md',
+      })
+      expect(snapshot.activePane).toEqual({ 'tab-legacy-remote': 'pane-legacy-agent' })
+      expect(snapshot.activeTabId).toBe('tab-legacy-remote')
+
+      // The pane listing for the tab resolves the same (normalized) content.
+      // Both were captured from the same stable injected snapshot.
+      expect(panes.panes).toEqual([
+        expect.objectContaining({ id: 'pane-legacy-agent', index: 0, kind: 'fresh-agent', title: 'Freshclaude' }),
+        expect.objectContaining({ id: 'pane-legacy-editor', index: 1, kind: 'editor', title: 'notes.md' }),
+      ])
+    } finally {
+      await client.dispose()
     }
-
-    // Byte-exact migrated content + derived seeded titles.
-    const tree = snapshot.layouts['tab-legacy-remote']
-    expect(tree.type).toBe('split')
-    expect(tree.sizes).toEqual([55, 45])
-    expect(tree.children![0].content).toMatchObject({
-      kind: 'fresh-agent',
-      sessionType: 'freshclaude',
-      provider: 'claude',
-      createRequestId: 'req-legacy-agent',
-      sessionRef: { provider: 'claude', sessionId: canonical },
-    })
-    expect(tree.children![1].content).toMatchObject({ kind: 'editor', filePath: '/tmp/notes.md' })
-    expect(snapshot.paneTitles?.['tab-legacy-remote']).toEqual({
-      'pane-legacy-agent': 'Freshclaude',
-      'pane-legacy-editor': 'notes.md',
-    })
-    expect(snapshot.activePane).toEqual({ 'tab-legacy-remote': 'pane-legacy-agent' })
-    expect(snapshot.activeTabId).toBe('tab-legacy-remote')
-
-    // The pane listing for the tab resolves the same (normalized) content.
-    // (`panes` was captured alongside `snapshot` in the converged poll
-    // iteration above — after the injection won the last-writer race.)
-    expect(panes.panes).toEqual([
-      expect.objectContaining({ id: 'pane-legacy-agent', index: 0, kind: 'fresh-agent', title: 'Freshclaude' }),
-      expect.objectContaining({ id: 'pane-legacy-editor', index: 1, kind: 'editor', title: 'notes.md' }),
-    ])
   })
 })
