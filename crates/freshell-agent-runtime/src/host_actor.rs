@@ -1213,6 +1213,8 @@ impl FreshAgentHostActor {
                     != Some(identity.native_session_id.as_str());
                 state.profile.native_session_id = Some(identity.native_session_id.clone());
                 state.profile.naming_handle = identity.pending_naming_handle.clone();
+                *self.observed_native_session_id.lock().await =
+                    Some(identity.native_session_id.clone());
                 if changed {
                     if let Some(reference) = state.profile.session_ref.as_mut() {
                         reference.session_id = identity.native_session_id.clone();
