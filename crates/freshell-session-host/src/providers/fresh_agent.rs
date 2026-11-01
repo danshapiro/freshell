@@ -3116,7 +3116,14 @@ mod tests {
         diagnostic: broadcast::Receiver<String>,
         dir: tempfile::TempDir,
         _exec_dir: tempfile::TempDir,
-        _environment: SnapshotProviderEnv,
+        _environment: NativeCodexFixtureEnvironment,
+    }
+
+    // Keep restoration and its lock together even when a fixture is destructured
+    // into local bindings. Fields drop in declaration order, so the snapshot is
+    // restored before another fixture may acquire the environment lock.
+    struct NativeCodexFixtureEnvironment {
+        _snapshot: SnapshotProviderEnv,
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
@@ -3192,8 +3199,10 @@ await import({});
             diagnostic,
             dir,
             _exec_dir: exec_dir,
-            _environment,
-            _lock,
+            _environment: NativeCodexFixtureEnvironment {
+                _snapshot: _environment,
+                _lock,
+            },
         }
     }
 
@@ -4868,7 +4877,6 @@ await import(parameters.source)
             dir,
             _exec_dir,
             _environment,
-            _lock,
         } = native_codex_fixture(json!({"recordTurns":true})).await;
         // Move the factory's only transport handle into the real production
         // actor. No direct fixture handle can keep its bridge guard alive.
