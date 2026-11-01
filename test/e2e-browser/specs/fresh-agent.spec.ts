@@ -1,5 +1,6 @@
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { openFreshHistorySession, splitFreshBrowserPane } from '../helpers/managed-runtime.js'
 
 // The browser-preferences persist path debounces localStorage writes by
 // 500ms; wait past it before reading the blob.
@@ -370,6 +371,87 @@ async function seedIndexedClaudeContextUsage(
 }
 
 test.describe('Fresh Agent', () => {
+  for (const expanded of [false, true]) {
+    test(`opens exact fresh history with sidebar collision and project ${expanded ? 'expanded' : 'collapsed'}`, async ({ freshellPage, page, terminal, harness }) => {
+      await terminal.waitForTerminal()
+      const sessionId = '63333000-0000-4333-8333-000000000178'
+      const repoRoot = '/home/user/code/freshell'
+      const checkoutPath = repoRoot + '/.worktrees/managed-history'
+      await stubFreshclaudeThread(page, sessionId)
+      await installFreshclaudeStripPane(page, sessionId)
+      const { tabId, paneId } = await getActiveLeaf(harness)
+      const originalLayout = await harness.getPaneLayout(tabId)
+      const originalTabCount = await harness.getTabCount()
+      await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true))
+      let directoryResponses = 0
+      const target = { sessionId, provider: 'claude', sessionType: 'freshclaude', projectPath: repoRoot,
+        cwd: checkoutPath, checkoutPath, title: 'Exact fresh history target', lastActivityAt: Date.now(), isRunning: false }
+      await page.route('**/api/session-directory?*', async route => {
+        directoryResponses += 1
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+          items: [target,
+            { ...target, provider: 'codex', sessionType: 'freshcodex', title: 'Other provider same root' },
+            { ...target, sessionId: 'other-native-root', title: 'Other native root' },
+            { ...target, projectPath: repoRoot + '-other', sessionId: 'other-project-root', title: 'Other project' }],
+          nextCursor: null, revision: 178,
+        }) })
+      })
+      await page.getByRole('button', { name: /^Projects/ }).click()
+      await page.getByRole('button', { name: 'Refresh sessions' }).click()
+      const project = page.locator('[data-context="history-project"][data-project-path="' + repoRoot + '"]')
+      const history = page.locator('[data-context="history-session"][data-provider="claude"][data-session-id="' + sessionId + '"]')
+      await expect(project).toBeVisible()
+      if (expanded) await project.click()
+      await expect(history).toHaveCount(expanded ? 1 : 0)
+      const sidebar = page.locator('[data-context="sidebar-session"][data-provider="claude"][data-session-id="' + sessionId + '"]')
+      await expect(sidebar).toBeVisible()
+      await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+      const responsesBeforeOpen = directoryResponses
+      const framesBeforeOpen = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.().length ?? 0)
+
+      await openFreshHistorySession(page, { repoRoot: checkoutPath, provider: 'claude', nativeSessionId: sessionId })
+
+      expect(directoryResponses).toBeGreaterThan(responsesBeforeOpen)
+      await expect(page.getByRole('heading', { name: 'Projects', exact: true })).toHaveCount(0)
+      await expect(page.locator('[data-context="fresh-agent"][data-pane-id="' + paneId + '"]')).toBeVisible()
+      expect(await harness.getActiveTabId()).toBe(tabId)
+      expect(await harness.getTabCount()).toBe(originalTabCount)
+      expect(await harness.getPaneLayout(tabId)).toEqual(originalLayout)
+      const frames = await page.evaluate(cursor => window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.().slice(cursor) ?? [], framesBeforeOpen)
+      // Opening this indexed root reuses the existing allocation. The fixture
+      // records suppressed lifecycle intents and must never create or send.
+      expect(frames.filter((frame: any) => ['freshAgent.create', 'freshAgent.send'].includes(frame.type))).toEqual([])
+      for (const frame of frames.filter((frame: any) => frame.type === 'freshAgent.attach') as Array<{ sessionId: string; provider: string }>) {
+        expect(frame).toMatchObject({ sessionId, provider: 'claude' })
+      }
+    })
+  }
+
+  test('splits the observed fresh pane horizontally into a second pane and picker', async ({ freshellPage, page, terminal, harness }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000165'
+    await stubFreshclaudeThread(page, sessionId)
+    await installFreshclaudeStripPane(page, sessionId)
+    const { tabId, paneId } = await getActiveLeaf(harness)
+    const freshPane = page.locator('[data-context="fresh-agent"][data-pane-id="' + paneId + '"]')
+    await expect(freshPane).toBeVisible()
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true))
+
+    await splitFreshBrowserPane(page, paneId)
+
+    const layout = await harness.getPaneLayout(tabId)
+    expect(layout?.type).toBe('split')
+    expect(layout?.direction).toBe('horizontal')
+    expect(layout?.children).toHaveLength(2)
+    expect(layout?.children[0]).toMatchObject({ type: 'leaf', id: paneId, content: { kind: 'fresh-agent', sessionId } })
+    expect(layout?.children[1]).toMatchObject({ type: 'leaf', content: { kind: 'picker' } })
+    expect(layout?.children[1].id).not.toBe(paneId)
+    await expect(freshPane).toBeVisible()
+    await expect(page.locator('[data-context="pane-header"]')).toHaveCount(2)
+    await expect(page.getByRole('toolbar', { name: /pane type picker/i })).toHaveCount(1)
+    await expect(page.locator('[data-context="pane-picker"][data-pane-id="' + layout?.children[1].id + '"]')).toBeVisible()
+  })
+
   test('preserves queued follow-ups after exit and lets users review and cancel them', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     const sessionId = '63333000-0000-4333-8333-000000000099'
@@ -857,6 +939,27 @@ test.describe('Fresh Agent', () => {
   })
 
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    const creates: Array<Record<string, unknown>> = []
+    let routedSocketCount = 0
+    await page.routeWebSocket('**/ws', (socket) => {
+      routedSocketCount += 1
+      const upstream = socket.connectToServer()
+      socket.onMessage((data) => {
+        const message = JSON.parse(String(data)) as Record<string, unknown>
+        if (message.type === 'freshAgent.create') {
+          creates.push(message)
+          return // Observe the actual client payload without launching a provider.
+        }
+        upstream.send(data)
+      })
+      upstream.onMessage((data) => socket.send(data))
+    })
+    // Playwright installs its WebSocket constructor through a navigation init
+    // script. Reload the document so the real client uses the routed transport.
+    await page.reload()
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    await expect.poll(() => routedSocketCount, { message: 'The settings test must observe the replacement WebSocket' }).toBeGreaterThan(0)
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
     await previewFreshclaudeDefaults(page)
@@ -866,9 +969,7 @@ test.describe('Fresh Agent', () => {
       effort: 'high',
     })
 
-    await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
-    await suppressFreshAgentNetworkForActivePane(page)
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
@@ -882,16 +983,24 @@ test.describe('Fresh Agent', () => {
     expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     await expect(thinking).toHaveValue('high')
 
-    await expect.poll(async () => {
-      const sent = await harness.getSentWsMessages()
-      return sent.find((message: any) => message?.type === 'freshAgent.create') ?? null
-    }).toMatchObject({
+    const paneId = await page.locator('[data-context="fresh-agent"]').last().getAttribute('data-pane-id')
+    const pane = await page.evaluate((targetPaneId) => {
+      const state = window.__FRESHELL_TEST_HARNESS__!.getState()
+      const find = (node: any): any => node.type === 'leaf'
+        ? node.id === targetPaneId ? node.content : undefined
+        : node.children.map(find).find(Boolean)
+      return find(state.panes.layouts[state.tabs.activeTabId!])
+    }, paneId)
+    await expect.poll(() => creates[0] ?? null).toMatchObject({
       type: 'freshAgent.create',
+      requestId: pane.createRequestId,
+      paneId,
       sessionType: 'freshclaude',
       provider: 'claude',
       model: 'opus[1m]',
       effort: 'high',
     })
+    expect(creates).toHaveLength(1)
   })
 
   test('style setting persists per Fresh Agent pane type and applies serif rendering', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {

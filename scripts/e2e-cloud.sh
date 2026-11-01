@@ -424,6 +424,7 @@ cmd_push() {
 # Subcommand: run
 # ---------------------------------------------------------------------------
 cmd_run() {
+  cd "$ROOT"
   local local_mode=false
   local cloud_mode=false
   local force_build=false
@@ -568,6 +569,23 @@ cmd_run() {
     fi
   fi
 
+  # Validate the closed owned target before any identity, build or job action.
+  # JSON-quoted YAML values retain exact selections without exporting owner
+  # paths, OneCLI files, Docker access or local receipt destinations.
+  local managed_external_yaml managed_external=false
+  managed_external_yaml=$(cd "$ROOT" && pnpm exec tsx scripts/testing/e2e-external-target.ts cloud-metadata "${pw_args[@]}")
+  if [ -n "$managed_external_yaml" ]; then
+    managed_external=true
+    if $local_mode || [ "$shards" != "1" ]; then
+      echo "[e2e-cloud] ERROR: the owned external target requires configured Cloud and exactly one task." >&2
+      exit 1
+    fi
+    if [ "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" != "$(git -C "$ROOT" rev-parse HEAD)" ] || [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+      echo "[e2e-cloud] ERROR: the owned external target requires this exact clean candidate." >&2
+      exit 1
+    fi
+  fi
+
   if $local_mode; then
     echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: ${backend_source})"
     cd "$ROOT"
@@ -639,6 +657,60 @@ cmd_run() {
     fi
   fi
 
+  local managed_browser_digest=""
+  if $managed_external; then
+    managed_browser_digest=$(gcloud artifacts docker images describe "$IMAGE_REMOTE" \
+      $(account_flag) --project="$GCP_PROJECT" --format='value(image_summary.digest)')
+    if [[ ! "$managed_browser_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+      echo "[e2e-cloud] ERROR: exact managed browser image digest is unavailable." >&2
+      exit 1
+    fi
+    local managed_source_digest="$managed_browser_digest"
+    managed_browser_digest=$(node --input-type=module - "${IMAGE_REMOTE%:*}" "$managed_source_digest" "$GCP_ACCOUNT" <<'JS'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+try {
+  const [repository, sourceDigest, account] = process.argv.slice(2)
+  if (!/^[a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9-]+\/[a-z0-9_-]+\/[a-z0-9_-]+$/.test(repository)) throw new Error('repository')
+  const token = execFileSync('gcloud', ['auth', 'print-access-token', ...(account ? [`--account=${account}`] : [])], { encoding: 'utf8', timeout: 30_000 }).trim()
+  const imageTypes = ['application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json']
+  const indexTypes = ['application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json']
+  async function manifest(digest) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('digest')
+    const response = await fetch(`https://${repository.split('/')[0]}/v2/${repository.split('/').slice(1).join('/')}/manifests/${digest}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: [...indexTypes, ...imageTypes].join(', ') },
+      redirect: 'error', signal: AbortSignal.timeout(30_000),
+    })
+    if (!response.ok || response.headers.get('Docker-Content-Digest') !== digest) throw new Error('manifest response')
+    const raw = Buffer.from(await response.arrayBuffer())
+    if (raw.length > 2 * 1024 * 1024 || `sha256:${createHash('sha256').update(raw).digest('hex')}` !== digest) throw new Error('manifest content')
+    const document = JSON.parse(raw.toString('utf8'))
+    if (document.schemaVersion !== 2) throw new Error('manifest schema')
+    return document
+  }
+  const source = await manifest(sourceDigest)
+  let selectedDigest = sourceDigest
+  if (indexTypes.includes(source.mediaType)) {
+    if (!Array.isArray(source.manifests)) throw new Error('index')
+    const matches = source.manifests.filter(entry => entry.platform?.os === 'linux' && entry.platform?.architecture === 'amd64')
+    if (matches.length !== 1 || !imageTypes.includes(matches[0].mediaType)) throw new Error('platform')
+    selectedDigest = matches[0].digest
+    const selected = await manifest(selectedDigest)
+    if (!imageTypes.includes(selected.mediaType)) throw new Error('selected manifest')
+  } else if (!imageTypes.includes(source.mediaType)) throw new Error('manifest type')
+  console.log(selectedDigest)
+} catch {
+  console.error('[e2e-cloud] ERROR: exact candidate Linux amd64 image manifest could not be verified.')
+  process.exit(1)
+}
+JS
+    )
+    IMAGE_REMOTE="${IMAGE_REMOTE%:*}@${managed_browser_digest}"
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg sourceImageDigest "$managed_source_digest" --arg imageDigest "$managed_browser_digest" \
+      '{severity:"info", event:"managed_external_image_resolved", runId:$runId, candidateSha:$candidateSha, sourceImageDigest:$sourceImageDigest, imageDigest:$imageDigest}'
+  fi
+
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
   echo "[e2e-cloud]   Image:   $IMAGE_REMOTE"
   echo "[e2e-cloud]   Shards:  $shards"
@@ -663,6 +735,9 @@ cmd_run() {
     } > "$RUN_ENV_FILE"
   else
     echo 'PLAYWRIGHT_ARGS: ""' > "$RUN_ENV_FILE"
+  fi
+  if $managed_external; then
+    printf '%s\n' "$managed_external_yaml" >> "$RUN_ENV_FILE"
   fi
 
   # Cloud-lane WS-ready tolerance (kata j90s). Under gVisor the e2e Node
@@ -710,13 +785,34 @@ cmd_run() {
     exit 1
   fi
   echo "[e2e-cloud]   Job:     $RUN_JOB_NAME"
+  RUN_MANAGED_EXTERNAL=$managed_external
   cleanup_run_job() {
+    local initial_status=$? cleanup_ok=true
     if [ -n "${RUN_JOB_NAME:-}" ]; then
-      gcloud run jobs delete $(gcloud_flags) "$RUN_JOB_NAME" --quiet >/dev/null 2>&1 || true
+      if ${RUN_MANAGED_EXTERNAL:-false}; then
+        # Reuse the owner cleanup operation: observe identity, cancel any
+        # unfinished owned execution, delete the exact job and verify absence.
+        if ! jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+          --arg jobName "$RUN_JOB_NAME" --arg project "$GCP_PROJECT" --arg region "$GCP_REGION" --arg account "$GCP_ACCOUNT" \
+          '{runId:$runId,candidateSha:$candidateSha,jobName:$jobName,project:$project,region:$region,account:$account}' | \
+          pnpm exec tsx -e 'import fs from "node:fs"; import { cleanupOwnedExternalCloudJob } from "./scripts/testing/runtime-external-browser.ts"; cleanupOwnedExternalCloudJob(JSON.parse(fs.readFileSync(0,"utf8")))' >/dev/null 2>&1; then
+          cleanup_ok=false
+        fi
+        jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+          --arg jobName "$RUN_JOB_NAME" --argjson ok "$cleanup_ok" \
+          '{severity: (if $ok then "info" else "error" end), event:"managed_external_job_cleanup", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, ok:$ok}'
+      else
+        gcloud run jobs delete $(gcloud_flags) "$RUN_JOB_NAME" --quiet >/dev/null 2>&1 || true
+      fi
     fi
     if [ -n "${RUN_ENV_FILE:-}" ]; then
       rm -f "$RUN_ENV_FILE"
     fi
+    if ! $cleanup_ok; then
+      echo "[e2e-cloud] ERROR: exact owned job cleanup could not be verified." >&2
+      exit 1
+    fi
+    return "$initial_status"
   }
   trap cleanup_run_job EXIT
   trap 'exit 130' INT
@@ -731,6 +827,19 @@ cmd_run() {
   # shared-name reads — exceeded the per-case budgets across three
   # consecutive focused runs (retry-passing flakes), while the same specs
   # are 44/44 green locally at 3 workers.
+  local -a owned_job_labels=()
+  if $managed_external; then
+    owned_job_labels=("--labels=freshell-managed-run=$FRESHELL_RUNTIME_EXTERNAL_RUN_ID,freshell-managed-candidate=$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA")
+    if [ -z "$GCP_ACCOUNT" ]; then
+      echo "[e2e-cloud] ERROR: managed external cleanup requires a resolved Cloud identity." >&2
+      exit 1
+    fi
+    # Reserve the exact name before create: a lost create acknowledgement can
+    # leave a real job even when this launcher's EXIT trap cannot complete.
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg project "$GCP_PROJECT" --arg region "$GCP_REGION" --arg account "$GCP_ACCOUNT" \
+      '{severity:"info", event:"managed_external_job_reserved", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, project:$project, region:$region, account:$account}'
+  fi
   gcloud run jobs create $(gcloud_flags) "$RUN_JOB_NAME" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
@@ -738,7 +847,24 @@ cmd_run() {
     --max-retries=0 \
     --env-vars-file="$RUN_ENV_FILE" \
     --memory=4Gi \
-    --cpu=4
+    --cpu=4 "${owned_job_labels[@]}"
+  if $managed_external; then
+    local managed_job_image
+    if ! managed_job_image=$(gcloud run jobs describe $(gcloud_flags) "$RUN_JOB_NAME" --format=json | \
+      jq -er --arg jobName "$RUN_JOB_NAME" --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" \
+        --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" --arg image "$IMAGE_REMOTE" '
+        select(.metadata.name == $jobName
+          and .metadata.labels["freshell-managed-run"] == $runId
+          and .metadata.labels["freshell-managed-candidate"] == $candidateSha)
+        | .spec.template.spec.template.spec.containers
+        | select(length == 1 and .[0].image == $image) | .[0].image'); then
+      echo "[e2e-cloud] ERROR: exact owned job image observation is unavailable or changed." >&2
+      exit 1
+    fi
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg image "$managed_job_image" --arg imageDigest "$managed_browser_digest" \
+      '{severity:"info", event:"managed_external_job_created", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, image:$image, imageDigest:$imageDigest}'
+  fi
 
   # Start this run's job and capture the accepted execution ID immediately.
   # The external managed-environment target uses the dispatch receipt below
@@ -771,12 +897,49 @@ cmd_run() {
       --limit=1 || true)
   fi
 
+  if $managed_external && [ -n "$execution_id" ]; then
+    if [[ "$execution_id" != "$RUN_JOB_NAME"-* ]]; then
+      echo "[e2e-cloud] ERROR: observed execution differs from the exact owned job." >&2
+      exit 1
+    fi
+    local managed_execution_image managed_execution_json
+    if ! managed_execution_json=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" --format=json); then
+      managed_execution_json=null
+    fi
+    if ! managed_execution_image=$(jq -er --arg executionName "$execution_id" --arg image "$IMAGE_REMOTE" '
+        select(.metadata.name == $executionName) | .spec.template.spec.containers
+        | select(length == 1 and .[0].image == $image) | .[0].image' <<< "$managed_execution_json"); then
+      jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+        --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" --arg expectedImage "$IMAGE_REMOTE" \
+        --argjson observed "$managed_execution_json" '
+        def name: if type == "string" and test("^[A-Za-z0-9_./-]{1,300}$") then . else null end;
+        def image: if type == "string" and test("^([a-z0-9.-]+(/[A-Za-z0-9._-]+)+(:[A-Za-z0-9._-]+|@sha256:[a-f0-9]{64})|sha256:[a-f0-9]{64})$") then . else null end;
+        ($observed | if type == "object" then . else {} end) as $object
+        | $object.spec.template.spec.containers as $containers
+        | {severity:"error", event:"managed_external_execution_image_refused", runId:$runId, candidateSha:$candidateSha,
+          jobName:$jobName, executionName:$executionName, expectedImage:$expectedImage,
+          observedName:($object.metadata.name | name),
+          observedContainerCount:(if ($containers | type) == "array" then ($containers | length) else null end),
+          observedImages:(if ($containers | type) == "array" then ($containers | map(if type == "object" then .image | image else null end)) else null end)}'
+      echo "[e2e-cloud] ERROR: exact owned execution image observation is unavailable or changed." >&2
+      exit 1
+    fi
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" --arg image "$managed_execution_image" \
+      --arg imageDigest "$managed_browser_digest" \
+      '{severity:"info", event:"managed_external_job_execution", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, executionName:$executionName, image:$image, imageDigest:$imageDigest}'
+  fi
+
   if [ "$execute_exit" -ne 0 ]; then
     echo "[e2e-cloud] Cloud Run Job execution failed (exit code $execute_exit)."
     if [ -n "$execution_id" ]; then
       echo "[e2e-cloud] Fetching logs..."
       gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
     fi
+    exit 1
+  fi
+  if $managed_external && [ -z "$execution_id" ]; then
+    echo "[e2e-cloud] ERROR: exact managed execution identity is unavailable." >&2
     exit 1
   fi
 
@@ -981,6 +1144,27 @@ cmd_run() {
   if [ "$retry_evidence_count" -gt 0 ]; then
     echo "[e2e-cloud] ERROR: recovered Playwright retry evidence prevents a zero-flake cloud receipt."
     exit 1
+  fi
+
+  if $managed_external; then
+    local external_query external_raw external_cases external_attempt external_complete=false
+    external_query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND jsonPayload.runId=\"${FRESHELL_RUNTIME_EXTERNAL_RUN_ID}\" AND jsonPayload.candidateSha=\"${FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA}\" AND (jsonPayload.event=\"managed_external_case\" OR jsonPayload.event=\"managed_external_complete\")"
+    for external_attempt in 1 2 3 4 5; do
+      if external_raw=$(gcloud logging read "$external_query" $(account_flag) --project="$GCP_PROJECT" --format=json --limit=1000 2>/dev/null); then
+        if external_cases=$(printf '%s' "$external_raw" | pnpm exec tsx -e 'import fs from "node:fs"; import { parseExternalCloudExecutionEvents } from "./scripts/testing/runtime-external-browser.ts"; const entries=JSON.parse(fs.readFileSync(0,"utf8")); const cases=parseExternalCloudExecutionEvents(entries.map((entry: { jsonPayload?: unknown })=>entry.jsonPayload), {runId:process.env.FRESHELL_RUNTIME_EXTERNAL_RUN_ID!, candidateSha:process.env.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA!}); process.stdout.write(JSON.stringify(cases))' 2>/dev/null); then
+          external_complete=true
+          break
+        fi
+      fi
+      if [ "$external_attempt" -lt 5 ]; then sleep 3; fi
+    done
+    if ! $external_complete; then
+      echo "[e2e-cloud] ERROR: complete exact external execution observations are unavailable." >&2
+      exit 1
+    fi
+    jq -cn --arg runId "$FRESHELL_RUNTIME_EXTERNAL_RUN_ID" --arg candidateSha "$FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA" \
+      --arg jobName "$RUN_JOB_NAME" --arg executionName "$execution_id" --argjson cases "$external_cases" \
+      '{severity:"info", event:"managed_external_cloud_cases", runId:$runId, candidateSha:$candidateSha, jobName:$jobName, executionName:$executionName, cases:$cases}'
   fi
 
   echo "[e2e-cloud] All tasks completed successfully."

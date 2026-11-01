@@ -1,6 +1,7 @@
 import { defineConfig } from '@playwright/test'
 import baseConfig from './playwright.config.js'
-import { LOCAL_ONLY_SPECS } from './playwright.config.js'
+import { LOCAL_ONLY_SPECS, managedExternal } from './playwright.config.js'
+import { fileURLToPath } from 'node:url'
 
 // Cloud Run Playwright config.
 //
@@ -99,8 +100,8 @@ export default defineConfig({
   globalSetup: undefined,
   globalTeardown: undefined,
   forbidOnly: true,
-  retries: 2,
-  workers: 2,
+  retries: managedExternal ? 0 : 2,
+  workers: managedExternal ? 1 : 2,
   use: {
     ...baseConfig.use,
     // Keep the first failed attempt's trace, even when a later retry passes.
@@ -110,17 +111,18 @@ export default defineConfig({
   reporter: [
     ['line'],
     ['html', { open: 'never' }],
-    ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }]] : []),
+    ...(managedExternal ? [[fileURLToPath(new URL('../../scripts/testing/runtime-external-browser.ts', import.meta.url))] as const] : []),
+    ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }] as const] : []),
   ],
   grepInvert: CLOUD_SKIP_TITLES,
   projects: (baseConfig.projects ?? [])
     .filter(
       (p) => !['firefox', 'webkit', 'continuity-smoke'].includes(p.name ?? ''),
     )
-    .map((p) => ({
+    .map((p) => p.name === 'chromium-external-target' ? p : ({
       ...p,
       testIgnore: [
-        ...(p.testIgnore ?? []),
+        ...(Array.isArray(p.testIgnore) ? p.testIgnore : p.testIgnore ? [p.testIgnore] : []),
         ...CLOUD_SKIP_SPECS.map((s) => `**/${s}`),
       ],
     })),

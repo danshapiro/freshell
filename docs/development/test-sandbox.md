@@ -37,7 +37,13 @@ scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex <destructi
 
 `--runtime-suite` is intentionally incompatible with `--corpus`. It uses `--network none`, a
 read-only container root with only explicit tmpfs/bind/volume write locations and enables
-`no-new-privileges`. The root entrypoint may initialize cache-volume ownership, but it always drops
+`no-new-privileges` for the requested command. Before that container starts, a separate disposable
+container on the dedicated bridge prepares the fingerprinted Node dependencies and runs
+`cargo fetch --locked` when `Cargo.lock` exists. Only this fixed preparation has networking and
+a writable root; it never receives the requested command or mounts provider homes or admin
+sockets. Preparation failure stops the run before the requested command starts. The command's
+container reuses those volumes with Cargo in offline mode, so a cold cache needs no manual warm-up.
+The root entrypoint may initialize cache-volume ownership, but it always drops
 to the unprivileged `sandbox` UID before test code and the self-test verifies that test code has zero
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
 Docker socket; this wrapper never grants it to tests.
@@ -85,14 +91,33 @@ wrapper's CID/name settlement checks; unknown daemon state retains the
 control directory and an error receipt. Ordinary completion joins the guard
 before returning. The coordinator's watchdog limits and kill behavior remain
 unchanged.
-Warm dependency caches through the documented ordinary sandbox preparation
-before a strict run if needed; strict mode keeps its read-only home and no network.
+Strict mode automatically prepares the dependency caches before starting the requested command;
+that command keeps its read-only root and no network.
+The exact stopped-repair selector has a finite managed-runtime route:
+
+```bash
+scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored"
+```
+
+For this literal command only, the owner compiles the current supervisor library test
+harness with pinned Cargo, selects and copies that executable, and prepares three fresh
+historical fixtures through a restricted run-owned broker. The selected harness and its
+aborting children execute inside a disposable rootless container with UID0 mapped to
+the unprivileged host owner, zero capabilities, no network, a read-only root and only
+the private run directory writable. Private build artifacts mount read-only at their
+canonical host paths. The actual importer/read helpers still use UID65534:GID0 and
+their production permissions. No administrative socket, operator home or provider
+grant is mounted. The three parents must reach their named abort boundary, reopen the
+same surviving Registry files, and pass all original import/retraction assertions;
+compilation or listing alone is insufficient. The owner preserves logs and verifies
+exact container/helper/provider-volume cleanup. Every other selector retains the
+ordinary sandbox route, and combining this command with `--corpus` remains refused.
 
 ## Safety guarantees
 
 | What | Guarantee |
 |---|---|
-| Network | Ordinary mode uses the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` uses `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
+| Network | Ordinary mode and fixed dependency preparation use the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` commands use `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
 | Host processes | Container has its own PID namespace. Killing/crashing anything inside (including something literally named `freshell-server`) cannot reach a host process. |
 | `~/.freshell`, `~/.claude`, `~/.codex`, `~/.local/share/opencode` | Not mounted by default. `--corpus` mounts only `~/.codex/sessions` and `~/.claude/projects`, and only **read-only**. |
 | Repo | Bind-mounted read-write at `/workspace` so test output/artifacts are inspectable from the host. |
@@ -137,6 +162,7 @@ Named Docker volumes persist across runs to avoid re-fetching dependencies every
 of each is slower — see below):
 
 - `freshell-sandbox-cargo-registry`, `freshell-sandbox-cargo-git` — cargo's package cache
+- `freshell-sandbox-pnpm-store` — pnpm's downloaded package store.
 - `freshell-sandbox-rust-target-v1-<worktree-hash>` — **sandbox-owned**, not the host's
   `target/`. The hash is derived from the canonical host path of the working copy, so repeat runs
   reuse that copy's Rust build output while different copies get separate volumes. The ordinary
@@ -158,11 +184,17 @@ of each is slower — see below):
   branches these stay mounted but unused.
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
 
+Set `FRESHELL_SANDBOX_CACHE_PREFIX` to a unique Docker volume name prefix to use an
+independent set of the seven dependency and browser caches, including when running
+`scripts/sandbox-selftest.sh`. The default prefix is `freshell-sandbox`; paths are rejected
+to prevent accidentally mounting host directories. This setting does not change the canonical
+per-worktree Rust target volume. The cold-start regression creates and removes its own caches.
+
 Reset shared dependency and browser-download caches (these will re-warm on the next run):
 
 ```bash
 docker volume rm freshell-sandbox-cargo-registry freshell-sandbox-cargo-git \
-  freshell-sandbox-node-modules \
+  freshell-sandbox-pnpm-store freshell-sandbox-node-modules \
   freshell-sandbox-sidecar-node-modules freshell-sandbox-mcp-node-modules \
   freshell-sandbox-playwright-cache
 ```
@@ -188,7 +220,7 @@ same-copy reuse, runtime aliasing, cross-copy isolation, concurrent first use,
 Docker's running/stopped container reference checks, and recreation after an
 explicit scratch-volume removal. It removes only its own labeled volumes after
 checking that no container references them. `scripts/sandbox-selftest.sh`
-also runs this focused test as Proof 7.
+also runs this focused test as Proof 7, followed by cold strict startup as Proof 8.
 
 ## Rebuilding the image
 

@@ -6,17 +6,17 @@ use crate::registry::*;
 use freshell_runtime_protocol::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct RecoveryFixture {
+pub(super) struct RecoveryFixture {
     _root: tempfile::TempDir,
-    supervisor: Supervisor,
-    soul: SoulId,
-    start: RecoveryStart,
-    context: ProviderLaunchContext,
+    pub(super) supervisor: Supervisor,
+    pub(super) soul: SoulId,
+    pub(super) start: RecoveryStart,
+    pub(super) context: ProviderLaunchContext,
 }
 
 /// A retained Claude terminal with one accepted prepared-input generation,
 /// and a recovery attempt that begins from it.
-async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
+pub(super) async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
     recovery_fixture(budgets, "claude", false).await
 }
 
@@ -85,6 +85,7 @@ async fn recovery_fixture(
         .commit_created(
             prepared.incarnation_id,
             BackendCreatedRecord {
+                launch_policy: Default::default(),
                 daemon_id: DockerDaemonId::new(),
                 container_id: "callback-budget-container".into(),
                 image_ref: image.clone(),
@@ -216,8 +217,9 @@ async fn claude_recovery_callback_outlasts_an_ordinary_callback_with_a_live_scop
         .unwrap_err();
 
     server.await.expect("the server saw a live scope");
+    assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
     assert!(
-        error.message.contains("invalid scoped grant reference"),
+        error.message.contains("invalid exact provider preparation"),
         "the callback was answered, not timed out: {}",
         error.message
     );
@@ -261,7 +263,13 @@ async fn ordinary_callback_keeps_the_ordinary_wait() {
 async fn codex_replacement_callback_uses_validated_current_consumer() {
     for fresh in [false, true] {
         let fixture = recovery_fixture(budgets(1000, 1000), "codex", fresh).await;
-        let server = slow_callback_server(
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        let mut server = slow_callback_server(
             &fixture.supervisor,
             Duration::ZERO,
             b"not a prepared context",
@@ -286,11 +294,28 @@ async fn codex_replacement_callback_uses_validated_current_consumer() {
             )
             .await
             .unwrap_err();
-        server.await.unwrap();
-        assert!(
-            error.message.contains("invalid scoped grant reference"),
-            "{}",
-            error.message
-        );
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result.expect("current consumer callback must settle"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("current consumer callback was not dispatched or did not settle");
+            }
+        }
+        assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+        let after = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(after.write_fence(), before.write_fence());
+        assert_eq!(after.resume_spec, before.resume_spec);
+        assert!(fixture
+            .supervisor
+            .auth_lookup_authorities
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 }

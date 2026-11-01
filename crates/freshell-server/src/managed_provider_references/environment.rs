@@ -17,7 +17,7 @@ impl SourceEnvironment {
         original: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
         use freshell_platform::provider_environment_grants::{
-            read_environment_grant, read_opencode_auth_environment, EnvironmentProfile,
+            read_environment_grant_with_native_auth, read_opencode_auth_grant, EnvironmentProfile,
         };
         use freshell_runtime_protocol::ProviderSecretProfile;
         freshell_runtime_protocol::validate_provider_secrets("opencode", references)
@@ -44,27 +44,32 @@ impl SourceEnvironment {
                 ambient.insert(name.clone(), value);
             }
         }
+        // Establish the selected typed authority before decoding ENV, regardless
+        // of reference order. A well-known overlay alone is not native auth.
+        let selected_auth = references
+            .iter()
+            .find(|reference| reference.profile == ProviderSecretProfile::OpencodeOnecliAuthFile)
+            .map(|reference| {
+                read_opencode_auth_grant(std::path::Path::new(&reference.source_path), &names)
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let native_auth = selected_auth
+            .as_ref()
+            .is_some_and(|auth| auth.valid_native_auth);
+        let auth = selected_auth.map(|auth| auth.environment);
         let mut onecli = BTreeMap::new();
-        let mut auth = None;
         let mut relocated_files = BTreeMap::new();
         for reference in references {
             match reference.profile {
                 ProviderSecretProfile::OpencodeOnecliEnvironment => {
-                    let values = read_environment_grant(
+                    let values = read_environment_grant_with_native_auth(
                         std::path::Path::new(&reference.source_path),
                         EnvironmentProfile::Opencode,
+                        native_auth,
                     )
                     .map_err(|error| error.to_string())?;
                     onecli.extend(values.into_iter().filter(|(name, _)| names.contains(name)));
-                }
-                ProviderSecretProfile::OpencodeOnecliAuthFile => {
-                    auth = Some(
-                        read_opencode_auth_environment(
-                            std::path::Path::new(&reference.source_path),
-                            &names,
-                        )
-                        .map_err(|error| error.to_string())?,
-                    );
                 }
                 ProviderSecretProfile::OpencodeOnecliCaFile => {
                     let destination = reference
@@ -238,6 +243,146 @@ mod tests {
     }
     use freshell_runtime_protocol::ProviderSecretProfile;
     use std::os::unix::fs::PermissionsExt;
+
+    fn private_grant(
+        path: &std::path::Path,
+        raw: &str,
+        profile: ProviderSecretProfile,
+    ) -> ProviderSecretReference {
+        std::fs::write(path, raw).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ProviderSecretReference {
+            source_path: path.to_str().unwrap().into(),
+            profile,
+            provider_relative_path: None,
+        }
+    }
+
+    #[test]
+    fn managed_provider_source_environment_pairs_transport_with_selected_native_auth_in_any_order()
+    {
+        use super::super::sources::{LoadedSourceOccurrence, SourceOccurrence};
+        let owned = tempfile::tempdir().unwrap();
+        let grant = owned.path().join("environment.env");
+        let auth = owned.path().join("auth.json");
+        let ca = owned.path().join("ca.pem");
+        let config = owned.path().join("opencode.json");
+        let raw = r#"{"instructions":["{file:{env:NODE_EXTRA_CA_CERTS}}"]}"#;
+        std::fs::write(&config, raw).unwrap();
+        let references = [
+            private_grant(&grant, "HTTPS_PROXY=http://192.0.2.10:10255\nHTTP_PROXY=http://192.0.2.10:10255\nNODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\nNODE_USE_ENV_PROXY=1\nNO_PROXY=localhost,127.0.0.1\n", ProviderSecretProfile::OpencodeOnecliEnvironment),
+            private_grant(&auth, "{}", ProviderSecretProfile::OpencodeOnecliAuthFile),
+            private_grant(&ca, "synthetic-ca", ProviderSecretProfile::OpencodeOnecliCaFile),
+        ];
+        for auth_value in [
+            r#"{"openai":{"type":"api","key":"synthetic-native-key"}}"#,
+            r#"{"openai":{"type":"oauth","access":"synthetic-access","refresh":"synthetic-refresh","expires":1790000000000}}"#,
+        ] {
+            std::fs::write(&auth, auth_value).unwrap();
+            for order in [[0, 1, 2], [1, 2, 0]] {
+                let ordered = order.map(|index| references[index].clone());
+                let environment = SourceEnvironment::read(
+                    vec![
+                        "HTTPS_PROXY".into(),
+                        "NODE_EXTRA_CA_CERTS".into(),
+                        "OPENAI_API_KEY".into(),
+                    ],
+                    &ordered,
+                    &|_| None,
+                )
+                .expect("selected native auth permits a nonempty transport-only environment");
+                assert!(!environment.needs_native_auth());
+                assert_eq!(
+                    environment
+                        .lookup(SourceLane::Main, "HTTPS_PROXY")
+                        .as_deref(),
+                    Some("http://192.0.2.10:10255")
+                );
+                assert_eq!(
+                    environment
+                        .lookup(SourceLane::Tui, "HTTPS_PROXY")
+                        .as_deref(),
+                    Some("http://192.0.2.10:10255")
+                );
+                assert!(environment
+                    .lookup(SourceLane::Main, "OPENAI_API_KEY")
+                    .is_none());
+                assert!(
+                    environment.lookup(SourceLane::Main, "HTTP_PROXY").is_none(),
+                    "unselected transport values are not source lookup authority"
+                );
+                let plan = environment
+                    .plan_sources(
+                        vec![LoadedSourceOccurrence {
+                            requires_config_bind: false,
+                            mcp_ownership_snapshot: None,
+                            source: SourceOccurrence {
+                                logical_path: config.clone(),
+                                canonical_source: config.clone(),
+                                lane: SourceLane::Main,
+                                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
+                            },
+                            view: std::sync::Arc::new(raw.into()),
+                        }],
+                        owned.path(),
+                        owned.path(),
+                    )
+                    .unwrap();
+                assert_eq!(plan[0].references.selections[0].canonical_source, ca);
+                assert!(environment.frozen_inputs(&plan).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn managed_provider_source_environment_transport_requires_valid_selected_native_auth() {
+        let owned = tempfile::tempdir().unwrap();
+        let grant = owned.path().join("environment.env");
+        let auth = owned.path().join("auth.json");
+        let references = [
+            private_grant(
+                &grant,
+                "HTTPS_PROXY=http://192.0.2.10:10255\n",
+                ProviderSecretProfile::OpencodeOnecliEnvironment,
+            ),
+            private_grant(&auth, "{}", ProviderSecretProfile::OpencodeOnecliAuthFile),
+        ];
+        assert!(SourceEnvironment::read(vec![], &references[..1], &|_| None).is_err());
+        for raw in [
+            "",
+            "{}",
+            "[]",
+            "not-json-private-sentinel",
+            r#"{"OPENAI_API_KEY":"synthetic-codex-key"}"#,
+            r#"{"openai":{"type":"api","key":""}}"#,
+            r#"{"openai":{"type":"oauth","access":"synthetic-private-sentinel","expires":1790000000000}}"#,
+            r#"{"openai":{"type":"unsupported","key":"synthetic-private-sentinel"}}"#,
+            r#"{"source":{"type":"wellknown","key":"HTTPS_PROXY","token":"http://192.0.2.10:10255"}}"#,
+        ] {
+            std::fs::write(&auth, raw).unwrap();
+            let error = SourceEnvironment::read(vec!["HTTPS_PROXY".into()], &references, &|_| None)
+                .err()
+                .expect("invalid or source-lookup-only auth cannot authorize transport-only ENV");
+            assert!(!error.contains("private-sentinel"));
+        }
+        std::fs::write(
+            &auth,
+            r#"{"openai":{"type":"api","key":"synthetic-native-key"}}"#,
+        )
+        .unwrap();
+        std::fs::write(&grant, "# no child values\n").unwrap();
+        assert!(
+            SourceEnvironment::read(vec![], &references, &|_| None).is_err(),
+            "even valid native auth cannot authorize an empty child environment"
+        );
+        std::fs::write(&grant, "HTTPS_PROXY=http://192.0.2.10:10255\n").unwrap();
+        let mut mismatched = references.clone();
+        mismatched[1].profile = ProviderSecretProfile::CodexOnecliAuthFile;
+        assert!(SourceEnvironment::read(vec![], &mismatched, &|_| None).is_err());
+        std::fs::remove_file(&auth).unwrap();
+        assert!(SourceEnvironment::read(vec![], &references, &|_| None).is_err());
+    }
+
     #[test]
     fn managed_provider_source_environment_freezes_only_selected_original_inputs() {
         use super::super::sources::{LoadedSourceOccurrence, SourceOccurrence};
