@@ -27,7 +27,7 @@ export function FreshAgentNoticeStack({ notices, errors }: {
       <div className="fresh-agent-errors" role="region" aria-label="Agent errors">
         <span className="text-xs text-muted-foreground">{errors.length} {errors.length === 1 ? 'error' : 'errors'}</span>
         {errors.map(error => error.content === null ? (
-          <p key={error.id} data-agent-error={error.id} role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : undefined}>{error.summary}</p>
+          <p key={error.id} className="text-xs" data-agent-error={error.id} role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : undefined}>{error.summary}</p>
         ) : (
           <details key={error.id} data-agent-error={error.id}>
             <summary><span role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : undefined}>{error.summary}</span></summary>

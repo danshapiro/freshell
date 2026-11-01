@@ -624,3 +624,23 @@ test('Changes closes on programmatic and keyboard tab switches', async ({ freshe
     await expect(page.getByRole('button', {name: 'Diffs: 30 changed files'})).toHaveAttribute('aria-expanded','false')
   }
 })
+
+test('short panes keep warning summary text readable', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  await fitRoot(page, { width: 560 })
+  await fitRoot(page, { height: 320 })
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
+    event: { type: 'freshAgent.notice', level: 'warning', code: 'refusal', message: 'Send refused' },
+  }))
+  const warning = page.getByRole('alert', { name: 'Agent warning' })
+  await expect(warning).toHaveText('Send refused')
+  const geometry = await warning.evaluate(el => {
+    const rect = el.getBoundingClientRect(); const parent = el.closest('.fresh-agent-errors')!.getBoundingClientRect()
+    return { lineHeight: parseFloat(getComputedStyle(el).lineHeight), visibleHeight: Math.min(rect.bottom, parent.bottom) - Math.max(rect.top, parent.top) }
+  })
+  expect(geometry.visibleHeight).toBeGreaterThanOrEqual(geometry.lineHeight)
+  await assertUsefulSpace(page)
+})
