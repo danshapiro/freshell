@@ -213,6 +213,26 @@ pub type SidecarLivenessProbe = std::sync::Arc<
         + Sync,
 >;
 
+/// The freshopencode WS lane's live-turn status probe -- `(session_id) -> the
+/// WS session record's turn-derived status` (`"running"` while the session's
+/// registered turn task is unfinished, `"idle"` when it is not), or `None`
+/// when this process's WS lane holds no record for the id. Registered
+/// set-once by `FreshOpencodeState::new` (which shares this state), so the
+/// durable snapshot route ([`FreshAgentState::get_opencode_snapshot`]) can
+/// report the session's ACTUAL status -- the SAME derivation the
+/// existing-session attach broadcast asserts -- instead of a hardcoded idle.
+/// Unwired (no WS lane over this state, e.g. bare REST test rigs) keeps the
+/// route's honest idle default. Precedent: [`SidecarLivenessProbe`] solves the
+/// same cross-lane liveness problem with the same shape.
+pub type OpencodeTurnStatusProbe = std::sync::Arc<
+    dyn Fn(
+            &str,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<&'static str>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Handle pairing the shared gate with the permit-wait timeout
 /// (`CreateProtectConfig.spawn_timeout_ms`, resolved once in main.rs so both
 /// doors share one env snapshot).
@@ -2092,6 +2112,13 @@ pub struct FreshAgentState {
     panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
     /// The single lazily-started `opencode serve` client for this server process.
     opencode: SharedOpencodeManagerHandle,
+    /// The freshopencode WS lane's turn-status probe (see
+    /// [`OpencodeTurnStatusProbe`]): set-once by `FreshOpencodeState::new`
+    /// (which shares this state), consulted by
+    /// [`Self::get_opencode_snapshot`]'s live-status overlay so the durable
+    /// snapshot route reports the WS session record's actual turn-derived
+    /// status instead of a hardcoded idle.
+    opencode_turn_status: Arc<std::sync::OnceLock<OpencodeTurnStatusProbe>>,
     /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
     /// requests never touch this web process's legacy provider manager.
     hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
@@ -2442,6 +2469,7 @@ impl FreshAgentState {
             checkpoint_event_sink: CheckpointEventSink::default(),
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
+            opencode_turn_status: Arc::new(std::sync::OnceLock::new()),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
             local_claude_rest: Arc::new(std::sync::OnceLock::new()),
             local_codex_rest: Arc::new(std::sync::OnceLock::new()),
@@ -2501,6 +2529,20 @@ impl FreshAgentState {
         persister: CheckpointEventPersister,
     ) -> Result<(), &'static str> {
         self.checkpoint_event_sink.set_persister(persister)
+    }
+
+    /// Wire the freshopencode WS lane's turn-status probe (set-once; called by
+    /// `FreshOpencodeState::new`, which shares this state -- production and
+    /// every test rig construct the WS lane exactly once per REST state, so a
+    /// collision means a second lane was built over one state and the FIRST
+    /// lane's records stay authoritative for the route).
+    pub(crate) fn set_opencode_turn_status_probe(
+        &self,
+        probe: OpencodeTurnStatusProbe,
+    ) -> Result<(), &'static str> {
+        self.opencode_turn_status
+            .set(probe)
+            .map_err(|_| "opencode turn status probe is already installed")
     }
 
     /// Side-effect-free coordinator read for `(provider, session_id)`
@@ -3348,14 +3390,21 @@ impl FreshAgentState {
         // to the serve path below and surfaces as a real
         // `OpencodeSnapshotError::NotFound` (404).
         if thread_id.starts_with(OPENCODE_PLACEHOLDER_PREFIX) {
-            return Ok(build_opencode_snapshot_json(
+            let mut snapshot = build_opencode_snapshot_json(
                 thread_id,
                 &json!({}),
                 &json!([]),
                 // A placeholder id never has a rollback record (rollback needs a
                 // materialized session).
                 None,
-            ));
+            );
+            // A placeholder the WS lane tracks can already be running its
+            // first turn (a pane that has not folded the materialized frame
+            // yet refetches by this id): the same record's turn-derived status
+            // applies to this arm too.
+            self.apply_opencode_ws_turn_status(thread_id, &mut snapshot)
+                .await;
+            return Ok(snapshot);
         }
 
         // b8ke focused review FR2: the daemon capture — ONE observation of
@@ -3421,7 +3470,31 @@ impl FreshAgentState {
         // replay.
         self.ensure_child_watchers(&manager, thread_id, &snapshot);
         attach_child_activity(&manager, &route, &mut snapshot).await;
+        // The live-status overlay: a session this process's WS lane tracks
+        // reports its record's turn-derived status, never the built
+        // snapshot's session-record-blind idle.
+        self.apply_opencode_ws_turn_status(thread_id, &mut snapshot)
+            .await;
         Ok(snapshot)
+    }
+
+    /// The live-status overlay for the opencode snapshot route: when this
+    /// process's freshopencode WS lane holds a session record for `thread_id`
+    /// (keyed by BOTH the placeholder and the durable `ses_*` id), the route
+    /// reports the record's turn-derived status -- the SAME derivation the
+    /// existing-session attach broadcast asserts (the probe is
+    /// [`crate::OpencodeTurnStatusProbe`], registered by
+    /// `FreshOpencodeState::new` over this shared state) -- instead of the
+    /// built snapshot's hardcoded idle. No WS record (e.g. a
+    /// REST-lane-materialized session, the documented product gap) changes
+    /// nothing: the route keeps its honest idle rather than guessing.
+    async fn apply_opencode_ws_turn_status(&self, thread_id: &str, snapshot: &mut Value) {
+        let Some(probe) = self.opencode_turn_status.get() else {
+            return;
+        };
+        if let Some(status) = probe(thread_id).await {
+            snapshot["status"] = json!(status);
+        }
     }
 
     /// Ensure a live child→parent watcher exists for every child session this
@@ -4591,11 +4664,13 @@ pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Opt
 }
 
 /// `normalizeOpencodeSnapshot` (`normalize.ts:357-405`): map the session's own info + its
-/// message page into the `FreshAgentSnapshotSchema` shape. `status` always reports `idle`
-/// here -- this REST read has no live busy/idle bit to consult (that lives in the WS
-/// session's in-memory turn task, not the serve's own session record) -- an honest
-/// approximation the task report calls out; the client's WS-driven busy chrome already
-/// covers the live case, this endpoint's job is the committed transcript.
+/// message page into the `FreshAgentSnapshotSchema` shape. `status` carries the
+/// built-in `idle` default -- this REST read has no live busy/idle bit of its own
+/// (that lives in the WS session's in-memory turn task, not the serve's own session
+/// record) -- and [`FreshAgentState::apply_opencode_ws_turn_status`] overlays the
+/// WS session record's turn-derived status on it whenever this process tracks the
+/// session, so the route answers the session's ACTUAL status mid-turn instead of a
+/// false idle (the e1r2 report's materialization-blip evidence).
 fn build_opencode_snapshot_json(
     thread_id: &str,
     info: &Value,

@@ -104,6 +104,32 @@ describe('freshAgentSlice busy/streaming clearing', () => {
     expect(state.sessions[key].status).toBe('running')
   })
 
+  // A transient reservation does not end the turn. The fence-less
+  // mount-rebind attach for a just-materialized freshopencode session answers
+  // the typed SESSION_RESERVED refusal (FENCE_REQUIRED server-side — "re-
+  // observe the owner record and retry with the pair"), and the pane redrives
+  // the attach with the observed pair. The turn keeps running throughout, so
+  // the generic hard-error busy-clear must NOT fire here: it would
+  // manufacture a false mid-turn idle (the busy→idle edge retires the
+  // rewind epoch's in-flight capture window and kills the honest "still
+  // saving" hover while the turn is genuinely running). The error fields are
+  // still recorded — the pane's banner filter reads lastErrorCode to keep
+  // the transient reservation unsurfaced (Task 14).
+  it('sessionError (SESSION_RESERVED) records the refusal without clearing a running status', () => {
+    const reservedLoc = { sessionId: 'ses_reserved', sessionType: 'freshopencode' as const, provider: 'opencode' as const }
+    const reservedKey = makeFreshAgentSessionKey(reservedLoc)
+    let state = reducer(undefined, sessionSnapshotReceived({ ...reservedLoc, latestTurnId: null, status: 'running', streamingActive: true }))
+    state = reducer(state, sessionError({
+      ...reservedLoc,
+      message: "The attach carried no observed ownership pair; re-observe the session's owner record and retry",
+      code: 'SESSION_RESERVED',
+    }))
+    expect(state.sessions[reservedKey].status).toBe('running')
+    expect(state.sessions[reservedKey].streamingActive).toBe(true)
+    expect(state.sessions[reservedKey].lastErrorCode).toBe('SESSION_RESERVED')
+    expect(state.sessions[reservedKey].lastError).toContain('observed ownership pair')
+  })
+
   it('clearSessionError dismisses the banner: clears lastError/lastErrorCode without minting or mutating status', () => {
     let state = streaming()
     state = reducer(state, sessionError({ ...loc, message: 'boom', code: 'OPENCODE_COMPACT_FAILED' }))

@@ -2099,13 +2099,26 @@ impl CheckpointService {
             }
         }
         for record in records {
+            // Address the enriched frame to every id the session has lived
+            // under, mirroring the REST replay's alias discipline: a pane
+            // re-keyed by materialization holds the durable id, while a pane
+            // that has not processed the materialized frame yet still holds
+            // the capture-time placeholder. The client's locator + pending
+            // gates make the non-matching copies inert.
             if record.request_ids.is_empty() {
-                self.broadcast_outcome(record.outcome.clone());
+                for alias in &record.session_aliases {
+                    let mut outcome = record.outcome.clone();
+                    outcome.session_id = alias.clone();
+                    self.broadcast_outcome(outcome);
+                }
             } else {
                 for request_id in &record.request_ids {
-                    let mut outcome = record.outcome.clone();
-                    outcome.request_id = request_id.clone();
-                    self.broadcast_outcome(outcome);
+                    for alias in &record.session_aliases {
+                        let mut outcome = record.outcome.clone();
+                        outcome.request_id = request_id.clone();
+                        outcome.session_id = alias.clone();
+                        self.broadcast_outcome(outcome);
+                    }
                 }
             }
         }
@@ -8175,6 +8188,120 @@ mod tests {
                 Some(expected_display_turn_id.as_str())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn identity_re_broadcast_is_addressed_to_every_session_alias() {
+        // A freshopencode first message captures under the placeholder id, then
+        // materializes the durable ses_* id (observe_materialized appends it to
+        // session_aliases). The identity-enriched re-broadcast must reach a pane
+        // holding EITHER id, exactly like the REST replay path does.
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel(1024);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+        let send = FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "freshopencode-req1".to_string(),
+            session_type: SessionType::Freshopencode,
+            text: "turn text is not stored".to_string(),
+            cwd: Some(workspace_path.clone()),
+            images: None,
+            request_id: Some("req1".to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "V1StGXR8_Z5jdHi6B-myT".to_string(),
+                workspace: Some(FreshAgentCheckpointWorkspace {
+                    path: workspace_path,
+                    provenance: CheckpointWorkspaceProvenance::ResolvedProject,
+                }),
+            }),
+        };
+        let key = checkpoint_attempt_key(&send, "V1StGXR8_Z5jdHi6B-myT");
+        let resolved_workspace = ResolvedCheckpointWorkspace {
+            path: workspace.path().to_path_buf(),
+            provenance: "resolved-project".to_string(),
+        };
+        let mut record = service.new_record(
+            &send,
+            "V1StGXR8_Z5jdHi6B-myT",
+            "req1",
+            Some((&resolved_workspace, "")),
+            Ok("checkpoint-first-message".to_string()),
+        );
+        record.dispatch_started = true;
+        service.persist_outcome(&key, record).await.unwrap();
+
+        service
+            .persist_event_before_broadcast_with_match(
+                &json!({
+                    "type": "freshAgent.session.materialized",
+                    "provider": "opencode",
+                    "sessionType": "freshopencode",
+                    "previousSessionId": "freshopencode-req1",
+                    "sessionId": "ses_durable"
+                })
+                .to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        service
+            .persist_event_before_broadcast_with_match(
+                &json!({
+                    "type": "freshAgent.event",
+                    "provider": "opencode",
+                    "sessionId": "ses_durable",
+                    "sessionType": "freshopencode",
+                    "event": {
+                        "type": "checkpointTurnIdentity",
+                        "logicalAttemptId": "V1StGXR8_Z5jdHi6B-myT",
+                        "requestId": "req1",
+                        "sessionId": "ses_durable",
+                        "nativeTurnId": "msg_55c25d96e4445f67b35ea116686e169c",
+                        "displayTurnId": "msg_55c25d96e4445f67b35ea116686e169c"
+                    }
+                })
+                .to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut outcome_frames = Vec::new();
+        while let Ok(frame) = broadcast_rx.try_recv() {
+            let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if value["type"] == "freshAgent.checkpoint.outcome" {
+                outcome_frames.push(value);
+            }
+        }
+        let session_ids: Vec<&str> = outcome_frames
+            .iter()
+            .filter(|f| {
+                f["requestId"] == "req1"
+                    && f["nativeTurnId"] == "msg_55c25d96e4445f67b35ea116686e169c"
+            })
+            .map(|f| f["sessionId"].as_str().unwrap())
+            .collect();
+        assert!(
+            session_ids.contains(&"freshopencode-req1"),
+            "the still-placeholder pane keeps its frame: {session_ids:?}"
+        );
+        assert!(
+            session_ids.contains(&"ses_durable"),
+            "the materialized pane binds live: {session_ids:?}"
+        );
+        // No duplicate (request, session) pair.
+        let mut pairs = session_ids.iter().map(|s| ("req1", *s)).collect::<Vec<_>>();
+        pairs.sort();
+        pairs.dedup();
+        assert_eq!(pairs.len(), session_ids.len());
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ import { test, expect, createFreshE2ePage } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { expectNoRewindStatusText } from '../helpers/fresh-agent-transcript.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -117,8 +118,13 @@ test.describe('fresh-agent checkpoint availability', () => {
 
       const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(userTurn).toBeVisible({ timeout: 20_000 })
-      await expect(userTurn.getByRole('status', { name: 'Code rewind available for this message' }))
-        .toContainText('Code rewind is available for this message.')
+      // Rewind state lives on the hover button (the transcript status note is
+      // removed): the bound capture shows the enabled rewind button even while
+      // the provider turn is still running, and no status text renders.
+      await userTurn.hover()
+      const rewindAvailable = userTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewindAvailable).toBeEnabled()
+      await expectNoRewindStatusText(paneRoot)
       await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 30_000 })
 
       let content: any
@@ -144,8 +150,7 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedPane).toBeVisible({ timeout: 20_000 })
       const reloadedTurn = reloadedPane.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(reloadedTurn).toBeVisible({ timeout: 30_000 })
-      await expect(reloadedTurn.getByRole('status', { name: 'Code rewind available for this message' }))
-        .toContainText('Code rewind is available for this message.')
+      await expectNoRewindStatusText(reloadedPane)
       await reloadedTurn.hover()
       const rewind = reloadedTurn.getByRole('button', { name: 'Rewind code to here' })
       await expect(rewind).toBeEnabled()
@@ -247,10 +252,13 @@ test.describe('fresh-agent checkpoint availability', () => {
 
       const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(userTurn).toBeVisible({ timeout: 20_000 })
-      const unavailable = userTurn.getByRole('note', { name: 'Code rewind unavailable for this message' })
-      await expect(unavailable).toContainText('A selected project file could not be read')
-      await userTurn.hover()
-      await expect(userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+      // Mid-turn the pane is still running its provider turn: the capture
+      // already settled unavailable, so the uncertain window makes NO
+      // rewind claim at all on the landed row (the freshopencode MCP/CLI
+      // honesty spec pins the nothing-state deterministically behind its
+      // prompt gate, and the unit tests pin it too). What still holds
+      // mid-turn: no per-turn rewind status text renders anywhere.
+      await expectNoRewindStatusText(paneRoot)
       await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 30_000 })
 
       let content: any
@@ -281,6 +289,14 @@ test.describe('fresh-agent checkpoint availability', () => {
         return unavailableOutcome?.nativeTurnId
       }, { timeout: 30_000 }).toEqual(expect.any(String))
 
+      // The honest settled verdict: the turn's end returns it — the row
+      // binds the identity-enriched unavailable outcome, so the hover shows
+      // the disabled unavailable rewind with the exact server reason.
+      await userTurn.hover()
+      const unavailable = userTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(unavailable).toBeDisabled()
+      await expect(unavailable).toHaveAttribute('title', /A selected project file could not be read/)
+
       await page.evaluate(() => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
@@ -297,11 +313,11 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedPane).toBeVisible({ timeout: 20_000 })
       const reloadedUserTurn = reloadedPane.locator('[data-turn-role="user"]', { hasText: marker })
       await expect(reloadedUserTurn).toBeVisible({ timeout: 30_000 })
-      await expect(reloadedUserTurn.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-        .toContainText('A selected project file could not be read')
+      await expectNoRewindStatusText(reloadedPane)
       await reloadedUserTurn.hover()
-      await expect(reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' }))
-        .toBeDisabled()
+      const reloadedUnavailable = reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' })
+      await expect(reloadedUnavailable).toBeDisabled()
+      await expect(reloadedUnavailable).toHaveAttribute('title', /A selected project file could not be read/)
 
       // Provider ground truth: the send behind the unavailable checkpoint
       // really reached the provider as that checkpoint's turn. The fake

@@ -76,9 +76,13 @@ import type { RuntimeOwnerRecord } from '@/store/freshAgentTypes'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import {
+  coalesceSyntheticToolResultTurns,
   freshAgentSnapshotHasUserTurn,
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
+  isModernCheckpointTurn,
+  LOCAL_ECHO_TURN_ID_PREFIX,
+  reclassifyPtyNotificationTurns,
 } from '@shared/fresh-agent-turns'
 import {
   buildFreshAgentSlashCommandMenu,
@@ -154,6 +158,10 @@ import {
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = FRESH_AGENT_BUSY_STATUSES
+// Stable empty list for the transcript-turn source (snapshot turns) — the
+// ONE derivation feeds both the newest-user-row memo and the transcript's
+// turns prop, and its identity never churns on a missing snapshot.
+const EMPTY_TRANSCRIPT_TURNS: FreshAgentTurn[] = []
 // Copy for the stuck-notice card (role="alert") shown while the store carries
 // the deadman's 'stuck' status; recovery actions live on the card itself.
 const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
@@ -234,8 +242,12 @@ type LocalEcho = {
   text: string
   requestId: string
   submittedTurnId?: string
-  /** Turn keys captured at send time — used by the echo-landed check to
-   * distinguish the new server turn from pre-existing turns. Unlike the
+  /** Turn keys captured at send time — the send boundary. Persisted WITH
+   * the echo record (the store's echo normalizer keep-lists the field), so
+   * a reloaded pane restores the boundary and can prove which rows predate
+   * the send. Used by the echo-landed check to distinguish the new server
+   * turn from pre-existing turns, and by the newest-ness derivation to keep
+   * a restored echo current beside earlier rows. Unlike the
    * previous-snapshot turns, these never include the just-sent turn, so
    * the text-match guard cannot permanently block the echo from clearing
    * if the first snapshot's text match fails (e.g. the server normalises
@@ -254,6 +266,14 @@ type PendingSendMetadata = {
   checkpointAvailabilityScope?: string
   checkpointWorkspace?: NonNullable<FreshAgentPaneContent['checkpointWorkspace']>
   logicalAttemptId?: string
+  /** The pane's busy-epoch at dispatch time (see `busyEpochRef`). The send's
+   * capture is "in flight" only while the pane is still in THIS busy
+   * window: every busy→idle edge advances the epoch — at the edge itself,
+   * or at the still-pending echo's clear when the edge passed before the
+   * row landed — so a retained un-enriched entry goes stale the moment its
+   * turn settles and can never mark a LATER busy window (e.g. an
+   * MCP/CLI-driven turn) as saving. */
+  busyEpoch?: number
   checkpointOutcome?: CheckpointTurnAvailability
   submittedTurnId?: string
   legacyAccepted?: boolean
@@ -410,15 +430,85 @@ function checkpointAvailabilityMatchesTurn(
 
 const MODERN_TURN_CHECKPOINT_UNAVAILABLE = 'No exact code checkpoint is available for this message.'
 
-function isModernCheckpointTurn(turn: FreshAgentTurn): boolean {
-  // Current provider snapshots mark materialized/live turns with their source;
-  // providers that expose an exact native identity are modern even when an
-  // older server omitted that source field. Older snapshots with neither keep
-  // the legacy label-based rewind path.
-  return Boolean(turn.nativeTurnId)
-    || turn.source === 'durable'
-    || turn.source === 'live'
-    || turn.source === 'server'
+// The fallback for a modern turn with no bound checkpoint outcome. Agent
+// response turns are never rewindable and never even considered (defect 2).
+// "Still saving" (defect 4) belongs to the NEWEST user row only, while this
+// pane's agent turn is running AND this pane's own composer send has a
+// checkpoint capture genuinely in flight: an MCP/CLI-driven turn sends
+// through the REST lane with no capture at all, so its row must never claim
+// a save is underway even while the pane is busy. The UNCERTAIN window —
+// newest user row, busy, but nothing this pane can evidence as in flight
+// (an MCP/CLI-driven turn; a mid-turn reload whose fresh mount has no send
+// metadata; a capture that already settled) makes NO claim at all: undefined,
+// the User Request's explicit "(or nothing)" acceptance. Older unbound rows
+// (historical MCP/CLI-driven turns) keep the honest unavailable verdict —
+// nothing is being saved for them even while a later turn runs — and the
+// newest row's honest unavailable verdict returns at the busy→idle settle.
+// Every state here is computed, never stored: each dies at the busy→idle
+// edge and at the capture-enrichment edge, so none can wedge.
+export function unboundRewindAvailability(
+  turn: FreshAgentTurn,
+  agentBusy: boolean,
+  isNewestUserTurn: boolean,
+  captureInFlight: boolean,
+): FreshAgentTurnRewindAvailability | undefined {
+  if (turn.role !== 'user') return undefined
+  if (!isModernCheckpointTurn(turn)) return undefined
+  if (agentBusy && isNewestUserTurn && !captureInFlight) return undefined
+  return agentBusy && isNewestUserTurn
+    ? { status: 'pending' }
+    : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
+}
+
+// True while this pane has a composer send whose checkpoint capture has not
+// yet been identity-enriched AND whose dispatch busy window is still the
+// pane's CURRENT busy window. The barrier-time outcome frame carries the
+// send's logicalAttemptId but no native row ids; the identity-enriched
+// outcome adds nativeTurnId. An attempt's outcome counts as "capture in
+// flight" ONLY while the capture SUCCEEDED (status exactly 'available') and
+// its identity observation is still pending (no nativeTurnId) — covering
+// BOTH the pre-barrier window (no outcome yet) and the post-barrier
+// pre-identity window — but only for as long as the pane stays in the busy
+// window the send's turn runs in: `currentBusyEpoch` is the pane's busy-epoch
+// (advanced at every turn-settling busy→idle edge of effectiveStatus — at
+// the edge itself, or at the still-pending echo's clear when the edge
+// passed before the row landed) and each metadata entry records the epoch
+// it was dispatched at, so the moment the pane settles the send's turn the
+// retained entry goes stale. A SETTLED
+// non-available outcome (unavailable/failed/etc.) is never in flight,
+// regardless of native ids: the server settles some captures as unavailable
+// (e.g. a non-Git directory) BEFORE forwarding the message, and that outcome
+// arriving must not leave the row claiming a save is underway for the whole
+// running turn. Without the epoch gate an un-enriched send's lingering
+// metadata (deleted only on send-failure frames) would mislabel a LATER
+// busy window — e.g. an MCP/CLI-driven turn, which mints no send metadata
+// and produces no capture at all — as still-saving. The attempt's outcome
+// record is looked up where the pane keeps it: the pending send metadata's
+// own checkpointOutcome (the same record the availability map and
+// paneContent.checkpointOutcomes persist from) plus the persisted pane
+// outcome entry for the send's request — the pane-local stand-in for the
+// logicalAttemptId join, since the durable outcome records key by the send's
+// requestId (minted 1:1 with the attempt's logicalAttemptId) and carry no
+// logicalAttemptId of their own. A metadata entry with no recorded epoch
+// predates the mechanism and can assert nothing about its busy window: it
+// reads false (never claims an in-flight capture that cannot be evidenced).
+// MCP/CLI-driven turns mint no send metadata and produce no capture
+// outcome, so they read false throughout.
+function paneCaptureInFlight(
+  pendingSends: ReadonlyMap<string, PendingSendMetadata>,
+  paneOutcomes: readonly FreshAgentCheckpointOutcome[] | undefined,
+  currentBusyEpoch: number,
+): boolean {
+  for (const [requestId, metadata] of pendingSends) {
+    if (!metadata.logicalAttemptId) continue
+    if (metadata.busyEpoch !== currentBusyEpoch) continue
+    const metadataOutcome = metadata.checkpointOutcome
+    if (metadataOutcome && (metadataOutcome.status !== 'available' || metadataOutcome.nativeTurnId)) continue
+    const persistedOutcome = paneOutcomes?.find((outcome) => outcome.requestId === requestId)
+    if (persistedOutcome && (persistedOutcome.status !== 'available' || persistedOutcome.nativeTurnId)) continue
+    return true
+  }
+  return false
 }
 
 function localEchoLanded(
@@ -1169,7 +1259,72 @@ export function FreshAgentView({
   const [localEcho, setLocalEchoState] = useState<LocalEcho | null>(() => paneContent.pendingLocalEcho ?? null)
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
+  // The send-time turn-key boundary of THIS mount's composer send: which
+  // turns already existed when the CURRENT optimistic echo was dispatched.
+  // It must ride a ref, not the echo state: the pane-content sync effect
+  // below adopts the normalized STORE copy of a fresh echo in the
+  // store-driven render that precedes the send's own state update, so a
+  // boundary carried on the state echo is stripped before any render can
+  // read it. Keyed by the echo's requestId and consulted only while it
+  // describes the CURRENT echo (a foreign re-keyed echo reads as no
+  // boundary here — it falls back to the boundary its own record
+  // persisted, if any). A RESTORED echo has no ref entry at all: the
+  // newest-ness derivation reads the boundary the send persisted into the
+  // echo record itself, which the store's echo normalizer now keeps.
+  const localEchoSendBoundaryRef = useRef<{ requestId: string; turnKeys: ReadonlySet<string> } | null>(null)
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
+  // The pane's busy-epoch: advanced at every busy→idle edge of effectiveStatus
+  // that SETTLES a turn. A composer send records the current epoch into its
+  // pending send metadata at dispatch time, and `paneCaptureInFlight` only
+  // counts the entry while the pane is still in that SAME busy window — so
+  // an un-enriched send's retained metadata can never survive its own turn's
+  // settle to mislabel a later busy window (e.g. an MCP/CLI-driven turn) as
+  // still-saving. A settle observed with NO pending echo bumps right at the
+  // edge; a settle observed while the send's echo is still pending (the row
+  // has not landed — transcript history lag) cannot bump at the edge (the
+  // first-send materialization blip is the same edge shape while the turn is
+  // still about to run) and is instead RECORDED and retired at the echo's
+  // clear: both echo-clear arms in applySnapshot — the row-landed clear and
+  // the stale clear — bump the epoch, gated on the pane not being busy at
+  // the clear moment (a live store read via isPaneBusyNow). A clear that
+  // fires mid-turn (slow materialization; the blip's resumed busy window)
+  // keeps the window, whose capture is genuinely in flight there. The only
+  // surviving corner is a history-lagged row landing DURING a later busy
+  // window, which retires at that window's own settle edge — the accepted
+  // bounded residual.
+  const busyEpochRef = useRef(0)
+  const wasPaneBusyRef = useRef(false)
+  // True from a busy→idle settle edge observed while the send's local echo
+  // was still pending, until that echo clears. Lives and dies with THIS
+  // echo: any render with no pending echo clears it (its clear already ran —
+  // bumped, or honestly blocked mid-turn — or the send failed), so a stale
+  // record can never retire a LATER send's dispatch window at that send's
+  // own confident-path echo clear.
+  const retireAtEchoClearRef = useRef(false)
+  // The pane's CURRENT effective busy state, read from the store at the
+  // moment of the call — not the last render. The echo-clear arms in
+  // applySnapshot can run inside the microtask window between a busy
+  // frame's dispatch and React's commit, where the render-mirrored refs
+  // still hold pre-busy state; Redux state is synchronous, so this read
+  // cannot miss a busy window that already opened. Mirrors the render's
+  // effectiveStatus derivation exactly: the session record's status wins
+  // over the pane content's status.
+  const isPaneBusyNow = useCallback((): boolean => {
+    const state = appStore.getState()
+    const paneRoot = state.panes.layouts[tabId]
+    const content = paneRoot ? findPaneContent(paneRoot, paneId) : null
+    if (!content || content.kind !== 'fresh-agent') return false
+    if (content.sessionId) {
+      const sessionKey = makeFreshAgentSessionKey({
+        sessionId: content.sessionId,
+        sessionType: content.sessionType,
+        provider: content.provider,
+      })
+      const sessionStatus = state.freshAgent.sessions[sessionKey]?.status
+      if (sessionStatus !== undefined) return BUSY_STATES.has(sessionStatus)
+    }
+    return BUSY_STATES.has(content.status)
+  }, [appStore, paneId, tabId])
   const [asyncQuestionStatuses, setAsyncQuestionStatuses] = useState<Record<string, AsyncQuestionAnswerStatus>>({})
 
   const [checkpointAvailabilityByTurn, setCheckpointAvailabilityByTurn] = useState<Map<string, CheckpointTurnAvailability>>(
@@ -1367,16 +1522,6 @@ export function FreshAgentView({
     if (typeof requestId !== 'string' || requestId.length === 0) return undefined
     return checkpointAvailabilityByTurn.get(checkpointAvailabilityKey(scope, 'request', requestId))
   }, [checkpointAvailabilityByTurn, paneContent.createRequestId, paneContent.provider])
-  const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
-    const availability = getCheckpointAvailability(turn)
-    if (!availability) {
-      return isModernCheckpointTurn(turn)
-        ? { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
-        : undefined
-    }
-    if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
-    return { status: availability.status }
-  }, [getCheckpointAvailability])
   // Task 10: requestIds whose FRESH_AGENT_LOST_SESSION failure already fired a
   // retry, plus the retry requestIds themselves -- a retry is never retried,
   // so a resend can happen at most once per failed request (loop-proof).
@@ -1574,12 +1719,20 @@ export function FreshAgentView({
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
     const current = paneContentRef.current
-    // Strip runtime-only fields (previousTurnKeys) before persisting —
-    // the persisted echo only needs the wire-identity fields. On remount
-    // the echo is restored without previousTurnKeys, which correctly
-    // disables the text-match guard (no send-time turns to compare against).
+    // The persisted echo record carries the send boundary
+    // (previousTurnKeys) alongside the identity fields: a reloaded pane
+    // restores the echo WITH the turns that predate its send, so the
+    // newest-ness derivation can keep the honest still-saving verdict
+    // beside earlier rows. A legacy record written before the field
+    // existed rehydrates without it and reads as "no boundary" (the
+    // conservative restored-echo treatment).
     const persisted = next
-      ? { requestId: next.requestId, text: next.text, ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}) }
+      ? {
+          requestId: next.requestId,
+          text: next.text,
+          ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}),
+          ...(next.previousTurnKeys ? { previousTurnKeys: [...next.previousTurnKeys] } : {}),
+        }
       : undefined
     if (sameLocalEcho(current.pendingLocalEcho, persisted)) return
     dispatch(mergePaneContent({
@@ -1979,6 +2132,7 @@ export function FreshAgentView({
     recordPendingSendMetadata(retryRequestId, {
       text,
       logicalAttemptId: nanoid(),
+      busyEpoch: busyEpochRef.current,
       checkpointAvailabilityScope: checkpointAvailabilityScope(current),
       ...(current.checkpointWorkspace ? { checkpointWorkspace: current.checkpointWorkspace } : {}),
     })
@@ -1986,6 +2140,12 @@ export function FreshAgentView({
     const echo = localEchoRef.current
     if (echo && echo.text === text) {
       setLocalEcho({ ...echo, requestId: retryRequestId })
+      // The retry re-keys the SAME message's echo: its send-time boundary
+      // (which turns existed before this message) carries over unchanged.
+      const boundary = localEchoSendBoundaryRef.current
+      if (boundary && boundary.requestId === echo.requestId) {
+        localEchoSendBoundaryRef.current = { requestId: retryRequestId, turnKeys: boundary.turnKeys }
+      }
     }
   }, [recordPendingSendMetadata, sendFreshAgentSendFrame, setLocalEcho])
 
@@ -3582,8 +3742,28 @@ export function FreshAgentView({
           && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
-      if (echo) {
-        if (landedEcho || staleEcho) setLocalEcho(null)
+      if (echo && (landedEcho || staleEcho)) {
+        // This echo clear is the retire point for a send whose turn ALREADY
+        // settled while the echo was still pending: the busy→idle edge
+        // recorded the settle in retireAtEchoClearRef instead of bumping
+        // (the row had not landed, so the edge could not distinguish a real
+        // settle from the first-send materialization blip), and the history
+        // confirmation this clear represents — the row landing, or the
+        // bounded stale budget giving up on a row that never lands — is
+        // what upgrades the recorded settle into the epoch bump. The
+        // stale-echo clear ALONE is still not a settle signal (OpenCode can
+        // answer empty idle snapshots while the accepted first send is
+        // still materializing), so the bump only fires when the pane is NOT
+        // busy at this clear moment, read from the store at call time
+        // (isPaneBusyNow): mid-turn clears — slow materialization, the
+        // blip's resumed busy window — keep the window, whose capture is
+        // genuinely in flight. Consume-on-bump keeps a second clear of the
+        // same echo from double-bumping.
+        if (retireAtEchoClearRef.current && !isPaneBusyNow()) {
+          busyEpochRef.current += 1
+          retireAtEchoClearRef.current = false
+        }
+        setLocalEcho(null)
       }
       // Task 16 (zrrj): an idle snapshot that does not yet contain the
       // just-sent turn means the durable transcript is lagging -- schedule a
@@ -3914,6 +4094,7 @@ export function FreshAgentView({
     captureFreshAgentAttachmentAttempt,
     claudeSession,
     isRestoring,
+    isPaneBusyNow,
     dispatch,
     paneContent.provider,
     paneContent.soulId,
@@ -4093,6 +4274,157 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // Render-phase busy-epoch adjustment (the lastCreateArmKeyRef pattern):
+  // a busy→idle transition retires the capture window once per edge — the
+  // ref pair makes re-renders of an unchanged isBusy no-ops, so a
+  // double-render of the same transition (StrictMode) cannot double-count.
+  // An edge observed with NO pending echo is the turn's real settle (the
+  // row landed long before): it bumps the epoch here. An edge observed WITH
+  // the send's echo still pending cannot bump — the FIRST-SEND
+  // MATERIALIZATION JOURNEY hits the same shape (between the pane's
+  // optimistic running and the provider's busy status the materialization
+  // refetch answers an idle snapshot before the provider persisted any
+  // row), and that edge belongs to the same turn, not to a settle. A REAL
+  // settle in that shape (the turn ended while transcript history lagged
+  // the row) is recorded in retireAtEchoClearRef and retired at the echo's
+  // clear by the echo-clear arms in applySnapshot, which confirm the
+  // history (the row landed, or the bounded stale give-up) and gate on the
+  // pane not being busy at the clear moment. Every epoch bump rides an
+  // isBusy change or an echo clear, so the captureInFlight recompute below
+  // always sees the bumped epoch in a render that observes the causing
+  // transition.
+  if (wasPaneBusyRef.current && !isBusy) {
+    if (localEcho) retireAtEchoClearRef.current = true
+    else busyEpochRef.current += 1
+  }
+  // The retire record lives and dies with THIS echo: once no echo is
+  // pending, its clear already ran (bumped, or honestly blocked mid-turn)
+  // or the send failed — a stale record must never retire a LATER send's
+  // window at that send's own confident-path echo clear.
+  if (!localEcho) retireAtEchoClearRef.current = false
+  wasPaneBusyRef.current = isBusy
+  // The user's just-sent message as an optimistic echo row, displayed after
+  // the turns until the send's turn lands in the snapshot (the transcript
+  // appends it as the newest turn). While it is displayed it holds the
+  // newest user row for the rewind fallback ONLY while no user row landed
+  // after its send (the newestUserTurnKey memo below decides that): older
+  // rows keep the honest unavailable verdict, and a LATER landed row both
+  // takes over the newest-user-row slot and retires the echo's claim.
+  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
+    id: `${LOCAL_ECHO_TURN_ID_PREFIX}${localEcho.requestId}`,
+    turnId: localEcho.submittedTurnId ?? `${LOCAL_ECHO_TURN_ID_PREFIX}${localEcho.requestId}`,
+    requestId: localEcho.requestId,
+    role: 'user',
+    summary: localEcho.text,
+    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+  } as FreshAgentTurn : undefined), [localEcho])
+  const transcriptTurns = snapshot?.turns ?? EMPTY_TRANSCRIPT_TURNS
+  // Render-phase reads of refs: every pendingSendMetadataRef mutation rides
+  // a state transition that re-renders (a send creates the local echo; an
+  // outcome arrival publishes checkpoint availability and persists the pane
+  // outcome; a send failure clears the echo/status), and every busyEpochRef
+  // bump rides the isBusy flip of the busy→idle edge's own render — so
+  // recomputing on each render always reflects the last transition: the
+  // enriched outcome's arrival flips the flag false, and the pane leaving
+  // busy retires it (the epoch moves past every entry dispatched in the
+  // window that just ended). Fed through getRewindAvailability's deps so
+  // the memoized transcript re-renders when the flag flips.
+  const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)
+  const newestUserTurnKey = useMemo(() => {
+    // The transcript renders turns through its display pipeline — opencode-pty
+    // notification rows reclassify to agent text, synthetic tool-result rows
+    // coalesce away — so the newest USER row must be derived from the SAME
+    // displayed roles (round-3 delta review defect 1): a machine-injected
+    // notification row (raw role user, displayed as assistant) landing after
+    // a prompt must never steal the newest-user slot from the real prompt,
+    // which would hand the prompt the unearned mid-turn unavailable verdict
+    // while its capture identity was still unbound. Both transforms are pure
+    // display derivations over the snapshot turns (the wire and store turns
+    // are never mutated), and neither retypes a REAL prompt row, so the
+    // send-boundary key comparison below stays consistent: the boundary holds
+    // raw send-time keys and displayed user rows keep theirs.
+    const displayedUserTurns = coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(transcriptTurns))
+      .filter((turn) => turn.role === 'user')
+    const lastLandedUserKey = displayedUserTurns.length > 0 ? getFreshAgentDisplayTurnKey(displayedUserTurns[displayedUserTurns.length - 1]) : undefined
+    if (!localEchoTurn) return lastLandedUserKey
+    // The echo holds the newest user row only while no user row landed
+    // AFTER its send — otherwise it is a stale echo (a delayed transcript
+    // can leave an old echo visible while a later turn runs) and the
+    // landed row takes over the newest-user-row slot. The send's turn-key
+    // boundary decides "after": this mount's own composer send stamps it
+    // in localEchoSendBoundaryRef, and a RESTORED echo (a reload inside
+    // the echo window remounts the pane without the send metadata) reads
+    // the boundary the send persisted INTO the echo record itself — the
+    // field survives the store's echo normalizer and the pagehide
+    // persist, so the reloaded pane can prove the rows beside a
+    // second-or-later message's echo PREDATE its send (⊆ the boundary)
+    // while a later-landed row (∉ the boundary) still outdates it. A
+    // legacy record persisted without the field reads as no boundary:
+    // every landed row may belong to a later turn, so only an empty
+    // transcript keeps the echo current. The echo's own row landing never
+    // fights this rule — that clear retires the echo in the same snapshot
+    // application.
+    const boundary = localEchoSendBoundaryRef.current
+    const sendTimeTurnKeys = (boundary && localEcho && boundary.requestId === localEcho.requestId
+      ? boundary.turnKeys
+      : undefined)
+      ?? (localEcho?.previousTurnKeys ? new Set(localEcho.previousTurnKeys) : undefined)
+    const echoOutdated = sendTimeTurnKeys
+      ? displayedUserTurns.some((turn) => !sendTimeTurnKeys.has(getTurnKey(turn)))
+      : displayedUserTurns.length > 0
+    return echoOutdated ? lastLandedUserKey : getFreshAgentDisplayTurnKey(localEchoTurn)
+  }, [localEcho, localEchoTurn, transcriptTurns])
+  const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
+    const availability = getCheckpointAvailability(turn)
+    if (!availability) {
+      // The pane's pending local echo with NO bound availability. A fresh
+      // echo normally holds the send-time request-keyed pending publication
+      // (the bound path above), but a reload inside the echo window restores
+      // the echo row from persisted pane content alone: that transient
+      // publication and the pending send metadata do not survive the
+      // remount, and the restored row carries no modern identity (no source,
+      // no nativeTurnId), so without this branch it would fall to the LEGACY
+      // enabled rewind path — an unearned rewind offer for a message whose
+      // checkpoint outcome this pane cannot know. The same newest-user-row
+      // discipline as the modern fallback applies (defect fix: a stale echo
+      // beside a later landed row is never the newest user row), with one
+      // honesty rule stricter than the modern fallback: while the pane is
+      // busy AND the echo is still the pane's newest user row (the send
+      // boundary proves every landed row predates the send), the send's
+      // turn is genuinely in flight — still saving. While the pane is busy
+      // but some landed row sits OUTSIDE the boundary, the echo is
+      // UNCERTAIN: that row may be a later turn's row OR a late-landing
+      // OLDER row (a queued second message can dispatch before the first
+      // row reaches the snapshot, and that row then lands during the
+      // second turn) — the client cannot tell, so mid-turn the echo makes
+      // NO claim at all (undefined; the hover hides the rewind affordance
+      // for the echo row, never an unearned settled verdict). At the
+      // busy→idle settle the honest unavailable verdict returns, and the
+      // stale clear retires the echo row on its own schedule. Identified
+      // by the echo row's `__local-echo:` id, the marker both the fresh
+      // send and the restored pendingLocalEcho build their row with (the
+      // display key compares consistently: both sides derive through
+      // getFreshAgentDisplayTurnKey over the same memoized echo turn).
+      if (localEchoTurn && turn.id === localEchoTurn.id) {
+        const echoIsNewestUserRow = newestUserTurnKey !== undefined
+          && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey
+        if (isBusy) {
+          return echoIsNewestUserRow
+            ? { status: 'pending' }
+            : undefined
+        }
+        return { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
+      }
+      return unboundRewindAvailability(
+        turn,
+        isBusy,
+        newestUserTurnKey !== undefined && getFreshAgentDisplayTurnKey(turn) === newestUserTurnKey,
+        captureInFlight,
+      )
+    }
+    if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
+    return { status: availability.status }
+  }, [getCheckpointAvailability, isBusy, newestUserTurnKey, captureInFlight, localEchoTurn])
   // The live tail (transcript-live plan §4.4): what the running turn shows
   // before its transcript lines land. This view never subscribes to the
   // tail's text — only to whether it shows anything, so the transcript's own
@@ -4136,14 +4468,6 @@ export function FreshAgentView({
       ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript, 'ended')
       : false
   ))
-  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
-    id: `__local-echo:${localEcho.requestId}`,
-    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-    requestId: localEcho.requestId,
-    role: 'user',
-    summary: localEcho.text,
-    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-  } as FreshAgentTurn : undefined), [localEcho])
   const splitLiveTailAtEcho = Boolean(localEchoTurn && endedLiveTailShows)
   // Provider notices (rate limits, a failed compaction, CLI banners) show in
   // the pane's notice banner; they never end the turn (transcript-live P4).
@@ -4378,6 +4702,7 @@ export function FreshAgentView({
       text,
       asyncQuestionKeys,
       logicalAttemptId,
+      busyEpoch: busyEpochRef.current,
       checkpointAvailabilityScope: checkpointScope,
       ...(current.checkpointWorkspace ? { checkpointWorkspace: current.checkpointWorkspace } : {}),
     })
@@ -4412,6 +4737,10 @@ export function FreshAgentView({
       text,
       requestId,
       previousTurnKeys: (snapshotRef.current?.turns ?? []).map(getTurnKey),
+    }
+    localEchoSendBoundaryRef.current = {
+      requestId,
+      turnKeys: new Set(nextLocalEcho.previousTurnKeys),
     }
     setLocalEchoState(nextLocalEcho)
     dispatch(mergePaneContent({
@@ -4631,7 +4960,7 @@ export function FreshAgentView({
   const content = useMemo(() => {
     const retainedHistory = snapshot?.extensions?.[snapshot.provider]?.nativeHistoryRetention
     const partialHistory = isRecord(retainedHistory) && retainedHistory.partial === true
-    const turns = snapshot?.turns ?? []
+    const turns = transcriptTurns
     const pendingApprovals = snapshot?.pendingApprovals ?? []
     const pendingQuestions = snapshot?.pendingQuestions ?? []
     const worktrees = snapshot?.worktrees ?? []
@@ -5301,6 +5630,7 @@ export function FreshAgentView({
     snapshot,
     snapshotRevealError,
     snapshotDirty,
+    transcriptTurns,
     slashCommands,
     dispatch,
     appStore,
