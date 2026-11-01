@@ -568,13 +568,13 @@ mod tests {
                 AdminCommand::ObserveClaudeSources(Box::new(request)),
             );
             envelope.auth = Some("synthetic-control-secret".into());
-            let result = tokio::time::timeout(
-                Duration::from_millis(250),
-                supervisor.dispatch(envelope),
-            )
-            .await
-            .expect("dispatch must finish within the existing timeout in every backend mode")
-            .result;
+            let result =
+                tokio::time::timeout(Duration::from_millis(250), supervisor.dispatch(envelope))
+                    .await
+                    .expect(
+                        "dispatch must finish within the existing timeout in every backend mode",
+                    )
+                    .result;
             let returned = Instant::now();
             assert_eq!(
                 backend.calls.load(std::sync::atomic::Ordering::SeqCst),
