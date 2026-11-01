@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import { SYNC_BUILD_TIMEOUT_MS } from '../../../scripts/testing/sync-subprocess.js'
 import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
 import {
   buildProviderQualificationReceipt,
@@ -298,8 +299,10 @@ export class ManagedRuntimeBrowserRig {
   }
 
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
-    await this.web?.stop().catch(() => undefined)
-    return this.runtime.cleanup()
+    const errors: string[] = []
+    try { await this.web?.stop() } catch (error) { errors.push(`web server: ${String(error)}`) }
+    // Keep the returned result and the durable cleanup receipt in agreement.
+    return this.runtime.cleanup(errors)
   }
 
   async destroyTestRig(): Promise<{ ok: boolean; errors: string[] }> {
@@ -526,7 +529,7 @@ export class ManagedRuntimeBrowserRig {
     if (!prepared) execFileSync(mise, [
       'exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-server',
       '--features', features,
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
+    ], { cwd: this.repoRoot, stdio: 'inherit', timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL' })
     const source = prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
     fs.copyFileSync(source, target)
@@ -541,7 +544,7 @@ export class ManagedRuntimeBrowserRig {
     if (!prepared) execFileSync(mise, [
       'exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-supervisor',
       '--features', 'provider-qualification',
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
+    ], { cwd: this.repoRoot, stdio: 'inherit', timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL' })
     const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
     fs.copyFileSync(prepared ?? path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
     fs.chmodSync(target, 0o755)
