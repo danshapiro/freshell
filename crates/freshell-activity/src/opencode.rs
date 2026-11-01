@@ -24,6 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use freshell_protocol::TerminalTurnOutcome;
 use freshell_protocol::{OpencodeActivityRecord, OpencodePhase};
 
 use crate::ledger::TurnCompletionLedger;
@@ -36,7 +37,8 @@ pub type OpencodeEffect = TrackerEffect<OpencodeActivityRecord>;
 
 /// Session status vocabulary from `/session/status` and the SSE
 /// `session.status` events. `Retry` is busy everywhere (D6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OpencodeStatus {
     Busy,
     Retry,
@@ -89,6 +91,8 @@ struct TerminalOpencode {
     session_roots: HashMap<String, String>,
     /// Pending permission ids (Task 7).
     pending_permissions: HashSet<String>,
+    /// A structured provider error observed for the currently owned turn.
+    turn_failed: bool,
     /// Present == busy on the wire (`OpencodePhase::Busy` is the only phase).
     record: Option<OpencodeActivityRecord>,
     last_observed_at: i64,
@@ -157,6 +161,14 @@ fn unique_sorted(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
+fn terminal_outcome(failed: bool) -> TerminalTurnOutcome {
+    if failed {
+        TerminalTurnOutcome::Failed
+    } else {
+        TerminalTurnOutcome::Completed
+    }
+}
+
 /// Ownership + turn-edge tracker for OpenCode terminal panes.
 #[derive(Debug)]
 pub struct OpencodeActivityTracker {
@@ -199,6 +211,36 @@ impl OpencodeActivityTracker {
         self.ledger.list_latest_completions()
     }
 
+    /// Restore a historical observation snapshot without importing its old
+    /// completion ledger or emitting attention for already-finished turns.
+    pub fn seed_terminal_from_history(
+        &mut self,
+        terminal_id: &str,
+        mut history: Self,
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let Some(mut state) = history.states.remove(terminal_id) else {
+            return Vec::new();
+        };
+        if let Ownership::AwaitingAssociation { previous_known, .. } = &state.ownership {
+            // Retire the ended episode's pause with its deferred completion:
+            // neither may affect a later live turn or spontaneous exit.
+            state.pending_permissions.clear();
+            state.ownership = Ownership::Quiet {
+                known_session_id: previous_known.clone(),
+            };
+        }
+        state.last_observed_at = at;
+        let upsert: Vec<_> = state.record.clone().into_iter().collect();
+        let remove = if upsert.is_empty() {
+            vec![terminal_id.to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.states.insert(terminal_id.to_owned(), state);
+        vec![TrackerEffect::Changed { upsert, remove }]
+    }
+
     /// Create-or-reset the terminal's state (tracking starts at create).
     pub fn track_terminal(
         &mut self,
@@ -212,6 +254,7 @@ impl OpencodeActivityTracker {
             };
             state.session_roots.clear();
             state.pending_permissions.clear();
+            state.turn_failed = false;
             state.last_observed_at = at;
             // A stale record from the previous incarnation is removed.
             return clear_record(state, false);
@@ -225,6 +268,7 @@ impl OpencodeActivityTracker {
                 },
                 session_roots: HashMap::new(),
                 pending_permissions: HashSet::new(),
+                turn_failed: false,
                 record: None,
                 last_observed_at: at,
             },
@@ -269,11 +313,15 @@ impl OpencodeActivityTracker {
                 // DEFERRED completion (Node confirmOpencodeAssociation):
                 // stamped at the STORED turn-end instant, not the bind's.
                 let seq = ledger.record_turn_completion(&state.terminal_id, completed_at);
+                let outcome = terminal_outcome(state.turn_failed);
+                state.turn_failed = false;
                 vec![TrackerEffect::TurnComplete {
                     terminal_id: state.terminal_id.clone(),
                     session_id: Some(own),
                     at: completed_at,
                     completion_seq: seq,
+                    outcome: Some(outcome),
+                    outcome_update: false,
                 }]
             }
             Ownership::AwaitingAssociation { previous_known, .. } => {
@@ -453,11 +501,10 @@ impl OpencodeActivityTracker {
     /// the lane translates into this SAME SessionError-shaped call (abort
     /// window W2, derives from opencode 1.18.11). Only `MessageAbortedError`
     /// on the owned root's OWN turn (matching id+cycle+stream) arms the
-    /// per-turn abort gate (D1); every other name/state is a no-op — failed
-    /// turns ring like completed turns, and trailing errors on quiet states
-    /// change nothing. Child `session.error` is ignored: the raw sessionID
-    /// must equal the owned root, no root-remapping for aborts (D5). No
-    /// effects, ever.
+    /// per-turn abort gate (D1); other structured errors mark the owned turn
+    /// failed. Trailing errors on quiet states change nothing. Child
+    /// `session.error` is ignored: the raw sessionID must equal the owned
+    /// root, no root-remapping for aborts (D5). No effects, ever.
     pub fn note_error(
         &mut self,
         terminal_id: &str,
@@ -471,9 +518,6 @@ impl OpencodeActivityTracker {
             return Vec::new();
         };
         state.last_observed_at = at;
-        if error_name != "MessageAbortedError" {
-            return Vec::new();
-        }
         if resolve_root(state, session_id) != session_id {
             return Vec::new();
         }
@@ -491,7 +535,11 @@ impl OpencodeActivityTracker {
                 turn_aborted,
                 ..
             } if own.as_str() == session_id && *c == cycle && *st == stream => {
-                *turn_aborted = true;
+                if error_name == "MessageAbortedError" {
+                    *turn_aborted = true;
+                } else {
+                    state.turn_failed = true;
+                }
             }
             _ => {}
         }
@@ -770,11 +818,15 @@ fn reduce_idle_edge(
             let mut effects = clear_record(state, false);
             if !turn_aborted {
                 let seq = ledger.record_turn_completion(&state.terminal_id, at);
+                let outcome = terminal_outcome(state.turn_failed);
+                state.turn_failed = false;
                 effects.push(TrackerEffect::TurnComplete {
                     terminal_id: state.terminal_id.clone(),
                     session_id: Some(own),
                     at,
                     completion_seq: seq,
+                    outcome: Some(outcome),
+                    outcome_update: false,
                 });
             }
             effects
@@ -855,6 +907,7 @@ fn reduce_busy_edge(
                 stream,
                 turn_aborted: false,
             };
+            state.turn_failed = false;
             set_busy_record(state, Some(session_id.to_string()), at)
         }
         Ownership::Candidate {
@@ -873,6 +926,7 @@ fn reduce_busy_edge(
                     stream,
                     turn_aborted: false,
                 };
+                state.turn_failed = false;
                 set_busy_record(state, Some(own), at)
             } else {
                 state.ownership = Ownership::Ambiguous {
@@ -894,6 +948,7 @@ fn reduce_busy_edge(
                     stream,
                     turn_aborted: false,
                 };
+                state.turn_failed = false;
                 set_busy_record(state, Some(own), at)
             } else {
                 state.ownership = Ownership::Ambiguous {
@@ -1027,11 +1082,15 @@ fn reduce_snapshot(
                 let mut effects = clear_record(state, false);
                 if !turn_aborted {
                     let seq = ledger.record_turn_completion(&state.terminal_id, at);
+                    let outcome = terminal_outcome(state.turn_failed);
+                    state.turn_failed = false;
                     effects.push(TrackerEffect::TurnComplete {
                         terminal_id: state.terminal_id.clone(),
                         session_id: Some(own),
                         at,
                         completion_seq: seq,
+                        outcome: Some(outcome),
+                        outcome_update: false,
                     });
                 }
                 effects
@@ -1201,6 +1260,19 @@ mod tests {
             session_id: Some(session_id.to_string()),
             at,
             completion_seq: seq,
+            outcome: Some(TerminalTurnOutcome::Completed),
+            outcome_update: false,
+        }
+    }
+
+    fn failed_turn_complete(session_id: &str, at: i64, seq: i64) -> OpencodeEffect {
+        TrackerEffect::TurnComplete {
+            terminal_id: "t1".to_string(),
+            session_id: Some(session_id.to_string()),
+            at,
+            completion_seq: seq,
+            outcome: Some(TerminalTurnOutcome::Failed),
+            outcome_update: false,
         }
     }
 
@@ -1219,6 +1291,72 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn unbound_busy_history() -> OpencodeActivityTracker {
+        let mut history = OpencodeActivityTracker::new();
+        history.track_terminal("t1", None, 0);
+        history.note_snapshot("t1", &[("ses-r".into(), OpencodeStatus::Busy)], 1, 1, 100);
+        history
+    }
+
+    #[test]
+    fn historical_unbound_permission_end_does_not_swallow_the_next_completion() {
+        let mut history = unbound_busy_history();
+        history.note_permission_asked("t1", "ses-r", "perm-old", 150);
+        history.note_session_idle("t1", "ses-r", 1, 1, 200);
+
+        let mut tracker = OpencodeActivityTracker::new();
+        assert_eq!(
+            tracker.seed_terminal_from_history("t1", history, 300),
+            vec![remove()]
+        );
+        assert!(tracker.list_latest_completions().is_empty());
+        assert!(tracker.bind_session("t1", "ses-r", 310).is_empty());
+        assert_eq!(
+            tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 2, 1, 400),
+            vec![upsert(rec(Some("ses-r"), 400))]
+        );
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 2, 1, 500),
+            vec![remove(), turn_complete("ses-r", 500, 1)]
+        );
+        assert!(!tracker.has_pending_permissions("t1"));
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 2, 1, 510)
+            .is_empty());
+    }
+
+    #[test]
+    fn historical_unbound_busy_and_pending_permission_remain_actionable() {
+        for paused in [false, true] {
+            let mut history = unbound_busy_history();
+            if paused {
+                history.note_permission_asked("t1", "ses-r", "perm-current", 150);
+            }
+            let mut tracker = OpencodeActivityTracker::new();
+            assert_eq!(
+                tracker.seed_terminal_from_history("t1", history, 300),
+                if paused {
+                    vec![remove()]
+                } else {
+                    vec![upsert(rec(Some("ses-r"), 100))]
+                }
+            );
+            assert_eq!(tracker.has_pending_permissions("t1"), paused);
+            assert!(tracker.list_latest_completions().is_empty());
+            if paused {
+                assert_eq!(
+                    tracker.note_permission_replied("t1", "perm-current", 350),
+                    vec![upsert(rec(Some("ses-r"), 350))]
+                );
+            }
+            tracker.bind_session("t1", "ses-r", 400);
+            assert_eq!(
+                tracker.note_session_idle("t1", "ses-r", 1, 1, 500),
+                vec![remove(), turn_complete("ses-r", 500, 1)]
+            );
+        }
     }
 
     #[test]
@@ -1555,18 +1693,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_turn_rings_and_trailing_error_is_noop() {
+    fn structured_error_marks_only_the_owned_turn_failed() {
         let mut tracker = OpencodeActivityTracker::new();
         tracker.track_terminal("t1", Some("ses-r"), 0);
         tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
-        // Any error name other than MessageAbortedError changes nothing:
-        // failed turns ring like completed turns (D1).
+        // Structured provider failure is body-free metadata on the eventual
+        // completion; it does not alter the activity stream.
         assert!(tracker
             .note_error("t1", "ses-r", "UnknownError", 1, 1, 150)
             .is_empty());
         assert_eq!(
             tracker.note_session_idle("t1", "ses-r", 1, 1, 200),
-            vec![remove(), turn_complete("ses-r", 200, 1)]
+            vec![remove(), failed_turn_complete("ses-r", 200, 1)]
         );
         // Trailing error on the now-quiet state: no effects, no state change.
         assert!(tracker
@@ -1575,10 +1713,13 @@ mod tests {
         assert!(tracker.list().is_empty());
         // Ownership stayed Quiet{known}: the next turn completes normally
         // (the trailing abort did not poison it).
-        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 300);
         assert_eq!(
-            completions(&tracker.note_session_idle("t1", "ses-r", 1, 1, 400)),
-            vec![2]
+            tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 300),
+            vec![upsert(rec(Some("ses-r"), 300))]
+        );
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 1, 400),
+            vec![remove(), turn_complete("ses-r", 400, 2)]
         );
     }
 
@@ -2033,5 +2174,94 @@ mod tests {
             tracker.note_session_idle("t1", "ses-b", 1, 1, 200),
             vec![remove(), turn_complete("ses-b", 200, 1)]
         );
+    }
+}
+
+/// The native OpenCode activity lane's event vocabulary. Its transport
+/// produces these from the per-pane sidecar's `/event` stream +
+/// `/session/status` snapshots; the hub routes them into the pure
+/// `OpencodeActivityTracker`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpencodeLaneEvent {
+    /// `/session/status` snapshot (absence == idle).
+    Snapshot {
+        statuses: Vec<(String, OpencodeStatus)>,
+    },
+    /// `session.created` — folds the parentID chain into the root map.
+    SessionCreated {
+        session_id: String,
+        parent_id: Option<String>,
+    },
+    /// `session.status` edge (busy | retry | idle).
+    Status {
+        session_id: String,
+        status: OpencodeStatus,
+    },
+    /// `session.idle` — the deprecated twin of `session.status{idle}`.
+    SessionIdle { session_id: String },
+    /// `session.error` (and Task 9's abort-marked `message.updated`,
+    /// translated into this same shape).
+    SessionError {
+        session_id: String,
+        error_name: String,
+    },
+    /// `permission.asked` — the turn pauses on a human.
+    PermissionAsked {
+        session_id: String,
+        permission_id: String,
+    },
+    /// `permission.replied` — the pause ends.
+    PermissionReplied { permission_id: String },
+    /// The verify/connect `/session/status` probe failed in a way that
+    /// must NOT read as idle (#603/#604). The hub applies crash semantics
+    /// via [`OpencodeActivityTracker::note_verify_failed`].
+    SnapshotFailed { error: String },
+    /// #608: the authoritative pending-ask listing fetched from GET
+    /// /permission + GET /question (noted only when BOTH succeeded). The
+    /// hub drains any locally-pending id not listed — see
+    /// OpencodeActivityTracker::note_permissions_synced.
+    PermissionsSynced { pending_ids: Vec<String> },
+}
+
+/// Ordered, body-free observations retained by one native provider launch.
+/// The enclosing output batch owns the terminal and source epoch identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeActivityBatch {
+    pub retained_from_seq: u64,
+    pub head_seq: u64,
+    pub events: Vec<OpencodeActivityEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeActivityEvent {
+    pub seq: u64,
+    /// Host observation time, retained unchanged across output reads.
+    #[serde(default)]
+    pub at: i64,
+    pub cycle: u64,
+    pub stream: u64,
+    pub event: OpencodeLaneEvent,
+}
+
+impl OpencodeActivityBatch {
+    /// Missing retained history is represented by the bounds, never by an
+    /// invented idle edge. A native observation sequence is always contiguous.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retained_from_seq == 0
+            || self.retained_from_seq > self.head_seq.saturating_add(1)
+            || self.head_seq.checked_sub(self.retained_from_seq - 1)
+                != Some(self.events.len() as u64)
+            || self.events.iter().enumerate().any(|(offset, entry)| {
+                entry.seq != self.retained_from_seq + offset as u64
+                    || entry.cycle == 0
+                    || entry.stream == 0
+            })
+        {
+            return Err("invalid native OpenCode activity sequence");
+        }
+        Ok(())
     }
 }

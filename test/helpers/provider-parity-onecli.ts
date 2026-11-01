@@ -40,7 +40,10 @@ export async function withMissingGrant<T>(grant: string, action: () => Promise<T
 }
 
 export function exposeGrantsToHarness(serverEnv: Record<string, string>): () => void {
-  const previous = Object.fromEntries(Object.keys(serverEnv).map(key => [key, process.env[key]]))
+  const keys = new Set([...Object.keys(serverEnv), ...Object.keys(process.env)
+    .filter(key => /^FRESHELL_MANAGED_(CLAUDE|CODEX|OPENCODE|AMPLIFIER)_ONECLI_/.test(key))])
+  const previous = Object.fromEntries([...keys].map(key => [key, process.env[key]]))
+  for (const key of keys) delete process.env[key]
   Object.assign(process.env, serverEnv)
   return () => {
     for (const [key, value] of Object.entries(previous)) {

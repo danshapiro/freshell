@@ -60,7 +60,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 
 ## Fresh agents (in-app)
 
-- Use new-tab with agent="claude", "kilroy", "codex", or "opencode", optional model=, effort=, cwd=. Use split-pane with agent="claude", "kilroy", or "codex" for a fresh pane beside an existing one. Fresh Codex resume uses sessionRef: { provider: "codex", sessionId }; the resume shorthand promotes to that identity. For direct Claude or Codex terminals, use mode="claude" or mode="codex". Drive fresh panes with send-keys and read them with capture-pane. Example:
+- Use new-tab or split-pane with agent="claude", "kilroy", "codex", or "opencode", optional model=, effort=, permissionMode=, cwd=. Resume an existing conversation with a provider-matched sessionRef; Kilroy uses provider "claude". Fresh Codex resume shorthand is promoted to canonical sessionRef; raw terminal Codex resume requires sessionRef. Then drive the pane with send-keys and read it with capture-pane. Example:
   new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Choosing the right action
@@ -547,14 +547,14 @@ async function routeAction(
 
     // -- Pane actions --
     case 'split-pane': {
-      const rawTarget = params?.target as string | undefined
-      const resolved = await resolvePaneTarget(rawTarget)
-      if (!resolved.pane) return { error: resolved.message || 'No pane found', hint: "Run action 'list-panes' to see available panes." }
-      const paneId = resolved.pane.id
       const { direction, browser, editor, mode, shell, cwd, target: _t, resume, sessionRef, ...rest } = params || {}
       const resumeProvider = mode ?? freshAgentResumeProvider(rest.agent)
       const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
       if (codexResumeError) return codexResumeError
+      const rawTarget = params?.target as string | undefined
+      const resolved = await resolvePaneTarget(rawTarget)
+      if (!resolved.pane) return { error: resolved.message || 'No pane found', hint: "Run action 'list-panes' to see available panes." }
+      const paneId = resolved.pane.id
       const effectiveSessionRef = sessionRef ?? (typeof resumeProvider === 'string' && typeof resume === 'string'
         ? { provider: resumeProvider, sessionId: resume }
         : undefined)

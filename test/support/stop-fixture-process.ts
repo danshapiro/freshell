@@ -82,3 +82,12 @@ export async function stopFixtureProcess(
     throw new Error(`captured fixture process did not exit within ${forceTimeoutMs}ms after SIGKILL`)
   }
 }
+
+export async function stopFixtureProcessThen(
+  child: FixtureProcess | undefined,
+  callback: () => Promise<void>,
+  options: StopFixtureProcessOptions = {},
+): Promise<void> {
+  await stopFixtureProcess(child, options)
+  await callback()
+}

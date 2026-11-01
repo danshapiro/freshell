@@ -69,7 +69,6 @@ use freshell_codex::next_monotonic_turn_complete_at;
 // unified turn-end attention edge — emitted for ANY turn end except a
 // user-initiated interrupt, deliberately diverging from the legacy
 // status-guarded positive-completion chime of adapter.ts:377-381).
-use crate::attention::turn_complete_event;
 use freshell_opencode::{
     normalize_opencode_effort, normalize_opencode_model, ChangedReason, DaemonSignal,
     OpencodeServeManager, SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
@@ -208,7 +207,7 @@ pub struct FreshOpencodeState {
     /// close BEFORE its durable retire and wedging every other opencode map
     /// reader. Pinned by `handle_kill_never_holds_the_sessions_map_across_
     /// its_session_lock_wait` and its teardown/refusal-teardown twins.)
-    sessions: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>,
+    sessions: Arc<TokioMutex<HashMap<String, Arc<OpencodeSessionCell>>>>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
     /// resending the SAME `requestId` on every reconnect while a pane is
@@ -712,6 +711,28 @@ enum ResumeOpencodeError {
 }
 
 impl OpencodeSession {
+    /// The session's turn-derived status -- the ONE derivation every surface
+    /// reporting a freshopencode session's live status must use: the
+    /// registered `turn_task` is unfinished => `running`, else `idle`.
+    /// Today's consumers: the existing-session attach broadcast (both its
+    /// arms) and, through [`turn_status_probe`], the durable snapshot
+    /// route's live-status overlay (`get_opencode_snapshot`). Like the
+    /// attach labels, this reads `is_finished()` alone (the `settling`
+    /// refinement is the send-during-compact drain gate's own concern,
+    /// documented on [`TurnTask::settling`]).
+    fn turn_derived_status(&self) -> &'static str {
+        let running = self
+            .turn_task
+            .as_ref()
+            .map(|t| !t.is_finished())
+            .unwrap_or(false);
+        if running {
+            "running"
+        } else {
+            "idle"
+        }
+    }
+
     fn new(
         placeholder_id: String,
         cwd: Option<String>,
@@ -823,6 +844,166 @@ enum IdleVerdict {
     /// The live poll could not answer — transient; retry, never conclude.
     PollFailed,
 }
+/// The WS lane's session map ([`FreshOpencodeState::sessions`]): keyed by
+/// BOTH the placeholder id and (once materialized) the durable `ses_*` id —
+/// both aliases of the SAME record.
+type OpencodeSessions = Arc<TokioMutex<HashMap<String, Arc<OpencodeSessionCell>>>>;
+
+/// The per-session LOCK-FREE running mirror the snapshot route's probe reads
+/// when the session mutex is contended (focused E3R2 review defect 1).
+/// [`OpencodeSession::turn_derived_status`] — the probe's uncontended truth —
+/// lives behind the per-session mutex, and during a first send's
+/// materialization that mutex is HELD (the create parks under it) while the
+/// send has ALREADY broadcast `running`; there is no other lock-free source
+/// of the busy truth (no task registry outside the mutex, no broadcast
+/// ledger, and the daemon does not know a not-yet-created session). The
+/// mirror is the bounded lock-free claim that broadcast implies: armed at
+/// the send path's running-broadcast site and held by the spawned turn drive,
+/// so it clears at the drive's end (settle, error, or abort) with NO
+/// enumerated clear sites to drift. `mint` hands out strictly monotonic
+/// claim tokens (never reset), `current` holds the newest live claim's
+/// token — 0 means no running claim (idle). Arming runs under the session
+/// mutex (all arm sites do), so the fetch_add→store pair never interleaves;
+/// a claim's drop clears `current` only when it is STILL the newest claim,
+/// so an overlapping drive's older guard can never clear a newer send's
+/// claim (the unserialized-overlapping-sends corner the record documents).
+#[derive(Default)]
+struct RunningMirror {
+    mint: std::sync::atomic::AtomicU64,
+    current: std::sync::atomic::AtomicU64,
+}
+
+impl RunningMirror {
+    const fn new() -> Self {
+        Self {
+            mint: std::sync::atomic::AtomicU64::new(0),
+            current: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.current.load(Ordering::SeqCst) != 0
+    }
+}
+
+/// One map value in [`OpencodeSessions`]: the session record under the
+/// lane's per-session mutex, plus the record's lock-free running mirror.
+/// `Deref` to the inner mutex keeps every existing `arc.lock().await` /
+/// `arc.try_lock()` call site working unchanged; the mirror sits BESIDE the
+/// mutex so the probe's contended arm can read it without the lock.
+struct OpencodeSessionCell {
+    session: TokioMutex<OpencodeSession>,
+    running: RunningMirror,
+}
+
+impl std::ops::Deref for OpencodeSessionCell {
+    type Target = TokioMutex<OpencodeSession>;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl OpencodeSessionCell {
+    fn wrapping(session: OpencodeSession) -> Self {
+        Self {
+            session: TokioMutex::new(session),
+            running: RunningMirror::new(),
+        }
+    }
+
+    /// The probe's contended-arm answer: the mirror's status — running while
+    /// a lane send is genuinely in flight, idle when no live claim exists.
+    fn mirror_turn_status(&self) -> &'static str {
+        if self.running.is_running() {
+            "running"
+        } else {
+            "idle"
+        }
+    }
+}
+
+/// Wrap a session record into its map cell (both aliases of one record share
+/// ONE cell, so the mirror is shared across the placeholder and durable ids).
+fn session_cell(session: OpencodeSession) -> Arc<OpencodeSessionCell> {
+    Arc::new(OpencodeSessionCell::wrapping(session))
+}
+
+/// The RAII running claim [`RunningMirror`] arming: created at the send
+/// path's running-broadcast site (under the session mutex), moved into the
+/// spawned turn drive so the claim lives EXACTLY as long as the drive —
+/// its `Drop` clears the mirror at the drive's end (natural settle, error,
+/// or abort) and every pre-spawn error return clears it when `send_locked`
+/// unwinds. A claim's drop only clears the mirror while it is still the
+/// NEWEST claim, so an overlapping older drive's drop is inert.
+struct RunningClaimGuard {
+    cell: Arc<OpencodeSessionCell>,
+    token: u64,
+}
+
+impl RunningClaimGuard {
+    fn arm(cell: &Arc<OpencodeSessionCell>) -> Self {
+        let token = cell.running.mint.fetch_add(1, Ordering::SeqCst) + 1;
+        cell.running.current.store(token, Ordering::SeqCst);
+        Self {
+            cell: Arc::clone(cell),
+            token,
+        }
+    }
+}
+
+impl Drop for RunningClaimGuard {
+    fn drop(&mut self) {
+        // Clear only OUR claim and only while it is still the current one —
+        // a newer send's claim has already overwritten `current`, and an
+        // overlapping older drive's drop must not clear it.
+        let _ = self.cell.running.current.compare_exchange(
+            self.token,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+/// The WS lane's turn-status probe handed to the shared
+/// [`crate::FreshAgentState`] (registered by [`FreshOpencodeState::new`]):
+/// resolves a session id -- placeholder OR durable `ses_*`, the map is keyed
+/// by both -- to the WS session record's turn-derived status via
+/// [`OpencodeSession::turn_derived_status`]. `None` when this lane holds no
+/// record for the id: the snapshot route then keeps its honest idle instead
+/// of guessing. Lock order follows the lane's discipline (the sessions-map
+/// guard is never held across the per-session lock). The per-session lock is
+/// a TRY-lock (round-3 delta review defect 3): a first send's materialization
+/// holds that mutex while awaiting the OpenCode session creation, and a probe
+/// that BLOCKED on it would stall the placeholder snapshot request (up to the
+/// route's timeout) exactly when the pane needs its refetch answered. On
+/// contention the probe reads the session's LOCK-FREE running mirror instead
+/// (focused E3R2 review defect 1): the running broadcast has already fired
+/// for exactly this window, so the mirror answers running while the send is
+/// genuinely in flight — never a blanket idle — and idle only when no live
+/// running claim exists. The uncontended arm is unchanged: full truthfulness
+/// from the record itself whenever the lock is free.
+fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusProbe {
+    let sessions = sessions.clone();
+    Arc::new(move |session_id: &str| {
+        let sessions = sessions.clone();
+        let session_id = session_id.to_string();
+        Box::pin(async move {
+            let session_arc = {
+                let guard = sessions.lock().await;
+                guard.get(&session_id).cloned()
+            };
+            let session_arc = session_arc?;
+            let Ok(session) = session_arc.try_lock() else {
+                // The record lock is held (a send's materialization, a
+                // compact's preflight, ...): answer from the lock-free mirror.
+                return Some(session_arc.mirror_turn_status());
+            };
+            Some(session.turn_derived_status())
+        })
+    })
+}
+
 impl FreshOpencodeState {
     /// b8ke e3 post-cap F2: test seam — retain a condemned-session
     /// witness (the kill path's retained accepted-daemon-turn evidence).
@@ -859,9 +1040,26 @@ impl FreshOpencodeState {
     /// Build the state around an existing [`FreshAgentState`] (REUSED, not duplicated),
     /// so this slice and the REST tabs slice share exactly one `opencode serve` sidecar.
     pub fn new(fresh_agent: FreshAgentState) -> Self {
+        let sessions = Arc::new(TokioMutex::new(HashMap::new()));
+        // Wire this lane's turn-status probe into the SHARED REST state so the
+        // durable snapshot route (`get_opencode_snapshot`) reports the WS
+        // session record's actual turn-derived status -- the same derivation the
+        // attach broadcast asserts -- instead of a hardcoded idle. The probe
+        // captures ONLY the sessions map (never the states), so no reference
+        // cycle forms. Set-once: a second WS lane over the same REST state
+        // keeps the FIRST lane's records (one lane per state is the
+        // construction contract; the collision is WARN-observable).
+        if fresh_agent
+            .set_opencode_turn_status_probe(turn_status_probe(&sessions))
+            .is_err()
+        {
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                "freshagent.opencode.turn_status_probe_already_installed: a second WS lane \
+                 over the same FreshAgentState keeps the first lane's probe");
+        }
         Self {
             fresh_agent,
-            sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            sessions,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
@@ -1526,7 +1724,7 @@ impl FreshOpencodeState {
         self.sessions
             .lock()
             .await
-            .insert(placeholder.clone(), Arc::new(TokioMutex::new(session)));
+            .insert(placeholder.clone(), session_cell(session));
 
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
         // codex/claude: a duplicate `create` arriving right after this point must see the
@@ -1601,6 +1799,86 @@ impl FreshOpencodeState {
     }
 
     // ── freshAgent.send (WS) — materialize-or-send ─────────────────────────
+
+    pub async fn prepare_managed_native_session(
+        &self,
+        mut msg: FreshAgentCreate,
+    ) -> Result<String, String> {
+        // Managed admission already owns this soul's isolated provider store.
+        // Create/load through the same native manager and resume ownership lane;
+        // ordinary browser creates retain their lazy, placeholder-only behavior.
+        self.ensure_daemon_loss_watcher().await;
+        let manager = self.fresh_agent.ensure_manager().await;
+        let selected = match msg
+            .session_ref
+            .as_ref()
+            .map(|reference| reference.session_id.clone())
+            .or(msg.resume_session_id.clone())
+        {
+            Some(root) => root,
+            None => {
+                manager
+                    .create_session(None, None, msg.cwd.as_deref())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .id
+            }
+        };
+        let base = manager
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        let route = msg.cwd.clone();
+        let budget = crate::resolve_probe_timeout_ms(
+            None,
+            std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        );
+        let (info, messages) = tokio::time::timeout(Duration::from_millis(budget), async {
+            let info = manager
+                .get_session_at(&selected, &route, &base)
+                .await
+                .map_err(|error| error.to_string())?;
+            let messages = manager
+                .list_messages_at(&selected, &route, &base)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((info, messages))
+        })
+        .await
+        .map_err(|_| "native OpenCode history load timed out".to_string())??;
+        let actual = info
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("native OpenCode root response lacks identity")?
+            .to_string();
+        if actual != selected || !info["parentID"].is_null() || !info["parent_id"].is_null() {
+            return Err("native OpenCode loaded a different or parent-bearing root".into());
+        }
+        let rows = messages
+            .as_array()
+            .ok_or("native OpenCode history response is not an array")?;
+        if rows.iter().any(|row| !row["info"].is_object()) {
+            return Err("native OpenCode history response is malformed".into());
+        }
+        let evidence = json!({"rootSessionId":actual,"parentSessionId":null,"messagesRead":"complete_v1",
+            "messageCount":rows.len(),"tailMessageId":rows.last().and_then(|row|row["info"]["id"].as_str())});
+        msg.resume_session_id = Some(actual.clone());
+        msg.session_ref = Some(SessionLocator {
+            provider: PROVIDER.into(),
+            session_id: actual.clone(),
+        });
+        self.handle_create(msg, None).await;
+        if !self.has_live_session(&actual).await {
+            return Err("native OpenCode loaded root was not registered".into());
+        }
+        self.broadcast(&event_frame(
+            &actual,
+            json!({"type":"freshAgent.native.loaded","nativeSessionId":actual,"evidence":evidence}),
+        ));
+        Ok(actual)
+    }
 
     /// The resume branch of `handle_create` (P1.13 Task 8, V2/A4): rebind the
     /// surviving durable `ses_*` session instead of minting a `freshopencode-*`
@@ -2272,7 +2550,7 @@ impl FreshOpencodeState {
     #[allow(clippy::too_many_arguments)] // the send field set + the drain's armed guard (the compact precedent)
     async fn send_locked(
         &self,
-        session_arc: &Arc<TokioMutex<OpencodeSession>>,
+        session_arc: &Arc<OpencodeSessionCell>,
         session: &mut tokio::sync::MutexGuard<'_, OpencodeSession>,
         msg: FreshAgentSend,
         session_id: String,
@@ -2356,6 +2634,18 @@ impl FreshOpencodeState {
             &busy_session_id,
             snapshot_event(&busy_session_id, "running"),
         ));
+        // The lock-free running claim for exactly this busy window (focused
+        // E3R2 review defect 1): the snapshot route's turn-status probe
+        // TRY-LOCKS this session's mutex, and the materialization below
+        // parks holding it — the pane that reloaded mid-send and missed the
+        // broadcast above would otherwise read a blanket idle from its
+        // refetch. Armed here (under the session mutex, so arming never
+        // interleaves), then moved into the spawned turn drive so the claim
+        // lives exactly as long as the drive: cleared at its natural settle,
+        // on any pre-spawn error return when this frame unwinds, and on
+        // every abort path (kill/interrupt join the aborted handle, so the
+        // guard's Drop has run before they answer).
+        let running_claim = RunningClaimGuard::arm(session_arc);
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
             // Already materialized: THE continuity fix — reuse it, no new session.
@@ -2432,8 +2722,20 @@ impl FreshOpencodeState {
                          placeholder resolves to a live owner; the pane is not \
                          materialized by this send"
                     );
-                    self.emit_fresh_agent_error(
-                        &session_id,
+                    // rewind-status episode 2: the refusal answers through
+                    // the REQUEST-CORRELATED error door (`send_error` — the
+                    // same door the already-materialized checkpoint guard
+                    // and the drain-time guard refusals already use) — the
+                    // client's owned-send-failure lane matches the frame's
+                    // requestId, clears the pending echo and the
+                    // optimistic running status, so a refused first send
+                    // can never leave a "Saving code rewind checkpoint"
+                    // hover for a turn that never ran. The session-scoped
+                    // `freshAgent.error` envelope stays reserved for the
+                    // attach lane's transient refusals (the 354caf5f1
+                    // preservation contract).
+                    self.send_error(
+                        &request_id,
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                     );
@@ -2461,7 +2763,11 @@ impl FreshOpencodeState {
                     } else {
                         "Another resume for this session is in flight"
                     };
-                    self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
+                    // rewind-status episode 2: request-correlated like the
+                    // Adopt arm above — a refused send is a send failure,
+                    // never a session-scoped degradation the slice's
+                    // preservation branch would keep "running".
+                    self.send_error(&request_id, "SESSION_RESERVED", message);
                     return;
                 }
             }
@@ -2825,6 +3131,12 @@ impl FreshOpencodeState {
         let prompt_dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let turn_task = tokio::spawn(async move {
+            // The drive owns the send's lock-free running claim (armed at the
+            // running broadcast above): held for the drive's whole life, so
+            // the probe's contended arm answers running exactly while this
+            // turn is in flight, and the claim clears at the drive's end —
+            // the settle tail's trailing idle broadcast — or on any abort.
+            let _running_claim = running_claim;
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
             // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
             // accepted witness (b8ke focused FR1 + round-2 R2-4) arms the session's
@@ -2893,6 +3205,7 @@ impl FreshOpencodeState {
             drop(released_at_dispatch);
             drop(op_guard.take()); // never-dispatched paths (errors, aborts)
             let result = turn_result;
+            let outcome = classify_turn_outcome(&result, turn_errored.load(Ordering::SeqCst));
             match &result {
                 // The idle edge was observed (or the daemon itself is gone —
                 // nothing runs daemon-side): the accepted turn is settled.
@@ -2933,10 +3246,9 @@ impl FreshOpencodeState {
             settle_turn_outcome(
                 &fresh_agent,
                 &real_id,
-                result.is_ok(),
                 &turn_aborted,
-                &turn_errored,
                 &last_turn_complete_at,
+                outcome,
             );
             // send-during-compact queue: FIFO one-at-a-time — after this
             // send settles, drive the next queued entry (no-op when the
@@ -3276,13 +3588,27 @@ impl FreshOpencodeState {
     pub async fn insert_live_session_for_test(&self, session_id: &str) {
         self.sessions.lock().await.insert(
             session_id.to_string(),
-            Arc::new(TokioMutex::new(OpencodeSession::new(
+            session_cell(OpencodeSession::new(
                 session_id.to_string(),
                 None,
                 None,
                 None,
-            ))),
+            )),
         );
+    }
+
+    /// Test-only seam (focused E3R2 review defect 1): read the session's
+    /// LOCK-FREE running mirror directly — the same cell the probe's
+    /// contended arm reads — WITHOUT taking the per-session mutex, so a
+    /// test can assert the claim's arm and clear around a held lock.
+    /// Production code must never call this.
+    #[doc(hidden)]
+    pub async fn opencode_running_claim_active_for_test(&self, session_id: &str) -> bool {
+        let cell = {
+            let guard = self.sessions.lock().await;
+            guard.get(session_id).cloned()
+        };
+        cell.is_some_and(|cell| cell.running.is_running())
     }
 
     /// Test-only seam for the b8ke focused FR1 red/green: settle the
@@ -4776,13 +5102,7 @@ impl FreshOpencodeState {
             // hands the interrupt a live SEND task with no real id,
             // preserve its observation exactly like the Err arm (clear the
             // flag + restore-if-empty) instead of strangling it.
-            if let InterruptedOp::SendTaken {
-                task,
-                clock: _,
-                clock_at_flag: _,
-                ..
-            } = taken
-            {
+            if let InterruptedOp::SendTaken { task, .. } = taken {
                 turn_aborted.store(false, Ordering::SeqCst);
                 let mut session = session_arc.lock().await;
                 if session.turn_task.is_none() && !session.killed.load(Ordering::SeqCst) {
@@ -4899,7 +5219,12 @@ impl FreshOpencodeState {
                                     session.killed.load(Ordering::SeqCst)
                                 };
                                 if !session_gone {
-                                    mint_turn_complete_edge(&self.fresh_agent, &real_id, &clock);
+                                    mint_turn_complete_edge(
+                                        &self.fresh_agent,
+                                        &real_id,
+                                        &clock,
+                                        None,
+                                    );
                                     tracing::debug!(
                                         provider = PROVIDER,
                                         session_id = %real_id,
@@ -5556,14 +5881,13 @@ impl FreshOpencodeState {
                 }
                 Err(_) => {}
             }
-            let succeeded = result.is_ok();
+            let outcome = classify_turn_outcome(&result, turn_errored.load(Ordering::SeqCst));
             settle_turn_outcome(
                 &fresh_agent,
                 &compact_id,
-                succeeded,
                 &turn_aborted,
-                &turn_errored,
                 &last_turn_complete_at,
+                outcome,
             );
             if let Err(err) = result {
                 // Server-side observability (the 2026-09-11 compact incident's
@@ -6030,7 +6354,7 @@ impl FreshOpencodeState {
         // ep2-r5: bind the child's session INSTANCE — the fork's rescue
         // verifies this exact `Arc` against the map (a same-key
         // replacement for the child can never satisfy it).
-        let child_session_arc = Arc::new(TokioMutex::new(child_session));
+        let child_session_arc = session_cell(child_session);
         self.sessions
             .lock()
             .await
@@ -6935,12 +7259,7 @@ impl FreshOpencodeState {
             // first, the durable attach path below owns the guarded bridge restart.
             let session = arc.lock().await;
             if session.real_session_id.is_none() {
-                let running = session
-                    .turn_task
-                    .as_ref()
-                    .map(|task| !task.is_finished())
-                    .unwrap_or(false);
-                let status = if running { "running" } else { "idle" };
+                let status = session.turn_derived_status();
                 self.broadcast(&event_frame(
                     &session.placeholder_id,
                     snapshot_event(&session.placeholder_id, status),
@@ -7179,7 +7498,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running, real_session_id) = {
+        let (status_session_id, status, real_session_id) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) --
@@ -7214,12 +7533,8 @@ impl FreshOpencodeState {
                 .real_session_id
                 .clone()
                 .unwrap_or_else(|| session.placeholder_id.clone());
-            let running = session
-                .turn_task
-                .as_ref()
-                .map(|t| !t.is_finished())
-                .unwrap_or(false);
-            (status_session_id, running, session.real_session_id.clone())
+            let status = session.turn_derived_status();
+            (status_session_id, status, session.real_session_id.clone())
         };
 
         // Attach addressed by the PLACEHOLDER id of an already-materialized session:
@@ -7244,7 +7559,6 @@ impl FreshOpencodeState {
             }
         }
 
-        let status = if running { "running" } else { "idle" };
         self.broadcast(&event_frame(
             &status_session_id,
             snapshot_event(&status_session_id, status),
@@ -7285,7 +7599,7 @@ impl FreshOpencodeState {
         // performs the ONE `commit_live`, so this lane skips both its own
         // claim and its own commit (under-ticket mode).
         handoff: Option<(&str, u64)>,
-    ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
+    ) -> Result<Arc<OpencodeSessionCell>, ResumeOpencodeError> {
         // A `freshopencode-*` placeholder is minted by Freshell for a pane
         // that has not materialized yet. Opencode has never seen it, so no
         // daemon can resume it: answer NotFound before ANY side effect — no
@@ -7500,7 +7814,7 @@ impl FreshOpencodeState {
         });
         self.install_serve_bridge(&manager, &mut session, session_id)
             .await;
-        let session_arc = Arc::new(TokioMutex::new(session));
+        let session_arc = session_cell(session);
 
         self.sessions
             .lock()
@@ -8290,7 +8604,7 @@ impl FreshOpencodeState {
     /// deadlocked production) — the session `Arc`s are cloned out under ONE
     /// short map lock, the guard drops, and each session is read outside it.
     async fn materialized_session_ids(&self) -> Vec<String> {
-        let arcs: Vec<Arc<TokioMutex<OpencodeSession>>> = {
+        let arcs: Vec<Arc<OpencodeSessionCell>> = {
             let map = self.sessions.lock().await;
             map.values().cloned().collect()
         };
@@ -8827,18 +9141,18 @@ pub(crate) enum TransitionalBridgeRescue {
 /// current entry. The wrapped [`OpencodeSession`] stays private to this
 /// module; the runner only ever passes the handle through.
 #[derive(Clone)]
-pub(crate) struct OpencodeSessionHandle(Arc<TokioMutex<OpencodeSession>>);
+pub(crate) struct OpencodeSessionHandle(Arc<OpencodeSessionCell>);
 
 impl OpencodeSessionHandle {
     /// Wrap the session instance a caller is committing (or has just
     /// committed) under its durable id.
-    fn new(instance: Arc<TokioMutex<OpencodeSession>>) -> Self {
+    fn new(instance: Arc<OpencodeSessionCell>) -> Self {
         Self(instance)
     }
 
     /// The committed-instance binding (ep2-r5): true iff `current` IS the
     /// session instance this handle was minted from.
-    fn ptr_eq(&self, current: &Arc<TokioMutex<OpencodeSession>>) -> bool {
+    fn ptr_eq(&self, current: &Arc<OpencodeSessionCell>) -> bool {
         Arc::ptr_eq(&self.0, current)
     }
 }
@@ -8912,6 +9226,51 @@ fn error_event(session_id: &str, message: &str) -> Value {
     json!({ "type": "freshAgent.error", "sessionId": session_id, "message": message })
 }
 
+/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the
+/// unified turn-end attention edge — emitted for ANY turn end except a
+/// user-initiated interrupt, deliberately diverging from the legacy
+/// status-guarded positive-completion chime of adapter.ts:377-381).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOutcome {
+    Completed,
+    ProviderError,
+    IdleTimeout,
+    SidecarLost,
+    RequestFailed,
+}
+
+impl TurnOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::ProviderError => "provider_error",
+            Self::IdleTimeout => "idle_timeout",
+            Self::SidecarLost => "sidecar_lost",
+            Self::RequestFailed => "request_failed",
+        }
+    }
+}
+
+fn classify_turn_outcome(result: &Result<(), ServeError>, provider_errored: bool) -> TurnOutcome {
+    if provider_errored {
+        return TurnOutcome::ProviderError;
+    }
+    match result {
+        Ok(()) => TurnOutcome::Completed,
+        Err(ServeError::IdleTimeout { .. }) => TurnOutcome::IdleTimeout,
+        Err(ServeError::SidecarLost { .. }) => TurnOutcome::SidecarLost,
+        Err(_) => TurnOutcome::RequestFailed,
+    }
+}
+
+fn turn_complete_event(session_id: &str, at: i64, outcome: Option<TurnOutcome>) -> Value {
+    let mut event = crate::attention::turn_complete_event(session_id, at);
+    if let Some(outcome) = outcome {
+        event["outcome"] = json!(outcome.as_str());
+    }
+    event
+}
+
 /// Stamp the session's strictly-monotonic turn-complete clock and broadcast the
 /// unified `freshAgent.turn.complete` edge — the shared mint of
 /// [`settle_turn_outcome`]'s tail, so a later edge can never collide with or
@@ -8920,6 +9279,7 @@ fn mint_turn_complete_edge(
     fresh_agent: &FreshAgentState,
     real_id: &str,
     last_turn_complete_at: &StdMutex<Option<i64>>,
+    outcome: Option<TurnOutcome>,
 ) {
     let at = {
         let mut guard = last_turn_complete_at
@@ -8929,7 +9289,10 @@ fn mint_turn_complete_edge(
         *guard = Some(at);
         at
     };
-    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    fresh_agent.broadcast(&event_frame(
+        real_id,
+        turn_complete_event(real_id, at, outcome),
+    ));
 }
 
 /// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
@@ -8939,29 +9302,27 @@ fn mint_turn_complete_edge(
 /// "the user did not interrupt" (`!turn_aborted`). A clean finish, a
 /// `session.error` turn (`turn_errored`), and a failed settle (`succeeded=false`:
 /// prompt-POST failure, `IdleTimeout`, `SidecarLost`) all ended a turn the user
-/// may not have been watching — one identical edge, no outcome on the wire —
-/// stamped by the session's monotonic turn-complete clock.
+/// may not have been watching. The edge carries a finite outcome category, never
+/// provider error text, and is stamped by the session's monotonic clock.
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
-    succeeded: bool,
     turn_aborted: &AtomicBool,
-    turn_errored: &AtomicBool,
     last_turn_complete_at: &StdMutex<Option<i64>>,
+    outcome: TurnOutcome,
 ) {
     fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
     // Unified "needs attention": ANY turn end rings except a user-initiated
     // interrupt (turn_aborted). A clean finish, a session.error turn
-    // (turn_errored), and a failed settle (succeeded=false: prompt-POST
-    // failure, IdleTimeout, SidecarLost) all ended a turn the user may not
-    // have been watching — one identical edge, no outcome on the wire.
+    // (turn_errored), and a failed settle all ended a turn the user may not
+    // have been watching. The event's outcome is a fixed category, not raw detail.
     if turn_aborted.load(Ordering::SeqCst) {
         return;
     }
-    if !succeeded || turn_errored.load(Ordering::SeqCst) {
+    if outcome != TurnOutcome::Completed {
         tracing::debug!(provider = PROVIDER, session_id = %real_id, "turn.settled_non_clean_unified_edge");
     }
-    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at);
+    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at, Some(outcome));
 }
 
 /// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
@@ -9158,6 +9519,7 @@ mod tests {
     struct AbortRecordingHttp {
         next_session: AtomicUsize,
         prompts: StdMutex<Vec<String>>,
+        prompt_completions: AtomicUsize,
         aborts: StdMutex<Vec<String>>,
         prompt_dispatched: tokio::sync::Notify,
     }
@@ -9218,7 +9580,14 @@ mod tests {
                     }
                 }
             }
-            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+            let is_prompt = req.url.contains("/prompt_async")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            Box::pin(async move {
+                if is_prompt {
+                    self.prompt_completions.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(ServeHttpResponse::new(200, body))
+            })
         }
     }
 
@@ -11021,6 +11390,242 @@ mod tests {
                 .any(|frame| frame.contains("freshAgent.session.materialized")),
             "the normal materialization event is emitted"
         );
+    }
+
+    // ── rewind-status episode 2: the send-time materialization claim
+    // refusals are request-correlated send failures ────────────────────────
+
+    /// The shared harness for the send-time claim-refusal contract tests: a
+    /// state whose broadcast receiver is RETAINED and whose ownership
+    /// coordinator is WIRED (the pre-spawn materialization claim runs).
+    async fn state_with_registry_and_receiver() -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        (st, rx, registry)
+    }
+
+    /// The send-time claim-refusal contract, shared by every arm: a first
+    /// send whose materialization claim is refused answers through the
+    /// REQUEST-CORRELATED error door (`send_error` — the same door as the
+    /// already-materialized checkpoint guard and the drain-time guard
+    /// refusals), so the client's owned-send-failure lane (the
+    /// `type === 'error'` requestId match in FreshAgentView) clears the
+    /// pending echo and the optimistic running status honestly; the refusal
+    /// NEVER rides the session-scoped `freshAgent.error` envelope (the door
+    /// the slice's 354caf5f1 SESSION_RESERVED preservation branch sees, which
+    /// would keep a refused-and-never-run turn "running" with a "Saving
+    /// code rewind checkpoint" hover). The attach lane keeps the
+    /// session-scoped shape by design — these tests pin the SEND lane.
+    async fn assert_first_send_claim_refusal_is_request_correlated(
+        st: &FreshOpencodeState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        placeholder: &str,
+        request_id: &str,
+        expected_message_fragment: &str,
+    ) {
+        let frames = drain_frames(rx);
+        let correlated = frames.iter().find(|f| {
+            f["type"] == "error"
+                && f["requestId"] == json!(request_id)
+                && f["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("SESSION_RESERVED"))
+        });
+        let Some(refusal) = correlated else {
+            panic!(
+                "the refused first send must answer through the request-correlated \
+                 error door (type=error, requestId={request_id}, SESSION_RESERVED in \
+                 the message): {frames:?}"
+            );
+        };
+        assert!(
+            refusal["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(expected_message_fragment)),
+            "the correlated refusal carries the claim arm's typed message: {refusal:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error"
+                && f["event"]["code"] == "SESSION_RESERVED"),
+            "the send-time claim refusal must never ride the session-scoped \
+             freshAgent.error envelope (the attach lane's preserved shape): \
+             {frames:?}"
+        );
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get(placeholder)
+            .cloned()
+            .expect("the placeholder session remains mapped");
+        assert!(
+            session_arc.lock().await.turn_task.is_none(),
+            "a refused first send never starts a turn"
+        );
+    }
+
+    /// The Adopt arm (the `LaneClaim::Adopt` match arm of `send_locked`'s
+    /// pre-spawn materialization claim): the placeholder resolves to a LIVE
+    /// same-kind owner (an earlier materialization for this pane completed;
+    /// the duplicate first send answers typed).
+    #[tokio::test]
+    async fn first_send_claim_refused_by_a_live_owner_answers_a_request_correlated_error() {
+        let (st, mut rx, registry) = state_with_registry_and_receiver().await;
+
+        st.handle_create(create_msg("req-claim-adopt"), None).await;
+        let placeholder = "freshopencode-req-claim-adopt";
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            placeholder,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-test-earlier-materialization",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the placeholder's earlier-materialization claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                placeholder,
+                "op-test-earlier-materialization",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(placeholder.to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed,
+            "precondition: the placeholder key is LIVE under a fresh-agent owner"
+        );
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg(placeholder, "the duplicate first message");
+        send.request_id = Some("req-claim-adopt-send".into());
+        st.handle_send(send).await;
+
+        assert_first_send_claim_refusal_is_request_correlated(
+            &st,
+            &mut rx,
+            placeholder,
+            "req-claim-adopt-send",
+            "Another resume for this session is in flight",
+        )
+        .await;
+    }
+
+    /// The Refused arm's in-flight conflict (the `LaneClaim::Refused`
+    /// match arm of `send_locked`'s pre-spawn materialization claim, the
+    /// default message branch): the coordinator holds the placeholder's
+    /// pre-spawn claim for another lifecycle operation (Blocked).
+    #[tokio::test]
+    async fn first_send_claim_refused_by_an_in_flight_operation_answers_a_request_correlated_error()
+    {
+        let (st, mut rx, registry) = state_with_registry_and_receiver().await;
+
+        st.handle_create(create_msg("req-claim-blocked"), None)
+            .await;
+        let placeholder = "freshopencode-req-claim-blocked";
+
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_start(
+            PROVIDER,
+            placeholder,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-test-in-flight-lifecycle",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the in-flight lifecycle operation's claim must grant")
+        };
+        // No commit: the key stays Starting — the send's own materialize
+        // claim (a DIFFERENT operation id) is refused Blocked.
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg(placeholder, "the blocked first message");
+        send.request_id = Some("req-claim-blocked-send".into());
+        st.handle_send(send).await;
+
+        assert_first_send_claim_refusal_is_request_correlated(
+            &st,
+            &mut rx,
+            placeholder,
+            "req-claim-blocked-send",
+            "Another resume for this session is in flight",
+        )
+        .await;
+    }
+
+    /// The Refused arm's stale-fence branch (the `LaneClaim::Refused`
+    /// match arm of `send_locked`'s pre-spawn materialization claim): a
+    /// delayed old-generation send claims a since-vacated placeholder and
+    /// answers the honest stale refusal — correlated like every other
+    /// send refusal.
+    #[tokio::test]
+    async fn first_send_claim_refused_by_a_stale_fence_answers_a_request_correlated_error() {
+        let (st, mut rx, registry) = state_with_registry_and_receiver().await;
+
+        st.handle_create(create_msg("req-claim-stale"), None).await;
+        let placeholder = "freshopencode-req-claim-stale";
+
+        // The CLIENT'S pair — observed before the generation bump.
+        let before = registry.observe(PROVIDER, placeholder);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            placeholder,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-test-generation-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump claim must grant")
+        };
+        assert_eq!(
+            registry.fail(
+                PROVIDER,
+                placeholder,
+                "op-test-generation-bump",
+                generation,
+                false,
+            ),
+            freshell_ownership::FailOutcome::Released,
+            "precondition: the key is Vacant again at the bumped generation"
+        );
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg_fenced(
+            placeholder,
+            "the delayed first message",
+            Some(before.epoch),
+            Some(before.generation),
+        );
+        send.request_id = Some("req-claim-stale-send".into());
+        st.handle_send(send).await;
+
+        assert_first_send_claim_refusal_is_request_correlated(
+            &st,
+            &mut rx,
+            placeholder,
+            "req-claim-stale-send",
+            "The observed ownership fence is stale; refresh and retry",
+        )
+        .await;
     }
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
@@ -13152,6 +13757,225 @@ mod tests {
         assert!(matches!(err, crate::OpencodeSnapshotError::NotFound));
     }
 
+    /// Root-cause fix for the rewind-status defect family (delta round 2): the
+    /// durable snapshot route (`GET /api/fresh-agent/threads/freshopencode/opencode/:id`)
+    /// must report the session's ACTUAL turn-derived status -- the SAME derivation
+    /// the existing-session attach broadcast asserts (the WS session record's
+    /// `turn_task` unfinished => running) -- never a hardcoded idle. A mid-turn
+    /// refetch answering a false idle is the materialization blip that forced
+    /// every client-side timing gate in this family (the e1r2 report's Deviation 2:
+    /// the refetch answered idle before the provider persisted any row); with the
+    /// truthful status the pane's busy state survives the refetch and the first
+    /// message's honest "still saving" hover holds.
+    #[tokio::test]
+    async fn get_opencode_snapshot_reports_the_ws_record_turn_status_while_a_turn_runs() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        // The WS lane over the SHARED FreshAgentState -- its construction wires
+        // the lane's turn-status probe into the REST state the route reads.
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-status"), None).await;
+        let placeholder = "freshopencode-req-status";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let durable_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized after send")
+        };
+        assert!(durable_id.starts_with("ses_"));
+
+        // The running-turn shape every turn registration produces (a detached,
+        // not-yet-finished drive task) -- the record the attach broadcast reads.
+        {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).expect("session tracked").clone();
+            session_arc.lock().await.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        }
+
+        // The durable arm -- the pane's materialization refetch -- must answer
+        // the record's turn-derived status, not the built snapshot's idle.
+        let snapshot = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("materialized session snapshot builds");
+        assert_eq!(
+            snapshot["status"],
+            json!("running"),
+            "the durable snapshot route must answer the WS record's running status mid-turn"
+        );
+        // The placeholder arm (a pane that has not folded the materialized
+        // frame yet) reads the SAME record -- the attach broadcast's own rule.
+        let placeholder_snapshot = st
+            .fresh_agent
+            .get_opencode_snapshot(placeholder, None)
+            .await
+            .expect("placeholder snapshot builds");
+        assert_eq!(
+            placeholder_snapshot["status"],
+            json!("running"),
+            "the placeholder arm mirrors the same WS record's status"
+        );
+
+        // The turn settles: the SAME record now derives idle, and the route
+        // reports it (idle when idle -- the derivation's other edge).
+        st.settle_local_turn_task_for_test(&durable_id).await;
+        let settled = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("settled session snapshot builds");
+        assert_eq!(settled["status"], json!("idle"));
+
+        // No WS record for the id (the REST-lane-materialized shape -- the
+        // documented product gap): keep today's honest idle instead of
+        // guessing. The serve still knows the session; the map does not.
+        st.sessions.lock().await.clear();
+        let no_record = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("serve-known session still builds without a WS record");
+        assert_eq!(
+            no_record["status"],
+            json!("idle"),
+            "no WS record keeps the honest idle -- the route never guesses"
+        );
+    }
+
+    /// Focused E3R2 review defect 1 (superseding the round-3 delta defect-3
+    /// fix's contended-window contract): the snapshot route's turn-status
+    /// probe must never BLOCK on the per-session mutex, AND its contended
+    /// arm must never answer a blanket idle. A first send's materialization
+    /// holds that mutex while awaiting the OpenCode session creation, and
+    /// the send has ALREADY broadcast `running` (send_locked's status
+    /// broadcast fires before any materialization) — so a pane that reloads
+    /// in exactly that window missed the broadcast, and a placeholder
+    /// snapshot refetch answering the pre-probe honest idle flips the pane
+    /// idle mid-send (the in-flight message's row then shows the unearned
+    /// "Rewind unavailable" verdict). The probe TRY-LOCKS the session
+    /// record; on contention it reads the session's LOCK-FREE running
+    /// mirror (armed at the running-broadcast site, cleared when the send's
+    /// drive ends) and reports the mirror's status: running while the send
+    /// is genuinely in flight, idle only when no running claim is live.
+    /// The uncontended success path is unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn placeholder_snapshot_answers_promptly_while_a_first_send_holds_the_session_mutex() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(GatedCreateHttp {
+                arrived_tx,
+                release: Arc::clone(&release),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        // The WS lane over the SHARED FreshAgentState -- its construction wires
+        // the lane's turn-status probe into the REST state the route reads.
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-probe-liveness"), None)
+            .await;
+        let placeholder = "freshopencode-req-probe-liveness";
+
+        // The first send parks inside its cold-start session creation, HOLDING
+        // the per-session mutex the probe reads.
+        let st2 = st.clone();
+        let send =
+            tokio::spawn(async move { st2.handle_send(send_msg(placeholder, "hello")).await });
+        arrived_rx
+            .recv()
+            .await
+            .expect("the first send reaches its session creation");
+
+        // The placeholder snapshot request answers PROMPTLY -- the probe skips
+        // parking on the held mutex -- and the answer is the LOCK-FREE
+        // mirror's HONEST running: the send has already broadcast running and
+        // is genuinely in flight inside the held critical section, so the
+        // pane that reloaded mid-send and missed the broadcast must NOT be
+        // flipped idle by its refetch.
+        let snapshot = tokio::time::timeout(
+            Duration::from_millis(750),
+            st.fresh_agent.get_opencode_snapshot(placeholder, None),
+        )
+        .await
+        .expect(
+            "the placeholder snapshot answers while materialization holds \
+             the session mutex -- the probe must not block on the record lock",
+        )
+        .expect("placeholder snapshot builds");
+        assert_eq!(
+            snapshot["status"],
+            json!("running"),
+            "the contended probe reports the session's lock-free running mirror \
+             while the first send is genuinely in flight -- never a blanket idle"
+        );
+        // The mirror's claim is armed for exactly this window (read lock-free
+        // while the mutex stays held).
+        assert!(
+            st.opencode_running_claim_active_for_test(placeholder).await,
+            "the running claim is armed while the first send holds the session mutex"
+        );
+
+        // Release the gated create so the parked send finishes: the send
+        // spawns its turn drive (the claim moves into the drive), then the
+        // drive is settled — the abort path kill/interrupt use — so the
+        // claim must clear: the mirror never wedges running past the end of
+        // the drive it was armed for, and a fresh snapshot answers idle.
+        release.notify_one();
+        let _ = send.await;
+        st.settle_local_turn_task_for_test(placeholder).await;
+        assert!(
+            !st.opencode_running_claim_active_for_test(placeholder).await,
+            "the running claim clears when the send's drive ends"
+        );
+        let settled = tokio::time::timeout(
+            Duration::from_millis(750),
+            st.fresh_agent.get_opencode_snapshot(placeholder, None),
+        )
+        .await
+        .expect("the settled placeholder snapshot still answers promptly")
+        .expect("settled placeholder snapshot builds");
+        assert_eq!(
+            settled["status"],
+            json!("idle"),
+            "once no running claim is live the probe reports the honest idle"
+        );
+    }
+
     #[tokio::test]
     async fn second_send_reuses_the_same_durable_session_id() {
         let (st, _killed) = state().await;
@@ -13186,6 +14010,130 @@ mod tests {
             first_real_id, second_real_id,
             "second send must reuse the durable session id"
         );
+    }
+
+    struct NativeBootstrapHttp {
+        inner: RealisticServeHttp,
+        requests: StdMutex<Vec<(bool, String)>>,
+    }
+    impl ServeHttp for NativeBootstrapHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.requests.lock().unwrap().push((
+                matches!(req.method, freshell_opencode::serve::HttpMethod::Post),
+                req.url.clone(),
+            ));
+            self.inner.request(req)
+        }
+    }
+
+    async fn cold_native_bootstrap_runtime() -> (FreshOpencodeState, Arc<NativeBootstrapHttp>) {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let owner = FreshAgentState::new(Arc::new("owned-native".into()), Arc::new(tx));
+        let http = Arc::new(NativeBootstrapHttp {
+            inner: RealisticServeHttp::new(),
+            requests: StdMutex::new(vec![]),
+        });
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        assert!(manager.base_url().await.is_none());
+        owner.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(owner), http)
+    }
+
+    #[tokio::test]
+    async fn managed_native_resume_starts_cold_daemon_and_loads_before_any_prompt() {
+        let (runtime, http) = cold_native_bootstrap_runtime().await;
+        let expected_root = "ses_existing_native_root";
+        http.inner
+            .created
+            .lock()
+            .unwrap()
+            .insert(expected_root.into());
+        let mut request = create_msg("managed-cold-native-resume");
+        request.resume_session_id = Some(expected_root.into());
+        let actual = runtime
+            .prepare_managed_native_session(request)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected_root);
+        assert!(runtime.has_live_session(expected_root).await);
+        let requests = http.requests.lock().unwrap().clone();
+        assert!(requests
+            .iter()
+            .any(|(post, url)| !post && url.contains("/global/health")));
+        assert!(
+            requests
+                .iter()
+                .any(|(post, url)| !post
+                    && url.contains(&format!("/session/{expected_root}/message")))
+        );
+        assert!(!requests
+            .iter()
+            .any(|(post, url)| *post && (url.ends_with("/session") || url.contains("/session?"))));
+        assert!(!requests
+            .iter()
+            .any(|(_, url)| url.contains("/prompt_async")));
+        let session = runtime
+            .sessions
+            .lock()
+            .await
+            .get(expected_root)
+            .unwrap()
+            .clone();
+        assert!(session.lock().await.turn_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_native_bootstrap_creates_and_loads_before_any_prompt() {
+        let (runtime, http) = cold_native_bootstrap_runtime().await;
+        let root = runtime
+            .prepare_managed_native_session(create_msg("managed-empty-input"))
+            .await
+            .unwrap();
+        assert!(
+            root.starts_with("ses_"),
+            "native root must come from actual provider creation, not a local placeholder"
+        );
+        assert!(runtime.has_live_session(&root).await);
+        let requests = http.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |(post, url)| *post && (url.ends_with("/session") || url.contains("/session?"))
+                )
+                .count(),
+            1
+        );
+        assert!(requests
+            .iter()
+            .any(|(post, url)| !*post && url.contains(&format!("/session/{root}/message"))));
+        assert!(
+            !requests
+                .iter()
+                .any(|(_, url)| url.contains("/prompt_async")),
+            "bootstrap may never submit model input"
+        );
+        let session = runtime.sessions.lock().await.get(&root).unwrap().clone();
+        assert!(session.lock().await.turn_task.is_none());
     }
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
@@ -13840,7 +14788,7 @@ mod tests {
         let mut session =
             OpencodeSession::new("freshopencode-req-live".to_string(), None, None, None);
         session.real_session_id = Some("ses_live".to_string());
-        let session_arc = Arc::new(TokioMutex::new(session));
+        let session_arc = session_cell(session);
         {
             let mut guard = st.sessions.lock().await;
             guard.insert("freshopencode-req-live".to_string(), session_arc.clone());
@@ -15140,7 +16088,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert(durable_id.to_string(), Arc::new(TokioMutex::new(session)));
+            .insert(durable_id.to_string(), session_cell(session));
         (st, rx, registry)
     }
 
@@ -16796,7 +17744,7 @@ mod tests {
         // the pending RPC window — the tail's own mint, which nothing can
         // un-ring. The injection runs the real mint helper (the same
         // clock-stamped broadcast the tail's mint segment performs).
-        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock);
+        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock, None);
 
         // The tail completes inside the window (a finished drive observed
         // its end), then the abort RPC fails and the Err arm runs — with the
@@ -18186,7 +19134,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+            .insert(id.to_string(), session_cell(session));
     }
 
     /// Drain every buffered bus frame in arrival order (full parsed payloads).
@@ -20733,7 +21681,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
+            .insert(id.to_string(), session_cell(session));
     }
 
     /// b8ke ext r26 F3: the fork's PRE-MUTATION claim — the request-scoped
@@ -21472,11 +22420,52 @@ mod tests {
         assert_eq!(error["event"]["message"], "boom");
 
         let complete = serde_json::from_str::<serde_json::Value>(
-            &serde_json::to_string(&event_frame("s-1", turn_complete_event("s-1", 42))).unwrap(),
+            &serde_json::to_string(&event_frame(
+                "s-1",
+                turn_complete_event("s-1", 42, Some(TurnOutcome::IdleTimeout)),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(complete["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(complete["event"]["at"], 42);
+        assert_eq!(complete["event"]["outcome"], "idle_timeout");
+        assert!(complete["event"].get("message").is_none());
+
+        let legacy_complete = turn_complete_event("s-1", 43, None);
+        assert!(legacy_complete.get("outcome").is_none());
+    }
+
+    #[test]
+    fn turn_outcome_reports_only_bounded_settlement_categories() {
+        let idle_timeout = Err(ServeError::IdleTimeout {
+            session_id: "private-session-detail".into(),
+            timeout_ms: 10,
+        });
+        assert_eq!(
+            classify_turn_outcome(&idle_timeout, false),
+            TurnOutcome::IdleTimeout
+        );
+        let sidecar_lost = Err(ServeError::SidecarLost {
+            session_id: "private-session-detail".into(),
+        });
+        assert_eq!(
+            classify_turn_outcome(&sidecar_lost, false),
+            TurnOutcome::SidecarLost
+        );
+        assert_eq!(
+            classify_turn_outcome(&Ok(()), true),
+            TurnOutcome::ProviderError
+        );
+        assert_eq!(
+            classify_turn_outcome(&Ok(()), false),
+            TurnOutcome::Completed
+        );
+        let failed_request = Err(ServeError::Transport("private transport detail".into()));
+        assert_eq!(
+            classify_turn_outcome(&failed_request, false),
+            TurnOutcome::RequestFailed
+        );
     }
 
     #[test]
@@ -21836,7 +22825,7 @@ mod tests {
         st.sessions
             .lock()
             .await
-            .insert("ses_real".to_string(), Arc::new(TokioMutex::new(session)));
+            .insert("ses_real".to_string(), session_cell(session));
         let sink = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(sink.clone());
         if let Some(pointer) = pointer {
@@ -22327,12 +23316,12 @@ mod tests {
         // Register an UNMATERIALIZED placeholder (no durable ses_* id yet).
         st.sessions.lock().await.insert(
             "freshopencode-placeholder-1".to_string(),
-            Arc::new(TokioMutex::new(OpencodeSession::new(
+            session_cell(OpencodeSession::new(
                 "freshopencode-placeholder-1".to_string(),
                 None,
                 None,
                 None,
-            ))),
+            )),
         );
         let (sink, captured) = capturing_sink();
         st.handle_rollback(undo_op("freshopencode-placeholder-1", "rb-7"), sink)

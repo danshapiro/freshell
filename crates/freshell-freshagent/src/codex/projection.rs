@@ -1974,7 +1974,13 @@ mod tests {
         assert_eq!(peer.expect_notification().await.0, "initialized");
         let request = peer.expect_request().await;
         assert_eq!(request.1, "thread/read");
-        assert_eq!(request.2["includeTurns"], true);
+        assert_eq!(request.2["includeTurns"], false);
+        peer.respond(&request.0, history(json!([])));
+        let request = peer.expect_request().await;
+        assert_eq!(request.1, "thread/turns/list");
+        assert_eq!(request.2["threadId"], "thread-1");
+        assert_eq!(request.2["limit"], 1);
+        assert_eq!(request.2["itemsView"], "full");
         state
             .sessions
             .lock()
@@ -1985,10 +1991,18 @@ mod tests {
             .lock()
             .unwrap()
             .invalidate_history(&["removed".into()]);
-        peer.respond(&request.0,history(json!([{"id":"removed","status":"completed","itemsView":"full","items":[{"id":"a","type":"agentMessage","text":"must disappear"}]}])));
+        peer.respond(&request.0,json!({"data":[{"id":"removed","status":"completed","itemsView":"full","items":[{"id":"a","type":"agentMessage","text":"must disappear"}]}],"nextCursor":null,"backwardsCursor":null}));
         let reread = peer.expect_request().await;
         assert_eq!(reread.1, "thread/read");
+        assert_eq!(reread.2["includeTurns"], false);
         peer.respond(&reread.0, history(json!([])));
+        let reread = peer.expect_request().await;
+        assert_eq!(reread.1, "thread/turns/list");
+        assert_eq!(reread.2["threadId"], "thread-1");
+        peer.respond(
+            &reread.0,
+            json!({"data":[],"nextCursor":null,"backwardsCursor":null}),
+        );
         let result = snapshot.await.unwrap().unwrap();
         assert_eq!(result["turns"], json!([]));
         assert_eq!(
@@ -2117,6 +2131,13 @@ mod tests {
         peer.expect_notification().await;
         let request = peer.expect_request().await;
         assert_eq!(request.1, "thread/read");
+        assert_eq!(request.2["includeTurns"], false);
+        peer.respond(&request.0, history(json!([])));
+        let request = peer.expect_request().await;
+        assert_eq!(request.1, "thread/turns/list");
+        assert_eq!(request.2["threadId"], "thread-1");
+        assert_eq!(request.2["limit"], 1);
+        assert_eq!(request.2["itemsView"], "full");
         {
             let mut p = projection.lock().unwrap();
             let ops = delta(&mut p, "t", "lo");
@@ -2124,7 +2145,7 @@ mod tests {
         }
         peer.respond(
             &request.0,
-            history(json!([{"id":"t","status":"inProgress","itemsView":"full","items":[]}])),
+            json!({"data":[{"id":"t","status":"inProgress","itemsView":"full","items":[]}],"nextCursor":null,"backwardsCursor":null}),
         );
         let view = snapshot.await.unwrap().unwrap();
         assert_eq!(view["turns"][0]["items"][0]["text"], "Hel");

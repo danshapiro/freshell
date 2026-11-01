@@ -1,0 +1,251 @@
+--- a/amplifier_app_cli/session_store.py
++++ b/amplifier_app_cli/session_store.py
+@@ -195,6 +195,15 @@
+         if not session_dir.exists():
+             raise FileNotFoundError(f"Session '{session_id}' not found")
+ 
++        from .freshell_native_resume import managed_launch, load_native, _status
++        native_binding = managed_launch()
++        if native_binding is not None:
++            try:
++                return load_native(self, session_id)
++            except (OSError, ValueError):
++                _status("amplifier.native_load.refused", native_binding[0], "no_complete_native_load")
++                raise
++
+         # Load transcript with recovery
+         transcript = self._load_transcript(session_dir)
+ 
+--- a/amplifier_app_cli/session_runner.py
++++ b/amplifier_app_cli/session_runner.py
+@@ -226,11 +226,14 @@
+             "project_name", Path(cwd).name if cwd else ""
+         )
+ 
++    from .freshell_native_resume import managed_launch, publish_initialized
++    native_binding = managed_launch()
++
+     # Step 7: Restore transcript (resume only)
+     # NOTE: Transcript repair (orphaned tool calls, ordering violations) is handled
+     # by _repair_transcript_if_needed() in main.py, which runs before every LLM call.
+     # This covers both resume and mid-session Ctrl+C cases in a single code path.
+-    if config.is_resume and config.initial_transcript:
++    if config.is_resume and (config.initial_transcript or native_binding):
+         transcript_to_restore = config.initial_transcript
+ 
+         context = session.coordinator.get("context")
+@@ -250,7 +253,14 @@
+                     )
+ 
+             # Restore the (possibly repaired) transcript
+-            await context.set_messages(transcript_to_restore)
++            try:
++                await context.set_messages(transcript_to_restore)
++            except Exception:
++                if native_binding:
++                    from .freshell_native_resume import _status
++                    _status("amplifier.native_context_restore.refused", native_binding[0], "set_messages_failed")
++                    await session.cleanup()
++                raise
+             logger.info(
+                 "Restored %d messages from transcript", len(transcript_to_restore)
+             )
+@@ -269,6 +279,9 @@
+                         "Re-injected system prompt (%d chars)",
+                         len(fresh_system_msg.get("content", "")),
+                     )
++        elif native_binding:
++            await session.cleanup()
++            raise ValueError("managed native context lacks set_messages")
+         elif config.initial_transcript:
+             logger.warning(
+                 "Context module lacks set_messages - transcript NOT restored"
+@@ -324,6 +337,8 @@
+         except Exception as e:
+             logger.warning("SessionConfigurator initialization failed: %s", e)
+             configurator = None
++
++    await publish_initialized(session, config)
+ 
+     return InitializedSession(
+         session=session,
+--- /dev/null
++++ b/amplifier_app_cli/freshell_native_resume.py
+@@ -0,0 +1,164 @@
++"""Pinned managed CLI load/context acknowledgement; ordinary launches are unchanged."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import stat
++import sys
++from pathlib import Path
++
++
++CLI_PIN = "1873aa980535c99a743b17172e4231833f6c8741"
++
++
++def managed_launch():
++    raw = os.environ.get("FRESHELL_NATIVE_IDENTITY_LAUNCH")
++    directory = os.environ.get("FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR")
++    if raw is None and directory is None:
++        return None
++    if not raw or not directory:
++        raise ValueError("managed native launch binding is incomplete")
++    launch = json.loads(raw)
++    required = {"incarnationId", "launchNonce", "evidenceRevision", "executionGeneration", "requestedNativeSessionId"}
++    if not isinstance(launch, dict) or set(launch) != required:
++        raise ValueError("managed native launch binding is invalid")
++    if not all(isinstance(launch[x], str) and launch[x] for x in ["incarnationId", "launchNonce"]):
++        raise ValueError("managed native launch identity is invalid")
++    if type(launch["evidenceRevision"]) is not int or launch["evidenceRevision"] < 0 or type(launch["executionGeneration"]) is not int or launch["executionGeneration"] <= 0:
++        raise ValueError("managed native launch revision is invalid")
++    requested = launch["requestedNativeSessionId"]
++    if requested is not None and (not isinstance(requested, str) or not requested):
++        raise ValueError("managed native requested root is invalid")
++    return launch, Path(directory)
++
++
++class LoadedTranscript(list):
++    def __init__(self, messages, witness):
++        super().__init__(messages)
++        self.native_load_witness = witness
++
++
++def _read_complete(path, jsonl):
++    with path.open("rb") as stream:
++        start = os.fstat(stream.fileno())
++        if not stat.S_ISREG(start.st_mode):
++            raise OSError("native session source is not a regular file")
++        raw = stream.read()
++        end = os.fstat(stream.fileno())
++    current = path.stat()
++    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
++    if identity(start) != identity(end) or identity(end) != identity(current) or len(raw) != end.st_size:
++        raise OSError("native session source changed during load")
++    if jsonl and raw and not raw.endswith(b"\n"):
++        raise ValueError("native transcript has an incomplete EOF")
++    decoded = [json.loads(line) for line in raw.splitlines() if line.strip()] if jsonl else json.loads(raw)
++    if jsonl and not all(isinstance(message, dict) for message in decoded):
++        raise ValueError("native transcript message is invalid")
++    if not jsonl and not isinstance(decoded, dict):
++        raise ValueError("native metadata is invalid")
++    witness = {"path": str(path), "device": end.st_dev, "inode": end.st_ino,
++               "size": end.st_size, "mtimeNs": end.st_mtime_ns, "ctimeNs": end.st_ctime_ns,
++               "eofSha256": hashlib.sha256(raw).hexdigest()}
++    return decoded, witness
++
++
++def _selected_complete(directory, filename, jsonl):
++    failure = None
++    for path in [directory / filename, directory / (filename + ".backup")]:
++        try:
++            return _read_complete(path, jsonl)
++        except (OSError, ValueError) as error:
++            failure = error
++    raise OSError("no complete native session source is loadable") from failure
++
++
++def load_native(store, session_id):
++    directory = store.base_dir / session_id
++    transcript, transcript_source = _selected_complete(directory, "transcript.jsonl", True)
++    metadata, metadata_source = _selected_complete(directory, "metadata.json", False)
++    if metadata.get("session_id") != session_id or metadata.get("parent_id") is not None:
++        raise ValueError("native loaded root metadata disagrees")
++    witness = {"sessionId": session_id, "parentId": metadata.get("parent_id"),
++               "transcript": transcript_source, "metadata": metadata_source,
++               "messageCount": len(transcript)}
++    return LoadedTranscript(transcript, witness), metadata
++
++
++def _status(event, launch, reason=None, native_session_id=None):
++    record = {"severity": "error" if reason else "info", "event": event,
++              "incarnationId": launch["incarnationId"], "launchNonce": launch["launchNonce"],
++              "evidenceRevision": launch["evidenceRevision"], "executionGeneration": launch["executionGeneration"]}
++    if reason:
++        record["reason"] = reason
++    if native_session_id is not None:
++        record["nativeSessionId"] = native_session_id
++    sys.stderr.write(json.dumps(record) + "\n")
++
++
++def _revalidate(witness):
++    for name in ["transcript", "metadata"]:
++        source = witness[name]
++        _, current = _read_complete(Path(source["path"]), name == "transcript")
++        if current != source:
++            raise OSError("native loaded source changed before context acceptance")
++
++
++async def publish_initialized(session, config):
++    binding = managed_launch()
++    if binding is None:
++        return
++    try:
++        await _publish_initialized(session, config, binding)
++    except Exception:
++        _status("amplifier.native_loaded_context.refused", binding[0], "loaded_context_not_accepted")
++        await session.cleanup()
++        raise
++
++
++async def _publish_initialized(session, config, binding):
++    launch, signal_dir = binding
++    native_id, parent_id = session.session_id, session.parent_id
++    if not native_id or parent_id is not None:
++        raise ValueError("native selected session is not a root")
++    requested = launch["requestedNativeSessionId"]
++    if requested is not None and native_id != requested:
++        _status("amplifier.native_root.refused", launch, "native_root_mismatch", native_id)
++        raise ValueError("native selected root disagrees with current launch")
++    context = session.coordinator.get("context")
++    if context is None or not callable(getattr(context, "set_messages", None)) or not callable(getattr(context, "get_messages", None)):
++        raise ValueError("native context cannot accept restored messages")
++    accepted = await context.get_messages()
++    if config.is_resume:
++        witness = getattr(config.initial_transcript, "native_load_witness", None)
++        if witness is None or witness["sessionId"] != native_id:
++            raise ValueError("native resume did not pass the managed native loader")
++        original = list(config.initial_transcript)
++        if accepted != original and not (accepted and accepted[0].get("role") == "system" and accepted[1:] == original):
++            raise ValueError("native context did not retain the restored transcript")
++    else:
++        from .session_store import SessionStore
++        store = SessionStore()
++        # Native initialization creates a durable empty root through the existing
++        # native writer; no prompt or helper-fabricated transcript is involved.
++        store.save(native_id, accepted, {"session_id": native_id, "parent_id": parent_id,
++                                        "bundle": config.bundle_name})
++        loaded, _ = store.load(native_id)
++        witness = loaded.native_load_witness
++        await context.set_messages(accepted)
++    _revalidate(witness)
++    native = {"session_id": native_id, "parent_id": parent_id,
++              "source": "resume" if config.is_resume else "startup", "cli_pin": CLI_PIN,
++              "producer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
++              "load": witness, "acceptedMessageCount": len(accepted)}
++    signal_dir.mkdir(parents=True, exist_ok=True)
++    target = signal_dir / "amplifier-loaded-context.json"
++    temporary = signal_dir / "amplifier-loaded-context.tmp"
++    with temporary.open("x", encoding="utf-8") as stream:
++        json.dump({"launch": launch, "native": native}, stream)
++        stream.write("\n")
++        stream.flush()
++        os.fsync(stream.fileno())
++    temporary.replace(target)
++    _status("amplifier.native_loaded_context.published", launch)
+--- a/amplifier_app_cli/runtime/config.py
++++ b/amplifier_app_cli/runtime/config.py
+@@ -878,6 +878,10 @@
+     Returns:
+         List containing the modes behavior URI.
+     """
++    import os
++    if os.environ.get("FRESHELL_NATIVE_IDENTITY_LAUNCH"):
++        return ["file:///opt/amplifier-modes#subdirectory=behaviors/modes.yaml"]
++
+     return [
+         # Only load the behavior, NOT the root bundle (which includes foundation)
+         "git+https://github.com/microsoft/amplifier-bundle-modes@main#subdirectory=behaviors/modes.yaml",

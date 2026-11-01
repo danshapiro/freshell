@@ -465,6 +465,8 @@ impl RetainedOutputPage {
         }
         let reset = self.after > head || self.after.saturating_add(1) < retained;
         Ok(RuntimeOutputBatch {
+            codex_activity: None,
+            opencode_activity: None,
             incarnation_id: self.source.incarnation_id,
             terminal_id: self.source.terminal_id,
             stream_epoch: self.source.stream_epoch,

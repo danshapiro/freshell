@@ -235,10 +235,18 @@ fn provider_config_preparation_worker_consumes_bounded_private_control_and_clean
     let home = root.path().join("home");
     let source = root.path().join("source");
     fs::create_dir(&home).unwrap();
-    fs::create_dir_all(source.join("plugin/node_modules/selected-dependency")).unwrap();
+    let entries = source.join("plugin/node_modules/selected-dependency/entries");
+    fs::create_dir_all(&entries).unwrap();
+    for index in 0..=4200 {
+        fs::write(
+            entries.join(format!("entry-{index}.js")),
+            "module.exports='installed-dependency';",
+        )
+        .unwrap();
+    }
     fs::write(
         source.join("plugin/node_modules/selected-dependency/index.js"),
-        "module.exports='installed-dependency';",
+        "module.exports=require('./entries/entry-4200.js');",
     )
     .unwrap();
     fs::write(source.join("plugin/resource"), "ordinary-resource").unwrap();
@@ -317,7 +325,17 @@ fn provider_config_preparation_worker_consumes_bounded_private_control_and_clean
         let output = run(&frame(&payload));
         assert!(
             output.status.success(),
-            "bounded complete control must prepare selected inputs"
+            "bounded complete control must prepare selected inputs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_dir(
+                home.join(".config/opencode/plugin/node_modules/selected-dependency/entries")
+            )
+            .unwrap()
+            .count(),
+            4201,
+            "the complete installed environment must survive both private copies"
         );
         let copied = home.join(".config/opencode/plugin/command");
         assert_eq!(
