@@ -106,6 +106,7 @@ Each task is implemented and reviewed before the next starts. The review scope i
 
 **Files:**
 - Modify: crates/freshell-server/src/managed_provider_bootstrap.rs:92-133,364-385,654-676
+- Modify: crates/freshell-server/src/managed_runtime_opencode_replan_tests.rs:188 (add the missing `native_identity` field to an existing test fixture so the focused feature-gated test target compiles).
 
 **Interfaces:**
 - Consumes: provider_launch_context_for_managed(provider, workspace, mcp_capability) and ProviderPreparation::Codex { approval_default, tui_args, sidecar_args }.
@@ -136,11 +137,11 @@ without_capability.validate("codex").unwrap();
 
 Run: cargo test -p freshell-server --features managed-provider-qualification --bin freshell-server managed_provider_bootstrap::tests::managed_codex_provider_context_renders_tui_and_sidecar_mcp -- --exact
 
-Expected: FAIL during compilation because mcp_enabled is undefined in provider_launch_context_from_home_at_with_selected_roots and the Codex pattern in with_managed_mcp_reference omits approval_default (E0425 and E0027). The failure must identify these existing source errors.
+Expected: The first compile may also reveal an existing E0063 in `managed_runtime_opencode_replan_tests.rs` because a `HostResult::FreshAgentCommand` test fixture omits `native_identity`. Add `native_identity: None` to that fixture, then rerun the focused command while the two production defects remain; it must fail on the intended E0425 (`mcp_enabled`) and E0027 (`approval_default`) errors rather than stopping at unrelated test-fixture compilation.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Initialize source-less Codex preparation with empty MCP argument vectors; the optional capability branch later fills them through with_managed_mcp_reference. Ignore the policy field in the mutable match so its existing value remains intact:
+Initialize source-less Codex preparation with empty MCP argument vectors; the optional capability branch later fills them through with_managed_mcp_reference. Ignore the policy field in the mutable match so its existing value remains intact. The `native_identity: None` fixture correction is test setup only and does not change behavior:
 
 ~~~rust
 ProviderPreparation::Codex {
@@ -186,7 +187,7 @@ Expected: PASS; the first test covers both MCP paths and the second proves the s
 - [ ] **Step 7: Commit the task**
 
 ~~~bash
-git add crates/freshell-server/src/managed_provider_bootstrap.rs
+git add crates/freshell-server/src/managed_provider_bootstrap.rs crates/freshell-server/src/managed_runtime_opencode_replan_tests.rs
 git commit -m "fix: restore managed provider qualification compilation"
 ~~~
 
@@ -382,6 +383,7 @@ git commit -m "feat: complete managed runtime update integration"
 
 - The complete User Request block remains byte-for-byte identical to the block at original plan commit `76701e039`, appears exactly once, and retains hash `e692116fad48424da56cfb1c577231258ad9b4f16aded3cabc1652328c94aecf`.
 - The implementation is split into sequential reviewable tasks: compile repair; supervisor protocol/Reopen/schema/admin CLI; updater orchestration; fixture, systemd, operator guidance, and safety surfaces. Each task owns a disjoint file set, has an explicit interface and review boundary, lists focused commands, and commits only its files.
+- Task 1 also repairs one pre-existing feature-gated test-fixture compile error (`native_identity` omitted) that the focused server test exposed after the two planned production errors; its only change is a `None` fixture value.
 - All 14 final-review findings are concrete plan requirements: ordinary restart wording is removed from both extension skills and prebuild guidance with a runtime behavior test; reset-mode aborts restore healthy web service; Reopen atomically restores automatic primary view; Stops halt at the first non-VerifiedEmpty outcome; durable-only checks running/on-disk executable identity; callback peer covers issue/activate/commit/abort/revoke; desired-stopped emptiness checks the addressed incarnation; Inventory is the authoritative saved-reference source joined by soul ID; schema/Reopen/CLI/callback red and green commands target exact named tests; implementation tasks are split; operator guidance specifies host shell and why; graph checks include forward and reverse activation/propagation relations; the default completion event includes the reminder; and worker invokes the resolved tsx JavaScript entrypoint with pinned Node.
 - Reset targets remain separate from saved-reference candidates. The fixed Inventory is taken after web ingress closes; Stop uses the supervisor's active-first/otherwise-latest incarnation selection; targets are coding-provider souls with desired-running state; missing required identity yields unavailable without Reopen; Reopen candidates intersect only the successfully stopped set.
 - Reopen remains migration-free. The candidate schema command avoids registry open; current schema is read-only. Successful command/digest/incarnation association, stopped-to-running CAS, and automatic-primary-view restoration commit atomically; exact replay precedes revision validation; pending revocation creates no command/incarnation/view/revision and retries with a fresh ID.
