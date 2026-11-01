@@ -809,15 +809,44 @@ test.describe('Multi-Client', () => {
     // transport-level reconnect must NOT re-claim (stuck markers would force
     // sinceSeq=0 replays that duplicate scrollback).
     await waitForTerminalText(page, '__MODE_SYNC_MARK__', terminalId!, 45_000)
-    await page.evaluate(() => { window.__FRESHELL_TEST_HARNESS__?.forceDisconnect() })
-    await waitForReady(page)
-    await page.waitForFunction((id) => {
-      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-      return sent.some((m: any) =>
-        m?.type === 'terminal.attach'
-        && m?.terminalId === id
-        && m?.surfaceReset !== true)
-    }, terminalId, { timeout: 45_000 })
+    // A same-server reconnect must supply its own ready and attach receipts;
+    // neither a cached ready state nor an earlier attach proves consumption.
+    const reconnectDeadline = Date.now() + 45_000
+    const reconnectRemaining = () => Math.max(1, reconnectDeadline - Date.now())
+    receivedFrames.clear()
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      harness?.clearSentWsMessages?.()
+      harness?.forceDisconnect()
+    })
+    await receivedFrames.waitForFrame(
+      (frame) => frame.type === 'ready',
+      'ready from the same-surface reconnect',
+      reconnectRemaining(),
+    )
+    let reconnectAttachRequestId: string | undefined
+    await expect.poll(async () => {
+      reconnectAttachRequestId = await page.evaluate((id) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (harness?.getWsReadyState() !== 'ready' || harness.getState().connection.status !== 'ready') return undefined
+        const sent = harness.getSentWsMessages?.() ?? []
+        const attach = [...sent].reverse().find((msg: any) =>
+          msg?.type === 'terminal.attach'
+          && msg?.terminalId === id
+          && msg?.surfaceReset !== true
+          && typeof msg?.attachRequestId === 'string'
+          && msg.attachRequestId.length > 0) as { attachRequestId: string } | undefined
+        return attach?.attachRequestId
+      }, terminalId)
+      return reconnectAttachRequestId
+    }, { timeout: reconnectRemaining() }).toBeTruthy()
+    await receivedFrames.waitForFrame(
+      (frame) => frame.type === 'terminal.attach.ready'
+        && frame.terminalId === terminalId
+        && frame.attachRequestId === reconnectAttachRequestId,
+      `attach.ready for same-surface reconnect ${reconnectAttachRequestId}`,
+      reconnectRemaining(),
+    )
 
     // Wheel over the pane must now forward SGR mouse reports on the wire.
     await page.evaluate(() => { window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.() })
