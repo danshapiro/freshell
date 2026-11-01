@@ -313,32 +313,34 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     throw new Error(`No tabs-snapshot generation contained [${needles.join(', ')}] within ${timeoutMs}ms`)
   }
 
-  /**
-   * Wait until the NEWEST persisted tabs-snapshot generation FOR THE GIVEN
-   * CLIENT carries >= minRecords records — the scenario-4 size pin. Same
-   * fs-poll idiom as waitForSnapshotContaining (snapshot pushes fire on ready
-   * + every 5s, so the registry's JSON generation files lag the UI by
-   * seconds): read every generation file, keep only the given
-   * clientInstanceId's, rank newest by (snapshotRevision, capturedAt) — the
-   * server's own per-client monotonic ordering (tabs_persist.rs
-   * `generation_rank`) — and insist the newest generation has the full tab
-   * set on disk.
-   */
-  async function waitForNewestGenerationRecordCount(
+  type WorkspaceIdentity = Array<{
+    tabId: string
+    panes: Array<{ paneId: string; kind: string; mode?: string }>
+  }>
+
+  /** Wait for this client's newest durable generation to contain its exact
+   * open tab/pane set. Lifecycle pushes can persist an intermediate prefix;
+   * a count of 40 also accepts the boot tab plus only 39 newly added tabs. */
+  async function waitForNewestGenerationWorkspace(
     clientInstanceId: string,
-    minRecords: number,
+    expectedWorkspace: WorkspaceIdentity,
     timeoutMs = 30_000,
   ): Promise<void> {
     const snapshotsDir = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    const ordered = (workspace: WorkspaceIdentity) => workspace.map((tab) => ({
+      tabId: tab.tabId,
+      panes: [...tab.panes].sort((a, b) => a.paneId.localeCompare(b.paneId)),
+    })).sort((a, b) => a.tabId.localeCompare(b.tabId))
+    const expected = JSON.stringify(ordered(expectedWorkspace))
     const deadline = Date.now() + timeoutMs
-    let lastObserved = 0
+    let lastObserved: unknown = null
     while (Date.now() < deadline) {
+      let newest: { revision: number; capturedAt: number; records: any[] } | null = null
       const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
       for (const device of devices) {
         const deviceDir = path.join(snapshotsDir, device)
         const files = (await fs.readdir(deviceDir).catch(() => [] as string[]))
           .filter((f) => f.endsWith('.json'))
-        let newest: { revision: number; capturedAt: number; count: number } | null = null
         for (const f of files) {
           const raw = await fs.readFile(path.join(deviceDir, f), 'utf8').catch(() => '')
           let doc: any = null
@@ -350,21 +352,31 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
           if (doc?.clientInstanceId !== clientInstanceId) continue
           const revision = Number(doc?.snapshotRevision ?? 0)
           const capturedAt = Number(doc?.capturedAt ?? 0)
-          const count = Array.isArray(doc?.records) ? doc.records.length : 0
           if (!newest || revision > newest.revision || (revision === newest.revision && capturedAt > newest.capturedAt)) {
-            newest = { revision, capturedAt, count }
+            newest = { revision, capturedAt, records: Array.isArray(doc.records) ? doc.records : [] }
           }
         }
-        if (newest) {
-          lastObserved = Math.max(lastObserved, newest.count)
-          if (newest.count >= minRecords) return
-        }
+      }
+      if (newest) {
+        const workspace = ordered(newest.records
+          .filter((record) => record?.status === 'open')
+          .map((record) => ({
+            tabId: record.tabId,
+            panes: (Array.isArray(record.panes) ? record.panes : []).map((pane: any) => ({
+              paneId: pane.paneId,
+              kind: pane.kind,
+              ...(pane.kind === 'terminal' ? { mode: pane.payload?.mode } : {}),
+            })),
+          })))
+        lastObserved = { revision: newest.revision, capturedAt: newest.capturedAt, workspace }
+        if (JSON.stringify(workspace) === expected) return
       }
       await new Promise((r) => setTimeout(r, 500))
     }
     throw new Error(
-      `No persisted generation for client ${clientInstanceId} reached ${minRecords} records `
-      + `within ${timeoutMs}ms (last observed: ${lastObserved})`,
+      `No newest persisted generation for client ${clientInstanceId} matched the expected `
+      + `${expectedWorkspace.length}-tab open workspace within ${timeoutMs}ms `
+      + `(last observed: ${JSON.stringify(lastObserved)})`,
     )
   }
 
@@ -752,7 +764,28 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     for (let i = 0; i < 40; i++) {
       await newShellTab.click()
     }
-    await harnessP.waitForTabCount(41, 30_000) // 1 boot tab + 40 shell tabs
+    // A tab enters Redux before its layout mounts. Capture all 41 identities
+    // only once every tab has its pane, within the same existing UI budget.
+    let expectedWorkspace: WorkspaceIdentity = []
+    await expect.poll(async () => {
+      expectedWorkspace = await pageP.evaluate(() => {
+        const state = window.__FRESHELL_TEST_HARNESS__!.getState()
+        const panesOf = (node: any): Array<{ paneId: string; kind: string; mode?: string }> => {
+          if (!node) return []
+          if (node.type === 'leaf') return [{
+            paneId: node.id,
+            kind: node.content.kind,
+            ...(node.content.kind === 'terminal' ? { mode: node.content.mode } : {}),
+          }]
+          return (node.children ?? []).flatMap(panesOf)
+        }
+        return state.tabs.tabs.map((tab) => ({
+          tabId: tab.id,
+          panes: panesOf(state.panes.layouts[tab.id]),
+        }))
+      })
+      return expectedWorkspace.length === 41 && expectedWorkspace.every((tab) => tab.panes.length === 1)
+    }, { timeout: 30_000 }).toBe(true)
 
     // The populating client's claimed tabs-registry clientInstanceId (the
     // TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY value,
@@ -763,10 +796,10 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     )
     expect(populatingClientId, 'populating context claimed a tabs-registry clientInstanceId').toBeTruthy()
 
-    // The 40-tab layout must be IN DISK before the context dies: newest
-    // generation for this client carries >= 40 records (the boot picker tab
-    // may contribute a 41st).
-    await waitForNewestGenerationRecordCount(populatingClientId!, 40)
+    // Picker tabs are persisted too: require the exact 41 open tab/pane
+    // identities before loss, not an intermediate 40-record generation.
+    // Closed inventory cannot substitute for a missing open tab.
+    await waitForNewestGenerationWorkspace(populatingClientId!, expectedWorkspace)
 
     // ---- Lose the populating browser WITHOUT a server restart ----
     await ctxP.close()
