@@ -681,14 +681,19 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       const redone = await snap()
       expect(redone?.rollback ?? null).toBeNull()
       expect(redone?.rolledBackTurns ?? null).toBeNull()
+      await expect(page.getByRole('button', { name: 'Toggle rolled-back history' })).toHaveCount(0)
 
       // ── DOUBLE undo: turn 2 then turn 1 roll back; the marker bucket lists
       // both steps in CONVERSATION order (user-role filter first — one undone
       // step contributes a user row AND an assistant row). ──
       await typeSlash(page, '/undo')
       await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(1)
+      // REST can settle before the browser processes rolledBack and refills
+      // the composer. Wait for that ack so it cannot overwrite the next /undo.
+      await expect.poll(() => composerLocator(page).inputValue(), { timeout: 15_000 }).toBe('prompt two')
       await typeSlash(page, '/undo')
       await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(0)
+      await expect.poll(() => composerLocator(page).inputValue(), { timeout: 15_000 }).toBe('prompt one')
       await expect
         .poll(
           async () => ((await snap())?.rolledBackTurns ?? [])
