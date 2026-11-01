@@ -484,10 +484,10 @@ for (const height of [200, 120]) test(`nested ${height}px panes retain requests 
   }
 })
 
-test('compact header advertises multiple diagnostics and expands long prominent status', async ({ freshellPage, page, terminal }) => {
+for (const [sessionType, provider, populated] of [['freshclaude', 'claude', false], ['freshcodex', 'codex', true]] as const) test(`compact header advertises multiple diagnostics and expands long prominent status${populated ? ' with Codex metadata' : ''}`, async ({ freshellPage, page, terminal }) => {
   void freshellPage
   await terminal.waitForTerminal()
-  await seedCompactPane(page, { sessionType:'freshclaude',provider:'claude',style:'sans',theme:'light' })
+  await seedCompactPane(page, { sessionType, provider, populated, style:'sans',theme:'light' })
   const text = 'Session identity corrected by server — this pane now points at its live session.'
   await page.evaluate(() => {
     const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
@@ -520,6 +520,11 @@ test('compact header advertises multiple diagnostics and expands long prominent 
       h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:undefined}}})
     })
     await expect(notices).toHaveCount(0)
+    if (size.height === 320) {
+      await hitAndClick(page.getByRole('button', { name: 'Yes', exact: true }))
+      await hitAndClick(page.getByRole('button', { name: 'Allow tool use', exact: true }))
+      await assertUsefulSpace(page)
+    }
   }
 })
 
