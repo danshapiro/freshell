@@ -1003,22 +1003,16 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         "wrong-provider",
         "boot-changes",
     ] {
-        let fixture = running_fresh_provider(if scenario == "wrong-provider" {
-            FreshProvider::Claude
-        } else {
-            FreshProvider::Codex
-        })
+        let fixture = running_fresh_provider_with_name(
+            if scenario == "wrong-provider" {
+                FreshProvider::Claude
+            } else {
+                FreshProvider::Codex
+            },
+            None,
+            "name-native",
+        )
         .await;
-        fixture
-            .supervisor
-            .registry
-            .record_native_session(
-                fixture.soul.clone(),
-                fixture.incarnation.clone(),
-                "name-native".into(),
-            )
-            .await
-            .unwrap();
         let view = fixture
             .supervisor
             .registry

@@ -63,10 +63,14 @@ async fn unconfirmed_codex_supervisor(
         )
         .await
         .unwrap();
-    registry
-        .mark_running(prepared.incarnation_id)
-        .await
-        .unwrap();
+    // Initialization grants execution but cannot prove a surviving worker.
+    // Keep the valid STARTING record; the independent store probe below must
+    // supply its own exact saved-session evidence before recovery is ready.
+    assert!(matches!(
+        registry.mark_running(prepared.incarnation_id).await,
+        Err(crate::registry::RegistryError::RecoveryBlocked { reason, .. })
+            if reason == "NATIVE_IDENTITY_UNOBSERVED"
+    ));
     let context = registry.recovery_context(soul).await.unwrap();
     recovery_supervisor(root, registry, context, BackendRuntimeState::Running).await
 }
@@ -90,7 +94,25 @@ async fn authenticated_unconfirmed_worker_probes_exact_saved_codex_before_recove
         .await;
         assert!(context.resume_spec.is_none());
         let original = context.fresh_agent.clone();
-        let expected = crate::resume_catalog::exact_resume_candidate(&context, None).unwrap();
+        let candidate = crate::resume_catalog::exact_resume_candidate(&context, None);
+        let expected = if outcome == "unknown-native" {
+            assert!(context.native_session_id.is_none());
+            assert!(matches!(
+                candidate,
+                Err(RecoveryProbe::Blocked {
+                    path: RecoveryPath::NativeResume,
+                    reason: RecoveryBlockReason::StoreUnreadable,
+                    ..
+                })
+            ));
+            None
+        } else {
+            Some(
+                candidate
+                    .unwrap()
+                    .expect("the recorded native root has an exact candidate"),
+            )
+        };
         let runtime = context.prior_handle.runtime_dir();
         let secret = b"synthetic-host-secret";
         std::fs::write(runtime.join("secret"), secret).unwrap();
@@ -116,7 +138,10 @@ async fn authenticated_unconfirmed_worker_probes_exact_saved_codex_before_recove
                         } => Ok(HostResult::Hello {
                             host_boot_id: boot.clone(),
                             proof: host_proof(secret, &challenge, &boot, &incarnation_id),
-                            capabilities: vec![],
+                            capabilities: vec![
+                                "owned-provider-config-v1".into(),
+                                "provider-store-probe-v1".into(),
+                            ],
                             effective_limits: checkpoints::tests::limits(),
                         }),
                         command => {
@@ -253,11 +278,14 @@ async fn authenticated_unconfirmed_worker_probes_exact_saved_codex_before_recove
                 assert!(after.evidence_revision > 0);
             }
             "superseded" => {
+                let newer = newer.unwrap();
+                assert_eq!(after.resume_spec.as_ref(), Some(&newer));
+                assert_eq!(after.evidence_revision, newer.evidence_revision);
+                assert_eq!(after.evidence_revision, context.evidence_revision + 1);
                 assert!(
-                    matches!(result, Ok(RecoveryProbe::Blocked { .. })),
-                    "{result:?}"
+                    matches!(result, Err(ref error) if error.code == RuntimeErrorCode::RegistryFailure),
+                    "the superseded probe cannot publish over the newer registry evidence: {result:?}"
                 );
-                assert_eq!(after.resume_spec, newer);
             }
             _ => {
                 assert!(

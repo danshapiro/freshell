@@ -263,7 +263,13 @@ async fn ordinary_callback_keeps_the_ordinary_wait() {
 async fn codex_replacement_callback_uses_validated_current_consumer() {
     for fresh in [false, true] {
         let fixture = recovery_fixture(budgets(1000, 1000), "codex", fresh).await;
-        let server = slow_callback_server(
+        let before = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        let mut server = slow_callback_server(
             &fixture.supervisor,
             Duration::ZERO,
             b"not a prepared context",
@@ -288,11 +294,28 @@ async fn codex_replacement_callback_uses_validated_current_consumer() {
             )
             .await
             .unwrap_err();
-        server.await.unwrap();
-        assert!(
-            error.message.contains("invalid scoped grant reference"),
-            "{}",
-            error.message
-        );
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result.expect("current consumer callback must settle"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("current consumer callback was not dispatched or did not settle");
+            }
+        }
+        assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+        let after = fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(after.write_fence(), before.write_fence());
+        assert_eq!(after.resume_spec, before.resume_spec);
+        assert!(fixture
+            .supervisor
+            .auth_lookup_authorities
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 }
