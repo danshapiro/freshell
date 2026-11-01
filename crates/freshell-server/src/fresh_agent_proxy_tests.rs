@@ -1994,6 +1994,7 @@ async fn hosted_codex_preparation_refusal_case(rest: bool, operational: bool) {
             let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
             observed.lock().await.push(request.body.clone());
             let result = match request.body {
+                AdminCommand::Inventory => Ok(AdminResult::Inventory(Vec::new())),
                 AdminCommand::Health => Ok(AdminResult::Health { control_epoch: 1, installation_id: InstallationId::new() }),
                 AdminCommand::ReserveProviderInputs(_input) if operational => {
                     Err(freshell_runtime_protocol::RuntimeError::new(RuntimeErrorCode::BackendUnavailable, "owned supervisor unavailable"))
@@ -2922,11 +2923,7 @@ async fn replay_once_rebuilds_pending_state_without_repeating_even_recent_attent
             let (mut stream, _) = listener.accept().await.unwrap();
             let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
             let result = match request.body {
-                AdminCommand::Health if index == 0 => AdminResult::Health {
-                    control_epoch: 77,
-                    installation_id: InstallationId::new(),
-                },
-                AdminCommand::Inventory if index == 1 => {
+                AdminCommand::Inventory if index == 0 => {
                     AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
                         "soulId": expected_soul,
                         "incarnationId": "state-replay-incarnation",
@@ -2942,6 +2939,10 @@ async fn replay_once_rebuilds_pending_state_without_repeating_even_recent_attent
                     }))
                     .unwrap()])
                 }
+                AdminCommand::Health if index == 1 => AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                },
                 AdminCommand::FreshAgentReadEvents(read) if index == 2 => {
                     assert_eq!(read.soul_id, expected_soul);
                     assert_eq!(read.after_sequence, 0);
