@@ -1652,6 +1652,7 @@ body {
   /* Include pane borders in the wrapped-composer budget so a 320px pane
      retains its 64px transcript floor. */
   .fresh-agent-pane .fresh-agent-top-stack { max-height: min(35cqh, max(0px, calc(100cqh - 242px))); }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) { grid-template-rows: 18px minmax(44px, 1fr); }
   .fresh-agent-sidebar { padding-block: 0; max-height: min(10cqh, max(0px, calc((100cqh - 242px) * .125))); }
   .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(25cqh, max(0px, calc((100cqh - 242px) * .875))); }
 }
