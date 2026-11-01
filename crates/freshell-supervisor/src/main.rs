@@ -18,10 +18,14 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    freshell_agent_runtime::process_qualification_policy()?;
     let args: Vec<String> = std::env::args().collect();
+    if let Some(version) = schema_version_command(&args) {
+        println!("{version}");
+        return Ok(());
+    }
+    freshell_agent_runtime::process_qualification_policy()?;
     if args.get(1).map(String::as_str) != Some("serve") {
-        return Err("usage: freshell-supervisor serve --registry-root PATH --control-socket PATH --control-secret-file PATH --docker-socket PATH --runtime-root PATH --host-binary PATH --image-ref sha256:... --test-run-id ID [--installation-id ID] [--operator-home PATH]".into());
+        return Err("usage: freshell-supervisor schema-version | serve --registry-root PATH --control-socket PATH --control-secret-file PATH --docker-socket PATH --runtime-root PATH --host-binary PATH --image-ref sha256:... --test-run-id ID [--installation-id ID] [--operator-home PATH]".into());
     }
     let rest = &args[2..];
     let registry_root = PathBuf::from(required_arg(rest, "--registry-root")?);
@@ -120,4 +124,31 @@ fn optional_u64_arg(args: &[String], key: &str) -> Result<Option<u64>, String> {
                 .map_err(|e| format!("invalid {key}: {e}"))
         })
         .transpose()
+}
+
+fn schema_version_command(args: &[String]) -> Option<String> {
+    (args.get(1).map(String::as_str) == Some("schema-version") && args.len() == 2)
+        .then(|| freshell_supervisor::registry::SCHEMA_VERSION.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schema_version_command;
+    use freshell_supervisor::registry::SCHEMA_VERSION;
+
+    #[test]
+    fn schema_version_command_does_not_open_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry_root = directory.path().join("registry");
+
+        let output =
+            schema_version_command(&["freshell-supervisor".into(), "schema-version".into()])
+                .expect("the schema-version command is available before the registry is opened");
+
+        assert_eq!(output, SCHEMA_VERSION.to_string());
+        assert!(
+            !registry_root.exists(),
+            "schema reporting must not create the registry"
+        );
+    }
 }

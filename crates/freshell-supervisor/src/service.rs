@@ -105,6 +105,7 @@ pub struct SupervisorConfig {
     pub admission: AdmissionPolicy,
 }
 
+#[derive(Clone)]
 pub(crate) struct LaunchWorkload {
     pub(crate) soul_id: SoulId,
     pub(crate) fixture: Option<FixtureKind>,
@@ -831,6 +832,10 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
+            AdminCommand::Reopen(request) => self
+                .reopen(envelope.request_id, request)
+                .await
+                .map(AdminResult::Reopen),
             AdminCommand::TerminalInput(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1482,7 +1487,19 @@ impl Supervisor {
            + '_ {
         // Construct the large activation state here so recovery callers only
         // retain the boxed future while polling host replies and registry I/O.
-        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence))
+        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence, false))
+    }
+
+    fn activate_reopen_prepared_observed(
+        &self,
+        prepared: PreparedLaunch,
+        workload: LaunchWorkload,
+        limits: RuntimeLimits,
+        fence: RecoveryWriteFence,
+    ) -> impl std::future::Future<Output = Result<(LaunchResult, RecoveryWriteFence), RuntimeError>>
+           + Send
+           + '_ {
+        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence, true))
     }
 
     async fn activate_prepared_observed_inner(
@@ -1491,6 +1508,7 @@ impl Supervisor {
         workload: LaunchWorkload,
         limits: RuntimeLimits,
         mut fence: RecoveryWriteFence,
+        defer_provider_preparation_completion: bool,
     ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         let mut state = prepared.state;
         if let Some(capability) = workload
@@ -1952,7 +1970,7 @@ impl Supervisor {
                 serde_json::json!({"incarnationId":handle.incarnation_id(),"error":error.message}),
             );
         }
-        if workload.resume_spec.is_none() {
+        if workload.resume_spec.is_none() && !defer_provider_preparation_completion {
             self.complete_pending_provider_preparation(&handle)
                 .await
                 .map_err(|error| {
@@ -4232,6 +4250,37 @@ impl Supervisor {
         cwd: &str,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        self.issue_replacement_mcp_capability_inner(
+            start, provider, context, references, cwd, workspace, false,
+        )
+        .await
+    }
+
+    async fn issue_reopen_mcp_capability(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        provider: &str,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+        references: &[freshell_runtime_protocol::ProviderSecretReference],
+        cwd: &str,
+        workspace: &str,
+    ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        self.issue_replacement_mcp_capability_inner(
+            start, provider, context, references, cwd, workspace, true,
+        )
+        .await
+    }
+
+    async fn issue_replacement_mcp_capability_inner(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        provider: &str,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+        references: &[freshell_runtime_protocol::ProviderSecretReference],
+        cwd: &str,
+        workspace: &str,
+        reopen_prepared: bool,
+    ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
         let codex_source_runtime = if provider == "codex" {
             use freshell_platform::codex_inputs::NativeSourceRuntime;
             let incompatible =
@@ -4287,24 +4336,28 @@ impl Supervisor {
                 .as_ref()
                 .map(|inputs| inputs.generation_id.as_str()),
         );
-        let response = self
-            .mcp_capability_callback(McpCapabilityRequest {
-                action: "issue",
-                soul_id: &start.context.soul_id,
-                incarnation_id: None,
-                grant_id: None,
-                provider: Some(provider),
-                tui_source,
-                workspace: Some(workspace),
-                auth_lookup_authority: Some(&scope.key),
-                claude_recovery_source: claude_recovery_source.as_ref(),
-                codex_source_runtime,
-                cwd: Some(cwd),
-                prior_context: Some(context),
-                provider_secret_references: Some(references),
-                provider_path_inputs: Some(&path_inputs),
-            })
-            .await?;
+        let callback_request = McpCapabilityRequest {
+            action: "issue",
+            soul_id: &start.context.soul_id,
+            incarnation_id: None,
+            grant_id: None,
+            provider: Some(provider),
+            tui_source,
+            workspace: Some(workspace),
+            auth_lookup_authority: Some(&scope.key),
+            claude_recovery_source: claude_recovery_source.as_ref(),
+            codex_source_runtime,
+            cwd: Some(cwd),
+            prior_context: Some(context),
+            provider_secret_references: Some(references),
+            provider_path_inputs: Some(&path_inputs),
+        };
+        let response = if reopen_prepared {
+            self.mcp_capability_callback_for_reopen(callback_request)
+                .await?
+        } else {
+            self.mcp_capability_callback(callback_request).await?
+        };
         let prepared: freshell_runtime_protocol::PreparedProviderContext =
             serde_json::from_slice(&response).map_err(|_| {
                 RuntimeError::new(
@@ -4328,6 +4381,21 @@ impl Supervisor {
     async fn mcp_capability_callback(
         &self,
         request: McpCapabilityRequest<'_>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.mcp_capability_callback_inner(request, true).await
+    }
+
+    async fn mcp_capability_callback_for_reopen(
+        &self,
+        request: McpCapabilityRequest<'_>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.mcp_capability_callback_inner(request, false).await
+    }
+
+    async fn mcp_capability_callback_inner(
+        &self,
+        request: McpCapabilityRequest<'_>,
+        await_running: bool,
     ) -> Result<Vec<u8>, RuntimeError> {
         if self.config.control_secret.contains(['\r', '\n']) {
             return Err(RuntimeError::new(
@@ -4379,7 +4447,7 @@ impl Supervisor {
         // Recovery composes several large native request futures. Keep this
         // exchange and intent polling off its nested poll stack.
         let bounded = Box::pin(tokio::time::timeout(budget, exchange));
-        let response = if request.action == "issue" {
+        let response = if request.action == "issue" && await_running {
             Box::pin(self.await_running_startup(request.soul_id, "provider_preparation", bounded))
                 .await?
         } else {
@@ -4421,6 +4489,28 @@ impl Supervisor {
         stage: &'static str,
         operation: impl std::future::Future<Output = T>,
     ) -> Result<T, RuntimeError> {
+        self.await_startup_with_reopen_authority(soul_id, stage, None, operation)
+            .await
+    }
+
+    async fn await_running_or_reopen_startup<T>(
+        &self,
+        soul_id: &SoulId,
+        incarnation_id: &IncarnationId,
+        stage: &'static str,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
+        self.await_startup_with_reopen_authority(soul_id, stage, Some(incarnation_id), operation)
+            .await
+    }
+
+    async fn await_startup_with_reopen_authority<T>(
+        &self,
+        soul_id: &SoulId,
+        stage: &'static str,
+        reopen_incarnation: Option<&IncarnationId>,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
         tokio::pin!(operation);
         loop {
             let context = self
@@ -4429,22 +4519,365 @@ impl Supervisor {
                 .await
                 .map_err(map_registry)?;
             if context.desired_state != freshell_runtime_protocol::DesiredState::Running {
-                append_event(
-                    &self.config.lifecycle_log,
-                    "supervisor.startup.interrupted",
-                    serde_json::json!({
-                        "severity":"info", "soulId":soul_id, "intentRevision":context.intent_revision,
-                        "stage":stage, "reason":"stopped_intent"
-                    }),
-                );
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::StaleIntentRevision,
-                    "startup interrupted by stopped intent",
-                ));
+                let reopen_is_current =
+                    match (reopen_incarnation, context.recovery_attempt_id.as_ref()) {
+                        (Some(incarnation_id), Some(attempt_id)) => self
+                            .registry
+                            .is_current_reopen_preparation(
+                                soul_id.clone(),
+                                incarnation_id.clone(),
+                                context.intent_revision,
+                                attempt_id.clone(),
+                            )
+                            .await
+                            .map_err(map_registry)?,
+                        _ => false,
+                    };
+                if !reopen_is_current {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.startup.interrupted",
+                        serde_json::json!({
+                            "severity":"info", "soulId":soul_id, "intentRevision":context.intent_revision,
+                            "stage":stage, "reason":"stopped_intent"
+                        }),
+                    );
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::StaleIntentRevision,
+                        "startup interrupted by stopped intent",
+                    ));
+                }
             }
             tokio::select! {
                 result = &mut operation => return Ok(result),
                 _ = sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    }
+
+    async fn reopen(
+        &self,
+        request_id: RequestId,
+        request: freshell_runtime_protocol::ReopenRequest,
+    ) -> Result<freshell_runtime_protocol::ReopenResult, RuntimeError> {
+        let payload_digest = semantic_reopen_digest(&request);
+        if let Some(view) = self
+            .registry
+            .successful_reopen(
+                request.soul_id.clone(),
+                request_id.clone(),
+                payload_digest.clone(),
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            return Ok(reopened_result(view));
+        }
+        self.registry
+            .assert_epoch(request.expected_control_epoch)
+            .map_err(map_registry)?;
+
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        if let Some(view) = self
+            .registry
+            .successful_reopen(
+                request.soul_id.clone(),
+                request_id.clone(),
+                payload_digest.clone(),
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            return Ok(reopened_result(view));
+        }
+        self.registry
+            .assert_epoch(request.expected_control_epoch)
+            .map_err(map_registry)?;
+
+        let prior_context = self
+            .registry
+            .recovery_context(request.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let prior_incarnation = prior_context.prior_handle.incarnation_id().clone();
+        let prior_view = find_view(&self.registry, &prior_incarnation).await?;
+
+        for handle in self
+            .registry
+            .pending_stop_handles()
+            .await
+            .map_err(map_registry)?
+            .into_iter()
+            .filter(|handle| handle.soul_id() == &request.soul_id)
+        {
+            let stop_fence = handle.stop_fence().map_err(map_registry)?;
+            if stop_fence.intent_revision != request.expected_intent_revision {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "Reopen expected a different stopped intent revision",
+                ));
+            }
+            let outcome = self.finish_stop_handle(&handle).await?;
+            let view = find_view(&self.registry, handle.incarnation_id()).await?;
+            if outcome != StopOutcome::VerifiedEmpty {
+                return Ok(failed_reopen_result(
+                    Some(view),
+                    "the prior runtime could not be verified empty",
+                ));
+            }
+            let progress = self
+                .registry
+                .stop_progress(&handle)
+                .await
+                .map_err(map_registry)?;
+            if !progress.settled {
+                return Ok(pending_reopen_result(
+                    Some(view),
+                    "the prior runtime capability revoke is still pending",
+                ));
+            }
+        }
+
+        let preparation = match self
+            .registry
+            .prepare_reopen(
+                request.soul_id.clone(),
+                request_id.clone(),
+                payload_digest.clone(),
+                request.expected_intent_revision,
+            )
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error @ RegistryError::StaleIntentRevision { .. })
+            | Err(error @ RegistryError::RequestConflict) => return Err(map_registry(error)),
+            Err(error) => {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.refused",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "soulId":request.soul_id,
+                        "expectedIntentRevision":request.expected_intent_revision,
+                        "reason":"prior_stop_not_ready",
+                        "errorCode":map_registry(error).code,
+                    }),
+                );
+                return Ok(failed_reopen_result(
+                    Some(prior_view),
+                    "the prior Stop is not settled and verified empty",
+                ));
+            }
+        };
+
+        let mut terminal = if preparation.replacement.resume_spec.is_some() {
+            terminal_without_first_boot_state(preparation.replacement.terminal.clone())
+        } else {
+            preparation.replacement.terminal.clone()
+        };
+        let mut fresh_agent =
+            fresh_without_raw_bootstrap(preparation.replacement.fresh_agent.clone());
+        let provider_context = terminal
+            .as_ref()
+            .and_then(|spec| {
+                spec.provider_launch_context.as_ref().map(|context| {
+                    (
+                        spec.mode.clone(),
+                        context.clone(),
+                        spec.provider_secret_references.clone(),
+                        spec.cwd.clone(),
+                        spec.workspace_path.clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                fresh_agent.as_ref().and_then(|agent| {
+                    agent.provider_launch_context.as_ref().map(|context| {
+                        (
+                            agent.provider.native_provider().to_owned(),
+                            context.clone(),
+                            agent.provider_secret_references.clone(),
+                            agent.cwd.clone(),
+                            agent.workspace_path.clone(),
+                        )
+                    })
+                })
+            });
+        if let Some((provider, context, references, cwd, workspace)) = provider_context {
+            if context.mcp_capability.is_some() {
+                let prepared = match self
+                    .issue_reopen_mcp_capability(
+                        &preparation.start,
+                        &provider,
+                        &context,
+                        &references,
+                        &cwd,
+                        &workspace,
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        append_event(
+                            &self.config.lifecycle_log,
+                            "supervisor.reopen.provider_preparation_failed",
+                            serde_json::json!({
+                                "severity":"error",
+                                "soulId":request.soul_id,
+                                "incarnationId":preparation.replacement.prepared.incarnation_id,
+                                "attemptId":preparation.start.attempt_id,
+                                "errorCode":error.code,
+                            }),
+                        );
+                        return Ok(failed_reopen_result(
+                            Some(prior_view),
+                            "saved provider preparation could not be renewed",
+                        ));
+                    }
+                };
+                install_reopen_provider_context(terminal.as_mut(), fresh_agent.as_mut(), prepared)?;
+            }
+        }
+        self.registry
+            .persist_reopen_launch_specs(
+                request.soul_id.clone(),
+                preparation.replacement.prepared.incarnation_id.clone(),
+                preparation.start.attempt_id.clone(),
+                terminal.clone(),
+                fresh_agent.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+
+        let prepared = preparation.replacement.prepared.clone();
+        let workload = LaunchWorkload {
+            soul_id: request.soul_id.clone(),
+            fixture: preparation.replacement.fixture,
+            terminal,
+            fresh_agent,
+            resume_spec: preparation.replacement.resume_spec.clone(),
+        };
+        let fence = preparation
+            .start
+            .context
+            .write_fence_for_attempt(preparation.start.attempt_id.clone())
+            .for_incarnation(prepared.incarnation_id.clone());
+        if let Err(error) = Box::pin(self.activate_reopen_prepared_observed(
+            prepared.clone(),
+            workload.clone(),
+            preparation.start.context.requested_limits,
+            fence,
+        ))
+        .await
+        {
+            self.abort_reopen_provider_preparation(&prepared, &workload)
+                .await;
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.reopen.activation_failed",
+                serde_json::json!({
+                    "severity":"error",
+                    "soulId":request.soul_id,
+                    "incarnationId":prepared.incarnation_id,
+                    "attemptId":preparation.start.attempt_id,
+                    "errorCode":error.code,
+                }),
+            );
+            return Ok(failed_reopen_result(
+                Some(prior_view),
+                "the replacement runtime could not be started; manual recovery is required",
+            ));
+        }
+
+        if workload.resume_spec.is_none() {
+            let handle = self
+                .registry
+                .owned_handle(prepared.incarnation_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if let Err(error) = self.commit_provider_preparation(&handle).await {
+                self.abort_reopen_provider_preparation(&prepared, &workload)
+                    .await;
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.provider_commit_failed",
+                    serde_json::json!({
+                        "severity":"error",
+                        "soulId":request.soul_id,
+                        "incarnationId":prepared.incarnation_id,
+                        "errorCode":error.code,
+                    }),
+                );
+                return Ok(failed_reopen_result(
+                    Some(prior_view),
+                    "provider preparation could not be committed; manual recovery is required",
+                ));
+            }
+        }
+
+        self.registry
+            .finish_reopen(
+                request.soul_id.clone(),
+                request_id,
+                payload_digest,
+                request.expected_intent_revision,
+                preparation.start.attempt_id,
+                prepared.incarnation_id.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        let view = find_view(&self.registry, &prepared.incarnation_id).await?;
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.reopen.succeeded",
+            serde_json::json!({
+                "severity":"info",
+                "soulId":request.soul_id,
+                "incarnationId":prepared.incarnation_id,
+                "intentRevision":view.intent_revision,
+            }),
+        );
+        Ok(reopened_result(view))
+    }
+
+    async fn abort_reopen_provider_preparation(
+        &self,
+        prepared: &PreparedLaunch,
+        workload: &LaunchWorkload,
+    ) {
+        let capability = workload
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.provider_launch_context.as_ref())
+            .or_else(|| {
+                workload
+                    .fresh_agent
+                    .as_ref()
+                    .and_then(|agent| agent.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.mcp_capability.as_ref());
+        if let Some(capability) = capability {
+            if let Err(error) = self
+                .notify_mcp_capability(
+                    "abort",
+                    &capability.endpoint,
+                    &prepared.soul_id,
+                    &prepared.incarnation_id,
+                    &capability.grant_id,
+                )
+                .await
+            {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.reopen.provider_abort_pending",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "soulId":prepared.soul_id,
+                        "incarnationId":prepared.incarnation_id,
+                        "errorCode":error.code,
+                    }),
+                );
             }
         }
     }
@@ -5241,8 +5674,12 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, ClassifiedFailure> {
-        let startup_soul = match &command {
-            HostCommand::GrantExecution { soul_id, .. } => Some(soul_id.clone()),
+        let startup_authority = match &command {
+            HostCommand::GrantExecution {
+                soul_id,
+                incarnation_id,
+                ..
+            } => Some((soul_id.clone(), incarnation_id.clone())),
             _ => None,
         };
         let budget = self.host_command_budgets.for_command(&command);
@@ -5260,8 +5697,14 @@ impl Supervisor {
             &envelope,
             budget,
         ));
-        let reply = if let Some(soul) = startup_soul {
-            Box::pin(self.await_running_startup(&soul, "execution_grant", exchange)).await??
+        let reply = if let Some((soul, incarnation)) = startup_authority {
+            Box::pin(self.await_running_or_reopen_startup(
+                &soul,
+                &incarnation,
+                "execution_grant",
+                exchange,
+            ))
+            .await??
         } else {
             exchange.await?
         };
@@ -5312,6 +5755,930 @@ impl Supervisor {
             },
             fence,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::tests::materialize_test_runtime;
+    use freshell_runtime_protocol::{
+        AdminCommand, AdminResult, ControlRole, Envelope, ReopenOutcome, ReopenRequest, RequestId,
+        SoulId, StopOutcome,
+    };
+    use serde::Deserialize;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+        sync::oneshot,
+    };
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct FrozenCallbackRequest {
+        action: String,
+        control_secret: String,
+        soul_id: String,
+        incarnation_id: Option<String>,
+        grant_id: Option<String>,
+        provider: Option<String>,
+        tui_source: Option<Value>,
+        workspace: Option<String>,
+        auth_lookup_authority: Option<String>,
+        claude_recovery_source: Option<Value>,
+        codex_source_runtime: Option<Value>,
+        cwd: Option<String>,
+        prior_context: Option<Value>,
+        provider_secret_references: Option<Value>,
+        provider_path_inputs: Option<Value>,
+    }
+
+    async fn frozen_callback_peer(
+        listener: UnixListener,
+        expected_actions: Vec<String>,
+        prepared_provider_context: Vec<u8>,
+        failed_action: Option<String>,
+        mut issue_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) -> Vec<FrozenCallbackRequest> {
+        let mut requests = Vec::new();
+        for expected_action in expected_actions {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).await.unwrap();
+            let raw: Value = serde_json::from_slice(&body).unwrap();
+            let fields: std::collections::BTreeSet<_> = raw
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                fields,
+                [
+                    "action",
+                    "authLookupAuthority",
+                    "claudeRecoverySource",
+                    "codexSourceRuntime",
+                    "controlSecret",
+                    "cwd",
+                    "grantId",
+                    "incarnationId",
+                    "priorContext",
+                    "provider",
+                    "providerPathInputs",
+                    "providerSecretReferences",
+                    "soulId",
+                    "tuiSource",
+                    "workspace",
+                ]
+                .into_iter()
+                .collect(),
+                "frozen callback request has the exact protocol-v2 field set"
+            );
+            let request: FrozenCallbackRequest = serde_json::from_value(raw).unwrap();
+            assert_eq!(request.action, expected_action);
+            let response: &[u8] = if request.action == "issue" {
+                if let Some((prepared, continue_issue)) = issue_gate.take() {
+                    prepared.send(()).unwrap();
+                    continue_issue.await.unwrap();
+                }
+                prepared_provider_context.as_slice()
+            } else if failed_action.as_deref() == Some(request.action.as_str()) {
+                b"rejected"
+            } else {
+                b"ok"
+            };
+            requests.push(request);
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        requests
+    }
+
+    #[derive(Default)]
+    struct FakeReopenBackend {
+        runtimes: StdMutex<HashMap<String, FakeReopenRuntime>>,
+    }
+
+    struct FakeReopenRuntime {
+        incarnation_id: IncarnationId,
+        state: crate::backend::BackendRuntimeState,
+        host: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for FakeReopenBackend {
+        fn drop(&mut self) {
+            for runtime in self.runtimes.get_mut().unwrap().values_mut() {
+                if let Some(host) = runtime.host.take() {
+                    host.abort();
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeBackend for FakeReopenBackend {
+        async fn create_stopped(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<crate::backend::BackendCreated, BackendError> {
+            let container_id = format!("{:064x}", self.runtimes.lock().unwrap().len() + 1);
+            self.runtimes.lock().unwrap().insert(
+                container_id.clone(),
+                FakeReopenRuntime {
+                    incarnation_id: spec.incarnation_id.clone(),
+                    state: crate::backend::BackendRuntimeState::Created,
+                    host: None,
+                },
+            );
+            Ok(crate::backend::BackendCreated {
+                daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
+                container_id,
+                immutable_config_digest: "fake-reopen-config".into(),
+            })
+        }
+
+        async fn start_host(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            let socket_path = handle.runtime_dir().join("host.sock");
+            let listener = UnixListener::bind(&socket_path)
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let secret = std::fs::read(handle.runtime_dir().join("secret"))
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let incarnation = handle.incarnation_id().clone();
+            let limits = handle.requested_limits();
+            let host = tokio::spawn(async move {
+                let boot = freshell_runtime_protocol::HostBootId::new();
+                let mut grant_epoch = 0;
+                let mut execution_generation = 0;
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(request) = read_frame::<_, Envelope<HostCommand>>(&mut stream).await
+                    else {
+                        return;
+                    };
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id: requested,
+                            challenge,
+                        } if requested == incarnation => Ok(HostResult::Hello {
+                            host_boot_id: boot.clone(),
+                            proof: host_proof(&secret, &challenge, &boot, &incarnation),
+                            capabilities: vec!["native-identity-observation-v1".into()],
+                            effective_limits: limits,
+                        }),
+                        HostCommand::GrantExecution {
+                            control_epoch,
+                            execution_generation: generation,
+                            ..
+                        } => {
+                            grant_epoch = control_epoch;
+                            execution_generation = generation;
+                            Ok(HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 42,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({"fixture":"reopen"}),
+                                native_session_id: None,
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
+                        HostCommand::Status { .. } => Ok(HostResult::Status {
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(42),
+                            worker_launch_count: 1,
+                            max_control_epoch: grant_epoch,
+                            max_execution_generation: execution_generation,
+                            fixture_evidence: serde_json::json!({"fixture":"reopen"}),
+                            exited: false,
+                            native_session_id: None,
+                            native_identity_observation: None,
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        }),
+                        _ => return,
+                    };
+                    if write_frame(
+                        &mut stream,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result,
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            let mut runtimes = self.runtimes.lock().unwrap();
+            let runtime = runtimes.get_mut(handle.container_id()).ok_or_else(|| {
+                BackendError::OwnershipMismatch("unknown Reopen fixture container".into())
+            })?;
+            if runtime.incarnation_id != *handle.incarnation_id() {
+                return Err(BackendError::OwnershipMismatch(
+                    "Reopen fixture container changed incarnation".into(),
+                ));
+            }
+            runtime.state = crate::backend::BackendRuntimeState::Running;
+            runtime.host = Some(host);
+            Ok(())
+        }
+
+        async fn inspect(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<crate::backend::BackendInspection, BackendError> {
+            let runtimes = self.runtimes.lock().unwrap();
+            let runtime = runtimes.get(handle.container_id()).ok_or_else(|| {
+                BackendError::OwnershipMismatch("unknown Reopen fixture container".into())
+            })?;
+            if runtime.incarnation_id != *handle.incarnation_id() {
+                return Err(BackendError::OwnershipMismatch(
+                    "Reopen fixture container changed incarnation".into(),
+                ));
+            }
+            Ok(crate::backend::BackendInspection {
+                state: runtime.state,
+                configured_limits: handle.requested_limits(),
+            })
+        }
+
+        async fn request_stop(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+            _grace_seconds: u64,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable(
+                "unexpected Reopen fixture stop".into(),
+            ))
+        }
+
+        async fn force_stop(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable(
+                "unexpected Reopen fixture force stop".into(),
+            ))
+        }
+
+        async fn verify_empty(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<bool, BackendError> {
+            Ok(matches!(
+                self.inspect(handle).await?.state,
+                crate::backend::BackendRuntimeState::Created
+                    | crate::backend::BackendRuntimeState::Exited
+                    | crate::backend::BackendRuntimeState::Missing
+                    | crate::backend::BackendRuntimeState::Dead
+            ))
+        }
+
+        async fn list_known(
+            &self,
+            handles: &[crate::registry::OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, crate::backend::BackendInspection)>, BackendError> {
+            let mut result = Vec::new();
+            for handle in handles {
+                result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+            }
+            Ok(result)
+        }
+
+        async fn read_limits(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+
+        async fn enable_long_lived(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    async fn stopped_supervisor(root: &Path) -> (Supervisor, SoulId, IncarnationId, u64) {
+        let registry = Registry::open(root.join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let launch = materialize_test_runtime(&registry, soul.clone()).await;
+        let connection = rusqlite::Connection::open(registry.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE souls SET provider='claude',provider_store_id='reopen-store',native_session_id='native-reopen' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE incarnations SET fixture_kind='heartbeat' WHERE incarnation_id=?1",
+                [launch.incarnation_id.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO view_intents (view_id,soul_id,owner_id,workspace_id,kind,preferred_tab_id,preferred_pane_id,title,placement_group,visibility,revision,soul_intent_revision,created_at,updated_at) VALUES ('view-reopen-fixture',?1,'owner-reopen-fixture','workspace-reopen-fixture','automatic_primary','tab-reopen-fixture','pane-reopen-fixture','Reopen fixture','group-reopen-fixture','visible',1,1,1,1)",
+                [soul.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let handle = registry
+            .begin_stop_expected(soul.clone(), Some(launch.intent_revision))
+            .await
+            .unwrap();
+        registry
+            .record_ordinary_stop_outcome(&handle, StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let revision = handle.stop_fence().unwrap().intent_revision;
+        let incarnation = handle.incarnation_id().clone();
+        let supervisor = Supervisor::new(
+            registry,
+            Arc::new(FakeReopenBackend::default()),
+            SupervisorConfig {
+                runtime_root: root.join("runtime"),
+                control_socket_path: root.join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "reopen-test".into(),
+                control_secret: "synthetic-reopen-control-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: Default::default(),
+            },
+        )
+        .unwrap();
+        (supervisor, soul, incarnation, revision)
+    }
+
+    fn seed_reopen_callback_capability(
+        supervisor: &Supervisor,
+        soul: &SoulId,
+        prior_incarnation: &IncarnationId,
+        revision: u64,
+    ) {
+        let provider_launch_context = freshell_runtime_protocol::ProviderLaunchContext {
+            prepared_inputs: None,
+            preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+                approval_default: None,
+            },
+            mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                grant_id: "grant-reopen-prior".into(),
+                endpoint: "http://host.docker.internal:3456".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            }),
+            config: Vec::new(),
+        };
+        let terminal = freshell_runtime_protocol::TerminalLaunchSpec {
+            terminal_id: "terminal-reopen-prior".into(),
+            stream_id: "stream-reopen-prior".into(),
+            mode: "codex".into(),
+            program: "codex".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: "/synthetic/workspace".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "test-project".into(),
+            workspace_path: "/synthetic/workspace".into(),
+            git_common_dir: None,
+            create_request_id: Some("create-reopen-prior".into()),
+            resume_session_id: Some("native-reopen".into()),
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: Some(provider_launch_context),
+            opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
+        };
+        let connection = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE souls SET provider='codex',provider_store_id='reopen-store',native_session_id='native-reopen' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE incarnations SET terminal_id=?1,terminal_spec=?2 WHERE incarnation_id=?3",
+                rusqlite::params![
+                    terminal.terminal_id,
+                    serde_json::to_string(&terminal).unwrap(),
+                    prior_incarnation.as_str()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE ordinary_stops SET capability_endpoint='http://host.docker.internal:3456',capability_grant_id='grant-reopen-prior',revoke_pending=1,settled=0 WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), prior_incarnation.as_str(), revision],
+            )
+            .unwrap();
+    }
+
+    fn reopened_codex_provider_context() -> Vec<u8> {
+        serde_json::to_vec(&freshell_runtime_protocol::PreparedProviderContext {
+            provider_launch_context: freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
+                preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+                    tui_args: Vec::new(),
+                    sidecar_args: Vec::new(),
+                    approval_default: None,
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-reopen-new".into(),
+                    endpoint: "http://host.docker.internal:3456".into(),
+                    provider_relative_path: ".freshell/mcp-capability.json".into(),
+                    host_gateway_address: None,
+                }),
+                config: Vec::new(),
+            },
+            provider_secret_references: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn reopen_envelope(
+        supervisor: &Supervisor,
+        request_id: RequestId,
+        soul_id: SoulId,
+        expected_intent_revision: u64,
+    ) -> Envelope<AdminCommand> {
+        let mut envelope = Envelope::new(
+            request_id,
+            ControlRole::Web,
+            AdminCommand::Reopen(ReopenRequest {
+                soul_id,
+                expected_intent_revision,
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            }),
+        );
+        envelope.auth = Some(supervisor.config.control_secret.clone());
+        envelope
+    }
+
+    #[tokio::test]
+    async fn reopen_success_replay_returns_same_incarnation_before_revision_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        let request_id = RequestId::new();
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let old_container: String = database
+            .query_row(
+                "SELECT container_id FROM incarnations WHERE incarnation_id=?1",
+                [previous.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_command: (String, String, String) = database
+            .query_row(
+                "SELECT request_id,payload_digest,state FROM commands WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let hidden_visibility: String = database
+            .query_row(
+                "SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'",
+                [soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden_visibility, "hidden");
+        drop(database);
+
+        let first = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                request_id.clone(),
+                soul.clone(),
+                revision,
+            ))
+            .await
+            .result
+            .unwrap();
+        let AdminResult::Reopen(first) = first else {
+            panic!("Reopen returned an unexpected result: {first:?}");
+        };
+        assert_eq!(
+            first.outcome,
+            ReopenOutcome::Reopened,
+            "{first:?}\n{}",
+            std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap()
+        );
+        let first_view = first.view.expect("reopened result includes its view");
+        assert_ne!(first_view.incarnation_id, previous);
+        assert_eq!(first_view.soul_id, soul);
+        assert_eq!(
+            first_view.desired_state,
+            freshell_runtime_protocol::DesiredState::Running
+        );
+        assert_eq!(
+            first_view.launch_state,
+            freshell_runtime_protocol::LaunchState::Running
+        );
+        assert_eq!(first_view.provider.as_deref(), Some("claude"));
+        assert_eq!(
+            first_view.native_session_id.as_deref(),
+            Some("native-reopen")
+        );
+        assert_ne!(
+            first_view.container_id.as_deref(),
+            Some(old_container.as_str())
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let reopened_soul: (String, String, Option<String>, String, u64) = database
+            .query_row(
+                "SELECT provider,provider_store_id,native_session_id,desired_state,intent_revision FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened_soul,
+            (
+                "claude".into(),
+                "reopen-store".into(),
+                Some("native-reopen".into()),
+                "running".into(),
+                revision + 1
+            )
+        );
+        let retained_command: (String, String, String, String) = database
+            .query_row(
+                "SELECT request_id,payload_digest,state,incarnation_id FROM commands WHERE soul_id=?1 AND request_id=?2",
+                rusqlite::params![soul.as_str(), old_command.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_command,
+            (
+                old_command.0,
+                old_command.1,
+                old_command.2,
+                previous.to_string()
+            ),
+            "the previous command history remains associated with its original incarnation"
+        );
+        let (reopen_state, reopen_incarnation): (String, String) = database
+            .query_row(
+                "SELECT state,incarnation_id FROM commands WHERE soul_id=?1 AND request_id=?2",
+                rusqlite::params![soul.as_str(), request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reopen_state, "running");
+        assert_eq!(reopen_incarnation, first_view.incarnation_id.as_str());
+        let (visibility, view_revision): (String, u64) = database
+            .query_row(
+                "SELECT visibility,soul_intent_revision FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (visibility.as_str(), view_revision),
+            ("visible", revision + 1)
+        );
+        drop(database);
+
+        let replay = supervisor
+            .dispatch(reopen_envelope(&supervisor, request_id, soul, revision))
+            .await
+            .result
+            .unwrap();
+        let AdminResult::Reopen(replay) = replay else {
+            panic!("Reopen replay returned an unexpected result: {replay:?}");
+        };
+        assert_eq!(replay.outcome, ReopenOutcome::Reopened);
+        assert_eq!(
+            replay.view.unwrap().incarnation_id,
+            first_view.incarnation_id,
+            "exact successful replay must return its original incarnation before checking the stale revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_conflicting_digest_and_stale_revision_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, _previous, revision) = stopped_supervisor(directory.path()).await;
+        let request_id = RequestId::new();
+        let first = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                request_id.clone(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        assert!(matches!(
+            first.result.unwrap(),
+            AdminResult::Reopen(result) if result.outcome == ReopenOutcome::Reopened
+        ));
+
+        let conflict = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                request_id,
+                soul.clone(),
+                revision + 1,
+            ))
+            .await;
+        assert_eq!(
+            conflict.result.unwrap_err().code,
+            freshell_runtime_protocol::RuntimeErrorCode::RequestIdConflict
+        );
+
+        let stale = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        assert_eq!(
+            stale.result.unwrap_err().code,
+            freshell_runtime_protocol::RuntimeErrorCode::StaleIntentRevision
+        );
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (commands, incarnations): (u64, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM commands WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1)",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(commands, 2);
+        assert_eq!(incarnations, 2);
+    }
+
+    #[tokio::test]
+    async fn reopen_pending_revoke_keeps_stopped_revision_command_and_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        database
+            .execute(
+                "UPDATE ordinary_stops SET capability_endpoint='http://host.docker.internal:3456',capability_grant_id='grant-pending-reopen',revoke_pending=1,settled=0 WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), previous.as_str(), revision],
+            )
+            .unwrap();
+        let before: (u64, u64, String, u64, String) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM commands WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary') FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        drop(database);
+
+        let reply = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        let AdminResult::Reopen(result) = reply.result.unwrap() else {
+            panic!("Reopen returned an unexpected result");
+        };
+        assert_eq!(result.outcome, ReopenOutcome::Pending);
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let after: (u64, u64, String, u64, String, u64) = database
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM commands WHERE soul_id=?1),(SELECT COUNT(*) FROM incarnations WHERE soul_id=?1),desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'),(SELECT COUNT(*) FROM commands WHERE soul_id=?1 AND state='reopen_prepared') FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after.0, before.0,
+            "pending revoke cannot associate a Reopen command"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "pending revoke cannot create a new incarnation"
+        );
+        assert_eq!(after.2, "stopped");
+        assert_eq!(after.3, revision);
+        assert_eq!(after.4, "hidden");
+        assert_eq!(after.5, 0);
+        let revoke_pending: bool = database
+            .query_row(
+                "SELECT revoke_pending FROM ordinary_stops WHERE soul_id=?1 AND incarnation_id=?2 AND intent_revision=?3",
+                rusqlite::params![soul.as_str(), previous.as_str(), revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(revoke_pending);
+    }
+
+    #[tokio::test]
+    async fn reopen_uses_frozen_legacy_callback_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+        let callback_socket = supervisor
+            .config
+            .control_socket_path
+            .with_file_name("mcp.sock");
+        let listener = UnixListener::bind(&callback_socket).unwrap();
+        let (prepared_tx, prepared_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let peer = tokio::spawn(frozen_callback_peer(
+            listener,
+            ["revoke", "issue", "activate", "commit"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            None,
+            Some((prepared_tx, continue_rx)),
+        ));
+        let request_id = RequestId::new();
+        let mut reopen = Box::pin(supervisor.dispatch(reopen_envelope(
+            &supervisor,
+            request_id.clone(),
+            soul.clone(),
+            revision,
+        )));
+        tokio::select! {
+            _ = prepared_rx => {}
+            reply = &mut reopen => panic!("Reopen finished before provider callback was released: {reply:?}"),
+        }
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let prepared_state: (String, u64, String, String, String) = database
+            .query_row(
+                "SELECT s.desired_state,s.intent_revision,c.state,i.launch_state,v.visibility FROM souls s JOIN commands c ON c.soul_id=s.soul_id AND c.request_id=?2 JOIN incarnations i ON i.incarnation_id=c.incarnation_id JOIN view_intents v ON v.soul_id=s.soul_id AND v.kind='automatic_primary' WHERE s.soul_id=?1",
+                rusqlite::params![soul.as_str(), request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            prepared_state,
+            (
+                "stopped".into(),
+                revision,
+                "reopen_prepared".into(),
+                "prepared".into(),
+                "hidden".into(),
+            ),
+            "a prepared Reopen keeps stopped intent and hidden view until final success"
+        );
+        drop(database);
+        continue_tx.send(()).unwrap();
+        let result = reopen.await;
+        let AdminResult::Reopen(result) = result
+            .result
+            .unwrap_or_else(|error| panic!("Reopen failed unexpectedly: {error:?}"))
+        else {
+            panic!("Reopen returned an unexpected result");
+        };
+        assert_eq!(result.outcome, ReopenOutcome::Reopened);
+        let reopened_incarnation = result.view.unwrap().incarnation_id;
+        let requests = peer.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            ["revoke", "issue", "activate", "commit"]
+        );
+        assert!(requests.iter().all(|request| {
+            request.control_secret == supervisor.config.control_secret
+                && request.soul_id == soul.as_str()
+        }));
+        assert_eq!(requests[0].action, "revoke");
+        assert_eq!(
+            requests[0].incarnation_id.as_deref(),
+            Some(previous.as_str())
+        );
+        assert_eq!(requests[0].grant_id.as_deref(), Some("grant-reopen-prior"));
+        let issue = &requests[1];
+        assert!(issue.incarnation_id.is_none());
+        assert!(issue.grant_id.is_none());
+        assert_eq!(issue.provider.as_deref(), Some("codex"));
+        assert_eq!(issue.workspace.as_deref(), Some("/synthetic/workspace"));
+        assert_eq!(issue.cwd.as_deref(), Some("/synthetic/workspace"));
+        assert!(issue.auth_lookup_authority.is_some());
+        assert!(issue.codex_source_runtime.is_some());
+        assert!(issue.tui_source.is_none());
+        assert!(issue.claude_recovery_source.is_none());
+        assert!(issue.prior_context.is_some());
+        assert_eq!(
+            issue.provider_secret_references,
+            Some(Value::Array(Vec::new()))
+        );
+        assert_eq!(
+            issue.provider_path_inputs,
+            Some(Value::Object(Default::default()))
+        );
+        for request in &requests[2..] {
+            assert_eq!(
+                request.incarnation_id.as_deref(),
+                Some(reopened_incarnation.as_str())
+            );
+            assert_eq!(request.grant_id.as_deref(), Some("grant-reopen-new"));
+            assert!(request.provider.is_none());
+            assert!(request.workspace.is_none());
+            assert!(request.cwd.is_none());
+            assert!(request.prior_context.is_none());
+            assert!(request.provider_secret_references.is_none());
+            assert!(request.provider_path_inputs.is_none());
+        }
+        assert_ne!(reopened_incarnation, previous);
+    }
+
+    #[tokio::test]
+    async fn reopen_aborts_prepared_capability_after_activation_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, soul, previous, revision) = stopped_supervisor(directory.path()).await;
+        seed_reopen_callback_capability(&supervisor, &soul, &previous, revision);
+        let listener = UnixListener::bind(
+            supervisor
+                .config
+                .control_socket_path
+                .with_file_name("mcp.sock"),
+        )
+        .unwrap();
+        let peer = tokio::spawn(frozen_callback_peer(
+            listener,
+            ["revoke", "issue", "activate", "abort"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            reopened_codex_provider_context(),
+            Some("activate".into()),
+            None,
+        ));
+
+        let reply = supervisor
+            .dispatch(reopen_envelope(
+                &supervisor,
+                RequestId::new(),
+                soul.clone(),
+                revision,
+            ))
+            .await;
+        let AdminResult::Reopen(result) = reply.result.unwrap() else {
+            panic!("Reopen returned an unexpected result");
+        };
+        assert_eq!(result.outcome, ReopenOutcome::Failed);
+        let requests = peer.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.action.as_str())
+                .collect::<Vec<_>>(),
+            ["revoke", "issue", "activate", "abort"]
+        );
+        assert_eq!(
+            requests[0].incarnation_id.as_deref(),
+            Some(previous.as_str())
+        );
+        assert_eq!(requests[0].grant_id.as_deref(), Some("grant-reopen-prior"));
+        assert_eq!(requests[3].incarnation_id, requests[2].incarnation_id);
+        assert_eq!(requests[3].grant_id.as_deref(), Some("grant-reopen-new"));
+
+        let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (desired, intent_revision, view_visibility, reopen_state): (String, u64, String, String) = database
+            .query_row(
+                "SELECT desired_state,intent_revision,(SELECT visibility FROM view_intents WHERE soul_id=?1 AND kind='automatic_primary'),(SELECT state FROM commands WHERE soul_id=?1 AND state='reopen_prepared') FROM souls WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(desired, "stopped");
+        assert_eq!(intent_revision, revision);
+        assert_eq!(view_visibility, "hidden");
+        assert_eq!(reopen_state, "reopen_prepared");
     }
 }
 
@@ -8582,6 +9949,95 @@ mod stop_intent_order_tests {
             .unwrap();
         assert_eq!((desired.as_str(), state.as_str()), ("stopped", "stopped"));
     }
+}
+
+fn semantic_reopen_digest(request: &freshell_runtime_protocol::ReopenRequest) -> String {
+    let value = serde_json::json!({
+        "operation":"reopen",
+        "soulId":request.soul_id,
+        "expectedStoppedIntentRevision":request.expected_intent_revision,
+    });
+    format!("sha256:{:x}", Sha256::digest(value.to_string().as_bytes()))
+}
+
+fn reopened_result(view: RuntimeView) -> freshell_runtime_protocol::ReopenResult {
+    freshell_runtime_protocol::ReopenResult {
+        outcome: freshell_runtime_protocol::ReopenOutcome::Reopened,
+        view: Some(view),
+        message: None,
+    }
+}
+
+fn pending_reopen_result(
+    view: Option<RuntimeView>,
+    message: &str,
+) -> freshell_runtime_protocol::ReopenResult {
+    freshell_runtime_protocol::ReopenResult {
+        outcome: freshell_runtime_protocol::ReopenOutcome::Pending,
+        view,
+        message: Some(message.into()),
+    }
+}
+
+fn failed_reopen_result(
+    view: Option<RuntimeView>,
+    message: &str,
+) -> freshell_runtime_protocol::ReopenResult {
+    freshell_runtime_protocol::ReopenResult {
+        outcome: freshell_runtime_protocol::ReopenOutcome::Failed,
+        view,
+        message: Some(message.into()),
+    }
+}
+
+fn terminal_without_first_boot_state(
+    terminal: Option<TerminalLaunchSpec>,
+) -> Option<TerminalLaunchSpec> {
+    terminal.map(|mut terminal| {
+        terminal.provider_bootstrap_files.clear();
+        terminal.opencode_transfer = None;
+        terminal.opencode_transfer_attempt_id = None;
+        terminal.opencode_adoption = None;
+        terminal
+    })
+}
+
+fn fresh_without_raw_bootstrap(
+    agent: Option<FreshAgentLaunchSpec>,
+) -> Option<FreshAgentLaunchSpec> {
+    agent.map(|mut agent| {
+        if agent.provider != freshell_runtime_protocol::FreshProvider::Kilroy {
+            agent.provider_bootstrap_files.clear();
+        }
+        agent
+    })
+}
+
+fn install_reopen_provider_context(
+    terminal: Option<&mut TerminalLaunchSpec>,
+    fresh_agent: Option<&mut FreshAgentLaunchSpec>,
+    prepared: freshell_runtime_protocol::PreparedProviderContext,
+) -> Result<(), RuntimeError> {
+    match (terminal, fresh_agent) {
+        (Some(terminal), None) => {
+            prepared.validate(&terminal.mode)?;
+            terminal.provider_launch_context = Some(prepared.provider_launch_context);
+            terminal.provider_secret_references = prepared.provider_secret_references;
+        }
+        (None, Some(agent)) => {
+            let provider = agent.provider.native_provider();
+            prepared.validate(provider)?;
+            agent.provider_launch_context = Some(prepared.provider_launch_context);
+            agent.provider_secret_references = prepared.provider_secret_references;
+        }
+        _ => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "saved provider context does not identify exactly one workload",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn semantic_launch_digest(

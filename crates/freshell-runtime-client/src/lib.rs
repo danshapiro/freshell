@@ -15,12 +15,13 @@ use freshell_runtime_protocol::{
     MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
     OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
     PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
-    RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode,
-    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
-    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
-    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
-    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    RecoveryTrigger, ReopenRequest, ReopenResult, RepairAudit, RepairRequest, RequestId,
+    RestoreLostSoulsRequest, RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError,
+    RuntimeErrorCode, RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot,
+    RuntimeNotice, RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest,
+    TerminalReadOutputRequest, TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult,
+    UpdateViewVisibilityRequest, UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent,
+    CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -1503,6 +1504,39 @@ impl RuntimeClient {
                     .await?
                 {
                     AdminResult::Stop { outcome, view } => Ok((outcome, view)),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn reopen_with_request_id(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        expected_intent_revision: u64,
+    ) -> Result<ReopenResult, ClientError> {
+        let mut request = ReopenRequest {
+            soul_id,
+            expected_intent_revision,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::Reopen(request))
+            .await
+        {
+            Ok(AdminResult::Reopen(result)) => Ok(result),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::Reopen(request))
+                    .await?
+                {
+                    AdminResult::Reopen(result) => Ok(result),
                     _ => Err(ClientError::UnexpectedResult),
                 }
             }
