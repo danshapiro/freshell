@@ -208,6 +208,7 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `OPENCODE_CMD` | No | OpenCode CLI command override |
 | `GEMINI_CMD` | No | Gemini CLI command override |
 | `ANTIGRAVITY_CMD` | No | Antigravity CLI command override |
+| `FRESHELL_ANTIGRAVITY_HOME` | No | Antigravity store root override (default: `~/.gemini/antigravity-cli`; snap installs fall back to `~/snap/antigravity-cli/common/.gemini/antigravity-cli`) |
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for automatic conversation names and terminal summaries; takes precedence over Settings at startup |
@@ -247,7 +248,13 @@ Antigravity CLI support launches `agy` panes (with no launch flags — the
 real CLI starts interactive by default, as probed against pinned binaries
 1.4.10 and 1.4.12), indexes native conversation history, binds one
 conversation identity per pane, and shows busy and turn-completion
-state — with these recorded limitations. Freshell's view of Antigravity's
+state — with these recorded limitations. Freshell reads Antigravity
+conversations from `~/.gemini/antigravity-cli` (or the
+`FRESHELL_ANTIGRAVITY_HOME` override); snap installs keep their store
+under `~/snap/antigravity-cli/common/.gemini/antigravity-cli`, which
+Freshell falls back to automatically whenever the default root holds no
+conversations — the chosen root is named in the server log at startup,
+and neither root existing is logged loudly. Freshell's view of Antigravity's
 on-disk conversation format follows Google's documented store, but the
 transcript record schema and the store's authority have not been
 validated against a real authenticated `agy` session, so they remain
@@ -271,8 +278,10 @@ have no waiting-for-approval attention signal (the same treatment as other
 terminal CLI panes). Resuming passes the conversation
 id to `agy` verbatim without Freshell-side validation for now; the real CLI
 (probed) prints a warning for an unknown conversation id and continues into
-a fresh interactive session rather than failing, so a stale resume id is
-not caught for you — enabling the validated resume
+a fresh interactive session rather than failing, and the pane then rebinds
+to that fresh conversation on its next typed prompt — so a stale resume id
+is not caught for you, but it never dead-ends the pane and never silently
+substitutes: enabling the validated resume
 gate is deferred until real-binary transcript evidence exists.
 
 ### Standalone CLI and MCP client
