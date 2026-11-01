@@ -9481,7 +9481,7 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
 
-    expect(screen.getByRole('menu', { name: 'Slash commands' })).toBeInTheDocument()
+    expect(await screen.findByRole('menu', { name: 'Slash commands' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: /\/new/i })).toHaveTextContent('Start a new conversation')
     expect(screen.getByRole('menuitem', { name: /\/compact/i })).toHaveTextContent('compact')
     expect(screen.queryByText('/reset')).not.toBeInTheDocument()
