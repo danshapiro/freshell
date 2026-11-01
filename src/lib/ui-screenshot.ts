@@ -1,4 +1,5 @@
 import html2canvas from 'html2canvas'
+import { prepareScreenshotViewport } from '@/lib/screenshot-viewport'
 import { suspendTerminalRenderersForScreenshot } from '@/lib/screenshot-capture-env'
 
 const ELEMENT_WAIT_TIMEOUT_MS = 1500
@@ -33,7 +34,7 @@ type IframeReplacement =
   | { kind: 'placeholder'; message: string; src: string }
 
 type PreparedIframeCapture = {
-  onclone: (doc: Document, clonedTarget: HTMLElement) => void
+  onclone: (doc: Document, clonedTarget: HTMLElement, ignoreElements: (element: Element) => boolean) => void
 }
 
 function sleep(ms: number): Promise<void> {
@@ -253,33 +254,34 @@ function revealClonedTargetChain(clonedTarget: HTMLElement): void {
  *  replacements rather than risk an image landing on the wrong iframe. The
  *  pane id disambiguates same-URL iframes (each browser/extension pane hosts
  *  exactly one). No marker attributes are stamped on the live DOM at all. */
-async function prepareIframeCapture(target: HTMLElement, scale: number): Promise<PreparedIframeCapture> {
-  const iframes = Array.from(target.querySelectorAll('iframe'))
-  if (iframes.length === 0) {
-    return { onclone: () => {} }
+async function prepareIframeCapture(
+  target: HTMLElement, scale: number, ignoreElements: (element: Element) => boolean,
+): Promise<PreparedIframeCapture> {
+  const retained = (iframe: HTMLIFrameElement, omitted: (element: Element) => boolean) => {
+    if (!target.contains(iframe)) return false
+    for (let node: Element | null = iframe; node; node = node.parentElement) {
+      if (omitted(node)) return false
+      if (node === target) break
+    }
+    return true
   }
-
-  const originalFingerprints = iframes.map((iframe) => iframeFingerprint(iframe))
+  const iframes = Array.from(target.querySelectorAll('iframe')).filter((iframe) => retained(iframe, ignoreElements))
+  const originalFingerprints = iframes.map(iframeFingerprint)
   const replacements: (IframeReplacement | null)[] = []
   for (const iframe of iframes) {
-    // Layout-gated, not paint-gated: a background tab's iframe is
-    // visibility-hidden yet fully laid out, and its same-origin document is
-    // readable regardless of CSS visibility.
     replacements.push(hasLayout(iframe) ? await captureIframeReplacement(iframe, scale) : null)
   }
-
   return {
-    onclone: (doc, clonedTarget) => {
-      const cloneIframes = Array.from(clonedTarget.querySelectorAll('iframe'))
-      if (cloneIframes.length !== iframes.length) return
-      for (let i = 0; i < cloneIframes.length; i += 1) {
-        if (iframeFingerprint(cloneIframes[i]) !== originalFingerprints[i]) return
+    onclone: (doc, clonedTarget, currentOmissions) => {
+      const indexes = iframes.map((_, i) => i).filter((i) => retained(iframes[i], currentOmissions))
+      const copies = Array.from(clonedTarget.querySelectorAll('iframe'))
+      if (copies.length !== indexes.length) return
+      for (let i = 0; i < copies.length; i++) {
+        if (iframeFingerprint(copies[i]) !== originalFingerprints[indexes[i]]) return
       }
-      for (let i = 0; i < cloneIframes.length; i += 1) {
-        const replacement = replacements[i]
-        if (replacement) {
-          cloneIframes[i].replaceWith(buildIframeReplacementElement(doc, cloneIframes[i], replacement))
-        }
+      for (let i = 0; i < copies.length; i++) {
+        const replacement = replacements[indexes[i]]
+        if (replacement) copies[i].replaceWith(buildIframeReplacementElement(doc, copies[i], replacement))
       }
     },
   }
@@ -323,22 +325,26 @@ export async function captureUiScreenshot(request: ScreenshotRequest): Promise<S
     // not terminal canvases), so the suspension starts as late as possible —
     // exactly around the main render, the only step that reads the WebGL
     // canvases — and a never-found target suspends nothing at all.
-    const preparedIframes = await prepareIframeCapture(target, scale)
+    const iframeViewport = prepareScreenshotViewport(target)
+    const preparedIframes = await prepareIframeCapture(target, scale, iframeViewport.ignoreElements)
     // Web canvases (xterm's WebGL renderer) are only reliably readable around
     // a fresh synchronous render — the refcounted suspension forces one and
     // freezes the renderers while html2canvas copies each canvas into its
     // clone. Balanced in `finally`, including every failure path.
     const restoreRenderers = await suspendTerminalRenderersForScreenshot()
     try {
+      const preparedViewport = prepareScreenshotViewport(target)
       const canvas = await html2canvas(target, {
         backgroundColor: null,
         allowTaint: true,
         useCORS: true,
         logging: false,
         scale,
+        ignoreElements: preparedViewport.ignoreElements,
         onclone: (doc, clonedTarget) => {
           if (needsReveal) revealClonedTargetChain(clonedTarget)
-          preparedIframes.onclone(doc, clonedTarget)
+          preparedViewport.onclone(doc, clonedTarget)
+          preparedIframes.onclone(doc, clonedTarget, preparedViewport.ignoreElements)
         },
       })
 

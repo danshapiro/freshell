@@ -134,6 +134,52 @@ function mockCloneRender(resultBase64 = 'ROOTPNG') {
   }
 }
 
+/** Models html2canvas's pre-descent exclusion and saved element scroll offsets. */
+function mockPrunedRender(failAfterClone = false, changeClone?: (doc: Document) => void) {
+  const visited: Element[] = []
+  let copy: Document
+  vi.mocked(html2canvas).mockImplementation(async (target: any, options: any) => {
+    if (target.ownerDocument !== document) {
+      return { width: 500, height: 300, toDataURL: () => 'data:image/png;base64,FRAME' } as any
+    }
+    copy = document.implementation.createHTMLDocument('capture')
+    const pairs = new Map<Node, Node>()
+    const clone = (source: Node): Node => {
+      if (source instanceof Element) visited.push(source)
+      const dest = copy.importNode(source, false)
+      pairs.set(source, dest)
+      for (const child of source.childNodes) {
+        if (child instanceof Element && options.ignoreElements?.(child)) continue
+        dest.appendChild(clone(child))
+      }
+      return dest
+    }
+    copy.replaceChild(clone(document.documentElement), copy.documentElement)
+    for (const [source, dest] of pairs) {
+      if (source instanceof HTMLElement && dest.nodeType === Node.ELEMENT_NODE) {
+        ;(dest as HTMLElement).scrollTop = source.scrollTop
+        ;(dest as HTMLElement).scrollLeft = source.scrollLeft
+      }
+    }
+    changeClone?.(copy)
+    options.onclone(copy, pairs.get(target))
+    if (failAfterClone) throw new Error('render failed after clone')
+    return { width: 800, height: 500, toDataURL: () => 'data:image/png;base64,VIEW' } as any
+  })
+  return { visited, get copy() { return copy! } }
+}
+
+function rectAt(node: HTMLElement, top: number, height: number, width = 800) {
+  Object.defineProperty(node, 'getBoundingClientRect', {
+    configurable: true,
+    value: () => ({ top, bottom: top + height, left: 0, right: width, width, height, x: 0, y: top }),
+  })
+  Object.defineProperties(node, {
+    clientHeight: { configurable: true, value: height },
+    clientWidth: { configurable: true, value: width },
+  })
+}
+
 function createMenuStore() {
   return configureStore({
     reducer: {
@@ -813,5 +859,204 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toBe('renderer exploded')
     expect(resumes).toHaveLength(1)
+  })
+})
+
+describe('captureUiScreenshot transcript viewport', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    document.body.innerHTML = ''
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockResolvedValue(async () => {})
+  })
+
+  it.each([false, true])('excludes history before visiting its descendants; render failure=%s', async (fail) => {
+    document.body.innerHTML = `
+      <textarea id="focus">keep selection</textarea>
+      <div data-pane-shell="true" data-pane-id="target">
+        <div data-context="fresh-agent-transcript">
+          <article id="old"><span id="old-token">old</span></article>
+          <article id="visible">current viewport</article>
+          <div id="tail">live tail without a turn index</div>
+          <section id="future"><span id="future-token">later</span></section>
+        </div>
+      </div>
+      <div data-pane-shell="true" data-pane-id="other">
+        <div data-context="fresh-agent-transcript"><article id="unrelated"><span>large unrelated history</span></article></div>
+        <section id="editor"><span id="editor-token">unrelated non-transcript content</span></section>
+      </div>`
+    const target = document.querySelector<HTMLElement>('[data-pane-id="target"]')!
+    const scroller = target.querySelector<HTMLElement>('[data-context]')!
+    rectAt(target, 0, 500)
+    rectAt(scroller, 0, 500)
+    const rows = Array.from(scroller.children) as HTMLElement[]
+    rows.forEach((row, i) => rectAt(row, [-2000, -20, 450, 2000][i], [300, 400, 100, 300][i]))
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scroller, 'clientWidth', { configurable: true, value: 800 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 4500 })
+    scroller.scrollTop = 2020
+    scroller.scrollLeft = 7
+    const input = document.querySelector<HTMLTextAreaElement>('#focus')!
+    input.focus()
+    input.setSelectionRange(2, 6)
+    const before = document.body.innerHTML
+    const resume = vi.fn(async () => {})
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockResolvedValue(resume)
+    const render = mockPrunedRender(fail)
+    const result = await captureUiScreenshot({ scope: 'pane', paneId: 'target' })
+    expect(result.ok).toBe(!fail)
+    expect(render.visited.map((node) => node.id)).toContain('visible')
+    expect(render.visited.map((node) => node.id)).toContain('tail')
+    for (const id of ['old', 'old-token', 'future', 'future-token', 'unrelated', 'editor', 'editor-token']) {
+      expect(render.visited.map((node) => node.id)).not.toContain(id)
+      expect(render.copy.getElementById(id)).toBeNull()
+    }
+    expect(render.copy.querySelector('[data-pane-id="other"]')).not.toBeNull()
+    expect(render.copy.querySelector('[data-context]')!.scrollTop).toBe(2020)
+    expect(document.body.innerHTML).toBe(before)
+    expect(document.activeElement).toBe(input)
+    expect([input.selectionStart, input.selectionEnd]).toEqual([2, 6])
+    expect([scroller.scrollTop, scroller.scrollLeft]).toEqual([2020, 7])
+    expect(resume).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['empty transcript', 'no transcript'])('captures %s', async (kind) => {
+    document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target">${kind === 'empty transcript'
+      ? '<div data-context="fresh-agent-transcript"></div>' : '<p id="plain">Plain pane</p>'}</div>`
+    const target = document.querySelector<HTMLElement>('[data-pane-id="target"]')!
+    rectAt(target, 0, 500)
+    const render = mockPrunedRender()
+    expect((await captureUiScreenshot({ scope: 'pane', paneId: 'target' })).ok).toBe(true)
+    expect(render.copy.querySelector('[data-pane-id="target"]')).not.toBeNull()
+    if (kind === 'empty transcript') expect(render.copy.querySelector('[data-context]')!.children).toHaveLength(0)
+    else expect(render.copy.querySelector('#plain')!.textContent).toBe('Plain pane')
+  })
+
+  it('renders existing srgb gradient/shadow colors through clone-only compatible CSS after pruning', async () => {
+    document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target" class="fresh-agent-style-serif">
+      <div data-context="fresh-agent-transcript">
+        <article id="old" class="fresh-agent-turn" data-turn-role="user"><div class="fresh-agent-transcript-copy">old</div></article>
+        <article class="fresh-agent-turn" data-turn-role="user"><div id="visible-copy" class="fresh-agent-transcript-copy">visible</div></article>
+      </div><textarea class="fresh-agent-composer-input"></textarea>
+    </div>`
+    const target = document.querySelector<HTMLElement>('[data-pane-id="target"]')!
+    const scroller = target.querySelector<HTMLElement>('[data-context]')!
+    rectAt(target, 0, 500); rectAt(scroller, 0, 500)
+    rectAt(scroller.children[0] as HTMLElement, -2000, 200)
+    rectAt(scroller.children[1] as HTMLElement, 0, 500)
+    const before = document.body.innerHTML
+    const computed = window.getComputedStyle.bind(window)
+    const colorReads: Element[] = []
+    const styles = vi.spyOn(window, 'getComputedStyle').mockImplementation((node) => {
+      if (node.ownerDocument !== document && node.matches('.fresh-agent-transcript-copy, .fresh-agent-composer-input')) {
+        colorReads.push(node)
+        return { getPropertyValue: (property: string) => property === 'background-image'
+          ? 'linear-gradient(to right, rgb(20, 40, 60), color(srgb 0.2 0.4 0.6 / 0.72) 58%, transparent 100%)'
+          : 'color(srgb 0.2 0.4 0.6 / 0.45) 0px 0px 0px 1px inset' } as CSSStyleDeclaration
+      }
+      return computed(node)
+    })
+    try {
+      const render = mockPrunedRender()
+      expect((await captureUiScreenshot({ scope: 'pane', paneId: 'target' })).ok).toBe(true)
+      expect(render.copy.getElementById('visible-copy')!.style.backgroundImage).toContain('rgba(51, 102, 153, 0.72)')
+      expect((render.copy.querySelector('.fresh-agent-composer-input') as HTMLElement).style.boxShadow).toContain('rgba(51, 102, 153, 0.45)')
+      expect(colorReads).toHaveLength(2)
+      expect(render.copy.getElementById('old')).toBeNull()
+      expect(document.body.innerHTML).toBe(before)
+    } finally {
+      styles.mockRestore()
+    }
+  })
+
+  it('retains partially visible first and last rows and arbitrary live/caption/section roots', async () => {
+    document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target"><div data-context="fresh-agent-transcript">
+      <article id="old"><span id="old-token">old</span></article>
+      <article id="first">first partial row</article><div id="caption">caption</div>
+      <article id="live">live</article><section id="last">last partial section</section>
+      <section id="future"><span id="future-token">future</span></section>
+    </div></div>`
+    const target = document.querySelector<HTMLElement>('[data-pane-id="target"]')!
+    const scroller = target.querySelector<HTMLElement>('[data-context]')!
+    rectAt(target, 0, 500); rectAt(scroller, 0, 500)
+    Array.from(scroller.children).forEach((row, i) => rectAt(row as HTMLElement,
+      [-2000, -40, 120, 200, 480, 2000][i], [200, 160, 80, 280, 160, 200][i]))
+    const render = mockPrunedRender()
+    expect((await captureUiScreenshot({ scope: 'pane', paneId: 'target' })).ok).toBe(true)
+    for (const id of ['first', 'caption', 'live', 'last']) expect(render.copy.getElementById(id)).not.toBeNull()
+    for (const id of ['old', 'old-token', 'future', 'future-token']) {
+      expect(render.visited.map((row) => row.id)).not.toContain(id)
+    }
+  })
+
+  it('measures the current viewport after preparatory awaits', async () => {
+    document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target"><div data-context="fresh-agent-transcript">
+      <article id="formerly-visible">old viewport</article><article id="newly-visible">new viewport</article>
+    </div></div>`
+    const target = document.querySelector<HTMLElement>('[data-pane-id="target"]')!
+    const scroller = target.querySelector<HTMLElement>('[data-context]')!
+    const [first, second] = Array.from(scroller.children) as HTMLElement[]
+    rectAt(target, 0, 500); rectAt(scroller, 0, 500)
+    rectAt(first, 0, 500); rectAt(second, 2000, 500)
+    const resume = vi.fn(async () => {})
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementation(async () => {
+      scroller.scrollTop = 2000
+      rectAt(first, -2000, 500); rectAt(second, 0, 500)
+      return resume
+    })
+    const render = mockPrunedRender()
+    expect((await captureUiScreenshot({ scope: 'pane', paneId: 'target' })).ok).toBe(true)
+    expect(render.copy.getElementById('formerly-visible')).toBeNull()
+    expect(render.copy.getElementById('newly-visible')).not.toBeNull()
+    expect(render.copy.querySelector('[data-context]')!.scrollTop).toBe(2000)
+    expect(scroller.scrollTop).toBe(2000)
+    expect(resume).toHaveBeenCalledOnce()
+  })
+
+  it.each(['count', 'pane owner'])('fails clearly and resumes renderers on clone transcript %s drift', async (drift) => {
+    document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target"><div data-context="fresh-agent-transcript">
+      <article>current viewport</article><article id="old"><span id="old-token">history</span></article>
+    </div></div>`
+    const target = document.querySelector<HTMLElement>('[data-pane-id="target"]')!
+    const scroller = target.querySelector<HTMLElement>('[data-context]')!
+    rectAt(target, 0, 500); rectAt(scroller, 0, 500)
+    rectAt(scroller.children[0] as HTMLElement, 0, 500); rectAt(scroller.children[1] as HTMLElement, 2000, 500)
+    const resume = vi.fn(async () => {})
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockResolvedValue(resume)
+    const render = mockPrunedRender(false, (copy) => {
+      if (drift === 'count') copy.querySelector('[data-context]')!.remove()
+      else copy.querySelector('[data-pane-id]')!.setAttribute('data-pane-id', 'changed-pane')
+    })
+    const result = await captureUiScreenshot({ scope: 'pane', paneId: 'target' })
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/screenshot transcript (tree|identity) changed during capture/)
+    expect(resume).toHaveBeenCalledOnce()
+    expect(html2canvas).toHaveBeenCalledOnce()
+    expect(render.visited.map((row) => row.id)).not.toContain('old-token')
+  })
+  it('view capture replaces its visible iframe while omitting a hidden-tab iframe', async () => {
+    document.body.innerHTML = `
+      <div data-context="global">
+        <div data-tab-content-id="visible"><div data-pane-shell="true" data-pane-id="visible-browser">
+          <iframe id="visible-frame" src="about:blank"></iframe>
+        </div></div>
+        <div data-tab-content-id="hidden" style="visibility:hidden"><div data-pane-shell="true" data-pane-id="hidden-browser">
+          <iframe id="hidden-frame" src="about:blank"></iframe>
+        </div></div>
+      </div>`
+    const target = document.querySelector<HTMLElement>('[data-context="global"]')!
+    const visible = document.querySelector<HTMLIFrameElement>('#visible-frame')!
+    const hidden = document.querySelector<HTMLIFrameElement>('#hidden-frame')!
+    rectAt(target, 0, 500); rectAt(visible, 0, 300); rectAt(hidden, 0, 300)
+    visible.contentDocument!.body.innerHTML = '<h1>Visible iframe canary</h1>'
+    const hiddenDocument = vi.fn(() => null)
+    Object.defineProperty(hidden, 'contentDocument', { configurable: true, get: hiddenDocument })
+    const render = mockPrunedRender()
+    const result = await captureUiScreenshot({ scope: 'view' })
+    expect(result.ok).toBe(true)
+    expect(render.copy.querySelector('[data-pane-id="visible-browser"] [data-screenshot-iframe-image="true"]')).not.toBeNull()
+    expect(render.copy.querySelector('#visible-frame')).toBeNull()
+    expect(render.copy.querySelector('#hidden-frame')).toBeNull()
+    expect(hiddenDocument).not.toHaveBeenCalled()
+    expect(render.visited).not.toContain(hidden)
   })
 })
