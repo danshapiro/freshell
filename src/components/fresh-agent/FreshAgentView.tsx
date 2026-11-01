@@ -5161,8 +5161,12 @@ export function FreshAgentView({
       ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text }] : []),
       ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
+    const verboseNotice = notice && (notice.text.length > 240 || notice.text.split('\n').length > 3)
+    const noticeSummary = verboseNotice
+      ? `${notice.text.slice(0, 160)}…${notice.text === deliveryNoticeRef.current ? ' Check the conversation before sending again.' : ''}`
+      : notice?.text
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: notice.text, level: notice.level, content: null }] : []),
+      ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null }] : []),
     { id: 'create', summary: 'Agent could not start', content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
