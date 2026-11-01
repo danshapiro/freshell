@@ -524,6 +524,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // ── store-root resolution through the wiring seam (round 7, Major 2) ──
+
+    /// A HOME whose ONLY antigravity store is the SNAP layout root
+    /// (`<home>/snap/antigravity-cli/common/.gemini/antigravity-cli` —
+    /// the probed real-snap-install layout: snap confinement pins the
+    /// CLI's HOME to `~/snap/antigravity-cli/common`, receipts in the
+    /// plan's Provider Contract Record) still yields discovered
+    /// sessions: the source is constructed exactly the way the server's
+    /// wiring seam constructs it (`AntigravitySource::new(
+    /// antigravity_home(home))`), so the snap fallback inside the
+    /// resolution is what makes the rows appear. Pre-round-7 the seam
+    /// resolved only `<home>/.gemini/antigravity-cli` and a snap-only
+    /// machine silently listed NOTHING.
+    #[test]
+    fn snap_layout_store_is_discovered_through_the_home_seam() {
+        let home = unique_temp_dir("snap-seam");
+        let snap_store = home
+            .join("snap")
+            .join("antigravity-cli")
+            .join("common")
+            .join(".gemini")
+            .join("antigravity-cli");
+        let transcript = write_transcript(
+            &snap_store,
+            FRESH_CONV,
+            &fixture_content("fresh.sanitized.jsonl"),
+        );
+        // The wiring seam's exact composition — the resolution decides
+        // the root, the source only joins `brain`.
+        let resolved = crate::provider_layout::antigravity_home(&home);
+        assert_eq!(
+            resolved, snap_store,
+            "the seam resolves the snap store when it is the only conversation-bearing root"
+        );
+        let source = AntigravitySource::new(resolved);
+        let items = source.scan();
+        assert_eq!(
+            items.len(),
+            1,
+            "the snap-layout store's conversation is discovered through the seam"
+        );
+        assert_eq!(
+            items[0].session_id, FRESH_CONV,
+            "the snap store's own conversation id is the row's identity"
+        );
+        assert_eq!(items[0].source_file.as_deref(), Some(transcript.as_path()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Both candidate roots absent → the seam resolves the DEFAULT root
+    /// (where a non-snap CLI writes) and discovery is an HONEST empty —
+    /// and the resolved root is announced/logged (the absence warn is
+    /// pinned in `provider_layout::antigravity_home_tests`).
+    #[test]
+    fn both_roots_absent_resolves_the_default_root_and_discovers_an_honest_empty() {
+        let home = unique_temp_dir("both-absent-seam");
+        let resolved = crate::provider_layout::antigravity_home(&home);
+        assert_eq!(
+            resolved,
+            home.join(".gemini").join("antigravity-cli"),
+            "both roots absent resolves the default path"
+        );
+        let source = AntigravitySource::new(resolved);
+        assert!(
+            source
+                .discover_checked()
+                .expect("a missing antigravity home is a genuine empty")
+                .is_empty(),
+            "an absent store is an honest empty, never an error"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // ── SessionIndex integration: prune, truncated tail, honest drop ──
 
     #[tokio::test]

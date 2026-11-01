@@ -389,19 +389,189 @@ impl ProviderLayout for AntigravityLayout {
     }
 }
 
-/// Antigravity home resolution — ONE resolution shared by every wiring seam
-/// (the `AntigravitySource::new` home, the `WatchedProvider` home, and the
-/// existence `provider_roots`): `FRESHELL_ANTIGRAVITY_HOME` (used as-is —
-/// the `amplifier_home` precedent, amplifier.rs:57) else
-/// `<home>/.gemini/antigravity-cli`. NEVER bare `~/.gemini`: that subtree is
-/// shared with the maintained Gemini CLI's config, and watching/indexing it
-/// would flood provider-dirty marks with unrelated config churn. Applied
-/// ONLY at wiring seams — never inside [`AntigravityLayout`].
-pub fn antigravity_home(home: &Path) -> PathBuf {
-    match std::env::var("FRESHELL_ANTIGRAVITY_HOME") {
-        Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => home.join(".gemini").join("antigravity-cli"),
+/// How [`resolve_antigravity_home`] chose the root — the structured
+/// announcement's `source` field (round 7, Major 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntigravityRootSource {
+    /// `FRESHELL_ANTIGRAVITY_HOME`, used as-is (never probed).
+    EnvOverride,
+    /// `<home>/.gemini/antigravity-cli` — the raw binary's store.
+    DefaultRoot,
+    /// `<home>/snap/antigravity-cli/common/.gemini/antigravity-cli` —
+    /// the snap install's store (snap confinement pins the CLI's HOME
+    /// to `~/snap/antigravity-cli/common`, so the CLI writes its usual
+    /// relative store under it).
+    SnapFallback,
+}
+
+impl AntigravityRootSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "env_override",
+            Self::DefaultRoot => "default",
+            Self::SnapFallback => "snap_fallback",
+        }
     }
+}
+
+/// The full resolution decision: the resolved home, how it was chosen,
+/// and whether ANY candidate root existed on disk (the absence log's
+/// predicate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntigravityHomeResolution {
+    pub home: PathBuf,
+    pub source: AntigravityRootSource,
+    /// Whether the default or the snap root existed on disk at all (an
+    /// env override is treated as present: it is never probed).
+    pub any_root_present: bool,
+}
+
+/// Antigravity home resolution — ONE resolution shared by every wiring
+/// seam (the `AntigravitySource::new` home, the `WatchedProvider` home,
+/// the ws association's locator root, and the existence
+/// `provider_roots`):
+///
+/// 1. `FRESHELL_ANTIGRAVITY_HOME` (used as-is — the `amplifier_home`
+///    precedent, amplifier.rs:57);
+/// 2. else `<home>/.gemini/antigravity-cli` — the raw binary's store
+///    (NEVER bare `~/.gemini`: that subtree is shared with the
+///    maintained Gemini CLI's config, and watching/indexing it would
+///    flood provider-dirty marks with unrelated config churn) — chosen
+///    when it is the materially-present store, i.e. its `brain/` holds
+///    at least one conversation;
+/// 3. else the SNAP install's store (round 7, Major 2 — the probed
+///    layout, receipts in the plan's Provider Contract Record): snap
+///    confinement pins the CLI's `HOME` to
+///    `~/snap/antigravity-cli/common`, so a snap-installed `agy` writes
+///    the SAME relative store under it —
+///    `<home>/snap/antigravity-cli/common/.gemini/antigravity-cli` —
+///    chosen when the default root is ABSENT or conversation-less and
+///    the snap root holds at least one conversation;
+/// 4. else the DEFAULT root (honest empty: the place a non-snap CLI
+///    writes; discovery/locator/watcher all point where the next
+///    conversation will land).
+///
+/// A conversation-less but existing default does NOT shadow a
+/// conversation-bearing snap root: a raw-binary run creates the default
+/// subtree without ever starting a conversation, which must not hide the
+/// user's real snap store (the observed dev-machine shape:
+/// `~/.gemini/antigravity-cli` exists with an EMPTY `brain/` while every
+/// real conversation lives under the snap root). Resolution is decided
+/// from disk truth at each call; only the CHOSEN root is watched/indexed
+/// (a machine whose two roots BOTH hold conversations follows the
+/// default — recorded in the README and the plan's Known limitations).
+///
+/// Global Constraint 7: the chosen root is announced once per process
+/// per resolved path (`antigravity_store_root_resolved`, naming the root
+/// and its source), and a machine where NEITHER root exists logs the
+/// absence loudly (`antigravity_store_root_missing`) — on such a host
+/// every history/locator/existence feature is a silent no-op without
+/// that line.
+///
+/// Applied ONLY at wiring seams — never inside [`AntigravityLayout`].
+pub fn antigravity_home(home: &Path) -> PathBuf {
+    let resolution = resolve_antigravity_home(home);
+    announce_antigravity_root(home, &resolution);
+    resolution.home
+}
+
+/// The pure resolution (no logging) — the decision core the tests pin.
+pub fn resolve_antigravity_home(home: &Path) -> AntigravityHomeResolution {
+    if let Ok(v) = std::env::var("FRESHELL_ANTIGRAVITY_HOME") {
+        if !v.is_empty() {
+            return AntigravityHomeResolution {
+                home: PathBuf::from(v),
+                source: AntigravityRootSource::EnvOverride,
+                any_root_present: true,
+            };
+        }
+    }
+    let default_root = home.join(".gemini").join("antigravity-cli");
+    let snap_root = snap_antigravity_root(home);
+    if root_holds_conversations(&default_root) {
+        return AntigravityHomeResolution {
+            home: default_root,
+            source: AntigravityRootSource::DefaultRoot,
+            any_root_present: true,
+        };
+    }
+    if root_holds_conversations(&snap_root) {
+        return AntigravityHomeResolution {
+            home: snap_root,
+            source: AntigravityRootSource::SnapFallback,
+            any_root_present: true,
+        };
+    }
+    AntigravityHomeResolution {
+        any_root_present: default_root.exists() || snap_root.exists(),
+        home: default_root,
+        source: AntigravityRootSource::DefaultRoot,
+    }
+}
+
+/// The snap install's store root under `home`: the snap pins the CLI's
+/// HOME to `<home>/snap/antigravity-cli/common`, and the CLI writes its
+/// usual `.gemini/antigravity-cli` store under that HOME (probed
+/// read-only on the real snap install, 2026-11-01 — see the Provider
+/// Contract Record).
+fn snap_antigravity_root(home: &Path) -> PathBuf {
+    home.join("snap")
+        .join("antigravity-cli")
+        .join("common")
+        .join(".gemini")
+        .join("antigravity-cli")
+}
+
+/// Whether `root` is the materially-present store: its `brain/` holds
+/// at least one readable entry (a conversation directory). A root that
+/// exists without conversations is indistinguishable from a never-used
+/// subtree and does not shadow the other candidate.
+fn root_holds_conversations(root: &Path) -> bool {
+    std::fs::read_dir(root.join("brain"))
+        .map(|mut entries| entries.next().is_some_and(|entry| entry.is_ok()))
+        .unwrap_or(false)
+}
+
+/// The once-per-resolved-path announcement lane: every wiring seam calls
+/// [`antigravity_home`] at boot, so the lines are deduped per resolved
+/// root — one announcement per distinct root per process, never one per
+/// seam (bounded: the set holds one path per distinct resolution).
+static ANNOUNCED_ANTIGRAVITY_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn announce_antigravity_root(home: &Path, resolution: &AntigravityHomeResolution) {
+    let announced = ANNOUNCED_ANTIGRAVITY_ROOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let Ok(mut announced) = announced.lock() else {
+        return;
+    };
+    if announced.contains(&resolution.home) {
+        return; // this root was already announced this process
+    }
+    announced.push(resolution.home.clone());
+    drop(announced);
+    if !resolution.any_root_present {
+        tracing::warn!(
+            target: "freshell_sessions::provider_layout",
+            event = "antigravity_store_root_missing",
+            root = %resolution.home.display(),
+            source = resolution.source.as_str(),
+            default_root = %home.join(".gemini").join("antigravity-cli").display(),
+            snap_root = %snap_antigravity_root(home).display(),
+            "antigravity_store_root_missing: no antigravity store root exists \
+             (neither the default nor the snap install's); history, search, \
+             identity, and activity will all be empty until the CLI creates \
+             its store — set FRESHELL_ANTIGRAVITY_HOME to point at a \
+             nonstandard store root"
+        );
+    }
+    tracing::info!(
+        target: "freshell_sessions::provider_layout",
+        event = "antigravity_store_root_resolved",
+        root = %resolution.home.display(),
+        source = resolution.source.as_str(),
+        "antigravity_store_root_resolved: the antigravity store root every \
+         seam (history source, watcher, locator, existence) reads"
+    );
 }
 
 /// All five provider layouts. Convenience for callers that need to iterate
@@ -829,6 +999,14 @@ mod tests {
             std::env::set_var(name, value);
             Self { name, saved }
         }
+
+        /// Round 7, Major 2: the snap-fallback tests need the var UNSET
+        /// (default/snap resolution) with the same panic-safe restore.
+        fn unset(name: &'static str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, saved }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -840,3 +1018,13 @@ mod tests {
         }
     }
 }
+
+// Round 7, Major 2 (whole-delta review): the antigravity home-resolution
+// tests live in a `#[path]`-included sibling child (the
+// `codex_locator_tests_warn.rs` convention) — this file sits against the
+// 1K-line cap. The include sits at the TOP level (the codex precedent):
+// inside the inline `mod tests`, a `#[path]` child would resolve against
+// the nonexistent `src/provider_layout/tests/` base.
+#[cfg(test)]
+#[path = "provider_layout_antigravity_home_tests.rs"]
+mod antigravity_home_tests;
