@@ -86,7 +86,11 @@ pub struct FreshAgentProfile {
 
 impl FreshAgentProfile {
     pub fn effective_permission_mode(&self) -> Option<&str> {
-        self.permission_mode.as_deref().or_else(|| {
+        let permission_mode = self
+            .permission_mode
+            .as_deref()
+            .filter(|permission| self.provider != FreshProvider::Codex || *permission != "default");
+        permission_mode.or_else(|| {
             if self.provider != FreshProvider::Codex {
                 return None;
             }
