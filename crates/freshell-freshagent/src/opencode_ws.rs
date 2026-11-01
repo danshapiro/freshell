@@ -69,6 +69,7 @@ use freshell_codex::next_monotonic_turn_complete_at;
 // unified turn-end attention edge — emitted for ANY turn end except a
 // user-initiated interrupt, deliberately diverging from the legacy
 // status-guarded positive-completion chime of adapter.ts:377-381).
+use freshell_opencode::serve::IdleWait;
 use freshell_opencode::{
     normalize_opencode_effort, normalize_opencode_model, ChangedReason, DaemonSignal,
     OpencodeServeManager, SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
@@ -89,8 +90,9 @@ use crate::{
 const SESSION_TYPE: &str = "freshopencode";
 /// The runtime provider (`AGENT_SESSION_TYPES.opencode.provider`).
 const PROVIDER: &str = "opencode";
-/// `DEFAULT_TURN_TIMEOUT_MS` (`adapter.ts:35`).
-const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_millis(600_000);
+/// A native busy/retry observation renews this quiet window. It is not a
+/// maximum turn duration: a long-running tool remains busy until native idle.
+const TURN_QUIET_TIMEOUT: Duration = Duration::from_secs(600);
 /// OpenCode may publish a prompt response before `/session/:id/message` reflects it.
 /// Keep reconciliation to one initial read plus three short retries.
 const CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS: usize = 4;
@@ -3157,7 +3159,7 @@ impl FreshOpencodeState {
                             model.as_deref(),
                             effort.as_deref(),
                             Some(&identity.native_message_id),
-                            DEFAULT_TURN_TIMEOUT,
+                            IdleWait::WhileActive(TURN_QUIET_TIMEOUT),
                             route.clone(),
                             Some(daemon_turn_accepted.clone()),
                             Some(dispatch_witness),
@@ -3170,7 +3172,7 @@ impl FreshOpencodeState {
                             &text,
                             model.as_deref(),
                             effort.as_deref(),
-                            DEFAULT_TURN_TIMEOUT,
+                            IdleWait::WhileActive(TURN_QUIET_TIMEOUT),
                             route.clone(),
                             Some(daemon_turn_accepted.clone()),
                             Some(dispatch_witness),
@@ -5817,7 +5819,12 @@ impl FreshOpencodeState {
                     // nothing more to persist. Settle waits on idle.
                     undo_guard.disarm();
                     manager
-                        .await_idle(&compact_id, rx, DEFAULT_TURN_TIMEOUT, route)
+                        .await_idle(
+                            &compact_id,
+                            rx,
+                            IdleWait::WhileActive(TURN_QUIET_TIMEOUT),
+                            route,
+                        )
                         .await
                 }
                 Err(err) => {
@@ -17161,6 +17168,114 @@ mod tests {
             .expect("healthy fake serve starts");
         fresh_agent.set_manager_for_test(manager).await;
         (FreshOpencodeState::new(fresh_agent), rx)
+    }
+
+    async fn assert_long_running_turn_waits_for_native_idle(compact: bool) {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(128);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(0));
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig {
+                idle_poll_interval: Duration::from_secs(1),
+                ..ServeConfig::default()
+            },
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        insert_compact_session(&st, "ses_1", Some("provider/model")).await;
+        drain_frames(&mut rx);
+
+        if compact {
+            st.handle_compact(compact_msg("ses_1")).await;
+        } else {
+            st.handle_send(send_msg("ses_1", "run the long command"))
+                .await;
+        }
+        // Let the detached production drive dispatch and observe native busy.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(http.status_polls.load(Ordering::SeqCst) > 0);
+        drain_frames(&mut rx);
+
+        for _ in 0..601 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let premature = drain_frames(&mut rx);
+        assert!(
+            !premature.iter().any(|f| {
+                f["event"]["type"] == "freshAgent.turn.complete"
+                    || (f["event"]["type"] == "freshAgent.session.snapshot"
+                        && f["event"]["status"] == "idle")
+            }),
+            "a native busy turn must not report idle or completion after ten minutes: {premature:?}"
+        );
+        let session = st.sessions.lock().await.get("ses_1").unwrap().clone();
+        assert!(
+            !session
+                .lock()
+                .await
+                .turn_task
+                .as_ref()
+                .unwrap()
+                .is_finished(),
+            "the native turn observer must remain registered and interruptible"
+        );
+
+        // No SSE completion is injected: the real status-poll fallback must settle it.
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let settled = drain_frames(&mut rx);
+        assert!(settled.iter().any(|f| {
+            f["event"]["type"] == "freshAgent.session.snapshot" && f["event"]["status"] == "idle"
+        }));
+        assert_eq!(
+            settled
+                .iter()
+                .filter(|f| f["event"]["type"] == "freshAgent.turn.complete")
+                .count(),
+            1,
+            "the actual native completion must ring exactly once: {settled:?}"
+        );
+        tokio::time::advance(Duration::from_secs(601)).await;
+        tokio::task::yield_now().await;
+        assert!(!drain_frames(&mut rx)
+            .iter()
+            .any(|f| f["event"]["type"] == "freshAgent.turn.complete"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_running_send_does_not_complete_at_the_old_turn_deadline() {
+        assert_long_running_turn_waits_for_native_idle(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_running_compact_does_not_complete_at_the_old_turn_deadline() {
+        assert_long_running_turn_waits_for_native_idle(true).await;
     }
 
     #[tokio::test]

@@ -509,13 +509,13 @@ test.describe('Fresh Agent', () => {
     const paneRoot = page.locator('[data-context="fresh-agent"]')
     await expect(paneRoot).toBeVisible({ timeout: 10_000 })
 
-    // Model chip: effective model display name on the button, raw id + effort
-    // on the hover tooltip, dialog affordance in the accessible name.
-    const chip = paneRoot.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    // Model chip: effective model display name and thinking level on the
+    // button, raw id + effort on the hover tooltip.
+    const chip = paneRoot.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' })
     await expect(chip).toBeVisible()
     await expect(chip).toHaveAttribute('title', 'opus[1m] · effort high')
     // Desktop (>520px pane) shows the long label form.
-    await expect(paneRoot.getByText('Claude Opus 5 (1M context)', { exact: true })).toBeVisible()
+    await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeVisible()
 
     // Unknown context state: muted lug, never a fake 0% meter.
     await expect(paneRoot.getByText('context —', { exact: true })).toBeVisible()
@@ -574,7 +574,7 @@ test.describe('Fresh Agent', () => {
     await stubFreshclaudeThread(page, '63333000-0000-4333-8333-000000000003')
     await installFreshclaudeStripPane(page, '63333000-0000-4333-8333-000000000003')
 
-    const chip = page.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    const chip = page.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) high — change model' })
     await expect(chip).toBeVisible({ timeout: 10_000 })
     await chip.click()
     await expect(page.getByRole('dialog', { name: 'Model and thinking level' })).toBeVisible({ timeout: 10_000 })
