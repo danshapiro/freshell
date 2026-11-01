@@ -1,3 +1,4 @@
+import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Tab Management', () => {
@@ -15,21 +16,18 @@ test.describe('Tab Management', () => {
     return null
   }
 
-  async function selectShellForActiveTab(page: any): Promise<void> {
-    const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-    for (const name of shellNames) {
-      try {
-        const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-        if (await button.isVisible().catch(() => false)) {
-          await button.click({ timeout: 5000 })
-          await page.locator('.xterm').last().waitFor({ state: 'visible', timeout: 30_000 })
-          return
-        }
-      } catch {
-        continue
-      }
+  async function selectShellForActiveTab(page: Page): Promise<void> {
+    const tabId = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState().tabs.activeTabId)
+    if (!tabId) throw new Error('No active tab to select a shell for')
+    const content = page.locator(`[data-tab-content-id="${tabId}"]`)
+    const terminal = content.locator('.xterm')
+    const picker = content.getByRole('toolbar', { name: /pane type picker/i })
+    await expect.poll(async () => await terminal.isVisible() || await picker.isVisible()).toBe(true)
+    if (!await terminal.isVisible()) {
+      await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+        .first().press('Enter', { timeout: 5_000 })
     }
-    throw new Error('No shell option available for the active tab')
+    await expect(terminal).toBeVisible({ timeout: 30_000 })
   }
 
   test('starts with one tab', async ({ freshellPage, harness }) => {
@@ -216,7 +214,7 @@ test.describe('Tab Management', () => {
     expect(tabIdsAfter).not.toEqual(tabIdsBefore)
   })
 
-  test('Ctrl+Shift+brackets follow reordered tab order from a focused terminal', async ({ freshellPage, page, harness, terminal }) => {
+  test('Ctrl+Shift+brackets follow reordered tab order from a focused terminal', async ({ freshellPage, page, harness }) => {
     const addButton = page.locator('[data-context="tab-add"]')
     await addButton.click()
     await selectShellForActiveTab(page)
@@ -251,21 +249,23 @@ test.describe('Tab Management', () => {
     const orderedIds = reordered.tabs.tabs.map((tab: { id: string }) => tab.id)
     const startingActiveId = reordered.tabs.activeTabId as string
     const startingIndex = orderedIds.indexOf(startingActiveId)
-    const expectedPrevIndex = (startingIndex - 1 + orderedIds.length) % orderedIds.length
     const expectedPrevId = orderedIds[(startingIndex - 1 + orderedIds.length) % orderedIds.length]
     const expectedNextId = orderedIds[(startingIndex + 1) % orderedIds.length]
 
-    await terminal.waitForTerminal(startingIndex)
-    await terminal.getTerminalContainer(startingIndex).click()
-    await expect(terminal.getTerminalInput(startingIndex)).toBeFocused()
+    const focusTerminal = async (tabId: string) => {
+      const content = page.locator(`[data-tab-content-id="${tabId}"]`)
+      await content.locator('.xterm').click()
+      await expect(content.locator('.xterm-helper-textarea')).toBeFocused()
+    }
+    await focusTerminal(startingActiveId)
     await page.keyboard.press('Control+Shift+[')
     await expect.poll(() => harness.getActiveTabId()).toBe(expectedPrevId)
 
-    await terminal.getTerminalContainer(expectedPrevIndex).click()
+    await focusTerminal(expectedPrevId)
     await page.keyboard.press('Control+Shift+]')
     await expect.poll(() => harness.getActiveTabId()).toBe(startingActiveId)
 
-    await terminal.getTerminalContainer(startingIndex).click()
+    await focusTerminal(startingActiveId)
     await page.keyboard.press('Control+Shift+]')
     await expect.poll(() => harness.getActiveTabId()).toBe(expectedNextId)
 
