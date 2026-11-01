@@ -4781,7 +4781,6 @@ export function FreshAgentView({
       setNoticeExpanded(false)
       return
     }
-    if (notice.level === 'info') setNoticeExpanded(false)
     if (noticeExpanded || notice.text === deliveryNoticeRef.current) return
     const timer = window.setTimeout(() => setNotice(null), 6000)
     return () => window.clearTimeout(timer)
@@ -5122,13 +5121,14 @@ export function FreshAgentView({
       : 'Refreshing conversation'
     const WatermarkIcon = descriptor?.icon
     const handlePaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
-      if (event.target instanceof Element && event.target.closest('.fresh-agent-diff-drawer-overlay, .fresh-agent-diff-trigger')) return
+      if (event.target instanceof Element && event.target.closest('.fresh-agent-diff-drawer-overlay')) return
       if (event.defaultPrevented) return
       if (isTranscriptNavigationKey(event) && !isInteractiveTarget(event.target)) {
         scrollTranscriptByKey(event, transcriptRef.current)
         return
       }
-      if (isEditableTarget(event.target) || (event.target instanceof Element && event.target.closest('.fresh-agent-top-stack') && isInteractiveTarget(event.target))) return
+      if (isEditableTarget(event.target)) return
+      if ((event.key === ' ' || event.key === 'Enter') && event.target instanceof Element && event.target.closest('.fresh-agent-top-stack') && isInteractiveTarget(event.target)) return
       if (!isPlainTextKey(event)) return
       event.preventDefault()
       composerRef.current?.appendText(event.key)
@@ -5164,7 +5164,7 @@ export function FreshAgentView({
     const routineNotices = [
       ...(isRestoring ? [{ id: 'restoring', text: 'Restoring session...' }] : []),
       ...(paneContent.reconcileNotice ? [{ id: 'reconciliation', text: paneContent.reconcileNotice, prominent: true }] : []),
-      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text }] : []),
+      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text, onToggle: setNoticeExpanded }] : []),
       ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
     const verboseNotice = notice && (notice.text.length > 240 || notice.text.split('\n').length > 3)

@@ -14,13 +14,20 @@ it('groups routine notices and preserves recovery behind an error summary', asyn
  await user.click(screen.getByText('Conversation could not load'))
  expect(button).toBeVisible(); await user.click(button); expect(retry).toHaveBeenCalledOnce()
 })
-it('keeps reconciliation and owner transition visible in the compact status row', () => {
+it('keeps reconciliation and owner transition visible with nonempty expandable details', async () => {
+ const user = userEvent.setup()
  render(<FreshAgentNoticeStack notices={[{id:'reconciliation',text:'Session corrected',prominent:true},{id:'transition',text:'Reopening elsewhere',prominent:true}]} errors={[]} />)
- expect(screen.getByText('Session corrected')).toBeVisible()
- expect(screen.getByText('Reopening elsewhere')).toBeVisible()
- expect(screen.getByRole('status',{name:'Agent notices'})).toHaveTextContent('2 notices')
- expect(screen.queryByText('Notice details')).not.toBeInTheDocument()
- expect(screen.getByRole('status',{name:'Agent notices'}).querySelector('details')).toBeNull()
+ const status = screen.getByRole('status',{name:'Agent notices'})
+ const summary = status.querySelector('summary')!
+ expect(summary).toHaveTextContent('Session corrected')
+ expect(summary).toHaveTextContent('Reopening elsewhere')
+ expect(summary).toBeVisible()
+ expect(status).toHaveTextContent('2 notices')
+ await user.click(summary)
+ const body = status.querySelector('.fresh-agent-diagnostic-body')!
+ expect(body).toBeVisible()
+ expect(body).toHaveTextContent('Session corrected')
+ expect(body).toHaveTextContent('Reopening elsewhere')
 })
 
 it('expands prominent-only status to real readable content', async () => {
@@ -43,7 +50,16 @@ it('names warning disclosures with the message while announcing warning severity
  render(<FreshAgentNoticeStack notices={[]} errors={[{id:'notice',summary,level:'warning',content:<p>Provider diagnostics</p>}]} />)
  const alert = screen.getByRole('alert',{name:'Agent warning'})
  expect(alert.closest('summary')).toHaveAccessibleName(summary)
- expect(screen.getByRole('region',{name:'Agent errors'})).toHaveTextContent('1 warning')
+ expect(screen.getByLabelText('1 warning')).toBeVisible()
+ expect(screen.getByLabelText('1 warning')).toHaveTextContent('1')
+})
+
+it('shows the total diagnostic count with its exact severity breakdown', () => {
+ render(<FreshAgentNoticeStack notices={[]} errors={[{id:'first',summary:'First error',content:null},{id:'second',summary:'Second warning',content:null,level:'warning'}]} />)
+ const count = screen.getByLabelText('1 error, 1 warning')
+ expect(count).toBeVisible()
+ expect(count).toHaveTextContent('2')
+ expect(screen.getByRole('region',{name:'Agent errors'})).toContainElement(count)
 })
 
 it('lets short warnings expand so wrapped instructions are reachable', async () => {

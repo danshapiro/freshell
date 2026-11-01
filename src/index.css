@@ -1605,8 +1605,11 @@ body {
 .fresh-agent-top-stack-scroll > * + * { margin-top: .25rem; }
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-top-stack-content > .fresh-agent-diff-panel { flex: 0 0 auto; }
 .fresh-agent-top-stack-content > .fresh-agent-diff-panel { padding: 0; }
-.fresh-agent-errors { min-height: 0; overflow: auto; flex: 0 1 auto; }
-.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors > details > summary { font-size: .75rem; }
+.fresh-agent-errors { display: flex; align-items: start; gap: .375rem; min-height: 0; overflow: auto; flex: 0 1 auto; }
+.fresh-agent-diagnostic-count { flex: 0 0 auto; line-height: 1.2; }
+.fresh-agent-error-summaries { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; }
+.fresh-agent-errors:has(details[open]) { display: block; }
+.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors summary { font-size: .75rem; }
 .fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; }
 .fresh-agent-top-stack summary:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
 .fresh-agent-diagnostic-body, .fresh-agent-approval-preview, .fresh-agent-plan-body {
@@ -1622,9 +1625,6 @@ body {
 @container (min-width: 900px) {
   .fresh-agent-sidebar { max-height: none; }
   .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(35cqh, max(0px, calc(100cqh - 240px))); }
-}
-@container (max-height: 319px) {
-  .fresh-agent-top-stack { overflow: auto; }
 }
 
 /* Short and wide panes share a concise header row so request answers fit. */
@@ -1644,7 +1644,6 @@ body {
   .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
-  .fresh-agent-top-stack .fresh-agent-errors > span { display: none; }
   .fresh-agent-top-stack .fresh-agent-notices summary,
   .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
 }
@@ -1678,7 +1677,6 @@ body {
   .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
-  .fresh-agent-top-stack .fresh-agent-errors > span { display: none; }
   .fresh-agent-top-stack .fresh-agent-notices summary,
   .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
 }
@@ -1717,4 +1715,16 @@ body {
   white-space: normal;
 }
 .fresh-agent-notice-summary { margin-left: .5rem; }
-.fresh-agent-notices > div { white-space: nowrap; }
+
+/* Below a 320px bordered pane the request, transcript and composer floors
+   cannot fit together. Keep a usable stack, and scroll the existing layout
+   to reach the conversation and composer instead of collapsing requests. */
+@container (max-height: 317px) {
+  .fresh-agent-layout { overflow: auto; }
+  .fresh-agent-main { min-height: 320px; flex-shrink: 0; }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors, .fresh-agent-diff-trigger) {
+    min-height: 68px;
+    max-height: 78px;
+    flex-shrink: 0;
+  }
+}

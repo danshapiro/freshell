@@ -48,6 +48,11 @@ function isVerbose(text: string) {
   return text.length > 240 || text.split('\n').length > 3
 }
 
+function formatInputPreview(input: Record<string, unknown>) {
+  const compact = JSON.stringify(input)
+  return isVerbose(compact) ? JSON.stringify(input, null, 2) : compact
+}
+
 function Preview({ text, children, command, toolName }: { text: string; children: ReactNode; command?: boolean; toolName?: string }) {
   if (!isVerbose(text)) return children
   return <>
@@ -73,8 +78,7 @@ function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprova
     ...(native.additionalPermissions ? { additionalPermissions: native.additionalPermissions } : {}),
     ...(native.grantRoot ? { path: native.grantRoot } : {}),
   }
-  const compactDetails = JSON.stringify(details)
-  const detailsText = isVerbose(compactDetails) ? JSON.stringify(details, null, 2) : compactDetails
+  const detailsText = formatInputPreview(details)
   return (
     <div role="alert" aria-label={`Permission request for ${approval.toolName ?? 'Tool'}`} className="fresh-agent-approval-card rounded-md border border-amber-500/50 p-3 space-y-2">
       <p className="font-medium">{native.kind === 'writeStdin' ? 'Write to a running command' : approval.toolName}</p>
@@ -113,6 +117,8 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
     && typeof input.new_string === 'string'
     ? { oldStr: input.old_string, newStr: input.new_string, filePath: typeof input.file_path === 'string' ? input.file_path : undefined }
     : null
+  const requestPath = approval.blockedPath ?? (typeof input.file_path === 'string' ? input.file_path : undefined)
+  const inputText = formatInputPreview(input)
   const remember = suggestions.length > 0 ? rememberLabel(suggestions) : null
 
   const suggestionsList = (
@@ -138,8 +144,8 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
           approval
         </span>
         <span className="fresh-agent-approval-tool">{toolName}</span>
-        {approval.blockedPath ? (
-          <span className="fresh-agent-approval-path truncate font-mono text-xs text-muted-foreground">{approval.blockedPath}</span>
+        {requestPath ? (
+          <span className="fresh-agent-approval-path truncate font-mono text-xs text-muted-foreground">{requestPath}</span>
         ) : null}
       </div>
       {approval.decisionReason ? (
@@ -155,8 +161,8 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
           <DiffView oldStr={editDiff.oldStr} newStr={editDiff.newStr} filePath={editDiff.filePath} />
         </div></Preview>
       ) : Object.keys(input).length > 0 ? (
-        <Preview text={JSON.stringify(input, null, 2)}><pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
-          {JSON.stringify(input, null, 2)}
+        <Preview text={inputText}><pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
+          {inputText}
         </pre></Preview>
       ) : null}
 

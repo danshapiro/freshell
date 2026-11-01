@@ -233,8 +233,8 @@ function ScopedDiffPanel({ diffs, cwd, onComment, paneRoot, hidden }: DiffPanelP
   const [open, setOpen] = useState(false)
   const [fallbackRoot, setFallbackRoot] = useState<HTMLElement | null>(null)
   useEffect(() => {
-    if (hidden) setOpen(false)
-  }, [hidden])
+    if (hidden || diffs.length === 0) setOpen(false)
+  }, [hidden, diffs.length])
   if (diffs.length === 0) return null
   const count = changedFileCount(diffs)
   const countLabel = count === null ? 'file count unavailable' : `${count} changed file${count === 1 ? '' : 's'}`

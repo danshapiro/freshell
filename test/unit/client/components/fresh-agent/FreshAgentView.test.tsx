@@ -17613,7 +17613,7 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     }))))
 
     const card = await screen.findByRole('status', { name: 'Agent notices' })
-    expect(within(card).getByText(/being reopened/i)).toBeVisible()
+    expect(within(card.querySelector('summary')!).getByText(/being reopened/i)).toBeVisible()
     expect(within(card).queryByRole('button')).toBeNull()
     // Not the cross-kind divergence card, not the fenced recovery card.
     expect(document.querySelector('[data-agent-error="handoff"]')).toBeNull()

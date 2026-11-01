@@ -226,7 +226,7 @@ async function saveScreenshot(page: Page, path: string): Promise<void> {
   const bytes = await page.screenshot({ path })
   // Cloud Run has no persistent filesystem artifact export. Retain these four
   // review images in chunked structured stdout as well as test-results.
-  if (!['compact-freshclaude-desktop', 'compact-serif-light-split', 'compact-mono-light-narrow', 'compact-phone-dark', 'compact-geometry-failure'].some(name => path.includes(name))) return
+  if (!['compact-freshclaude-desktop', 'compact-serif-light-split', 'compact-mono-light-narrow', 'compact-phone-dark', 'compact-tiny', 'compact-geometry-failure'].some(name => path.includes(name))) return
   const base64 = bytes.toString('base64')
   for (let offset = 0; offset < base64.length; offset += 12000) console.log(JSON.stringify({ event: 'compact_panel_screenshot', severity: 'INFO', path, offset, data: base64.slice(offset, offset + 12000) }))
 }
@@ -444,6 +444,7 @@ for (const height of [200, 120]) test(`nested ${height}px panes retain requests 
   console.log(JSON.stringify({event:'tiny_compact_geometry',severity:'INFO',height,...initial}))
   expect(initial.visible).toBe(true)
   expect(initial.stackHeight).toBeGreaterThanOrEqual(64)
+  await saveScreenshot(page, `test-results/compact-tiny-${height}px.png`)
   await hitAndClick(stack.getByRole('button', { name: 'Yes', exact: true }))
   await hitAndClick(stack.getByRole('button', { name: 'Allow tool use', exact: true }))
   const name = stack.getByRole('textbox', {name:'Name'})
@@ -479,16 +480,21 @@ test('compact header advertises multiple diagnostics and expands long prominent 
   await terminal.waitForTerminal()
   await seedCompactPane(page, { sessionType:'freshclaude',provider:'claude',style:'sans',theme:'light' })
   const text = 'Session identity corrected by server — this pane now points at its live session.'
-  await page.evaluate(text => {
+  await page.evaluate(() => {
     const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
-    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:text,closeError:'Second actionable diagnostic'}}})
-  },text)
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:undefined,closeError:'Second actionable diagnostic'}}})
+  })
   for (const size of [{width:1100,height:700},{width:560,height:320},{width:390,height:700}]) {
     await fitRoot(page,{width:size.width})
     await fitRoot(page,{height:size.height})
     const errors=page.getByRole('region',{name:'Agent errors'})
-    const count=errors.getByText('2 errors',{exact:true})
+    const count=errors.getByLabel('2 errors',{exact:true})
+    await expect(count).toHaveText('2')
     expect(await count.evaluate(el=>{const b=el.getBoundingClientRect();const hit=document.elementFromPoint(b.x+b.width/2,b.y+b.height/2);return b.width>0&&b.height>0&&(hit===el||el.contains(hit))})).toBe(true)
+    await page.evaluate(text => {
+      const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+      h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:text}}})
+    },text)
     const notices=page.getByRole('status',{name:'Agent notices'})
     const summary=notices.locator('summary')
     await hitAndClick(summary)
@@ -498,6 +504,11 @@ test('compact header advertises multiple diagnostics and expands long prominent 
     expect(await body.evaluate(el=>el.scrollWidth<=el.clientWidth+1)).toBe(true)
     await hitAndClick(summary)
     await assertUsefulSpace(page)
+    await page.evaluate(() => {
+      const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+      h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:undefined}}})
+    })
+    await expect(notices).toHaveCount(0)
   }
 })
 

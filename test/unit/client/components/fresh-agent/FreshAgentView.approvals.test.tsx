@@ -407,6 +407,7 @@ it('funnels letters from top-stack controls while leaving Space and Enter for ac
   serve(CLAUDE, [{ requestId: 'command', toolName: 'Bash', input: { command: 'echo '.repeat(500) } }])
   await mount(createStore(CLAUDE))
   const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+  fireEvent.change(composer, { target: { value: 'Draft' } })
   for (const control of [screen.getByText('Command details'), screen.getByRole('button', { name: 'Allow tool use' })]) {
     control.focus()
     for (const key of [' ', 'Enter']) {
@@ -416,9 +417,10 @@ it('funnels letters from top-stack controls while leaving Space and Enter for ac
       expect(control).toHaveFocus()
     }
     fireEvent.keyDown(control, { key: 'x' })
+    await advance(20) // appendText focuses on the next animation frame.
     expect(composer).toHaveFocus()
   }
-  expect(composer).toHaveValue('xx')
+  expect(composer).toHaveValue('Draftxx')
   expect(responds()).toEqual([])
 })
 

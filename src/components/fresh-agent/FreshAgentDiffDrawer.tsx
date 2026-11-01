@@ -52,10 +52,15 @@ export function FreshAgentDiffDrawer({ children, onClose, paneRoot }: {
         onCloseRef.current()
       } else if (event.key === 'Tab') {
         const controls = Array.from(wrapper.querySelectorAll<HTMLElement>('button, input, select, textarea, a[href], [tabindex]'))
-          .filter((node) => !node.matches(':disabled, [tabindex="-1"]') && !node.closest('[hidden], [inert]') && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none')
+          .filter((node) => {
+            if (node.matches(':disabled, [tabindex="-1"]') || node.closest('[hidden], [inert]')) return false
+            const style = getComputedStyle(node)
+            return style.visibility !== 'hidden' && style.display !== 'none'
+          })
         const first = controls[0]
         const last = controls.at(-1)
-        if (event.shiftKey ? document.activeElement === first : document.activeElement === last) {
+        const active = document.activeElement
+        if (!controls.includes(active as HTMLElement) || (event.shiftKey ? active === first : active === last)) {
           event.preventDefault()
           const next = event.shiftKey ? last : first
           next?.focus()
