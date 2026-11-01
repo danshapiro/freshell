@@ -38,6 +38,11 @@ import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude, startLocalProvide
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
 
+// A fixture-only failure seam, reached after the owned processes have settled.
+const removeRoot = process.argv.includes('--fail-fixture-removal')
+  ? async () => { throw Object.assign(new Error('injected fixture removal failure'), { code: 'ENOTEMPTY' }) }
+  : undefined
+
 const TURN_TIMEOUT_MS = 45_000
 export const PLAN = '# Plan\n\n1. Edit foo.ts\n2. Run the tests'
 export const PLAN_FILE_TEXT = '# Real plan\n\n- step A\n- step B'
@@ -129,7 +134,7 @@ async function readJson(file) {
 }
 
 async function runScenario(name, spec) {
-  const fixture = await createClaudeFixture({ prefix: `freshell-claude-perm-${name}-` })
+  const fixture = await createClaudeFixture({ prefix: `freshell-claude-perm-${name}-`, removeRoot })
   const outside = path.join(fixture.root, 'outside')
   await fs.mkdir(outside, { recursive: true })
   const ctx = { cwd: fixture.cwd, outsideFile: path.join(outside, 'notes.txt'), planPath: null }
@@ -156,10 +161,9 @@ async function runScenario(name, spec) {
   let provider
   let sidecar
   let sidecarExit
-  // Resolves when the sidecar (and, after the group kill below, its whole
-  // process tree) has exited; the finally awaits it before touching the
-  // fixture so a draining native CLI cannot race fixture.cleanup().
-  let exited = Promise.resolve()
+  // The direct child's close event also joins its stdout/stderr. The shared
+  // fixture separately joins the native CLI before removing its writable home.
+  let closed = Promise.resolve()
   let failure
   let settingsLocal = null
   const written = {}
@@ -174,8 +178,10 @@ async function runScenario(name, spec) {
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     })
+    fixture.ownProcess(sidecar)
     sidecar.stdin.on('error', () => {})
-    exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
+    sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal } })
+    closed = new Promise((resolve) => sidecar.once('close', resolve))
     createInterface({ input: sidecar.stderr }).on('line', () => {})
     const send = (message) => sidecar.stdin.write(`${JSON.stringify(message)}\n`)
     const waiters = []
@@ -205,6 +211,7 @@ async function runScenario(name, spec) {
     if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
     if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
     sessionId = created.sessionId
+    await fixture.ownProcessId(created.cliPid)
     if (spec.plan) {
       send({ type: 'configure', sessionId, requestId: 'to-plan', settings: { permissionMode: 'plan' } })
       const answer = await waitFor((frame) => frame.type === 'sdk.configured' && frame.requestId === 'to-plan', 'the plan-mode configure')
@@ -226,7 +233,7 @@ async function runScenario(name, spec) {
     }
     send({ type: 'shutdown' })
     sidecar.stdin.end()
-    await Promise.race([exited, sleep(10_000)])
+    await Promise.race([closed, sleep(10_000)])
   } catch (error) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
@@ -237,7 +244,7 @@ async function runScenario(name, spec) {
       }
       sidecar.kill('SIGKILL')
     }
-    await exited
+    await closed
     if (provider) await provider.close()
     try {
       await fixture.cleanup()

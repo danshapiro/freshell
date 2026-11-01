@@ -48,33 +48,6 @@ let child: ChildProcess | undefined
 let receipt: Receipt
 let stderr = ''
 
-beforeAll(async () => {
-  child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
-    cwd: REPO_ROOT,
-    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  let stdout = ''
-  child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
-  child.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      child?.kill('SIGTERM')
-      reject(new Error(`the permission contract harness timed out; stderr=${stderr.slice(-2000)}`))
-    }, 140_000)
-    timer.unref()
-    child!.once('error', (error) => { clearTimeout(timer); reject(error) })
-    child!.once('exit', () => { clearTimeout(timer); resolve() })
-  })
-  const lines = stdout.trim().split('\n').filter(Boolean)
-  if (lines.length !== 1) throw new Error(`expected one receipt line; stdout=${stdout.slice(-1000)} stderr=${stderr.slice(-2000)}`)
-  receipt = JSON.parse(lines[0]!)
-}, 150_000)
-
-afterAll(() => {
-  if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-})
-
 const scenario = (name: string): ScenarioReceipt => {
   const recorded = receipt.scenarios[name]
   expect(recorded, `scenario ${name} ran`).toBeDefined()
@@ -89,6 +62,37 @@ const OUTSIDE_READ_RULE = { type: 'addRules', rules: [{ toolName: 'Read', ruleCo
 const ACCEPT_EDITS = { type: 'setMode', mode: 'acceptEdits', destination: 'session' }
 
 describe(`Claude permission suggestions and plan approvals over the pinned CLI ${PINNED_CLI_VERSION} and a local provider`, () => {
+  beforeAll(async () => {
+    child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+      cwd: REPO_ROOT,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
+    child.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child?.kill('SIGTERM')
+        reject(new Error(`the permission contract harness timed out; stderr=${stderr.slice(-2000)}`))
+      }, 140_000)
+      timer.unref()
+      child!.once('error', (error) => { clearTimeout(timer); reject(error) })
+      child!.once('close', () => { clearTimeout(timer); resolve() })
+    })
+    const lines = stdout.trim().split('\n').filter(Boolean)
+    if (lines.length !== 1) throw new Error(`expected one receipt line; stdout=${stdout.slice(-1000)} stderr=${stderr.slice(-2000)}`)
+    receipt = JSON.parse(lines[0]!)
+  }, 150_000)
+
+  afterAll(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = new Promise<void>((resolve) => child!.once('close', () => resolve()))
+      child.kill('SIGKILL')
+      await closed
+    }
+  })
+
   it('runs every scenario on the pinned SDK and CLI, and each sidecar then exits cleanly', () => {
     expect(receipt).toMatchObject({ sdkVersion: PINNED_SDK_VERSION, bundledCliVersion: PINNED_CLI_VERSION })
     expect(Object.keys(receipt.scenarios)).toEqual([
@@ -174,37 +178,16 @@ describe(`Claude permission suggestions and plan approvals over the pinned CLI $
 // (fixtureRemoved=false), never as a crash that eats it.
 describe('Claude permission contract harness survives a fixture-cleanup failure', () => {
   it('still prints one receipt line reporting fixtureRemoved=false for every scenario instead of crashing', async () => {
-    // Deterministic sabotage: once a scenario's own setup is complete (its
-    // outside/notes.txt marker exists, and nothing writes into the fixture
-    // root itself after that), make the root unwritable so fixture.cleanup()
-    // fails with EACCES — the same finally block that raced the live CLI.
-    const chmodded = new Set<string>()
-    const watcher = setInterval(() => {
-      void (async () => {
-        let entries: string[]
-        try {
-          entries = await fs.readdir(os.tmpdir())
-        } catch {
-          return
-        }
-        for (const entry of entries) {
-          if (!entry.startsWith('freshell-claude-perm-') || chmodded.has(entry)) continue
-          const root = path.join(os.tmpdir(), entry)
-          const setupDone = await fs.stat(path.join(root, 'outside', 'notes.txt')).then(() => true, () => false)
-          if (!setupDone) continue
-          chmodded.add(entry)
-          await fs.chmod(root, 0o500).catch(() => {
-            chmodded.delete(entry)
-          })
-        }
-      })()
-    }, 25)
+    // Fail the removal itself after the harness has joined every owned writer.
+    // A private parent contains both the retained fixtures and our final cleanup.
+    const fixtureParent = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-cleanup-receipt-'))
 
-    const child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+    const child = spawn(process.execPath, [HARNESS, REPO_ROOT, '--fail-fixture-removal'], {
       cwd: REPO_ROOT,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8' },
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C.UTF-8', TMPDIR: fixtureParent },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    const closed = new Promise<void>((resolve) => child.once('close', () => resolve()))
     let stdout = ''
     let stderr = ''
     child.stdout!.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
@@ -220,28 +203,25 @@ describe('Claude permission contract harness survives a fixture-cleanup failure'
           clearTimeout(timer)
           reject(error)
         })
-        child.once('exit', (code, signal) => {
+        child.once('close', (code, signal) => {
           clearTimeout(timer)
           resolve({ code, signal })
         })
       })
-      expect(chmodded, `sabotaged fixture roots (${[...chmodded].join(', ')}); stderr=${stderr.slice(-2000)}`).toHaveLength(8)
       const lines = stdout.trim().split('\n').filter(Boolean)
       expect(lines, `the receipt must survive a cleanup failure; stderr tail: ${stderr.slice(-2000)}`).toHaveLength(1)
       const sabotagedReceipt = JSON.parse(lines[0]!) as Receipt
       expect(Object.keys(sabotagedReceipt.scenarios)).toHaveLength(8)
       for (const name of Object.keys(sabotagedReceipt.scenarios)) {
+        expect(sabotagedReceipt.scenarios[name]!.failure, `${name}: only cleanup was forced to fail; ${stderr.slice(-2000)}`).toBeUndefined()
+        expect(sabotagedReceipt.scenarios[name]!.sidecarExit, name).toEqual({ code: 0, signal: null })
         expect(sabotagedReceipt.scenarios[name]!.fixtureRemoved, `${name}: the receipt reports the cleanup failure`).toBe(false)
       }
       expect(exit.code).toBe(1)
     } finally {
-      clearInterval(watcher)
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-      for (const entry of chmodded) {
-        const root = path.join(os.tmpdir(), entry)
-        await fs.chmod(root, 0o700).catch(() => {})
-        await fs.rm(root, { recursive: true, force: true }).catch(() => {})
-      }
+      await closed
+      await fs.rm(fixtureParent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     }
   }, 220_000)
 })
