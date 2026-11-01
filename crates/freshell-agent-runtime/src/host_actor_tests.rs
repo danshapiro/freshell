@@ -1687,6 +1687,11 @@ async fn accepted_dispatch_native_identity_requires_current_source_and_existing_
             assert_eq!(result, Ok(CommandState::ProviderAcked), "{scenario}");
             assert_eq!(current.native_session_id.as_deref(), Some("native-new"));
             assert_eq!(
+                actor.observed_native_session_id().await.as_deref(),
+                Some("native-new"),
+                "the accepted native root must own subsequent host observations: {scenario}"
+            );
+            assert_eq!(
                 current.naming_handle,
                 if scenario == "initial-recovery" {
                     Some("pending-original".into())
@@ -1703,6 +1708,11 @@ async fn accepted_dispatch_native_identity_requires_current_source_and_existing_
                 current.native_session_id.as_deref(),
                 Some("native-new"),
                 "{scenario}"
+            );
+            assert_ne!(
+                actor.observed_native_session_id().await.as_deref(),
+                Some("native-new"),
+                "an unaccepted native root must not become host observation authority: {scenario}"
             );
             assert_eq!(
                 current.naming_handle.as_deref(),
