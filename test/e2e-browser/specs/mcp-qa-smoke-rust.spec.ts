@@ -260,7 +260,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       const codexResume = await mcp.callFreshellAction('new-tab', {
         mode: 'codex', cwd: sharedRoot, sessionRef: { provider: 'codex', sessionId: codexSessionId },
       })
-      expect(codexResume.status).toBe('ok')
+      expect(codexResume.status, JSON.stringify(codexResume)).toBe('ok')
       const codexResumePaneId: string = codexResume.data.paneId
       preRestartTabIds.push(codexResume.data.tabId)
 
