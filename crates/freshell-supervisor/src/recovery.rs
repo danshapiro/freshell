@@ -2211,7 +2211,6 @@ impl Supervisor {
                             )
                             .await;
                     }
-                    let captured = self.persist_resume_probe(context, store_probe).await?;
                     return Ok(retained_runtime_probe(
                         status.exited,
                         ReattachHandle {
@@ -2219,7 +2218,7 @@ impl Supervisor {
                             host_boot_id: status.host_boot_id,
                             container_id: context.prior_handle.container_id().to_owned(),
                         },
-                        after_native_probe(context, captured),
+                        after_native_probe(context, store_probe),
                         context.provider != "shell"
                             && context.fixture.is_none()
                             && !deterministic_fresh_fixture(context),
@@ -2321,9 +2320,7 @@ impl Supervisor {
             }),
         );
         match probe {
-            ready @ RecoveryProbe::ResumeReady { .. } => {
-                self.persist_resume_probe(context, ready).await
-            }
+            ready @ RecoveryProbe::ResumeReady { .. } => Ok(ready),
             other @ RecoveryProbe::Blocked { .. } => Ok(other),
             _ => Ok(blocked(
                 RecoveryPath::NativeResume,
@@ -2332,33 +2329,6 @@ impl Supervisor {
                 Some(2_000),
             )),
         }
-    }
-
-    async fn persist_resume_probe(
-        &self,
-        context: &RecoveryContext,
-        probe: RecoveryProbe,
-    ) -> Result<RecoveryProbe, RuntimeError> {
-        let RecoveryProbe::ResumeReady { resume_spec, .. } = probe else {
-            return Ok(probe);
-        };
-        let stored = self
-            .registry
-            .store_verified_resume_spec_for_live_incarnation(
-                context.soul_id.clone(),
-                context.prior_handle.incarnation_id().clone(),
-                context.evidence_revision,
-                *resume_spec,
-            )
-            .await
-            .map_err(map_registry)?;
-        Ok(match stored {
-            Some(stored) => RecoveryProbe::ResumeReady {
-                evidence_revision:stored.evidence_revision, resume_spec:Box::new(stored),
-            },
-            None => blocked(RecoveryPath::NativeResume, RecoveryBlockReason::ProviderUnavailable,
-                "provider-store evidence was superseded by a newer incarnation or recovery state; retry the probe", Some(2_000)),
-        })
     }
 
     /// Capture a verified exact-session resume proof while the provider store
@@ -2719,10 +2689,20 @@ impl Supervisor {
         &self,
         request: RecoverRequest,
     ) -> Result<RecoveryResult, RuntimeError> {
-        Box::pin(self.recover_scheduled(request, false)).await
+        self.recover_scheduled(request, false).await
     }
 
-    pub(crate) async fn recover_scheduled(
+    pub(crate) fn recover_scheduled(
+        &self,
+        request: RecoverRequest,
+        only_due_retry: bool,
+    ) -> impl std::future::Future<Output = Result<RecoveryResult, RuntimeError>> + Send + '_ {
+        // Construct recovery's owned state here so direct and spawned callers
+        // retain a pointer instead of reserving copies on their polling stack.
+        Box::pin(self.recover_scheduled_inner(request, only_due_retry))
+    }
+
+    async fn recover_scheduled_inner(
         &self,
         request: RecoverRequest,
         only_due_retry: bool,
@@ -11696,6 +11676,20 @@ pub(crate) mod automatic_retry_tests {
         }
     }
 
+    async fn settle_retry_preparation_callback(
+        mut server: tokio::task::JoinHandle<()>,
+        case: &str,
+    ) {
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result.expect("preparation callback server must settle"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("{case}: preparation callback was not dispatched or did not settle");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn retry_valid_wrong_provider_preparation_is_not_transient() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11711,7 +11705,7 @@ pub(crate) mod automatic_retry_tests {
         for case in ["wrong_provider", "missing_capability", "unavailable"] {
             let dir = tempfile::tempdir().unwrap();
             let (supervisor, backend, clock) = open(dir.path(), 0);
-            let soul = seed(&supervisor).await;
+            let soul = seed_native(&supervisor, dir.path()).await;
             let context = supervisor
                 .registry
                 .recovery_context(soul.clone())
@@ -11722,18 +11716,15 @@ pub(crate) mod automatic_retry_tests {
                 "mcpCapability":{"grantId":"grant-retry-test", "endpoint":"http://host.docker.internal:9", "providerRelativePath":".freshell/mcp-capability.json"},
                 "config":[]
             });
-            let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
-                "terminalId":"preparation-retry", "streamId":"preparation-stream", "mode":"codex", "program":"codex",
-                "cwd":dir.path(), "workspacePath":dir.path(), "projectKey":"preparation-retry",
-                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "providerLaunchContext":launch_context,
-            })).unwrap();
-            terminal.validate().unwrap();
+            let mut agent = context.prior_handle.fresh_agent().unwrap().clone();
+            agent.provider_launch_context = Some(serde_json::from_value(launch_context).unwrap());
+            agent.validate().unwrap();
             Connection::open(supervisor.registry.database_path())
                 .unwrap()
                 .execute(
-                    "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                    "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
                     rusqlite::params![
-                        serde_json::to_string(&terminal).unwrap(),
+                        serde_json::to_string(&agent).unwrap(),
                         context.prior_handle.incarnation_id().as_str()
                     ],
                 )
@@ -11742,7 +11733,7 @@ pub(crate) mod automatic_retry_tests {
                 None
             } else {
                 let listener = tokio::net::UnixListener::bind(dir.path().join("mcp.sock")).unwrap();
-                let mut response = terminal.provider_launch_context.unwrap();
+                let mut response = agent.provider_launch_context.unwrap();
                 if case == "wrong_provider" {
                     response.preparation =
                         freshell_runtime_protocol::ProviderPreparation::Opencode {
@@ -11767,12 +11758,19 @@ pub(crate) mod automatic_retry_tests {
                     let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
                     assert_eq!(request["action"], "issue");
                     assert_eq!(request["provider"], "codex");
+                    assert_eq!(
+                        request["codexSourceRuntime"],
+                        serde_json::json!(
+                            freshell_platform::codex_inputs::NativeSourceRuntime::AppServer
+                        )
+                    );
+                    assert!(request["authLookupAuthority"].as_str().is_some());
                     stream.write_all(&response).await.unwrap();
                 }))
             };
             let report = supervisor.reconcile_startup().await.unwrap();
             if let Some(server) = server {
-                server.await.unwrap();
+                settle_retry_preparation_callback(server, &format!("{case}: {report:?}")).await;
             }
             assert_eq!(
                 due(dir.path()),
@@ -11817,7 +11815,7 @@ pub(crate) mod automatic_retry_tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (supervisor, _, _) = open(dir.path(), 0);
-            let soul = seed(&supervisor).await;
+            let soul = seed_native(&supervisor, dir.path()).await;
             let context = supervisor
                 .registry
                 .recovery_context(soul.clone())
@@ -11836,6 +11834,16 @@ pub(crate) mod automatic_retry_tests {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut request = Vec::new();
                     stream.read_to_end(&mut request).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request["action"], "issue");
+                    assert_eq!(request["provider"], "codex");
+                    assert_eq!(
+                        request["codexSourceRuntime"],
+                        serde_json::json!(
+                            freshell_platform::codex_inputs::NativeSourceRuntime::AppServer
+                        )
+                    );
+                    assert!(request["authLookupAuthority"].as_str().is_some());
                     stream.write_all(&response).await.unwrap();
                 })
             });
@@ -11844,8 +11852,21 @@ pub(crate) mod automatic_retry_tests {
                     .reserved_attempt_id
                     .clone()
                     .expect("reserved callback attempt"),
-                context: context.clone(),
+                context: supervisor
+                    .registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap(),
             };
+            assert_eq!(
+                start.context.recovery_attempt_id.as_ref(),
+                Some(&start.attempt_id)
+            );
+            assert!(supervisor
+                .registry
+                .validate_auth_lookup_attempt(start.clone())
+                .await
+                .unwrap());
             let prior = freshell_runtime_protocol::ProviderLaunchContext {
                 preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
                     approval_default: None,
@@ -11861,7 +11882,7 @@ pub(crate) mod automatic_retry_tests {
                 .await
                 .unwrap_err();
             if let Some(server) = server {
-                server.await.unwrap();
+                settle_retry_preparation_callback(server, &format!("{error:?}")).await;
             }
             assert_eq!(
                 error.code,
