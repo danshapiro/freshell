@@ -931,6 +931,79 @@ describe('captureUiScreenshot transcript viewport', () => {
     else expect(render.copy.querySelector('#plain')!.textContent).toBe('Plain pane')
   })
 
+  it.each([
+    { name: 'natural height', internal: false, padding: 0, border: 0, shift: 0, blank: false, outside: false },
+    { name: 'internally scrolled', internal: true, padding: 0, border: 0, shift: 0, blank: false, outside: false },
+    { name: 'padding border and partial line', internal: false, padding: 11, border: 3, shift: 7, blank: false, outside: false },
+    { name: 'internal padding border and partial line', internal: true, padding: 11, border: 3, shift: 7, blank: false, outside: false },
+    { name: 'leading trailing and intervening empty lines', internal: false, padding: 0, border: 0, shift: 0, blank: true, outside: false },
+    { name: 'offscreen pre in retained article', internal: false, padding: 0, border: 0, shift: 0, blank: false, outside: true },
+  ])('captures middle code lines without visiting 30k highlighted spans: $name', async ({ internal, padding, border, shift, blank, outside }) => {
+    document.body.innerHTML = '<div data-pane-shell="true" data-pane-id="code"><div data-context="fresh-agent-transcript" style="overflow:auto"><article><pre style="white-space:pre;line-height:20px"><code style="font-size:14px;font-family:monospace;line-height:20px"></code></pre></article></div></div>'
+    const target = document.querySelector<HTMLElement>('[data-pane-id="code"]')!
+    const scroller = target.querySelector<HTMLElement>('[data-context]')!
+    const row = scroller.firstElementChild as HTMLElement
+    const pre = row.querySelector('pre')!, code = pre.querySelector('code')!
+    const lines = Array.from({ length: 30000 }, (_, i) => blank && (i === 0 || i === 29999 || i % 5 === 0)
+      ? '' : `\tline_${String(i).padStart(5, '0')}`)
+    const spans = lines.map((line, i) => {
+      const span = document.createElement('span'); span.textContent = line + (i < lines.length - 1 ? '\n' : '')
+      code.appendChild(span); return span
+    })
+    pre.style.padding = `${padding}px`; pre.style.border = `${border}px solid black`
+    if (internal) { pre.style.height = '192px'; pre.style.overflow = 'auto' }
+    const preTop = outside ? 1000 : internal ? 0 : -200000 - shift
+    const height = internal ? 192 : 600000
+    rectAt(target, 0, 500); rectAt(scroller, 0, 500)
+    rectAt(row, outside ? 0 : preTop, outside ? 601000 : height)
+    rectAt(pre, preTop, height)
+    Object.defineProperties(pre, { clientTop: { configurable: true, value: border }, clientLeft: { configurable: true, value: border },
+      clientHeight: { configurable: true, value: height - 2 * border }, clientWidth: { configurable: true, value: 800 - 2 * border } })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 600000 })
+    scroller.scrollTop = internal ? 0 : 200000 + shift
+    pre.scrollTop = internal ? 200000 + shift : 0; pre.scrollLeft = 37
+    const offsets = [scroller.scrollTop, pre.scrollTop, pre.scrollLeft]
+    const render = mockPrunedRender()
+    expect((await captureUiScreenshot({ scope: 'pane', paneId: 'code' })).ok).toBe(true)
+    expect(render.visited).not.toContain(code)
+    expect(spans.some((span) => render.visited.includes(span))).toBe(false)
+    expect(render.visited.length).toBeLessThan(20)
+    process.stdout.write(JSON.stringify({ severity: 'info', event: 'screenshot_code_clone_elements', internal, padding, border, blank, outside, visited: render.visited.length }) + '\n')
+    const copiedPre = render.copy.querySelector('pre')!, copiedText = copiedPre.firstElementChild as HTMLElement
+    if (outside) expect(copiedPre.textContent).toBe('')
+    else {
+      expect(copiedPre.textContent).toContain(blank ? 'line_10001' : 'line_10000')
+      expect(copiedPre.textContent).not.toContain('line_00000')
+      expect(copiedPre.textContent).not.toContain('line_29999')
+      const first = lines.findIndex((line) => line === copiedPre.textContent!.split('\n')[0])
+      expect(parseFloat(copiedText.style.top)).toBe(padding + first * 20 - pre.scrollTop)
+      expect(copiedText.style.left).toBe(`${padding - 37}px`)
+      expect(copiedText.textContent).toBe(lines.slice(first, first + copiedText.textContent!.split('\n').length).join('\n'))
+      if (blank) expect(copiedText.textContent).toContain('\n\n')
+    }
+    expect(copiedPre.style.height).toBe(`${height}px`)
+    expect([copiedPre.scrollTop, copiedPre.scrollLeft]).toEqual([0, 0])
+    expect(pre.querySelectorAll('span')).toHaveLength(30000)
+    expect([scroller.scrollTop, pre.scrollTop, pre.scrollLeft]).toEqual(offsets)
+  })
+
+  it.each(['small highlighted', 'wrapped plain'])('retains %s text and literal nested scroll offsets', async (kind) => {
+    document.body.innerHTML = '<div data-pane-shell="true" data-pane-id="code"><div data-context="fresh-agent-transcript"><article><pre></pre></article></div></div>'
+    const target = document.querySelector<HTMLElement>('[data-pane-id="code"]')!, scroller = target.querySelector<HTMLElement>('[data-context]')!
+    const pre = scroller.querySelector('pre')!
+    if (kind === 'small highlighted') { pre.style.whiteSpace = 'pre'; pre.innerHTML = '<code style="line-height:20px"><span style="color:red">const small = 1</span></code>' }
+    else { pre.style.whiteSpace = 'pre-wrap'; pre.textContent = 'first\n\n\t' + 'wrapped token '.repeat(2000) + '\nlast\n' }
+    rectAt(target, 0, 500); rectAt(scroller, 0, 500); rectAt(scroller.firstElementChild as HTMLElement, 0, 300); rectAt(pre, 0, 192)
+    pre.scrollTop = 37; pre.scrollLeft = 19
+    const text = pre.textContent, render = mockPrunedRender()
+    expect((await captureUiScreenshot({ scope: 'pane', paneId: 'code' })).ok).toBe(true)
+    const copiedPre = render.copy.querySelector('pre')!
+    expect(copiedPre.textContent).toBe(text)
+    expect([copiedPre.scrollTop, copiedPre.scrollLeft]).toEqual([37, 19])
+    if (kind === 'small highlighted') { expect(render.visited).toContain(pre.querySelector('span')); expect(copiedPre.querySelector('span')!.style.color).toBe('red') }
+    expect([pre.scrollTop, pre.scrollLeft]).toEqual([37, 19])
+  })
+
   it('renders existing srgb gradient/shadow colors through clone-only compatible CSS after pruning', async () => {
     document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target" class="fresh-agent-style-serif">
       <div data-context="fresh-agent-transcript">
