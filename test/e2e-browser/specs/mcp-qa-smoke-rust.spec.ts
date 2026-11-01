@@ -71,6 +71,8 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
     const amplifierArgLog = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')
     const opencodeArgLog = path.join(sharedRoot, 'fake-opencode-argv.jsonl')
     const codexArgLog = path.join(sharedRoot, 'fake-codex-argv.jsonl')
+    const codexRequestLog = path.join(sharedRoot, 'fake-codex-requests.jsonl')
+    const codexSessionId = randomUUID()
 
     const [fakeAmplifierPath, fakeOpencodePath] = await Promise.all([
       installFakeCli(binDir, FAKE_AMPLIFIER_CLI_SOURCE, 'amplifier'),
@@ -90,6 +92,22 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
         FAKE_OPENCODE_TERMINAL_ARGV_LOG: opencodeArgLog,
         CODEX_CMD: fakeCodexPath,
         FAKE_CODEX_ARGV_LOG: codexArgLog,
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ appendRequestLogPath: codexRequestLog }),
+      },
+      setupHome: async (homeDir) => {
+        // An exact resume requires native evidence. A made-up sessionRef is
+        // correctly refused as SESSION_MISSING; it must never start blank.
+        const sessions = path.join(homeDir, '.codex', 'sessions')
+        await fs.mkdir(sessions, { recursive: true })
+        const records = [
+          { timestamp: '2026-07-21T08:00:00.000Z', type: 'session_meta',
+            payload: { id: codexSessionId, cwd: sharedRoot } },
+          { timestamp: '2026-07-21T08:00:01.000Z', type: 'response_item',
+            payload: { type: 'message', role: 'user',
+              content: [{ type: 'input_text', text: 'MCP smoke saved conversation' }] } },
+        ]
+        await fs.writeFile(path.join(sessions, `${codexSessionId}.jsonl`),
+          `${records.map(record => JSON.stringify(record)).join('\n')}\n`)
       },
     })
     const info = await server.start()
@@ -243,11 +261,10 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       expect(opencodeCapture).toMatch(/opencode: session ses_e2e_\S+ started/)
 
       // -----------------------------------------------------------------
-      // 4. CODEX -- fresh launch plus the Rust-baseline sessionRef acceptance
-      //    path. Raw resume values are rejected locally; an explicit sessionRef
-      //    is accepted by create-tab. The current terminal launcher does not
-      //    turn that sessionRef into a terminal `codex resume` argv, so this
-      //    positive receipt asserts the documented fresh-terminal prompt.
+      // 4. CODEX -- fresh launch plus an exact, seeded native resume.
+      //    Raw resume values are rejected locally. The managed app-server
+      //    owns the resume while the terminal connects through --remote;
+      //    prove the exact native identity at that protocol boundary.
       // -----------------------------------------------------------------
       const codexFresh = await mcp.callFreshellAction('new-tab', { mode: 'codex', cwd: sharedRoot })
       expect(codexFresh.status).toBe('ok')
@@ -256,7 +273,6 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       const codexFreshWait = await mcp.callFreshellAction('wait-for', { target: codexFreshPaneId, pattern: 'codex> ', timeout: 20 })
       expect(codexFreshWait.data.matched).toBe(true)
 
-      const codexSessionId = `codex-thread-${randomUUID()}`
       const codexResume = await mcp.callFreshellAction('new-tab', {
         mode: 'codex', cwd: sharedRoot, sessionRef: { provider: 'codex', sessionId: codexSessionId },
       })
@@ -273,6 +289,10 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
 
       const codexArgvLines = await readArgvLines(codexArgLog)
       expect(codexArgvLines.some((e) => e.argv.includes('--remote'))).toBe(true)
+      const codexRequests = (await fs.readFile(codexRequestLog, 'utf8')).trim().split('\n')
+        .map(line => JSON.parse(line) as { method: string; params?: { threadId?: string } })
+      expect(codexRequests.filter(request => request.method === 'thread/resume'
+        && request.params?.threadId === codexSessionId)).toHaveLength(1)
 
       // Sanity: the raw-resume rejection this test relies on for the
       // "resume via sessionRef only" design decision above is itself real,
