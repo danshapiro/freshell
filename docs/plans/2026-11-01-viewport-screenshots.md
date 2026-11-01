@@ -53,7 +53,7 @@ This is an internal screenshot implementation change; there is no new end-user f
 ## File responsibilities and existing interfaces
 
 1. Create `src/lib/screenshot-viewport.ts`: source-only geometry snapshots, early omitted-root identity set, clone-only transcript spacers, and the large-code adapter. Each capture owns its closure; there is no cache, registry, serializer, or cancellation framework.
-2. Modify `src/lib/ui-screenshot.ts:314`: prepare immediately before the main html2canvas call, pass `ignoreElements`, and compose `onclone` after existing hidden-chain reveal. Preserve iframe preparation and the renderer suspension's `finally`.
+2. Modify `src/lib/ui-screenshot.ts:257,314`: align iframe preparation/correlation with the omitted roots, prepare fresh viewport geometry immediately before the main html2canvas call, and compose `onclone` after existing hidden-chain reveal. Preserve iframe fingerprints and the renderer suspension's `finally`.
 3. Modify `test/unit/client/ui-screenshot.test.ts`: behavioral cloner and tests through `captureUiScreenshot`, including failure cleanup. Keep all existing iframe/scope tests.
 4. Create `test/e2e-browser/specs/pane-viewport-screenshot.spec.ts`: provider-free real transcript fixtures, same-browser full html2canvas references for modest transcripts, genuine 30,000-element stress, giant code, wrapped tool output, and interaction isolation. Keep test helpers in this spec unless repetition demonstrably needs a local extraction.
 
@@ -67,12 +67,12 @@ The drafts below are pre-implementation proposals. Once execution starts, source
 
 **Files:**
 - Create: `src/lib/screenshot-viewport.ts`
-- Modify: `src/lib/ui-screenshot.ts:314`
+- Modify: `src/lib/ui-screenshot.ts:257,314`
 - Modify/Test: `test/unit/client/ui-screenshot.test.ts`
 - Create/Test: `test/e2e-browser/specs/pane-viewport-screenshot.spec.ts`
 
 **Interfaces:**
-- Consumes: `HTMLElement` capture target already resolved by `captureUiScreenshot` after async iframe preparation and renderer suspension.
+- Consumes: resolved `HTMLElement` capture target; iframe inclusion is sampled before preparation, and the main geometry snapshot is taken fresh after async iframe preparation and renderer suspension.
 - Produces: `export type PreparedScreenshotViewport = { ignoreElements: (element: Element) => boolean; onclone: (doc: Document, clonedTarget: HTMLElement) => void }` and `export function prepareScreenshotViewport(target: HTMLElement): PreparedScreenshotViewport`.
 - Task 2 extends this helper internally; its exported shape stays unchanged.
 
@@ -85,6 +85,9 @@ function mockPrunedRender(failAfterClone = false) {
   const visited: Element[] = []
   let copy: Document
   vi.mocked(html2canvas).mockImplementation(async (target: any, options: any) => {
+    if (target.ownerDocument !== document) {
+      return { width: 500, height: 300, toDataURL: () => 'data:image/png;base64,FRAME' } as any
+    }
     copy = document.implementation.createHTMLDocument('capture')
     const pairs = new Map<Node, Node>()
     const clone = (source: Node): Node => {
@@ -185,6 +188,39 @@ The behavioral cloner deliberately handles `createHTMLDocument`'s null `defaultV
 
 Also add direct behavioral cases through this cloner for an empty transcript, no transcript, a partially visible first/last row, and a row collection containing live/caption/section roots. A visible row must survive and an offscreen root's descendants must never be visited. Extend the existing clone-target-drift regression with a changed scroller count/pane owner: capture returns an actionable failure and resumes renderers; it must never retry by cloning full history.
 
+Add this regression through the same pre-descent cloner (inside the describe block above), preserving all existing iframe tree/src/pane drift tests:
+
+```ts
+it('view capture replaces its visible iframe while omitting a hidden-tab iframe', async () => {
+  document.body.innerHTML = `
+    <div data-context="global">
+      <div data-tab-content-id="visible"><div data-pane-shell="true" data-pane-id="visible-browser">
+        <iframe id="visible-frame" src="about:blank"></iframe>
+      </div></div>
+      <div data-tab-content-id="hidden" style="visibility:hidden"><div data-pane-shell="true" data-pane-id="hidden-browser">
+        <iframe id="hidden-frame" src="about:blank"></iframe>
+      </div></div>
+    </div>`
+  const target = document.querySelector<HTMLElement>('[data-context="global"]')!
+  const visible = document.querySelector<HTMLIFrameElement>('#visible-frame')!
+  const hidden = document.querySelector<HTMLIFrameElement>('#hidden-frame')!
+  rectAt(target, 0, 500); rectAt(visible, 0, 300); rectAt(hidden, 0, 300)
+  visible.contentDocument!.body.innerHTML = '<h1>Visible iframe canary</h1>'
+  const hiddenDocument = vi.fn(() => null)
+  Object.defineProperty(hidden, 'contentDocument', { configurable: true, get: hiddenDocument })
+  const render = mockPrunedRender()
+  const result = await captureUiScreenshot({ scope: 'view' })
+  expect(result.ok).toBe(true)
+  expect(render.copy.querySelector('[data-pane-id="visible-browser"] [data-screenshot-iframe-image="true"]')).not.toBeNull()
+  expect(render.copy.querySelector('#visible-frame')).toBeNull()
+  expect(render.copy.querySelector('#hidden-frame')).toBeNull()
+  expect(hiddenDocument).not.toHaveBeenCalled()
+  expect(render.visited).not.toContain(hidden)
+})
+```
+
+Also exercise the preparatory await: let the mocked renderer suspension change the transcript's scroll/row geometry before it resolves; assert the main clone retains the newly visible row, omits the formerly visible row, and restores the new literal offset. Run existing count, src and same-src/different-pane iframe drift cases unchanged; a genuinely changed retained iframe list still applies no replacements. The background-pane iframe test must still pre-render/reveal its laid-out hidden iframe.
+
 Create the browser spec and its reusable fixture helpers now. Use these exact fixture interfaces and implementation (the fixtures mount actual FreshAgentTranscript/MarkdownRenderer/Tool components; only provider responses are synthetic):
 
 ```ts
@@ -198,6 +234,10 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 const require = createRequire(import.meta.url)
 const TRANSCRIPT = '[data-context="fresh-agent-transcript"]'
 let nextFixture = 0
+
+async function settle(page: Page) {
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+}
 
 function turns(count: number): FreshAgentTurn[] {
   return Array.from({ length: count }, (_, i): FreshAgentTurn => ({
@@ -242,7 +282,7 @@ async function mountTranscript(page: Page, content: FreshAgentTurn[], style: 'se
   await expect(scroller.locator('article')).toHaveCount(content.length)
   await page.evaluate(async () => { await document.fonts.ready })
   await page.addStyleTag({ content: '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important }' })
-  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await settle(page)
   return { paneId, tabId, pane, scroller }
 }
 
@@ -285,6 +325,52 @@ async function reference(page: Page, paneId: string, scope: 'pane' | 'tab' | 'vi
   }, { id: paneId, scope })
 }
 
+// Stress oracle: measure the ACTUAL large source, then position just its
+// visible rows absolutely in the html2canvas copy. This deliberately uses
+// neither the production range search nor its spacers/scroll restoration.
+async function viewportReference(page: Page, paneId: string) {
+  await page.addScriptTag({ path: require.resolve('html2canvas/dist/html2canvas.min.js') })
+  return page.evaluate(async (paneId) => {
+    const pane = document.querySelector<HTMLElement>(`[data-pane-shell="true"][data-pane-id="${paneId}"]`)!
+    const scroll = pane.querySelector<HTMLElement>('[data-context="fresh-agent-transcript"]')!
+    const p = pane.getBoundingClientRect(), s = scroll.getBoundingClientRect()
+    const rows = Array.from(scroll.children) as HTMLElement[]
+    const measured = rows.map((row) => ({ row, box: row.getBoundingClientRect() }))
+      .filter(({ box }) => box.bottom > s.top + scroll.clientTop && box.top < s.top + scroll.clientTop + scroll.clientHeight)
+      .map(({ row, box }) => {
+        const style = getComputedStyle(row)
+        return { row, box, css: Array.from(style, (key) => [key, style.getPropertyValue(key)]) }
+      })
+    if (!measured.length) throw new Error('stress oracle has no live visible rows')
+    const kept = new Set(measured.map(({ row }) => row)), omitted = new Set<Element>()
+    for (const row of rows) if (!kept.has(row)) omitted.add(row)
+    for (const other of document.querySelectorAll('[data-pane-shell="true"]')) {
+      if (other !== pane) for (const child of other.children) omitted.add(child)
+    }
+    const canvas = await (window as any).html2canvas(pane, {
+      backgroundColor: null, allowTaint: true, useCORS: true, logging: false, scale: Math.max(1, devicePixelRatio || 1),
+      ignoreElements: (el: Element) => omitted.has(el),
+      onclone: (_doc: Document, copy: HTMLElement) => {
+        for (let node: HTMLElement | null = copy; node && node !== copy.ownerDocument.documentElement; node = node.parentElement) node.style.visibility = 'visible'
+        const dest = copy.querySelector<HTMLElement>('[data-context="fresh-agent-transcript"]')!
+        Object.assign(dest.style, { position: 'relative', display: 'block', boxSizing: 'border-box',
+          width: `${s.width}px`, height: `${s.height}px`, flex: 'none', overflow: 'hidden' })
+        Array.from(dest.children).forEach((row, i) => {
+          const { box, css } = measured[i], el = row as HTMLElement
+          for (const [key, value] of css) el.style.setProperty(key, value)
+          Object.assign(el.style, { position: 'absolute', margin: '0', visibility: 'visible', boxSizing: 'border-box',
+            left: `${box.left - s.left - scroll.clientLeft}px`, top: `${box.top - s.top - scroll.clientTop}px`,
+            width: `${box.width}px`, height: `${box.height}px` })
+        })
+        dest.scrollTop = 0; dest.scrollLeft = 0
+      },
+    })
+    const crop = { x: s.left - p.left, y: s.top - p.top, width: s.width, height: s.height }
+    return { base64: canvas.toDataURL('image/png').split(',')[1], width: canvas.width, height: canvas.height,
+      crop, crops: [crop], rows: measured.map(({ row, box }) => ({ text: row.textContent, top: box.top - s.top, height: box.height })) }
+  }, paneId)
+}
+
 async function compare(page: Page, actual: string, expected: Awaited<ReturnType<typeof reference>> & {
   actualCrop?: { x: number; y: number; width: number; height: number }
 }) {
@@ -316,6 +402,7 @@ for (const style of ['serif', 'mono'] as const) {
     const fixture = await mountTranscript(page, turns(18), style)
     for (const fraction of [0, 0.47, 1]) {
       await fixture.scroller.evaluate((el, fraction) => { el.scrollTop = (el.scrollHeight - el.clientHeight) * fraction }, fraction)
+      await settle(page)
       const offsets = await fixture.scroller.evaluate((el) => ({ top: el.scrollTop, height: el.scrollHeight }))
       const expected = await reference(page, fixture.paneId)
       const shot = await png(page, serverInfo, 'pane', fixture.paneId)
@@ -330,11 +417,11 @@ for (const style of ['serif', 'mono'] as const) {
 
 Add a 30,000-element stress/isolation test in this task, with the following concrete sequence and assertions. Keep its test name `30k background transcript excludes unrelated history and preserves live interaction` and `test.setTimeout(120_000)`; it must run on the configured cloud backend.
 
-1. Mount a modest 18-turn target; set its viewport at turn 8 with a partial first row, record that row's top relative to the scroller and collect the full `reference`. Mount another target from `turns(600)` generated with unique ids, containing the **same visible turns** with the same text and role parity, preceded and followed by generated history. Scroll by the visible anchor's measured position to reproduce exactly that first reference viewport. Assert `target.querySelectorAll('*').length >= 30_000`; increase generated rows deterministically if the actual count is lower, never reduce that assertion. Keep the comparison region away from transcript top/bottom and optional index labels. The two fixture pane widths and style must be identical. This reference is captured **before** the large fixture is present, so no unoptimized 30k clone is run.
+1. Mount the actual `turns(600)` target and assert `target.querySelectorAll('*').length >= 30_000`; increase generated rows deterministically if the actual count is lower, never reduce that assertion. At middle and bottom positions, build `viewportReference` from this same source's live row boxes and text. It retains only intersecting rows and positions those copies absolutely at their measured coordinates, with source-computed row styles preserving `:first-child` differences. This independently checks the production spacers, extent and literal scroll restoration. The full scroller crop includes the **same actual minimap** and buttons; there is no cross-fixture cumulative-offset or tick-count assumption and no unbounded reference clone. Keep the ordinary tests' unmodified full html2canvas references unchanged.
 2. Mount a separate background tab using a second `turns(600)` fixture and assert its independent count is also at least 30,000. It remains unrelated to the requested pane and provides the whole-document cloning regression.
 3. Before capture, focus the original foreground textarea, set selection `[2,6]`, and save its object identity on a test-owned window value. Snapshot Redux `tabs.activeTabId`, all `panes.activePane` entries, selection start/end/direction, `window.scrollX/Y`, and every fixture transcript's `scrollTop/Left`. Add document `focusin`, capture-phase `scroll`, and a store subscription (if no subscribe is exposed, sample via a short interval) to record transient focus/selection/tab/pane/scroll changes. Start an rAF heartbeat storing largest frame gap; these observations begin **after** fixture setup and scrolling have settled.
 4. Start `png(...)` without awaiting; send one keyboard character to the foreground textbox while it is in flight; await the shot. The character must land in the original textarea; selection's expected change is solely that keyboard operation. There must be no focus events away from that exact element, no tab/pane changes, and no observed source scroll changes. Compare against a control keyboard operation's selection result, or snapshot the selection before starting capture and perform the character after measuring capture neutrality; do not assert an unchanged selection while intentionally replacing it with a character.
-5. Assert PNG dimensions equal the modest reference and `compare(...).different === 0` for its scroller crop. This proves useful expected visible content and geometry on the actual huge DOM. Record capture milliseconds, maximum heartbeat gap, element counts, viewport/DPR, source offsets, named test/backend, and actual/reference PNGs through `testInfo.attach`. Assert capture completes within **15 seconds** after fixture readiness. This generous bound distinguishes the measured former roughly 60-second clone from the accepted brief hesitation; heartbeat/keyboard latency is recorded diagnostically and does not promise imperceptibility. Do not loosen the bound to hide a correctness or clone-bounding failure.
+5. Assert PNG dimensions equal the same-source measured reference and `compare(...).different === 0` for its whole scroller crop. Also assert independently measured visible text includes the selected middle/bottom sentinel and the middle first row is partially clipped. Record capture milliseconds, maximum heartbeat gap, element counts, viewport/DPR, source offsets, named test/backend, and actual/reference PNGs through `testInfo.attach`. Assert capture completes within **10 seconds** after fixture readiness: the existing Rust route's 10-second deadline already returns HTTP 503 when the client cannot finish. The elapsed assertion includes response/file overhead and deliberately requires margin inside that real deadline. Heartbeat/keyboard latency remains diagnostic and does not promise imperceptibility. Do not loosen useful content, geometry or timing assertions to hide a failure.
 6. Stop only this test's observers/subscription/heartbeat in `finally`. Let the shared fixture own server and page cleanup. All persistent PNGs/logs remain under the suite's configured artifact path; do not copy dependencies or private data.
 
 Implement the stress sequence with this test body; the detailed observations above explain each assertion. The unchanged selection is checked during capture; the separate keyboard proof uses a second capture so its intentional selection edit does not invalidate that check.
@@ -344,16 +431,6 @@ test('30k background transcript excludes unrelated history and preserves live in
   test.setTimeout(120_000)
   await terminal.waitForTerminal()
   const all = turns(600)
-  const small = await mountTranscript(page, all.slice(292, 310))
-  const anchor = '[data-turn-index="8"]'
-  await small.scroller.evaluate((scroll, selector) => {
-    const row = scroll.querySelector<HTMLElement>(selector)!
-    scroll.scrollTop += row.getBoundingClientRect().top - scroll.getBoundingClientRect().top + 23
-  }, anchor)
-  const middleReference = await reference(page, small.paneId)
-  const bottom = await mountTranscript(page, all.slice(-18))
-  await bottom.scroller.evaluate((scroll) => { scroll.scrollTop = scroll.scrollHeight })
-  const bottomReference = await reference(page, bottom.paneId)
   const large = await mountTranscript(page, all)
   const unrelated = await mountTranscript(page, turns(600))
   await unrelated.pane.evaluate((pane) => {
@@ -375,9 +452,12 @@ test('30k background transcript excludes unrelated history and preserves live in
     input.style.cssText = 'position:fixed;top:1px;left:1px;z-index:99999;width:120px;height:30px'
     document.body.appendChild(input); input.focus(); input.setSelectionRange(2, 6)
   })
-  for (const [position, expected] of [['middle', middleReference], ['bottom', bottomReference]] as const) {
+  for (const position of ['middle', 'bottom'] as const) {
     if (position === 'bottom') await large.scroller.evaluate((scroll) => { scroll.scrollTop = scroll.scrollHeight })
-    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await settle(page)
+    const expected = await viewportReference(page, large.paneId)
+    expect(expected.rows.some((row) => row.text?.includes(`Viewport row ${position === 'middle' ? 300 : 599}`))).toBe(true)
+    if (position === 'middle') expect(expected.rows[0].top).toBeLessThan(0)
     await page.evaluate(() => {
       const w = window as any, input = document.activeElement as HTMLTextAreaElement
       const h = window.__FRESHELL_TEST_HARNESS__!
@@ -412,7 +492,7 @@ test('30k background transcript excludes unrelated history and preserves live in
     finally { observations = await page.evaluate(() => (window as any).__viewportCaptureObservation.stop()) }
     const elapsed = Date.now() - started
     expect(observations.errors).toEqual([])
-    expect(elapsed).toBeLessThan(15000)
+    expect(elapsed).toBeLessThan(10000)
     expect(await compare(page, shot.base64, expected)).toEqual({ different: 0, width: expected.width, height: expected.height })
     await testInfo.attach(`30k-${position}-metrics`, { body: JSON.stringify({ elapsed, ...observations,
       targetElements: await large.pane.locator('*').count(), unrelatedElements: await unrelated.pane.locator('*').count() }), contentType: 'application/json' })
@@ -427,7 +507,7 @@ test('30k background transcript excludes unrelated history and preserves live in
 })
 ```
 
-The anchored small/large fixtures contain identical turn text and surrounding roles; do not derive their reference from an already-pruned capture. The middle and bottom references are both captured before either large fixture mounts. If fixture construction count needs adjustment, use an even number of rows and preserve the shared anchor/parity; source rendering costs are excluded from capture timing. Add viewport/DPR and literal inner-pre scroll offsets to the attached metric object when those fixtures introduce an inner scroller.
+The stress oracle uses the live large source, not the production helper or its output: its measured absolute-row layout is independent of production's spacer arithmetic. It never clones offscreen history or the unrelated huge pane. If fixture construction count needs adjustment, use an even number of rows and update the final-turn sentinel accordingly; source/oracle rendering costs are excluded from production capture timing. Add viewport/DPR and literal inner-pre scroll offsets to the attached metric object when those fixtures introduce an inner scroller.
 
 For tab and view scope coverage add the following complete test. The same modest reference image includes both split panes, and each viewport crop is independently checked:
 
@@ -447,11 +527,13 @@ test('tab and view capture preserve two independently scrolled transcripts', asy
   const tab = page.locator(`[data-tab-content-id="${first.tabId}"]`)
   await tab.locator(TRANSCRIPT).nth(0).evaluate((el) => { el.scrollTop = el.scrollHeight * 0.31 })
   await tab.locator(TRANSCRIPT).nth(1).evaluate((el) => { el.scrollTop = el.scrollHeight * 0.67 })
+  await settle(page)
   const expectedTab = await reference(page, first.tabId, 'tab')
   const shotTab = await png(page, serverInfo, 'tab', first.tabId)
   expect(expectedTab.crops).toHaveLength(2)
   for (const crop of expectedTab.crops) expect((await compare(page, shotTab.base64, { ...expectedTab, crop })).different).toBe(0)
   await page.evaluate((tabId) => window.__FRESHELL_TEST_HARNESS__!.dispatch({ type: 'tabs/setActiveTab', payload: tabId }), first.tabId)
+  await settle(page)
   const expectedView = await reference(page, '', 'view')
   const shotView = await png(page, serverInfo, 'view', '')
   expect(expectedView.crops).toHaveLength(2)
@@ -470,7 +552,7 @@ pnpm run test:vitest run test/unit/client/ui-screenshot.test.ts test/unit/client
 GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/pane-viewport-screenshot.spec.ts
 ```
 
-Expected: the new cloner test fails because offscreen/unrelated roots are visited; the real stress case exceeds the capture ceiling on the existing code. Ordinary reference cases may already pass and establish the accuracy to preserve. Confirm failures are the missing behavior, with fixtures rendered and REST reached, rather than setup/type failures. Keep the red receipt; do not run giant unoptimized references.
+Expected: the new cloner test fails because offscreen/unrelated roots are visited; the real stress case on existing code can miss the Rust route's 10-second deadline, so `png()` receives HTTP 503 and fails its expected-200 assertion (rather than reaching a hypothetical 15-second client bound). Ordinary reference cases may already pass and establish the accuracy to preserve. Confirm failures are the missing behavior, with fixtures rendered and REST reached, rather than setup/type failures. Keep the red receipt; do not run giant unoptimized references.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -595,17 +677,54 @@ export function prepareScreenshotViewport(target: HTMLElement): PreparedScreensh
 
 Source direct row boxes are chronological; binary searches give logarithmic geometry reads while building the omitted identity set remains linear in rows. Known unrelated tab/pane boundaries omit their direct content children before cloning, so a huge unrelated editor/terminal subtree cannot dominate capture; outer tabs and pane shells have the existing explicit full-size layout and stay present. Transcript plans beneath an omitted boundary are excluded from source/clone correlation. Do not call `querySelectorAll('*')` or compute styles for all descendants in production. Negative continuation margins are why positions come from real boxes rather than accumulated guessed row heights. If browser coverage exposes a row-order assumption violated by actual transcript CSS, adjust this focused range selection using the measured boxes, keeping the pre-clone exclusion guarantee.
 
-In `ui-screenshot.ts`, add `import { prepareScreenshotViewport } from '@/lib/screenshot-viewport'`. Inside the existing renderer suspension `try`, immediately before the main call, add `const preparedViewport = prepareScreenshotViewport(target)`. Add `ignoreElements: preparedViewport.ignoreElements` to that call's options. The composed callback becomes:
+In `ui-screenshot.ts`, add `import { prepareScreenshotViewport } from '@/lib/screenshot-viewport'`. Keep the helper's exported shape unchanged. Extend only the private `PreparedIframeCapture.onclone` signature to receive `(doc: Document, clonedTarget: HTMLElement, ignoreElements: (element: Element) => boolean): void`. Replace `prepareIframeCapture` with this small composition of the existing capture/replacement functions:
+
+```ts
+async function prepareIframeCapture(
+  target: HTMLElement, scale: number, ignoreElements: (element: Element) => boolean,
+): Promise<PreparedIframeCapture> {
+  const retained = (iframe: HTMLIFrameElement, omitted: (element: Element) => boolean) => {
+    if (!target.contains(iframe)) return false
+    for (let node: Element | null = iframe; node; node = node.parentElement) {
+      if (omitted(node)) return false
+      if (node === target) break
+    }
+    return true
+  }
+  const iframes = Array.from(target.querySelectorAll('iframe')).filter((iframe) => retained(iframe, ignoreElements))
+  const originalFingerprints = iframes.map(iframeFingerprint)
+  const replacements: (IframeReplacement | null)[] = []
+  for (const iframe of iframes) {
+    replacements.push(hasLayout(iframe) ? await captureIframeReplacement(iframe, scale) : null)
+  }
+  return {
+    onclone: (doc, clonedTarget, currentOmissions) => {
+      const indexes = iframes.map((_, i) => i).filter((i) => retained(iframes[i], currentOmissions))
+      const copies = Array.from(clonedTarget.querySelectorAll('iframe'))
+      if (copies.length !== indexes.length) return
+      for (let i = 0; i < copies.length; i++) {
+        if (iframeFingerprint(copies[i]) !== originalFingerprints[indexes[i]]) return
+      }
+      for (let i = 0; i < copies.length; i++) {
+        const replacement = replacements[indexes[i]]
+        if (replacement) copies[i].replaceWith(buildIframeReplacementElement(doc, copies[i], replacement))
+      }
+    },
+  }
+}
+```
+
+Before iframe preparation, take `const iframeViewport = prepareScreenshotViewport(target)` and call `await prepareIframeCapture(target, scale, iframeViewport.ignoreElements)`. That first snapshot only filters iframe pre-renders; discard it for the main render. After both iframe preparation and renderer suspension await, inside the existing `try`, immediately before the main html2canvas call, take **fresh** `const preparedViewport = prepareScreenshotViewport(target)`. Add `ignoreElements: preparedViewport.ignoreElements` to the main options. No await may separate this fresh geometry snapshot from html2canvas's synchronous clone. The composed callback becomes:
 
 ```ts
 onclone: (doc, clonedTarget) => {
   if (needsReveal) revealClonedTargetChain(clonedTarget)
   preparedViewport.onclone(doc, clonedTarget)
-  preparedIframes.onclone(doc, clonedTarget)
+  preparedIframes.onclone(doc, clonedTarget, preparedViewport.ignoreElements)
 },
 ```
 
-Keep the nested iframe html2canvas calls unchanged and retain `finally { await restoreRenderers() }` and the outer result error handling. No live style, focus, tab-selection, or scroll writes are introduced. Existing normal nested scroll restoration remains html2canvas's responsibility; its clone stores/restores source element scroll offsets. Task 2 explicitly restores adapted `<pre>` geometry where content exclusion would otherwise clamp those offsets.
+Keep the nested iframe html2canvas calls unchanged and retain `finally { await restoreRenderers() }` and the outer result error handling. Omission filtering walks source ancestors, matching early exclusion of entire roots, including hidden-tab and offscreen-row descendants. Count and per-index original pane/src fingerprints still guard every retained replacement; newly included, added, moved or changed frames cannot receive an unrelated image. No live style, focus, tab-selection, or scroll writes are introduced. Existing normal nested scroll restoration remains html2canvas's responsibility; its clone stores/restores source element scroll offsets. Task 2 explicitly restores adapted `<pre>` geometry where content exclusion would otherwise clamp those offsets. Leave html2canvas's exceptional internal clone-iframe cleanup unchanged; that optional lifecycle work is outside this small feature.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -617,7 +736,7 @@ pnpm run typecheck:client
 GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/pane-viewport-screenshot.spec.ts
 ```
 
-Expected: PASS for the new and existing screenshot units, client typecheck, and every new Task 1 browser case. Ordinary crops match full html2canvas exactly at top/middle/bottom; 30k stress contains the same visible rows as the modest reference, meets its 15-second ceiling, and has no capture-induced focus/selection/tab/pane/scroll events. An iframe or terminal cleanup failure is a regression to repair in this task.
+Expected: PASS for the new and existing screenshot units, client typecheck, and every new Task 1 browser case. Ordinary crops match full html2canvas exactly at top/middle/bottom; 30k stress exactly matches its independently measured same-source viewport (including its minimap), meets the real 10-second deadline, and has no capture-induced focus/selection/tab/pane/scroll events. The visible-plus-hidden-iframe view regression passes, all original iframe drift safeguards pass, and fresh viewport geometry is used after preparatory awaits. Renderer cleanup remains covered.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -700,7 +819,8 @@ Add real-browser tests with the Task 1 fixtures:
 
 ```ts
 function giantCode(): FreshAgentTurn[] {
-  const lines = Array.from({ length: 8000 }, (_, i) => `const line_${String(i).padStart(5, '0')} = "${i}: visible code sentinel";`)
+  const lines = Array.from({ length: 8000 }, (_, i) => i % 5 === 0 ? ''
+    : `${i % 3 === 0 ? '\t\t' : '\t'}const line_${String(i).padStart(5, '0')} = "${i}: visible code sentinel";`)
   return [{ id: 'giant', turnId: 'giant', role: 'assistant', summary: 'Synthetic giant code',
     items: [{ id: 'giant-text', kind: 'text', text: '```ts\n' + lines.join('\n') + '\n```' }] }]
 }
@@ -729,9 +849,10 @@ for (const width of [1000, 520]) {
       }, { tabId: fixture.tabId, paneId: fixture.paneId })
       await expect(page.locator('[data-pane-id="wrapped-narrow-split"] article').first()).toBeAttached()
     }
-    // The fixture tab is hidden, so expand its real tool button through DOM
-    // click, without activating the tab or focusing a different live node.
-    await fixture.pane.getByRole('button', { name: 'Bash tool call', includeHidden: true }).evaluate((button: HTMLElement) => button.click())
+    // Open the real activity strip in the hidden fixture. Its single tool
+    // starts expanded; clicking the tool button would close the output.
+    const activity = fixture.pane.getByRole('button', { name: 'Toggle activity details', includeHidden: true })
+    if (await activity.getAttribute('aria-expanded') === 'false') await activity.evaluate((button: HTMLElement) => button.click())
     const output = fixture.pane.locator('pre[data-tool-output]')
     await expect(output).toBeAttached()
     await output.evaluate((pre: HTMLElement) => { pre.scrollTop = (pre.scrollHeight - pre.clientHeight) * 0.53 })
@@ -742,6 +863,7 @@ for (const width of [1000, 520]) {
       const tail = document.createElement('div'); tail.style.cssText = 'height:1200px;flex:none'; scroll.appendChild(tail)
       scroll.scrollTop += pre.getBoundingClientRect().top - scroll.getBoundingClientRect().top + 35
     })
+    await settle(page)
     const before = await output.evaluate((pre) => ({ top: pre.scrollTop, text: pre.textContent, whiteSpace: getComputedStyle(pre).whiteSpace }))
     expect(before.top).toBeGreaterThan(0)
     expect(before.whiteSpace).toBe('pre-wrap')
@@ -755,11 +877,11 @@ for (const width of [1000, 520]) {
 }
 ```
 
-The real ToolCallCard button in `FreshAgentItemCard.tsx` is `.fresh-agent-tool-trigger` with accessible name `Bash tool call`; the draft uses that existing name. DOM click is appropriate solely to configure a hidden fixture, before observation/capture. The width-520 case also uses a real split pane, rather than treating a narrow browser alone as split coverage.
+`FreshAgentActivityStrip` initially renders only its summary when `expandTools` is false. Its real `Toggle activity details` disclosure exposes the tool, and a single tool automatically opens its output (`singleToolExpand`); do not click `Bash tool call` closed. DOM click is appropriate solely to configure a hidden fixture, before observation/capture. The width-520 case also uses a real split pane, rather than treating a narrow browser alone as split coverage.
 
-Add named browser cases `giant natural-height code captures middle and bottom visible lines` and `giant internally scrolled code preserves partial lines and horizontal offset`. Mount `giantCode()`, assert its **actual highlighted descendants** count is at least 30,000, and position the transcript midway through the pre, then near its bottom. The natural-height case leaves `pre.scrollTop === 0`; calculate the expected first line from `(clip.top - preRect.top - borderTop - paddingTop + pre.scrollTop) / lineHeight`. The internal case sets test-owned fixed pre height/overflow and literal inner offsets before capture. Both must capture the correct numbered visible lines and retain the source pre footprint and all live offsets.
+Add named browser cases `giant natural-height code captures middle and bottom visible lines` and `giant internally scrolled code preserves partial lines and horizontal offset`. Mount `giantCode()`, assert its **actual highlighted descendants** count is at least 30,000, and position the transcript midway through the pre, then near its bottom. The natural-height case leaves `pre.scrollTop === 0`; the internal case sets test-owned fixed pre height/overflow and literal inner offsets before capture. Both exercise blank lines and tab indentation, partial vertical clipping, and horizontal scroll. Select expected visible lines from **live browser Range glyph boxes**, without reusing production's line-height/origin formula; retain the source pre footprint and all live offsets.
 
-For a browser image oracle that permits lost syntax colors, build a separate **small** reference fixture from the expected visible plain-text lines rendered in a `pre` with the source's measured font, line-height, foreground, padding/border, width and background. Place its first baseline at the measured line origin, including fractional clipping and horizontal offset; capture with unmodified html2canvas in a disposable small fixture document. Copy the existing page styles/font links into that document; do not copy the giant highlighted subtree. Compare the actual code crop exactly to this reference, attach both PNGs, and assert line-number sentinel rows at the top/middle/bottom are present. Record captured element count from the unit traversal; browser capture must meet the same 15-second generous ceiling. Keep this reference builder local to the spec; do not add a production plain-code mode or test hook.
+For a browser image oracle that permits lost syntax colors, build a separate **small** reference fixture from those source-grounded visible plain-text lines, including intervening blanks/tabs, using the source's font, foreground, padding/border, width and background. Align a reference glyph to the independently measured live glyph, then verify first/middle/last visible glyph coordinates independently before the exact PNG comparison. Capture this small document with unmodified html2canvas; never copy the giant highlighted subtree. Record captured element count from the unit traversal; browser capture must meet the same 10-second bound. Keep this reference builder local to the spec; do not add a production plain-code mode or test hook.
 
 Use this local browser oracle and test implementation; unlike the production adapter it copies the browser's full computed style of just two elements into a disposable document. It never imports highlighted descendants or clones the giant source document:
 
@@ -775,11 +897,33 @@ async function codeReference(page: Page, paneId: string) {
       top: Math.max(r.top + pre.clientTop, s.top + scroll.clientTop, p.top),
       right: Math.min(r.left + pre.clientLeft + pre.clientWidth, s.left + scroll.clientLeft + scroll.clientWidth, p.right),
       bottom: Math.min(r.top + pre.clientTop + pre.clientHeight, s.top + scroll.clientTop + scroll.clientHeight, p.bottom) }
-    const cs = getComputedStyle(code), ps = getComputedStyle(pre), lh = parseFloat(cs.lineHeight)
-    const padding = parseFloat(ps.paddingTop), origin = r.top + pre.clientTop + padding - pre.scrollTop
-    const first = Math.max(0, Math.floor((clip.top - origin) / lh) - 2)
-    const last = Math.ceil((clip.bottom - origin) / lh) + 2
-    const visibleText = pre.textContent!.split('\n').slice(first, last).join('\n')
+    const cs = getComputedStyle(code), ps = getComputedStyle(pre)
+    const lines = pre.textContent!.split('\n')
+    const nodes: { node: Text; start: number; end: number }[] = []
+    const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT)
+    let total = 0, node: Node | null
+    while ((node = walker.nextNode())) {
+      nodes.push({ node: node as Text, start: total, end: total + node.textContent!.length })
+      total += node.textContent!.length
+    }
+    const glyphs: { line: number; char: number; top: number; bottom: number; left: number }[] = []
+    let offset = 0, cursor = 0
+    lines.forEach((line, index) => {
+      const char = line.search(/\S/)
+      if (char >= 0) {
+        const at = offset + char
+        while (nodes[cursor].end <= at) cursor++
+        const range = document.createRange(), part = nodes[cursor]
+        range.setStart(part.node, at - part.start); range.setEnd(part.node, at - part.start + 1)
+        const box = range.getBoundingClientRect()
+        glyphs.push({ line: index, char, top: box.top, bottom: box.bottom, left: box.left })
+      }
+      offset += line.length + 1
+    })
+    const visible = glyphs.filter((glyph) => glyph.bottom > clip.top && glyph.top < clip.bottom)
+    if (!visible.length) throw new Error('code oracle has no live visible glyphs')
+    const first = Math.max(0, visible[0].line - 2), last = Math.min(lines.length, visible.at(-1)!.line + 3)
+    const visibleText = lines.slice(first, last).join('\n')
     const frame = document.createElement('iframe')
     frame.style.cssText = 'position:fixed;left:-20000px;top:0;border:0;width:2000px;height:2000px'
     document.body.appendChild(frame)
@@ -807,13 +951,29 @@ async function codeReference(page: Page, paneId: string) {
       Object.assign(copy.style, { visibility: 'visible', position: 'absolute', boxSizing: 'border-box', margin: '0',
         left: `${r.left - clip.left}px`, top: `${r.top - clip.top}px`, width: `${r.width}px`, height: `${r.height}px`, overflow: 'hidden' })
       Object.assign(text.style, { visibility: 'visible', position: 'absolute', margin: '0', padding: '0', border: '0', whiteSpace: 'pre',
-        top: `${padding + first * lh - pre.scrollTop}px`, left: `${parseFloat(ps.paddingLeft) - pre.scrollLeft}px` })
+        top: '0', left: '0' })
       text.textContent = visibleText; copy.appendChild(text); root.appendChild(copy); d.body.appendChild(root)
       await d.fonts.ready
+      const glyphRect = (glyph: typeof visible[number]) => {
+        const at = lines.slice(first, glyph.line).reduce((n, line) => n + line.length + 1, 0) + glyph.char
+        const range = d.createRange()
+        range.setStart(text.firstChild!, at); range.setEnd(text.firstChild!, at + 1)
+        return range.getBoundingClientRect()
+      }
+      const anchor = visible[0], initial = glyphRect(anchor), rootBox = root.getBoundingClientRect()
+      text.style.top = `${anchor.top - clip.top - (initial.top - rootBox.top)}px`
+      text.style.left = `${anchor.left - clip.left - (initial.left - rootBox.left)}px`
+      const sentinels = [visible[0], visible[Math.floor(visible.length / 2)], visible.at(-1)!].map((glyph) => {
+        const actual = glyphRect(glyph), bounds = root.getBoundingClientRect()
+        return { line: glyph.line, sourceTop: glyph.top - clip.top, referenceTop: actual.top - bounds.top,
+          sourceLeft: glyph.left - clip.left, referenceLeft: actual.left - bounds.left }
+      })
       const canvas = await (window as any).html2canvas(root, { backgroundColor: null, scale: Math.max(1, devicePixelRatio || 1), logging: false })
       const crop = { x: 0, y: 0, width, height }
       return { base64: canvas.toDataURL('image/png').split(',')[1], crop, crops: [crop], width: canvas.width, height: canvas.height,
-        actualCrop: { x: clip.left - p.left, y: clip.top - p.top, width, height }, first, last, visibleText,
+        actualCrop: { x: clip.left - p.left, y: clip.top - p.top, width, height }, first, last, sentinels,
+        blankLines: lines.slice(visible[0].line, visible.at(-1)!.line + 1).filter((line) => !line.length).length,
+        hasTabs: lines.slice(first, last).some((line) => line.startsWith('\t')),
         offsets: [scroll.scrollTop, pre.scrollTop, pre.scrollLeft] }
     } finally { frame.remove() }
   }, paneId)
@@ -840,14 +1000,20 @@ for (const internal of [false, true]) {
         // Ensure real horizontal overflow without changing highlighted text.
         pre.style.width = '220px'; pre.style.overflowX = 'auto'; pre.scrollLeft = 37
       }, { internal, fraction })
-      await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+      await settle(page)
       const expected = await codeReference(page, fixture.paneId)
       expect(expected.first).toBeGreaterThan(100)
-      expect(expected.visibleText).toContain(`line_${String(expected.first).padStart(5, '0')}`)
+      expect(expected.blankLines).toBeGreaterThan(0)
+      expect(expected.hasTabs).toBe(true)
+      expect(expected.offsets[2]).toBe(37)
+      for (const glyph of expected.sentinels) {
+        expect(glyph.referenceTop).toBeCloseTo(glyph.sourceTop, 2)
+        expect(glyph.referenceLeft).toBeCloseTo(glyph.sourceLeft, 2)
+      }
       expect(expected.offsets[1] === 0).toBe(!internal)
       const before = await pre.evaluate((pre: HTMLElement) => ({ height: pre.getBoundingClientRect().height, top: pre.scrollTop, left: pre.scrollLeft }))
       const started = Date.now(), shot = await png(page, serverInfo, 'pane', fixture.paneId)
-      expect(Date.now() - started).toBeLessThan(15000)
+      expect(Date.now() - started).toBeLessThan(10000)
       expect((await compare(page, shot.base64, expected)).different).toBe(0)
       expect(await pre.evaluate((pre: HTMLElement) => ({ height: pre.getBoundingClientRect().height, top: pre.scrollTop, left: pre.scrollLeft }))).toEqual(before)
       expect(await pre.evaluate((pre: HTMLElement) => [pre.closest<HTMLElement>('[data-context="fresh-agent-transcript"]')!.scrollTop, pre.scrollTop, pre.scrollLeft])).toEqual(expected.offsets)
@@ -1007,11 +1173,11 @@ git commit -m "fix: capture visible lines of large screenshot code blocks"
 
 | User requirement or accepted residual | Production outcome and verification |
 | --- | --- |
-| Useful current viewport from a background pane | Task 1's existing capture path, clone-only reveal, ordinary top/middle/bottom full html2canvas references, 30k same-visible-content reference |
-| Typical 30,000-element transcript, efficient capture | Task 1 early omitted-root predicate, traversal assertions, actual DOM count, unrelated second huge pane, 15-second stress ceiling and diagnostic heartbeat |
+| Useful current viewport from a background pane | Task 1's existing capture path, clone-only reveal, ordinary top/middle/bottom full html2canvas references, independently measured same-source 30k viewport reference including minimap |
+| Typical 30,000-element transcript, efficient capture | Task 1 early omitted-root predicate, traversal assertions, actual DOM count, unrelated second huge pane/editor, existing 10-second server deadline plus elapsed assertion and diagnostic heartbeat |
 | No switching tabs, stolen focus, live scroll changes | Task 1 live-object/selection assertions and transient browser observations during REST capture; unchanged renderer/iframe cleanup |
 | Exclude history before cloning and retain offsets/layout | Task 1 pre-descent behavioral cloner, content-space anchor/top/bottom spacers, first-child exception and exact browser pixels |
-| Large highlighted code captures visible lines | Task 2 descendant exclusion and adapter; natural-height/internal-scroll 30k code at middle/bottom, partial lines, horizontal offset, geometric footprint |
+| Large highlighted code captures visible lines | Task 2 descendant exclusion and adapter; natural-height/internal-scroll 30k code at middle/bottom, independent live Range glyph positions, blanks/tabs, partial lines, horizontal offset, geometric footprint |
 | Simple implementation proportionate to low importance | One helper, two existing html2canvas hooks, no backend/API/settings/dependency/general framework |
 | Dedicated worktree, preserve unrelated work, baseline exception separate | Fixed worktree/branch/base, focused commits, parent-owned failure receipt, no unrelated component changes |
 | No production deploy/restart or unauthorized PR | No deployment/production commands in either task; push/approval handoff follows AGENTS.md |
@@ -1022,4 +1188,4 @@ git commit -m "fix: capture visible lines of large screenshot code blocks"
 
 ## Planner self-review
 
-The complete supplied User Request block is retained once. Both tasks deliver independently reviewable production behavior and fold their browser proof into the same deliverable; no separate test-only phase is required. Source changes are limited to the preparation helper and main capture integration, with typed synthetic fixtures and existing API/harness entrypoints. All mandatory outcomes have unit traversal or real-browser geometry/image evidence; wrapped text is explicitly validated without a speculative text layout engine. Existing scope, iframe identity, and renderer failure/overlap behavior remain covered. No private proof data, production step, dependency change, source test hook, or unauthorized PR action is introduced.
+The complete supplied User Request block is retained once. Both tasks deliver independently reviewable production behavior and fold their browser proof into the same deliverable; no separate test-only phase is required. Source changes are limited to the preparation helper and main capture/iframe composition, with typed synthetic fixtures and existing API/harness entrypoints. The 30k oracle uses actual source geometry and minimap rather than different fixtures; code-line selection/alignment uses independent live Range glyph positions rather than the adapter formula. Wrapped output opens its real activity disclosure and remains plain wrapped text. Exact ordinary/reference comparisons, the real 10-second deadline, two-frame settling, fresh geometry after awaits, retained iframe count/src/pane guards, and renderer failure/overlap behavior remain covered. Every edited literal, interface, reference, and count has been reconciled with these tasks and the current source. No private proof data, production step, dependency change, source test hook, exceptional iframe lifecycle framework, or unauthorized PR action is introduced.
