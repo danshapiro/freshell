@@ -518,8 +518,13 @@ pub async fn drain_and_associate(state: &WsState) {
     };
 
     // Arm step: registry truth (mode/managed/running/cwd) for panes the
-    // hub tagged at Created. Cheap (a small directory snapshot + an
-    // idempotent arm) and runs at most once per pane per server lifetime.
+    // hub tagged at Created. This runs on EVERY 150 ms sweep while any
+    // antigravity pane is tagged: each sweep takes a full
+    // `state.registry.directory()` snapshot and walks it (the sweep's
+    // standing cost — bounded by the registry's pane count). Only the
+    // `arm()` call itself is idempotent: a pane already armed is
+    // skipped, so the per-pane work past the first sweep is one
+    // registry-row check, never a re-arm.
     let pane_ids: HashSet<String> = association.pane_ids().into_iter().collect();
     if !pane_ids.is_empty() {
         for entry in state.registry.directory() {

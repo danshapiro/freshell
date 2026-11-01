@@ -1083,20 +1083,33 @@ async fn managed_default_legacy_codex_carrier_never_consults_gate_or_plans() {
 // fixture-validated only, and a wrong schema would make REAL conversations
 // answer Absent and visibly refuse/replace every restore with a misleading
 // "not found on disk" notice. Until then a stale antigravity resume id
-// passes through UNGATED (gemini-style) — the CLI's own error surfaces
-// in-pane, never a replacement conversation. Both scenarios run against an
-// `AbsentButObservedProbe` — the answer that WOULD gate a validated
-// provider into the typed SESSION_MISSING refusal — so any future gate
-// activation flips these tests red and forces an evidenced decision.
+// passes through UNGATED (gemini-style) and the CLI's own PROBED behavior
+// surfaces in-pane (round 7, Major 1 — the real binaries v1.4.10 AND
+// v1.4.12 print `warning: conversation "<id>" not found` and CONTINUE
+// INTO A FRESH INTERACTIVE SESSION, never a failure exit): the pane
+// stays ALIVE under its requested id, no replacement conversation is
+// ever spawned by Freshell, and the pane rebinds to the CLI's fresh
+// conversation on its next clean prompt (pinned by the
+// antigravity_session_rebind suite — this gate harness wires no
+// activity hub, so it pins the GATE door only). Both scenarios run
+// against an `AbsentButObservedProbe` — the answer that WOULD gate a
+// validated provider into the typed SESSION_MISSING refusal — so any
+// future gate activation flips these tests red and forces an evidenced
+// decision.
 
 /// A fake `agy` for the deferral scenarios: records `"$@"` as ONE line per
 /// invocation to `capture`, then resolves `--conversation <id>` against the
 /// test-seeded brain tree — an existing
 /// `brain/<id>/.system_generated/logs/transcript.jsonl` is resumed (echo +
-/// stay alive); anything else errors VISIBLY on stderr with a greppable
-/// message and exits non-zero after a short grace (the `sleep` keeps the
-/// create's post-spawn tail from racing the dead-PTY ownership guard — the
-/// crash-once flake lesson documented on `crash_once_claude_spec`).
+/// stay alive); anything else follows the PROBED missing-id contract
+/// (round 7, Major 1; real binaries v1.4.10 AND v1.4.12, the round-6 PTY
+/// receipts): print `warning: conversation "<id>" not found` to stderr and
+/// CONTINUE into the fresh interactive session — NO failure exit, so no
+/// auto-resume respawn cycle ever runs. This gate harness wires no
+/// activity hub and its fresh arm models liveness only (`sleep`, no store
+/// writes): the fresh conversation's MINT and the dead→new REBIND are
+/// pinned by the antigravity_session_rebind suite and e2e scenario 8,
+/// which run the full association wiring.
 fn write_fake_agy(path: &std::path::Path, capture: &std::path::Path, brain_root: &std::path::Path) {
     let script = format!(
         "#!/bin/sh\n\
@@ -1109,15 +1122,11 @@ fn write_fake_agy(path: &std::path::Path, capture: &std::path::Path, brain_root:
          done\n\
          if [ -n \"$conv\" ] && [ -f \"{brain}/brain/$conv/.system_generated/logs/transcript.jsonl\" ]; then\n\
            echo \"agy: resumed conversation $conv\"\n\
-           exec sleep 30\n\
-         fi\n\
-         if [ -n \"$conv\" ]; then\n\
-           echo \"agy: no conversation $conv on disk\" >&2\n\
-           sleep 1\n\
-           exit 3\n\
+         elif [ -n \"$conv\" ]; then\n\
+           printf 'warning: conversation \"%s\" not found\\n' \"$conv\" >&2\n\
          fi\n\
          exec sleep 30\n\
-        ",
+         ",
         cap = capture.display(),
         brain = brain_root.display(),
     );
@@ -1382,12 +1391,20 @@ async fn antigravity_restore_with_brain_on_disk_resumes_ungated_never_substitute
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The deferral's designed honest failure mode: an absent id still launches
-/// the pane with `--conversation <absent id>`, the CLI's own error surfaces
-/// IN-PANE, and NO fresh replacement conversation spawns (substitution is
-/// exactly what deferral forbids — the stale row survives untouched too).
+/// The deferral's designed honest failure mode (round 7: the PROBED
+/// contract): an absent id still launches the pane with
+/// `--conversation <absent id>`, and the REAL CLI (argv/PTY probes
+/// v1.4.10 + v1.4.12) prints `warning: conversation "<id>" not found`
+/// and CONTINUES INTO A FRESH INTERACTIVE SESSION — no failure exit, so
+/// no auto-resume respawn cycle ever runs. The pane STAYS ALIVE under
+/// the requested id (exactly one spawn, forever — Freshell never
+/// substitutes a fresh id of its own), the CLI's own warning surfaces
+/// IN-PANE, and the stale row survives untouched. The follow-on tail —
+/// the first clean prompt mints the CLI's fresh conversation and the
+/// pane REBINDS dead→new — is pinned by the antigravity_session_rebind
+/// suite (full association wiring; this harness wires no activity hub).
 #[tokio::test(flavor = "multi_thread")]
-async fn antigravity_restore_with_absent_id_launches_cli_error_in_pane_never_replaces() {
+async fn antigravity_restore_with_absent_id_warns_in_pane_stays_alive_never_replaces() {
     let conv = "00000000-1111-2222-3333-444444444444"; // never seeded
     let base = std::env::temp_dir().join(format!(
         "freshell-resume-gate-agy-gone-{}-{}",
@@ -1423,7 +1440,8 @@ async fn antigravity_restore_with_absent_id_launches_cli_error_in_pane_never_rep
         "the stale id passes through to the CLI — never silently dropped or replaced: {frame}"
     );
 
-    // The pane carries the CLI's OWN error (in-pane surfacing).
+    // The pane carries the CLI's OWN warning (in-pane surfacing) — the
+    // probed byte-faithful line, quotes included.
     let terminal_id = frame["terminalId"]
         .as_str()
         .expect("terminalId")
@@ -1448,16 +1466,34 @@ async fn antigravity_restore_with_absent_id_launches_cli_error_in_pane_never_rep
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let (acc, _gap, _closed) = common::drain_until_marker_or_deadline(
         &mut ws,
-        &format!("agy: no conversation {conv}"),
+        &format!("warning: conversation \"{conv}\" not found"),
         deadline,
     )
     .await;
     assert!(
-        acc.contains(&format!("agy: no conversation {conv}")),
-        "the CLI's own error must surface in the pane: {acc:?}"
+        acc.contains(&format!("warning: conversation \"{conv}\" not found")),
+        "the CLI's own probed warning must surface in the pane: {acc:?}"
     );
 
-    // NO fresh replacement conversation spawns — exactly one row, forever.
+    // The pane STAYS ALIVE: the probed contract has NO failure exit, so
+    // the registry keeps the terminal Running through a bounded window
+    // (the pre-round-7 fake exited and drove an auto-resume respawn
+    // cycle the real CLI never produces).
+    let liveness_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < liveness_deadline {
+        let entry = registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == terminal_id);
+        assert!(
+            entry.is_some_and(|e| { e.status == freshell_protocol::TerminalRunStatus::Running }),
+            "the stale-resume pane stays ALIVE (the probed fresh session never exits)"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // NO fresh replacement conversation spawns — exactly one row, forever
+    // (no gate spawn, and no auto-resume respawn cycle either).
     assert_no_extra_spawn_rows(&capture, 1);
     assert_eq!(
         ledger

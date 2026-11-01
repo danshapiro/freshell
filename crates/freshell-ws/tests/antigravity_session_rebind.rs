@@ -37,6 +37,18 @@
 //!   4. Restart resume adjacency: a restarted server (fresh in-memory
 //!      state, same antigravity home) restores the pane with the adjacent
 //!      `--conversation <bound id>` argv and identity persists.
+//!
+//!      4b. Stale resume id — the PROBED missing-id contract (round 7,
+//!      Major 1): a restore create carrying an id that is NOT on disk
+//!      launches with `--conversation <dead id>`, the fake reproduces
+//!      the real binaries' probed behavior (warn on stderr, then
+//!      CONTINUE into a fresh interactive session — v1.4.10 + v1.4.12
+//!      PTY receipts), the pane STAYS ALIVE (exactly one spawn, no
+//!      respawn cycle), its identity keeps naming the dead id, and the
+//!      first clean prompt lands in the CLI's NEW conversation → the
+//!      pane REBINDS dead→new through the same rebind tail (loud
+//!      supersede via previousSessionId; the dead id never materializes
+//!      on disk).
 //!   5. Zero-turn pane (created, no submit): no sessionRef, no association
 //!      frame, pending marker retained.
 //!   6. Late-event rejection: a pane adopts, its process dies, the pane
@@ -119,6 +131,15 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   initializes `brain/conv-<FRESHELL_TERMINAL_ID>/` with a
 ///   `session_start` ownership record whose `workspacePaths` is the PTY
 ///   child's own cwd (`$(pwd)` — the pane's cwd).
+/// - A `--conversation <id>` whose store is MISSING follows the PROBED
+///   real-binary contract (round 7, Major 1; v1.4.10 + v1.4.12 PTY
+///   receipts in the plan's Provider Contract Record): print
+///   `warning: conversation "<id>" not found` to stderr and CONTINUE
+///   into a fresh interactive session under a NEW id (the fake's
+///   normal fresh mint) — no failure exit, no invented transcript under
+///   the requested dead id (the pre-round-7 fake invented one, a
+///   contract no real binary has; scenario 4b pins the rebind that
+///   follows).
 /// - Per stdin line: appends a `user_message` record (ms-precision ISO
 ///   `at` — the parser's documented timestamp shape) carrying the line
 ///   text and the active conversation id.
@@ -175,6 +196,7 @@ fi
 # value-taking flag followed by another flag is the loud-misparse shape;
 # a value-taking flag at the END of argv is the missing-argument shape.
 prev=""
+RESUMED=0
 for arg in "$@"; do
   case "$prev" in
     -i|--prompt-interactive)
@@ -189,7 +211,7 @@ for arg in "$@"; do
     --conversation)
       case "$arg" in
         -*) printf 'flag needs an argument: -conversation\n' >&2; exit 2 ;;
-        *) CONV="$arg" ;;
+        *) CONV="$arg"; RESUMED=1 ;;
       esac
       ;;
   esac
@@ -208,6 +230,19 @@ esac
 transcript_of() { printf '%s/%s/.system_generated/logs/transcript.jsonl' "$AGY_BRAIN" "$CONV"; }
 TRANSCRIPT="$(transcript_of)"
 if [ ! -f "$TRANSCRIPT" ]; then
+  if [ "$RESUMED" = "1" ]; then
+    # The PROBED missing-id contract (round 7, Major 1; real binaries
+    # v1.4.10 + v1.4.12, round-6 PTY receipts in the plan's Provider
+    # Contract Record): `agy --conversation <unknown-id>` prints
+    # `warning: conversation "<id>" not found` and CONTINUES INTO A
+    # FRESH INTERACTIVE SESSION — a NEW conversation id (this fake's
+    # normal fresh mint path), never the requested dead one, and never
+    # a failure exit (the pre-round-7 fake invented a transcript under
+    # the REQUESTED id — a contract no real binary has).
+    printf 'warning: conversation "%s" not found\n' "$CONV" >&2
+    CONV="conv-$FRESHELL_TERMINAL_ID"
+    TRANSCRIPT="$(transcript_of)"
+  fi
   mkdir -p "$(dirname "$TRANSCRIPT")"
   printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
     "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
@@ -987,6 +1022,106 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         "identity persists across the restart (create-time reseed from the sessionRef)"
     );
 
+    // ── Scenario 4b: stale resume id — the PROBED missing-id contract ──
+    // (round 7, Major 1): the real binaries (argv/PTY probes, v1.4.10
+    // AND v1.4.12 — round-6 receipts, the plan's Provider Contract
+    // Record) answer `agy --conversation <unknown-id>` with
+    // `warning: conversation "<id>" not found` on stderr and CONTINUE
+    // INTO A FRESH INTERACTIVE SESSION — never a failure exit, so the
+    // auto-resume respawn cycle never runs. The restore create still
+    // carries the EXACT dead id (the deferred gate), exactly ONE spawn
+    // happens, the pane's identity keeps naming the dead id, and the
+    // pane's first clean prompt lands in the CLI's NEW conversation —
+    // the locator binds it and the pane REBINDS dead→new through the
+    // SAME rebind tail as the in-CLI switch. Never a silent
+    // substitution: the supersede is loud on the wire (the frame names
+    // the dead id as previousSessionId) and the dead id never
+    // materializes as a conversation.
+    let stale_conv = "conv-stale-never-on-disk-4b";
+    let created4b =
+        create_resume_await_created(&mut ws2, &cwd, "req-agy-sc4b-stale", stale_conv).await;
+    let tid4b = created4b["terminalId"]
+        .as_str()
+        .expect("stale-resume create spawns")
+        .to_string();
+    assert_eq!(
+        created4b["sessionRef"]["sessionId"], stale_conv,
+        "the dead id passes through the create door verbatim — never substituted: {created4b}"
+    );
+    assert_eq!(
+        registry_resume_id(&server2.registry, &tid4b).as_deref(),
+        Some(stale_conv),
+        "the restored pane's registry meta names the dead id (create-time reseed)"
+    );
+    // Exactly ONE spawn carries the dead id — and it STAYS one (the
+    // pane is ALIVE; a death would drive the auto-resume respawn cycle
+    // and append rows).
+    let rows4b = wait_argv_rows(&argv_capture_2, |rows| {
+        rows.iter()
+            .any(|r| conversation_pair_position(r, stale_conv).is_some())
+    })
+    .await;
+    assert_eq!(
+        rows4b
+            .iter()
+            .filter(|r| conversation_pair_position(r, stale_conv).is_some())
+            .count(),
+        1,
+        "exactly one spawn for the stale resume (no respawn cycle): {rows4b:?}"
+    );
+    // The first clean prompt lands in the CLI's FRESH conversation (a
+    // NEW id — the fake's normal mint path) and the pane REBINDS
+    // dead→new through rebind_antigravity_identity.
+    submit_prompt(&mut ws2, &tid4b, "prompt after the stale resume delta").await;
+    let rebound4b = next_associated_frame(&mut ws2, &tid4b, "sc4b-stale-rebind").await;
+    let fresh_conv = conv_of(&tid4b);
+    assert_ne!(
+        fresh_conv, stale_conv,
+        "the CLI's fresh session is a NEW conversation id (the dead id is never minted)"
+    );
+    assert_eq!(
+        rebound4b["sessionRef"]["sessionId"], fresh_conv,
+        "the rebind moves the pane to the CLI's fresh conversation: {rebound4b}"
+    );
+    assert_eq!(
+        rebound4b["previousSessionId"], stale_conv,
+        "the rebind names the superseded DEAD id — a loud supersede, never a swap: {rebound4b}"
+    );
+    assert_eq!(
+        registry_resume_id(&server2.registry, &tid4b).as_deref(),
+        Some(fresh_conv.as_str()),
+        "registry meta follows the stale-resume rebind"
+    );
+    assert!(
+        server2
+            .state
+            .identity
+            .session_ref_for(&tid4b)
+            .is_some_and(|r| r.provider == "antigravity" && r.session_id == fresh_conv),
+        "the identity row follows the stale-resume rebind"
+    );
+    assert!(
+        !transcript_path(home.path(), stale_conv).exists(),
+        "the requested dead id never materialized as a conversation on disk"
+    );
+    assert!(
+        transcript_path(home.path(), &fresh_conv).exists(),
+        "the CLI's fresh conversation exists under its NEW id"
+    );
+    // No further spawn EVER: the pane stayed alive through the rebind
+    // (the pre-round-7 fake exited on a missing store and drove a
+    // respawn cycle the real CLI never produces).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows_after = argv_rows(&argv_capture_2);
+    assert_eq!(
+        rows_after
+            .iter()
+            .filter(|r| conversation_pair_position(r, stale_conv).is_some())
+            .count(),
+        1,
+        "the stale-resume pane never respawned (alive: no exit, no cycle): {rows_after:?}"
+    );
+
     // ── Scenario 5: zero-turn pane (created, no submit) ────────────────
     let tid5 = create_pane(&mut ws, &cwd, "req-agy-sc5-zero-turn").await;
     to_kill.push(tid5.clone());
@@ -1290,6 +1425,7 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         server.registry.kill(tid);
     }
     server2.registry.kill(&tid4);
+    server2.registry.kill(&tid4b);
     let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&argv_capture_2);
     let _ = std::fs::remove_file(&fake_agy);

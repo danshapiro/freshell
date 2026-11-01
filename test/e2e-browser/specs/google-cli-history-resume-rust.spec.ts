@@ -63,23 +63,26 @@ import type { Page } from '@playwright/test'
  *      sessionRef, no resume argv, and NO conversation was ever minted for
  *      it (the brain tree holds only the bound pane's conversation).
  *
-  * TEST 3 — deleted store, honest restore (two-part shape):
-  *   8. Delete `brain/<id>/` under the isolated HOME. PART A: the restart
-  *      resume attempt spawns NOTHING — the reconcile door intercepts the
-  *      deleted store (`dead_session`/`session_not_on_disk`, no provider
-  *      carve-out) into the loud user-driven Dead-sessions dialog, so no
-  *      restore spawn ever happens on the restart path. PART B: a direct
-  *      create-door restore attempt (this spec's raw WS client) launches
-  *      with `--conversation <id>` (the antigravity resume gate is deferred
-  *      by design — Task 7's honest-restore: no SpawnFresh substitution),
-  *      the fake's OWN missing-store error surfaces in the captured output
-  *      stream (`agy: conversation <id> not found`) with a non-zero exit,
-  *      NO replacement conversation is ever minted (no fresh-argv row, no
-  *      new brain dir, the pane's sessionRef still names the deleted id),
-  *      and `--continue` never appears. (The bounded auto-resume lane may
-  *      re-attempt the SAME id a few times — every retry carries the same
-  *      `--conversation <id>` pair, so the no-replacement invariants hold
-  *      at every instant.)
+ * TEST 3 — deleted store, honest restore (two-part shape):
+ *   8. Delete `brain/<id>/` under the isolated HOME. PART A: the restart
+ *      resume attempt spawns NOTHING — the reconcile door intercepts the
+ *      deleted store (`dead_session`/`session_not_on_disk`, no provider
+ *      carve-out) into the loud user-driven Dead-sessions dialog, so no
+ *      restore spawn ever happens on the restart path. PART B: a direct
+ *      create-door restore attempt (this spec's raw WS client) launches
+ *      with `--conversation <id>` (the antigravity resume gate is deferred
+ *      by design — Task 7's honest-restore: no SpawnFresh substitution),
+ *      and the PROBED real-binary contract (v1.4.10 + v1.4.12, round-6
+ *      receipts; the fake reproduces it byte-for-byte) plays out end to
+ *      end: the CLI prints `warning: conversation "<id>" not found` in
+ *      the pane and CONTINUES INTO A FRESH INTERACTIVE SESSION — the
+ *      pane stays ALIVE (exactly one spawn, no respawn cycle, no exit),
+ *      its identity keeps naming the deleted id, the next clean prompt
+ *      mints brain/<new-id>/ and the pane REBINDS dead→new through the
+ *      server's rebind machinery (previousSessionId names the dead id),
+ *      and the History read model lists the fresh conversation. Never a
+ *      silent replacement: the dead id is never re-minted and
+ *      `--continue` never appears.
   *
   * Cloud legality: deterministic fakes, generous polls (15-100 s), no
  * wall-clock-sensitive waits, and every selector is role/accessible-name
@@ -854,7 +857,7 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
     }
   })
 
-  test('scenario 8: a deleted brain/<id> parks the pane in the distinct dead-session state and a direct resume attempt surfaces the fake\'s missing-store error — never a replacement conversation', async ({ page }) => {
+  test('scenario 8: a deleted brain/<id> parks the pane in the distinct dead-session state; a direct resume attempt warns in-pane, stays alive, and rebinds to the CLI\'s fresh conversation — never a silent replacement', async ({ page }) => {
     const fixture = await makeFixture('freshell-google-cli-deleted-store-')
     try {
       const server = await startOwnedServer(fixture)
@@ -961,19 +964,30 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
           // A deliberate restore create carrying the deleted sessionRef goes
           // through the CREATE door, where the antigravity resume gate is
           // DEFERRED by design (Task 7: never a typed SESSION_MISSING
-          // refusal, never a substituted fresh id): the CLI launches with the
-          // ADJACENT `--conversation <deleted id>` pair, the fake's OWN
-          // missing-store error surfaces in its output stream, and the
-          // process dies non-zero. Driven through the spec-owned raw WS
-          // client, attached to the spawned terminal so the error bytes and
-          // the exit code are captured directly.
+          // refusal, never a Freshell-side substituted id): the CLI
+          // launches with the ADJACENT `--conversation <deleted id>` pair,
+          // and the REAL CLI contract (probed v1.4.10 + v1.4.12, the
+          // round-6 PTY receipts; the fake reproduces it byte-for-byte)
+          // prints `warning: conversation "<id>" not found` and CONTINUES
+          // INTO A FRESH INTERACTIVE SESSION — the pane STAYS ALIVE (no
+          // exit, no auto-resume respawn cycle, exactly ONE spawn), the
+          // warning surfaces in the pane's own output, and the pane's
+          // identity still names the DEAD id. The next clean prompt mints
+          // brain/<new-id>/ and the pane REBINDS dead→new through the
+          // server's rebind machinery (the association frame names the
+          // dead id as previousSessionId) — a stale resume never
+          // dead-ends the pane and never silently substitutes: it warns
+          // AND rebinds transparently. Driven through the spec-owned raw
+          // WS client, attached to the spawned terminal so the output
+          // bytes and the association frames are captured directly.
+          let newId: string | null = null
           let ws: WebSocket | null = null
           try {
           ws = await connectAndHello(info.wsUrl, info.token)
           // A persistent frame collector: everything this connection
           // receives from here on (the created reply, the attach replay,
-          // the fake's output stream, the exit) lands in one array the
-          // polls below scan — no listener-arithmetic races.
+          // the fake's output stream, the rebind broadcast) lands in one
+          // array the polls below scan — no listener-arithmetic races.
           const collected: any[] = []
           ws.on('message', (raw) => {
             try {
@@ -1010,27 +1024,14 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
           const resumeTerminalId: string = created.terminalId
           expect(resumeTerminalId).toBeTruthy()
 
-          // ATTACH WITH THE REAL CLIENT'S RECOVERY DISCIPLINE. The spawned
-          // fake dies within its first milliseconds (the missing store is
-          // the scenario's point), and the crash auto-resume lane then
-          // holds the session for a respawn cycle: a one-shot attach that
-          // lands inside that window is bounced with
-          // `error{SESSION_RESERVED, retryAfterMs}` — whose message
-          // explicitly says "retry after it settles" — and the pane's
-          // terminal may be REPLACED (a new terminal, same sessionRef —
-          // the bounded respawn cycle the tail invariants below already
-          // tolerate). The production client retries the bounce and folds
-          // `terminal.replaced` into the pane; this spec-owned client
-          // does the same, bounded: attach to the pane's CURRENT terminal
-          // until output streams (the respawned fakes print the SAME
-          // missing-store error, so every respawn is another chance to
-          // observe it), following replaced folds along the way. (A
-          // one-shot attach raced the recovery cycle and lost on the
-          // contended cloud runners — a pre-existing spec flake, proven
-          // by parent-commit cloud runs failing the same poll.)
+          // ATTACH. Under the probed contract the fake never dies, so a
+          // plain attach streams the warning; the bounded retry below
+          // merely tolerates a transient SESSION_RESERVED bounce (the
+          // pre-round-7 spec followed auto-resume replacement chains
+          // that only existed because the FAKE exited — cycles the real
+          // CLI never produces).
           const attachDeadline = Date.now() + 30_000
           let currentTerminalId: string = resumeTerminalId
-          const chainIds = new Set<string>([resumeTerminalId])
           let attached = false
           for (let attempt = 0; !attached && Date.now() < attachDeadline; attempt += 1) {
             const attachRequestId = `att-agy-deleted-store-${attempt}`
@@ -1042,16 +1043,8 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
               cols: 120,
               rows: 30,
             }))
-            const outcome = await new Promise<'output' | 'bounce' | 'replaced' | 'timeout'>((resolve) => {
+            const outcome = await new Promise<'output' | 'bounce' | 'timeout'>((resolve) => {
               const timer = setInterval(() => {
-                const replaced = collected.find((m) => m?.type === 'terminal.replaced' && m?.oldTerminalId === currentTerminalId)
-                if (replaced) {
-                  clearInterval(timer)
-                  currentTerminalId = String(replaced.newTerminalId)
-                  chainIds.add(currentTerminalId)
-                  resolve('replaced')
-                  return
-                }
                 const bounce = collected.find((m) => m?.type === 'error' && m?.requestId === attachRequestId && m?.code === 'SESSION_RESERVED')
                 if (bounce) {
                   clearInterval(timer)
@@ -1077,16 +1070,13 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
               // inside it and retry (a poll, never a fixed wait).
               await new Promise((resolve) => setTimeout(resolve, 300))
             }
-            // 'replaced' loops immediately with the new terminal id;
             // 'timeout' exits the loop and fails the assertion below.
           }
-          expect(attached, 'the deleted-store resume terminal (or one of its bounded auto-resume replacements) never streamed output to this client').toBe(true)
+          expect(attached, 'the stale-resume terminal never streamed output to this client').toBe(true)
 
-          // The fake's OWN missing-store error surfaces in the resumed
-          // terminal's output stream (the attach delivers the retained
-          // tail even if the child already died), and the CLI then dies
-          // NON-ZERO — both delivered to this attached client.
-          const errorNeedle = `agy: conversation ${boundId} not found`
+          // The CLI's OWN probed warning surfaces in the resumed
+          // terminal's output stream — byte-faithful, quotes included.
+          const warningNeedle = `warning: conversation "${boundId}" not found`
           // The poll's value on a miss is the collected-frame summary, so
           // a failure names exactly what this attached client saw.
           const summarizeCollected = () => collected.map((m) => {
@@ -1109,43 +1099,94 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
               .map((m) => String(m?.data ?? ''))
               .join('')
               .replace(/[\r\n]/g, '')
-            return joined.includes(errorNeedle) ? true : summarizeCollected()
+            return joined.includes(warningNeedle) ? true : summarizeCollected()
           }, { timeout: 45_000 }).toBe(true)
-          // The CLI dies NON-ZERO: the exit frame is delivered to this
-          // ATTACHED client for a terminal in the followed chain (the
-          // original when the attach won the race, else one of its
-          // bounded replacements — every spawn carries the SAME deleted
-          // id and dies the SAME non-zero death).
+
+          // The pane STAYS ALIVE: no exit frame for the resumed terminal
+          // ever arrives (a bounded absence window — the pre-round-7
+          // fake exited 1 and drove a respawn cycle the real CLI never
+          // produces), and the spawn stays exactly ONE (no respawn
+          // row carrying the dead id).
+          await new Promise((resolve) => setTimeout(resolve, 2_000))
+          const exited = collected.find(
+            (m) => m?.type === 'terminal.exit' && m?.terminalId === resumeTerminalId && typeof m?.exitCode === 'number',
+          )
+          expect(exited, 'the stale-resume pane never exits (the probed fresh session stays alive)').toBeUndefined()
+          const resumeSpawnCount = (await readArgvLog(fixture.agyArgLog))
+            .filter((row) => {
+              const idx = row.argv.indexOf('--conversation')
+              return idx !== -1 && row.argv[idx + 1] === boundId
+            }).length
+          expect(resumeSpawnCount, 'exactly ONE spawn carries the dead id (no respawn cycle, no replacement spawn)').toBe(1)
+
+          // The pane's identity still names the DEAD id (the created
+          // frame carried it verbatim — the rebind below names it as
+          // previousSessionId, proving the identity held the dead id up
+          // to the rebind). The next clean prompt mints the CLI's fresh
+          // conversation and REBINDS the pane dead→new.
+          ws.send(JSON.stringify({ type: 'terminal.input', terminalId: resumeTerminalId, data: 'stale-resume nonce 6y3n8p\r' }))
+
+          // The fresh conversation is minted under a NEW id — the dead id
+          // is never re-minted.
           await expect.poll(async () => {
-            const exit = collected.find(
-              (m) => m?.type === 'terminal.exit' && chainIds.has(String(m?.terminalId)) && typeof m?.exitCode === 'number',
-            )
-            return exit ? exit.exitCode : null
-          }, { timeout: 30_000 }).toBe(1)
+            const ids = await listBrainIds(info)
+            const fresh = ids.find((id) => id !== boundId)
+            if (fresh) newId = fresh
+            return newId
+          }, { timeout: 30_000, message: 'the CLI\'s fresh session mints a NEW brain/<id>/ (the dead id is never re-minted)' }).not.toBeNull()
+          expect(newId).not.toBe(boundId)
+          expect(newId).toMatch(UUID_RE)
+
+          // …and the pane REBINDS dead→new through the server's rebind
+          // machinery: the association frame names the NEW conversation
+          // with the DEAD id as previousSessionId (the loud supersede —
+          // never a silent swap).
+          await expect.poll(async () => {
+            const hit = collected.find((m) => m?.type === 'terminal.session.associated'
+              && m?.terminalId === resumeTerminalId
+              && m?.sessionRef?.provider === 'antigravity'
+              && m?.sessionRef?.sessionId === newId
+              && m?.previousSessionId === boundId)
+            return hit ? true : summarizeCollected()
+          }, { timeout: 45_000, message: 'the stale-resume pane REBINDS dead→new (terminal.session.associated with previousSessionId = the dead id)' }).toBe(true)
+
+          // Sidebar/history reflect the NEW conversation: the session
+          // index picks the minted transcript up through the watcher and
+          // the History read model lists it (generous budget — the
+          // watcher coalesces events and the re-parse lands late under
+          // cloud contention; the poll settles the moment the row
+          // appears).
+          await expect.poll(async () => {
+            const rows = await fetchDirectory(info)
+            return rows.some((row) => row.provider === 'antigravity' && row.sessionId === newId)
+              ? true
+              : `directory rows: ${rows.filter((row) => row.provider === 'antigravity').map((row) => row.sessionId).join(',')}`
+          }, { timeout: 100_000, message: 'the History read model lists the rebound fresh conversation' }).toBe(true)
         } finally {
           closeWs(ws)
         }
 
         // ── The no-replacement invariants (both doors) ───────────────────
-        // argv: row 0 is the pane's original fresh launch; EVERY later row
-        // carries the ADJACENT `--conversation <deleted id>` pair (the
-        // Part-B attempt plus any bounded auto-resume retries of the SAME
-        // id — a replacement fresh spawn, or a row naming any other id,
-        // would both fail here). `--continue` never appears.
-        await expect.poll(async () => (await readArgvLog(fixture.agyArgLog)).length, { timeout: 30_000 }).toBeGreaterThanOrEqual(2)
+        // argv: row 0 is the pane's original fresh launch; row 1 is the
+        // Part-B resume attempt carrying the ADJACENT `--conversation
+        // <deleted id>` pair; NO further row EVER exists (no respawn
+        // cycle, no replacement fresh spawn — the pane stayed alive), and
+        // no row names any other id. `--continue` never appears.
+        await expect.poll(async () => (await readArgvLog(fixture.agyArgLog)).length, { timeout: 30_000 }).toBe(2)
         const rows = await readArgvLog(fixture.agyArgLog)
         expectNoContinueAnywhere(rows)
         expect(rows[0].argv, 'row 0 is the original fresh launch').not.toContain('--conversation')
-        for (let i = 1; i < rows.length; i += 1) {
-          const argv = rows[i].argv
-          const idx = argv.indexOf('--conversation')
-          expect(idx, `post-delete spawn ${i} must be a resume attempt: ${JSON.stringify(argv)}`).not.toBe(-1)
-          expect(argv[idx + 1], `the resume attempt names the deleted id: ${JSON.stringify(argv)}`).toBe(boundId)
-        }
+        expect(rows.length, 'exactly two spawns: the fresh launch + the ONE stale resume').toBe(2)
+        const resumeIdx = rows[1].argv.indexOf('--conversation')
+        expect(resumeIdx, 'the resume attempt carries the adjacent pair').not.toBe(-1)
+        expect(rows[1].argv[resumeIdx + 1], 'the resume attempt names the deleted id').toBe(boundId)
 
-        // The brain tree stays EMPTY: the deleted conversation was never
-        // re-minted and no replacement conversation was created.
-        await expect.poll(async () => listBrainIds(info), { timeout: 15_000 }).toEqual([])
+        // The brain tree holds EXACTLY the fresh conversation: the
+        // deleted conversation was never re-minted under its dead id —
+        // the CLI's fresh session minted a NEW id and the pane is
+        // rebound to it.
+        expect(newId, 'the rebind landed before the tail invariants').not.toBeNull()
+        await expect.poll(async () => listBrainIds(info), { timeout: 15_000 }).toEqual([newId])
       } finally {
         await server.stop().catch(() => {})
       }

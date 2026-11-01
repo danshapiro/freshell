@@ -43,10 +43,17 @@
 //   ran two turns against one captured submit, so multi-line prompts never
 //   bound — the round-3 review finding.)
 // - resume (`--conversation <id>` anywhere in argv — the server's adjacent
-//   resumeArgs pair): missing brain/<id>/ ⇒ non-zero exit with a greppable
-//   error; else `agy: resumed conversation <id>` and the existing transcript
-//   continues (a session_start {source:"resume"} record is appended — the
-//   resumed.sanitized.jsonl shape).
+//   resumeArgs pair): an existing brain/<id>/ continues (`agy: resumed
+//   conversation <id>` + a session_start {source:"resume"} record appended
+//   — the resumed.sanitized.jsonl shape); a MISSING brain/<id>/ follows
+//   the PROBED missing-id contract (round 7, Major 1; real binaries
+//   v1.4.10 AND v1.4.12, the round-6 PTY receipts in the plan's Provider
+//   Contract Record): print `warning: conversation "<id>" not found` to
+//   stderr and CONTINUE INTO A FRESH INTERACTIVE SESSION — the same
+//   `agy> ` prompt and the same first-prompt mint under a NEW
+//   crypto.randomUUID() (the fake's normal mint path), NEVER a failure
+//   exit and NEVER a transcript under the requested dead id (the
+//   pre-round-7 fake exited 1 — a contract no real binary has).
 // - argv mirrored to FAKE_AGY_TERMINAL_ARGV_LOG as JSONL (so specs can
 //   prove the launch shape: NO prompt-taking `-i` (panes launch BARE),
 //   no headless `-p`, `--conversation <id>` adjacent, `--continue` NEVER).
@@ -325,9 +332,17 @@ async function mintConversationGated() {
   return mintConversation()
 }
 
+// The PROBED missing-id contract (round 7, Major 1; real binaries v1.4.10
+// AND v1.4.12, the round-6 PTY receipts): the CLI prints
+// `warning: conversation "<id>" not found` (byte-faithful, quotes
+// included) and CONTINUES — no failure exit. The CALLER owns what
+// "continues" means: the launch arm prints the fresh prompt (the first
+// submit then mints a NEW conversation), and the in-CLI `resume:` verb
+// warns and keeps the current conversation (the argv form is the probed
+// shape; the in-CLI form is this fake's documented choice, following
+// the only real-binary evidence: the CLI never dies on a missing id).
 function missingConversation(conversationId) {
-  process.stderr.write(`agy: conversation ${conversationId} not found\r\n`)
-  exitWith(1)
+  process.stderr.write(`warning: conversation "${conversationId}" not found\r\n`)
 }
 
 // ── the per-line turn program ────────────────────────────────────────────────
@@ -416,6 +431,8 @@ async function handleLine(line) {
   if (resumeMatch) {
     const id = resumeMatch[1]
     if (!fs.existsSync(brainDir(id))) {
+      // The probed missing-id contract: warn and CONTINUE (the CLI never
+      // dies on a missing id) — the pane keeps its CURRENT conversation.
       missingConversation(id)
       return
     }
@@ -486,7 +503,13 @@ const conversationIdx = argv.indexOf('--conversation')
 if (conversationIdx !== -1) {
   const resumeId = argv[conversationIdx + 1] ?? ''
   if (!fs.existsSync(brainDir(resumeId))) {
+    // The PROBED missing-id contract (round 7, Major 1): warn, then
+    // CONTINUE into the FRESH interactive session — the pane stays
+    // alive under the requested (dead) id, and the first prompt mints
+    // a NEW conversation (the normal mint path below). Never an exit,
+    // never a transcript under the requested dead id.
     missingConversation(resumeId)
+    process.stdout.write('agy> \r\n')
   } else {
     appendRecord(resumeId, sessionStartRecord(resumeId, 'resume'))
     activateConversation(resumeId)
