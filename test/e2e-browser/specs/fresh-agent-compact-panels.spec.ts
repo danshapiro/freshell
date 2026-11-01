@@ -251,8 +251,17 @@ async function splitFreshPane(page: Page, direction: 'horizontal' | 'vertical'):
 
 async function fitRoot(page: Page, target: { height?: number; width?: number }, divisor = 1, heightDivisor = divisor): Promise<void> {
   const root = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
-  const before = (await root.boundingBox())!; const viewport = page.viewportSize()!
-  await page.setViewportSize({ width: Math.round(viewport.width + ((target.width ?? before.width) - before.width) * divisor), height: Math.round(viewport.height + ((target.height ?? before.height) - before.height) * heightDivisor) })
+  // Responsive chrome can change height after a resize (for example mobile
+  // landscape). Remeasure that change instead of assuming a fixed budget.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = (await root.boundingBox())!; const viewport = page.viewportSize()!
+    const next = { width: Math.round(viewport.width + ((target.width ?? before.width) - before.width) * divisor), height: Math.round(viewport.height + ((target.height ?? before.height) - before.height) * heightDivisor) }
+    if (next.width === viewport.width && next.height === viewport.height) break
+    await page.setViewportSize(next)
+    await page.evaluate(() => new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    }))
+  }
   if (target.height) await expect.poll(async () => (await root.boundingBox())!.height).toBeCloseTo(target.height, 0)
   if (target.width) await expect.poll(async () => (await root.boundingBox())!.width).toBeCloseTo(target.width, 0)
 }
