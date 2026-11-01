@@ -98,6 +98,7 @@ pub(crate) fn provider_launch_context_from_home_at_with_selected_roots(
     mcp_capability: Option<McpCapabilityReference>,
     selected_roots: &[freshell_platform::opencode_recipe::DiscoveryRoot],
 ) -> Result<Option<ProviderLaunchContext>, String> {
+    let mcp_enabled = mcp_capability.is_some();
     let (root, entries, preparation) = match provider {
         "claude" => (
             ".claude",
@@ -120,11 +121,16 @@ pub(crate) fn provider_launch_context_from_home_at_with_selected_roots(
             &["config.toml", "AGENTS.md", "skills", "rules"][..],
             ProviderPreparation::Codex {
                 approval_default: None,
-                // Base args stay empty: managed MCP args are injected by
-                // `with_managed_mcp_reference` when an MCP reference arrives
-                // (the Claude arm's `mcp_args: Vec::new()` pattern).
-                tui_args: Vec::new(),
-                sidecar_args: Vec::new(),
+                tui_args: if mcp_enabled {
+                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
+                } else {
+                    Vec::new()
+                },
+                sidecar_args: if mcp_enabled {
+                    managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?
+                } else {
+                    Vec::new()
+                },
             },
         ),
         "opencode" => (
