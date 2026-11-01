@@ -242,11 +242,10 @@ for (const mode of UNIFIED_AGENT_MODES) {
           }, { timeout: 45_000 }).toBe('durable_artifact_missing')
           // The pane's own banner announces the death (FreshAgentView's
           // durable_artifact_missing restoreError text, role="alert").
-          await expect(
-            a.page.getByRole('alert').filter({
-              hasText: 'This session cannot be resumed because the saved session artifact is no longer available.',
-            }),
-          ).toBeVisible({ timeout: 10_000 })
+          const restoreError = a.page.locator('[data-agent-error="restore"]:visible, [data-agent-error="pane-restore"]:visible')
+          await expect(restoreError.locator('summary')).toBeVisible({ timeout: 10_000 })
+          await restoreError.locator('summary').click()
+          await expect(restoreError.getByRole('alert').filter({ hasText: 'This session cannot be resumed because the saved session artifact is no longer available.' })).toBeVisible()
           // NEVER a modal: zero Dead sessions dialogs.
           await expect(a.page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
         }

@@ -315,7 +315,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         && frame.event?.type === 'freshAgent.session.snapshot')).toHaveLength(0)
       await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible()
       await expect(page.getByTestId('managed-runtime-recovery-card')).toHaveCount(0)
-      await expect(pane.getByRole('button', { name: 'Start new session' })).toHaveCount(0)
+      await expect(pane.locator('[data-agent-error="ended"], [data-agent-error="stuck"]')).toHaveCount(0)
       await expectOriginalConversation()
       expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount)
       releaseHeldSnapshot!()

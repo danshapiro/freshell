@@ -795,6 +795,8 @@ test.describe('Session handoff across two devices (rust only)', () => {
       const phoneCard = phone.page.getByRole('alert', {
         name: 'Session open as a terminal on another device',
       })
+      await expect(phone.page.locator('[data-agent-error="owner"] summary')).toBeVisible({ timeout: 45_000 })
+      await phone.page.locator('[data-agent-error="owner"] summary').click()
       await expect(phoneCard).toBeVisible({ timeout: 45_000 })
 
       // 7. Wait BEYOND the snapshot debounce + poll windows: the writer-row
@@ -1041,6 +1043,8 @@ test.describe('Session handoff across two devices (rust only)', () => {
       expect(desktopBuffer).not.toContain('[Launch failed]')
 
       // 5. PHONE convergence: the divergence card.
+      await expect(phone.page.locator('[data-agent-error="owner"] summary')).toBeVisible({ timeout: 45_000 })
+      await phone.page.locator('[data-agent-error="owner"] summary').click()
       await expect(
         phone.page.getByRole('alert', { name: 'Session open as a terminal on another device' }),
       ).toBeVisible({ timeout: 45_000 })
@@ -1271,6 +1275,8 @@ test.describe('Session handoff across two devices (rust only)', () => {
       const phoneCard = phone.page.getByRole('alert', {
         name: 'Session open as a terminal on another device',
       })
+      await expect(phone.page.locator('[data-agent-error="owner"] summary')).toBeVisible({ timeout: 45_000 })
+      await phone.page.locator('[data-agent-error="owner"] summary').click()
       await expect(phoneCard).toBeVisible({ timeout: 45_000 })
       const phoneLeaf = findLeafByPaneId(
         await phone.harness.getPaneLayout(phoneSession.tabId),

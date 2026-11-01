@@ -207,7 +207,10 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
         // The summary request fails (APIERR in the compaction's instructions).
         const failure = 'Error during compaction: API Error: 400 local provider error'
         await lane.send(pane, '/compact APIERR:400')
-        await expect(pane.paneRoot.getByRole('alert').filter({ hasText: failure }), 'the notice banner').toBeVisible({ timeout: 30_000 })
+        const notices = pane.paneRoot.getByRole('status', { name: 'Agent notices' })
+        await expect(notices, 'the grouped notice summary').toBeVisible({ timeout: 30_000 })
+        await notices.locator('summary').click()
+        await expect(notices.getByText(failure, { exact: true }), 'the expanded notice').toBeVisible()
         await expect(pane.paneRoot.getByRole('note', { name: 'Agent error' }).filter({ hasText: failure }), 'the durable command error').toHaveCount(1, { timeout: 30_000 })
         await lane.waitForIdle(pane)
         await expect(pane.paneRoot.getByText('Context compaction', { exact: true })).toHaveCount(1)
@@ -269,10 +272,12 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
       await lane.send(pane, REPLAY_PROMPT)
       await lane.waitForIdle(pane, 60_000)
 
-      const created = pane.paneRoot.getByRole('button', { name: `Diff: ${path.join(lane.workspace, 'a.txt')}` })
+      await pane.paneRoot.getByRole('button', { name: /^Diffs:/ }).click()
+      const changes = lane.page.getByRole('dialog', { name: 'Changes' })
+      const created = changes.getByRole('button', { name: `Diff: ${path.join(lane.workspace, 'a.txt')}` })
       await expect(created).toBeVisible({ timeout: 30_000 })
       await expect(created).toContainText('created')
-      const edited = pane.paneRoot.getByRole('button', { name: `Diff: ${path.join(lane.workspace, 'b.txt')}` })
+      const edited = changes.getByRole('button', { name: `Diff: ${path.join(lane.workspace, 'b.txt')}` })
       await expect(edited).toContainText('+1 −0')
 
       const diffResponse = lane.page.waitForResponse((response) => response.url().includes('/api/fresh-agent/diff'))
@@ -280,8 +285,8 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
       expect((await diffResponse).status()).toBe(200)
       await expect(edited).toHaveAttribute('aria-expanded', 'true')
       // The git diff of b.txt: a hunk that adds the edited line.
-      await expect(pane.paneRoot.getByText(/^@@ /)).toBeVisible()
-      await expect(pane.paneRoot.getByText('+gamma', { exact: true })).toBeVisible()
+      await expect(changes.getByText(/^@@ /)).toBeVisible()
+      await expect(changes.getByText('+gamma', { exact: true })).toBeVisible()
     })
   })
 
@@ -366,8 +371,11 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
       await expect(reloaded.paneRoot.getByText('All done.')).toHaveCount(1, { timeout: 30_000 })
       await expect.poll(() => transcriptShape(reloaded.paneRoot), { timeout: 30_000, message: 'the reloaded transcript matches the one before' })
         .toEqual(before)
-      await expect(reloaded.paneRoot.getByRole('button', { name: `Diff: ${path.join(lane.workspace, 'b.txt')}` })).toContainText('+1 −0')
+      await reloaded.paneRoot.getByRole('button', { name: /^Diffs:/ }).click()
+      const changes = page.getByRole('dialog', { name: 'Changes' })
+      await expect(changes.getByRole('button', { name: `Diff: ${path.join(lane.workspace, 'b.txt')}` })).toContainText('+1 −0')
 
+      await changes.getByRole('button', { name: 'Close', exact: true }).click()
       // The session is still live: the next turn runs on it.
       await lane.send(reloaded, 'hello again')
       await expect(agentTurns(reloaded).getByText('ok', { exact: true })).toHaveCount(1, { timeout: 30_000 })

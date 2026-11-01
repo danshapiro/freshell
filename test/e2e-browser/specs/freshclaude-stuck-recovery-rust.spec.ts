@@ -43,12 +43,13 @@ test.describe('freshclaude quiet timeout and process recovery', () => {
         expect(id).toMatch(/^[0-9a-f-]{36}$/)
         const before = await sequence()
         await lane.send(pane, 'hang until process recovery')
-        const stuck = pane.paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+        const stuck = pane.paneRoot.locator('[data-agent-error="stuck"]')
         await expect(stuck).toBeVisible({ timeout: 30_000 })
         await expect.poll(sequence).toBe(before + 1)
         const atBefore = (await lane.harness.getState())?.turnCompletion?.lastAtByTerminalId?.[`claude:${id}`]
         expect(atBefore).toBeGreaterThan(0)
 
+        await stuck.locator('summary').click()
         await stuck.getByRole('button', { name: /restart sidecar and resume session/i }).click()
         await lane.waitForIdle(pane)
         await expect(stuck).toBeHidden()

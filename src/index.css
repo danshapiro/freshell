@@ -330,7 +330,7 @@ html {
 
 .fresh-agent-style-serif .fresh-agent-transcript-scroll {
   gap: 0;
-  padding: 1rem 1.5rem 1.2rem;
+  padding: .75rem 1.5rem 1rem;
 }
 
 .fresh-agent-style-serif .fresh-agent-turn {
@@ -1603,7 +1603,7 @@ body {
   flex: 1 1 auto;
 }
 .fresh-agent-top-stack-scroll > * + * { margin-top: .25rem; }
-.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-diff-trigger { flex: 0 0 auto; }
+.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-top-stack > .fresh-agent-diff-panel { flex: 0 0 auto; }
 .fresh-agent-errors { min-height: 0; overflow: auto; flex: 0 1 auto; }
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors > details > summary { font-size: .75rem; }
 .fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; }
@@ -1623,4 +1623,56 @@ body {
 }
 @container (max-height: 319px) {
   .fresh-agent-top-stack { overflow: auto; }
+}
+
+/* Short split panes share one concise header row so requests keep a hit area. */
+@container (max-height: 479px) {
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) {
+    display: grid;
+    grid-template-columns: auto repeat(3, minmax(0, 1fr));
+    grid-template-rows: 20px minmax(44px, 1fr);
+    gap: 2px 6px;
+    padding: 2px 6px;
+  }
+  .fresh-agent-top-stack > .fresh-agent-request-count { grid-column: 1; grid-row: 1; align-self: start; }
+  .fresh-agent-top-stack > .fresh-agent-notices { grid-column: 2; grid-row: 1; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack > .fresh-agent-errors { grid-column: 3; grid-row: 1; }
+  .fresh-agent-top-stack > .fresh-agent-diff-panel { grid-column: 4; grid-row: 1; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack > .fresh-agent-top-stack-scroll { grid-column: 1 / -1; grid-row: 2; }
+  .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
+  .fresh-agent-top-stack .fresh-agent-request-count,
+  .fresh-agent-top-stack summary { line-height: 1.2; }
+  .fresh-agent-top-stack .fresh-agent-errors > span { display: none; }
+  .fresh-agent-top-stack .fresh-agent-notices summary,
+  .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
+}
+
+@container (max-height: 479px) and (max-width: 899px) {
+  .fresh-agent-sidebar { padding-block: 0; max-height: min(10cqh, max(0px, calc((100cqh - 240px) * .125))); }
+  .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(25cqh, max(0px, calc((100cqh - 240px) * .875))); }
+}
+
+/* Narrow panes need room for the composer's second row as well as metadata. */
+@container (max-width: 899px) and (min-height: 480px) {
+  .fresh-agent-sidebar { max-height: min(8cqh, max(0px, calc((100cqh - 240px) * .3))); }
+  .fresh-agent-pane .fresh-agent-top-stack { max-height: min(25cqh, max(0px, calc(100cqh - 240px))); }
+  .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(17cqh, max(0px, calc((100cqh - 240px) * .7))); }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: 20px minmax(20px, 1fr) minmax(44px, 1fr);
+    gap: 2px 6px;
+    padding: 2px 6px;
+  }
+  .fresh-agent-top-stack > .fresh-agent-request-count { grid-column: 1 / -1; grid-row: 1; }
+  .fresh-agent-top-stack > .fresh-agent-notices { grid-column: 1; grid-row: 2; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack > .fresh-agent-errors { grid-column: 2; grid-row: 2; }
+  .fresh-agent-top-stack > .fresh-agent-diff-panel { grid-column: 3; grid-row: 2; min-height: 0; overflow: auto; }
+  .fresh-agent-top-stack > .fresh-agent-top-stack-scroll { grid-column: 1 / -1; grid-row: 3; }
+  .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
+  .fresh-agent-top-stack .fresh-agent-request-count,
+  .fresh-agent-top-stack summary { line-height: 1.2; }
+  .fresh-agent-top-stack .fresh-agent-errors > span { display: none; }
+  .fresh-agent-top-stack .fresh-agent-notices summary,
+  .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
 }

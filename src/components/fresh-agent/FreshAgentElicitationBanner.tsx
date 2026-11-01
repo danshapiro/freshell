@@ -6,8 +6,8 @@ type Props = {
   disabled?: boolean
   onRespond: (action: 'accept' | 'decline' | 'cancel', content: FreshAgentElicitationContent | null) => void
 }
-const CONTROL = 'rounded border border-border bg-background px-2 py-1 text-sm disabled:opacity-50'
-const ACTION = 'rounded-md border border-border px-3 py-1.5 text-sm disabled:opacity-50'
+const CONTROL = 'min-h-[2.75rem] sm:min-h-0 rounded border border-border bg-background px-2 py-1 text-sm disabled:opacity-50'
+const ACTION = 'min-h-[2.75rem] sm:min-h-0 rounded-md border border-border px-3 py-1.5 text-sm disabled:opacity-50'
 
 export default function FreshAgentElicitationBanner({ request, disabled, onRespond }: Props) {
   const formId = useId()

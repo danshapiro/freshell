@@ -199,6 +199,8 @@ test('fresh-agent: a close started during verified start-new cleanup preserves t
     expect(closeRequestId).toBeTruthy()
     failClose()
     await expect.poll(async () => (await harness.getState()).panes.closingTabs?.[targetTabId!]).toBeUndefined()
+    await expect(page.locator('[data-agent-error="close"] summary')).toBeVisible()
+    await page.locator('[data-agent-error="close"] summary').click()
     await expect(page.getByText(/Close failed:/)).toBeVisible()
     await harness.waitForTabCount(2)
     await assertRetained('the pane close could not be recorded durably; the pane was left open')
@@ -318,6 +320,8 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   expect(snapshot.extensions.codex.nativeHistoryRetention.partial).toBe(true)
   expect(snapshot.turns.flatMap((turn: { items: Array<{ id: string }> }) => turn.items).some((item: { id: string }) => item.id === 'large-history-tool')).toBe(true)
   await expect(page.getByRole('note', { name: 'Retained conversation history' })).toContainText('The saved conversation has not been changed.')
+  await expect(page.locator('[data-agent-error="close"] summary')).toBeVisible()
+  await page.locator('[data-agent-error="close"] summary').click()
   const closeWarning = page.getByText('Close failed: Previous close was not confirmed', { exact: true })
   await expect(closeWarning).toBeVisible()
   const before = await paneContent(page)
@@ -452,6 +456,8 @@ test('fresh-agent: automatic recovery reads actual saved Codex history without c
     resumeSessionId: SESSION_ID, createRequestId: CREATE_REQUEST_ID, recoverySummary: { recoveryState: 'recovering' } })
   await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
   await expect(page.getByText('Restoring session...', { exact: true })).toBeHidden()
+  await expect(page.locator('[data-agent-error="close"] summary')).toBeVisible()
+  await page.locator('[data-agent-error="close"] summary').click()
   await expect(page.getByText('Close failed: Previous close was not confirmed', { exact: true })).toBeVisible()
   const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
   expect(messages.filter((frame) => ['freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(frame.type ?? ''))).toEqual([])
@@ -598,7 +604,7 @@ test('legacy provider fixture: injected managed projection preserves the convers
     await expect(page.getByText('Fixture turn', { exact: true })).toBeVisible()
     await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
     await expect(page.getByRole('button', { name: 'Resume session', exact: true })).toBeHidden()
-    await expect(page.getByRole('button', { name: 'Start new session', exact: true })).toBeHidden()
+    await expect(page.locator('[data-agent-error="ended"], [data-agent-error="stuck"]')).toHaveCount(0)
     const lost = () => page.evaluate((sessionId) => {
       const sessions = Object.values(window.__FRESHELL_TEST_HARNESS__!.getState().freshAgent.sessions) as Array<{ sessionId: string; lost?: boolean }>
       return sessions.find((session) => session.sessionId === sessionId)?.lost
@@ -606,6 +612,7 @@ test('legacy provider fixture: injected managed projection preserves the convers
     expect(await lost()).toBe(true)
     release()
     await expect.poll(lost).toBe(false)
+    await expect(page.locator('[data-agent-error="ended"], [data-agent-error="stuck"]')).toHaveCount(0)
     await expect(composer).toBeEnabled()
     await expect(composer).toHaveValue('Draft retained while reattaching')
     await expect(page.getByText('Fixture turn', { exact: true })).toBeVisible()

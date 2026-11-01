@@ -859,9 +859,10 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       expect(leafAfterSecondReload?.content?.kind).toBe('fresh-agent')
       expect(leafAfterSecondReload?.content?.sessionRef?.sessionId).toBe(staleDurable)
       expect(leafAfterSecondReload?.content?.restoreError?.reason).toBe('durable_artifact_missing')
-      await expect(page.getByRole('alert').filter({
-        hasText: 'This session cannot be resumed because the saved session artifact is no longer available.',
-      })).toBeVisible({ timeout: 10_000 })
+      const restoreError = page.locator('[data-agent-error="restore"]:visible, [data-agent-error="pane-restore"]:visible')
+      await expect(restoreError.locator('summary')).toBeVisible({ timeout: 10_000 })
+      await restoreError.locator('summary').click()
+      await expect(restoreError.getByRole('alert').filter({ hasText: 'This session cannot be resumed because the saved session artifact is no longer available.' })).toBeVisible()
       await page.waitForTimeout(1_000)
       const sentAfterSecondReload = await harness.getSentWsMessages()
       expect(sentAfterSecondReload.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])

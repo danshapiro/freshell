@@ -549,6 +549,14 @@ function composerLocator(page: Page) {
 }
 
 /** Type a slash command into the composer and commit it with Enter. */
+async function showNotice(page: Page, text: string | RegExp): Promise<void> {
+  const notices = page.getByRole('status', { name: 'Agent notices' })
+  await expect(notices.getByText(text)).toHaveCount(1, { timeout: 30_000 })
+  if (!(await notices.locator('details').evaluate(node => node.hasAttribute('open')))) {
+    await notices.locator('summary').click()
+  }
+}
+
 async function typeSlash(page: Page, text: string): Promise<void> {
   const composer = composerLocator(page)
   await composer.fill(text)
@@ -864,8 +872,11 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // Typed /redo never reaches the wire: the composer's reserved-name
       // interception answers with the pinned codex undo-only copy.
       await typeSlash(page, '/redo')
+      const notices = page.getByRole('status', { name: 'Agent notices' })
+      await expect(notices).toBeVisible({ timeout: 15_000 })
+      await showNotice(page, /Redo is not available for Codex sessions/)
       await expect(
-        page.getByText(/Redo is not available for Codex sessions/),
+        notices.getByText(/Redo is not available for Codex sessions/),
         'the REDO_CODEX_UNSUPPORTED_NOTICE prefix renders on the notice banner',
       ).toBeVisible({ timeout: 15_000 })
       expect(userRows(await snap())).toBe(0) // transcript unchanged
@@ -1159,6 +1170,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
 
       // The CLI refused the guarded fork; the server's pinned reason renders
       // verbatim on the notice banner, never a guard-less retry.
+      await showNotice(page, "Claude folded another message into that turn, so it can't be undone to that point.")
       await expect(
         page.getByText("Claude folded another message into that turn, so it can't be undone to that point."),
         'the honest refusal renders on the notice banner',
@@ -1323,6 +1335,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // Mid-turn /undo: the client busy gate answers with the pinned steer
       // copy — no rollback frame ever leaves the client.
       await typeSlash(page, '/undo')
+      await showNotice(page, /queue a message to steer it/)
       await expect(
         page.getByText(/queue a message to steer it/),
         'the pinned busy copy renders on the notice banner',
@@ -1341,6 +1354,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await expect(card).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await typeSlash(page, '/undo')
+      await showNotice(page, /the removed prompt is back in the composer/)
       await expect(
         page.getByText(/the removed prompt is back in the composer/),
         'UNDO_REFILL_NOTICE: the post-turn /undo succeeds',

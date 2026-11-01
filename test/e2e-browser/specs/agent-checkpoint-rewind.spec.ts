@@ -316,7 +316,10 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         // The component's own success notice (`setNotice('Code rewound to
         // before: "..."')`) is the observable UI confirmation the restore
         // actually completed, not just that the click landed.
-        await expect(page.getByText(/Code rewound to before/i)).toBeVisible({ timeout: 15_000 })
+        const notices = page.getByRole('status', { name: 'Agent notices' })
+        await expect(notices).toBeVisible({ timeout: 15_000 })
+        await notices.locator('summary').click()
+        await expect(notices.getByText(/Code rewound to before/i)).toBeVisible()
         expect(confirmMessageSeen).toMatch(/Rewind code to the state before/i)
         expect(confirmMessageSeen).toMatch(/conversation is not affected/i)
 

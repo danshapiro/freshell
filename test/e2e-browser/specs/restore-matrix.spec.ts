@@ -1360,7 +1360,7 @@ test.describe('Restore Matrix', () => {
         // ended" banner is user-visible, and the busy state the seeded
         // control proved was on is now off -- never silently stuck "busy"
         // forever after the provider process is lost.
-        await expect(paneRoot.getByText(/This session has ended/i)).toBeVisible({ timeout: 30_000 })
+        await expect(paneRoot.locator('[data-agent-error="ended"]')).toBeVisible({ timeout: 30_000 })
         await expect(freshAgentIcon).not.toHaveClass(/text-blue-500/, { timeout: 15_000 })
 
         // The durable session id is preserved through the crash (TERM-18's
@@ -1373,8 +1373,9 @@ test.describe('Restore Matrix', () => {
 
         // Resume the same durable conversation through a replacement
         // provider process, then send another turn.
+        await paneRoot.locator('[data-agent-error="ended"] summary').click()
         await paneRoot.getByRole('button', { name: 'Resume session' }).click()
-        await expect(paneRoot.getByText(/This session has ended/i)).not.toBeVisible({ timeout: 20_000 })
+        await expect(paneRoot.locator('[data-agent-error="ended"]')).not.toBeVisible({ timeout: 20_000 })
 
         await composer.fill('term18-retry-after-crash probe')
         await paneRoot.getByRole('button', { name: 'Send' }).click()
@@ -1419,7 +1420,7 @@ test.describe('Restore Matrix', () => {
         // watch-independent: seq 0 -> 1) -- but the client partitions it as
         // WATCHED: no attention flags anywhere (that partition is what
         // skips the bell), and the tab strip alone carries the watched mark.
-        await expect(paneRoot.getByText(/This session has ended/i)).toBeVisible({ timeout: 30_000 })
+        await expect(paneRoot.locator('[data-agent-error="ended"]')).toBeVisible({ timeout: 30_000 })
         await expect
           .poll(
             async () => (await harness.getState())?.turnCompletion?.seq ?? 0,
