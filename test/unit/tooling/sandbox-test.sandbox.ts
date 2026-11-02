@@ -210,7 +210,7 @@ with (root / 'receipt.jsonl').open('a') as log:
       if (!run) throw new Error(`Fixture never launched its owned workload: ${JSON.stringify(events)}`)
       return { status, events, watchdogEvents, control: path.dirname(run.cidfile), name: run.name }
     },
-    run(guard = false, runtimeSuite = true, twoPhase = false, options: { command?: string; cargoJobs?: string; executePrelude?: boolean } = {}) {
+    run(guard = false, runtimeSuite = true, twoPhase = false, options: { command?: string; cargoJobs?: string; executePrelude?: boolean; prepareOnly?: boolean } = {}) {
       const command = options.command ?? 'true'
       const wrapperArgs = runtimeSuite ? ['--runtime-suite', command] : [command]
       const callerEnv = { ...process.env }
@@ -222,7 +222,7 @@ with (root / 'receipt.jsonl').open('a') as log:
           FIXTURE_VOLUME_STATE: volumeState,
           FIXTURE_EXECUTE_PRELUDE: options.executePrelude ? '1' : '0',
           FRESHELL_SANDBOX_OWNER_GUARD: guard ? '1' : '0',
-          FRESHELL_SANDBOX_DEPENDENCIES_READY: twoPhase ? '' : '1', FRESHELL_SANDBOX_PREPARE_ONLY: '' },
+          FRESHELL_SANDBOX_DEPENDENCIES_READY: twoPhase ? '' : '1', FRESHELL_SANDBOX_PREPARE_ONLY: options.prepareOnly ? '1' : '' },
         encoding: 'utf8', timeout: 40_000,
       })
       const events = readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
@@ -302,6 +302,37 @@ describe('sandbox build budget and compact failure receipts', () => {
         expect(rows).toContainEqual(expect.objectContaining({ event: 'sandbox_result', phase, docker_status: 0, final_status: 0, settled: true }))
       }
       expect(readdirSync(path.join(f.root, 'control'))).toEqual([])
+    } finally { f.cleanup() }
+  })
+
+  it.each([
+    ['ordinary', false, false],
+    ['dependency-preparation', true, true],
+    ['runtime-suite', true, false],
+  ] as const)('executes the real effective-limits helper in the %s prelude', (phase, runtime, prepareOnly) => {
+    const f = fixture('budget-success')
+    const command = "printf 'prelude-caller-ok'"
+    try {
+      const result = f.run(false, runtime, false, { command, cargoJobs: '3', executePrelude: true, prepareOnly })
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toBe('prelude-caller-ok')
+      const limits = Object.fromEntries([
+        ['cpu_max', 'cpu.max'], ['memory_max', 'memory.max'],
+        ['memory_swap_max', 'memory.swap.max'], ['pids_max', 'pids.max'],
+      ].map(([field, file]) => [field, readFileSync(`/sys/fs/cgroup/${file}`, 'utf8').trim()]))
+      const [quota, period] = limits.cpu_max.split(' ').map(Number)
+      expect(quota / period).toBe(2)
+      expect(limits.memory_max).toBe('8589934592')
+      expect(limits.memory_swap_max).toBe('8589934592')
+      expect(limits.pids_max).toBe('512')
+      const receipts = metadata(result.stderr).filter(row => row.event === 'sandbox_effective_limits')
+      expect(receipts).toHaveLength(1)
+      expect(receipts[0]).toEqual(expect.objectContaining({
+        severity: 'info', phase, container: result.name,
+        command_sha256: createHash('sha256').update(command).digest('hex'),
+        cargo_build_jobs_env: '3', availability: 'complete', ...limits,
+      }))
+      expect(metadata(result.stderr).some(row => row.event === 'sandbox_diagnostics_unavailable')).toBe(false)
     } finally { f.cleanup() }
   })
 
