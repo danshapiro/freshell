@@ -14035,15 +14035,16 @@ mod host_agent_admission_tests {
         assert_eq!(created["type"], "freshAgent.created");
         assert_eq!(created["requestId"], "hosted-create-admitted");
 
-        let deliveries = gateway.deliveries.lock().unwrap();
-        assert_eq!(deliveries.len(), 1);
-        match &deliveries[0] {
-            crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) => {
-                assert_eq!(create.request_id, "hosted-create-admitted");
+        {
+            let deliveries = gateway.deliveries.lock().unwrap();
+            assert_eq!(deliveries.len(), 1);
+            match &deliveries[0] {
+                crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) => {
+                    assert_eq!(create.request_id, "hosted-create-admitted");
+                }
+                other => panic!("expected one hosted create delivery, got {other:?}"),
             }
-            other => panic!("expected one hosted create delivery, got {other:?}"),
         }
-        drop(deliveries);
         assert_eq!(gate.status().active_permits, 1);
 
         release_gateway_tx
