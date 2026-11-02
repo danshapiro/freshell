@@ -1185,6 +1185,13 @@ pub struct SessionIndex {
     /// Subscribers (via `subscribe_changes`) wake on changes.
     change_tx: tokio::sync::watch::Sender<u64>,
     change_rx: tokio::sync::watch::Receiver<u64>,
+    /// One-way readiness (kata freshell#vnpc): `false` until the first
+    /// sweep completes and publishes, then `true` for the rest of the
+    /// process lifetime. `Arc`-wrapped for the same reason `snapshot` is:
+    /// the detached background refresh flips it through
+    /// `perform_refresh`'s Arc-clone parameter list.
+    ready_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    ready_rx: tokio::sync::watch::Receiver<bool>,
     /// One-way refresh→watcher report (amplifier watch-reduction design,
     /// "Self-correction channel"). After a sweep that fully discovered
     /// amplifier, the watcher receives every amplifier session dir whose
@@ -1296,6 +1303,7 @@ impl SessionIndex {
             .map(load_cache_file)
             .unwrap_or_default();
         let (change_tx, change_rx) = tokio::sync::watch::channel(0u64);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         Self {
             sources,
             ttl,
@@ -1311,6 +1319,8 @@ impl SessionIndex {
             last_full_at: Arc::new(StdMutex::new(None)),
             change_tx,
             change_rx,
+            ready_tx: Arc::new(ready_tx),
+            ready_rx,
             amplifier_root_report: Arc::new(StdMutex::new(None)),
             startup_gate: Arc::new(StdMutex::new(None)),
         }
@@ -1509,6 +1519,24 @@ impl SessionIndex {
         self.change_rx.clone()
     }
 
+    /// One-way readiness: false until the first sweep completes and publishes,
+    /// then true for the rest of the process lifetime. Fires for EVERY first
+    /// publish — including empty, content-identical (changed == 0), and
+    /// scan-failure publishes — unlike the change generation, which is
+    /// deliberately silent on unchanged content. A late subscriber sees the
+    /// current value immediately (watch channels store it), so the
+    /// readiness-before-subscription race converges by construction.
+    pub fn subscribe_ready(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.ready_rx.clone()
+    }
+
+    /// Whether the first sweep has completed and published (see
+    /// [`Self::subscribe_ready`]) — the sync one-shot companion for callers
+    /// that prefer a poll over a subscription.
+    pub fn is_ready(&self) -> bool {
+        *self.ready_rx.borrow()
+    }
+
     /// Test seam for proving that an explicitly requested refresh completed
     /// even when it publishes identical contents and leaves the generation
     /// unchanged. This waits for the current sweep to release its lock; it
@@ -1634,6 +1662,7 @@ impl SessionIndex {
                             Arc::clone(&self.last_full_at),
                             self.ttl,
                             self.change_tx.clone(),
+                            Arc::clone(&self.ready_tx),
                             Arc::clone(&self.amplifier_root_report),
                         )
                         .await;
@@ -1745,6 +1774,7 @@ impl SessionIndex {
             Arc::clone(&self.last_full_at),
             self.ttl,
             self.change_tx.clone(),
+            Arc::clone(&self.ready_tx),
             Arc::clone(&self.amplifier_root_report),
         )
         .await
@@ -1771,6 +1801,7 @@ impl SessionIndex {
         let last_full_at = Arc::clone(&self.last_full_at);
         let ttl = self.ttl;
         let change_tx = self.change_tx.clone();
+        let ready_tx = Arc::clone(&self.ready_tx);
         let amplifier_root_report = Arc::clone(&self.amplifier_root_report);
         let startup_gate = Arc::clone(&self.startup_gate);
         tokio::spawn(async move {
@@ -1795,6 +1826,7 @@ impl SessionIndex {
                 last_full_at,
                 ttl,
                 change_tx,
+                ready_tx,
                 amplifier_root_report,
             )
             .await;
@@ -1871,6 +1903,7 @@ impl SessionIndex {
         last_full_at: Arc<StdMutex<Option<Instant>>>,
         ttl: Duration,
         change_tx: tokio::sync::watch::Sender<u64>,
+        ready_tx: Arc<tokio::sync::watch::Sender<bool>>,
         amplifier_root_report: Arc<
             StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
         >,
@@ -1894,6 +1927,7 @@ impl SessionIndex {
                 Arc::clone(&last_full_at),
                 ttl,
                 change_tx.clone(),
+                Arc::clone(&ready_tx),
                 Arc::clone(&amplifier_root_report),
             )
             .await;
@@ -1956,6 +1990,7 @@ impl SessionIndex {
         last_full_at: Arc<StdMutex<Option<Instant>>>,
         ttl: Duration,
         change_tx: tokio::sync::watch::Sender<u64>,
+        ready_tx: Arc<tokio::sync::watch::Sender<bool>>,
         amplifier_root_report: Arc<
             StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
         >,
@@ -2089,6 +2124,21 @@ impl SessionIndex {
                 codex_segment_paths,
                 codex_history_segments,
                 codex_history_revisions,
+            });
+            // First sweep completed: publish readiness regardless of content
+            // delta — empty, cache-identical (changed == 0), and
+            // scan-failure publishes all count. send_if_modified (NOT
+            // send_modify — tokio notifies unconditionally on send_modify,
+            // verified at the pinned 1.52.3): only the false->true
+            // transition notifies, so later publishes never re-wake
+            // readiness watchers. (Load-bearing ledger C1d.)
+            ready_tx.send_if_modified(|r| {
+                if *r {
+                    false
+                } else {
+                    *r = true;
+                    true
+                }
             });
         } // guard dropped here — never held across an .await.
           // Self-correction report (amplifier watch-reduction design
@@ -3925,6 +3975,7 @@ pub(crate) mod tests {
         let panicking_source: Arc<dyn SessionSource> = Arc::new(PanicSource);
 
         let (change_tx, _change_rx) = tokio::sync::watch::channel(0u64);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         let refresh_lock = Arc::new(AsyncMutex::new(()));
         let guard = Arc::clone(&refresh_lock)
             .try_lock_owned()
@@ -3944,6 +3995,7 @@ pub(crate) mod tests {
             Arc::new(StdMutex::new(Some(Instant::now()))),
             Duration::from_secs(3600),
             change_tx,
+            Arc::new(ready_tx),
             Arc::new(StdMutex::new(None)),
         )
         .await;
@@ -3965,6 +4017,14 @@ pub(crate) mod tests {
             Some(1),
             "the published snapshot must be preserved (not overwritten with an \
              empty-but-fresh one) after the blocking sweep panics"
+        );
+        // Readiness means "a sweep completed AND published" (kata
+        // freshell#vnpc): the panicked sweep published nothing, and the
+        // white-box seed above was not a publish, so the one-way readiness
+        // watch must still be cold.
+        assert!(
+            !*ready_rx.borrow(),
+            "a panicked sweep must not mark the index ready"
         );
     }
 
@@ -8353,6 +8413,183 @@ pub(crate) mod tests {
         assert!(
             new_gen > initial_gen,
             "generation must advance: {new_gen} > {initial_gen}"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    // Readiness watch: readiness is "the first sweep completed and published",
+    // INDEPENDENT of whether content changed. The change generation
+    // (perform_refresh_once's tail) deliberately stays silent on empty or
+    // cache-identical publications; the readiness watch must not inherit that
+    // silence — those are exactly the parked-pane recovery cases
+    // (kata freshell#vnpc).
+    #[tokio::test]
+    async fn readiness_watch_fires_on_first_publish_even_when_nothing_changed() {
+        // A file source with zero parseable sessions: the first sweep
+        // publishes an empty snapshot with changed == 0.
+        let claude_home = unique_temp_dir("readiness-empty");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let index = test_index(vec![Arc::new(ClaudeSource::new(claude_home.clone()))]);
+        let ready = index.subscribe_ready();
+        assert!(!*ready.borrow(), "cold index must not be ready");
+        assert!(!index.is_ready(), "cold index must not be ready");
+
+        // The change generation starts at 0 and must STAY 0 across the empty
+        // first publication — that silence is exactly what the readiness
+        // watch must not inherit.
+        let gen = index.subscribe_changes();
+
+        let _ = index.snapshot().await; // first sweep: changed == 0, still publishes
+
+        assert!(*ready.borrow(), "empty publication must mark readiness");
+        assert_eq!(
+            *gen.borrow(),
+            0,
+            "empty first publication must stay generation-silent"
+        );
+        // Readiness-before-subscription race: a LATE subscriber sees the
+        // current value immediately — watch channels store the value, no
+        // replay needed.
+        let late = index.subscribe_ready();
+        assert!(
+            *late.borrow(),
+            "late subscriber must see readiness immediately"
+        );
+        assert!(index.is_ready());
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    #[tokio::test]
+    async fn readiness_watch_fires_on_cache_identical_first_publication() {
+        // Modeled on persisted_cache_round_trip_avoids_reparse_on_reload:
+        // build an index over real fixtures, persist its cache, then build a
+        // SECOND index (fresh parse counter) pointed at the same directory +
+        // cache file. Its first sweep re-parses nothing (changed == 0), so
+        // the generation does NOT bump — readiness must still fire.
+        let claude_home = unique_temp_dir("readiness-cache-identical");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let cache_dir = unique_temp_dir("readiness-cache-identical-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+
+        // First index: cold sweep parses the file; persist its file_cache
+        // directly (white-box, same module) so the test does not depend on
+        // the fire-and-forget background save's timing.
+        let index1 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap1 = index1.snapshot().await;
+        assert_eq!(snap1.len(), 1);
+        save_cache_file(&cache_path, &index1.file_cache.lock().unwrap()).unwrap();
+
+        // Second index, same directory + cache file, FRESH parse counter.
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source2 = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index2 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source2)],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let ready = index2.subscribe_ready();
+        let gen = index2.subscribe_changes();
+        let _ = index2.snapshot().await;
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            0,
+            "the cache-identical first sweep must re-parse nothing (donor premise)"
+        );
+        assert_eq!(
+            *gen.borrow(),
+            0,
+            "cache-identical first publication must stay generation-silent"
+        );
+        assert!(
+            *ready.borrow(),
+            "cache-identical publication must mark readiness"
+        );
+        assert!(index2.is_ready());
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn readiness_subscriber_wakes_from_false_on_first_publish() {
+        // NOTE (ledger F1): SessionIndex is NOT Clone — hold it in an
+        // Arc<SessionIndex> (production's own shape) and clone the Arc for
+        // the sweeper task.
+        let claude_home = unique_temp_dir("readiness-wake");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        // discover_calls is the second sweep's observable-work settle signal
+        // (the generation cannot play that role here: the assertion is that
+        // nothing re-notifies readiness).
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            discover_calls: Arc::clone(&discover_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index = Arc::new(test_index_with_ttl(
+            vec![Arc::new(source)],
+            Duration::from_millis(10),
+        ));
+
+        let mut ready = index.subscribe_ready();
+        assert!(!*ready.borrow(), "cold index must not be ready");
+        let sweeper = tokio::spawn({
+            let index = Arc::clone(&index);
+            async move { index.snapshot().await }
+        });
+        ready.changed().await.expect("watch sender alive");
+        assert!(*ready.borrow(), "first publish must flip readiness to true");
+        let _ = sweeper.await;
+        assert!(index.is_ready());
+
+        // Exactly one transition: a second publish does not re-notify,
+        // because the flip uses send_if_modified with an idempotence guard
+        // (tokio's send_modify would notify unconditionally — ledger C1d).
+        tokio::time::sleep(Duration::from_millis(50)).await; // past the TTL
+        let _ = index.snapshot().await; // stale → detached background refresh
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                discover_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "the second sweep must actually run before asserting no re-notify"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ready.changed())
+                .await
+                .is_err(),
+            "a second publish must not re-notify readiness watchers"
         );
 
         std::fs::remove_dir_all(&claude_home).ok();
