@@ -145,6 +145,8 @@ if [ "$run_rust" = 1 ]; then
     # between commit and main ran cargo test. Runs the changed crates plus
     # their workspace dependents; workspace-wide when the change is
     # root-level (Cargo.lock, toolchain) or the base is unknown.
+    # HOOK_DIR contains the trusted shared wrapper, while PUSH_ROOT is the
+    # source checkout being pushed and the only repo mounted as /workspace.
     case "$test_mode" in
       unavailable)
         echo "pre-push: node_modules missing (no tsx) — SKIPPING rust test lane (npm install to enforce)" >&2
@@ -155,7 +157,7 @@ if [ "$run_rust" = 1 ]; then
       workspace)
         test_command="CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --workspace --exclude freshell-tauri --locked"
         echo "pre-push: rust gate — sandboxed $test_command (the long one)" >&2
-        "$HOOK_DIR/../sandbox-test.sh" "$test_command" \
+        "$HOOK_DIR/../sandbox-test.sh" --workspace-root "$PUSH_ROOT" "$test_command" \
           || fail "$test_command (sandboxed)"
         ;;
       packages)
@@ -163,7 +165,7 @@ if [ "$run_rust" = 1 ]; then
         for p in $test_pkgs; do pkgs_args="$pkgs_args -p $p"; done
         test_command="CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked${pkgs_args}"
         echo "pre-push: rust gate — sandboxed targeted cargo test:$pkgs_args" >&2
-        "$HOOK_DIR/../sandbox-test.sh" "$test_command" \
+        "$HOOK_DIR/../sandbox-test.sh" --workspace-root "$PUSH_ROOT" "$test_command" \
           || fail "$test_command (sandboxed)"
         ;;
       skip)
