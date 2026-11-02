@@ -67,7 +67,7 @@ Consequences this plan owns (sanctioned by the Accepted tradeoffs — correction
 
 1. The kata's `turn_settled.at` question is unanswerable as literally posed: no such record exists. The binary answer is: (i) no real settle record exists, so the per-settle dedupe has no real referent to swallow; (ii) real `created_at` is second-granularity and demonstrably collides, so ANY dedupe keyed on wall-clock alone WOULD collide; (iii) `step_index` is the collision-proof per-record identity (unique per record, strictly increasing across turns). The corrected dedupe therefore keys on the record identity `(created_at, step_index)`, and the property "two genuine turns can never share a dedupe key" holds by construction. THE BINARY PROOF is the receipts — the corpus facts (Task 1 Step 2) plus the fresh same-conversation receipts (Task 1 Step 6: step_index unique per record, strictly increasing across turns, on a conversation this run minted) — NOT any test. The Task 2 tracker test `same_second_settles_with_distinct_step_indexes_both_complete` pins the dedupe MACHINERY against today's swallowing rule using the labeled fake-contract `turn_settled` extension (Consequence 2); it exercises the code path end to end but supplies no binary evidence about records the binary does not produce, and the gate-flip citation (Task 3) rests on the receipts alone.
 2. Two structures the candidate schema invented are retained ONLY as explicitly-labeled fake-contract test extensions (the e2e/rebind fakes append them to drive the locator and attention machinery): the `session_start` ownership record (the locator's cwd/ownership anchor — real transcripts carry no ownership or workspace evidence, so transcript-driven identity binding does not engage on real-format sessions; recorded limitation) and the `turn_settled` settle record (the attention machinery's settle signal — real transcripts carry none; recorded limitation). Both carry the real-shaped field discipline (`created_at`, `step_index`) so the corrected dedupe is exercised end to end.
-3. The resume path itself parses NO transcript records: the gate consults the path-anchored by-id locator (`crates/freshell-server/src/antigravity_existence_by_id.rs` — `File::open(brain/<id>/.system_generated/logs/transcript.jsonl)`), which the real corpus validates. CAVEAT the flip must close (Task 3, plan-review round 2 finding 1): the production probe's WARM-INDEX hit answers `Present` without touching the disk (`existence.rs:325-328`), so a conversation deleted from disk can still pass the gate in the window before the index rescans — and `agy` then silently starts a fresh conversation (GC3 violation). The activation therefore adds a gate-variant validation: for antigravity, a `Present` is confirmed against the same on-disk by-id walk before the gate trusts it (stale hit → Absent → typed refusal). With that validation in place the flip is safe for on-disk conversations the moment the corrected schema lands and a real resume is proven — the sequencing this plan enforces.
+3. The resume path itself parses NO transcript records: the gate consults the path-anchored by-id locator (`crates/freshell-server/src/antigravity_existence_by_id.rs` — `File::open(brain/<id>/.system_generated/logs/transcript.jsonl)`), which the real corpus validates. CAVEATS the flip must close (Task 3, plan-review rounds 2-3 findings 1): the production probe answers `Present` from a warm-index hit without touching the disk (`existence.rs:325-328`) and `Unknown` while the index is cold (every startup, before warm-up) — both windows would pass a stale id to `agy`, whose documented missing-ID behavior silently starts a fresh conversation (GC3 violation), and the cold window passes ANY id through on `Unknown → Proceed`. The activation therefore adds a gate-variant validation: for antigravity, BOTH `Present` and `Unknown` answers are validated against the same on-disk by-id walk before the gate trusts them (disk Present confirms; disk Absent corrects to the typed refusal; disk Unreadable defers as Unknown, G28 fail-open). With that validation in place the flip is safe for on-disk conversations the moment the corrected schema lands and a real resume is proven — the sequencing this plan enforces.
 4. The real format carries no workspace evidence, so real conversations index with cwd `None` (project "unknown"). The Task 2 removal of the antigravity cwd gate is the decided tradeoff that makes real conversations visible in history at all.
 
 ---
@@ -183,13 +183,15 @@ Shared-file pre-run baselines (2026-11-02, strategist receipts): settings.json `
 
 Expected: exit 0; the nonce echoed; the fence passes (settings.json unchanged); exactly one new `<uuid>` under `brain/`. Auth ordering (strategist receipts, 2026-11-02; overlay-first on BOTH paths — the modelProvider precondition is the User Request's explicit constraint, not an API-key-only nicety): (1) if the coordinator obtains a key (user-approved source: the Freshell config's `settings.ai.geminiApiKey`, OneCLI after `onecli auth login`, or a user-supplied key), run the primary command as written (`--settings` overlay + the key exported into the probe env only, never printed); (2) on ANY key-path failure (invalid key, CLI-setup error) or no key, run the same invocations WITH the `--settings` overlay and without the env guard (the machine's live OAuth sign-in — GC15) — the fallback invocation is itself the OAuth-liveness probe (the token file carries no readable expiry; `auth_method` is `consumer`; last refreshed 2026-10-31) — and record which auth produced the evidence; (2b) ONLY if the binary rejects the `--settings '{"modelProvider":"gemini"}'` overlay under OAuth auth (a CLI-setup error naming the combination), retry once WITHOUT the overlay to diagnose the binary's behavior — those receipts are DIAGNOSTIC ONLY and CANNOT support the gate flip: the User Request's explicit settings precondition is unsatisfied on that path, so if ONLY branch (2b) succeeds the run records the constraint conflict and the flip does NOT happen (GC13) — the receipts record the deviation honestly and the flip waits for overlay-conformant evidence; (3) if the OAuth path also fails, STOP: record the blocker in the evidence report and `run-state.md`, and do NOT run Task 3's flip (GC13) — Task 2 still lands (the correction is warranted by the corpus evidence alone), and the run reports the gate item as blocked. A key-path failure is "try OAuth", never an immediate STOP.
 
-Resolve the conversation id (disambiguate by the nonce if more than one new dir appeared):
+Resolve the conversation id — assign the DIRECTORY name directly (the loop body confirms which fresh conversation carries the nonce; `grep -l` would print a transcript path, not an id, so do not parse command output by hand):
 
 ```bash
+CONV_ID=""
 for id in $(comm -13 /tmp/opencode/yhqb/brain-before.txt /tmp/opencode/yhqb/brain-after.txt); do
-  grep -l "$NONCE1" "$AGY_STORE/brain/$id/.system_generated/logs/transcript.jsonl" 2>/dev/null
+  if grep -q "$NONCE1" "$AGY_STORE/brain/$id/.system_generated/logs/transcript.jsonl" 2>/dev/null; then
+    CONV_ID="$id"
+  fi
 done
-CONV_ID=<the printed id>
 case "$CONV_ID" in
   ''|*[!0-9a-fA-F-]*) echo "CONV_ID unresolved or not a UUID shape — REFUSING every store deletion; resolve manually before ANY rm"; exit 1;;
 esac
@@ -1432,6 +1434,37 @@ And in `crates/freshell-server/src/existence.rs`'s tests module — the PRODUCTI
             SessionExistence::Present
         );
     }
+
+    #[test]
+    fn antigravity_cold_index_absent_id_is_disk_refused_not_unknown_proceed() {
+        // The cold window (every startup, before the index warms) must not
+        // pass a stale id through as Unknown → Proceed: the gate variant
+        // validates cold Unknowns against the disk too. Absent on disk ⇒
+        // the typed refusal, not a silent fresh conversation.
+        let home = temp_antigravity_home("gate_cold_absent");
+        let id = seed_antigravity_conversation(&home, "gate-cold");
+        let probe = IndexExistenceProbe::new(None).with_antigravity_transcript_locator(
+            antigravity_transcript_locator(home.clone()),
+        );
+        std::fs::remove_file(conversation_transcript_path(&home, &id).unwrap()).unwrap();
+        assert_eq!(
+            probe.exists_for_gate("antigravity", &id),
+            SessionExistence::Absent
+        );
+    }
+
+    #[test]
+    fn antigravity_cold_index_present_id_resumes() {
+        let home = temp_antigravity_home("gate_cold_present");
+        let id = seed_antigravity_conversation(&home, "gate-cold-kept");
+        let probe = IndexExistenceProbe::new(None).with_antigravity_transcript_locator(
+            antigravity_transcript_locator(home.clone()),
+        );
+        assert_eq!(
+            probe.exists_for_gate("antigravity", &id),
+            SessionExistence::Present
+        );
+    }
 ```
 
 Build the seeding helpers next to the existing `temp_*` helpers in that tests module (a temp antigravity home + one `brain/<id>/.system_generated/logs/transcript.jsonl` file + one warm-index item whose provider is `antigravity`), following the module's existing fixture style.
@@ -1446,41 +1479,49 @@ cargo test -p freshell-freshagent antigravity_is_a_session_provider_mode
 cargo test -p freshell-server antigravity
 ```
 
-Expected: the two NEW `antigravity_absent_*` unit tests PASS immediately (the constant flip is their entire subject). The DESIGNED reds are the three deferral pins plus the production-probe red, and each fails exactly as its own comment promised: `unvalidated_providers_and_empty_ids_never_consult_probe` FAILS (the `PanickingProbe` consult panics on the antigravity row); the two `resume_validation_gate` antigravity scenarios FAIL (the `AbsentButObservedProbe` now gates: the brain-on-disk create answers the typed refusal instead of `terminal.created`, and the absent-id pane no longer spawns); the `terminal_tabs` door-3 pin FAILS (the stale id no longer passes through: `resume_session_id` is `None`, not `"stale-agy"`); `antigravity_warm_index_present_is_disk_validated_by_the_gate_variant` FAILS (the warm-index hit answers `Present` for the deleted transcript — the GC3 hole). Record these reds — they are the activation being deliberate.
+Expected: the two NEW `antigravity_absent_*` unit tests PASS immediately (the constant flip is their entire subject). The DESIGNED reds are the three deferral pins plus the two production-probe reds, and each fails exactly as its own comment promised: `unvalidated_providers_and_empty_ids_never_consult_probe` FAILS (the `PanickingProbe` consult panics on the antigravity row); the two `resume_validation_gate` antigravity scenarios FAIL (the `AbsentButObservedProbe` now gates: the brain-on-disk create answers the typed refusal instead of `terminal.created`, and the absent-id pane no longer spawns); the `terminal_tabs` door-3 pin FAILS (the stale id no longer passes through: `resume_session_id` is `None`, not `"stale-agy"`); `antigravity_warm_index_present_is_disk_validated_by_the_gate_variant` FAILS (the warm-index hit answers `Present` for the deleted transcript) and `antigravity_cold_index_absent_id_is_disk_refused_not_unknown_proceed` FAILS (the cold window answers `Unknown` for the deleted transcript, which the gate passes through) — the two GC3 holes. Record these reds — they are the activation being deliberate.
 
 - [ ] **Step 3: Rewrite every pin to the post-activation contract**
 
 **3a — `resume_validation.rs:295-330`:** remove `"antigravity"` from the unvalidated mode row (keep `gemini`, `kimi`, `shell`, `third-party`), and replace the deferral comment with the activation record: antigravity IS validated (real-binary transcript evidence + proven real resume, 2026-11-02; evidence report path); the probe IS consulted; a stale id answers the typed refusal at the spawn doors. Add the Step-1 unit test.
 
-**3a′ — the production probe's gate variant** (`crates/freshell-server/src/existence.rs`, `exists_for_gate` at `:499-520`): for antigravity, validate a `Present` answer against the on-disk by-id locator BEFORE the gate trusts it — mirroring the codex Absent-fallback pattern but on the Present side (the production wiring already hands the probe the locator via `with_antigravity_transcript_locator`, `main.rs:2204`). Append after `let base = self.exists(provider, session_id);`:
+**3a′ — the production probe's gate variant** (`crates/freshell-server/src/existence.rs`, `exists_for_gate` at `:499-520`): for antigravity, validate BOTH a warm-index `Present` AND a cold/other `Unknown` against the on-disk by-id locator BEFORE the gate trusts them — the warm hit can be stale for a conversation deleted from disk, and the cold window (every startup, before the index warms) would otherwise pass any id through on `Unknown → Proceed` (the production wiring already hands the probe the locator via `with_antigravity_transcript_locator`, `main.rs:2204`). Append after `let base = self.exists(provider, session_id);`:
 
 ```rust
-        // Antigravity gate validation (activated 2026-11-02): a warm-index
-        // hit is NOT sufficient evidence for the resume gate — the index
-        // can be stale for a conversation deleted from disk, and the CLI's
-        // documented missing-ID behavior silently starts a FRESH
-        // conversation (GC3 violation). Validate Present against the same
-        // on-disk by-id walk the Absent arm uses; disk Absent corrects the
-        // stale hit, disk Unreadable defers as Unknown (G28), disk Present
-        // confirms (and feeds the observed set — module-doc invariant).
-        if provider == "antigravity" && base == SessionExistence::Present {
+        // Antigravity gate validation (activated 2026-11-02): neither a
+        // warm-index hit nor a cold-index Unknown is sufficient evidence
+        // for the resume gate — the index can be stale for a conversation
+        // deleted from disk, and the cold window precedes every warm-up,
+        // while the CLI's documented missing-ID behavior silently starts
+        // a FRESH conversation (GC3 violation). Validate both against the
+        // same on-disk by-id walk the Absent arm uses: disk Present
+        // confirms (and feeds the observed set — module-doc invariant),
+        // disk Absent corrects to Absent (typed refusal), disk Unreadable
+        // defers as Unknown (G28 fail-open). Absent itself needs no
+        // re-check — the warm-Absent arm at :444 already disk-verified it.
+        if provider == "antigravity" {
             if let Some(locator) = &self.antigravity_transcript_locator {
-                return match locator(session_id) {
-                    ByIdAnswer::Present => {
-                        self.observed
-                            .lock()
-                            .expect("observed set lock")
-                            .insert(format!("{provider}:{session_id}"));
-                        SessionExistence::Present
+                match base {
+                    SessionExistence::Present | SessionExistence::Unknown => {
+                        return match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                SessionExistence::Present
+                            }
+                            ByIdAnswer::Absent => SessionExistence::Absent,
+                            ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                        };
                     }
-                    ByIdAnswer::Absent => SessionExistence::Absent,
-                    ByIdAnswer::Unreadable => SessionExistence::Unknown,
-                };
+                    _ => {}
+                }
             }
         }
 ```
 
-This runs inside the gate variant only (gate callers already run it under `spawn_blocking` per the A13 note), and `exists()` — the inline reconcile path with its ~250ms IO discipline — is untouched. The Absent side needs no change: the warm-Absent arm at `:444` already re-checks the same locator, and cold answers `Unknown` (G28).
+This runs inside the gate variant only (gate callers already run it under `spawn_blocking` per the A13 note), and `exists()` — the inline reconcile path with its ~250ms IO discipline — is untouched. The one `File::open` is far cheaper than the codex by-id walk the same variant already tolerates.
 
 **3b — `resume_validation_gate.rs`:** replace the section banner (`:1079-1098`) with the activation record. Add a disk-wired probe so the gate consults the same evidence production uses (the harness cannot depend on `freshell-server`; this mirrors the by-id walk's shape):
 
@@ -1742,7 +1783,12 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       const settings = ['--settings', '{"modelProvider":"gemini"}']
       const brainDir = path.join(await resolveAgyStoreRoot(), 'brain')
       const before = new Set(await fs.readdir(brainDir).catch(() => [] as string[]))
-
+      // EVERY fresh conversation whose transcript carries the nonce — the
+      // cleanup sweep must remove them all even if the id resolution or any
+      // later assertion fails (a failed tier run must not leave its scratch
+      // data in the live store).
+      const nonceBearing = new Set<string>()
+      try {
       // Turn 1: a fresh scratch conversation this run owns.
       const first = await execFileAsync(
         agyCommand,
@@ -1751,26 +1797,22 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       )
       expect(first.stdout).toContain(nonce)
 
-      // Find the NEW conversation whose transcript carries the nonce.
+      // Find the NEW conversation(s) whose transcripts carry the nonce.
       const after = await fs.readdir(brainDir)
       const freshIds = after.filter((id) => !before.has(id))
-      expect(freshIds.length).toBeGreaterThanOrEqual(1)
       let convId: string | undefined
       for (const id of freshIds) {
         const body = await fs
           .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
           .catch(() => '')
         if (body.includes(nonce)) {
-          convId = id
-          break
+          nonceBearing.add(id)
+          convId ??= id
         }
       }
+      expect(freshIds.length).toBeGreaterThanOrEqual(1)
       expect(convId, 'the new conversation whose transcript carries the nonce').toBeTruthy()
 
-      // Cleanup ALWAYS runs once convId is resolved — on success AND on any
-      // assertion failure, timeout, or rejected resume (a failed tier run
-      // must not leave its scratch conversation in the live store).
-      try {
       // Binary record-schema pins on the run-owned transcript (the
       // corrected contract; evidence: real-binary-transcript-evidence.md).
       const transcriptPath = path.join(brainDir, convId!, '.system_generated', 'logs', 'transcript.jsonl')
@@ -1819,15 +1861,18 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       expect(new Set(userSteps).size).toBe(userSteps.length)
       expect(userSteps[userSteps.length - 1]).toBeGreaterThan(userSteps[0])
 
-      // Cleanup (finally): this run owns the conversation it created (the
-      // contract-probe hygiene precedent). Remove BOTH store trees this
-      // conversation owns (Task 1 Step 7 parity): brain/<id> (the
-      // transcript) and conversations/<id>.db (the per-conversation
-      // sidecar db — verified present per conversation in the real store).
+      // Cleanup (finally): this run owns every conversation it created (the
+      // contract-probe hygiene precedent). Remove BOTH store trees for EVERY
+      // nonce-bearing fresh conversation — success or any failure (Task 1
+      // Step 7 parity): brain/<id> (the transcript) and
+      // conversations/<id>.db (the per-conversation sidecar db — verified
+      // present per conversation in the real store).
       } finally {
         const storeRoot = await resolveAgyStoreRoot()
-        await fs.rm(path.join(brainDir, convId!), { recursive: true, force: true }).catch(() => {})
-        await fs.rm(path.join(storeRoot, 'conversations', `${convId}.db`), { force: true }).catch(() => {})
+        for (const id of nonceBearing) {
+          await fs.rm(path.join(brainDir, id), { recursive: true, force: true }).catch(() => {})
+          await fs.rm(path.join(storeRoot, 'conversations', `${id}.db`), { force: true }).catch(() => {})
+        }
       }
     },
     420_000,
@@ -1917,3 +1962,5 @@ Load-bearing amendments (Stage 2, 2026-11-02, after the finder/strategist audit 
 Plan-review round 1 remediation (2026-11-02): six Major findings CLEARED in the plan (see the run's plan-review-log.md) — the binary proof is the receipts, not the synthetic test (Consequence 1); `conversation_id_from_path` consumes `transcript.jsonl` first (the draft always returned `None`); the Task 2 red commit carries the call-site updates so the red is behavioral, not a compile error; the settings fence restores only this run's own damage signature and otherwise leaves a concurrent change untouched (GC2); the `--settings` overlay is passed on BOTH auth paths, with the no-overlay form only as the evidenced recorded deviation of branch (2b); cleanup runs unconditionally (tier-4 `finally`; Task 1 cleanup not gated on receipt success — receipts gate the flip, never cleanup).
 
 Plan-review round 2 remediation (2026-11-02): four Major + one Minor findings CLEARED (see the run's plan-review-log.md) — the gate-variant Present-validation (production `exists_for_gate` consults the by-id disk locator for antigravity Present answers, closing the stale-warm-index hole that would let a deleted conversation pass to `agy` and silently mint a fresh one; red test drives the production probe); the fence attributes damage by CONTENT (jq strip-and-compare against the baseline — key presence alone is not attribution); branch (2b) receipts are diagnostic-only and CANNOT support the flip (the settings precondition is unsatisfied on that path); the evidence report is written from the retained `/tmp/opencode/yhqb` receipts BEFORE that directory is removed; README `:289-295`'s busy/completion claims are replaced with honest fake-contract scoping instead of contradicting the validated-schema text.
+
+Plan-review round 3 remediation (2026-11-02, the cap round — loop ended FAILED/non-converged with every finding CLEARED): the gate-variant validation extended to the COLD window (both `Present` and `Unknown` answers are disk-validated for antigravity — every startup's cold index would otherwise pass any stale id through on Unknown→Proceed); two cold-path production-probe tests added; the Task 1 conversation-id assignment made executable (directory-name assignment in the loop, not a placeholder redirect); the tier-4 cleanup try/finally now opens before the first invocation and sweeps every nonce-bearing fresh conversation.
