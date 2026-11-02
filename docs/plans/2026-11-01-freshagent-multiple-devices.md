@@ -284,6 +284,10 @@ release startup while the other attaches, then reload surviving device and
 assert one native runtime, zero cleanup stops, unique transcript rows.
 Browser 'stage1 switches': new/fork A, verify B continues parent, including
 provider-required parent retirement as an explicit distinct expected outcome.
+The in-process fixture covers the non-retiring fork outcome. A separate
+managed-runtime fixture seeds real parent state on both devices, then proves
+the requester alone rekeys to the child while the sibling stays on its parent
+view and sees that parent exit, with no client detach or kill.
 ```
 
 - [x] **Step 2: Run and observe red**

@@ -314,10 +314,19 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       await native.waitForHeldTurn(heldPrompt)
       await native.releaseTurn()
       await expect(mobile.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
-      const parentUserTurn = desktop.page.locator('[data-context="fresh-agent"] article[data-turn-role="user"]').last()
+      await expect.poll(async () => ({
+        desktop: findFreshAgentLeaf(await desktop.harness.getPaneLayout(desktop.tabId))?.content?.status ?? null,
+        mobile: findFreshAgentLeaf(await mobile.harness.getPaneLayout(mobile.tabId))?.content?.status ?? null,
+      }), { timeout: 45_000, message: 'both parent views settle before the transcript fork action' })
+        .toEqual({ desktop: 'idle', mobile: 'idle' })
+      const parentUserTurn = desktop.page.locator(
+        '[data-context="fresh-agent"] article[data-turn-role="user"]',
+      ).filter({ hasText: heldPrompt }).first()
       await expect(parentUserTurn).toBeVisible({ timeout: 20_000 })
       await parentUserTurn.hover({ timeout: 20_000 })
-      await parentUserTurn.getByRole('button', { name: 'Fork conversation from here' }).click({ timeout: 20_000 })
+      const forkButton = parentUserTurn.getByRole('button', { name: 'Fork conversation from here' })
+      await expect(forkButton).toBeVisible({ timeout: 20_000 })
+      await forkButton.click({ timeout: 20_000 })
       await expect.poll(() => frames.desktop.some((frame) => frame.direction === 'sent'
         && frame.type === 'freshAgent.fork'
         && frame.sessionId === session.sessionId), {
@@ -389,7 +398,35 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         }
       }, { timeout: 45_000, message: 'the parent continuation appears once in the shared transcript snapshot' })
         .toEqual({ user: 1, assistant: 1 })
-      expect(native.stopCount()).toBe(0)
+
+      if (mode === 'freshclaude' || mode === 'kilroy') {
+        const childSessionId = forkReply?.sessionId as string
+        const childView = await openView('desktop', childSessionId)
+        await expect.poll(async () => findFreshAgentLeaf(await childView.harness.getPaneLayout(childView.tabId))?.content?.status ?? null, {
+          timeout: 45_000,
+          message: 'the desktop can open the fork child before explicitly terminating it',
+        }).toBe('idle')
+        const childTurn = childView.page.locator(
+          `[data-context="fresh-agent"][data-pane-id="${childView.paneId}"] article[data-turn-index]`,
+        ).last()
+        await expect(childTurn).toBeVisible({ timeout: 20_000 })
+        await childTurn.click({ button: 'right' })
+        const terminateAgent = childView.page.getByRole('menuitem', { name: 'Terminate agent', exact: true })
+        await expect(terminateAgent).toBeVisible({ timeout: 15_000 })
+        await terminateAgent.click()
+
+        await expect.poll(() => native.stopCount(childSessionId), {
+          timeout: 30_000,
+          message: 'the native stop counter reports the explicitly terminated fork child',
+        }).toBe(1)
+        expect(native.stopCount(session.sessionId), 'the parent remains running on mobile').toBe(0)
+        expect(frames.desktop.filter((frame) => frame.direction === 'sent'
+          && frame.type === 'freshAgent.kill'
+          && frame.sessionId === childSessionId)).toHaveLength(1)
+        expect(findFreshAgentLeaf(await mobile.harness.getPaneLayout(mobile.tabId))?.content?.sessionRef?.sessionId)
+          .toBe(session.sessionId)
+      }
+
       expect(native.bootCount(session.sessionId)).toBe(parentBoots)
     }))
   }
