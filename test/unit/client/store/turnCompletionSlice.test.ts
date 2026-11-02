@@ -52,6 +52,14 @@ import reducer, {
 import panesReducer from '@/store/panesSlice'
 import tabsReducer, { closePaneWithCleanup, closeTab } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import terminalLifecycleReducer from '@/store/terminalLifecycleSlice'
+import { appReducers } from '@/store/appReducers'
+import antigravityActivityReducer, {
+  removeAntigravityActivity,
+  resetAntigravityActivity,
+  setAntigravityActivitySnapshot,
+  upsertAntigravityActivity,
+} from '@/store/antigravityActivitySlice'
 import type { PaneNode } from '@/store/paneTypes'
 import { applyServerIdle } from '@/store/turnCompletionThunks'
 
@@ -397,6 +405,93 @@ describe('turnCompletionSlice', () => {
       expect(store.getState().turnCompletion.pendingEvents).toEqual([])
       expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-missing']).toBeUndefined()
     })
+
+    it('folds the DEATH idle through the lifecycle bridge after terminal.exit cleared the pane terminalId', () => {
+      // The crash death-bell wire order: the pane's terminal.exit handler
+      // records the exit into terminalLifecycle and CLEARS
+      // paneContent.terminalId, and only THEN the hub's death
+      // `terminal.idle` arrives (exit push → hub exit event → bell). The
+      // direct layout lookup therefore misses exactly the attached-pane
+      // crash — the bridge through the lifecycle slice's lastTerminalId
+      // (the terminal.replaced handler's precedent) must resolve the pane
+      // so the unified attention edge rings.
+      const now = Date.now()
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          terminalLifecycle: terminalLifecycleReducer,
+          turnCompletion: reducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{ id: 'tab-1', createRequestId: 'req-1', title: 'Tab 1', status: 'exited' as const, mode: 'opencode' as const, shell: 'system' as const, createdAt: now }],
+            activeTabId: 'tab-1',
+            renameRequestTabId: null,
+          },
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'leaf' as const,
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal' as const,
+                  createRequestId: 'cr-1',
+                  status: 'exited' as const,
+                  mode: 'opencode' as const,
+                  shell: 'system' as const,
+                  // CLEARED by the exit handler before the death idle lands.
+                  terminalId: undefined,
+                },
+              },
+            },
+            activePane: { 'tab-1': 'pane-1' },
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
+          },
+          settings: { settings: defaultSettings, loaded: true },
+          terminalLifecycle: {
+            byPaneId: {
+              'pane-1': {
+                lastTerminalId: 'term-dying',
+                exit: { exitCode: 3, at: now },
+              },
+            },
+            stuckAtByPaneId: {},
+          },
+          turnCompletion: {
+            seq: 0,
+            lastAtByTerminalId: {},
+            lastIdleAtByTerminalId: {},
+            pendingEvents: [],
+            attentionByTab: {},
+            attentionByPane: {},
+          },
+        },
+      })
+
+      store.dispatch(applyServerIdle({
+        terminalId: 'term-dying',
+        at: now,
+        reason: 'grace',
+      }) as any)
+
+      expect(store.getState().turnCompletion.pendingEvents).toEqual([{
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-dying',
+        at: now,
+        seq: 1,
+        source: 'terminal',
+        watched: false,
+      }])
+      expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-dying']).toBe(now)
+    })
   })
 
   describe('recordTerminalIdle (truly-idle edge for terminal CLI panes)', () => {
@@ -440,6 +535,215 @@ describe('turnCompletionSlice', () => {
       state = reducer(state, resetCompletionDedupeBaselines())
       state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 1_000, reason: 'grace' }))
       expect(state.pendingEvents).toHaveLength(2)
+    })
+  })
+
+  describe('antigravity activity ingestion (plan Task 8)', () => {
+    it('registers the antigravityActivity slice in the app store and ingests records', () => {
+      // The registration trap the plan review flagged: an UNREGISTERED slice
+      // silently discards every dispatch, so busy never reaches the UI. Build
+      // the store from the app's exact reducer map and prove the slice is
+      // both present and fed. (The serializable-check exemption mirrors the
+      // repo's App-level store pattern — the sessions slice's
+      // expandedProjects Set is a pre-existing known non-serializable.)
+      const store = configureStore({
+        reducer: appReducers,
+        middleware: (getDefault) => getDefault({
+          serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
+        }),
+      })
+
+      expect(store.getState().antigravityActivity).toBeDefined()
+
+      store.dispatch(upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 1_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      expect(store.getState().antigravityActivity.byTerminalId['t-agy']).toMatchObject({
+        terminalId: 't-agy',
+        phase: 'busy',
+      })
+
+      store.dispatch(removeAntigravityActivity({ terminalIds: ['t-agy'], mutationSeq: 2 }))
+      expect(store.getState().antigravityActivity.byTerminalId['t-agy']).toBeUndefined()
+
+      store.dispatch(resetAntigravityActivity())
+      expect(store.getState().antigravityActivity.lastSnapshotSeq).toBe(0)
+    })
+
+    // Whole-delta review round 5, Major 1: the antigravity wire's
+    // `updatedAt` is TWO-CLOCK by design — provisional busy carries the
+    // registry's submit stamp (the tracker's `note_submit`), settled idle
+    // carries the CLI record's own `at` (`note_record`), and the
+    // locator's 5 s backward tolerance lets that record legitimately land
+    // BEFORE the submit stamp. A later mutation can therefore carry an
+    // EARLIER timestamp; `mutationSeq` (the frame-ingestion counter, one
+    // shared strictly-increasing sequence with snapshot request seqs) is
+    // the only safe ordering key.
+    it('orders upserts by mutationSeq, not updatedAt (a later-seq idle with an earlier CLI-record timestamp ingests)', () => {
+      let state = antigravityActivityReducer(undefined, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 10_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'busy', updatedAt: 10_000 })
+
+      // The settled idle: a LATER frame (mutationSeq 2) whose timestamp
+      // is 2 s BEFORE the registry submit stamp — inside the locator's
+      // backward tolerance. It must ingest and clear the false busy.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 8_000, sessionId: 'conv-1' }],
+        mutationSeq: 2,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 8_000 })
+      expect(state.liveMutationSeqByTerminalId['t-agy']).toBe(2)
+    })
+
+    it('ignores an older-seq upsert after a newer one even with a later timestamp (the seq gate guards both directions)', () => {
+      let state = antigravityActivityReducer(undefined, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 10_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 8_000, sessionId: 'conv-1' }],
+        mutationSeq: 2,
+      }))
+
+      // A stale re-delivery of the busy frame (older seq) must NOT
+      // resurrect busy even though its updatedAt is LATER than the idle
+      // record's — the gate must not become a timestamp gate again.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 12_000, sessionId: 'conv-1' }],
+        mutationSeq: 1,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 8_000 })
+      expect(state.liveMutationSeqByTerminalId['t-agy']).toBe(2)
+    })
+
+    it('extends the seq ordering to snapshot-sourced records (older-seq live mutations stay out; newer ones still ingest)', () => {
+      // A snapshot-ingested record's effective seq is the snapshot's
+      // requestSeq (the same counter the live frames use) — the seq
+      // discipline must hold across the snapshot/live boundary too.
+      let state = antigravityActivityReducer(undefined, setAntigravityActivitySnapshot({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 5_000, sessionId: 'conv-1' }],
+        requestSeq: 10,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'busy', updatedAt: 5_000 })
+
+      // Older than the snapshot: ignored even with a later timestamp.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 99_000, sessionId: 'conv-1' }],
+        mutationSeq: 8,
+      }))
+      expect(state.byTerminalId['t-agy']?.phase).toBe('busy')
+
+      // Newer than the snapshot: ingests even with an earlier timestamp.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 4_000, sessionId: 'conv-1' }],
+        mutationSeq: 12,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 4_000 })
+      expect(state.liveMutationSeqByTerminalId['t-agy']).toBe(12)
+    })
+
+    it('keeps the removal seq authoritative (an older-seq upsert never crosses a newer tombstone)', () => {
+      let state = antigravityActivityReducer(undefined, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 10_000, sessionId: 'conv-1' }],
+        mutationSeq: 5,
+      }))
+      state = antigravityActivityReducer(state, removeAntigravityActivity({ terminalIds: ['t-agy'], mutationSeq: 6 }))
+      expect(state.byTerminalId['t-agy']).toBeUndefined()
+
+      // An older-seq upsert (a stale frame) must not resurrect the
+      // record regardless of its timestamp.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'busy', updatedAt: 50_000, sessionId: 'conv-1' }],
+        mutationSeq: 5,
+      }))
+      expect(state.byTerminalId['t-agy']).toBeUndefined()
+      expect(state.removedMutationSeqByTerminalId['t-agy']).toBe(6)
+
+      // A newer-seq upsert resurrects and clears the tombstone.
+      state = antigravityActivityReducer(state, upsertAntigravityActivity({
+        terminals: [{ terminalId: 't-agy', phase: 'idle', updatedAt: 3_000, sessionId: 'conv-1' }],
+        mutationSeq: 7,
+      }))
+      expect(state.byTerminalId['t-agy']).toMatchObject({ phase: 'idle', updatedAt: 3_000 })
+      expect(state.removedMutationSeqByTerminalId['t-agy']).toBeUndefined()
+    })
+
+    it('applies the server-idle edge to an antigravity pane (the terminal.idle path is mode-agnostic)', () => {
+      const now = Date.now()
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          antigravityActivity: antigravityActivityReducer,
+          turnCompletion: reducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{ id: 'tab-1', createRequestId: 'req-1', title: 'Tab 1', status: 'running' as const, mode: 'antigravity' as const, shell: 'system' as const, createdAt: now }],
+            activeTabId: 'tab-1',
+            renameRequestTabId: null,
+          },
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'leaf' as const,
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal' as const,
+                  createRequestId: 'cr-1',
+                  status: 'running' as const,
+                  mode: 'antigravity' as const,
+                  shell: 'system' as const,
+                  terminalId: 'term-agy',
+                },
+              },
+            },
+            activePane: { 'tab-1': 'pane-1' },
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
+          },
+          settings: { settings: defaultSettings, loaded: true },
+          antigravityActivity: {
+            byTerminalId: { 'term-agy': { terminalId: 'term-agy', phase: 'busy', updatedAt: 1 } },
+            lastSnapshotSeq: 0,
+            liveMutationSeqByTerminalId: {},
+            removedMutationSeqByTerminalId: {},
+          },
+          turnCompletion: {
+            seq: 0,
+            lastAtByTerminalId: {},
+            lastIdleAtByTerminalId: {},
+            pendingEvents: [],
+            attentionByTab: {},
+            attentionByPane: {},
+          },
+        },
+      })
+
+      store.dispatch(applyServerIdle({
+        terminalId: 'term-agy',
+        at: 1_000,
+        reason: 'grace',
+      }) as any)
+
+      expect(store.getState().turnCompletion.pendingEvents).toEqual([{
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-agy',
+        at: 1_000,
+        seq: 1,
+        source: 'terminal',
+        watched: false,
+      }])
+      expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-agy']).toBe(1_000)
     })
   })
 })

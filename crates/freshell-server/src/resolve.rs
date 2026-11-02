@@ -235,7 +235,8 @@ pub struct ResolveState {
 /// settings-enabled providers, so a disabled provider's sessions can never
 /// be found — report those as UNSEARCHED so "not found" never overclaims.
 /// Order matches the canonical provider list.
-const KNOWN_RESUME_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+const KNOWN_RESUME_PROVIDERS: [&str; 5] =
+    ["claude", "codex", "opencode", "amplifier", "antigravity"];
 
 /// Wire response (`ResumeResolveResponseSchema`): the core outcome plus the
 /// router-level provider-health fields. `providerErrors`/`unsearchedProviders`
@@ -1089,8 +1090,8 @@ mod tests {
             auth_token: Arc::new("tok".into()),
             // Isolated home: overrides read/write under `<dir>/.freshell/`,
             // never the developer's real config (same pattern as the
-            // session_directory router tests). All four Node providers are
-            // discovered, and the fresh-store default enables all four
+            // session_directory router tests). All discovered Node providers
+            // are enumerated, and the fresh-store default enables them all
             // (Node's `DEFAULT_ENABLED_CLI_PROVIDERS`), so the baseline
             // `unsearchedProviders` is `[]` — deterministic expectations.
             settings: crate::settings_store::SettingsStore::load(
@@ -1844,7 +1845,7 @@ mod tests {
         assert_eq!(body["status"], "ready");
         assert_eq!(body["providerErrors"], serde_json::json!([]));
         assert!(body["unsearchedProviders"].is_array());
-        // Baseline is [] — the fresh-store default enables all FOUR Node
+        // Baseline is [] — the fresh-store default enables all the discovered
         // providers (`DEFAULT_ENABLED_CLI_PROVIDERS` incl. amplifier); a
         // regression in that default must fail loudly here.
         assert_eq!(body["unsearchedProviders"], serde_json::json!([]));
@@ -1997,6 +1998,99 @@ mod tests {
         assert!(
             unsearched.iter().any(|v| v == "codex"),
             "codex must be listed unsearched, got {unsearched:?}"
+        );
+    }
+
+    /// Plan Task 5: `KNOWN_RESUME_PROVIDERS` gains `"antigravity"`, so a
+    /// settings-disabled antigravity is reported honestly in
+    /// `unsearchedProviders` (its indexed sessions filtered out, never
+    /// resolved), exactly like the other known providers.
+    #[tokio::test]
+    async fn antigravity_disabled_provider_is_unsearched_and_its_sessions_do_not_resolve() {
+        let dir = temp_dir("dis-antigravity");
+        seed_enabled_providers(&dir, &["claude"]);
+        let agy_id = "11111111-2222-3333-4444-555555555555";
+        let mut agy = claude_fixture();
+        agy.provider = "antigravity".to_string();
+        agy.session_id = agy_id.to_string();
+        let index = fixture_index(vec![agy]).await;
+        let (status, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": agy_id }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(
+            body["matches"],
+            serde_json::json!([]),
+            "a disabled antigravity's indexed session must not resolve"
+        );
+        let unsearched = body["unsearchedProviders"].as_array().unwrap();
+        assert!(
+            unsearched.iter().any(|v| v == "antigravity"),
+            "antigravity must be listed unsearched when disabled in settings, got {unsearched:?}"
+        );
+    }
+
+    /// Plan Task 5: an ENABLED antigravity's exact conversationId resolves
+    /// straight off the index and reports the provider (the exact-hit path
+    /// is provider-agnostic — no per-provider resolver code).
+    #[tokio::test]
+    async fn antigravity_exact_conversation_id_resolves_and_reports_the_provider() {
+        const AGY_CONV: &str = "11111111-2222-3333-4444-555555555555";
+        let dir = temp_dir("agy-exact");
+        seed_enabled_providers(&dir, &["claude", "antigravity"]);
+        // A real antigravity store under the isolated home's .gemini
+        // subtree, seeded from the committed fixture.
+        let transcript_dir = dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(AGY_CONV)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test/fixtures/coding-cli/antigravity/fresh.sanitized.jsonl"),
+        )
+        .unwrap();
+        std::fs::write(transcript_dir.join("transcript.jsonl"), fixture).unwrap();
+
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![
+                Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+                    dir.join(".gemini").join("antigravity-cli"),
+                )) as Arc<dyn SessionSource>,
+            ],
+            std::time::Duration::from_secs(3600),
+            None,
+        ));
+        index.warm().await;
+
+        let (status, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": AGY_CONV }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(
+            body["matches"],
+            serde_json::json!([{
+                "provider": "antigravity",
+                "sessionId": AGY_CONV,
+                "cwd": "/home/u/proj",
+                "sessionType": "antigravity",
+                "title": "Fix the flaky test",
+                "firstUserMessage": "Fix the flaky test",
+                "lastActivityAt": 1_793_304_005_500i64,
+                "matchKind": "exact",
+            }]),
+            "the exact conversationId must resolve through the real antigravity source"
         );
     }
 

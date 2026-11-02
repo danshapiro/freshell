@@ -2,7 +2,7 @@
 // advisory provider hint from arbitrary pasted text. Hints only assist
 // the UI — session-store evidence decides the provider.
 
-export type ResumeHintProvider = 'claude' | 'codex' | 'opencode' | 'amplifier'
+export type ResumeHintProvider = 'claude' | 'codex' | 'opencode' | 'amplifier' | 'antigravity'
 
 export type ResumeCandidateKind = 'prefixed-id' | 'uuid' | 'hex-prefix'
 
@@ -43,6 +43,13 @@ const COMMAND_HINTS: ReadonlyArray<readonly [RegExp, ResumeHintProvider]> = [
   [/\bcodex\s+resume\b/i, 'codex'],
   [/\bopencode\s+--session\b/i, 'opencode'],
   [/\bamplifier\s+(?:--resume|resume)\b/i, 'amplifier'],
+  // Antigravity (plan Task 7): the CLI's resume form is
+  // `agy --conversation <id>` (the manifest's `resumeArgs`,
+  // extensions/antigravity/freshell.json); the provider name is an accepted
+  // alias for the same command shape. Command-shape only — no WORD_HINTS row
+  // (a bare provider word is not resume evidence).
+  [/\bagy\s+--conversation\b/i, 'antigravity'],
+  [/\bantigravity\s+--conversation\b/i, 'antigravity'],
 ]
 
 const WORD_HINTS: ReadonlyArray<readonly [RegExp, ResumeHintProvider]> = [

@@ -17,7 +17,10 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 
-function sessionRef(sessionId: string, provider: 'claude' | 'codex' | 'opencode' = 'claude'): SessionNameRef {
+function sessionRef(
+  sessionId: string,
+  provider: 'claude' | 'codex' | 'opencode' | 'antigravity' = 'claude',
+): SessionNameRef {
   return { kind: 'session', provider, sessionId }
 }
 
@@ -59,6 +62,29 @@ describe('sessionNames reducer', () => {
     ]))
     expect(recordAt(state, sessionRef('s1'))?.name).toBe('Fix login')
     expect(recordAt(state, sessionRef('s1'))?.revision).toBe(3)
+  })
+
+  it('stores an accepted antigravity record by its naming ref key (Task 9: the fourth scoped CLI)', () => {
+    // An antigravity rename riding the canonical update shape must fold
+    // cleanly — no schema rejection, no console error, no dropped record.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let state = sessionNamesReducer(undefined, { type: 'init' })
+    state = sessionNamesReducer(state, receiveSessionNames([
+      update(record(sessionRef('conv-1', 'antigravity'), 'Antigravity rename', 2), 10),
+    ]))
+    expect(recordAt(state, sessionRef('conv-1', 'antigravity'))?.name).toBe('Antigravity rename')
+    expect(errorSpy).not.toHaveBeenCalled()
+    // A rename (higher revision, manual) replaces it by revision, and a
+    // gemini record (out of scope by contract) still never enters the cache.
+    state = sessionNamesReducer(state, receiveSessionNames([
+      update(record(sessionRef('conv-1', 'antigravity'), 'Renamed by user', 3, 'manual'), 11),
+    ]))
+    expect(recordAt(state, sessionRef('conv-1', 'antigravity'))?.name).toBe('Renamed by user')
+    state = sessionNamesReducer(state, receiveSessionNames([
+      update(record({ kind: 'session', provider: 'gemini', sessionId: 'g-1' } as never, 'Nope', 1), 12),
+    ]))
+    expect(recordAt(state, { kind: 'session', provider: 'gemini', sessionId: 'g-1' } as never)).toBeUndefined()
+    expect(errorSpy).toHaveBeenCalled()
   })
 
   it('merges records by revision, not arrival order: a stale late update never retitles', () => {

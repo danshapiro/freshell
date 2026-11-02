@@ -15,6 +15,7 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
+const EMPTY_ANTIGRAVITY_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
@@ -34,6 +35,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
   const amplifierActivityByTerminalId = useAppSelector((s) => s.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID)
+  const antigravityActivityByTerminalId = useAppSelector((s) => s.antigravityActivity?.byTerminalId ?? EMPTY_ANTIGRAVITY_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const paneRuntimeActivityByPaneId = useAppSelector(
@@ -69,6 +71,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
       codexActivityByTerminalId,
       claudeActivityByTerminalId,
       amplifierActivityByTerminalId,
+      antigravityActivityByTerminalId,
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       freshAgentSessions,

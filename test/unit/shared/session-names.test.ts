@@ -30,6 +30,28 @@ describe('SessionNameRefSchema', () => {
         .success,
     ).toBe(false)
   })
+
+  it('accepts the antigravity provider and still rejects out-of-scope providers (Task 9)', () => {
+    expect(
+      SessionNameRefSchema.safeParse({
+        kind: 'session',
+        provider: 'antigravity',
+        sessionId: 'conv-1',
+      }).success,
+    ).toBe(true)
+    expect(
+      SessionNameRefSchema.safeParse({ kind: 'session', provider: 'gemini', sessionId: 'g' })
+        .success,
+    ).toBe(false)
+    expect(
+      SessionNameRefSchema.safeParse({ kind: 'session', provider: 'kimi', sessionId: 'k' })
+        .success,
+    ).toBe(false)
+    expect(
+      SessionNameRefSchema.safeParse({ kind: 'session', provider: 'amplifier', sessionId: 'a' })
+        .success,
+    ).toBe(false)
+  })
 })
 
 describe('sessionNameRefKey', () => {
@@ -63,10 +85,11 @@ describe('sessionNameRefKey', () => {
 })
 
 describe('isUnifiedAgentMode', () => {
-  it('scopes exactly the three terminal CLI modes', () => {
+  it('scopes exactly the four terminal CLI modes', () => {
     expect(isUnifiedAgentMode('claude')).toBe(true)
     expect(isUnifiedAgentMode('codex')).toBe(true)
     expect(isUnifiedAgentMode('opencode')).toBe(true)
+    expect(isUnifiedAgentMode('antigravity')).toBe(true)
     expect(isUnifiedAgentMode('shell')).toBe(false)
     expect(isUnifiedAgentMode('gemini')).toBe(false)
     expect(isUnifiedAgentMode('kimi')).toBe(false)

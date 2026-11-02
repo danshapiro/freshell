@@ -258,6 +258,31 @@ describe('registry name-refresh overlay', () => {
     expect(groups.sameDeviceOpen[0].tabName).toBe('Renamed elsewhere')
   })
 
+  it('resolves a remote antigravity saved name through the durable sessionRef fallback', () => {
+    const agyRef: SessionNameRef = { kind: 'session', provider: 'antigravity', sessionId: 's-agy' }
+    const record = makeRecord({
+      tabName: 'Stale captured name',
+      nameSource: { kind: 'session', paneId: 'pane-1' },
+      panes: [makePane({ sessionRef: { provider: 'antigravity', sessionId: 's-agy' } })],
+    })
+    const state = {
+      tabs: { tabs: [] },
+      panes: { layouts: {}, paneTitles: {} },
+      connection: {},
+      tabRegistry: {
+        closed: [],
+        localClosed: {},
+        remoteOpen: [record],
+        sameDeviceOpen: [record],
+      },
+      sessionNames: sessionNamesWith([{ ref: agyRef, name: 'Antigravity renamed elsewhere', revision: 5 }]),
+    } as unknown as RootState
+
+    const groups = selectTabsRegistryGroups(state)
+    expect(groups.remoteOpen[0].tabName).toBe('Antigravity renamed elsewhere')
+    expect(groups.sameDeviceOpen[0].tabName).toBe('Antigravity renamed elsewhere')
+  })
+
   it('keeps a pre-Task-6 record without nameSource untouched (no invented ownership)', () => {
     const record = makeRecord({
       tabName: 'Stored name',

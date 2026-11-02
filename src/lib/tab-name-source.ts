@@ -34,7 +34,7 @@ export function parsePaneNamingIdentityInput(
       nameRef = { kind: 'pending', id: ref.id }
     } else if (
       ref.kind === 'session'
-      && (ref.provider === 'claude' || ref.provider === 'codex' || ref.provider === 'opencode')
+      && (ref.provider === 'claude' || ref.provider === 'codex' || ref.provider === 'opencode' || ref.provider === 'antigravity')
       && typeof ref.sessionId === 'string'
       && ref.sessionId.length > 0
     ) {

@@ -453,3 +453,116 @@ fn cold_index_codex_and_opencode_answer_unknown() {
     let _ = std::fs::remove_dir_all(&codex_root);
     let _ = std::fs::remove_dir_all(&opencode_root);
 }
+
+// ── Antigravity by-id locator (plan Task 7) ─────────────────────────────────
+//
+// The index's `AntigravitySource` drops every transcript whose
+// ownership/workspace parse yields no row (antigravity.rs module doc —
+// unreadable file, no ownership record, no usable workspace path), so a
+// conversation dir on disk can be index-invisible while the attach arm
+// (`agy --conversation <id>`) would still resume it. The by-id locator is
+// the attach-parity arm: before finalizing a warm-Absent for antigravity,
+// re-check the SAME canonical transcript path the CLI resolves.
+
+/// Antigravity home with `brain/<id>/.system_generated/logs/transcript.jsonl`
+/// seeded for each id (locator-relevant bytes only — the by-id check needs
+/// existence + readability, not parseable content).
+fn agy_home_with_conversations(tag: &str, ids: &[&str]) -> std::path::PathBuf {
+    let home = rv_temp_dir(tag);
+    for id in ids {
+        let logs = home
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir antigravity brain");
+        std::fs::write(logs.join("transcript.jsonl"), "{\"v\":1}\n")
+            .expect("write antigravity transcript");
+    }
+    home
+}
+
+/// Warm snapshot says Absent, but the conversation's transcript exists on
+/// disk (created after the snapshot, or parse-dropped from the index). The
+/// by-id fallback must answer Present — a stale warm snapshot must never
+/// adjudicate a real conversation absent.
+#[tokio::test]
+async fn antigravity_absent_snapshot_rescued_by_transcript_locator() {
+    let home = temp_claude_home("agy-rescue");
+    let conv = "11111111-2222-3333-4444-555555555555";
+    let agy_home = agy_home_with_conversations("agy-rescue-home", &[conv]);
+    let (probe, index) = probe_over(&home);
+    let probe =
+        probe.with_antigravity_transcript_locator(antigravity_transcript_locator(agy_home.clone()));
+    index.warm().await;
+    assert_eq!(
+        probe.exists("antigravity", conv),
+        SessionExistence::Present,
+        "the conversation transcript exists on disk (the attach arm would resume it) — \
+         a stale warm snapshot must never adjudicate it absent"
+    );
+    assert!(
+        probe.ever_observed_on_disk("antigravity", conv),
+        "a fallback hit is an on-disk observation and must feed ever_observed_on_disk"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&agy_home);
+}
+
+/// Warm snapshot Absent + a readable store without the id ⇒ positive
+/// Absent (both index and walk agree) — the fallback must never weaken
+/// positive denial.
+#[tokio::test]
+async fn antigravity_definitively_absent_stays_absent() {
+    let home = temp_claude_home("agy-absent");
+    let agy_home =
+        agy_home_with_conversations("agy-absent-home", &["11111111-2222-3333-4444-555555555556"]);
+    let (probe, index) = probe_over(&home);
+    let probe =
+        probe.with_antigravity_transcript_locator(antigravity_transcript_locator(agy_home.clone()));
+    index.warm().await;
+    assert_eq!(
+        probe.exists("antigravity", "00000000-1111-2222-3333-444444444444"),
+        SessionExistence::Absent,
+        "store readable, conversation definitively absent => positive Absent"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&agy_home);
+}
+
+/// An unreadable transcript (the corruption/permission class) answers
+/// honest Unknown — never a finalized Absent that could adjudicate a live
+/// conversation dead.
+#[tokio::test]
+async fn antigravity_unreadable_store_answers_unknown() {
+    let home = temp_claude_home("agy-unreadable");
+    let (probe, index) = probe_over(&home);
+    let probe = probe.with_antigravity_transcript_locator(Arc::new(|_sid: &str| {
+        crate::existence_by_id::ByIdAnswer::Unreadable
+    }));
+    index.warm().await;
+    assert_eq!(
+        probe.exists("antigravity", "agy-x"),
+        SessionExistence::Unknown,
+        "read failure is honest ignorance — fail open, never Absent"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Provider gating pin: the fallback is ANTIGRAVITY-scoped — a claude
+/// Absent must stay Absent even when the antigravity locator would answer
+/// Present for any id.
+#[tokio::test]
+async fn claude_absent_never_consults_the_antigravity_locator() {
+    let home = temp_claude_home("claude-agy-gate");
+    let (probe, index) = probe_over(&home);
+    let probe =
+        probe.with_antigravity_transcript_locator(Arc::new(|_sid: &str| ByIdAnswer::Present));
+    index.warm().await;
+    assert_eq!(
+        probe.exists("claude", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"),
+        SessionExistence::Absent,
+        "the by-id transcript fallback is provider-gated to antigravity only"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -16,7 +16,8 @@
 //! (Both hooks funnel through `finish_pty_exit`, so a future registry-layer
 //! observation could cover all paths; recorded as future work.)
 
-pub(crate) const AUTO_RESUME_MODES: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+pub(crate) const AUTO_RESUME_MODES: [&str; 5] =
+    ["claude", "codex", "opencode", "amplifier", "antigravity"];
 
 /// Backoff before retry N (index = attempts already made). 2 retries max
 /// per user ruling 2026-07-27. After the last entry: exhausted and LOUD.
@@ -1568,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn all_four_agent_modes_are_eligible() {
+    fn all_agent_modes_are_eligible() {
         for mode in AUTO_RESUME_MODES {
             let c = CrashContext { mode, ..ctx() };
             assert!(

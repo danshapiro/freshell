@@ -114,13 +114,14 @@ function parseRecordPaneNamingRef(payload: Record<string, unknown>): SessionName
     && typeof (sessionRef as { provider?: unknown }).provider === 'string'
     && ((sessionRef as { provider: string }).provider === 'claude'
       || (sessionRef as { provider: string }).provider === 'codex'
-      || (sessionRef as { provider: string }).provider === 'opencode')
+      || (sessionRef as { provider: string }).provider === 'opencode'
+      || (sessionRef as { provider: string }).provider === 'antigravity')
     && typeof (sessionRef as { sessionId?: unknown }).sessionId === 'string'
     && (sessionRef as { sessionId: string }).sessionId.length > 0
   ) {
     return {
       kind: 'session',
-      provider: (sessionRef as { provider: 'claude' | 'codex' | 'opencode' }).provider,
+      provider: (sessionRef as { provider: 'claude' | 'codex' | 'opencode' | 'antigravity' }).provider,
       sessionId: (sessionRef as { sessionId: string }).sessionId,
     }
   }

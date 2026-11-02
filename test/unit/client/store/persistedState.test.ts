@@ -674,6 +674,33 @@ describe('persistedState parsers', () => {
       expect(content.nameRef).toBeUndefined()
       expect(content.namingHandle).toBeUndefined()
     })
+
+    it('keeps an antigravity session nameRef on a persisted terminal pane through the panes parse', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-agy': {
+            type: 'leaf',
+            id: 'pane-agy',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-agy',
+              status: 'creating',
+              mode: 'antigravity',
+              shell: 'system',
+              nameRef: { kind: 'session', provider: 'antigravity', sessionId: 'conv-agy-1' },
+            },
+          },
+        },
+        activePane: { 'tab-agy': 'pane-agy' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      const content = (parsed!.layouts['tab-agy'] as any).content
+      expect(content.nameRef).toEqual({ kind: 'session', provider: 'antigravity', sessionId: 'conv-agy-1' })
+    })
   })
 
 // ── unified agent names (Task 7): the parse-level sanitizer gate ─────────────

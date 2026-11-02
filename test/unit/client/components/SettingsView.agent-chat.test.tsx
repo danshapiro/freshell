@@ -123,6 +123,38 @@ describe('SettingsView coding agents settings', () => {
     expect(screen.queryByRole('switch', { name: 'Kimi' })).not.toBeInTheDocument()
   })
 
+  it('shows the Antigravity CLI row when the CLI is available and toggling writes codingCli.enabledProviders', async () => {
+    const store = createSettingsViewStore({
+      settings: { codingCli: { enabledProviders: ['claude', 'codex'] } },
+      extraPreloadedState: {
+        connection: {
+          status: 'ready',
+          platform: 'linux',
+          availableClis: { antigravity: true },
+          featureFlags: {},
+        },
+      },
+    })
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    const antigravitySwitch = screen.getByRole('switch', { name: 'Antigravity CLI' })
+    expect(antigravitySwitch).toBeInTheDocument()
+    expect(antigravitySwitch).not.toBeChecked()
+
+    fireEvent.click(antigravitySwitch)
+
+    expect(store.getState().settings.settings.codingCli.enabledProviders).toEqual([
+      'claude', 'codex', 'antigravity',
+    ])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      codingCli: { enabledProviders: ['claude', 'codex', 'antigravity'] },
+    })
+  })
+
   it('hides Fresh agent rows when the runtime CLI is disabled in settings', () => {
     const store = createSettingsViewStore({
       settings: {

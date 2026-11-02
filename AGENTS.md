@@ -333,6 +333,7 @@ All components **must** be accessible for browser-use automation and WCAG compli
 Managed provider environment and recovery repair: [implementation plan](docs/plans/2026-10-05-managed-provider-environment.md).
 
 Freshcodex completion: [implementation plan](docs/plans/2026-10-25-freshcodex-complete.md). Managed native runtime: [qualification and ownership](docs/development/codex-native-runtime.md).
+Google coding CLI support (Antigravity CLI and existing Gemini CLI compatibility): [implementation plan](docs/plans/2026-10-29-google-cli-first-class-support.md).
 
 Fresh Agent compact panels: [implementation plan](docs/plans/2026-11-01-fresh-agent-compact-panels.md).
 
