@@ -87,10 +87,11 @@ Expected: FAIL because the helper does not exist (compile error: cannot find fun
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Add the test-local `format_native_input_rows` helper next to the sibling formatting code (mirror the repo's own row-formatting pattern at base_ref :7750-7753); then:
+Add the test-local `format_native_input_rows` helper next to the sibling formatting code (mirror the repo's own row-formatting pattern at base_ref :7750-7753); then restructure the count guard so the assertion is over the FINAL, quiesced file — not a race-won snapshot:
 
-1. Change the count assertion (:7976-7980) to embed the rendered rows in its panic message — expected count stays exactly 3 (two `/clear` + one original input); no count relaxation.
-2. Adopt the sibling's complete-JSONL discipline in the poll (:7958-7964 mirrors :7730-7746): wait for a complete trailing record before parsing instead of parsing a possibly-torn last line. A torn line must be awaited, not counted or panicked on.
+1. Keep the existing poll ONLY as the wait-until-3-rows-appear step (:7958-7964); it no longer decides the count.
+2. Once 3 rows are visible, shut the sidecar down and await its exit (the test already owns the sidecar lifecycle; the writer process is the sidecar, so after exit the file is final).
+3. Read the complete file with the sibling's complete-JSONL discipline (:7730-7746: wait for a complete trailing record; a torn line is never counted), then assert EXACTLY 3 rows, embedding `format_native_input_rows` in the panic message. A fourth row that landed any time before shutdown is now deterministically counted — the intermittent race the original failure relied on is closed. No count relaxation; no sleeps added (shutdown-join is the quiesce, not a timer).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -132,7 +133,7 @@ git commit -m "test: retain native-input evidence in clear-backlog count asserti
 
 - [ ] **Step 1: Reproduce under controlled starvation — a bounded multi-attempt campaign (diagnostic only — no repo change)**
 
-Run the exact clear-backlog test inside the runtime sandbox with deliberate CPU pressure against the test process (busy-loop helpers or `taskset` pinning, the retained driver-episode pattern) while a pre-opened read FD retains `native-inputs.jsonl` outside the TempDir. Make this a genuine campaign, not a single shot: at least three attempts with varied pressure strategies (e.g. different `taskset` CPU counts, different busy-loop intensities, a ~500 ms starvation window starting after row 3), each retaining its evidence. Success criterion: a fourth row appears matching the predicted fingerprint — no `uuid`, bare-string text `Continue only the original pending native operation. Do not select another tool.`, root E, row-3's PID. If a row appears that does NOT match the fingerprint, stop and re-investigate (the planning report §4.2–4.7 statically excludes all other writers; a mismatch is a genuinely new finding). If the campaign is inconclusive after all attempts, the isolation repair may still land (it removes the only statically-live racing writer and is defensively correct), but cnr1's Kata issue is NOT closed in this run: post an honest comment recording that the runtime fingerprint remains unconfirmed, that the retention changes now guarantee any recurrence retains the actual rows, and that the issue stays open pending a recurrence with retained evidence.
+Run the exact clear-backlog test (now with Task 1's restructured final-file count guard, which deterministically counts any row written before shutdown) inside the runtime sandbox with deliberate CPU pressure against the test process (busy-loop helpers or `taskset` pinning, the retained driver-episode pattern) while a pre-opened read FD retains `native-inputs.jsonl` outside the TempDir. Make this a genuine campaign, not a single shot: at least three attempts with varied pressure strategies (e.g. different `taskset` CPU counts, different busy-loop intensities, a ~500 ms starvation window starting after row 3), each retaining its evidence. Success criterion: a fourth row appears matching the predicted fingerprint — no `uuid`, bare-string text `Continue only the original pending native operation. Do not select another tool.`, root E, row-3's PID. If a row appears that does NOT match the fingerprint, stop and re-investigate (the planning report §4.2–4.7 statically excludes all other writers; a mismatch is a genuinely new finding). If the campaign is inconclusive after all attempts, the isolation repair may still land (it removes the only statically-live racing writer and is defensively correct), but cnr1's Kata issue is NOT closed in this run: post an honest comment recording that the runtime fingerprint remains unconfirmed, that the retention changes now guarantee any recurrence retains the actual rows, and that the issue stays open pending a recurrence with retained evidence.
 
 - [ ] **Step 2: Write the failing behavioral test**
 
@@ -516,19 +517,29 @@ git commit -m "feat: send-driven managed codex recovery for native exit in a liv
 
 ---
 
-### Task 8: gc1p acceptance — full installed parity case + both Rust contexts + retained evidence
+### Task 8: gc1p acceptance — parity-case assertion strengthening + full installed case + both Rust contexts + retained evidence
 
 **Files:**
-- No new files expected; fix-ups land in the files from Tasks 5-7 if the case exposes gaps (each fix-up gets its own focused test and commit).
+- Modify: `test/integration/server/fresh-agent-parity.test.ts` (post-crash section :1000-1100 — three assertion strengthenings in Step 0 below; test-only changes, no assertion ever relaxed)
+- No other new files expected; fix-ups land in the files from Tasks 5-7 if the case exposes gaps (each fix-up gets its own focused test and commit).
 
 **Interfaces:**
-- Consumes: Tasks 5-7 complete; the installed parity case's post-crash contract (test/integration/server/fresh-agent-parity.test.ts, base_ref post-crash section :1000-1100: first recovery send accepted through the ORIGINAL public reference, saved settings retained, committed native identity, pending-question resolution, second prompt, old/new history and name policies, archived original bytes preserved).
+- Consumes: Tasks 5-7 complete (the typed classification event from Task 7 exists by now); the installed parity case's post-crash contract (first recovery send accepted through the ORIGINAL public reference, saved settings retained, committed native identity, pending-question resolution, second prompt, old/new history and name policies, archived original bytes preserved).
+
+- [ ] **Step 0: Strengthen the parity case's post-crash proof (test-only; no relaxation)**
+
+Three additions close the gaps the plan review found in the case as written at base_ref:
+1. Observer-first sequencing: after the native-PID kill + history archive (:1040-1041), AWAIT the supervisor's send-recoverable classification event (the JSONL event Task 7's observer emits) BEFORE sending the recovery prompt — an event-conditioned wait on the case's existing structured-event polling helpers, never a blind sleep. Without this, the immediate send can recover before the timer-driven observer (:224-239) ever classifies, and a pass would not prove the observer/admission composition the issue is about.
+2. Archived-byte immutability: the case hashes and copies the archive files at archive time (:1023-1040) but never rereads them — add a post-recovery re-hash of every archived original-history file and assert byte equality with the archive-time hashes (this is the issue's "original-history byte guard", made checkable).
+3. Gateway ownership fence: the case's send helper omits `observedEpoch`/`observedGeneration` (:671-675), and `post_barrier_admission` accepts sends with both absent (`fresh_agent_proxy.rs:144-149`), so the fence is currently NOT exercised. Drive the recovery send (and the second prompt) WITH the observed epoch/generation pair attached so the fence is genuinely proven across the identity commit; if the harness cannot attach the pair, substitute a focused `freshell_proxy_tests.rs` test that proves fence-across-identity-commit semantics and record that substitution honestly in the task report.
+
+Each addition protects the contract it names; run the case once after adding them — additions 1 and 3 are green immediately after Tasks 5-7 (their machinery exists), addition 2 must be green because no recovery path may write the archive (if it fails, that is a real fix-up in the owning task with its own focused test).
 
 - [ ] **Step 1: Run the entire installed Codex parity case in the disposable sandbox**
 
-Run: `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='gc1p installed parity acceptance' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
+Run: `FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='gc1p installed parity acceptance' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: PASS — the whole case, including every post-crash assertion that previously failed at the first recovery send (base_ref :1041). If any assertion fails, capture the Task-5 diagnostics from the retained JSONL logs, fix the substantiated gap in the owning task's files with its own focused test, and rerun. Do not relax any assertion. This run also settles the validator's gateway-ownership-fence assumption (the case drives the recovery send through the original public reference with the gateway's ownership fence active — retained evidence proves the fence held pre-crash, and this run proves it holds across the identity commit).
+Expected: PASS — the whole case, including every post-crash assertion that previously failed at the first recovery send (base_ref :1041) and the three strengthened proofs. If any assertion fails, capture the Task-5 diagnostics from the retained JSONL logs, fix the substantiated gap in the owning task's files with its own focused test, and rerun. Do not relax any assertion.
 
 - [ ] **Step 2: Run the managed-recovery neighbor lanes**
 
@@ -548,14 +559,21 @@ Expected: PASS; retain receipts for both contexts.
 
 Save the parity-case log, the JSONL lifecycle/frame evidence, and the Rust receipts under the run's reports dir; `kata comment gc1p --body "..."` summarizing: root cause (two layers), the fixes (A1, B1, C), the acceptance commands and results, and the evidence paths. Do not close the issue yet — closure follows the final delta review.
 
-- [ ] **Step 5: Commit any fix-ups (or none)**
+- [ ] **Step 5: Commit the strengthened assertions (and any fix-ups)**
 
-If Step 1-3 required fix-ups, each is already committed with its focused test; otherwise note "no fix-ups needed" in the task report. There is no separate commit for this task's verification work.
+Commit Step 0's parity-case strengthenings with their own focused message (they are test-only changes; the case must pass with them before commit):
+
+```bash
+git add test/integration/server/fresh-agent-parity.test.ts
+git commit -m "test: prove observer-first sequencing, archived-byte immutability, and ownership fence in parity recovery"
+```
+
+If Steps 1-3 required fix-ups, each is already committed with its own focused test; otherwise note "no fix-ups needed" in the task report.
 
 ---
 
 ## Verification summary (whole plan)
 
-- Focused lanes: the per-task commands above (sandboxed cargo selectors, sandbox-wrapped vitest paths for real-sidecar test files, repo-owned Vitest paths for server-integration lanes), plus Task 5 Step 6's pre-fix actual-error capture run.
-- Whole-branch: the coordinator-gated full suite at execution end (`GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY='...' pnpm run check` or `pnpm run test` per the gate procedure), green excluding nothing — the four tracked Kata failures must be FIXED, not excluded.
-- Kata closure after the final delta review passes, per issue: `gc1p` closes when the full installed parity case passes post-fix with the actual-error capture retained; `wjwa` and `czzp` close when their cases are deterministic green in both build contexts; `cnr1` closes ONLY if the starvation campaign confirmed the fourth-row fingerprint at runtime — if unconfirmed, it stays open with an honest evidence comment (retention + isolation landed, runtime fingerprint pending a recurrence with retained rows). fy2w untouched in all cases.
+- Focused lanes: the per-task commands above (sandboxed cargo selectors, sandbox-wrapped vitest paths for real-sidecar test files, repo-owned Vitest paths for server-integration lanes), plus Task 5 Step 6's pre-fix actual-error capture run and Task 8 Step 0's strengthened parity assertions.
+- Whole-branch: the coordinator-gated full suite at execution end (`FRESHELL_RUST_TEST_SANDBOX=1 GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY='...' pnpm run check` or `pnpm run test` per the gate procedure — the `FRESHELL_RUST_TEST_SANDBOX=1` value is what routes the Rust phase into the disposable sandbox), green excluding nothing: no suite failure may remain at final HEAD.
+- Kata closure after the final delta review passes, per issue: `gc1p` closes when the full installed parity case passes post-fix with the actual-error capture retained; `wjwa` and `czzp` close when their cases are deterministic green in both build contexts; `cnr1` closes ONLY if the starvation campaign confirmed the fourth-row fingerprint at runtime. If the cnr1 campaign is inconclusive, the run records cnr1 as PARTIAL/non-converged for that issue (retention + isolation landed; runtime fingerprint pending a recurrence with retained rows), reports it prominently in the recap, and does not claim cnr1 fixed — the run status then reflects the partial outcome. fy2w untouched in all cases.
