@@ -237,8 +237,8 @@ pub fn read_maintenance_inventory(
                      AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id)
                      AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id)
                      AND NOT EXISTS(SELECT 1 FROM native_origin_owners o
-                                    WHERE o.ownership_state!='owned'
-                                      AND (o.owner_soul_id=s.soul_id OR o.owner_soul_id IS NULL))
+                                    WHERE o.owner_soul_id IS NULL
+                                       OR (o.ownership_state!='owned' AND o.owner_soul_id=s.soul_id))
                      AND NOT EXISTS(SELECT 1 FROM view_intents v
                                     WHERE v.soul_id=s.soul_id AND v.kind='automatic_primary'
                                       AND v.visibility!='hidden')
@@ -7918,6 +7918,24 @@ pub(crate) mod tests {
             assert_eq!(*status, MaintenanceInventoryStatus::Unresolved);
         }
         assert!(!outcomes.contains_key(&addressable));
+
+        // An ownerless row is registry-level unexplained authority. It must
+        // prevent even an otherwise safe stopped soul from being called empty.
+        let conn = Connection::open(&database_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO native_origin_owners (provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES ('codex','store','root-without-owner',NULL,NULL,'owned',0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let safe_record = snapshot
+            .no_runtime
+            .iter()
+            .find(|record| record.soul_id == safe_stopped)
+            .expect("safe soul remains represented");
+        assert_eq!(safe_record.status, MaintenanceInventoryStatus::Unresolved);
 
         // A dangling admission reservation cannot be tied to one soul, so it
         // prevents all no-runtime rows from claiming the registry is empty.
