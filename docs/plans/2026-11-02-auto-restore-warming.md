@@ -98,14 +98,18 @@ async fn readiness_watch_fires_on_cache_identical_first_publication() {
 
 #[tokio::test]
 async fn readiness_subscriber_wakes_from_false_on_first_publish() {
-    let index = /* cold index with one real seeded session (changed > 0) */;
+    // NOTE (ledger F1): SessionIndex is NOT Clone — hold it in an
+    // Arc<SessionIndex> (production's own shape) and clone the Arc for the
+    // sweeper task.
+    let index = std::sync::Arc::new(/* cold index with one real seeded session (changed > 0) */);
     let mut ready = index.subscribe_ready();
-    let sweeper = tokio::spawn({ let index = index.clone(); async move { index.snapshot().await } });
+    let sweeper = tokio::spawn({ let index = std::sync::Arc::clone(&index); async move { index.snapshot().await } });
     ready.changed().await.expect("watch sender alive");
     assert!(*ready.borrow());
     let _ = sweeper.await;
-    // Exactly one transition: a second publish does not re-notify
-    // (send_modify only notifies on change).
+    // Exactly one transition: a second publish does not re-notify, because
+    // the flip uses send_if_modified with an idempotence guard (tokio's
+    // send_modify would notify unconditionally — ledger C1d).
 }
 ```
 
@@ -147,7 +151,11 @@ pub fn is_ready(&self) -> bool {
 // store into self.snapshot, before the `if changed > 0` generation bump),
 // still under refresh_lock:
 // First sweep completed: publish readiness regardless of content delta.
-self.ready_tx.send_modify(|r| *r = true);
+// send_if_modified (NOT send_modify — tokio notifies unconditionally on
+// send_modify, verified at the pinned 1.52.3): only the false->true
+// transition notifies, so later publishes never re-wake readiness
+// watchers. (Load-bearing ledger C1d.)
+self.ready_tx.send_if_modified(|r| if *r { false } else { *r = true; true });
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -184,7 +192,8 @@ git commit -m "feat(sessions): add one-way SessionIndex readiness watch firing o
 - Modify: `crates/freshell-protocol/src/server_messages.rs` (Ready struct :1298-1329 + capabilities echo; new `SessionsIndexReady` variant; `SERVER_MESSAGE_TYPES` :219-290; `PaneVerdict::Error` reason doc :1195-1206)
 - Modify: `crates/freshell-ws/src/lib.rs` (hello capability parse beside :937-955; thread the per-connection flag into the connection handler)
 - Modify: `crates/freshell-ws/src/terminal.rs` (connection loop signature :285-361 + the broadcast forward site :715-723; `broadcast_sessions_index_ready` beside `broadcast_sessions_changed` :8693-8700; `WsState.session_index_ready` field beside `broadcast_tx` :168)
-- Test: `crates/freshell-protocol/tests/hello_capabilities.rs` (extend), `crates/freshell-protocol/tests/roundtrip.rs` or the pane_reconcile protocol test for the new frame, new `crates/freshell-ws/tests/session_index_ready.rs`
+- Modify: **the ~65 exhaustive `WsState { ... }` struct literals across ~35+ files** (ledger C10b — the repo's own >~6-site sweep rule, lib.rs:262-264): every literal gains exactly one `session_index_ready: None,` arm. Sweep sites: `crates/freshell-ws/tests/common/mod.rs`, every `crates/freshell-ws/tests/*.rs` harness building a state (`pane_reconcile.rs`, `hello_capabilities.rs`, `resume_validation_gate.rs`, and the rest — grep `WsState {`), `crates/freshell-ws/src/terminal.rs` inline tests, `crates/freshell-server/src/main.rs` (:2324 and :4775 literals — the production site gets `Some(index.subscribe_ready())`).
+- Test: `crates/freshell-protocol/tests/roundtrip.rs` (new-frame roundtrip) + `crates/freshell-protocol/tests/pane_reconcile.rs` (reason serialization, extended in Task 4) + `crates/freshell-ws/tests/hello_capabilities.rs` (capability parse pins — note: this file lives in freshell-ws/tests, NOT freshell-protocol; ledger F3) + new `crates/freshell-ws/tests/session_index_ready.rs`
 
 **Interfaces:**
 - Consumes: Task 1's `subscribe_ready()` (the WsState field holds the receiver; hand-built test states default `None`).
@@ -198,7 +207,7 @@ git commit -m "feat(sessions): add one-way SessionIndex readiness watch firing o
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-New file `crates/freshell-ws/tests/session_index_ready.rs`, using the `spawn_server_with` harness from `tests/pane_reconcile.rs:64-118` (raw tokio-tungstenite client, ephemeral port):
+New file `crates/freshell-ws/tests/session_index_ready.rs`, using the `spawn_server_with` harness from `tests/pane_reconcile.rs:64-118` (raw tokio-tungstenite client, ephemeral port; the harness's `Server` handle exposes only `{url, registry, identity}` — ledger F4 — so this test file owns a thin local spawn wrapper that ALSO retains an `Arc<WsState>` handle for calling `broadcast_sessions_index_ready(&state)` directly):
 
 ```rust
 // Three contracts, one file: (1) a negotiating client's ready frame carries
@@ -350,9 +359,11 @@ Expected: PASS (no legacy-shape change; frozen-client ready frames byte-identica
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-protocol/src crates/freshell-ws/src crates/freshell-ws/tests/session_index_ready.rs
+git add crates/freshell-protocol/src crates/freshell-ws/src crates/freshell-ws/tests crates/freshell-server/src/main.rs
 git commit -m "feat(ws): add capability-gated sessions.index.ready wire surface with ready-state handshake field"
 ```
+
+(The wide `git add` covers the mechanical WsState literal sweep across test harness files; verify with `git status` that only intended files are staged.)
 
 ---
 
@@ -395,7 +406,7 @@ async fn delayed_startup_gate_disabled_passes_through() {
 
 #[tokio::test]
 async fn readiness_broadcast_fires_exactly_once_on_first_publish() {
-    let index = /* tempdir SessionIndex with one seeded session file (sweep completes) */;
+    let index = std::sync::Arc::new(/* tempdir SessionIndex with one seeded session file (sweep completes) */);
     let ws_state = /* test WsState with a real broadcast_tx */;
     let mut rx = ws_state.broadcast_tx.subscribe();
     spawn_session_index_ready_broadcast(&index, &ws_state);
@@ -403,8 +414,12 @@ async fn readiness_broadcast_fires_exactly_once_on_first_publish() {
     let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
         .await.expect("broadcast arrives").expect("channel alive");
     assert!(frame.contains(r#""type":"sessions.index.ready""#));
-    // exactly once: a second publish must not re-broadcast
-    index.mark_dirty();
+    // exactly once: a second publish must not re-broadcast (the one-shot
+    // spawn task has exited; the readiness flip itself is idempotent via
+    // send_if_modified). NOTE (ledger F1): use the real scoped-dirty
+    // signature — `mark_dirty` takes `&[(PathBuf, String)]` — or call
+    // `request_refresh()` to trigger the second publish.
+    index.request_refresh();
     let _ = index.snapshot().await;
     assert!(tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await.is_err());
 }
@@ -548,8 +563,14 @@ fn warm_unreadable_store_answers_unreadable_not_unknown() {
 }
 #[test]
 fn cold_unreadable_locator_stays_unknown_warming_is_honest_pre_readiness() {
-    // cold index + claude/opencode locator Unreadable => Unknown (the scan
-    // may still speak; warming is the honest label).
+    // Cold index + the opencode by-id locator hitting an unreadable store =>
+    // Unknown (the scan may still speak; warming is the honest label).
+    // Root-proof unreadable seeding (ledger C4a): seed a DIRECTORY at the
+    // opencode.db path — SQLite's Connection::open fails on a directory for
+    // ANY euid. Do NOT seed a directory at a claude transcript path: the
+    // claude locator is metadata-based (claude_snapshot.rs candidate_is_file)
+    // and a directory is a clean MISS => Absent (ledger C4b) — a different
+    // verdict path, never Unreadable.
 }
 #[test]
 fn cold_opencode_resolves_by_id_without_waiting_for_the_scan() {
@@ -690,9 +711,10 @@ git commit -m "feat(existence): distinguish unreadable stores from warming post-
 - Modify: `shared/session-contract.ts` (RestoreErrorReasonSchema :17-23)
 - Modify: `src/lib/pane-reconcile.ts` (error arms :413-424 fresh-agent, :599-618 terminal)
 - Modify: `src/store/connectionSlice.ts` (new state + reducer)
-- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (getRestoreErrorMessage :906-921)
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (getRestoreErrorMessage :906-921 — the ONLY per-reason copy switch; TerminalView has no twin, ledger C9a)
 - Modify: `src/lib/ws-client.ts` (hello capabilities send :553-563)
 - Modify Rust persisted model for the vocabulary: `crates/freshell-ws/src/tabs_store_model.rs` (:364 reason list + `read_restore_error`/`restore_error`) and `crates/freshell-ws/src/tabs_persist_validation.rs` (:437-455 allowlist)
+- Modify (ledger C9b — two vocabulary allowlists the original file list missed, both required for the atomic vocabulary change): `shared/fresh-agent.ts` (`RESTORE_ERROR_REASONS` Set :71-77 gating `readRestoreError` :268-272 — without it a persisted `session_store_unreadable` latch is silently dropped during legacy-payload migration) and `crates/freshell-freshagent/src/layout_store_content.rs` (`RESTORE_ERROR_REASONS: [&str; 5]` :130-136 gating `read_restore_error` :198-207 — the Rust layout-mirror twin)
 - Test: `test/unit/shared/ws-protocol.reconcile.test.ts` (extend), `test/unit/client/lib/pane-reconcile.test.ts` (extend), a connectionSlice test (nearest: search test/unit/client/store for connection tests; else the App wiring test), `test/unit/client/components/App.reconcile-adoption.test.tsx` (extend), Rust `tabs_persist_validation` tests
 
 **Interfaces:**
@@ -812,6 +834,10 @@ if (msg.type === 'sessions.index.ready') {
 // the shared/session-contract.ts pointer), read_restore_error accepts it,
 // restore_error(reason) constructs it.
 // tabs_persist_validation.rs :452-455 — allowlist gains "session_store_unreadable".
+// shared/fresh-agent.ts :71-77 — RESTORE_ERROR_REASONS Set gains the reason
+// (readRestoreError keeps the persisted latch alive across migration).
+// crates/freshell-freshagent/src/layout_store_content.rs :130-136 — the Rust
+// RESTORE_ERROR_REASONS array gains the reason ("five" -> six entries).
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -835,7 +861,7 @@ Expected: PASS (existing behavior unchanged: `error{index_warming}` still folds 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add shared/ws-protocol.ts shared/session-contract.ts src/lib/ready-message-schema.ts src/lib/pane-reconcile.ts src/store/connectionSlice.ts src/lib/ws-client.ts src/components/fresh-agent/FreshAgentView.tsx src/App.tsx crates/freshell-ws/src/tabs_store_model.rs crates/freshell-ws/src/tabs_persist_validation.rs
+git add shared/ws-protocol.ts shared/session-contract.ts shared/fresh-agent.ts src/lib/ready-message-schema.ts src/lib/pane-reconcile.ts src/store/connectionSlice.ts src/lib/ws-client.ts src/components/fresh-agent/FreshAgentView.tsx src/App.tsx crates/freshell-ws/src/tabs_store_model.rs crates/freshell-ws/src/tabs_persist_validation.rs crates/freshell-freshagent/src/layout_store_content.rs
 git commit -m "feat(client): parse session-index readiness wire state; fold unreadable-store verdicts into honest restore errors"
 ```
 
@@ -858,7 +884,7 @@ git commit -m "feat(client): parse session-index readiness wire state; fold unre
 2. Result folded: `outcome.warming === 0` ⇒ `clearReconcileWarming()` + info log with duration-since-drive-start; still warming ⇒ bounded backoff: schedule one re-drive after 2s while `attempts < RECOVERY_RETRY_LIMIT` (debug log), else warn `reconcile_warming_recovery gave_up (attempts=N)` and stop (banner + manual Retry remain as the escape hatch — no busy polling).
 3. Watchdog: an in-flight drive whose result never arrives (disconnect killed it) is dropped after 10s (subscription unsubscribed; state untouched); a later readiness observation re-drives. `attempts` resets whenever `connection.lastReadyAt` changes (a new handshake = a new readiness observation).
 4. Single-flight: a second effect firing while a drive is in flight does not send a second request (dedup).
-5. Disconnect: a failed `ws.send` is caught and logged (warn) — the next ready re-evaluates.
+5. Disconnect: `ws.send` never throws (optional-chained no-op on a dead socket — ledger F2), so there is no send-failure arm; the 10s in-flight watchdog is the disconnect safety net, and the next ready re-evaluates and re-drives. (A `try/catch` around the send is dead code — do not add it; the banner's own Retry does not guard it either.)
 6. No drive when `sessionIndexReady === false` (pre-readiness) or when `reconcileWarming` is null.
 7. Logs are transition-gated (drive start, settle, retry-scheduled, gave-up, cleared) — nothing per poll/interval; the component runs no timers while idle.
 
@@ -957,10 +983,10 @@ export function ReconcileWarmingRecoveryDriver(): null {
       clearPending()
     }, RECOVERY_RESULT_WAIT_MS)
     pendingRef.current = { request, unsubscribe, watchdog, startedAt }
-    try { ws.send(request) } catch (err) {
-      log.warn(`[reconcile-warming-recovery] send failed — waiting for reconnect (${String(err)})`)
-      clearPending()
-    }
+    // ws.send never throws on a dead socket (optional-chained no-op, ledger
+    // F2) — the watchdog above is the disconnect safety net, mirroring the
+    // banner's own Retry which also does not guard the send.
+    ws.send(request)
   }, [warming, sessionIndexReady, dispatch, store])
 
   return null
@@ -1048,9 +1074,14 @@ test('closing a parked pane during warming cancels its recovery', async ({ fresh
 })
 
 test('unreadable store: honest per-pane error, banner cleared, identity preserved', async ({ freshellPage, serverInfo }) => {
-  // seed the claude session's transcript path as a DIRECTORY (EISDIR is
-  // root-proof) so the by-id locator cannot read it; parked during the hold;
-  // after readiness the drive folds error{session_store_unreadable}:
+  // OPENCODE seeding (ledger C4a/C4b): a pane claiming an opencode session,
+  // with a DIRECTORY seeded at <isolated data home>/opencode/opencode.db —
+  // SQLite open fails on a directory for any euid, so the by-id locator
+  // answers Unreadable root-proof. (A claude transcript directory is a
+  // clean miss => Absent — the pane would fold fresh/dead_session and never
+  // park; do not use it for this scenario.)
+  // Parked during the hold (cold Unreadable => Unknown => warming); after
+  // readiness the drive folds error{session_store_unreadable}:
   // assert banner cleared, the pane's content.restoreError.reason ===
   // 'session_store_unreadable' (harness getState), sessionRef PRESERVED,
   // no respawn, no dialogs. Warming never returns for this pane.
