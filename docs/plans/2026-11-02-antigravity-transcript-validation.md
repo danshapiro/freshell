@@ -1321,11 +1321,13 @@ Expected: PASS for every lane (the e2e trio on the local chromium project; the r
 git add test/fixtures/coding-cli/antigravity crates/freshell-sessions crates/freshell-activity \
   crates/freshell-protocol/src/common.rs crates/freshell-ws/src/antigravity_association.rs \
   crates/freshell-ws/src/activity.rs crates/freshell-ws/tests/antigravity_session_rebind.rs \
-  test/e2e-browser/fixtures/fake-agy-terminal.mjs \
+  crates/freshell-server/tests test/e2e-browser/fixtures/fake-agy-terminal.mjs \
   test/e2e-browser/specs/google-cli-identity-activity-rust.spec.ts \
   test/e2e-browser/specs/google-cli-history-resume-rust.spec.ts
 git commit -m "fix(antigravity): correct transcript record schema to the real binary contract"
 ```
+
+(Step 7 list amended post-execution: the `crates/freshell-server/tests` fixture-consumer files were required by Step 6's server-antigravity lane under the atomicity note — the task-review recorded the original list's omission as a plan defect, resolved by the implementer's declared deviation and this amendment.)
 
 ---
 
