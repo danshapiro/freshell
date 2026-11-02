@@ -3,7 +3,6 @@ import { nativeProtocolRequest } from './native-protocol.js'
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -471,9 +470,14 @@ describe('production sidecar native checkpoint continuation', () => {
       await worker.wait('created')
       await worker.wait('sdk.session.init')
       await worker.wait('probe.native-hooks-started')
+      const conflict = await worker.wait('probe.native-conflicting-hook-settled')
+      expect(conflict.event).toEqual({ event: 'hook-settled', toolUseID: 'toolu_second1',
+        signalAborted: false, permissionDecision: 'deny' })
       expect((await worker.wait('sdk.stream.ended')).reason).toBe('stream_eof')
       expect(await worker.waitExit()).toBe(3)
-      expect(existsSync(join(directory, 'late-native-hook-resolution'))).toBe(false)
+      const lifecyclePath = join(directory, 'native-hook-lifecycle.jsonl')
+      const lifecycle = (await readFile(lifecyclePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      expect(lifecycle).toEqual([conflict.event, { event: 'iterator-return', originalOwnerSettled: false }])
       expect(worker.stderr()).not.toMatch(/UnhandledPromiseRejection|ERR_UNHANDLED_REJECTION/i)
       expect(await readFile(transcriptPath)).toEqual(transcriptBefore)
       expect(await readFile(checkpointPath)).toEqual(checkpointBefore)
@@ -483,7 +487,7 @@ describe('production sidecar native checkpoint continuation', () => {
       await rm(directory, { recursive: true, force: true })
     }
   })
-  it('leaves parked native hook callbacks unresolved while shutdown closes the SDK transport', async () => {
+  it('denies a conflicting hook before shutdown and keeps the checkpoint owner parked through teardown', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-shutdown-checkpoint-'))
     await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
     let worker = checkpointSidecar(directory, 'native-shutdown-seed')
@@ -510,8 +514,14 @@ describe('production sidecar native checkpoint continuation', () => {
       await worker.wait('probe.native-child')
       worker.send({ type: 'send', sessionId: current.sessionId, text: 'resume owned checkpoint' })
       await worker.wait('probe.native-hooks-parked')
+      const conflict = await worker.wait('probe.native-conflicting-hook-settled')
+      expect(conflict.event).toEqual({ event: 'hook-settled', toolUseID: 'toolu_second1',
+        signalAborted: false, permissionDecision: 'deny' })
+      const lifecyclePath = join(directory, 'native-hook-lifecycle.jsonl')
+      const lifecycle = async () => (await readFile(lifecyclePath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      expect(await lifecycle()).toEqual([conflict.event])
       expect(await worker.close()).toBe(0)
-      expect(existsSync(join(directory, 'late-native-hook-resolution'))).toBe(false)
+      expect(await lifecycle()).toEqual([conflict.event, { event: 'transport-abort' }])
       expect(worker.stderr()).not.toMatch(/UnhandledPromiseRejection|ERR_UNHANDLED_REJECTION/i)
       expect(await readFile(transcriptPath)).toEqual(transcriptBefore)
       expect(await readFile(checkpointPath)).toEqual(checkpointBefore)

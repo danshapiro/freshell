@@ -150,12 +150,32 @@ export function query({ prompt, options }) {
           const secondInput = { command: 'second owned harmless counter' }
           const second = callback({ ...hookInput, tool_use_id: 'toolu_second1', tool_input: secondInput },
             'toolu_second1', { signal: options.abortController.signal })
-          for (const pending of [first, second]) {
-            void pending.then(
-              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'resolved\n'),
-              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'rejected\n'))
-          }
+          const lifecyclePath = join(options.cwd, 'native-hook-lifecycle.jsonl')
+          let originalOwnerSettled = false
+          const recordSettlement = (toolUseID, pending) => pending.then((decision) => {
+            if (toolUseID === 'toolu_original1') originalOwnerSettled = true
+            const event = { event: 'hook-settled', toolUseID,
+              signalAborted: options.abortController.signal.aborted,
+              permissionDecision: decision?.hookSpecificOutput?.permissionDecision ?? 'ordinary' }
+            appendFileSync(lifecyclePath, JSON.stringify(event) + '\n')
+            if (toolUseID === 'toolu_second1') {
+              process.stdout.write(JSON.stringify({ type: 'probe.native-conflicting-hook-settled', event }) + '\n')
+            }
+            return event
+          }, (error) => {
+            const event = { event: 'hook-rejected', toolUseID,
+              signalAborted: options.abortController.signal.aborted, error: String(error?.message ?? error) }
+            appendFileSync(lifecyclePath, JSON.stringify(event) + '\n')
+            if (toolUseID === 'toolu_second1') {
+              process.stdout.write(JSON.stringify({ type: 'probe.native-conflicting-hook-settled', event }) + '\n')
+            }
+            return event
+          })
+          recordSettlement(toolUseID, first)
+          const secondSettled = recordSettlement('toolu_second1', second)
           process.stdout.write(JSON.stringify({ type: 'probe.native-hooks-started' }) + '\n')
+          await secondSettled
+          appendFileSync(lifecyclePath, JSON.stringify({ event: 'iterator-return', originalOwnerSettled }) + '\n')
           return
         }
         if (callback && process.env.FRESHELL_SIDECAR_TEST_PARK_TWO_HOOKS_UNTIL_SHUTDOWN === '1') {
@@ -163,11 +183,33 @@ export function query({ prompt, options }) {
           const secondInput = { command: 'second owned harmless counter' }
           const second = callback({ ...hookInput, tool_use_id: 'toolu_second1', tool_input: secondInput },
             'toolu_second1', { signal: options.abortController.signal })
-          for (const pending of [first, second]) {
-            void pending.then(
-              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'resolved\n'),
-              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'rejected\n'))
+          const resolutionPath = join(options.cwd, 'native-hook-lifecycle.jsonl')
+          options.abortController.signal.addEventListener('abort', () => {
+            appendFileSync(resolutionPath, JSON.stringify({ event: 'transport-abort' }) + '\n')
+          }, { once: true })
+          const recordSettlement = (toolUseID, pending) => {
+            void pending.then((decision) => {
+              // Keep the hook result and teardown ordering together: the
+              // distinct second operation may be denied against the claimed
+              // checkpoint before shutdown, while the original owner stays parked.
+              const event = { event: 'hook-settled', toolUseID,
+                signalAborted: options.abortController.signal.aborted,
+                permissionDecision: decision?.hookSpecificOutput?.permissionDecision ?? 'ordinary' }
+              appendFileSync(resolutionPath, JSON.stringify(event) + '\n')
+              if (toolUseID === 'toolu_second1') {
+                process.stdout.write(JSON.stringify({ type: 'probe.native-conflicting-hook-settled', event }) + '\n')
+              }
+            }, (error) => {
+              const event = { event: 'hook-rejected', toolUseID,
+                signalAborted: options.abortController.signal.aborted, error: String(error?.message ?? error) }
+              appendFileSync(resolutionPath, JSON.stringify(event) + '\n')
+              if (toolUseID === 'toolu_second1') {
+                process.stdout.write(JSON.stringify({ type: 'probe.native-conflicting-hook-settled', event }) + '\n')
+              }
+            })
           }
+          recordSettlement(toolUseID, first)
+          recordSettlement('toolu_second1', second)
           process.stdout.write(JSON.stringify({ type: 'probe.native-hooks-parked' }) + '\n')
           await new Promise((resolve) => options.abortController.signal.addEventListener('abort', resolve, { once: true }))
           return
