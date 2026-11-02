@@ -21,7 +21,7 @@ Worktree: `.worktrees/antigravity-transcript-validation`, branch `the-usual/anti
 ### Accepted tradeoffs and residuals
 - The transcript record schema is a Stage-1 candidate; this run may promote or correct it against real evidence.
 
-**Goal:** Real `agy` 1.4.12 transcript evidence pins the REAL record schema (correcting the disproven Stage-1 candidate), Freshell's antigravity transcript consumers and fixtures are corrected to that schema with a collision-proof settle dedupe, the deferred conversation-resume gate is activated on that evidence together with a proven real resume, the README limitation is replaced with the validated behavior, and the real-provider smoke gains a real-resume tier.
+**Goal:** Real `agy` transcript evidence (the on-machine 1.2.11 + 1.4.12 corpus — store-log-attributed, schemas identical across both — plus fresh 1.4.12 receipts this run mints) pins the REAL record schema (correcting the disproven Stage-1 candidate), Freshell's antigravity transcript consumers and fixtures are corrected to that schema with a collision-proof settle dedupe, the deferred conversation-resume gate is activated on that evidence together with a proven real resume, the README limitation is replaced with the validated behavior, and the real-provider smoke gains a real-resume tier.
 
 **Architecture:** Investigation first: Task 1 re-derives the record schema from the three on-machine real conversations plus a fresh scratch conversation this run owns (including a real `--conversation` resume probe and back-to-back turns), records verbatim shape-only receipts, and flips the Provider Contract Record rows. Task 2 then corrects the record vocabulary in one atomic change across every consumer and test double: the sessions parser/fixtures/source/search go fully real (step-indexed `USER_INPUT`/`PLANNER_RESPONSE`/`GENERIC`/`SYSTEM_MESSAGE`/`CHECKPOINT` records, conversation id from the `brain/<id>` directory, flat token fields), the activity classifier and the locator's user-record arm adopt the real `USER_INPUT` shape, and the per-settle dedupe is re-keyed from wall-clock `at` alone to the record identity `(created_at, step_index)` — binary-evidenced collision-proof — while the two structures reality disproves (the ownership record the locator anchors on, the settle record the attention machinery consumes) are retained as explicitly-labeled fake-contract test extensions. Only after the corrected schema is implemented and the real resume is proven does Task 3 flip the gate (`VALIDATED_PROVIDERS` plus every deliberately-red deferral pin rewritten to the gated contract, README rewritten, the e2e dead-session scenario re-pinned), and Task 4 adds the triple-gated real-resume smoke tier and runs the final verification sweep. If the authenticated session cannot run (no `GEMINI_API_KEY` and no live alternative auth), Task 3's flip does not happen — the blocker is recorded and the run reports the miss honestly.
 
@@ -54,7 +54,7 @@ Run-specific constraints (this plan's own, binding):
 
 ## The corrected record contract (what Task 1 pins, Tasks 2-3 implement)
 
-The three on-machine real conversations (agy 1.4.12 snap; paths in the explorer reports under the run's logs dir) and the fresh scratch conversations Task 1 mints establish, as shape-only binary facts:
+The three on-machine real conversations (produced by agy 1.2.11 and 1.4.12 — store-log-attributed, schemas identical across both; paths in the explorer reports under the run's logs dir) and the fresh scratch conversations Task 1 mints establish, as shape-only binary facts:
 
 - Record types: `USER_INPUT`, `PLANNER_RESPONSE`, `GENERIC`, `SYSTEM_MESSAGE`, `CHECKPOINT` — and NOTHING else. No `session_start`, `user_message`, `assistant_message`, or `turn_settled` record exists in any real transcript.
 - Every record carries `type`, `source` (`USER_EXPLICIT` | `MODEL` | `SYSTEM`), `status` (`DONE` | `ERROR`), `step_index` (int), `created_at` (RFC3339 UTC, **second** granularity). Optional: `content`, `thinking`, `tool_calls`, `media`, `error`, `truncated_fields`, and the flat token fields `input_tokens`/`output_tokens`/`cache_read_tokens` (null on almost all records; no `totalTokens` key exists).
@@ -116,7 +116,7 @@ jq -r 'select(.type=="USER_INPUT") | [.step_index, .created_at] | @tsv' "$BIG"
 jq -r 'select(.input_tokens != null) | [.type, .step_index, .input_tokens, .output_tokens, .cache_read_tokens] | @tsv' "$AGY_STORE"/brain/*/.system_generated/logs/transcript.jsonl
 ```
 
-Expected (record every output verbatim in the evidence report): only the five real types; `source` ∈ {USER_EXPLICIT, MODEL, SYSTEM}; `status` ∈ {DONE, ERROR}; the candidate-key grep prints `0` for every file; the key union is exactly the real field set; the `created_at` histogram shows same-second groups (counts > 1); the step-index duplicate check prints nothing (unique per record); the multi-turn conversation's `USER_INPUT` records show strictly increasing step indexes (0 and 116) with second-granularity stamps; the token scan shows flat snake_case fields on a sparse subset of `PLANNER_RESPONSE` records.
+Expected (record every output verbatim in the evidence report): only the five real types; `source` ∈ {USER_EXPLICIT, MODEL, SYSTEM}; `status` ∈ {DONE, ERROR}; the candidate-key grep prints `0` for every file; the key union is exactly the real field set; the `created_at` histogram shows same-second groups (counts > 1); the step-index duplicate check prints nothing (unique per record); the multi-turn conversation's `USER_INPUT` records show strictly increasing step indexes (0 and 116) with second-granularity stamps; the token scan shows flat snake_case fields on a sparse subset of `PLANNER_RESPONSE` records. Also record per-type content-presence stats: how many `PLANNER_RESPONSE` records carry null/empty `content` (corpus: 42/45), the ~4KB truncated-content prefix lengths where `truncated_fields` includes `content`, and the fact that only the turn-final planner record of each multi-step turn carries the reply. The parser's first-NON-EMPTY summary read therefore selects turn 1's final reply — record that reading as evidenced by this shape (the naive "first PLANNER_RESPONSE carries the reply" is false in real multi-step turns). Record the store-log version lines that attribute the corpus (bounding receipts, re-quoted 2026-11-02: `I1030 01:09:09.367593 146 server.go:1631] Language server version: 1.2.11`; `I1031 11:29:14.566956 147 server.go:1953] Language server version: 1.4.12`).
 
 - [ ] **Step 3: Version-stamp the binary (self-update risk)**
 
@@ -126,20 +126,49 @@ agy --version
 
 Expected: `1.4.12`. Record it; re-run after all probes and record again (a drifted version means the receipts may be version-mixed — record honestly).
 
+- [ ] **Step 3b: Fence the shared config (checksum guard around every probe)**
+
+```bash
+AGY_STORE="$HOME/snap/antigravity-cli/common/.gemini/antigravity-cli"
+mkdir -p /tmp/opencode/yhqb
+sha256sum "$AGY_STORE/settings.json" | cut -d' ' -f1 > /tmp/opencode/yhqb/settings.sha.base
+stat -c '%y %s' "$AGY_STORE/settings.json" > /tmp/opencode/yhqb/settings.stat.base
+cp "$AGY_STORE/settings.json" /tmp/opencode/yhqb/settings.json.backup
+fence() {
+  now=$(sha256sum "$AGY_STORE/settings.json" | cut -d' ' -f1)
+  if [ "$now" != "$(cat /tmp/opencode/yhqb/settings.sha.base)" ]; then
+    cp /tmp/opencode/yhqb/settings.json.backup "$AGY_STORE/settings.json"
+    echo "settings.json MUTATED by the last invocation — byte-exact backup restored; ABORT (GC2 violation: record the diff and mtime in the evidence report)"
+    exit 1
+  fi
+  stat -c '%y %s' "$AGY_STORE/settings.json"
+}
+cat /tmp/opencode/yhqb/settings.sha.base
+```
+
+Expected: the printed sha256 is `134d65225f7cacfc1bfbfbfe29e6289363b6f5914d88cae206ff2ddd591b78b1` (baseline captured 2026-11-02; mtime 2026-10-30 01:04:06, 443 B). Run `fence` after EVERY agy invocation in Steps 4-5 — the `--settings` key form AND the OAuth-fallback form both touch the live store — and record the before/after checksums in the evidence report. On mismatch the guard restores the byte-exact backup (which lives OUTSIDE the store) and aborts; the mutation itself is recorded verbatim (diff + mtime + which invocation), never papered over. The binary's own `--help` claims the overlay is "Settings for this session only, never saved" — this fence is the on-host proof, not a restatement of that claim.
+
 - [ ] **Step 4: Mint a fresh scratch conversation this run owns (headless turn)**
 
 ```bash
 ls "$AGY_STORE/brain" | sort > /tmp/opencode/yhqb/brain-before.txt
+for f in settings.json cache/last_conversations.json history.jsonl conversation_summaries.db cli.log; do
+  stat -c "%n %y %s" "$AGY_STORE/$f"; sha256sum "$AGY_STORE/$f" | cut -d' ' -f1
+done > /tmp/opencode/yhqb/shared-files-before.txt
+cat /tmp/opencode/yhqb/shared-files-before.txt
 NONCE1="freshell-yhqb-$(date -u +%Y%m%dT%H%M%SZ)"
 timeout 240 env GEMINI_API_KEY="${GEMINI_API_KEY:?export GEMINI_API_KEY first (else use the OAuth fallback)}" \
   agy -p --settings '{"modelProvider":"gemini"}' "Reply with exactly: $NONCE1" \
   > /tmp/opencode/yhqb/turn1.out 2> /tmp/opencode/yhqb/turn1.err
 echo "exit=$?"; grep -c "$NONCE1" /tmp/opencode/yhqb/turn1.out
+fence
 ls "$AGY_STORE/brain" | sort > /tmp/opencode/yhqb/brain-after.txt
 comm -13 /tmp/opencode/yhqb/brain-before.txt /tmp/opencode/yhqb/brain-after.txt
 ```
 
-Expected: exit 0; the nonce echoed; exactly one new `<uuid>` under `brain/`. If `GEMINI_API_KEY` is unset, run the same invocations WITHOUT `--settings` and without the env guard (the machine's live OAuth sign-in — GC15) and record which auth produced the evidence. If BOTH paths fail (no authenticated session possible), STOP: record the blocker in the evidence report and `run-state.md`, and do NOT run Task 3's flip (GC13) — Task 2 still lands (the correction is warranted by the corpus evidence alone), and the run reports the gate item as blocked.
+Shared-file pre-run baselines (2026-11-02, strategist receipts): settings.json `134d6522…b78b1` (Oct 30 01:04:06, 443 B — must NOT move; the Step 3b fence guards it); cache/last_conversations.json `28feeb29…30da` (Oct 31 11:47:14, 230 B — expected to move: the pointer); history.jsonl `1f7334be…39387` (Oct 31 11:28:56, 1741 B — expected display lines); conversation_summaries.db `2ceb7213…236c` (Oct 31 11:29:45, 20480 B — possible ghost row); cli.log `03924560…7f3a` (Oct 31 11:29:14, 27 B). Re-run the same stat+sha256 loop after every scratch turn and record all deltas in the evidence report — record, do not "fix"; these are the CLI's own files.
+
+Expected: exit 0; the nonce echoed; the fence passes (settings.json unchanged); exactly one new `<uuid>` under `brain/`. Auth ordering (strategist receipts, 2026-11-02): (1) if the coordinator obtains a key (user-approved source: the Freshell config's `settings.ai.geminiApiKey`, OneCLI after `onecli auth login`, or a user-supplied key), run the primary command as written (`--settings` overlay + the key exported into the probe env only, never printed); (2) on ANY key-path failure (invalid key, CLI-setup error) or no key, run the same invocations WITHOUT `--settings` and without the env guard (the machine's live OAuth sign-in — GC15) — the fallback invocation is itself the OAuth-liveness probe (the token file carries no readable expiry; `auth_method` is `consumer`; last refreshed 2026-10-31) — and record which auth produced the evidence; (3) if the OAuth path also fails, STOP: record the blocker in the evidence report and `run-state.md`, and do NOT run Task 3's flip (GC13) — Task 2 still lands (the correction is warranted by the corpus evidence alone), and the run reports the gate item as blocked. A key-path failure is "try OAuth", never an immediate STOP.
 
 Resolve the conversation id (disambiguate by the nonce if more than one new dir appeared):
 
@@ -148,19 +177,29 @@ for id in $(comm -13 /tmp/opencode/yhqb/brain-before.txt /tmp/opencode/yhqb/brai
   grep -l "$NONCE1" "$AGY_STORE/brain/$id/.system_generated/logs/transcript.jsonl" 2>/dev/null
 done
 CONV_ID=<the printed id>
+case "$CONV_ID" in
+  ''|*[!0-9a-fA-F-]*) echo "CONV_ID unresolved or not a UUID shape — REFUSING every store deletion; resolve manually before ANY rm"; exit 1;;
+esac
+echo "CONV_ID=$CONV_ID" | tee /tmp/opencode/yhqb/conv-id.txt
 ```
 
+The UUID-shape guard is MANDATORY (Critical load-bearing finding C1): if the nonce-grep prints nothing (auth failure, transcript lag, store-root divergence), an empty `CONV_ID` would otherwise expand the Step 7 cleanup to the user's ENTIRE `brain/` tree — irreversible loss of every real conversation. Never bypass the guard; never run the cleanup unless Steps 4-6's receipts all passed.
+
 - [ ] **Step 5: Real resume probe + back-to-back turns (the never-probed headless resume)**
+
+Read-only de-risk (2026-11-02): the binary's `--help` documents both flags independently (`--conversation  Resume a previous conversation by ID`; `-p`, short alias of `--print  Run a single prompt non-interactively and print the response`) with no mutual-exclusion note, and the store's 17 CLI logs record no argv at all (no `--conversation` or `--print` lines), so this step remains the first-ever probe of the combination — on rejection, the bounded-PTY fallback is `agy --conversation <id>` on a pty (the documented `--prompt-interactive` middle shape also exists), recording whichever shape the binary actually supports. When riding the OAuth path, run these invocations WITHOUT `--settings` (the Step 4 auth ordering applies here too).
 
 ```bash
 timeout 240 agy -p --conversation "$CONV_ID" --settings '{"modelProvider":"gemini"}' \
   "Reply with exactly the string I asked you to reply with in the first message." \
   > /tmp/opencode/yhqb/turn2.out 2> /tmp/opencode/yhqb/turn2.err
 echo "exit=$?"; grep -c "$NONCE1" /tmp/opencode/yhqb/turn2.out; grep -c 'warning: conversation' /tmp/opencode/yhqb/turn2.err
+fence
 NONCE2="$NONCE1-b"
 timeout 240 agy -p --conversation "$CONV_ID" --settings '{"modelProvider":"gemini"}' \
   "Reply with exactly: $NONCE2" > /tmp/opencode/yhqb/turn3.out 2> /tmp/opencode/yhqb/turn3.err
 echo "exit=$?"; grep -c "$NONCE2" /tmp/opencode/yhqb/turn3.out
+fence
 ```
 
 Expected: exit 0 each; turn 2's stdout contains `NONCE1` (content continuity — the resume hit the SAME conversation); no `warning: conversation` on stderr; turn 3 echoes `NONCE2`. If the headless `-p --conversation <id>` combination is REJECTED by the binary (never probed before), record the exact rejection verbatim and re-probe resume through a bounded PTY session instead (the probed interactive shape: `agy --conversation <id>` on a pty, one prompt, exit) — the requirement is binary-level content continuity, not a specific flag combination; record whichever shape the binary actually supports.
@@ -175,14 +214,18 @@ jq -r '.created_at' "$T" | sort | uniq -c | sort -rn | head -5
 jq -r 'select(.input_tokens != null) | [.step_index, .input_tokens, .output_tokens, .cache_read_tokens] | @tsv' "$T"
 ```
 
-Expected: three `USER_INPUT` records with strictly increasing step indexes across the turns; the duplicate check prints nothing (step_index unique per record — the collision-proof identity); any same-second groups recorded (the corpus already proves second-granularity collisions; these receipts add the run-owned witness); the token-bearing records recorded with values. The token receipts settle Contract Record row 75(b): if one token-bearing record appears PER TURN, the fields are per-turn usage records and the parser's LAST-wins reads the latest turn's usage (record that reading); if only the conversation-final turn bears tokens, per-turn-vs-cumulative stays underdetermined — record that honestly (the LAST-wins choice and its under-report residual stay documented either way).
+Expected: three `USER_INPUT` records with strictly increasing step indexes across the turns; the duplicate check prints nothing (step_index unique per record — the collision-proof identity); any same-second groups recorded (the corpus already proves second-granularity collisions; these receipts add the run-owned witness); the token-bearing records recorded with values. The token receipts settle Contract Record row 75(b): if one token-bearing record appears PER TURN, the fields are per-turn usage records and the parser's LAST-wins reads the latest turn's usage (record that reading); if only the conversation-final turn bears tokens, per-turn-vs-cumulative stays underdetermined — record that honestly (the LAST-wins choice and its under-report residual stay documented either way). If the fresh receipts DISPROVE the collision-proof identity — a duplicate `step_index` within the scratch transcript, or USER_INPUT steps that do not strictly increase across the three turns (e.g. the binary resets steps per process) — the run does NOT proceed to Task 3: record the receipts verbatim in the evidence report and `run-state.md` as a named blocker, re-key the Task 2 dedupe design on an identity the receipts actually support (or record the collision question as unresolved), and the gate flip does not happen (GC13) — the flip's `step_index`-based "collision-proof by construction" claim would be unsound.
 
 - [ ] **Step 7: Cleanup, write the report, flip the Contract Record rows, commit**
 
 ```bash
+case "$CONV_ID" in
+  ''|*[!0-9a-fA-F-]*) echo "CONV_ID unresolved or not a UUID shape — REFUSING cleanup"; exit 1;;
+esac
 rm -rf "$AGY_STORE/brain/$CONV_ID" "$AGY_STORE/conversations/$CONV_ID.db"
 grep -rl "$NONCE1" "$AGY_STORE"/brain/*/.system_generated/logs/transcript.jsonl 2>/dev/null
 agy --version
+fence
 rm -rf /tmp/opencode/yhqb
 ```
 
@@ -192,9 +235,9 @@ Write `reports/real-binary-transcript-evidence.md` (under the run's logs dir): v
 
 Then update `docs/plans/2026-10-29-google-cli-first-class-support.md`:
 
-- Row `:67`: the record-schema blocker clause flips to `documented+validated (real binary v1.4.12 transcripts, 2026-11-02; corrected schema below — the candidate record vocabulary is disproven)`.
+- Row `:67`: the record-schema blocker clause flips to `documented+validated (real binary transcripts — agy 1.2.11 + 1.4.12 corpus, store-log-attributed, schemas identical, plus fresh 1.4.12 receipts — 2026-11-02; corrected schema below — the candidate record vocabulary is disproven)`.
 - Row `:70`: the content-continuation half flips to cite the Task 1 resume probe receipts (headless `--conversation` continuation proven, or the PTY shape the binary actually supported — whichever the receipts show).
-- Row `:74`: flips to `real-binary-validated (corrected schema, v1.4.12, 2026-11-02)` with a pointer to the evidence report and the note that Task 2 implements the correction.
+- Row `:74`: flips to `real-binary-validated (corrected schema; agy 1.2.11 + 1.4.12 corpus, store-log-attributed, plus fresh 1.4.12 receipts, 2026-11-02)` with a pointer to the evidence report and the note that Task 2 implements the correction.
 - Row `:75`: item (a) flips to the binary answer — `turn_settled` does not exist in the real format; `created_at` is second-granularity and collides; the corrected dedupe keys on `(created_at, step_index)`, step_index binary-evidenced unique per record and strictly increasing across turns. Item (b) flips to the token receipts' reading (per-turn vs underdetermined).
 - The candidate-schema block `:78-87` gains a `SUPERSEDED (2026-11-02)` header and the corrected schema block:
 
@@ -251,7 +294,8 @@ This change is deliberately ONE atomic task: the classifier, locator, parser, an
 
 ```rust
 //! Fixture-parity for the antigravity (Antigravity CLI, `agy`) transcript
-//! `.jsonl` parser — the REAL-BINARY record contract (agy v1.4.12,
+//! `.jsonl` parser — the REAL-BINARY record contract (agy 1.2.11 + 1.4.12,
+//! store-log-attributed, schemas identical, plus fresh 1.4.12 receipts;
 //! corrected 2026-11-02 against real transcripts; evidence:
 //! .worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
 //! real-binary-transcript-evidence.md). Every fixture is a SYNTHETIC
@@ -1551,6 +1595,7 @@ git commit -m "feat(antigravity): activate the validated conversation-resume gat
 
 **Files:**
 - Modify: `test/integration/real/antigravity-launch-smoke.test.ts` (the header runbook `:26-32` + the new tier-4 test)
+- Also align the existing tier-3 test (`completes a headless turn`) to pass the same session-scoped `--settings '{"modelProvider":"gemini"}'` overlay (GC15): as written it omits the overlay and implicitly relies on the operator having mutated the shared `settings.json` — which GC2 forbids and this host's settings.json does not have (no `modelProvider` key, verified 2026-11-02) — so the first key-bearing gated run would fail on tier 3 at CLI setup before tier 4 ever executes. Minimal same-file fix: `['-p', '--settings', '{"modelProvider":"gemini"}', 'Reply with exactly: antigravity-smoke-ok']`, and update the header's runbook note accordingly.
 - Test: the same file (the opt-in gated run)
 
 **Interfaces:**
@@ -1627,10 +1672,21 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       const lines = await readRecords()
       expect(lines[0].type).toBe('USER_INPUT')
       expect(lines.some((r: { type: string }) => r.type === 'PLANNER_RESPONSE')).toBe(true)
+      const version = (await execFileAsync(agyCommand, ['--version'], { timeout: 15_000 })).stdout.trim()
+      const KNOWN_TYPES = new Set(['USER_INPUT', 'PLANNER_RESPONSE', 'GENERIC', 'SYSTEM_MESSAGE', 'CHECKPOINT'])
+      const unknownTypes = new Set<string>()
       for (const record of lines) {
-        expect(typeof record.step_index).toBe('number')
-        expect(record.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
+        if (!KNOWN_TYPES.has(record.type)) { unknownTypes.add(record.type); continue }
+        // Stamps are asserted on the FIVE validated record types only: the contract
+        // says these types carry step_index and second-granularity created_at — it does
+        // not forbid a future CLI version from adding a sixth type. A stamp change on
+        // a KNOWN type still fails, and that failure is the drift alarm doing its job:
+        // record the version receipt and re-open the Provider Contract Record; never
+        // loosen the known-type assertions to get green.
+        expect(typeof record.step_index, `${record.type} step_index (agy ${version})`).toBe('number')
+        expect(record.created_at, `${record.type} created_at (agy ${version})`).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
       }
+      if (unknownTypes.size > 0) console.log(`[tier4] unknown record types (recorded, not failed): ${[...unknownTypes].join(', ')} (agy ${version})`)
 
       // THE real resume: same conversation, follow-up recall.
       const linesBefore = lines.length
@@ -1655,8 +1711,13 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
 
       // Cleanup: this run owns the conversation it created (the
       // contract-probe hygiene precedent). Record the id in the test
-      // output via the expect above; remove the run-created store tree.
+      // output via the expect above; remove BOTH store trees this
+      // conversation owns (Task 1 Step 7 parity): brain/<id> (the
+      // transcript) and conversations/<id>.db (the per-conversation
+      // sidecar db — verified present per conversation in the real store).
+      const storeRoot = await resolveAgyStoreRoot()
       await fs.rm(path.join(brainDir, convId!), { recursive: true, force: true }).catch(() => {})
+      await fs.rm(path.join(storeRoot, 'conversations', `${convId}.db`), { force: true }).catch(() => {})
     },
     420_000,
   )
@@ -1666,7 +1727,7 @@ Update the file's header runbook block (`:26-32`) to document the fourth tier (s
 
 - [ ] **Step 2: Run the gated probe and verify it matches the Task 1 receipts**
 
-This tier is a contract probe pinning behavior Task 1 already evidenced (the google-cli plan's Task 14 smoke precedent — there is no Red step against product code). Run:
+This tier is a contract probe pinning behavior Task 1 already evidenced (the google-cli plan's Task 14 smoke precedent — there is no Red step against product code). The key for the gated run, if used, is sourced with the user's explicit approval from one of: `~/.freshell/config.json` `settings.ai.geminiApiKey` (present on this host, verified 2026-11-02), OneCLI after `onecli auth login`, or a user-supplied value — exported only into the probe/test process environment, never printed, never committed; the evidence report records the source by name only. Run:
 
 ```bash
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 GEMINI_API_KEY="$GEMINI_API_KEY" \
@@ -1674,7 +1735,7 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 GEMINI_API_KEY="$GEMINI_API_KEY" \
   --config config/vitest/vitest.config.ts
 ```
 
-Expected: PASS — all four tiers, with the tier-4 receipts matching Task 1's (content recall, same-`brain/<id>` growth, unique and strictly-increasing USER_INPUT step indexes). If Task 1 recorded that the headless `-p --conversation <id>` combination is rejected by the binary, this tier's shape follows that evidence instead (the PTY-resume form), keeping the transcript/step assertions. Without the gates the suite skips the tier (never fails, never runs in the default suite — `config/vitest/vitest.config.ts:59` exclusion).
+Expected: PASS — all four tiers, with the tier-4 receipts matching Task 1's (content recall, same-`brain/<id>` growth, unique and strictly-increasing USER_INPUT step indexes). If Task 1 recorded that the headless `-p --conversation <id>` combination is rejected by the binary, this tier's shape follows that evidence instead (the PTY-resume form), keeping the transcript/step assertions. Without the gates the suite skips the tier (never fails, never runs in the default suite — `config/vitest/vitest.config.ts:59` exclusion). If no `GEMINI_API_KEY` is obtainable on this host (env unset; OneCLI requires `onecli auth login`; the user declines the Freshell-config key), the gated run still passes via `it.skip` — that outcome MUST be recorded in the evidence report and `run-state.md` as 'tier 4 delivered but not exercised on this host (no GEMINI_API_KEY)', and the run's success claim for the real-resume smoke item is downgraded to 'delivered; exercised only on a key-bearing host'. A skip is never counted as coverage.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1727,7 +1788,7 @@ git commit -m "test(antigravity): add the real-resume tier to the launch smoke"
 | 2 | Prove the `turn_settled.at` collision question with binary evidence (per-settle dedupe, equal-at = replay) | Task 1 (the binary receipts: no settle record; second-granularity collides; step_index unique + increasing), Task 2 (the dedupe re-keying + `same_second_settles_with_distinct_step_indexes_both_complete`) | Task 1 Step 6 receipts; Task 2 Step 1d/Step 2 red→green |
 | 3 | Flip the deferred resume gate in resume_validation.rs | Task 3 (VALIDATED_PROVIDERS + every deferral pin rewritten) | Task 3 Steps 2 (designed reds) and 4-6 (green + impacted sweep) |
 | 4 | Remove the corresponding README limitation | Task 3 (README:296-303 replaced; :275-279 rewritten with the schema outcome) | Task 3 Step 3g; no stale limitation text remains |
-| 5 | Extend the real-provider smoke to cover a real resume | Task 4 (tier 4) | Task 4 Step 2 gated run |
+| 5 | Extend the real-provider smoke to cover a real resume | Task 4 (tier 4) | Task 4 Step 2 gated run; if the tier was skipped for want of a key on this host, the verification record must say 'delivered, not exercised' — a skip is not coverage |
 | 6 | Gate stays OFF until real-binary evidence exists (GC4) | Task 1 → Task 2 → Task 3 ordering (GC13); the STOP branch in Task 1 Step 4 | Task sequencing + the honest-blocker branch |
 | 7 | Settings precondition modelProvider "gemini" per the smoke runbook | GC15; Task 1 Steps 4-5; Task 4's `--settings` overlay | The receipts record the auth path used |
 | 8 | Worktree on a branch from origin/main; no PR without approval | Run setup (already done) + GC6/Task discipline | No task creates a PR |
@@ -1739,3 +1800,5 @@ The run-state baseline ledger records the managed fresh-agent parity failures (k
 ## Self-review record
 
 Self-review performed before commit (per the usual-writing-plans contract): spec coverage, no silent deferrals (the two retained fake-contract extensions are explicitly labeled with their no-real-referent binary evidence and their limitation records — not silent), file/interface consistency (all paths/line anchors verified against the worktree at base_ref), executable tests (every red step names its intended failure; every command is runnable as written), placeholder scan (no TBD/TODO/vague directions), and operational completeness (cleanup, logging, README, e2e/smoke coverage). No `UNRESOLVED COVERAGE GAP`: the one conditional outcome — the authenticated session being unavailable — is handled by the explicit STOP branch (Task 1 Step 4 / GC13), not deferred.
+
+Load-bearing amendments (Stage 2, 2026-11-02, after the finder/strategist audit — reports under the run's logs dir): the Critical cleanup guard (UUID-shape `CONV_ID` assertion before first use and before every store deletion — an unguarded empty expansion would have deleted the user's entire `brain/` tree); the Step 3b settings.json checksum fence around every probe (sha256 + stat, byte-exact out-of-store backup, abort-on-mismatch) with the captured baseline `134d6522…b78b1`; the shared-file stat+sha256 residue receipts (last_conversations.json / history.jsonl / conversation_summaries.db / cli.log — record, do not fix) and the tier-4 cleanup extended to `conversations/<id>.db`; the H3 failure clause (fresh receipts that disprove step-index uniqueness/increase block the flip per GC13); the auth-ordering replacement (key path → OAuth fallback → STOP; key-path failure is "try OAuth", never an immediate STOP) with the key-source decision (the Freshell config's `settings.ai.geminiApiKey`, present on this host — recorded by name only, never printed); the corpus version stamps corrected to "agy 1.2.11 + 1.4.12 (store-log-attributed, schemas identical)" with bare 1.4.12 reserved for fresh receipts; the PLANNER_RESPONSE empty-content nuance (42/45 corpus records null/empty; only the turn-final planner record carries the reply) added to the evidence requirements; the tier-3 `--settings` overlay fix (its omission would fail the first key-bearing gated run at tier 3 before tier 4 executes) and the smoke's known-type-scoped stamp assertions with a version receipt; the tier-4 delivered-not-exercised honesty rule (a skip is never coverage); and grep-driven sweeps preferred over line anchors for the fake-writer plant sites (the rebind fake-writer anchors drifted; two locator plant sites sit outside the plan's listed anchors). The auditor's R1-R6 verifications (resume path never consults the transcript parser; the gate flip's blast radius is exactly the enumerated set with the `NoIndexProbe`/Unknown→Proceed behavior keeping the rebind suite green; the fixture-consumer set is complete; no google-cli spec sits in `CLOUD_SKIP_SPECS`; the refusal-notice shape; the doc anchors) are carried as settled facts into the evidence report.
