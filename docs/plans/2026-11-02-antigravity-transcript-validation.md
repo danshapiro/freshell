@@ -171,7 +171,7 @@ done > /tmp/opencode/yhqb/shared-files-before.txt
 cat /tmp/opencode/yhqb/shared-files-before.txt
 NONCE1="freshell-yhqb-$(date -u +%Y%m%dT%H%M%SZ)"
 timeout 240 env GEMINI_API_KEY="${GEMINI_API_KEY:?export GEMINI_API_KEY first (else use the OAuth fallback)}" \
-  agy -p --settings '{"modelProvider":"gemini"}' "Reply with exactly: $NONCE1" \
+  agy --settings '{"modelProvider":"gemini"}' -p="Reply with exactly: $NONCE1" \
   > /tmp/opencode/yhqb/turn1.out 2> /tmp/opencode/yhqb/turn1.err
 echo "exit=$?"; grep -c "$NONCE1" /tmp/opencode/yhqb/turn1.out
 fence
@@ -205,14 +205,14 @@ The UUID-shape guard is MANDATORY (Critical load-bearing finding C1): if the non
 Read-only de-risk (2026-11-02): the binary's `--help` documents both flags independently (`--conversation  Resume a previous conversation by ID`; `-p`, short alias of `--print  Run a single prompt non-interactively and print the response`) with no mutual-exclusion note, and the store's 17 CLI logs record no argv at all (no `--conversation` or `--print` lines), so this step remains the first-ever probe of the combination — on rejection, the bounded-PTY fallback is `agy --conversation <id>` on a pty (the documented `--prompt-interactive` middle shape also exists), recording whichever shape the binary actually supports. Keep the `--settings` overlay on the OAuth path too (overlay-first per the Step 4 auth ordering); the no-overlay form exists only as branch (2b)'s diagnostic retry, whose receipts cannot support the flip.
 
 ```bash
-timeout 240 agy -p --conversation "$CONV_ID" --settings '{"modelProvider":"gemini"}' \
-  "Reply with exactly the string I asked you to reply with in the first message." \
+timeout 240 agy --settings '{"modelProvider":"gemini"}' --conversation "$CONV_ID" \
+  -p="Reply with exactly the string I asked you to reply with in the first message." \
   > /tmp/opencode/yhqb/turn2.out 2> /tmp/opencode/yhqb/turn2.err
 echo "exit=$?"; grep -c "$NONCE1" /tmp/opencode/yhqb/turn2.out; grep -c 'warning: conversation' /tmp/opencode/yhqb/turn2.err
 fence
 NONCE2="$NONCE1-b"
-timeout 240 agy -p --conversation "$CONV_ID" --settings '{"modelProvider":"gemini"}' \
-  "Reply with exactly: $NONCE2" > /tmp/opencode/yhqb/turn3.out 2> /tmp/opencode/yhqb/turn3.err
+timeout 240 agy --settings '{"modelProvider":"gemini"}' --conversation "$CONV_ID" \
+  -p="Reply with exactly: $NONCE2" > /tmp/opencode/yhqb/turn3.out 2> /tmp/opencode/yhqb/turn3.err
 echo "exit=$?"; grep -c "$NONCE2" /tmp/opencode/yhqb/turn3.out
 fence
 ```
@@ -1749,7 +1749,7 @@ git commit -m "feat(antigravity): activate the validated conversation-resume gat
 
 **Interfaces:**
 - Consumes: the smoke's existing gating convention (`available && realEnabled && hasProviderKey`, `:58-60`, `:96-99`), `execFileAsync` with `--settings '{"modelProvider":"gemini"}'` (GC15), the store-root resolution order from `crates/freshell-sessions/src/provider_layout.rs` (`FRESHELL_ANTIGRAVITY_HOME` > default-when-conversation-bearing > snap root).
-- Produces: the real-resume smoke tier — the standing, opt-in, never-default proof that `agy -p --conversation <id>` continues a real conversation's content and appends to the same `brain/<id>` transcript with strictly-increasing step indexes. No production code.
+- Produces: the real-resume smoke tier — the standing, opt-in, never-default proof that `agy --settings '{"modelProvider":"gemini"}' --conversation <id> -p='<prompt>'` continues a real conversation's content and appends to the same `brain/<id>` transcript with strictly-increasing step indexes. No production code.
 
 - [ ] **Step 1: Write the failing behavioral test**
 

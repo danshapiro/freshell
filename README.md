@@ -273,10 +273,11 @@ under `~/snap/antigravity-cli/common/.gemini/antigravity-cli`, which
 Freshell falls back to automatically whenever the default root holds no
 conversations — the chosen root is named in the server log at startup,
 and neither root existing is logged loudly. Freshell's view of Antigravity's
-on-disk conversation format follows Google's documented store, but the
-transcript record schema and the store's authority have not been
-validated against a real authenticated `agy` session, so they remain
-candidate contracts. Freshell installs no Antigravity hooks and writes no
+on-disk conversation format is validated against real CLI sessions: the
+transcript record schema (record types, per-record stamps, token fields)
+and the store's authority were checked against real `agy` session
+transcripts (agy 1.2.11 and 1.4.12, November 2026), not inferred from
+fixtures. Freshell installs no Antigravity hooks and writes no
 Antigravity configuration anywhere; identity and activity are read-only
 views over the CLI's own files. Managed execution, durable recovery, live
 qualification, and a pinned runtime image for Antigravity are not built — the

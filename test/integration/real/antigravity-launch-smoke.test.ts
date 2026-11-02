@@ -234,6 +234,21 @@ describe('antigravity real launch smoke', () => {
       // present per conversation in the real store).
       } finally {
         const storeRoot = await resolveAgyStoreRoot()
+        // Re-scan fresh conversations in the finally: a failure AFTER the CLI
+        // already created a conversation (the exact creation-then-429 mode the
+        // Task 1 receipts recorded on a quota-dead key) can throw before the
+        // in-try scan populates nonceBearing — without this re-scan that
+        // scratch conversation would leak in the live store. The nonce gate
+        // stays: this run removes only conversations carrying THIS run's
+        // unique nonce, never a concurrent user conversation.
+        const nowIds = await fs.readdir(brainDir).catch(() => [] as string[])
+        for (const id of nowIds) {
+          if (before.has(id) || nonceBearing.has(id)) continue
+          const body = await fs
+            .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
+            .catch(() => '')
+          if (body.includes(nonce)) nonceBearing.add(id)
+        }
         for (const id of nonceBearing) {
           await fs.rm(path.join(brainDir, id), { recursive: true, force: true }).catch(() => {})
           await fs.rm(path.join(storeRoot, 'conversations', `${id}.db`), { force: true }).catch(() => {})
