@@ -103,6 +103,7 @@ fi
 mkdir -p "${FIXTURE}/scripts/testing" "${FIXTURE}/src"
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${FIXTURE}/scripts/"
 cp "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" "${FIXTURE}/scripts/testing/"
+cp "${REPO_ROOT}/scripts/testing/sandbox-diagnostics.mjs" "${FIXTURE}/scripts/testing/"
 cp "${REPO_ROOT}/scripts/test/assert-sandbox-readonly-root.sh" "${FIXTURE}/scripts/"
 write_node_manifest() {
   printf '{"name":"sandbox-startup-test","version":"1.0.0","private":true,"packageManager":"pnpm@10.34.5","dependencies":{"ms":"%s"}}\n' "$1" >"${FIXTURE}/package.json"

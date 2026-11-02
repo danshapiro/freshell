@@ -9,7 +9,7 @@ import { expect, it } from 'vitest'
 function fixture(mode: 'available' | 'missing' | 'foreign') {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'codex-sandbox-cache-'))
   for (const file of [
-    'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs',
+    'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs', 'scripts/testing/sandbox-diagnostics.mjs',
     'test/integration/providers/codex-local-provider.mjs',
     'test/fixtures/coding-cli/codex-native-artifact.json', 'docker/runtime/codex-native-sandbox.json',
   ]) {

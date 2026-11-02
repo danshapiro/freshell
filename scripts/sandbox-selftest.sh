@@ -539,6 +539,43 @@ else
 fi
 echo
 
+# ---- Proof 9: actual Cargo scheduling within the shared resource budget ----
+echo "--- Proof 9: sandbox build budget and Cargo overrides ---"
+# Finish dependency installation in its own container. A measured tiny build
+# must reuse that fingerprint, so memory.peak measures no dependency bootstrap.
+P9_SETUP_STATUS=0
+P9_SETUP_OUT="$(env -u CARGO_BUILD_JOBS "${REPO_ROOT}/scripts/sandbox-test.sh" ':' 2>&1)" || P9_SETUP_STATUS=$?
+echo "${P9_SETUP_OUT}"
+if [ "${P9_SETUP_STATUS}" -ne 0 ]; then
+  fail "build budget dependency setup: exit=${P9_SETUP_STATUS}"
+else
+  for P9_CASE in default project exported inline cli; do
+    P9_STATUS=0
+    P9_ENV=(env -u CARGO_BUILD_JOBS)
+    case "${P9_CASE}" in
+      default) P9_COMMAND='node scripts/testing/sandbox-budget-smoke.mjs 2' ;;
+      project) P9_COMMAND='node scripts/testing/sandbox-budget-smoke.mjs 1 --project-jobs 1' ;;
+      exported)
+        P9_ENV=(env CARGO_BUILD_JOBS=1)
+        P9_COMMAND='node scripts/testing/sandbox-budget-smoke.mjs 1'
+        ;;
+      inline) P9_COMMAND='CARGO_BUILD_JOBS=1 node scripts/testing/sandbox-budget-smoke.mjs 1' ;;
+      cli) P9_COMMAND='node scripts/testing/sandbox-budget-smoke.mjs 1 --cli-jobs 1' ;;
+    esac
+    P9_OUT="$("${P9_ENV[@]}" "${REPO_ROOT}/scripts/sandbox-test.sh" "${P9_COMMAND}" 2>&1)" || P9_STATUS=$?
+    echo "${P9_OUT}"
+    if [ "${P9_STATUS}" -eq 0 ] \
+      && grep -Fq '[sandbox] deps: reusing sandbox-owned node_modules' <<<"${P9_OUT}" \
+      && ! grep -Fq '[sandbox] deps: installing via' <<<"${P9_OUT}" \
+      && grep -q '"event":"sandbox_budget_smoke_passed"' <<<"${P9_OUT}"; then
+      pass "build budget ${P9_CASE}: actual jobs, overlap and low-pressure own-cgroup limits verified"
+    else
+      fail "build budget ${P9_CASE}: exit=${P9_STATUS}; requires reused dependencies and a complete smoke receipt"
+    fi
+  done
+fi
+echo
+
 # ---- final host isolation check ----
 FINAL_3001="$(host_3001)"
 FINAL_3002="$(host_3002)"
