@@ -65,7 +65,8 @@ function view(overrides: Partial<RuntimeView> = {}): RuntimeView {
 function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {}) {
   const effects: string[] = []
   const events: Record<string, unknown>[] = []
-  const defaultDeps: ManagedRuntimeUpdateDependencies = {
+  const runtimeApi = fakeRuntimeApi(effects)
+  const defaultDeps = {
     paths: {
       checkoutRoot: '/srv/freshell',
       home: '/home/operator',
@@ -145,7 +146,10 @@ function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {})
     admin: {
       candidateSchemaVersion: vi.fn(async () => 19),
       currentSchemaVersion: vi.fn(async () => 19),
-      health: vi.fn(async () => ({ state: 'ok' as const })),
+      health: vi.fn(async () => {
+        effects.push('health')
+        return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: 7 }
+      }),
       inventory: vi.fn(async () => [view()]),
       maintenanceInventory: vi.fn(async (_supervisorExecutable, _databasePath) => []),
       stop: vi.fn(async (soulId, expectedIntentRevision) => ({
@@ -165,8 +169,137 @@ function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {})
     now: vi.fn(() => new Date('2026-11-01T12:34:56.789Z')),
     randomSuffix: vi.fn(() => 'abc123def456'),
     ...overrides,
+  } as unknown as ManagedRuntimeUpdateDependencies
+  Object.assign(defaultDeps.owner, {
+    loadPersistentResourceManifest: vi.fn(async () => { effects.push('resource-manifest') }),
+  })
+  Object.assign(defaultDeps.artifacts, {
+    serverBuildInfo: vi.fn(async (candidate: string) => {
+      effects.push(`build-info:${candidate}`)
+      return { managedRuntimeV1: true }
+    }),
+  })
+  Object.assign(defaultDeps.services, {
+    waitWebStopped: vi.fn(async () => { effects.push('web-stopped') }),
+  })
+  const deps = Object.assign(defaultDeps, { runtimeApi }) as ManagedRuntimeUpdateDependencies & {
+    runtimeApi: FakeRuntimeApi
   }
-  return { deps: defaultDeps, effects, events }
+  return { deps, effects, events, runtimeApi }
+}
+
+interface FakeRuntimeResponse {
+  status: number
+  body: unknown
+}
+
+type TestOwner = typeof owner
+
+interface FakeRuntimeCall {
+  owner: TestOwner
+  token: string
+  method: string
+  endpoint: string
+  body?: unknown
+}
+
+interface FakeRuntimeApi {
+  calls: FakeRuntimeCall[]
+  readAuthToken(selectedOwner: TestOwner): Promise<string>
+  request(selectedOwner: TestOwner, token: string, method: string, endpoint: string, body?: unknown): Promise<FakeRuntimeResponse>
+  respond(method: string, endpoint: string, response: FakeRuntimeResponse | ((body: unknown) => FakeRuntimeResponse)): void
+}
+
+function readinessReport(overrides: {
+  installationId?: string
+  controlEpoch?: number
+  readiness?: Record<string, unknown>
+  paneOwnership?: Record<string, unknown>
+} = {}) {
+  return {
+    installationId: overrides.installationId ?? 'installation-1',
+    controlEpoch: overrides.controlEpoch ?? 7,
+    revision: 44,
+    readiness: {
+      initialScanState: 'complete',
+      blockedSubsystems: [],
+      ...(overrides.readiness ?? {}),
+    },
+    paneOwnership: {
+      complete: true,
+      panes: [],
+      unattachedProcesses: [],
+      readyToStop: true,
+      ...(overrides.paneOwnership ?? {}),
+    },
+  }
+}
+
+function fakeRuntimeApi(effects: string[]): FakeRuntimeApi {
+  const calls: FakeRuntimeCall[] = []
+  const responses = new Map<string, FakeRuntimeResponse | ((body: unknown) => FakeRuntimeResponse)>()
+  const key = (method: string, endpoint: string) => `${method} ${endpoint}`
+  const initialReadiness = readinessReport()
+  let maintenancePhase = 'open'
+  let maintenanceOwner: string | null = null
+  const defaultResponse = (method: string, endpoint: string, body: unknown): FakeRuntimeResponse => {
+    if (method === 'GET' && endpoint === '/api/runtime/readiness') {
+      return { status: 200, body: initialReadiness }
+    }
+    if (method === 'POST' && endpoint === '/api/runtime/maintenance/quiesce') {
+      const request = body as { ownerId?: string }
+      return {
+        status: 200,
+        body: {
+          drained: true,
+          readyToStop: true,
+          lease: { ownerId: request.ownerId, leaseId: 'fixture-lease', expiresInMs: 30_000 },
+          admission: { phase: 'quiesced', activePermits: 0 },
+          readiness: initialReadiness,
+        },
+      }
+    }
+    if (method === 'POST' && endpoint === '/api/runtime/maintenance/commit-stop') {
+      return { status: 200, body: { committed: true, readiness: initialReadiness, admission: { phase: 'shutdown-latched' } } }
+    }
+    if (method === 'POST' && endpoint === '/api/runtime/maintenance/release') {
+      return { status: 200, body: { admission: { phase: 'open' } } }
+    }
+    if (method === 'GET' && endpoint === '/api/runtime/maintenance/status') {
+      return { status: 200, body: { phase: maintenancePhase, activePermits: 0, leaseOwner: maintenanceOwner } }
+    }
+    return { status: 404, body: {} }
+  }
+  return {
+    calls,
+    async readAuthToken(selectedOwner) {
+      effects.push('runtime-auth-token')
+      expect(selectedOwner).toBe(owner)
+      return 'test-auth-token-not-for-output'
+    },
+    async request(selectedOwner, token, method, endpoint, body) {
+      effects.push(`runtime:${method}:${endpoint}`)
+      calls.push({ owner: selectedOwner, token, method, endpoint, body })
+      const selected = responses.get(key(method, endpoint))
+      const response = typeof selected === 'function' ? selected(body) : selected ?? defaultResponse(method, endpoint, body)
+      const responseBody = response.body && typeof response.body === 'object' && !Array.isArray(response.body)
+        ? response.body as Record<string, unknown>
+        : {}
+      if (method === 'POST' && endpoint === '/api/runtime/maintenance/quiesce' && responseBody.lease) {
+        const lease = responseBody.lease as Record<string, unknown>
+        maintenancePhase = 'quiesced'
+        maintenanceOwner = typeof lease.ownerId === 'string' ? lease.ownerId : null
+      } else if (method === 'POST' && endpoint === '/api/runtime/maintenance/release' && response.status === 200) {
+        maintenancePhase = 'open'
+        maintenanceOwner = null
+      } else if (method === 'POST' && endpoint === '/api/runtime/maintenance/commit-stop'
+        && response.status === 200 && responseBody.committed === true) {
+        maintenancePhase = 'shutdown-latched'
+      }
+      return response
+    },
+    respond(method, endpoint, response) { responses.set(key(method, endpoint), response) },
+  }
 }
 
 it('reset abort restores web before supervisor shutdown', async () => {
@@ -329,7 +462,9 @@ it('default completion event includes reminder', async () => {
     const result = await runManagedRuntimeWorker('client', f.deps)
 
     expect(result).toBe(0)
-    expect(f.deps.services.restart).toHaveBeenCalledWith(owner.webUnit)
+    expect(f.deps.services.stop).toHaveBeenCalledWith(owner.webUnit)
+    expect(f.deps.services.waitWebStopped).toHaveBeenCalledWith(owner)
+    expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
     expect(f.deps.services.restart).not.toHaveBeenCalledWith(owner.supervisorUnit)
     expect(f.events).toContainEqual(expect.objectContaining({
       event: 'update.completed',
@@ -725,7 +860,10 @@ it('all mode stops ingress, fences the coding-soul reset, then installs and reop
       }),
     }
   })
-  f.deps.admin.health = vi.fn(async () => { f.effects.push('health'); return { state: 'ok' as const } })
+  f.deps.admin.health = vi.fn(async () => {
+    f.effects.push('health')
+    return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: 7 }
+  })
   f.deps.admin.reopen = vi.fn(async (candidate) => {
     f.effects.push(`reopen:${candidate.soulId}:${candidate.expectedIntentRevision}`)
     return { outcome: 'reopened' as const }
@@ -769,16 +907,17 @@ it('durable-only skips web artifact replacement and verifies the selected runnin
   expect(f.effects).toContain('start:freshell-rust.service')
 })
 
-it('client mode builds web assets and restarts only the web service', async () => {
+it('client mode builds web assets and replaces only the web service', async () => {
   const f = dependencies()
 
   const result = await runManagedRuntimeWorker('client', f.deps)
 
   expect(result).toBe(0)
   expect(f.deps.artifacts.build).toHaveBeenCalledWith(owner, 'client')
-  expect(f.deps.services.restart).toHaveBeenCalledWith(owner.webUnit)
-  expect(f.deps.services.stop).not.toHaveBeenCalled()
-  expect(f.deps.services.start).not.toHaveBeenCalled()
+  expect(f.deps.services.stop).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.waitWebStopped).toHaveBeenCalledWith(owner)
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.restart).not.toHaveBeenCalled()
   expect(f.deps.admin.inventory).not.toHaveBeenCalled()
   expect(f.deps.admin.stop).not.toHaveBeenCalled()
   expect(f.deps.admin.reopen).not.toHaveBeenCalled()
@@ -1235,13 +1374,18 @@ it('web restoration failure reports the original error and the resulting unit st
 it('web restoration requires healthy supervisor control socket', async () => {
   const f = dependencies()
   f.deps.admin.inventory = vi.fn(async () => { throw new Error('inventory socket failed') })
-  f.deps.admin.health = vi.fn(async () => { throw new Error('supervisor control socket failed') })
+  let healthCount = 0
+  f.deps.admin.health = vi.fn(async () => {
+    healthCount += 1
+    if (healthCount > 6) throw new Error('supervisor control socket failed')
+    return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: 7 }
+  })
 
   const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
 
   expect(result).toBe(1)
   expect(f.deps.services.isActive).toHaveBeenCalledWith(owner.supervisorUnit)
-  expect(f.deps.admin.health).toHaveBeenCalledWith(owner)
+  expect(f.deps.admin.health).toHaveBeenCalledTimes(7)
   expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
   expect(f.events).toContainEqual(expect.objectContaining({
     event: 'update.web_restore_after_abort',
@@ -1374,4 +1518,426 @@ it('reset summary counts absent and ineligible saved conversation references', a
     unavailable_count: 0,
     eligible_count: 0,
   }))
+})
+
+it('host-managed panes refuse before mutation and are reported', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', {
+    status: 200,
+    body: readinessReport({
+      paneOwnership: {
+        panes: [{ clientId: 'client-safe-1', tabId: 'tab-safe-1', paneId: 'pane-host-safe-1', kind: 'fresh-agent', ownership: 'host-managed' }],
+        readyToStop: false,
+      },
+    }),
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('resource-manifest')
+  expect(f.effects).not.toContain('build:client')
+  expect(f.effects.some((effect) => effect.startsWith('install:'))).toBe(false)
+  expect(f.effects.some((effect) => effect.startsWith('restart:') || effect.startsWith('stop:') || effect.startsWith('start:'))).toBe(false)
+  expect(f.effects.some((effect) => effect.includes('pane-host-safe-1') && effect.includes('host-managed'))).toBe(true)
+})
+
+it('unknown pane ownership refuses before mutation', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', {
+    status: 200,
+    body: readinessReport({
+      paneOwnership: {
+        panes: [{ clientId: 'client-safe-2', tabId: 'tab-safe-2', paneId: 'pane-unknown-safe-2', kind: 'terminal', ownership: 'unknown' }],
+        readyToStop: false,
+      },
+    }),
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('resource-manifest')
+  expect(f.effects).not.toContain('build:all')
+  expect(f.effects.some((effect) => effect.startsWith('install:'))).toBe(false)
+  expect(f.effects.some((effect) => effect.startsWith('stop:') || effect.startsWith('start:'))).toBe(false)
+  expect(f.effects.some((effect) => effect.includes('pane-unknown-safe-2') && effect.includes('unknown'))).toBe(true)
+})
+
+it('legacy featureless server refuses before mutation', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', { status: 404, body: {} })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('resource-manifest')
+  expect(f.effects).not.toContain('build:client')
+  expect(f.effects.some((effect) => effect.startsWith('install:') || effect.startsWith('restart:'))).toBe(false)
+})
+
+it('initial readiness requires a complete report and finished unblocked scan', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', {
+    status: 200,
+    body: readinessReport({
+      readiness: { initialScanState: 'pending', blockedSubsystems: ['fixture-provider'] },
+      paneOwnership: { complete: false },
+    }),
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('resource-manifest')
+  expect(f.effects).not.toContain('build:client')
+  expect(f.effects.some((effect) => effect.startsWith('stop:') || effect.startsWith('start:'))).toBe(false)
+})
+
+it('authenticated readiness identity brackets intended supervisor', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(0)
+  const reads = f.runtimeApi.calls.filter((call) => call.method === 'GET' && call.endpoint === '/api/runtime/readiness')
+  expect(reads).toHaveLength(2)
+  expect(reads.every((call) => call.token === 'test-auth-token-not-for-output')).toBe(true)
+  for (const call of reads) {
+    const index = f.effects.indexOf(`runtime:${call.method}:${call.endpoint}`)
+    expect(f.effects[index - 1]).toBe('health')
+    expect(f.effects[index + 1]).toBe('health')
+  }
+  expect(f.effects.indexOf('runtime:GET:/api/runtime/readiness')).toBeLessThan(f.effects.indexOf('resource-manifest'))
+})
+
+it('quiesced final inventory catches create during build and releases on refusal', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/quiesce', (body) => {
+    const ownerId = (body as { ownerId: string }).ownerId
+    return {
+      status: 200,
+      body: {
+        drained: true,
+        readyToStop: false,
+        lease: { ownerId, leaseId: 'fixture-lease', expiresInMs: 30_000 },
+        admission: { phase: 'quiesced', activePermits: 0 },
+        readiness: readinessReport({
+          paneOwnership: {
+            panes: [{ clientId: 'client-safe-3', tabId: 'tab-safe-3', paneId: 'pane-created-in-build', kind: 'fresh-agent', ownership: 'host-managed' }],
+            readyToStop: false,
+          },
+        }),
+      },
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.effects.indexOf('build:all')).toBeLessThan(f.effects.indexOf('runtime:POST:/api/runtime/maintenance/quiesce'))
+  expect(f.runtimeApi.calls.some((call) => call.endpoint === '/api/runtime/maintenance/release')).toBe(true)
+  expect(f.effects).not.toContain('stop:freshell-rust.service')
+  expect(f.effects).not.toContain(`install:${owner.webExecutable}`)
+  expect(f.effects.some((effect) => effect.includes('pane-created-in-build') && effect.includes('host-managed'))).toBe(true)
+})
+
+it('updater never stops web without a live quiesce lease', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/quiesce', {
+    status: 200,
+    body: { drained: true, readyToStop: true, admission: { phase: 'quiesced', activePermits: 0 }, readiness: readinessReport() },
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('stop:freshell-rust.service')
+  expect(f.effects).not.toContain('stop:freshell-supervisor.service')
+  expect(f.effects).not.toContain('start:freshell-rust.service')
+})
+
+it('quiesce drain timeout releases the returned lease and never stops web', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/quiesce', (body) => {
+    const ownerId = (body as { ownerId: string }).ownerId
+    return {
+      status: 503,
+      body: {
+        drained: false,
+        readyToStop: false,
+        lease: { ownerId, leaseId: 'fixture-drain-timeout-lease', expiresInMs: 30_000 },
+        admission: { phase: 'quiesced', activePermits: 1 },
+      },
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.runtimeApi.calls.some((call) => call.endpoint === '/api/runtime/maintenance/release'
+    && (call.body as { leaseId?: string })?.leaseId === 'fixture-drain-timeout-lease')).toBe(true)
+  expect(f.effects.some((effect) => effect.startsWith('stop:') || effect.startsWith('restart:'))).toBe(false)
+})
+
+it('commit-stop blocker releases the temporary lease before refusing', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/commit-stop', () => ({
+    status: 409,
+    body: {
+      readyToStop: false,
+      readiness: readinessReport({
+        paneOwnership: {
+          unattachedProcesses: [{ kind: 'fresh-agent', source: 'host-registry', provider: 'claude', terminalId: 'terminal-safe-commit', ownership: 'unknown', reason: 'unattached' }],
+          readyToStop: false,
+        },
+      }),
+    },
+  }))
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.runtimeApi.calls.some((call) => call.endpoint === '/api/runtime/maintenance/release')).toBe(true)
+  expect(f.effects.some((effect) => effect.startsWith('stop:') || effect.startsWith('restart:'))).toBe(false)
+  expect(f.effects.some((effect) => effect.includes('terminal-safe-commit') && effect.includes('unknown'))).toBe(true)
+})
+
+it('quiesce identity must match direct supervisor health before web can stop', async () => {
+  const f = dependencies()
+  let healthCount = 0
+  f.deps.admin.health = vi.fn(async () => {
+    healthCount += 1
+    f.effects.push('health')
+    return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: healthCount === 4 ? 9 : 7 }
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.runtimeApi.calls.some((call) => call.endpoint === '/api/runtime/maintenance/release')).toBe(true)
+  expect(f.effects.some((effect) => effect.startsWith('stop:') || effect.startsWith('restart:'))).toBe(false)
+})
+
+it('commit-stop precedes web stop and candidate installation', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(0)
+  const commit = f.effects.indexOf('runtime:POST:/api/runtime/maintenance/commit-stop')
+  const stop = f.effects.indexOf('stop:freshell-rust.service')
+  const install = f.effects.indexOf(`install:${owner.webExecutable}`)
+  expect(commit).toBeGreaterThanOrEqual(0)
+  expect(commit).toBeLessThan(stop)
+  expect(stop).toBeLessThan(install)
+})
+
+it('unattached process census refuses before build and reports safe identifiers', async () => {
+  const f = dependencies()
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', {
+    status: 200,
+    body: readinessReport({
+      paneOwnership: {
+        unattachedProcesses: [{ kind: 'terminal', source: 'host-registry', provider: 'codex', terminalId: 'terminal-safe-unattached', ownership: 'unknown', reason: 'unattached' }],
+        readyToStop: false,
+      },
+    }),
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('build:all')
+  expect(f.effects.some((effect) => effect.includes('terminal-safe-unattached') && effect.includes('unknown'))).toBe(true)
+})
+
+it('shutdown committed gate cannot reopen while old server is alive', async () => {
+  const f = dependencies()
+  f.deps.services.stop = vi.fn(async (unit) => {
+    f.effects.push(`stop:${unit}`)
+    if (unit === owner.webUnit) throw new Error('injected web stop failure')
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(1)
+  expect(f.runtimeApi.calls.some((call) => call.endpoint === '/api/runtime/maintenance/commit-stop')).toBe(true)
+  expect(f.runtimeApi.calls.some((call) => call.endpoint === '/api/runtime/maintenance/release')).toBe(false)
+  expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.failed', manual_recovery: expect.any(String) }))
+})
+
+it('candidate without managed runtime is refused before install', async () => {
+  const buildInfo = (fDeps: ManagedRuntimeUpdateDependencies) =>
+    (fDeps.artifacts as ManagedRuntimeUpdateDependencies['artifacts'] & { serverBuildInfo: ReturnType<typeof vi.fn> }).serverBuildInfo
+  const f = dependencies()
+  buildInfo(f.deps).mockResolvedValue({ managedRuntimeV1: false })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(buildInfo(f.deps)).toHaveBeenCalledWith('/tmp/stage/freshell-server')
+  expect(f.effects.some((effect) => effect.startsWith('install:') || effect.startsWith('restart:') || effect.startsWith('stop:'))).toBe(false)
+})
+
+it('durable-only probes the installed web binary before web stop', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeWorker('durable-only', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  const probe = f.effects.indexOf(`build-info:${owner.webExecutable}`)
+  const stop = f.effects.indexOf(`stop:${owner.webUnit}`)
+  expect(probe).toBeGreaterThanOrEqual(0)
+  expect(probe).toBeLessThan(stop)
+  expect(f.deps.artifacts.serverBuildInfo).toHaveBeenCalledWith(owner.webExecutable)
+})
+
+it('missing candidate build-info command refuses before service effects', async () => {
+  const f = dependencies()
+  vi.mocked(f.deps.artifacts.serverBuildInfo).mockRejectedValue(new Error('spawn ENOENT'))
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.effects.some((effect) => effect.startsWith('stop:') || effect.startsWith('start:') || effect.startsWith('restart:'))).toBe(false)
+  expect(f.deps.services.stop).not.toHaveBeenCalled()
+})
+
+it('preflight refuses readiness whose supervisor identity changes across the bracket', async () => {
+  const f = dependencies()
+  let healthCount = 0
+  f.deps.admin.health = vi.fn(async () => {
+    healthCount += 1
+    f.effects.push('health')
+    return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: healthCount === 1 ? 7 : 8 }
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('resource-manifest')
+  expect(f.effects).not.toContain('build:client')
+  expect(f.effects.some((effect) => effect.startsWith('restart:') || effect.startsWith('stop:'))).toBe(false)
+})
+
+it('post-update scan must be complete and unblocked before success', async () => {
+  const f = dependencies()
+  let readCount = 0
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', () => {
+    readCount += 1
+    return {
+      status: 200,
+      body: readCount === 1
+        ? readinessReport()
+        : readinessReport({ readiness: { initialScanState: 'blocked', blockedSubsystems: ['fixture-provider'] } }),
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(1)
+  expect(f.events).not.toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+})
+
+it('post-update readiness accepts a complete ownership report while new host work is open', async () => {
+  const f = dependencies()
+  let readCount = 0
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', () => {
+    readCount += 1
+    return {
+      status: 200,
+      body: readCount === 1
+        ? readinessReport()
+        : readinessReport({
+          paneOwnership: {
+            panes: [{ clientId: 'client-safe-post-update', tabId: 'tab-safe-post-update', paneId: 'pane-open-after-update', kind: 'fresh-agent', ownership: 'host-managed' }],
+            readyToStop: false,
+          },
+        }),
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(0)
+  expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+})
+
+it('default update refuses a changed supervisor identity after web restart', async () => {
+  const f = dependencies()
+  let healthCount = 0
+  f.deps.admin.health = vi.fn(async () => {
+    healthCount += 1
+    f.effects.push('health')
+    return {
+      state: 'ok' as const,
+      installationId: 'installation-1',
+      controlEpoch: healthCount <= 6 ? 7 : 8,
+    }
+  })
+  let readinessCount = 0
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', () => {
+    readinessCount += 1
+    return { status: 200, body: readinessReport({ controlEpoch: readinessCount === 1 ? 7 : 8 }) }
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(1)
+  expect(f.events).not.toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+})
+
+it('reset update compares readiness with the deliberately restarted supervisor identity', async () => {
+  const f = dependencies()
+  let healthCount = 0
+  f.deps.admin.health = vi.fn(async () => {
+    healthCount += 1
+    f.effects.push('health')
+    return {
+      state: 'ok' as const,
+      installationId: 'installation-1',
+      controlEpoch: healthCount <= 6 ? 7 : 8,
+    }
+  })
+  let readinessCount = 0
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', () => {
+    readinessCount += 1
+    return { status: 200, body: readinessReport({ controlEpoch: readinessCount === 1 ? 7 : 8 }) }
+  })
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/quiesce', (body) => {
+    const request = body as { ownerId: string }
+    const report = readinessReport()
+    return {
+      status: 200,
+      body: { drained: true, readyToStop: true, lease: { ownerId: request.ownerId, leaseId: 'fixture-lease', expiresInMs: 30_000 }, admission: { phase: 'quiesced', activePermits: 0 }, readiness: report },
+    }
+  })
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/commit-stop', () => ({
+    status: 200,
+    body: { committed: true, readiness: readinessReport(), admission: { phase: 'shutdown-latched' } },
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+})
+
+it('readiness token stays out of args, logs, events, and operator output', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(0)
+  const exposed = JSON.stringify({
+    effects: f.effects,
+    events: f.events,
+    handoff: [
+      vi.mocked(f.deps.handoff.submit).mock.calls,
+      vi.mocked(f.deps.handoff.runLockedWorker).mock.calls,
+    ],
+  })
+  expect(exposed).not.toContain('test-auth-token-not-for-output')
+  expect(f.runtimeApi.calls.every((call) => call.token === 'test-auth-token-not-for-output')).toBe(true)
 })

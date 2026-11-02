@@ -124,7 +124,18 @@ if [[ "$SKIP_BUILD" != 1 ]]; then
     exit 0
   fi
   echo "Building Rust server (cargo build --release -p freshell-server)..."
-  cargo build --release -p freshell-server --locked
+  cargo_args=(build --release -p freshell-server --locked)
+  if [[ "${FRESHELL_MANAGED_RUNTIME_V1:-}" == "1" ]]; then
+    cargo_args+=(--features managed-runtime-v1)
+  fi
+  cargo "${cargo_args[@]}"
+fi
+
+# --client-only never starts a server, including when combined with
+# --skip-build. In that combination there is no client work to perform.
+if [[ "$CLIENT_ONLY" == 1 ]]; then
+  echo "Client-only mode requested with --skip-build; no server launch."
+  exit 0
 fi
 
 # The Claude SDK is a sanctioned Node sidecar, not the Freshell server.  Keep
@@ -134,6 +145,28 @@ echo "Preparing Rust runtime prerequisites..."
 pnpm run --silent prepare:rust-runtime
 
 [[ -x "$BINARY" ]] || { echo "Missing binary: $BINARY (build first)" >&2; exit 1; }
+
+# A requested managed-runtime launch must use a binary that proves the feature
+# was compiled in. This read-only command runs before any existing instance can
+# be stopped or any replacement server can be started, including --skip-build.
+if [[ "${FRESHELL_MANAGED_RUNTIME_V1:-}" == "1" ]]; then
+  if ! "$BINARY" --build-info | node -e '
+    let output = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { output += chunk; });
+    process.stdin.on("end", () => {
+      try {
+        const info = JSON.parse(output);
+        if (info?.managedRuntimeV1 !== true) process.exitCode = 1;
+      } catch {
+        process.exitCode = 1;
+      }
+    });
+  '; then
+    echo "FRESHELL_MANAGED_RUNTIME_V1=1 requires $BINARY to report managedRuntimeV1=true via --build-info; rebuild with --features managed-runtime-v1." >&2
+    exit 1
+  fi
+fi
 
 # --- preflight ---------------------------------------------------------------
 
