@@ -51,6 +51,7 @@ export interface RuntimeView {
 export interface NoRuntimeInventoryRecord {
   soulId: string
   desiredState: string
+  intentRevision: number
   outcome: 'verified_empty' | 'unresolved'
 }
 
@@ -203,6 +204,7 @@ export interface ManagedRuntimeUpdateDependencies {
     start(unit: string): Promise<void>
     restart(unit: string): Promise<void>
     isActive(unit: string): Promise<boolean>
+    state(unit: string): Promise<string>
     waitSupervisorReady(owner: ManagedRuntimeOwner): Promise<void>
     waitWebReady(owner: ManagedRuntimeOwner): Promise<void>
     waitCallbackReady(owner: ManagedRuntimeOwner): Promise<void>
@@ -211,7 +213,8 @@ export interface ManagedRuntimeUpdateDependencies {
     candidateSchemaVersion(supervisorExecutable: string): Promise<number>
     currentSchemaVersion(databasePath: string): Promise<number>
     health(owner: ManagedRuntimeOwner): Promise<{ state: 'ok' }>
-    inventory(owner: ManagedRuntimeOwner): Promise<InventorySnapshot>
+    inventory(owner: ManagedRuntimeOwner): Promise<RuntimeView[]>
+    maintenanceInventory(supervisorExecutable: string, databasePath: string): Promise<NoRuntimeInventoryRecord[]>
     stop(soulId: string, expectedIntentRevision: number, owner: ManagedRuntimeOwner): Promise<StopResult>
     reopen(candidate: ReopenCandidate, owner: ManagedRuntimeOwner): Promise<{ outcome: 'reopened' | 'pending' | 'failed'; message?: string }>
   }
@@ -236,6 +239,8 @@ interface WorkerExecutionState {
   stagedArtifacts?: StagedArtifacts
   webStopAttempted: boolean
   supervisorShutdownComplete: boolean
+  supervisorShutdownAttempted: boolean
+  supervisorStateAfterStopFailure?: string
   filesInstalled: boolean
   resetTargets: ManagedCodingSoulResetTarget[]
   attemptedStops: string[]
@@ -248,6 +253,7 @@ function createWorkerExecutionState(): WorkerExecutionState {
     phase: 'approval',
     webStopAttempted: false,
     supervisorShutdownComplete: false,
+    supervisorShutdownAttempted: false,
     filesInstalled: false,
     resetTargets: [],
     attemptedStops: [],
@@ -396,7 +402,12 @@ export async function runManagedRuntimeWorker(
 
   try {
     if (resetMode) {
-      if (!approvalFile || !(await dependencies.approval.consume(approvalFile))) {
+      let approvalConsumed = false
+      if (approvalFile) {
+        try { approvalConsumed = await dependencies.approval.consume(approvalFile) }
+        catch { approvalConsumed = false }
+      }
+      if (!approvalConsumed) {
         await record(dependencies, mode, 'approval', 'update.approval_refused', 'error', { error_code: 'approval_invalid' })
         return 2
       }
@@ -506,8 +517,11 @@ async function runResetUpdate(
   await record(dependencies, mode, execution.phase, 'update.web_stopped', 'info')
 
   execution.phase = 'inventory'
-  const inventory = await dependencies.admin.inventory(owner)
+  const views = await dependencies.admin.inventory(owner)
+  const noRuntime = await dependencies.admin.maintenanceInventory(artifacts.supervisorExecutable!, owner.databasePath)
+  const inventory: InventorySnapshot = { views, noRuntime }
   const groups = groupInventory(inventory)
+  validateNoRuntimeSnapshot(noRuntime, groups)
   validatePreviouslyStoppedSouls(groups, inventory)
   execution.resetTargets = selectResetTargets(groups)
   await record(dependencies, mode, execution.phase, 'update.inventory_captured', 'info', {
@@ -538,14 +552,15 @@ async function stopManagedCodingSouls(
       })
       throw new UpdateFailure(`Stop for ${target.soulId} returned ${result.outcome}.`)
     }
-    execution.verifiedEmptyStops.push(target.soulId)
     const stoppedView = result.view
     if (!stoppedView || stoppedView.soulId !== target.soulId || stoppedView.desiredState !== 'stopped'
+      || stoppedView.incarnationId !== target.addressedView.incarnationId
       || stoppedView.launchState !== 'stopped' || stoppedView.cleanupState !== 'verified_empty'
       || !Number.isSafeInteger(stoppedView.intentRevision)
       || stoppedView.intentRevision <= target.expectedIntentRevision) {
-      throw new UpdateFailure(`Stop for ${target.soulId} reported VerifiedEmpty without a matching stopped view and advanced intent revision.`)
+      throw new UpdateFailure(`Stop for ${target.soulId} reported VerifiedEmpty without the addressed incarnation, stopped view, and advanced intent revision.`)
     }
+    execution.verifiedEmptyStops.push(target.soulId)
     stoppedIntentRevisions.set(target.soulId, stoppedView.intentRevision)
     await record(dependencies, mode, execution.phase, 'update.stop_verified_empty', 'info', { soul_id: target.soulId })
   }
@@ -562,7 +577,20 @@ async function replaceDurableRuntime(
   execution: WorkerExecutionState,
 ): Promise<void> {
   execution.phase = 'stop_supervisor'
-  await dependencies.services.stop(owner.supervisorUnit)
+  execution.supervisorShutdownAttempted = true
+  try {
+    await dependencies.services.stop(owner.supervisorUnit)
+  } catch (error) {
+    let unitState = 'unknown'
+    try { unitState = await dependencies.services.state(owner.supervisorUnit) } catch { /* report unknown state */ }
+    execution.supervisorStateAfterStopFailure = unitState
+    execution.supervisorShutdownComplete = unitState !== 'active'
+    await record(dependencies, mode, execution.phase, 'update.supervisor_stop_failed', 'error', {
+      error_code: 'supervisor_stop_failed', unit_state: unitState, partial_state: true,
+      manual_recovery: MANUAL_RECOVERY,
+    })
+    throw error
+  }
   execution.supervisorShutdownComplete = true
   await record(dependencies, mode, execution.phase, 'update.supervisor_stopped', 'info')
 
@@ -614,10 +642,17 @@ async function reopenSavedConversations(
     unavailable_count: refs.unavailable.length,
     eligible_count: refs.candidates.length,
   })
-  const reopenResults: ReopenResult[] = refs.unavailable.map(item => ({
-    outcome: 'unavailable', soulId: item.soulId, provider: item.provider,
-    message: 'Saved resumable context has no required native session identity.',
-  }))
+  const reopenResults: ReopenResult[] = []
+  for (const item of refs.unavailable) {
+    reopenResults.push({
+      outcome: 'unavailable', soulId: item.soulId, provider: item.provider,
+      message: 'Saved resumable context has no required native session identity.',
+    })
+    await record(dependencies, mode, execution.phase, 'update.reopen_result', 'error', {
+      soul_id: item.soulId, provider: item.provider, outcome: 'unavailable',
+      reason: 'missing_native_session_identity',
+    })
+  }
   for (const candidate of refs.candidates) {
     let result: { outcome: 'reopened' | 'pending' | 'failed'; message?: string }
     try {
@@ -655,6 +690,8 @@ async function handleWorkerFailure(
   error: unknown,
 ): Promise<number> {
   const refusal = error instanceof UpdateRefusal
+  const partialState = mode !== 'client'
+    && (execution.supervisorShutdownAttempted || execution.supervisorShutdownComplete || execution.filesInstalled)
   if (execution.webStopAttempted && !execution.supervisorShutdownComplete && execution.owner) {
     const restoration = await restoreWebAfterAbort(dependencies, execution.owner, mode)
     await record(dependencies, mode, execution.phase, 'update.web_restore_after_abort', restoration.restored ? 'info' : 'error', {
@@ -667,11 +704,12 @@ async function handleWorkerFailure(
     error_code: refusal ? 'preflight_refused' : 'update_failed',
     attempted_prefix: execution.attemptedStops,
     verified_empty_stopped: execution.verifiedEmptyStops,
-    ...(mode !== 'client' && (execution.supervisorShutdownComplete || execution.filesInstalled) ? { manual_recovery: MANUAL_RECOVERY } : {}),
+    ...(execution.supervisorStateAfterStopFailure ? { supervisor_unit_state: execution.supervisorStateAfterStopFailure } : {}),
+    ...(partialState ? { partial_state: true, manual_recovery: MANUAL_RECOVERY } : {}),
   })
   const safeMessage = error instanceof Error ? error.message : 'Unknown updater failure.'
   await dependencies.logger.operator(safeMessage)
-  if (mode !== 'client' && (execution.supervisorShutdownComplete || execution.filesInstalled)) {
+  if (partialState) {
     await dependencies.logger.operator(MANUAL_RECOVERY)
   }
   return refusal && !execution.webStopAttempted && !execution.filesInstalled ? 2 : 1
@@ -714,10 +752,8 @@ export function buildReopenCandidates(
 }
 
 export async function runManagedUpdateCli(argv: string[], dependencies: ManagedRuntimeUpdateDependencies): Promise<number> {
-  const internal = parseInternalArgs(argv)
-  if (!internal) return runManagedRuntimeUpdate(argv, dependencies)
-  if (internal.kind === 'bootstrap') return runManagedUpdateBootstrap(internal, dependencies)
-  return runManagedRuntimeWorker(internal.mode, dependencies, internal.approvalFile)
+  if (argv[0] === '--bootstrap' || argv[0] === '--worker') return 2
+  return runManagedRuntimeUpdate(argv, dependencies)
 }
 
 export function parseInternalArgs(args: string[]):
@@ -829,7 +865,8 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
       async consume(filePath) {
         let raw: string
         try { raw = await fsp.readFile(filePath, 'utf8') } catch { return false }
-        await fsp.unlink(filePath).catch(() => undefined)
+        try { await fsp.unlink(filePath) }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false }
         return raw === 'APPROVED\n'
       },
       async remove(filePath) { await fsp.unlink(filePath).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }) },
@@ -880,6 +917,7 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
       async start(unit) { run(paths.systemctl, ['--user', 'start', unit]) },
       async restart(unit) { run(paths.systemctl, ['--user', 'restart', unit]) },
       async isActive(unit) { return systemdShow(unit, 'ActiveState') === 'active' },
+      async state(unit) { return systemdShow(unit, 'ActiveState') },
       async waitSupervisorReady(selected) {
         await waitUntil(async () => {
           const socket = await fsp.stat(selected.controlSocket).catch(() => null)
@@ -916,6 +954,10 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
         const value = parseJsonOutput(output)
         if (!Array.isArray(value.views)) throw new UpdateFailure('Supervisor Inventory returned an invalid response.')
         return value.views as RuntimeView[]
+      },
+      async maintenanceInventory(supervisorExecutable, databasePath) {
+        const output = run(supervisorExecutable, ['maintenance-inventory', databasePath], { cwd: paths.checkoutRoot })
+        return parseCandidateMaintenanceInventory(output)
       },
       async stop(soulId, expectedIntentRevision, selected) {
         const output = runAllowFailure(selected.adminCli, paths, [
@@ -1275,8 +1317,37 @@ function validatePreviouslyStoppedSouls(groups: Map<string, RuntimeView[]>, snap
   }
   const records = Array.isArray(snapshot) ? [] : snapshot.noRuntime ?? []
   for (const item of records) {
-    if (item.desiredState === 'stopped' && item.outcome !== 'verified_empty') {
-      throw new UpdateFailure(`Already-stopped soul ${item.soulId} has no addressable incarnation and no explicit no-runtime VerifiedEmpty result.`)
+    if (item.outcome !== 'verified_empty') {
+      throw new UpdateFailure(`No-runtime soul ${item.soulId} is unresolved; refusing to stop or replace the managed runtime.`)
+    }
+    if (item.desiredState !== 'stopped') {
+      throw new UpdateFailure(`No-runtime soul ${item.soulId} is not desired-stopped and cannot be safely reset without an addressable incarnation.`)
+    }
+  }
+}
+
+function validateNoRuntimeSnapshot(
+  records: NoRuntimeInventoryRecord[],
+  groups: Map<string, RuntimeView[]>,
+): void {
+  if (!Array.isArray(records)) throw new UpdateFailure('Candidate maintenance Inventory did not include an explicit no-runtime result.')
+  const seen = new Set<string>()
+  for (const record of records) {
+    if (!nonEmpty(record.soulId) || !['running', 'stopped'].includes(record.desiredState)
+      || !Number.isSafeInteger(record.intentRevision) || record.intentRevision < 0
+      || !['verified_empty', 'unresolved'].includes(record.outcome)) {
+      throw new UpdateFailure('Candidate maintenance Inventory returned an invalid no-runtime record.')
+    }
+    if (seen.has(record.soulId)) throw new UpdateFailure(`Candidate maintenance Inventory duplicated soul ${record.soulId}.`)
+    seen.add(record.soulId)
+    const liveViews = groups.get(record.soulId)
+    if (liveViews) {
+      const addressed = addressedIncarnation(liveViews)
+      throw new UpdateFailure(
+        `Candidate maintenance Inventory conflicts with live Inventory for ${record.soulId} `
+        + `(registry revision ${record.intentRevision}; live revision ${addressed?.intentRevision ?? 'unknown'}; `
+        + `live incarnation ${addressed?.incarnationId ?? 'unaddressable'}).`,
+      )
     }
   }
 }
@@ -1366,6 +1437,12 @@ async function restoreWebAfterAbort(
   let active = false
   try { active = await dependencies.services.isActive(owner.supervisorUnit) } catch { /* report state below */ }
   if (!active) return { restored: false, unitState: 'supervisor-not-healthy', errorCode: 'supervisor_not_healthy' }
+  try {
+    const health = await dependencies.admin.health(owner)
+    if (health.state !== 'ok') return { restored: false, unitState: 'supervisor-not-healthy', errorCode: 'supervisor_not_healthy' }
+  } catch {
+    return { restored: false, unitState: 'supervisor-not-healthy', errorCode: 'supervisor_not_healthy' }
+  }
   try {
     await assertWebActionsSafe(dependencies, owner, mode, 'restore_web')
     await dependencies.services.start(owner.webUnit)
@@ -1517,7 +1594,7 @@ export async function buildSelectedArtifacts(
     }
     if (mode !== 'client') {
       run(paths.cargo, ['build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host',
-        '--features', 'freshell-server/managed-runtime-v1', '--locked'], { cwd: paths.checkoutRoot, env: buildEnv })
+        '--locked'], { cwd: paths.checkoutRoot, env: buildEnv })
       run(paths.cargo, ['build', '--release', '-p', 'freshell-runtime-client', '--bin', 'freshell-supervisor-admin', '--locked'], {
         cwd: paths.checkoutRoot, env: buildEnv,
       })
@@ -1552,6 +1629,30 @@ function parseJsonOutput(output: string): Record<string, unknown> {
     if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
   } catch { /* produce a fixed safe failure below */ }
   throw new UpdateFailure('The supervisor admin CLI returned invalid JSON.')
+}
+
+function parseCandidateMaintenanceInventory(output: string): NoRuntimeInventoryRecord[] {
+  const value = parseJsonOutput(output)
+  if (!Array.isArray(value.noRuntime)) {
+    throw new UpdateFailure('Candidate maintenance Inventory omitted the explicit no-runtime result.')
+  }
+  return value.noRuntime.map((entry: unknown) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new UpdateFailure('Candidate maintenance Inventory returned an invalid no-runtime record.')
+    }
+    const record = entry as Record<string, unknown>
+    if (!nonEmpty(record.soulId) || !['running', 'stopped'].includes(String(record.desiredState))
+      || !Number.isSafeInteger(record.intentRevision) || Number(record.intentRevision) < 0
+      || !['verified_empty', 'unresolved'].includes(String(record.status))) {
+      throw new UpdateFailure('Candidate maintenance Inventory returned an invalid no-runtime record.')
+    }
+    return {
+      soulId: record.soulId,
+      desiredState: String(record.desiredState),
+      intentRevision: Number(record.intentRevision),
+      outcome: record.status as NoRuntimeInventoryRecord['outcome'],
+    }
+  })
 }
 
 async function fileIdentity(filePath: string): Promise<FileIdentity | null> {
@@ -1661,7 +1762,17 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2)
   const internal = parseInternalArgs(argv)
   if (argv[0] === '--bootstrap' || argv[0] === '--worker') {
-    if (!internal) { process.exitCode = 2; return }
+    if (!internal || !processRunsInTransientUnit(internal.unitName)) { process.exitCode = 2; return }
+    const runtimeDirectory = process.env.XDG_RUNTIME_DIR
+    if (!runtimeDirectory || !path.isAbsolute(runtimeDirectory)) { process.exitCode = 2; return }
+    if (internal.kind === 'worker') {
+      const expectedLogPath = path.join(os.homedir(), '.freshell', 'logs', `managed-runtime-update-${internal.runId}.jsonl`)
+      const lockPath = path.join(runtimeDirectory, UPDATE_LOCK_NAME)
+      if (process.env.FRESHELL_UPDATE_LOG_PATH !== expectedLogPath || !processHoldsLockFile(lockPath)) {
+        process.exitCode = 2
+        return
+      }
+    }
   } else if (!parseManagedUpdateMode(argv)) {
     process.exitCode = 2
     return
@@ -1675,8 +1786,30 @@ async function main(): Promise<void> {
     process.exitCode = 2
     return
   }
-  const result = await runManagedUpdateCli(argv, deps)
+  const result = internal
+    ? internal.kind === 'bootstrap'
+      ? await runManagedUpdateBootstrap(internal, deps)
+      : await runManagedRuntimeWorker(internal.mode, deps, internal.approvalFile)
+    : await runManagedUpdateCli(argv, deps)
   process.exitCode = result
+}
+
+function processRunsInTransientUnit(unitName: string): boolean {
+  try {
+    return fs.readFileSync('/proc/self/cgroup', 'utf8').split(/\r?\n/).some(line => {
+      const hierarchyPath = line.split(':', 3)[2]
+      return !!hierarchyPath && hierarchyPath.split('/').includes(unitName)
+    })
+  } catch { return false }
+}
+
+function processHoldsLockFile(lockPath: string): boolean {
+  try {
+    return fs.readdirSync('/proc/self/fd').some(descriptor => {
+      try { return path.resolve(fs.readlinkSync(`/proc/self/fd/${descriptor}`)) === path.resolve(lockPath) }
+      catch { return false }
+    })
+  } catch { return false }
 }
 
 function isScriptEntrypoint(): boolean {

@@ -12,6 +12,7 @@ import {
   createJsonLogger,
   parseManagedUpdateMode,
   runManagedUpdateBootstrap,
+  runManagedUpdateCli,
   runManagedRuntimeUpdate,
   runManagedRuntimeWorker,
   swapDirectoryOnDestination,
@@ -136,6 +137,7 @@ function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {})
       start: vi.fn(async (unit) => { effects.push(`start:${unit}`) }),
       restart: vi.fn(async (unit) => { effects.push(`restart:${unit}`) }),
       isActive: vi.fn(async (unit) => unit === owner.supervisorUnit),
+      state: vi.fn(async (unit) => unit === owner.supervisorUnit ? 'active' : 'inactive'),
       waitSupervisorReady: vi.fn(async () => { effects.push('supervisor-ready') }),
       waitWebReady: vi.fn(async () => { effects.push('web-ready') }),
       waitCallbackReady: vi.fn(async () => { effects.push('callback-ready') }),
@@ -145,6 +147,7 @@ function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {})
       currentSchemaVersion: vi.fn(async () => 19),
       health: vi.fn(async () => ({ state: 'ok' as const })),
       inventory: vi.fn(async () => [view()]),
+      maintenanceInventory: vi.fn(async (_supervisorExecutable, _databasePath) => []),
       stop: vi.fn(async (soulId, expectedIntentRevision) => ({
         outcome: 'verified_empty' as const,
         view: view({ soulId, intentRevision: expectedIntentRevision + 1, desiredState: 'stopped', launchState: 'stopped', cleanupState: 'verified_empty' }),
@@ -272,6 +275,38 @@ it('unverified Stop view restores web and prevents the next soul or supervisor a
   expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
 })
 
+it('stop result incarnation must match addressed view', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [
+    view({ soulId: 'soul-first', incarnationId: 'addressed-incarnation' }),
+    view({ soulId: 'soul-second', incarnationId: 'second-incarnation', provider: 'claude' }),
+  ])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      incarnationId: 'different-incarnation',
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.stop).toHaveBeenCalledWith('soul-first', 12, owner)
+  expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.failed',
+    attempted_prefix: ['soul-first'],
+    verified_empty_stopped: [],
+  }))
+})
+
 it('durable-only refuses changed web executable', async () => {
     const f = dependencies()
     f.deps.filesystem.webExecutableIdentity = vi.fn(async () => ({
@@ -330,6 +365,26 @@ it('invalid update modes refuse before approval or handoff', async () => {
   expect(f.deps.approval.readLine).not.toHaveBeenCalled()
   expect(f.deps.approval.create).not.toHaveBeenCalled()
   expect(f.deps.handoff.submit).not.toHaveBeenCalled()
+})
+
+it('public mode rejects internal worker flags', async () => {
+  const f = dependencies()
+  const runId = '20261101T123456789Z-abc123def456'
+  const unitName = `freshell-update-managed-runtime-${runId}.service`
+
+  const workerResult = await runManagedUpdateCli([
+    '--worker', '--mode', 'client', '--unit-name', unitName, '--run-id', runId,
+  ], f.deps)
+  const bootstrapResult = await runManagedUpdateCli([
+    '--bootstrap', '--mode', 'client', '--unit-name', unitName, '--run-id', runId,
+  ], f.deps)
+
+  expect(workerResult).toBe(2)
+  expect(bootstrapResult).toBe(2)
+  expect(f.deps.owner.resolve).not.toHaveBeenCalled()
+  expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+  expect(f.deps.services.restart).not.toHaveBeenCalled()
+  expect(f.effects).toEqual([])
 })
 
 it('reset mode requires the exact approval line and creates a mode-0600 handoff file', async () => {
@@ -443,8 +498,8 @@ const deps = {
   owner: { async resolve() { throw new Error('handoff worker owns update actions') }, async inspectGraph() { return { units: {} } } },
   artifacts: { async build() { throw new Error('handoff worker owns update actions') } },
   filesystem: { async webExecutableIdentity() { return { live: null, selected: null } }, async installExecutable() {}, async swapClientDirectory() {}, async installImageReference() {} },
-  services: { async stop() {}, async start() {}, async restart() {}, async isActive() { return false }, async waitSupervisorReady() {}, async waitWebReady() {}, async waitCallbackReady() {} },
-  admin: { async candidateSchemaVersion() { return 19 }, async currentSchemaVersion() { return 19 }, async health() { return { state: 'ok' } }, async inventory() { return [] }, async stop() { return { outcome: 'backend_unavailable' } }, async reopen() { return { outcome: 'failed' } } },
+  services: { async stop() {}, async start() {}, async restart() {}, async isActive() { return false }, async state() { return 'inactive' }, async waitSupervisorReady() {}, async waitWebReady() {}, async waitCallbackReady() {} },
+  admin: { async candidateSchemaVersion() { return 19 }, async currentSchemaVersion() { return 19 }, async health() { return { state: 'ok' } }, async inventory() { return [] }, async maintenanceInventory() { return [] }, async stop() { return { outcome: 'backend_unavailable' } }, async reopen() { return { outcome: 'failed' } } },
   docker: { async buildImage() { return 'sha256:' + 'b'.repeat(64) }, async verifyDaemon() {} },
   logger: { async event() {}, async operator() {} },
   now() { return new Date('2026-11-01T12:34:56.789Z') }, randomSuffix() { return 'abc123def456' },
@@ -493,6 +548,24 @@ it('worker approval refusal does not inspect or mutate the owner', async () => {
   expect(f.deps.owner.resolve).not.toHaveBeenCalled()
   expect(f.deps.artifacts.build).not.toHaveBeenCalled()
   expect(f.effects).toEqual([])
+})
+
+it('approval deletion failure refuses before owner inspection', async () => {
+  const f = dependencies()
+  f.deps.approval.consume = vi.fn(async () => {
+    const error = Object.assign(new Error('approval file could not be removed'), { code: 'EACCES' })
+    throw error
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.deps.owner.resolve).not.toHaveBeenCalled()
+  expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+  expect(f.deps.services.stop).not.toHaveBeenCalled()
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.approval_refused', phase: 'approval', error_code: 'approval_invalid',
+  }))
 })
 
 it('owner inspection errors refuse before building or service effects', async () => {
@@ -797,6 +870,43 @@ it('missing isolated Cargo target configuration leaves no staging directory', as
   }
 })
 
+it('durable build omits web-only feature', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-durable-build-'))
+  const paths = {
+    ...dependencies().deps.paths,
+    home: temp,
+    cargoTargetDirectory: path.join(temp, 'cargo-target'),
+  }
+  const commands: Array<{ command: string; args: string[] }> = []
+  const run = (command: string, args: string[]) => {
+    commands.push({ command, args })
+    if (command === paths.cargo) {
+      const release = path.join(paths.cargoTargetDirectory!, 'release')
+      fs.mkdirSync(release, { recursive: true })
+      if (args.includes('freshell-supervisor')) {
+        fs.writeFileSync(path.join(release, 'freshell-supervisor'), 'supervisor executable')
+        fs.writeFileSync(path.join(release, 'freshell-session-host'), 'session host')
+      }
+      if (args.includes('freshell-runtime-client')) fs.writeFileSync(path.join(release, 'freshell-supervisor-admin'), 'admin cli')
+    }
+    return ''
+  }
+  const docker = { buildImage: vi.fn(async () => 'sha256:' + 'b'.repeat(64)), verifyDaemon: vi.fn(async () => undefined) }
+
+  try {
+    const artifacts = await buildSelectedArtifacts(paths, owner, 'durable-only', run, docker)
+    const durableBuild = commands.find(({ command, args }) => command === paths.cargo && args.includes('freshell-supervisor'))
+
+    expect(durableBuild?.args).toEqual([
+      'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--locked',
+    ])
+    expect(artifacts.supervisorExecutable).toBeDefined()
+    await fs.promises.rm(artifacts.stagingRoot!, { recursive: true, force: true })
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+})
+
 it('artifact staging builds only the web or durable outputs selected by mode', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-artifacts-'))
   const paths = {
@@ -880,6 +990,7 @@ it('historical failed incarnations do not replace the active stop and reopen ref
     outcome: 'verified_empty' as const,
     view: view({
       soulId,
+      incarnationId: active.incarnationId,
       intentRevision: expectedIntentRevision + 1,
       desiredState: 'stopped',
       launchState: 'stopped',
@@ -1003,12 +1114,79 @@ it('desired-stopped cleanup checks the addressed incarnation and restores web be
   expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
 })
 
+it('inventory uses staged read-only registry snapshot for missing souls', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => {
+    f.effects.push('live-inventory')
+    return []
+  })
+  f.deps.admin.maintenanceInventory = vi.fn(async (_supervisorExecutable, _databasePath) => {
+    f.effects.push('candidate-maintenance-inventory')
+    return []
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.admin.inventory).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.maintenanceInventory).toHaveBeenCalledWith('/tmp/stage/freshell-supervisor', owner.databasePath)
+  expect(f.effects.indexOf('stop:freshell-rust.service')).toBeLessThan(f.effects.indexOf('live-inventory'))
+  expect(f.effects.indexOf('live-inventory')).toBeLessThan(f.effects.indexOf('candidate-maintenance-inventory'))
+  expect(f.effects.indexOf('candidate-maintenance-inventory')).toBeLessThan(f.effects.indexOf('stop:freshell-supervisor.service'))
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+})
+
+it('candidate no-runtime snapshot conflicts with live inventory before Stops', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [view({ intentRevision: 12, incarnationId: 'live-incarnation' })])
+  f.deps.admin.maintenanceInventory = vi.fn(async () => [{
+    soulId: 'soul-codex', desiredState: 'stopped', intentRevision: 99, outcome: 'verified_empty' as const,
+  }])
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+})
+
+it('failed supervisor stop reports partial shutdown and forward recovery', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [])
+  f.deps.services.stop = vi.fn(async (unit) => {
+    f.effects.push(`stop:${unit}`)
+    if (unit === owner.supervisorUnit) throw new Error('systemd stop failed after shutdown began')
+  })
+  f.deps.services.state = vi.fn(async (unit) => unit === owner.supervisorUnit ? 'failed' : 'inactive')
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.services.stop).toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.services.state).toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.supervisor_stop_failed',
+    phase: 'stop_supervisor',
+    unit_state: 'failed',
+    partial_state: true,
+    manual_recovery: expect.stringContaining('forward-recovery runbook'),
+  }))
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.failed',
+    phase: 'stop_supervisor',
+    manual_recovery: expect.stringContaining('forward-recovery runbook'),
+  }))
+  expect(f.effects.some((effect) => effect.includes('forward-recovery runbook'))).toBe(true)
+})
+
 it('an explicit no-runtime VerifiedEmpty record permits reset with no coding targets', async () => {
   const f = dependencies()
-  f.deps.admin.inventory = vi.fn(async () => ({
-    views: [],
-    noRuntime: [{ soulId: 'soul-no-runtime', desiredState: 'stopped' as const, outcome: 'verified_empty' as const }],
-  }))
+  f.deps.admin.inventory = vi.fn(async () => [])
+  f.deps.admin.maintenanceInventory = vi.fn(async () => [{
+    soulId: 'soul-no-runtime', desiredState: 'stopped', intentRevision: 2, outcome: 'verified_empty' as const,
+  }])
 
   const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
 
@@ -1020,10 +1198,10 @@ it('an explicit no-runtime VerifiedEmpty record permits reset with no coding tar
 
 it('an unresolved no-runtime stopped soul refuses before new Stops and restores web', async () => {
   const f = dependencies()
-  f.deps.admin.inventory = vi.fn(async () => ({
-    views: [],
-    noRuntime: [{ soulId: 'soul-unresolved', desiredState: 'stopped' as const, outcome: 'unresolved' as const }],
-  }))
+  f.deps.admin.inventory = vi.fn(async () => [])
+  f.deps.admin.maintenanceInventory = vi.fn(async () => [{
+    soulId: 'soul-unresolved', desiredState: 'stopped', intentRevision: 3, outcome: 'unresolved' as const,
+  }])
 
   const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
 
@@ -1052,6 +1230,25 @@ it('web restoration failure reports the original error and the resulting unit st
   }))
   expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.failed', phase: 'inventory' }))
   expect(f.effects).toContain('operator:inventory read failed')
+})
+
+it('web restoration requires healthy supervisor control socket', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => { throw new Error('inventory socket failed') })
+  f.deps.admin.health = vi.fn(async () => { throw new Error('supervisor control socket failed') })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.services.isActive).toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.admin.health).toHaveBeenCalledWith(owner)
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.web_restore_after_abort',
+    restored: false,
+    unit_state: 'supervisor-not-healthy',
+    restoration_error_code: 'supervisor_not_healthy',
+  }))
 })
 
 it('pending Reopen does not prevent later saved conversations from being attempted', async () => {
@@ -1118,6 +1315,29 @@ it('a resumable terminal context without native identity is unavailable without 
     unavailable_count: 1,
     eligible_count: 0,
   }))
+})
+
+it('unavailable reopen emits safe per-soul result', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [view({
+    soulId: 'soul-unavailable',
+    nativeSessionId: null,
+    terminalResumeSessionId: 'private-resume-session-id',
+  })])
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.reopen).not.toHaveBeenCalled()
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.reopen_result',
+    phase: 'reopen',
+    soul_id: 'soul-unavailable',
+    provider: 'codex',
+    outcome: 'unavailable',
+    reason: 'missing_native_session_identity',
+  }))
+  expect(JSON.stringify(f.events)).not.toContain('private-resume-session-id')
 })
 
 it('reset summary counts absent and ineligible saved conversation references', async () => {
