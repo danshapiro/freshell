@@ -35,6 +35,107 @@ use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+// ── capturing tracing layer (dev-only test facility, duplicated from
+// safe08_restore_diagnostics.rs / diag01_lifecycle_events.rs's convention;
+// thread-local default subscriber, safe under parallel `cargo test`) ──────
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+#[derive(Debug, Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct FieldVisitor {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct CaptureLayer {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+    }
+}
+
+fn capture() -> (
+    Arc<Mutex<Vec<CapturedEvent>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let layer = CaptureLayer {
+        events: Arc::clone(&events),
+    };
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+    (events, guard)
+}
+
+/// All captured events carrying `event = <name>`, in emission order.
+fn events_by_name(events: &Arc<Mutex<Vec<CapturedEvent>>>, name: &str) -> Vec<CapturedEvent> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.fields.get("event").map(String::as_str) == Some(name))
+        .cloned()
+        .collect()
+}
+
 fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -127,6 +228,7 @@ async fn spawn_server_with_probe(
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
 
     let mut state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
@@ -690,9 +792,14 @@ async fn frozen_client_create_path_is_deduped_same_as_negotiating_clients() {
 
 /// warming-never-completes (council red test): a probe pinned to Unknown
 /// forever must yield error{index_warming} after ONE bounded deferral —
-/// never a hang, never a fake fresh/dead_session.
+/// never a hang, never a fake fresh/dead_session. The server-side
+/// `pane_reconcile.index_warming` transition log fires exactly twice for
+/// such a request: once when the deferral arms, once more because the
+/// post-deferral re-derivation STILL answers warming (never per poll —
+/// there is no poll; the deferral is single-shot by construction).
 #[tokio::test]
 async fn warming_never_completes_yields_error_index_warming() {
+    let (events, _guard) = capture();
     // Server with deferral budget shrunk for tests (50ms) and the default
     // NoIndexProbe (always Unknown for known providers).
     let server = spawn_server_with(|state| state.reconcile_deferral_budget_ms = 50).await;
@@ -713,12 +820,42 @@ async fn warming_never_completes_yields_error_index_warming() {
         v.get("retryAfterMs").is_none(),
         "retry is deleted from the wire"
     );
+    let warming_events = events_by_name(&events, "pane_reconcile.index_warming");
+    assert_eq!(
+        warming_events.len(),
+        2,
+        "deferral arm + still-warming-after-derivation, never more: {warming_events:?}"
+    );
+    for event in &warming_events {
+        assert_eq!(
+            event.message,
+            "pane reconcile deferred: session index warming"
+        );
+        assert_eq!(
+            event.fields.get("reconcile_id").map(String::as_str),
+            Some("rec-warming")
+        );
+        assert_eq!(
+            event.fields.get("pane_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            event.fields.get("budget_ms").map(String::as_str),
+            Some("50")
+        );
+        assert!(
+            event.fields.contains_key("connection_id"),
+            "the event must identify the connection: {event:?}"
+        );
+    }
 }
 
 /// A known provider with no home on this machine is NOT warming — it gets
-/// the honest provider_unavailable label, immediately (no 2s deferral).
+/// the honest provider_unavailable label, immediately (no 2s deferral, and
+/// no `pane_reconcile.index_warming` event: the deferral never arms).
 #[tokio::test]
 async fn provider_unavailable_is_immediate_and_honest() {
+    let (events, _guard) = capture();
     // A single scripted answer repeats forever — "always ProviderUnavailable".
     let probe = FlippingProbe::new(vec![
         freshell_ws::existence::SessionExistence::ProviderUnavailable,
@@ -741,12 +878,19 @@ async fn provider_unavailable_is_immediate_and_honest() {
     let v = &result["verdicts"][0];
     assert_eq!(v["verdict"], "error");
     assert_eq!(v["reason"], "provider_unavailable");
+    assert!(
+        events_by_name(&events, "pane_reconcile.index_warming").is_empty(),
+        "the warming event must never fire for a non-warming reason"
+    );
 }
 
 /// The deferral is real: index warms during the wait -> the SECOND derivation
-/// answers with the warm verdict, not error.
+/// answers with the warm verdict, not error. The transition log fires
+/// exactly ONCE for the request — the deferral arm — and the still-warming
+/// follow-up never fires because the re-derivation resolved.
 #[tokio::test]
 async fn warming_resolves_during_deferral_rederives() {
+    let (events, _guard) = capture();
     // Fake probe: first call Unknown, subsequent calls Absent (never observed
     // -> per existing rules the verdict for a never-observed identity is
     // fresh{identity_never_observed}).
@@ -764,6 +908,33 @@ async fn warming_resolves_during_deferral_rederives() {
         .expect("send request");
     let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
     assert_ne!(result["verdicts"][0]["verdict"], "error");
+    let warming_events = events_by_name(&events, "pane_reconcile.index_warming");
+    assert_eq!(
+        warming_events.len(),
+        1,
+        "a deferred request that resolves during the deferral logs the transition exactly once: {warming_events:?}"
+    );
+    let event = &warming_events[0];
+    assert_eq!(
+        event.message,
+        "pane reconcile deferred: session index warming"
+    );
+    assert_eq!(
+        event.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(
+        event.fields.get("pane_count").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        event.fields.get("budget_ms").map(String::as_str),
+        Some("50")
+    );
+    assert!(
+        event.fields.contains_key("connection_id"),
+        "the event must identify the connection: {event:?}"
+    );
 }
 
 // --- waveC integration pin: idle-reap (#539) x reconcile verdicts (C2) ---------

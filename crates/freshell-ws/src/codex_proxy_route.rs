@@ -263,6 +263,7 @@ mod tests {
         let auth_token = StdArc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             terminal_meta: Default::default(),

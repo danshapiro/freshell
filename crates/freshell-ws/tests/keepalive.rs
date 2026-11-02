@@ -55,6 +55,7 @@ async fn spawn_server(
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        session_index_ready: None,
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),

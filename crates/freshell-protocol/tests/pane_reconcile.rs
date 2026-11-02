@@ -63,6 +63,7 @@ fn ready_capabilities_field_is_omitted_when_none() {
         capabilities: None,
         runtime_owners: None,
         fresh_agent_attention: None,
+        session_index_ready: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert!(
@@ -86,9 +87,11 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
             paced_terminal_replay_v1: None,
             terminal_lifetime_claim_v1: None,
             managed_runtime_v1: None,
+            session_index_ready_v1: None,
         }),
         runtime_owners: None,
         fresh_agent_attention: None,
+        session_index_ready: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert_eq!(wire["capabilities"], json!({ "paneReconcileV1": true }));

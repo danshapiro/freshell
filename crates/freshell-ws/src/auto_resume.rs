@@ -3027,6 +3027,7 @@ mod tests {
         let registry = freshell_terminal::TerminalRegistry::new()
             .with_ownership(std::sync::Arc::clone(&ownership));
         let state = crate::WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             terminal_meta: Default::default(),

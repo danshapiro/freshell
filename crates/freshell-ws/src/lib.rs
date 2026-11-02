@@ -166,6 +166,14 @@ pub struct WsState {
     /// Carries `ui.command` / `freshAgent.session.materialized` / `sessions.changed`
     /// during a fresh-agent turn, which the oracle's capture socket records.
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// Session-index readiness (auto-restore-warming Task 2): the one-way
+    /// readiness watch from `SessionIndex::subscribe_ready()` — read at
+    /// handshake time for the negotiated `ready.sessionIndexReady` state
+    /// field, and awaited by the Task 3 boot wiring that broadcasts
+    /// `sessions.index.ready` once per boot. `None` keeps hand-built test
+    /// states byte-identical (a negotiated ready then reports `false`,
+    /// the honest cold/no-index answer).
+    pub session_index_ready: Option<tokio::sync::watch::Receiver<bool>>,
     /// Lane D1: natural-exit crash events for the auto-resume hub. The
     /// receiver half is consumed by `auto_resume::spawn_auto_resume_hub`
     /// (Task 5); until then tests drain it directly (construction sites
@@ -628,6 +636,7 @@ pub struct HandshakeCapabilities {
     pub terminal_lifetime_claim_v1: bool,
     pub managed_runtime_v1: bool,
     pub fresh_agent_attention_replay_v1: bool,
+    pub session_index_ready_v1: bool,
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -657,6 +666,7 @@ pub async fn build_handshake_with_capabilities(
         terminal_lifetime_claim_v1,
         managed_runtime_v1,
         fresh_agent_attention_replay_v1,
+        session_index_ready_v1,
     } = capabilities;
     let boot_id = state.boot_id.as_ref().clone();
     let fresh_agent_attention = if fresh_agent_attention_replay_v1 {
@@ -726,7 +736,8 @@ pub async fn build_handshake_with_capabilities(
                 || paced_terminal_replay_v1
                 || terminal_lifetime_claim_v1
                 || managed_runtime_v1
-                || fresh_agent_attention_replay_v1)
+                || fresh_agent_attention_replay_v1
+                || session_index_ready_v1)
                 .then_some(freshell_protocol::ReadyCapabilities {
                     fresh_agent_attention_replay_v1: fresh_agent_attention_replay_v1
                         .then_some(true),
@@ -736,7 +747,20 @@ pub async fn build_handshake_with_capabilities(
                     paced_terminal_replay_v1: paced_terminal_replay_v1.then_some(true),
                     terminal_lifetime_claim_v1: terminal_lifetime_claim_v1.then_some(true),
                     managed_runtime_v1: managed_runtime_v1.then_some(true),
+                    session_index_ready_v1: session_index_ready_v1.then_some(true),
                 }),
+            // Auto-restore-warming Task 2: the CURRENT session-index
+            // readiness, reported only to connections that negotiated the
+            // capability (the frozen shape omits the field entirely). No
+            // wired watch reads as `false` — the honest cold/no-index
+            // answer.
+            session_index_ready: session_index_ready_v1.then(|| {
+                state
+                    .session_index_ready
+                    .as_ref()
+                    .map(|rx| *rx.borrow())
+                    .unwrap_or(false)
+            }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.handshake_settings.read().await.clone(),
@@ -991,6 +1015,17 @@ async fn handle_socket(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // Auto-restore-warming Task 2: the session-index readiness opt-in —
+    // gates `ready.sessionIndexReady` (the handshake state field) and the
+    // `sessions.index.ready` boot broadcast on THIS connection. Same
+    // opt-in gate as `paneReconcileV1`; the frozen client never sends it,
+    // so its handshake stays byte-for-byte unchanged.
+    let session_index_ready_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("sessionIndexReadyV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
@@ -1004,6 +1039,7 @@ async fn handle_socket(
             terminal_lifetime_claim_v1,
             managed_runtime_v1,
             fresh_agent_attention_replay_v1,
+            session_index_ready_v1,
         },
     )
     .await
@@ -1069,6 +1105,7 @@ async fn handle_socket(
         terminal_interest_v1,
         terminal_lifetime_claim_v1,
         managed_runtime_v1,
+        session_index_ready_v1,
     )
     .await;
 }
@@ -1148,6 +1185,7 @@ pub(crate) fn test_ws_state() -> WsState {
         settings: Arc::new(test_settings()),
         handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
         broadcast_tx: Arc::clone(&broadcast_tx),
+        session_index_ready: None,
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(

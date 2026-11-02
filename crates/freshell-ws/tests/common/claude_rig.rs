@@ -1097,6 +1097,7 @@ async fn spawn_rig_server(
     let cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>> = Arc::new(Vec::new());
 
     let state = WsState {
+        session_index_ready: None,
         layout,
         terminal_meta: Default::default(),
         pane_ledger: pane_ledger

@@ -131,6 +131,7 @@ async fn spawn_server_with_claude_environment(
     }
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),

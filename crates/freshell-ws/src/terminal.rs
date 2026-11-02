@@ -299,6 +299,7 @@ pub async fn run(
     terminal_interest_v1: bool,
     terminal_lifetime_claim_v1: bool,
     managed_runtime_v1: bool,
+    session_index_ready_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -345,6 +346,7 @@ pub async fn run(
         conn_identity,
         terminal_interest_v1,
         terminal_lifetime_claim_v1,
+        session_index_ready_v1,
     )
     .instrument(span)
     .await;
@@ -369,6 +371,7 @@ async fn run_loop(
     mut conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
     terminal_lifetime_claim_v1: bool,
+    session_index_ready_v1: bool,
 ) {
     // One independently supervised socket writer. The read/dispatch path
     // never awaits socket capacity; output is reconsidered one frame at a time.
@@ -716,6 +719,17 @@ async fn run_loop(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
+                        // Capability-gated frame (auto-restore-warming Task 2):
+                        // the session-index readiness broadcast goes ONLY to
+                        // connections whose hello negotiated
+                        // `sessionIndexReadyV1` — the frozen wire stays
+                        // byte-for-byte legacy. Pre-serialized frames make a
+                        // substring check the cheapest safe gate; the protocol
+                        // roundtrip test pins the serialized marker so drift
+                        // fails there, not silently here.
+                        if json.contains(SESSIONS_INDEX_READY_MARKER) && !session_index_ready_v1 {
+                            continue;
+                        }
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             close_reason = "send_error";
                             break;
@@ -2593,6 +2607,7 @@ async fn handle_client_text(
                     state,
                     pane_reconcile_fresh_agent_v1,
                     state.registry.managed_runtime_connection(conn_id),
+                    conn_id,
                 )
                 .await;
             }
@@ -8699,6 +8714,25 @@ pub fn broadcast_sessions_changed(state: &WsState) {
     let _ = state.broadcast_tx.send(frame);
 }
 
+/// The serialized `type` marker of the readiness broadcast — the forward
+/// site's capability gate substring-matches it on every pre-serialized
+/// broadcast frame; the protocol roundtrip test
+/// (`sessions_index_ready_frame_roundtrips`) pins that the typed frame
+/// really serializes to this marker, so drift fails there, not silently in
+/// production.
+const SESSIONS_INDEX_READY_MARKER: &str = r#""type":"sessions.index.ready""#;
+
+/// One broadcast per boot (auto-restore-warming Task 3 wiring): the session
+/// index finished its first sweep (`SessionIndex::subscribe_ready` fired),
+/// so parked panes may now resume automatically. Capability-gated at the
+/// forward site — frozen connections never see the frame. Mirrors
+/// [`broadcast_sessions_changed`]; deliberately carries NO revision —
+/// readiness is a one-way latch, not a change series.
+pub fn broadcast_sessions_index_ready(state: &WsState) {
+    let frame = serde_json::json!({ "type": "sessions.index.ready" }).to_string();
+    let _ = state.broadcast_tx.send(frame);
+}
+
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
 /// `pane.reconcile.request` (reconciliation design §5): the terminal sources
@@ -8717,6 +8751,7 @@ async fn handle_pane_reconcile(
     state: &WsState,
     pane_reconcile_fresh_agent_v1: bool,
     managed_runtime_v1: bool,
+    conn_id: u64,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
@@ -8834,13 +8869,28 @@ async fn handle_pane_reconcile(
     // client's manual retry affordance is the recovery path. The stall is
     // delay-only and scoped to THIS connection's select loop, bounded by the
     // budget (default 2000ms, shrunk in tests).
-    let warming = |vs: &[freshell_protocol::PaneVerdict]| {
-        vs.iter().any(|v| {
-            matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
-                && v.reason.as_deref() == Some("index_warming")
-        })
+    let is_index_warming = |v: &freshell_protocol::PaneVerdict| {
+        matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
+            && v.reason.as_deref() == Some("index_warming")
     };
+    let warming = |vs: &[freshell_protocol::PaneVerdict]| vs.iter().any(&is_index_warming);
     if warming(&verdicts) {
+        // Round-3 finding 6: production-visible recovery transitions live
+        // SERVER-SIDE, where the default RUST_LOG records INFO. Once per
+        // request by construction — the deferral is single-shot, so this
+        // can never become a per-poll log (the same unchanged wait is
+        // never re-logged).
+        let log_index_warming = |verdicts: &[freshell_protocol::PaneVerdict]| {
+            tracing::info!(
+                event = "pane_reconcile.index_warming",
+                connection_id = conn_id,
+                reconcile_id = %request.reconcile_id,
+                pane_count = verdicts.iter().filter(|v| is_index_warming(v)).count(),
+                budget_ms = state.reconcile_deferral_budget_ms,
+                "pane reconcile deferred: session index warming"
+            );
+        };
+        log_index_warming(&verdicts);
         tokio::time::sleep(std::time::Duration::from_millis(
             state.reconcile_deferral_budget_ms,
         ))
@@ -8858,6 +8908,12 @@ async fn handle_pane_reconcile(
                 .await;
             }
         };
+        if warming(&verdicts) {
+            // The bounded deferral expired and the index is STILL warming —
+            // the request's final state, logged once more (the answer below
+            // carries the per-pane error{index_warming} verdicts).
+            log_index_warming(&verdicts);
+        }
     }
     // A `dead_session` verdict parks the pane in the client's dead-sessions
     // dialog awaiting user adjudication — the loud, user-facing end of the
@@ -11961,6 +12017,7 @@ mod terminals_changed_tests {
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -12161,6 +12218,7 @@ mod terminal_kill_stop_wedge_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: Arc::new(pane_ledger),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -12588,6 +12646,7 @@ mod terminal_meta_created_tests {
         let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -13244,6 +13303,7 @@ mod pane_reconcile_gate_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -15252,6 +15312,7 @@ mod host_stats_dispatch_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),

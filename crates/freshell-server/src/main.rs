@@ -2356,6 +2356,13 @@ async fn main() -> ExitCode {
         handshake_settings: settings_store.shared_settings_lock(),
         config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
+        // Auto-restore-warming Task 2: the session-index readiness watch —
+        // read at handshake time for the negotiated `ready.sessionIndexReady`
+        // state field; the Task 3 boot wiring awaits it to fire the
+        // one-per-boot `sessions.index.ready` broadcast. `None` (no provider
+        // home) keeps readiness permanently cold — the honest answer for a
+        // boot with no session index at all.
+        session_index_ready: session_index.as_ref().map(|index| index.subscribe_ready()),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),
         fresh_opencode: fresh_opencode_state.clone(),
@@ -4785,6 +4792,7 @@ mod sessions_sweep_tests {
                 serde_json::from_value(settings_json).unwrap(),
             )),
             broadcast_tx: Arc::clone(&broadcast_tx),
+            session_index_ready: None,
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
