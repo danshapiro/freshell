@@ -1742,7 +1742,7 @@ git commit -m "feat(antigravity): activate the validated conversation-resume gat
 
 **Files:**
 - Modify: `test/integration/real/antigravity-launch-smoke.test.ts` (the header runbook `:26-32` + the new tier-4 test)
-- Also align the existing tier-3 test (`completes a headless turn`) to pass the same session-scoped `--settings '{"modelProvider":"gemini"}'` overlay (GC15): as written it omits the overlay and implicitly relies on the operator having mutated the shared `settings.json` — which GC2 forbids and this host's settings.json does not have (no `modelProvider` key, verified 2026-11-02) — so the first key-bearing gated run would fail on tier 3 at CLI setup before tier 4 ever executes. Minimal same-file fix: `['-p', '--settings', '{"modelProvider":"gemini"}', 'Reply with exactly: antigravity-smoke-ok']`, and update the header's runbook note accordingly.
+- Also align the existing tier-3 test (`completes a headless turn`) to pass the same session-scoped `--settings '{"modelProvider":"gemini"}'` overlay (GC15): as written it omits the overlay and implicitly relies on the operator having mutated the shared `settings.json` — which GC2 forbids and this host's settings.json does not have (no `modelProvider` key, verified 2026-11-02) — so the first key-bearing gated run would fail on tier 3 at CLI setup before tier 4 ever executes. Minimal same-file fix, in the ARGV SHAPE Task 1's receipts evidenced (`real-binary-transcript-evidence.md` §Headless argv receipt — `-p` TAKES the prompt as its value; `--settings` earlier in argv; the bare `-p <prompt>` positional form misparses and exits 2): `['--settings', '{"modelProvider":"gemini"}', '-p=Reply with exactly: antigravity-smoke-ok']`, and update the header's runbook note accordingly (document the `-p='<prompt>'` shape).
 - Test: the same file (the opt-in gated run)
 
 **Interfaces:**
@@ -1780,7 +1780,6 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
     'resumes a real conversation headlessly and appends to the same transcript',
     async () => {
       const nonce = `antigravity-smoke-resume-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const settings = ['--settings', '{"modelProvider":"gemini"}']
       const brainDir = path.join(await resolveAgyStoreRoot(), 'brain')
       const before = new Set(await fs.readdir(brainDir).catch(() => [] as string[]))
       // EVERY fresh conversation whose transcript carries the nonce — the
@@ -1792,7 +1791,7 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       // Turn 1: a fresh scratch conversation this run owns.
       const first = await execFileAsync(
         agyCommand,
-        ['-p', ...settings, `Reply with exactly: ${nonce}`],
+        ['--settings', '{"modelProvider":"gemini"}', `-p=Reply with exactly: ${nonce}`],
         { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
       )
       expect(first.stdout).toContain(nonce)
@@ -1844,7 +1843,7 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       const linesBefore = lines.length
       const second = await execFileAsync(
         agyCommand,
-        ['-p', '--conversation', convId!, ...settings, 'Reply with exactly the string I asked you to reply with in the first message.'],
+        ['--settings', '{"modelProvider":"gemini"}', '--conversation', convId!, '-p=Reply with exactly the string I asked you to reply with in the first message.'],
         { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
       )
       expect(second.stdout).toContain(nonce)
