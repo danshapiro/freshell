@@ -502,7 +502,7 @@ export async function runManagedRuntimeWorker(
 
     execution.phase = 'live_readiness'
     authToken = await dependencies.runtimeApi.readAuthToken(owner)
-    const initialReadiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
+    const initialReadiness = await readAuthenticatedReadiness(dependencies, owner, authToken, 'pre-update')
     assertReadinessForSafeShutdown(initialReadiness)
     execution.preUpdateSupervisorIdentity = initialReadiness.identity
     await record(dependencies, mode, execution.phase, 'update.live_ownership_verified', 'info')
@@ -600,12 +600,18 @@ async function readAuthenticatedReadiness(
   dependencies: ManagedRuntimeUpdateDependencies,
   owner: ManagedRuntimeOwner,
   token: string,
+  context: 'pre-update' | 'post-update',
 ): Promise<ReadinessReport> {
   const before = await directSupervisorIdentity(dependencies, owner)
   const response = await runtimeApiRequest(dependencies, owner, token, 'GET', '/api/runtime/readiness')
   const after = await directSupervisorIdentity(dependencies, owner)
   if (response.status !== 200) {
-    throw new UpdateRefusal('Authenticated live runtime readiness is unavailable; the selected web server may be legacy or featureless.')
+    if (context === 'pre-update') {
+      throw new UpdateRefusal(
+        'Authenticated /api/runtime/readiness is unavailable; the server may be legacy or missing the managed-runtime feature. No build or service changes have been made. Without this endpoint the updater cannot safely inventory open panes or bootstrap the install. Keep existing work running, save or port host-agent sessions, then use a separate deliberate approved recovery and verify readiness before describing agents as protected.',
+      )
+    }
+    throw new UpdateRefusal('Authenticated live runtime readiness is unavailable after the update; inspect the current web service and supervisor state before recovery.')
   }
   const report = parseReadinessReport(response.body)
   assertSameIdentity(after, before, 'The supervisor changed while live runtime readiness was being checked.')
@@ -1038,7 +1044,7 @@ async function runClientUpdate(
   execution.phase = 'web_readiness'
   await dependencies.services.waitWebReady(owner)
   await dependencies.services.waitCallbackReady(owner)
-  const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
+  const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken, 'post-update')
   assertSameIdentity(readiness.identity, expectedIdentity, 'Default web-only update changed the durable supervisor identity.')
   execution.postUpdateSupervisorIdentity = readiness.identity
   execution.postStartOwnership = summarizePostStartOwnership(readiness)
@@ -1174,7 +1180,7 @@ async function startUpdatedRuntime(
   await dependencies.services.start(owner.webUnit)
   await dependencies.services.waitWebReady(owner)
   await dependencies.services.waitCallbackReady(owner)
-  const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
+  const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken, 'post-update')
   assertSameIdentity(readiness.identity, supervisorIdentity, 'Updated web readiness did not match the deliberately restarted supervisor.')
   execution.postUpdateSupervisorIdentity = readiness.identity
   execution.postStartOwnership = summarizePostStartOwnership(readiness)

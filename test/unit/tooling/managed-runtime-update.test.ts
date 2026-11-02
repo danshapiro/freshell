@@ -1574,6 +1574,9 @@ it('legacy featureless server refuses before mutation', async () => {
   expect(f.effects).not.toContain('resource-manifest')
   expect(f.effects).not.toContain('build:client')
   expect(f.effects.some((effect) => effect.startsWith('install:') || effect.startsWith('restart:'))).toBe(false)
+  expect(f.effects.some((effect) => effect.startsWith('operator:')
+    && effect.includes('No build or service changes have been made')
+    && effect.includes('cannot safely inventory open panes or bootstrap'))).toBe(true)
 })
 
 it('initial readiness requires a complete report and finished unblocked scan', async () => {

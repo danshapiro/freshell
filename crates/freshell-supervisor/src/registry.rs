@@ -1559,7 +1559,7 @@ impl Registry {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul, &fence)?;
             if incarnation_id != fence.active_incarnation_id { return Err(RegistryError::NativeIdentityConflict); }
-            validate_live_native_observation(&tx, &soul, &incarnation_id)?;
+            validate_initial_live_native_observation(&tx, &soul, &incarnation_id)?;
             let reopen_prepared = reopen_incarnation_is_current(&tx, &incarnation_id)?;
             let now = now_millis();
             let changed = tx.execute(
@@ -2607,6 +2607,7 @@ impl Registry {
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
         let payload_digest = input_payload_digest(data, correlation);
         let protected_payload = data.to_vec();
+        let has_data = !data.is_empty();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some((existing_digest, existing_payload, state, recorded_incarnation)) = tx
@@ -2647,16 +2648,32 @@ impl Registry {
                 }
             }
 
-            let incarnation_raw: String = tx
+            let current: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT i.incarnation_id FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.soul_id=?1 AND i.launch_state='running' AND s.desired_state='running' AND s.recovery_state='live' ORDER BY i.created_at DESC LIMIT 1",
+                    "SELECT i.incarnation_id,s.recovery_state FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.soul_id=?1 AND i.launch_state='running' AND s.desired_state='running' AND s.recovery_state IN ('live','blocked') ORDER BY i.created_at DESC LIMIT 1",
                     params![soul_id.as_str()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .optional()?
-                .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+                .optional()?;
+            let (incarnation_raw, recovery_state) =
+                current.ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
             let incarnation_id = IncarnationId::parse(incarnation_raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+            let admitted = match recovery_state.as_str() {
+                "live" => true,
+                "blocked" => {
+                    has_data
+                        && fresh_opencode_terminal_can_accept_input_before_native_identity(
+                            &tx,
+                            &soul_id,
+                            &incarnation_id,
+                        )?
+                }
+                _ => false,
+            };
+            if !admitted {
+                return Err(RegistryError::UnknownSoul(soul_id.clone()));
+            }
 
             // A settings refusal must roll back admission of the prompt too.
             // Recovery consumes every queued row, so publishing it separately
@@ -6788,6 +6805,109 @@ fn validate_live_native_observation(
         return Err(RegistryError::NativeIdentityConflict);
     }
     Ok(())
+}
+
+fn validate_initial_live_native_observation(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+) -> Result<(), RegistryError> {
+    if fresh_opencode_terminal_can_start_without_native_identity(conn, soul, incarnation)? {
+        return Ok(());
+    }
+    validate_live_native_observation(conn, soul, incarnation)
+}
+
+fn fresh_opencode_terminal_can_start_without_native_identity(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+) -> Result<bool, RegistryError> {
+    let candidate: Option<(String, String, String, u64, u64)> = conn
+        .query_row(
+            "SELECT i.terminal_spec,i.native_identity_launch,i.launch_nonce,i.execution_generation,s.evidence_revision
+             FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id
+             WHERE s.soul_id=?1 AND i.incarnation_id=?2
+               AND s.provider='opencode' AND s.native_session_id IS NULL AND s.resume_spec IS NULL
+               AND s.recovery_attempt_id IS NULL AND s.desired_state='running'
+               AND i.fresh_agent_spec IS NULL AND i.fixture_kind IS NULL
+               AND i.launch_state='starting' AND i.grant_id IS NOT NULL AND i.host_boot_id IS NOT NULL
+               AND i.prior_incarnation_id IS NULL AND i.native_identity_observation IS NULL
+               AND i.native_identity_launch IS NOT NULL AND i.execution_generation>0",
+            params![soul.as_str(), incarnation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((terminal_spec, launch, nonce, generation, evidence_revision)) = candidate else {
+        return Ok(false);
+    };
+
+    let terminal: TerminalLaunchSpec = serde_json::from_str(&terminal_spec)?;
+    if terminal.validate().is_err()
+        || terminal.mode != "opencode"
+        || terminal.resume_session_id.is_some()
+        || terminal.opencode_transfer.is_some()
+        || terminal.opencode_transfer_attempt_id.is_some()
+        || terminal.opencode_adoption.is_some()
+    {
+        return Ok(false);
+    }
+    let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_str(&launch)?;
+    Ok(launch.incarnation_id == *incarnation
+        && launch.launch_nonce == nonce
+        && launch.execution_generation == generation
+        && launch.evidence_revision == evidence_revision
+        && launch.requested_native_session_id.is_none())
+}
+
+/// A fresh OpenCode process may need a prompt before it creates the native
+/// session row used by recovery. Admit input chunks while capability
+/// qualification is pending, but only for the exact current fresh terminal
+/// with no native identity; resume, transfer, adoption, fixture, and
+/// replacement paths stay closed.
+fn fresh_opencode_terminal_can_accept_input_before_native_identity(
+    conn: &Connection,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+) -> Result<bool, RegistryError> {
+    let candidate: Option<(String, String, String, u64, u64)> = conn
+        .query_row(
+            "SELECT i.terminal_spec,i.native_identity_launch,i.launch_nonce,i.execution_generation,s.evidence_revision
+             FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id
+             WHERE s.soul_id=?1 AND i.incarnation_id=?2
+               AND s.provider='opencode' AND s.native_session_id IS NULL AND s.resume_spec IS NULL
+               AND s.recovery_attempt_id IS NULL AND s.desired_state='running'
+               AND s.recovery_state='blocked' AND s.recovery_reason='CAPABILITY_PENDING'
+               AND i.fresh_agent_spec IS NULL AND i.fixture_kind IS NULL
+               AND i.launch_state='running' AND i.grant_id IS NOT NULL AND i.host_boot_id IS NOT NULL
+               AND i.prior_incarnation_id IS NULL AND i.recovery_attempt_id IS NULL
+               AND i.native_identity_observation IS NULL
+               AND i.native_identity_launch IS NOT NULL AND i.execution_generation>0",
+            params![soul.as_str(), incarnation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((terminal_spec, launch, nonce, generation, evidence_revision)) = candidate else {
+        return Ok(false);
+    };
+
+    let terminal: TerminalLaunchSpec = serde_json::from_str(&terminal_spec)?;
+    if terminal.validate().is_err()
+        || terminal.mode != "opencode"
+        || terminal.create_request_id.is_none()
+        || terminal.resume_session_id.is_some()
+        || terminal.opencode_transfer.is_some()
+        || terminal.opencode_transfer_attempt_id.is_some()
+        || terminal.opencode_adoption.is_some()
+    {
+        return Ok(false);
+    }
+    let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_str(&launch)?;
+    Ok(launch.incarnation_id == *incarnation
+        && launch.launch_nonce == nonce
+        && launch.execution_generation == generation
+        && launch.evidence_revision == evidence_revision
+        && launch.requested_native_session_id.is_none())
 }
 
 fn invalidate_claude_fork_recovery(
@@ -11077,6 +11197,239 @@ pub(crate) mod tests {
         assert_eq!(
             registry.inventory().await.unwrap()[0].launch_state,
             LaunchState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_fresh_opencode_terminal_can_publish_before_native_session_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_test_runtime(&registry, soul.clone()).await;
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId": "terminal-fresh-opencode",
+            "streamId": "stream-fresh-opencode",
+            "mode": "opencode",
+            "createRequestId": "create-fresh-opencode",
+            "program": "opencode",
+            "cwd": "/workspace",
+            "workspacePath": "/workspace",
+            "projectKey": "fresh-opencode-project",
+            "runAsUid": 65534,
+            "runAsGid": 0,
+            "cols": 80,
+            "rows": 24
+        }))
+        .unwrap();
+        terminal.validate().unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode',native_session_id=NULL,recovery_state='live' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL,launch_state='created',terminal_spec=?1 WHERE incarnation_id=?2",
+            params![serde_json::to_string(&terminal).unwrap(), prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let assert_not_exempt = |conn: &Connection, case: &str| {
+            assert!(
+                !fresh_opencode_terminal_can_start_without_native_identity(
+                    conn,
+                    &soul,
+                    &prepared.incarnation_id,
+                )
+                .unwrap(),
+                "initial-publication exemption must reject {case}"
+            );
+        };
+        let write_terminal = |conn: &Connection, spec: &TerminalLaunchSpec| {
+            conn.execute(
+                "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(spec).unwrap(),
+                    prepared.incarnation_id.as_str()
+                ],
+            )
+            .unwrap();
+        };
+        assert!(fresh_opencode_terminal_can_start_without_native_identity(
+            &conn,
+            &soul,
+            &prepared.incarnation_id
+        )
+        .unwrap());
+
+        let mut resumed = terminal.clone();
+        resumed.resume_session_id = Some("ses_existing".into());
+        resumed.validate().unwrap();
+        write_terminal(&conn, &resumed);
+        assert_not_exempt(&conn, "a resumed terminal");
+        write_terminal(&conn, &terminal);
+
+        conn.execute(
+            "UPDATE souls SET resume_spec='{}' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "a saved recovery resume spec");
+        conn.execute(
+            "UPDATE souls SET resume_spec=NULL,recovery_attempt_id='attempt-recovery' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "an active recovery attempt");
+        conn.execute(
+            "UPDATE souls SET recovery_attempt_id=NULL WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET prior_incarnation_id='prior-incarnation' WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "a replacement incarnation");
+        conn.execute(
+            "UPDATE incarnations SET prior_incarnation_id=NULL,fixture_kind='opencode' WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        assert_not_exempt(&conn, "a fixture workload");
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+
+        let transfer_descriptor = opencode_transfer_descriptor("initial-boundary-transfer");
+        let transfer = opencode_terminal(&transfer_descriptor, &"a".repeat(32));
+        transfer.validate().unwrap();
+        write_terminal(&conn, &transfer);
+        assert_not_exempt(&conn, "a transferred terminal");
+
+        let adoption_baseline = OpenCodeAdoptionBaseline::from_descriptor(
+            opencode_transfer_descriptor("initial-boundary-adoption"),
+        )
+        .unwrap();
+        let mut adoption = terminal.clone();
+        adoption.resume_session_id = Some("ses_exact".into());
+        adoption.opencode_adoption = Some(freshell_runtime_protocol::OpenCodeAdoptionExpectation {
+            baseline: adoption_baseline,
+            root_session_id: "ses_exact".into(),
+            root_tail: freshell_runtime_protocol::OpenCodeVerifiedRootTail::QualifiedEmpty,
+            evidence_generation: "f".repeat(64),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: "a".repeat(32),
+        });
+        adoption.validate().unwrap();
+        write_terminal(&conn, &adoption);
+        assert_not_exempt(&conn, "an adopted terminal");
+        write_terminal(&conn, &terminal);
+        drop(conn);
+
+        registry
+            .mark_running_observed_with_provider_preparation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                context.write_fence(),
+                true,
+            )
+            .await
+            .unwrap();
+        let running = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(running.native_session_id, None);
+        assert_eq!(
+            registry.inventory().await.unwrap()[0].launch_state,
+            LaunchState::Running
+        );
+
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET recovery_state='blocked',recovery_reason='CAPABILITY_PENDING' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+        let first_prompt = RequestId::new();
+        let first_input = registry
+            .begin_input(soul.clone(), first_prompt, b"first OpenCode prompt", None)
+            .await;
+        assert!(
+            first_input.is_ok(),
+            "the exact live fresh OpenCode terminal must admit its first prompt while native identity is pending: {first_input:?}"
+        );
+        let prompt_enter = registry
+            .begin_input(soul.clone(), RequestId::new(), b"\r", None)
+            .await;
+        assert!(
+            prompt_enter.is_ok(),
+            "split text and Enter input must remain admissible before OpenCode creates native identity: {prompt_enter:?}"
+        );
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET recovery_state='live',recovery_reason=NULL WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+
+        // The first terminal output carries the provider session ID after the
+        // user's initial prompt creates the OpenCode session row.
+        crate::service::record_terminal_identity_observation(
+            &registry,
+            &running,
+            "ses_after_first_prompt",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("ses_after_first_prompt")
+        );
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET recovery_state='blocked',recovery_reason='CAPABILITY_PENDING' WHERE soul_id=?1",
+                [running.soul_id.as_str()],
+            )
+            .unwrap();
+        let after_identity = registry
+            .begin_input(
+                running.soul_id.clone(),
+                RequestId::new(),
+                b"input after native identity",
+                None,
+            )
+            .await;
+        assert!(
+            after_identity.is_err(),
+            "once native identity exists, the CAPABILITY_PENDING exception must close"
         );
     }
 
