@@ -14,6 +14,8 @@ export type ContextMenuProps = {
    *  overflow-y pair bounding a long list into a scrollable surface.
    *  Merged through the div's existing cn(...) after the base classes. */
   className?: string
+  /** Only menus opened from an existing modal should rise above that modal. */
+  aboveModal?: boolean
   /** Opt in to scrolling the keyboard-focused item into view inside the
    *  menu's OWN scroll box — for bounded, scrollable menus. Default false
    *  keeps the long-press provider's preventScroll dismissal-guard
@@ -25,7 +27,7 @@ export type ContextMenuProps = {
 }
 
 export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function ContextMenu(
-  { open, items, position, onClose, className, scrollFocusedItemIntoView = false },
+  { open, items, position, onClose, className, aboveModal = false, scrollFocusedItemIntoView = false },
   ref
 ) {
   const innerRef = useRef<HTMLDivElement | null>(null)
@@ -97,7 +99,7 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
       aria-orientation="vertical"
       className={cn(
         'fixed min-w-[200px] rounded-md border border-border bg-card shadow-lg py-1 select-none',
-        OVERLAY_Z.menu,
+        aboveModal ? OVERLAY_Z.modalMenu : OVERLAY_Z.menu,
         className,
       )}
       style={{

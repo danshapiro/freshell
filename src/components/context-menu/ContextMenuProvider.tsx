@@ -1558,6 +1558,7 @@ export function ContextMenuProvider({
       {children}
       <ContextMenu
         ref={menuRef}
+        aboveModal={!!menuState?.contextElement?.closest('.fresh-agent-diff-drawer-overlay')}
         open={!!menuState && menuItems.length > 0}
         items={menuItems}
         position={menuState?.position || { x: 0, y: 0 }}

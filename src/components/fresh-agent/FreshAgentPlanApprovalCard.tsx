@@ -46,6 +46,16 @@ export function FreshAgentPlanApprovalCard({
   const planFilePath = typeof input.planFilePath === 'string' ? input.planFilePath : null
   const answer = (choice: PlanApprovalChoice) => onRespond(buildPlanDecision(choice, feedback))
 
+  const planBody = (
+    <div className="fresh-agent-plan-body mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-3 py-2">
+      {plan ? (
+        <FreshAgentMarkdownBody text={plan} />
+      ) : (
+        <p className="text-muted-foreground">No plan text was provided. You can still approve it or keep planning.</p>
+      )}
+    </div>
+  )
+
   return (
     <div
       role="alert"
@@ -63,13 +73,12 @@ export function FreshAgentPlanApprovalCard({
           {planFilePath}
         </p>
       ) : null}
-      <div className="fresh-agent-plan-body mt-2 max-h-96 overflow-auto rounded border border-border/60 bg-background/70 px-3 py-2">
-        {plan ? (
-          <FreshAgentMarkdownBody text={plan} />
-        ) : (
-          <p className="text-muted-foreground">No plan text was provided. You can still approve it or keep planning.</p>
-        )}
-      </div>
+      {plan && (plan.length > 240 || plan.split('\n').length > 3) ? (
+        <details>
+          <summary>Plan details</summary>
+          {planBody}
+        </details>
+      ) : planBody}
 
       <div className="fresh-agent-plan-actions mt-2 flex flex-wrap gap-2">
         {APPROVALS.map(({ choice, label, primary }) => (

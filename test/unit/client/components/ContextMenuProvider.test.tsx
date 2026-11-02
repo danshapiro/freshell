@@ -15,6 +15,7 @@ import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
 import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 import sessionNamesReducer from '@/store/sessionNamesSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
+import { FreshAgentDiffPanel } from '@/components/fresh-agent/FreshAgentDiffPanel'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -778,6 +779,41 @@ describe('ContextMenuProvider', () => {
       generation: 1,
       owner: { kind: 'terminal', terminalId: 't-default', mode: 'claude' },
     })
+  })
+
+  it.each([true, false])('keeps Changes context menus above the dialog and handles nested Escape (session present: %s)', async (hasSession) => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div className="fresh-agent-pane" data-context="fresh-agent" data-tab-id="tab-1" data-pane-id="pane-1"
+        data-session-id={hasSession ? 'diff-session' : undefined} data-provider="codex" data-session-type="freshcodex">
+        <FreshAgentDiffPanel diffs={[{ id: 'native', title: 'Turn changes', diff: '+changed' }]} />
+      </div>,
+    )
+    await user.click(screen.getByRole('button', { name: /^Diffs:/ }))
+    await user.click(screen.getByRole('button', { name: 'Diff: Turn changes' }))
+    const line = screen.getByText('+changed')
+    fireEvent.contextMenu(line, { clientX: 100, clientY: 100 })
+    const menu = screen.getByRole('menu')
+    expect(menu).toHaveClass('z-[70]')
+    expect(menu).not.toHaveClass('z-50')
+    const portal = screen.getByRole('dialog').parentElement!
+    expect(portal).toHaveAttribute('data-tab-id', 'tab-1')
+    expect(portal).toHaveAttribute('data-pane-id', 'pane-1')
+    expect(portal).toHaveAttribute('data-provider', 'codex')
+    expect(portal).toHaveAttribute('data-session-type', 'freshcodex')
+    if (hasSession) expect(screen.getByRole('menuitem', { name: 'Copy session ID' })).toBeVisible()
+    else expect(screen.queryByRole('menuitem', { name: 'Copy session ID' })).toBeNull()
+    if (hasSession) {
+      await user.click(screen.getByRole('menuitem', { name: 'Copy session ID' }))
+      expect(clipboardMocks.copyText).toHaveBeenCalledWith('diff-session')
+      fireEvent.contextMenu(line, { clientX: 100, clientY: 100 })
+    }
+    await waitFor(() => expect(screen.getByRole('menu').contains(document.activeElement)).toBe(true))
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(screen.getByRole('dialog', { name: 'Changes' })).toBeVisible()
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
   it('does not emit selector instability warnings when feature flags are absent', () => {

@@ -487,7 +487,7 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
     expect(leafContent(store.getState()).createError).toBeUndefined()
     // the GLOBAL projection must not have minted an error-card entry either:
     expect(store.getState().freshAgent.pendingCreateFailures['req-1']).toBeUndefined()
-    expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
+    expect(document.querySelector('[data-agent-error="create"]')).toBeNull()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
@@ -522,7 +522,7 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
     expect(leafContent(store.getState()).sessionId).toBe(DURABLE)
     // council rule 8: SILENT attach -- no stale error card may survive the auto-resolve
     expect(store.getState().freshAgent.pendingCreateFailures).toEqual({})
-    expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
+    expect(document.querySelector('[data-agent-error="create"]')).toBeNull()
   })
 
   it('keeps the Freshcodex prompt and settings when preparation refuses the selected configuration', async () => {
@@ -543,6 +543,7 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
       receiveWsBoth({ type: 'freshAgent.create.failed', requestId: selected.createRequestId,
         code: 'INVALID_REQUEST', message, retryable: false })
       await flush()
+      fireEvent.click(screen.getByText('Agent could not start', { exact: true }))
       expect(screen.getByText(message)).toBeVisible()
       expect(leafContent(store.getState())).toEqual(expect.objectContaining({ ...selected, status: 'create-failed' }))
       expect(store.getState().freshAgent.pendingCreateFailures[selected.createRequestId]).toEqual({ code: 'INVALID_REQUEST', message, retryable: false })
@@ -578,7 +579,7 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
     })
     await flush()
     // suppressed: the transient reservation must not surface as "Agent error"
-    expect(screen.queryByText(/Agent error/i)).toBeNull()
+    expect(document.querySelector('[data-agent-error="session"]')).toBeNull()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
@@ -730,7 +731,7 @@ describe('FreshAgentView error-banner dismissal', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     await flush()
-    expect(screen.queryByText(/Agent error/)).toBeNull()
+    expect(document.querySelector('[data-agent-error="session"]')).toBeNull()
     expect(sessionInStore(store.getState(), DURABLE).lastError).toBeUndefined()
     expect(sessionInStore(store.getState(), DURABLE).lastErrorCode).toBeUndefined()
 
@@ -747,13 +748,13 @@ describe('FreshAgentView error-banner dismissal', () => {
 
     receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SPAWN_FAILED', message: 'spawn exploded', retryable: false })
     await flush()
-    expect(document.querySelector('.fresh-agent-error-card')).not.toBeNull()
+    expect(document.querySelector('[data-agent-error="create"]')).not.toBeNull()
     expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     await flush()
     expect(store.getState().freshAgent.pendingCreateFailures).toEqual({})
     expect(leafContent(store.getState()).createError).toBeUndefined()
-    expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
+    expect(document.querySelector('[data-agent-error="create"]')).toBeNull()
   })
 })
