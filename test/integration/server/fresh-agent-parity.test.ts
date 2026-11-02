@@ -702,7 +702,7 @@ tool_timeout_sec = 120
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
     await send('Question: Which managed environment? Answer: Staging.', { effort: null })
-    await waitFor('managed contextual answer at loopback model', () => model!.traffic.some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
+    await waitFor('managed contextual answer at loopback model', async () => (await model!.readTraffic()).some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
     await waitFor('managed contextual answer completion', async () => (await snapshot()).status === 'idle' ? true : undefined)
     const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
