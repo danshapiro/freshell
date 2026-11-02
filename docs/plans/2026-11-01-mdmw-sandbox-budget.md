@@ -7,11 +7,11 @@
 ## User Request
 
 ### Requested result
-Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build concurrency, preserve deliberate overrides, record effective limits and useful container/workload failure diagnostics without exposing secrets, and prove the behavior with launcher tests and an isolated cold supported-toolchain Clippy run.
+Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build concurrency, preserve deliberate overrides, record effective limits and useful container/workload failure diagnostics without exposing secrets, and prove the behavior with launcher tests and an isolated cold supported-toolchain Clippy run. Address the three required sandbox review findings and investigate and fix the Codex blockers preventing the full suite, then rerun verification.
 
 ### Explicit constraints
-- Follow the-usual workflow, including independent reviews.
-- Keep the change scoped to freshell#mdmw, separate from machine watchdog and Electron recovery changes.
+- Follow the-usual workflow, including independent reviews; the user explicitly authorized repairs after the passed delta review.
+- Keep the change scoped to freshell#mdmw and the Codex blockers preventing its verification, separate from machine watchdog and Electron recovery changes.
 - Work in a dedicated .worktrees worktree from the recorded base cbae31df487bc150c1d57ba93b63f18910ce5098; preserve unrelated changes and existing worktrees.
 - Use meaningful red/green/refactor tests and real integration/smoke evidence; never weaken coverage to pass.
 - Do not reproduce memory pressure or kill a user manager on garageserver; use an isolated disposable environment for cold-build acceptance with equivalent rootless Docker/systemd behavior.
@@ -19,8 +19,9 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 
 ### Accepted tradeoffs and residuals
 - The user approved proceeding from the recorded failing base for this scoped fix, with existing failures recorded separately. The full gate exited 1 despite passing cloud test verdicts; the failing phase remains unidentified, so later failures cannot be assumed pre-existing without evidence.
+- The user approved addressing the sandbox review findings and expanding the work to resolve the Codex blockers so verification can be rerun.
 
-**Goal:** Ordinary and managed-runtime sandbox launches use a real two-CPU, 8 GiB budget whose native Cargo default is two jobs, preserve deliberate Cargo configuration/environment/CLI overrides, and produce secret-safe effective-limit and failure receipts backed by launcher tests and isolated current-source cold Clippy evidence.
+**Goal:** Ordinary and managed-runtime sandbox launches use a real two-CPU, 8 GiB budget whose native Cargo default is two jobs, preserve deliberate Cargo configuration/environment/CLI overrides, and produce secret-safe effective-limit and failure receipts backed by launcher tests and isolated current-source cold Clippy evidence. Strengthen the identified sandbox tests and failure diagnostics, resolve Codex blockers without weakening their behavior coverage, and complete the full-suite verification.
 
 **Architecture:** Set the shared Docker CPU/memory/swap/PID budget once. Let Cargo derive its default from the enforced CPU quota, forwarding only a caller-supplied jobs environment value; add a dependency-free Node observer/JSONL receipt helper within the existing owned lifecycle. Preserve auto-removal and exact cleanup, prove the launcher through its strict Docker test enclosure, and perform real cold acceptance in one fresh bounded normal-rootless/systemd KVM guest.
 
@@ -36,7 +37,7 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 6. Historical two-job evidence is a reliable candidate only. Final-source ordinary/runtime scheduling and cold current-source resource/containment evidence remain mandatory. Attribute the canonical image's floating Cargo version separately from the explicitly pinned Rust/Clippy 1.96.0 payload.
 7. New metadata contains fixed events, JSON encoding, command SHA256, published full CID, allowlisted numeric/null settings, own cgroup controls, and true statuses. Never add command text, arbitrary environment, Config.Env/Config.Cmd, raw inspect output, or raw daemon errors to metadata. Keep original workload stdout/stderr separate. Unavailable OOM state stays null; exit 137 is not proof of OOM.
 8. Fixed-path controls describe the workload's own cgroup, not an invented minimum across invisible ancestors. Required acceptance independently verifies actual limits, delegation, normal namespace and relevant ancestor capacity. Unavailable fields are honest diagnostics but cannot replace numeric acceptance evidence.
-9. Never reproduce memory pressure on garageserver, kill a user manager, change host policy, deploy/restart production, or open a PR. No Electron, watchdog, provider, unrelated Rust/Clippy, or machine repair belongs to this task.
+9. Never reproduce memory pressure on garageserver, kill a user manager, change host policy, deploy/restart production, or open a PR. Codex changes are limited to resolving the failures blocking verification; no Electron recovery, watchdog, other provider, unrelated Rust/Clippy, or machine repair belongs to this task.
 10. Finite harmless fake-Docker RED/GREEN may run inside the repository's strict Docker enclosure on garageserver. Do not run its process-signal fixture directly on the host. Real cold acceptance and resource-failure observation use the disposable guest.
 11. Kata criterion 5 allows cold Clippy to complete within budget or fail its own sandbox with useful evidence while unrelated services remain healthy. Report a failed workload as failed, with graph coverage and limits of measurement. Setup failure, missing jobs/controls, lost evidence, or a driver protective stop is not automatic proof of product containment.
 12. The approved broad base gate exited 1 despite passing cloud shard verdicts; its failing phase/wrapper status remains unidentified. Later failures receive their own evidence and disposition; none is automatically pre-existing. Full-suite verification remains a separate gate.
