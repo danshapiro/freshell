@@ -7919,12 +7919,12 @@ pub(crate) mod tests {
         }
         assert!(!outcomes.contains_key(&addressable));
 
-        // An ownerless row is registry-level unexplained authority. It must
-        // prevent even an otherwise safe stopped soul from being called empty.
+        // A dangling admission reservation cannot be tied to one soul, so it
+        // prevents all no-runtime rows from claiming the registry is empty.
         let conn = Connection::open(&database_path).unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
-            "INSERT INTO native_origin_owners (provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES ('codex','store','root-without-owner',NULL,NULL,'owned',0)",
+            "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES ('missing-incarnation','default',1,1,1,0)",
             [],
         )
         .unwrap();
@@ -7937,12 +7937,34 @@ pub(crate) mod tests {
             .expect("safe soul remains represented");
         assert_eq!(safe_record.status, MaintenanceInventoryStatus::Unresolved);
 
-        // A dangling admission reservation cannot be tied to one soul, so it
-        // prevents all no-runtime rows from claiming the registry is empty.
+        let conn = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM admission_reservations WHERE incarnation_id='missing-incarnation'",
+                [],
+            )
+            .unwrap(),
+            1,
+            "the dangling reservation is removed before testing other registry-wide evidence"
+        );
+        drop(conn);
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let safe_record = snapshot
+            .no_runtime
+            .iter()
+            .find(|record| record.soul_id == safe_stopped)
+            .expect("safe soul remains represented");
+        assert_eq!(
+            safe_record.status,
+            MaintenanceInventoryStatus::VerifiedEmpty
+        );
+
+        // An ownerless row is registry-level unexplained authority. It must
+        // independently prevent a safe stopped soul from being called empty.
         let conn = Connection::open(&database_path).unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
-            "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES ('missing-incarnation','default',1,1,1,0)",
+            "INSERT INTO native_origin_owners (provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES ('codex','store','root-without-owner',NULL,NULL,'owned',0)",
             [],
         )
         .unwrap();
