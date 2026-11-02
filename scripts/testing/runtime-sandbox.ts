@@ -8001,13 +8001,32 @@ export class ManagedRuntimeOwner {
     return this.ownedDockerProbe(containerId, args, true)
   }
 
+  /** Observe only a receipt-owned container through a probe the owner can join. */
+  async ownedContainerInspection(containerId: string): Promise<any> {
+    const rows = JSON.parse(await this.trackedDockerProbe(containerId, ['inspect', containerId]))
+    if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.Id !== containerId) {
+      throw new Error('exact container inspection is unavailable or ambiguous')
+    }
+    return rows[0]
+  }
+
+  async ownedContainerRunning(containerId: string): Promise<boolean> {
+    const inspected = await this.ownedContainerInspection(containerId)
+    if (typeof inspected.State?.Running !== 'boolean') throw new Error('exact container running-state inspection is malformed')
+    return inspected.State.Running
+  }
+
+  async ownedContainerLogs(containerId: string): Promise<string> {
+    return (await this.trackedDockerProbe(containerId, ['logs', containerId], false, undefined, { includeStderr: true })).slice(-20_000)
+  }
+
   private async ownedDockerProbe(containerId: string, args: string[], providerUser: boolean): Promise<string> {
     return this.trackedDockerProbe(containerId, ['exec', ...(providerUser ? ['--user', '65534:0'] : []), containerId,
       'env', 'HOME=/home/freshell/provider', ...args])
   }
 
   private async trackedDockerProbe(containerId: string, args: string[], historyHelper = false,
-    historyDiagnostic?: ExactRuntimeHandle & { provider: string; helperName: string }): Promise<string> {
+    historyDiagnostic?: ExactRuntimeHandle & { provider: string; helperName: string }, options?: { includeStderr: boolean }): Promise<string> {
     if (!this.runtime.broker.receiptIds().has(containerId)
       && !this.runtime.transferOwnedIds().containers.includes(containerId)) throw new Error('exact owned provider probe container required')
     const probeId = randomUUID()
@@ -8044,7 +8063,7 @@ export class ManagedRuntimeOwner {
         }
         if (nativeHistoryDiagnostic) reject(new NativeHistoryProbeFailure(nativeHistoryDiagnostic))
         else if (error) reject(new Error('owned provider probe failed or timed out', { cause: error }))
-        else resolve(stdout)
+        else resolve(options?.includeStderr ? `${stdout}${stderr}` : stdout)
       })
     } catch (error) {
       this.providerProbes.delete(probeId)

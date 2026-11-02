@@ -131,7 +131,7 @@ export async function createCodexLocalProvider(handler, { port = 0 } = {}) {
 
 /** Run the model-wire fixture beside the actual managed provider, never on host localhost. */
 export async function startInManagedContext(rig, source) {
-  const { containerId, handlerSource, port = 51991 } = source
+  const { containerId, handlerSource, port = 51991, signal } = source
   assert.match(containerId, /^[a-f0-9]{64}$/)
   assert.equal(typeof handlerSource, 'string')
   assert(Number.isSafeInteger(port) && port > 1024 && port < 65536)
@@ -161,8 +161,9 @@ export async function startInManagedContext(rig, source) {
   // unique to this invocation, even if a previously recorded PID is reused.
   async function stop(ready, signal) {
     signal?.throwIfAborted()
-    if (!rig.runtime.isContainerRunning(containerId, true)) return
+    const running = await rig.ownedContainerRunning(containerId)
     signal?.throwIfAborted()
+    if (!running) return
     const pidCheck = Number.isSafeInteger(ready?.pid)
       ? `const p=Number(fs.readFileSync(${JSON.stringify(`${directory}/pid`)},'utf8'));if(p!==${ready.pid})throw Error('fixture PID changed');`
       : ''
@@ -182,30 +183,42 @@ export async function startInManagedContext(rig, source) {
 
   let ready
   try {
+    signal?.throwIfAborted()
     await rig.ownedProviderExec(containerId, ['node', '-e', `
       const fs=require('node:fs'),{spawn}=require('node:child_process');
       fs.mkdirSync(${JSON.stringify(directory)}, {recursive:true,mode:0o700});
       const log=fs.openSync(${JSON.stringify(`${directory}/stderr`)},'a',0o600);
       const child=spawn(process.execPath,['--input-type=module','-e',${JSON.stringify(code)}],{detached:true,stdio:['ignore','ignore',log]});
       fs.writeFileSync(${JSON.stringify(`${directory}/pid`)},String(child.pid));child.unref();`])
+    signal?.throwIfAborted()
     const deadline = Date.now() + 30_000
     while (!ready && Date.now() < deadline) {
+      signal?.throwIfAborted()
       ready = JSON.parse(await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(fs.existsSync(${JSON.stringify(readyPath)})?fs.readFileSync(${JSON.stringify(readyPath)},'utf8'):'null')`]))
+      signal?.throwIfAborted()
       if (!ready) await new Promise(resolve => setTimeout(resolve, 50))
     }
+    signal?.throwIfAborted()
     if (!ready) {
       let diagnostic = 'stderr unavailable'
       try {
         const stderr = await rig.ownedProviderExec(containerId, ['cat', `${directory}/stderr`])
+        signal?.throwIfAborted()
         diagnostic = `stderr ${Buffer.byteLength(stderr, 'utf8')} bytes`
-      } catch { /* The startup timeout remains the primary failure. */ }
+      } catch (error) {
+        if (signal?.aborted) throw error
+        // The startup timeout remains the primary failure.
+      }
       throw new Error(`managed Codex loopback fixture did not start (${diagnostic})`)
     }
     assert.equal(ready.uid, 65534)
     assert.equal(ready.gid, 0)
     assert(Number.isSafeInteger(ready.pid) && ready.pid > 1, 'managed Codex fixture reported an invalid PID')
   } catch (error) {
-    try { await stop(ready) }
+    // The runtime owner will settle a cancelled startup. Starting another
+    // owned probe here would race its teardown snapshot.
+    if (signal?.aborted) throw error
+    try { await stop(ready, signal) }
     catch (cleanupError) {
       throw new AggregateError([error, cleanupError], 'managed Codex loopback fixture startup failed and cleanup was not confirmed')
     }
@@ -216,7 +229,9 @@ export async function startInManagedContext(rig, source) {
     context: ready,
     async traffic() {
       const text = await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=${JSON.stringify(trafficPath)};process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'')`])
-      return text.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line))
+      const lines = text.split(/\r?\n/)
+      lines.pop() // An unterminated final fragment is still being written.
+      return lines.filter(line => line.trim()).map(line => JSON.parse(line))
     },
     async stop(signal) { await stop(ready, signal) },
   }

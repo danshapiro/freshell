@@ -47,8 +47,8 @@ function fixture() {
     home: '/virtual/home',
   }
   const dependencies = {
-    captureVolumes: vi.fn((_owners: unknown[]) => { order.push('capture'); return captured }),
-    removeVolumes: vi.fn((_volumes: unknown[]) => { order.push('volumes'); return ['owned-volume'] }),
+    captureVolumes: vi.fn((_owners: unknown[], _budgetMs?: number) => { order.push('capture'); return captured }),
+    removeVolumes: vi.fn((_volumes: unknown[], _budgetMs?: number) => { order.push('volumes'); return ['owned-volume'] }),
     removeDirectory: vi.fn((directory: string) => { order.push(directory) }),
   }
   return { order, rig, resources, dependencies, owners, captured }
@@ -79,8 +79,10 @@ it('awaits both failed closes and still stops the owned runtime, preserving both
   const error = await observed
   expect(nestedErrors(error)).toEqual(expect.arrayContaining([wireFailure, modelFailure]))
   expect(f.rig.stop).toHaveBeenCalledOnce()
-  expect(f.dependencies.captureVolumes).toHaveBeenCalledExactlyOnceWith(f.owners)
-  expect(f.dependencies.removeVolumes).toHaveBeenCalledExactlyOnceWith(f.captured)
+  expect(f.dependencies.captureVolumes).toHaveBeenCalledOnce()
+  expect(f.dependencies.captureVolumes.mock.calls[0][0]).toEqual(f.owners)
+  expect(f.dependencies.removeVolumes).toHaveBeenCalledOnce()
+  expect(f.dependencies.removeVolumes.mock.calls[0][0]).toEqual(f.captured)
   expect(f.order.indexOf('capture')).toBeLessThan(f.order.indexOf('runtime'))
   expect(f.order.indexOf('runtime')).toBeLessThan(f.order.indexOf('volumes'))
   expect(f.resources.restoreGrants).toHaveBeenCalledOnce()
@@ -172,6 +174,73 @@ it.each(['final observation', 'fixture stop'])(
       workFinishing.resolve()
       runtimeFinishing.resolve()
       await flushMicrotasks()
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  },
+)
+
+it.each(['confirmed', 'unconfirmed'])(
+  'settles cleanup within the hook after a finite slow volume capture (%s owner)', async ownerOutcome => {
+    vi.useFakeTimers()
+    const f = fixture()
+    const observation = deferred()
+    const startedAt = Date.now()
+    let observationSettled = false
+    let ownerSettled = false
+    let removedPrematurely = false
+    let cleanupFinishedAt: number | undefined
+    const captureFailure = new Error('controlled volume capture exceeded its time budget')
+    // Model the three finite Docker calls in volume capture consuming their
+    // individual 120-second timeouts without allocating, sleeping, or Docker.
+    f.dependencies.captureVolumes.mockImplementation((_owners, budgetMs = 3 * 120_000) => {
+      f.order.push('capture')
+      const spent = Math.min(3 * 120_000, budgetMs)
+      vi.setSystemTime(Date.now() + spent)
+      if (spent < 3 * 120_000) throw captureFailure
+      return f.captured
+    })
+    f.resources.finalObservation.mockImplementation(async () => {
+      await observation.promise
+      observationSettled = true
+      return { state: 'final' }
+    })
+    f.rig.stop.mockImplementation(async () => {
+      f.order.push('runtime')
+      observation.resolve()
+      await flushMicrotasks()
+      // Model a separate finite owner settlement: a 120-second native capture,
+      // the existing 90-second broker drain, and 30 seconds of further cleanup.
+      vi.setSystemTime(Date.now() + 240_000)
+      ownerSettled = true
+      return ownerOutcome === 'confirmed'
+        ? { ok: true, errors: [] }
+        : { ok: false, errors: ['runtime ownership settlement failed'] }
+    })
+    f.dependencies.removeVolumes.mockImplementation(() => {
+      removedPrematurely ||= !ownerSettled || !observationSettled
+      return []
+    })
+    const observed = cleanupManagedCodexParity(f.resources, f.dependencies)
+      .then(() => { cleanupFinishedAt = Date.now(); return undefined }, error => { cleanupFinishedAt = Date.now(); return error })
+    try {
+      await flushMicrotasks()
+      await vi.advanceTimersByTimeAsync(30_000)
+      const result = await observed
+      expect(cleanupFinishedAt).toBeDefined()
+      expect(cleanupFinishedAt! - startedAt).toBeLessThanOrEqual(600_000)
+      expect(ownerSettled).toBe(true)
+      expect(observationSettled).toBe(true)
+      expect(removedPrematurely).toBe(false)
+      expect(nestedErrors(result).map(String).join(' ')).toContain('grace period')
+      expect(nestedErrors(result)).toContain(captureFailure)
+      expect(f.dependencies.removeVolumes).not.toHaveBeenCalled()
+      if (ownerOutcome === 'unconfirmed') {
+        expect(nestedErrors(result).map(String).join(' ')).toContain('runtime ownership settlement failed')
+        expect(f.dependencies.removeDirectory).not.toHaveBeenCalled()
+      }
+    } finally {
+      observation.resolve()
       vi.clearAllTimers()
       vi.useRealTimers()
     }

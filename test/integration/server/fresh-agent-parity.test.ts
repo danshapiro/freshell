@@ -19,7 +19,7 @@ import type { InitialProviderVolumeAuthorization } from '../../../scripts/testin
 // @ts-expect-error The native model-wire fixture is also used by the offline Node runner.
 import { startInManagedContext } from '../providers/codex-local-provider.mjs'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
-import { cleanupManagedCodexParity, collectManagedCodexProviderDiagnostics } from '../../helpers/codex-managed-cleanup.js'
+import { cleanupManagedCodexParity, collectManagedCodexProviderDiagnostics, createManagedCodexFixtureWork, readManagedCodexFixtureTraffic } from '../../helpers/codex-managed-cleanup.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -413,6 +413,7 @@ describe('installed Codex through the managed gateway and durable actor', () => 
   let naming: http.Server
   let retainedModelTraffic: any[] = []
   let finalObservation: ((signal: AbortSignal) => Promise<unknown>) | undefined
+  const fixtureWork = createManagedCodexFixtureWork()
   const namingRequests: string[] = []
   const owners: InitialProviderVolumeAuthorization[] = []
 
@@ -503,7 +504,7 @@ tool_timeout_sec = 120
 
   // The owner can also need time to settle native captures and drain its broker.
   afterAll(() => cleanupManagedCodexParity({
-    rig, owners, wire, model, finalObservation, naming, restoreGrants,
+    rig, owners, wire, model, fixtureWork, finalObservation, naming, restoreGrants,
     grantsDirectory: grants?.directory, home,
   }), 600_000)
 
@@ -571,7 +572,10 @@ tool_timeout_sec = 120
       if(prompt.includes('MANAGED_RECOVERY_SECOND'))return{text:'Managed recovery second answer.'};
       return {text:prompt.includes('ASYNC_QUESTION')?'Managed work continued before the answer.':prompt.includes('AWAITED_PLAN')?'Managed awaited answer completed.':'Managed native final answer.'};
     }`
-    model = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource })
+    const initialModel = await fixtureWork.run(signal => startInManagedContext(rig, { containerId: providerContainerId, handlerSource, signal }))
+    fixtureWork.throwIfAborted()
+    model = initialModel
+    const readModelTraffic = () => readManagedCodexFixtureTraffic(fixtureWork, model!)
     expect(model.context).toMatchObject({ uid: 65534, gid: 0 })
     const headers = { 'x-auth-token': rig.info.token }
     const observationReadTraffic: { route: string; requestedAt: number; completedAt: number; status: number; retryAfter: string | null }[] = []
@@ -619,12 +623,24 @@ tool_timeout_sec = 120
       if (!inventory || inventory.kind !== 'inventory') throw new Error('managed Codex final inventory is unavailable')
       const currentViews = inventory.data
       signal.throwIfAborted()
-      const hostDiagnostics = [...rig.runtime.broker.receiptIds()].map(containerId => {
+      const hostDiagnostics: { containerId: string; state: unknown; logs: string }[] = []
+      for (const containerId of rig.runtime.broker.receiptIds()) {
         let state: unknown
-        try { const inspected = rig.runtime.inspectContainer(containerId); state = inspected.State }
-        catch (error) { state = { error: String(error) } }
-        return { containerId, state, logs: rig.runtime.containerLogs(containerId).slice(-64 * 1024) }
-      })
+        try { const inspected = await rig.ownedContainerInspection(containerId); state = inspected.State }
+        catch (error) {
+          if (signal.aborted) throw error
+          state = { error: String(error) }
+        }
+        signal.throwIfAborted()
+        let logs: string
+        try { logs = await rig.ownedContainerLogs(containerId) }
+        catch (error) {
+          if (signal.aborted) throw error
+          logs = `container logs unavailable: ${String(error)}`
+        }
+        signal.throwIfAborted()
+        hostDiagnostics.push({ containerId, state, logs })
+      }
       signal.throwIfAborted()
       const { nativeFiles, traffic } = await collectManagedCodexProviderDiagnostics(
         signal,
@@ -668,7 +684,9 @@ tool_timeout_sec = 120
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed native final answer.') ? value : undefined
     })
     expect(saved.settings).toMatchObject({ model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted', cwd: workspace })
-    expect((await model.traffic())[0].body.reasoning.effort).toBe('xhigh')
+    const firstModelTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
+    expect(firstModelTraffic[0].body.reasoning.effort).toBe('xhigh')
     await send('AWAITED_PLAN', { collaborationMode: 'plan' })
     const pending = await waitFor('managed native awaited Plan control', async () => {
       const value = await snapshot()
@@ -759,8 +777,10 @@ tool_timeout_sec = 120
       process.stdout.write(JSON.stringify({uid:process.getuid(),root:{uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8)},readError}));`]))
     expect(hostMetadataAccess).toMatchObject({ uid: 0, root: { uid: 65534, mode: '700' }, readError: 'EACCES' })
     expect(nativeMetadata.headers).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'session_meta', id: view.nativeSessionId })]))
+    const beforeNamingTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
     rig.runtime.writeIncident('freshcodex-managed-native-before-naming', { created, view, nativeContext, nativeMetadata, fixtureContext: model.context, saved, asyncSnapshot,
-      hostMetadataAccess, traffic: await model.traffic(), final: await snapshot() })
+      hostMetadataAccess, traffic: beforeNamingTraffic, final: await snapshot() })
     const durableName = await waitFor('managed native durable shared name', async () => {
       const record = await readName()
       return record?.ref?.sessionId === view.nativeSessionId ? record : undefined
@@ -791,8 +811,10 @@ tool_timeout_sec = 120
       const observation = await readNativeName()
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
     }, 15_000)
+    const journeyTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
     rig.runtime.writeIncident('freshcodex-managed-native-journey', { created, view, nativeContext, context: model.context,
-      traffic: await model.traffic(), saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
+      traffic: journeyTraffic, saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
 
     const approval = async (decision: 'accept' | 'cancel', threadId = view.nativeSessionId) => {
       const pending = await waitFor('actual managed native approval', async () => {
@@ -835,7 +857,9 @@ tool_timeout_sec = 120
         // Native0.164 can return a failed unifiedExec result to the model
         // without persisting a commandExecution history item. Read the real
         // native tool result, never the fixture's repeated assistant phrase.
-        const command = (await model.traffic()).flatMap((row: any) => row.body?.input ?? [])
+        const traffic = await readModelTraffic()
+        fixtureWork.throwIfAborted()
+        const command = traffic.flatMap((row: any) => row.body?.input ?? [])
           .filter((item: any) => item.type === 'function_call_output' && item.call_id === 'call_effect_readonly').at(-1)
         expect(command?.output).toMatch(/Process exited with code [1-9][0-9]*/)
         expect(command?.output).toContain('Output:\n65534\n')
@@ -907,30 +931,64 @@ tool_timeout_sec = 120
     rig.runtime.writeIncident('freshcodex-managed-native-durable-child', { registered, childControl, childResponse, childSaved, parent: await snapshot() })
     const beforeRestart = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(), name: await readName() }
     expect(beforeRestart.name).toEqual(canonicalName)
-    const previousTraffic = await model.traffic()
+    const previousTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
     retainedModelTraffic = previousTraffic
     rig.runtime.writeIncident('freshcodex-managed-native-before-host-restart', { beforeRestart, canonicalName, effects, mcpResults, registered, childControl, childResponse, childSaved, traffic: previousTraffic })
-    await model.stop()
-    model = undefined
-    rig.runtime.restartOwnedRuntimeExact(providerContainerId)
-    const restarted = await waitFor('ordinary same-conversation host recovery readiness', async () => {
-      const current = await rig.runningViewForFreshSession(created.sessionId)
-      const diagnostics = [...rig.runtime.broker.receiptIds()].map(containerId => ({ containerId,
-        logs: rig.runtime.containerLogs(containerId).slice(-32 * 1024) }))
-      rig.runtime.writeIncident('freshcodex-managed-native-host-restart-status', { current, diagnostics, ownedHostEvidence: ownedHostEvidence() })
-      if (!current?.containerId || !current.hostBootId
-        || current.hostBootId === beforeRestart.view!.hostBootId
-        || !rig.runtime.isContainerRunning(current.containerId)) return undefined
-      providerContainerId = current.containerId
-      try {
-        const context = await inspectNativeContext()
-        expect(context).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
-        const value = await snapshot()
-        return value.threadId === view.nativeSessionId && value.status !== 'unavailable' ? current : undefined
-      } catch { return undefined }
+    const restarted = await fixtureWork.run(async signal => {
+      await model!.stop(signal)
+      signal.throwIfAborted()
+      model = undefined
+      rig.runtime.restartOwnedRuntimeExact(providerContainerId)
+      signal.throwIfAborted()
+      const currentHost = await waitFor('ordinary same-conversation host recovery readiness', async () => {
+        signal.throwIfAborted()
+        const current = await rig.runningViewForFreshSession(created.sessionId)
+        signal.throwIfAborted()
+        const diagnostics: { containerId: string; logs: string }[] = []
+        for (const containerId of rig.runtime.broker.receiptIds()) {
+          let logs: string
+          try { logs = await rig.ownedContainerLogs(containerId) }
+          catch (error) {
+            if (signal.aborted) throw error
+            logs = `container logs unavailable: ${String(error)}`
+          }
+          signal.throwIfAborted()
+          diagnostics.push({ containerId, logs })
+        }
+        rig.runtime.writeIncident('freshcodex-managed-native-host-restart-status', { current, diagnostics, ownedHostEvidence: ownedHostEvidence() })
+        if (!current?.containerId || !current.hostBootId
+          || current.hostBootId === beforeRestart.view!.hostBootId) return undefined
+        let running: boolean
+        try { running = await rig.ownedContainerRunning(current.containerId) }
+        catch (error) {
+          if (signal.aborted) throw error
+          return undefined
+        }
+        signal.throwIfAborted()
+        if (!running) return undefined
+        providerContainerId = current.containerId
+        try {
+          const context = await inspectNativeContext()
+          signal.throwIfAborted()
+          expect(context).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
+          const value = await snapshot(signal)
+          signal.throwIfAborted()
+          return value.threadId === view.nativeSessionId && value.status !== 'unavailable' ? current : undefined
+        } catch (error) {
+          if (signal.aborted) throw error
+          return undefined
+        }
+      })
+      signal.throwIfAborted()
+      const nextModel = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource, signal })
+      signal.throwIfAborted()
+      model = nextModel
+      return currentHost
     })
+    fixtureWork.throwIfAborted()
     expect(restarted.nativeSessionId).toBe(view.nativeSessionId)
-    model = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource })
+    if (!model) throw new Error('managed Codex fixture did not restart')
     await send('MANAGED_AFTER_HOST_RESTART')
     const afterRestart = await waitFor('same-conversation restarted send saved', async () => {
       const value = await snapshot()
@@ -940,9 +998,13 @@ tool_timeout_sec = 120
     expect(afterRestart.threadId).toBe(view.nativeSessionId)
     expect(JSON.stringify(afterRestart.turns)).toContain('MANAGED_NATIVE_FIRST')
     expect(await readName()).toEqual(canonicalName)
-    expect((await model.traffic()).filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
+    const postRestartTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
+    expect(postRestartTraffic.filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
+    const restartIncidentTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
     rig.runtime.writeIncident('freshcodex-managed-native-tools-restart', { created, nativeContext, canonicalName, effects, mcpResults,
-      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: await model.traffic(), finalName: await readName() })
+      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: restartIncidentTraffic, finalName: await readName() })
 
     const recoveryCwd = path.join(workspace, 'recovery-cwd')
     fs.mkdirSync(recoveryCwd)
@@ -956,7 +1018,8 @@ tool_timeout_sec = 120
     expect(recoverySettings).toMatchObject({ cwd: recoveryCwd, model: 'contract-model', effort: 'xhigh',
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
-      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.traffic()).length }
+      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await readModelTraffic()).length }
+    fixtureWork.throwIfAborted()
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
     // Kill only this receipt-owned, inspected release native PID. Archive its
@@ -990,8 +1053,10 @@ tool_timeout_sec = 120
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
+    const recoveryTraffic = await readModelTraffic()
+    fixtureWork.throwIfAborted()
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: (await model.traffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
+      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: recoveryTraffic.slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
@@ -1040,7 +1105,8 @@ tool_timeout_sec = 120
     const capture = await recoveredCapture.text()
     expect(capture).toContain('Managed recovery second answer.')
     expect(capture).not.toContain('MANAGED_NATIVE_FIRST')
-    const newTraffic = (await model.traffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
+    const newTraffic = (await readModelTraffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
+    fixtureWork.throwIfAborted()
     expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
     expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
     expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
