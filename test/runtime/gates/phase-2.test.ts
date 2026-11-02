@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 
 import {
   newRequest,
@@ -621,15 +622,30 @@ async function observeOomQuietInterval(
   workload: string,
 ): Promise<void> {
   const startedAt = Date.now()
-  const deadline = startedAt + 30_000
+  const intervalDeadline = startedAt + 30_000
+  const completionDeadline = startedAt + 45_000
+  const maxSampleDurationMs = 10_000
   const samples: any[] = []
-  while (Date.now() < deadline) {
-    const inspected = h.inspectContainer(runtime.containerId)
+
+  const remainingMs = (deadline: number, operation: string): number => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) throw new Error(`${workload} OOM quiet interval exceeded its deadline during ${operation}`)
+    return remaining
+  }
+
+  const captureSample = async (): Promise<any> => {
+    const sampleStartedAtMs = Date.now()
+    const sampleDeadline = Math.min(completionDeadline, sampleStartedAtMs + maxSampleDurationMs)
+    const inspected = inspectOwnedOomContainerBeforeDeadline(h, runtime.containerId, sampleDeadline)
+    remainingMs(sampleDeadline, 'Docker inspection')
     const hostPath = path.join(h.runtimeDir(supervisor, runtime.incarnationId), 'host-state.json')
-    const rawHost = JSON.parse(fs.readFileSync(hostPath, 'utf8'))
-    const inventory = await readInventorySoul(h, supervisor, runtime.soulId)
+    const rawHost = JSON.parse((await readFileBeforeDeadline(hostPath, sampleDeadline)).toString('utf8'))
+    remainingMs(sampleDeadline, 'host-state read')
+    const inventory = await readInventorySoul(h, supervisor, runtime.soulId, remainingMs(sampleDeadline, 'registry read'))
+    remainingMs(sampleDeadline, 'registry read')
     const receipts = h.broker.receipts().filter((receipt) => receipt.soulId === runtime.soulId)
-    const lifecycleEvents = readSupervisorLifecycleAfter(baseline.lifecyclePath, baseline.lifecycleOffset)
+    const lifecycleEvents = await readSupervisorLifecycleAfterBeforeDeadline(
+      baseline.lifecyclePath, baseline.lifecycleOffset, sampleDeadline)
     const sameSoulEvents = lifecycleEvents.filter((row: any) => row?.data?.soulId === runtime.soulId)
     const restartEvents = sameSoulEvents.filter((row: any) =>
       row.event === 'supervisor.launch_running' || row.event === 'supervisor.runtime_observer.recovery_scheduled')
@@ -639,6 +655,8 @@ async function observeOomQuietInterval(
     }
     const sample = {
       at: new Date().toISOString(),
+      sampleStartedAtMs,
+      sampleCompletedAtMs: Date.now(),
       docker: { id: inspected.Id, running: inspected.State?.Running,
         restartCount: inspected.State?.RestartCount, restartPolicy },
       host: { hostBootId: rawHost.hostBootId, workerLaunchCount: rawHost.workerLaunchCount },
@@ -662,26 +680,103 @@ async function observeOomQuietInterval(
       && receipts.length === 1 && receipts[0].incarnationId === runtime.incarnationId
       && receipts[0].containerId === runtime.containerId && restartEvents.length === 0
     samples.push({ ...sample, stable })
+    remainingMs(sampleDeadline, 'sample completion')
     if (!stable) {
       h.assert('P2-G06', false, `${workload} OOM runtime changed during the 30-second quiet interval`,
         { workload, identity: runtime, baseline, sample })
     }
-    const remaining = deadline - Date.now()
+    return samples.at(-1)
+  }
+
+  while (Date.now() < intervalDeadline) {
+    await captureSample()
+    const remaining = intervalDeadline - Date.now()
     if (remaining > 0) await sleep(Math.min(1_000, remaining))
   }
-  const durationMs = Date.now() - startedAt
-  const lifecycleEvents = readSupervisorLifecycleAfter(baseline.lifecyclePath, baseline.lifecycleOffset)
+
+  const untilBoundary = intervalDeadline - Date.now()
+  if (untilBoundary > 0) await sleep(untilBoundary)
+  const finalSample = await captureSample()
+  if (finalSample.sampleStartedAtMs < intervalDeadline) {
+    throw new Error(`${workload} OOM final exact state sample began before the 30-second boundary`)
+  }
+
+  const lifecycleEvents = await readSupervisorLifecycleAfterBeforeDeadline(
+    baseline.lifecyclePath, baseline.lifecycleOffset, completionDeadline)
   const sameSoulEvents = lifecycleEvents.filter((row: any) => row?.data?.soulId === runtime.soulId)
   const restartEvents = sameSoulEvents.filter((row: any) =>
     row.event === 'supervisor.launch_running' || row.event === 'supervisor.runtime_observer.recovery_scheduled')
+  const durationMs = Date.now() - startedAt
   const evidence = { workload, identity: runtime, durationMs, expectedDurationMs: 30_000,
-    sampleCount: samples.length, restartPolicy: baseline.restartPolicy,
+    maximumDurationMs: completionDeadline - startedAt, finalSample, sampleCount: samples.length,
+    restartPolicy: baseline.restartPolicy,
     restartCount: baseline.restartCount, workerLaunchCount: baseline.hostState.workerLaunchCount,
     sameSoulLifecycleEvents: sameSoulEvents, restartEvents, samples }
-  h.assert('P2-G06', durationMs >= 30_000 && samples.length > 0
+  h.assert('P2-G06', durationMs >= 30_000 && durationMs <= completionDeadline - startedAt
+    && finalSample.sampleStartedAtMs >= intervalDeadline
     && samples.every((sample) => sample.stable) && restartEvents.length === 0,
-  `${workload} OOM has a stable 30-second identity and lifecycle quiet interval`, evidence)
+  `${workload} OOM has a stable, bounded 30-second identity and lifecycle quiet interval`, evidence)
   h.recordLifecycle('p2.g06.oom.quiet_interval_passed', evidence)
+}
+
+function inspectOwnedOomContainerBeforeDeadline(
+  h: RuntimeHarness,
+  containerId: string,
+  deadline: number,
+): any {
+  if (!/^[a-f0-9]{64}$/.test(containerId) || !h.broker.receiptIds().has(containerId)) {
+    throw new Error(`refusing bounded inspection of unowned OOM runtime ${containerId}`)
+  }
+  const timeout = deadline - Date.now()
+  if (timeout <= 0) throw new Error('OOM runtime inspection deadline expired before Docker inspect')
+  const result = spawnSync('docker', ['inspect', containerId], {
+    encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  if (result.error) throw new Error(`bounded Docker inspect failed for ${containerId}: ${result.error.message}`)
+  if (result.status !== 0) {
+    throw new Error(`bounded Docker inspect failed for ${containerId}: ${result.stderr || `exit ${result.status}`}`)
+  }
+  const rows = JSON.parse(result.stdout)
+  if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.Id !== containerId) {
+    throw new Error(`bounded Docker inspect returned a different OOM runtime identity for ${containerId}`)
+  }
+  if (Date.now() > deadline) throw new Error(`bounded Docker inspect overran its deadline for ${containerId}`)
+  return rows[0]
+}
+
+async function readFileBeforeDeadline(file: string, deadline: number): Promise<Buffer> {
+  const timeoutMs = deadline - Date.now()
+  if (timeoutMs <= 0) throw new Error(`quiet-interval file read deadline expired: ${file}`)
+  let timer: NodeJS.Timeout | undefined
+  const controller = new AbortController()
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort()
+        reject(new Error(`quiet-interval file read timed out: ${file}`))
+      }, timeoutMs)
+      timer.unref?.()
+    })
+    const content = await Promise.race([fs.promises.readFile(file, { signal: controller.signal }), timeout])
+    if (Date.now() > deadline) throw new Error(`quiet-interval file read overran its deadline: ${file}`)
+    return content
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function readSupervisorLifecycleAfterBeforeDeadline(
+  file: string,
+  byteOffset: number,
+  deadline: number,
+): Promise<any[]> {
+  const content = await readFileBeforeDeadline(file, deadline)
+  if (content.byteLength < byteOffset) throw new Error(`supervisor lifecycle log shrank during OOM proof: ${file}`)
+  const suffix = content.subarray(byteOffset).toString('utf8')
+  const rows = !suffix.trim() ? [] : suffix.trimEnd().split(/\r?\n/).map((line) => JSON.parse(line))
+  if (Date.now() > deadline) throw new Error(`supervisor lifecycle scan overran its deadline: ${file}`)
+  return rows
 }
 
 async function stopManagedRuntimeWithEvidence(
@@ -770,12 +865,18 @@ function assertExactRuntimeAbsentAfterStop(
   }
 }
 
-async function readInventorySoul(h: RuntimeHarness, supervisor: SupervisorInstance, soulId: string): Promise<{
+async function readInventorySoul(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  soulId: string,
+  timeoutMs?: number,
+): Promise<{
   snapshot: any
   rows: any[]
   view: any
 }> {
-  const snapshot = dataOf(await h.adminOk(supervisor, h.inventorySnapshotBody()), 'inventory_snapshot')
+  const options = timeoutMs === undefined ? {} : { timeoutMs }
+  const snapshot = dataOf(await h.adminOk(supervisor, h.inventorySnapshotBody(), options), 'inventory_snapshot')
   const rows = snapshot.souls.filter((row: any) => row.soulId === soulId)
   return { snapshot, rows, view: rows.at(-1) }
 }
