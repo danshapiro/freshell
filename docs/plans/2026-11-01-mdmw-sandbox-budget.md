@@ -14,6 +14,7 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 - Keep the change scoped to freshell#mdmw and the Codex blockers preventing its verification, separate from machine watchdog and Electron recovery changes.
 - Work in a dedicated .worktrees worktree from the recorded base cbae31df487bc150c1d57ba93b63f18910ce5098; preserve unrelated changes and existing worktrees.
 - Use meaningful red/green/refactor tests and real integration/smoke evidence; never weaken coverage to pass.
+- On garageserver, store agent-created files only on the /home filesystem (including /tmp); if it lacks space, report the problem rather than using another filesystem.
 - Do not reproduce memory pressure or kill a user manager on garageserver; use an isolated disposable environment for cold-build acceptance with equivalent rootless Docker/systemd behavior.
 - Do not deploy, restart production, change host policy, or create a PR without the user's explicit approval; commit focused completed work.
 
@@ -262,6 +263,8 @@ No PR or deployment is authorized. Prepare the clean committed result and ask fo
 The user approved repairing the three required findings after the passed delta review and expanding this work to the Codex failures blocking the full suite. The earlier pass and its unresolved findings remain recorded; fresh task reviews, a review of the cumulative repairs and an independent review of the resulting complete delta are required. The exact failed gate, its skipped cases and unrun phases remain historical evidence, not a pass.
 
 Before allocating a test environment, use the ongoing read-only storage audit to choose evidence-based disk and memory admission, bounded resource use, monitoring and exact cleanup appropriate to that command. The earlier 120 GiB stop applied to a large guest and is not automatically a suitable bound for a tiny test; never silently ignore it or consume another task's reserve. A guest must not outlive its only resource guard when an agent or tool session ends. No host-policy changes, shared-cache deletion, extra worktree or workspace copy, production restart, or broad process kill is permitted. The process-signal and container-restart paths require a qualified disposable isolation boundary with its own daemon; ordinary finite behavioral tests use the repository-supported strict sandbox when applicable.
+
+On garageserver, put all newly generated test, temporary, cache, log and guard files on the `/home` filesystem, including private writable paths used by a container; do not use root-backed storage or tmpfs for those files. Verify the backing filesystem before releasing a test, and report insufficient space instead of moving files elsewhere. Preserve the actual historical execution evidence without relabeling it.
 
 ### Task 3: Close the sandbox test and diagnostic findings
 
