@@ -828,7 +828,7 @@ tool_timeout_sec = 120
           && wire.frames.slice(frameCursor).some(frame => {
             const event = frame.type === 'freshAgent.event' ? frame.event : frame
             const nativeTurn = value.turns.find((turn: any) => turn.role === 'user' && turn.items?.some((item: any) => item.text === 'MANAGED_EFFECT_'+choice))?.nativeTurnId
-            return event.type === 'freshAgent.transcript.patch' && event.sessionId === created.sessionId
+            return event.type === 'freshAgent.transcript.patch' && event.sessionId === view.nativeSessionId
               && event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurn && ['completed', 'interrupted', 'failed'].includes(op.status))
           })
           && (choice === 'DECLINE' || JSON.stringify(value.turns).includes('Managed '+file+' result:')) ? value : undefined
