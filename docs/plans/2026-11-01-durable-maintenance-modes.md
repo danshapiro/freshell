@@ -18,12 +18,14 @@ Implement the three managed-runtime update modes: default updates the web/client
 - If `FRESHELL_MANAGED_RUNTIME_V1=1` is requested but the server binary lacks the compile-time `managed-runtime-v1` feature, fail startup with a useful error. Supported deployment paths must detect and refuse binaries that would disable requested managed-runtime support.
 - Before an updater reports success, verify the authenticated runtime API is ready and connected to the intended supervisor. Generic HTTP health and a successful socket connection alone are insufficient evidence.
 - Integration/browser tests must create agents through ordinary UI paths for supported terminal and Fresh Agent modes, verify managed runtime identities, and confirm the same managed sessions remain attached across a web-only update.
+- Keep provider coverage scoped to the provider-free OpenCode terminal and `freshcodex` fixtures; skip Amplifier and Kilroy, and do not block this work on Claude authentication or external model calls.
 - Detect and report open panes whose agents are still host-managed outside durable souls. Preserve their running work; any migration that can interrupt them must be a separate deliberate operation.
 - Use the-usual workflow. Fix the pre-existing baseline compile failure in the dedicated worktree before continuing implementation.
 - Do not deploy or restart live production services as part of this code change.
 
 ### Accepted tradeoffs and residuals
 - An approved update may interrupt active coding sessions; saved history remains and reopening is attempted, but recovery is not guaranteed. Manually reopening or porting sessions afterward is acceptable if needed.
+- Do not require a particular session-transition mechanism for approved resets beyond attempting reopen; manual session porting afterward is acceptable.
 - Existing host-managed agents may remain outside durable-soul protection until a separate deliberate migration is authorized; preserve their running work during this task.
 
 ## Deployment and host-pane safety decisions
@@ -115,7 +117,7 @@ The Stage 2 ledger and evidence are in /home/dan/code/freshell/.worktrees/.the-u
 - Task 3 initially owns updater orchestration: `scripts/update-managed-runtime.ts`, the `package.json` script entry, and `test/unit/tooling/managed-runtime-update.test.ts`; the later, sequential Task 5 adds the newly requested deployment/readiness checks to the same updater files.
 - Task 4 owns server build protection, authenticated readiness, and live-pane ownership reporting: `crates/freshell-server/src/main.rs`, `crates/freshell-server/src/managed_runtime_api.rs`, the narrow pane-layout seam in `crates/freshell-freshagent/src/layout_store.rs` if required, and the corresponding server/layout behavior tests.
 - Task 5 owns updater verification and supported deployment preflight: `scripts/update-managed-runtime.ts`, `test/unit/tooling/managed-runtime-update.test.ts`, `scripts/launch-rust.sh`, and its deployment behavior tests.
-- Task 6 owns fixture, systemd, operator guidance, and UI routing coverage: `scripts/testing/runtime-sandbox.ts`, `test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts`, `installers/systemd/freshell-rust.service.d/managed-runtime.conf`, `AGENTS.md`, `scripts/prebuild-guard.ts`, `test/unit/tooling/prebuild-guard.test.ts`, both extension-installer skill copies, and the two managed-runtime operator runbooks.
+- Task 6 owns fixture, systemd, operator guidance, and UI routing coverage: `scripts/testing/runtime-sandbox.ts`, `test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts`, `test/e2e-browser/fixtures/fake-opencode-terminal.mjs`, `installers/systemd/freshell-rust.service.d/managed-runtime.conf`, `AGENTS.md`, `scripts/prebuild-guard.ts`, `test/unit/tooling/prebuild-guard.test.ts`, both extension-installer skill copies, and the two managed-runtime operator runbooks.
 
 Each task is implemented and reviewed before the next starts. The review scope is its owned files and the exact behavioral selectors listed in that task. Keep commits limited to that task's owned files; the compile repair is a prerequisite commit.
 
@@ -456,6 +458,7 @@ Commit only the updater, updater tests, launcher, and launcher behavior tests.
 **Files:**
 - Modify: `scripts/testing/runtime-sandbox.ts`.
 - Modify: `test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts`.
+- Modify: `test/e2e-browser/fixtures/fake-opencode-terminal.mjs` to support repeat turns in the same native OpenCode session for provider-free UI continuity coverage.
 - Modify: `installers/systemd/freshell-rust.service.d/managed-runtime.conf`.
 - Modify: `AGENTS.md`.
 - Modify: `scripts/prebuild-guard.ts` and its behavior test `test/unit/tooling/prebuild-guard.test.ts`.
@@ -468,7 +471,7 @@ Commit only the updater, updater tests, launcher, and launcher behavior tests.
 
 - [ ] **Step 1: Add failing fixture and guard behavior cases**
 
-Add real provider-free UI fixture coverage for the three update modes. Create at least one supported terminal coding-agent pane through the ordinary pane picker/TerminalView path and one supported Fresh Agent pane through its ordinary pane picker path; do not create these subjects through REST or test-only creation shortcuts. Verify their exact managed soul/incarnation/terminal-or-session identities in the supervisor and UI before and after default web-only update, and prove follow-up remains attached to those same sessions.
+Add real provider-free UI fixture coverage for the three update modes. Create a release-enabled OpenCode terminal coding-agent pane through the ordinary pane picker/TerminalView path and a `freshcodex` pane through its ordinary Fresh Agent picker path; do not create these subjects through REST or test-only creation shortcuts. Extend the existing fake OpenCode terminal only enough to record and answer repeat turns in the same native SQLite session. Verify exact UI pane/tab/create-request/terminal/session identities and authoritative managed soul/incarnation/container/host-boot/native-session identities before and after the default web-only update, reload the browser so it fetches the updated client, then send a follow-up and prove it reaches those same native sessions. Keep any real-provider P2-G04 coverage complementary; the required regression must not need OneCLI credentials or external model calls.
 
 Also add fixture checks for:
 
