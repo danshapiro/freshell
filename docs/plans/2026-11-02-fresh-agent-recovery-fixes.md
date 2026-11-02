@@ -166,6 +166,8 @@ Expected: FAIL because the fixture ignores the unknown env var and still runs th
 
 In `native-startup-query.mjs`'s checkpoint iterator, when `process.env.FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION === '1'` and the input is not `/clear`/`/compact`, yield a plain assistant result instead of the synthesized solo-Bash `tool_use` (so the sidecar's PreToolUse `defer` never fires). The `/clear` and `/compact` handling and the allow-path `effect-count` writer (:182) stay untouched. Then set the flag in the clear-backlog Rust test's env block and add it to the `SnapshotProviderEnv` keys so snapshot isolation sees it.
 
+No-tool-effect coverage note: with the flag, THIS scenario contains no tool flow by design (that IS the isolation), so the clear-backlog test's `effect-count`-absence assertion becomes a tripwire — it still fails if a tool path with effects ever runs in this scenario again. The LIVE no-tool-effect guard for the tool flow stays with the chain-keeping tests: the checkpoint Rust tests (base_ref :9077+ and :9203+, which run WITHOUT the flag and assert effect-count absence at :9418) and the no-flag lifecycle test — extend that no-flag lifecycle test's expectations to also assert the fixture's effect-count file is absent after the chain completes, so the unit lane names the guard explicitly. Keep all of those green in Step 7.
+
 - [ ] **Step 5: Run the focused test**
 
 Run: `bash scripts/sandbox-test.sh "pnpm run test:vitest run test/unit/claude-sidecar/native-continuation-lifecycle.test.ts --config config/vitest/vitest.config.ts"`
@@ -327,6 +329,7 @@ git commit -m "test: gate checkpoint release on native readiness across build co
 - Modify: `crates/freshell-supervisor/src/service.rs` (`activation_failure_data` :9961-9981)
 - Modify: `crates/freshell-supervisor/src/recovery.rs` (`recovery_activation_failure_data` :5885-5905)
 - Modify: `crates/freshell-server/src/fresh_agent_proxy.rs` (`dispatch_send` :169-219, error_event codes :177-185)
+- Modify: `test/integration/server/fresh-agent-parity.test.ts` (Step 6 adds the event-conditioned post-crash recovery-state wait before the recovery send — the wait site Task 8 Step 0 later re-targets)
 - Test: `crates/freshell-server/src/freshell_proxy_tests.rs` (frame contract :1434+), runtime-client unit tests
 
 **Interfaces:**
@@ -365,11 +368,13 @@ Rerun the Step 1/3 selectors: all PASS.
 
 - [ ] **Step 6: Capture the ACTUAL replacement-open error from the real failing sequence**
 
-With the diagnostics in place and BEFORE Task 6 changes any recovery behavior, run the still-failing installed parity case in the disposable sandbox so the new diagnostics capture the actual error from the real three-replacement sequence:
+With the diagnostics in place and BEFORE Task 6 changes any recovery behavior, make the parity case's crash section wait — event-conditioned, using the case's existing structured-event polling helpers — for the supervisor's post-provider-exit recovery state for this soul BEFORE the recovery send. Today (pre-fix) that terminal state is the replacement loop's blocked verdict (`RETRY_BUDGET` after the three attempts), so the wait guarantees the capture actually contains the three real replacement-open attempts rather than a send that merely raced ahead of the timer-driven observer (the same wait site is re-targeted to the new send-recoverable classification event in Task 8 Step 0 once Task 7 lands). Then run the still-failing case:
 
-Run: `FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='gc1p actual-error capture' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
+Run: `FRESHELL_TEST_SUMMARY='gc1p actual-error capture' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: the case still FAILS at the first post-crash recovery send (the recovery fix has not landed), but the retained JSONL/frames now name the actual open-failure subtype and mismatched field names for each replacement attempt. Retain this capture (it is the gc1p-required "actual replacement-open error" evidence and runtime-confirms the Task 6 diagnosis; do not fix recovery in this step).
+(`FRESHELL_RUST_TEST_SANDBOX=1` is inert on a Vitest passthrough lane — it only routes cargo phases. The parity lane's destructiveness is contained by its own disposable-runtime rig, whose canonical cleanup the retained PR #895 evidence verified.)
+
+Expected: the case still FAILS at the first post-crash recovery send (the recovery fix has not landed), and the retained JSONL/frames now name the actual open-failure subtype and mismatched field names for each of the three replacement attempts. Retain this capture (it is the gc1p-required "actual replacement-open error" evidence and runtime-confirms the Task 6 diagnosis; do not fix recovery in this step). Commit the test's wait addition together with this step's evidence retention note.
 
 - [ ] **Step 7: Refactor while green**
 
@@ -386,7 +391,7 @@ Expected: PASS.
 - [ ] **Step 9: Commit the task**
 
 ```bash
-git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-session-host/src/main.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/freshell_proxy_tests.rs
+git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-session-host/src/main.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/freshell_proxy_tests.rs test/integration/server/fresh-agent-parity.test.ts
 git commit -m "feat: typed redacted fresh-agent open-failure diagnostics end-to-end"
 ```
 
@@ -506,7 +511,7 @@ Keep the classification a pure function over the observation + host liveness fac
 1. Supervisor lanes: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-supervisor -- --nocapture"` — PASS (all recovery.rs retry tests, registry budget/spec tests, plus the new writer-claim test).
 2. Session-host lanes: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host -- --nocapture"` — PASS (task008 settings tests, task010 owned-tree mint-new test, resume-ordering tests around :4006/:4310, the map_fresh_agent_open_error tests from Task 5).
 3. Client-side budget semantics: `pnpm run test:vitest run test/runtime/gates/phase-3.test.ts --config config/vitest/vitest.config.ts` — PASS (RETRY_BUDGET persistence + manual-retry semantics unchanged).
-4. Managed terminal-provider crash lanes (different provider class — must be undisturbed): `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:vitest run test/integration/server/managed-provider-parity.test.ts --config config/vitest/vitest.config.ts` — PASS.
+4. Managed terminal-provider crash lanes (different provider class — must be undisturbed): `pnpm run test:vitest run test/integration/server/managed-provider-parity.test.ts --config config/vitest/vitest.config.ts` — PASS.
 
 - [ ] **Step 10: Commit the task**
 
@@ -529,21 +534,23 @@ git commit -m "feat: send-driven managed codex recovery for native exit in a liv
 - [ ] **Step 0: Strengthen the parity case's post-crash proof (test-only; no relaxation)**
 
 Three additions close the gaps the plan review found in the case as written at base_ref:
-1. Observer-first sequencing: after the native-PID kill + history archive (:1040-1041), AWAIT the supervisor's send-recoverable classification event (the JSONL event Task 7's observer emits) BEFORE sending the recovery prompt — an event-conditioned wait on the case's existing structured-event polling helpers, never a blind sleep. Without this, the immediate send can recover before the timer-driven observer (:224-239) ever classifies, and a pass would not prove the observer/admission composition the issue is about.
+1. Observer-first sequencing: after the native-PID kill + history archive (:1040-1041), the case must ALREADY await the supervisor's post-crash recovery state before the recovery send (the wait Task 5 Step 6 added, targeting the pre-fix blocked verdict) — re-target that wait to the NEW send-recoverable classification event Task 7's observer emits, keeping it an event-conditioned wait on the case's existing structured-event polling helpers, never a blind sleep. This is what proves the observer/admission composition the issue is about.
 2. Archived-byte immutability: the case hashes and copies the archive files at archive time (:1023-1040) but never rereads them — add a post-recovery re-hash of every archived original-history file and assert byte equality with the archive-time hashes (this is the issue's "original-history byte guard", made checkable).
 3. Gateway ownership fence: the case's send helper omits `observedEpoch`/`observedGeneration` (:671-675), and `post_barrier_admission` accepts sends with both absent (`fresh_agent_proxy.rs:144-149`), so the fence is currently NOT exercised. Drive the recovery send (and the second prompt) WITH the observed epoch/generation pair attached so the fence is genuinely proven across the identity commit; if the harness cannot attach the pair, substitute a focused `freshell_proxy_tests.rs` test that proves fence-across-identity-commit semantics and record that substitution honestly in the task report.
 
 Each addition protects the contract it names; run the case once after adding them — additions 1 and 3 are green immediately after Tasks 5-7 (their machinery exists), addition 2 must be green because no recovery path may write the archive (if it fails, that is a real fix-up in the owning task with its own focused test).
 
-- [ ] **Step 1: Run the entire installed Codex parity case in the disposable sandbox**
+- [ ] **Step 1: Run the entire installed Codex parity case**
 
-Run: `FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='gc1p installed parity acceptance' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
+Run: `FRESHELL_TEST_SUMMARY='gc1p installed parity acceptance' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
+
+(`FRESHELL_RUST_TEST_SANDBOX=1` is inert on a Vitest passthrough lane — it only routes cargo phases; the parity lane's destructiveness is contained by its own disposable-runtime rig.)
 
 Expected: PASS — the whole case, including every post-crash assertion that previously failed at the first recovery send (base_ref :1041) and the three strengthened proofs. If any assertion fails, capture the Task-5 diagnostics from the retained JSONL logs, fix the substantiated gap in the owning task's files with its own focused test, and rerun. Do not relax any assertion.
 
 - [ ] **Step 2: Run the managed-recovery neighbor lanes**
 
-Run: `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:vitest run test/integration/server/managed-provider-parity.test.ts --config config/vitest/vitest.config.ts` and `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:vitest run test/runtime/gates/phase-3.test.ts --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/integration/server/managed-provider-parity.test.ts --config config/vitest/vitest.config.ts` and `pnpm run test:vitest run test/runtime/gates/phase-3.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS (terminal-provider crash/host-restart and budget semantics undisturbed).
 
@@ -555,11 +562,18 @@ Expected: PASS (terminal-provider crash/host-restart and budget semantics undist
 
 Expected: PASS; retain receipts for both contexts.
 
-- [ ] **Step 4: Retain evidence and post the gc1p kata comment**
+- [ ] **Step 4: E2E lanes for the fixes**
+
+The fixes' end-to-end coverage (repo rule: unit AND e2e for everything):
+1. Crash/restart policy e2e neighbors (production changes from Tasks 5-7 must not disturb client crash policy): run the existing fresh-agent browser e2e specs `test/e2e-browser/specs/agent-crash-autoresume-rust.spec.ts` and `test/e2e-browser/specs/launch-retry-restart-rust.spec.ts` — PASS.
+2. Fixture inertness e2e (Task 2 changed a unit-test fixture; the browser lanes use different sim fixtures): run one Claude-sim-based e2e spec (any spec under `test/e2e-browser/specs/` that drives the `test/fixtures/claude-cli-sim/` fixture) to confirm the unit fixture flag is invisible there — PASS.
+3. Backend selection per repo rule: use the configured `FRESHELL_E2E_BACKEND`; if it is unset, stop and ask the user which backend before running (do not silently pick one).
+
+- [ ] **Step 5: Retain evidence and post the gc1p kata comment**
 
 Save the parity-case log, the JSONL lifecycle/frame evidence, and the Rust receipts under the run's reports dir; `kata comment gc1p --body "..."` summarizing: root cause (two layers), the fixes (A1, B1, C), the acceptance commands and results, and the evidence paths. Do not close the issue yet — closure follows the final delta review.
 
-- [ ] **Step 5: Commit the strengthened assertions (and any fix-ups)**
+- [ ] **Step 6: Commit the strengthened assertions (and any fix-ups)**
 
 Commit Step 0's parity-case strengthenings with their own focused message (they are test-only changes; the case must pass with them before commit):
 
@@ -575,5 +589,6 @@ If Steps 1-3 required fix-ups, each is already committed with its own focused te
 ## Verification summary (whole plan)
 
 - Focused lanes: the per-task commands above (sandboxed cargo selectors, sandbox-wrapped vitest paths for real-sidecar test files, repo-owned Vitest paths for server-integration lanes), plus Task 5 Step 6's pre-fix actual-error capture run and Task 8 Step 0's strengthened parity assertions.
+- E2E lanes: Task 8 Step 4 names the branch's end-to-end coverage — the crash/restart policy e2e neighbors for the production recovery changes and a Claude-sim-based spec for unit-fixture inertness (backend per `FRESHELL_E2E_BACKEND`; ask the user if unset).
 - Whole-branch: the coordinator-gated full suite at execution end (`FRESHELL_RUST_TEST_SANDBOX=1 GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY='...' pnpm run check` or `pnpm run test` per the gate procedure — the `FRESHELL_RUST_TEST_SANDBOX=1` value is what routes the Rust phase into the disposable sandbox), green excluding nothing: no suite failure may remain at final HEAD.
 - Kata closure after the final delta review passes, per issue: `gc1p` closes when the full installed parity case passes post-fix with the actual-error capture retained; `wjwa` and `czzp` close when their cases are deterministic green in both build contexts; `cnr1` closes ONLY if the starvation campaign confirmed the fourth-row fingerprint at runtime. If the cnr1 campaign is inconclusive, the run records cnr1 as PARTIAL/non-converged for that issue (retention + isolation landed; runtime fingerprint pending a recurrence with retained rows), reports it prominently in the recap, and does not claim cnr1 fixed — the run status then reflects the partial outcome. fy2w untouched in all cases.
