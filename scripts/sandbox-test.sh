@@ -32,34 +32,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WORKSPACE_ROOT="${REPO_ROOT}"
 IMAGE_TAG="freshell-sandbox:latest"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
-
-# A linked worktree's .git file points to its per-worktree admin directory,
-# which in turn resolves its objects and refs through the shared Git common
-# directory. The repo bind mount below does not expose that path. Mount only
-# the resolved common directory, at the same absolute path, and read-only so
-# Git can inspect this worktree without making host metadata writable.
-LINKED_WORKTREE_GIT_COMMON_DIR=""
-if [ -f "${REPO_ROOT}/.git" ]; then
-  WORKTREE_GIT_DIR="$(git -C "${REPO_ROOT}" rev-parse --absolute-git-dir 2>/dev/null || true)"
-  WORKTREE_GIT_COMMON_DIR="$(git -C "${REPO_ROOT}" rev-parse --git-common-dir 2>/dev/null || true)"
-  if [ -n "${WORKTREE_GIT_DIR}" ] && [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
-    case "${WORKTREE_GIT_COMMON_DIR}" in
-      /*) ;;
-      *) WORKTREE_GIT_COMMON_DIR="${REPO_ROOT}/${WORKTREE_GIT_COMMON_DIR}" ;;
-    esac
-    WORKTREE_GIT_DIR="$(realpath -e "${WORKTREE_GIT_DIR}" 2>/dev/null || true)"
-    WORKTREE_GIT_COMMON_DIR="$(realpath -e "${WORKTREE_GIT_COMMON_DIR}" 2>/dev/null || true)"
-    case "${WORKTREE_GIT_DIR}" in
-      "${WORKTREE_GIT_COMMON_DIR}"/worktrees/*)
-        if [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
-          LINKED_WORKTREE_GIT_COMMON_DIR="${WORKTREE_GIT_COMMON_DIR}"
-        fi
-        ;;
-    esac
-  fi
-fi
 
 if [ "${1:-}" = "--provider-mountpoints" ]; then
   shift
@@ -105,6 +80,63 @@ if [ "${1:-}" = "--native-tools" ]; then
     --require-all \
     --manifest "${NATIVE_MANIFEST}" \
     --output "${NATIVE_RECEIPT_DIR%/}/native-session-names.json"
+fi
+
+if [ "${1:-}" = "--workspace-root" ]; then
+  shift
+  REQUESTED_WORKSPACE_ROOT="${1:-}"
+  if [ -z "${REQUESTED_WORKSPACE_ROOT}" ] || [ ! -d "${REQUESTED_WORKSPACE_ROOT}" ]; then
+    echo '[sandbox] --workspace-root requires an existing worktree directory' >&2
+    exit 2
+  fi
+  case "${REQUESTED_WORKSPACE_ROOT}" in
+    /*) ;;
+    *) echo '[sandbox] --workspace-root must be absolute' >&2; exit 2 ;;
+  esac
+  WORKSPACE_ROOT="$(cd -- "${REQUESTED_WORKSPACE_ROOT}" && pwd -P)" || {
+    echo '[sandbox] could not resolve --workspace-root' >&2
+    exit 2
+  }
+  shift
+
+  TRUSTED_GIT_COMMON_DIR="$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  WORKSPACE_GIT_COMMON_DIR="$(git -C "${WORKSPACE_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  WORKSPACE_TOP="$(git -C "${WORKSPACE_ROOT}" rev-parse --show-toplevel 2>/dev/null || true)"
+  TRUSTED_GIT_COMMON_DIR="$(realpath -e "${TRUSTED_GIT_COMMON_DIR}" 2>/dev/null || true)"
+  WORKSPACE_GIT_COMMON_DIR="$(realpath -e "${WORKSPACE_GIT_COMMON_DIR}" 2>/dev/null || true)"
+  WORKSPACE_TOP="$(cd -- "${WORKSPACE_TOP}" 2>/dev/null && pwd -P)" || WORKSPACE_TOP=""
+  if [ -z "${TRUSTED_GIT_COMMON_DIR}" ] \
+    || [ "${WORKSPACE_GIT_COMMON_DIR}" != "${TRUSTED_GIT_COMMON_DIR}" ] \
+    || [ "${WORKSPACE_TOP}" != "${WORKSPACE_ROOT}" ]; then
+    echo '[sandbox] --workspace-root must be a worktree in the trusted wrapper repository' >&2
+    exit 2
+  fi
+fi
+
+# A linked worktree's .git file points to its per-worktree admin directory,
+# which in turn resolves its objects and refs through the shared Git common
+# directory. The workspace bind mount below does not expose that path. Mount only
+# the resolved common directory, at the same absolute path, and read-only so
+# Git can inspect this worktree without making host metadata writable.
+LINKED_WORKTREE_GIT_COMMON_DIR=""
+if [ -f "${WORKSPACE_ROOT}/.git" ]; then
+  WORKTREE_GIT_DIR="$(git -C "${WORKSPACE_ROOT}" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  WORKTREE_GIT_COMMON_DIR="$(git -C "${WORKSPACE_ROOT}" rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "${WORKTREE_GIT_DIR}" ] && [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
+    case "${WORKTREE_GIT_COMMON_DIR}" in
+      /*) ;;
+      *) WORKTREE_GIT_COMMON_DIR="${WORKSPACE_ROOT}/${WORKTREE_GIT_COMMON_DIR}" ;;
+    esac
+    WORKTREE_GIT_DIR="$(realpath -e "${WORKTREE_GIT_DIR}" 2>/dev/null || true)"
+    WORKTREE_GIT_COMMON_DIR="$(realpath -e "${WORKTREE_GIT_COMMON_DIR}" 2>/dev/null || true)"
+    case "${WORKTREE_GIT_DIR}" in
+      "${WORKTREE_GIT_COMMON_DIR}"/worktrees/*)
+        if [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
+          LINKED_WORKTREE_GIT_COMMON_DIR="${WORKTREE_GIT_COMMON_DIR}"
+        fi
+        ;;
+    esac
+  fi
 fi
 
 SETTLE_ONLY=0
@@ -156,7 +188,7 @@ else
   fi
 
   if [ "$#" -lt 1 ]; then
-    echo "usage: $0 [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
+    echo "usage: $0 [--workspace-root <absolute-worktree>] [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
     exit 2
   fi
   CMD="$1"
@@ -187,7 +219,7 @@ else
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
         node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
         CODEX_NATIVE_CONTRACT=1
-        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${REPO_ROOT}/.runtime-build/codex-contract/staged.json")"
+        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${WORKSPACE_ROOT}/.runtime-build/codex-contract/staged.json")"
         ;;
     esac
   fi
@@ -195,7 +227,7 @@ else
   # This exact stopped-repair route already owns its dedicated enclosure.
   if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "$#" -eq 1 ] && \
      [ "${CMD}" = "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored" ]; then
-    cd "${REPO_ROOT}"
+    cd "${WORKSPACE_ROOT}"
     exec pnpm exec tsx "${REPO_ROOT}/scripts/testing/task007-destructive-sandbox.ts"
   fi
   if [[ ! "${CACHE_PREFIX}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
@@ -207,7 +239,7 @@ else
   # guard and completed settlement. Only the fixed preparation has networking.
   if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
-    env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --runtime-suite \
+    env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite \
       'if [ -f Cargo.lock ]; then cargo fetch --locked; fi' &
     PREPARATION_PID=$!
     trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
@@ -217,7 +249,7 @@ else
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
     trap - INT TERM HUP
     if [ "${PREPARATION_STATUS}" -ne 0 ]; then exit "${PREPARATION_STATUS}"; fi
-    CALLER_FLAGS=(--runtime-suite)
+    CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}" --runtime-suite)
     if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
     exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
   fi
@@ -229,9 +261,9 @@ else
   target_cache_hash() {
     local hash_output
     if command -v sha256sum >/dev/null 2>&1; then
-      hash_output="$(printf '%s' "${REPO_ROOT}" | sha256sum)" || return 1
+      hash_output="$(printf '%s' "${WORKSPACE_ROOT}" | sha256sum)" || return 1
     elif command -v shasum >/dev/null 2>&1; then
-      hash_output="$(printf '%s' "${REPO_ROOT}" | shasum -a 256)" || return 1
+      hash_output="$(printf '%s' "${WORKSPACE_ROOT}" | shasum -a 256)" || return 1
     else
       return 1
     fi
@@ -349,7 +381,7 @@ owned_docker_client_running() {
   [ -n "${DOCKER_CLIENT_PID}" ] \
     && ps -p "${DOCKER_CLIENT_PID}" -o args= 2>/dev/null \
       | grep -F -- "--name ${OWNED_CONTAINER_NAME}" \
-      | grep -F -- "${REPO_ROOT}:/workspace" >/dev/null
+      | grep -F -- "${WORKSPACE_ROOT}:/workspace" >/dev/null
 }
 
 # shellcheck disable=SC2317 # Reached by the installed EXIT trap handler.
@@ -518,7 +550,7 @@ DOCKER_ARGS=(
   --pids-limit 512
   --memory 8g
   -e GIT_OPTIONAL_LOCKS=0
-  -v "${REPO_ROOT}:/workspace"
+  -v "${WORKSPACE_ROOT}:/workspace"
   -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
   -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
   -v "${CACHE_PREFIX}-pnpm-store:/home/sandbox/.local/share/pnpm/store"
@@ -563,7 +595,7 @@ if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]
   )
   if [ "${CODEX_NATIVE_CONTRACT:-0}" -eq 1 ]; then
     DOCKER_ARGS+=(
-      --security-opt "seccomp=${REPO_ROOT}/.runtime-build/codex-contract/codex-policy.json"
+      --security-opt "seccomp=${WORKSPACE_ROOT}/.runtime-build/codex-contract/codex-policy.json"
       -e FRESHELL_CODEX_CONTRACT_POLICY=prepared
     )
   fi
@@ -585,7 +617,7 @@ fi
 # root (dockerd itself runs as root), before the container ever hands off to
 # its non-root user. A named volume layered under a path inside our
 # bind-mounted repo (e.g. a volume mount at /workspace/target) needs a mount point at
-# ${REPO_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
+# ${WORKSPACE_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
 # that path doesn't exist yet, so dockerd creates it — root-owned. That stub
 # then breaks host-side `cargo`/`pnpm` in this worktree with EACCES the next
 # time a human (not root) tries to write there.
@@ -599,14 +631,14 @@ for entry in "${DOCKER_ARGS[@]}"; do
     subpath="${entry#*:/workspace/}"
     subpath="${subpath%%:*}" # strip a trailing :ro/:rw suffix, if present
     if [ -n "${subpath}" ]; then
-      mkdir -p "${REPO_ROOT}/${subpath}"
+      mkdir -p "${WORKSPACE_ROOT}/${subpath}"
     fi
     ;;
   type=volume,*dst=/workspace/*)
     subpath="${entry#*dst=/workspace/}"
     subpath="${subpath%%,*}"
     if [ -n "${subpath}" ]; then
-      mkdir -p "${REPO_ROOT}/${subpath}"
+      mkdir -p "${WORKSPACE_ROOT}/${subpath}"
     fi
     ;;
   esac
@@ -627,9 +659,9 @@ DOCKER_CLIENT_PID=""
 # yet know to pre-create) still left a root-owned entry directly under the
 # repo root, fail loudly with a concrete remediation instead of leaving the
 # next `cargo build`/`pnpm install` on the host to fail with a bare EACCES.
-ROOT_DROPPINGS="$(find "${REPO_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
+ROOT_DROPPINGS="$(find "${WORKSPACE_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
 if [ -n "${ROOT_DROPPINGS}" ]; then
-  echo "[sandbox] ERROR: root-owned entries found directly under ${REPO_ROOT}:" >&2
+  echo "[sandbox] ERROR: root-owned entries found directly under ${WORKSPACE_ROOT}:" >&2
   echo "${ROOT_DROPPINGS}" >&2
   echo "[sandbox] dockerd (which runs as root) created these as bind-mount points." >&2
   echo "[sandbox] Remediation: sudo chown -R \"\$(id -u):\$(id -g)\" <path>, for each path listed above, then re-run." >&2

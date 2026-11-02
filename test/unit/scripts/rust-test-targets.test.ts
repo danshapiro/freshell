@@ -249,6 +249,10 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   let fakeSandboxRunner: string
   let fixtureHookPath: string
   let cargoMetadataPath: string
+  let sharedOwnerRoot: string
+  let pushedWorktreeParent: string
+  let pushedWorktreeRoot: string
+  let sandboxDockerArgsPath: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
     const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' })
@@ -432,7 +436,9 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
         'import path from "node:path"',
         'import { spawnSync } from "node:child_process"',
         'const args = process.argv.slice(2)',
-        'fs.appendFileSync(process.env.FAKE_SANDBOX_LOG, JSON.stringify({args, ownerGuard:process.env.FRESHELL_SANDBOX_OWNER_GUARD ?? null, cwd:process.cwd()}) + "\\n")',
+        'let workspaceRoot = null',
+        'if (args[0] === "--workspace-root") { if (args.length < 3) process.exit(2); workspaceRoot = args[1]; args.splice(0, 2) }',
+        'fs.appendFileSync(process.env.FAKE_SANDBOX_LOG, JSON.stringify({args, workspaceRoot, ownerGuard:process.env.FRESHELL_SANDBOX_OWNER_GUARD ?? null, cwd:process.cwd()}) + "\\n")',
         'if (Number(process.env.FAKE_SANDBOX_EXIT ?? 0) !== 0) process.exit(Number(process.env.FAKE_SANDBOX_EXIT))',
         'const runtimeSuite = args[0] === "--runtime-suite"',
         'if (runtimeSuite ? args.length !== 2 : args.length !== 1) process.exit(2)',
@@ -464,9 +470,63 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       '#!/usr/bin/env bash\nexec node "$FAKE_SANDBOX_RUNNER" "$@"\n',
     )
     fs.chmodSync(sandboxTestPath, 0o755)
+    pushedWorktreeParent = fs.mkdtempSync(path.join(os.tmpdir(), "prepush routing's-pushed-"))
+    expect(pushedWorktreeParent).toContain("prepush routing's-pushed-")
+    sharedOwnerRoot = path.join(pushedWorktreeParent, 'owner')
+    pushedWorktreeRoot = path.join(pushedWorktreeParent, 'worktree')
+    git(['worktree', 'add', '--detach', sharedOwnerRoot, baseSha], { cwd: fixtureRoot })
+    git(['worktree', 'add', '--detach', pushedWorktreeRoot, rustSha], { cwd: fixtureRoot })
+    writeFixture(path.join(sharedOwnerRoot, 'package.json'), '{"type":"module"}\n')
+
+    const sharedHookDir = path.join(sharedOwnerRoot, 'scripts/hooks')
+    const sharedScriptsDir = path.join(sharedOwnerRoot, 'scripts')
+    const sharedBinDir = path.join(sharedOwnerRoot, 'node_modules/.bin')
+    fs.mkdirSync(sharedHookDir, { recursive: true })
+    fs.mkdirSync(sharedBinDir, { recursive: true })
+    fs.copyFileSync(hookPath, path.join(sharedHookDir, 'pre-push'))
+    fs.copyFileSync(
+      path.resolve(import.meta.dirname, '../../../scripts/hooks/rust-test-targets.ts'),
+      path.join(sharedHookDir, 'rust-test-targets.ts'),
+    )
+    fs.copyFileSync(
+      path.resolve(import.meta.dirname, '../../../scripts/hooks/prepush-manager.ts'),
+      path.join(sharedHookDir, 'prepush-manager.ts'),
+    )
+    fs.copyFileSync(
+      path.resolve(import.meta.dirname, '../../../scripts/sandbox-test.sh'),
+      path.join(sharedScriptsDir, 'sandbox-test.sh'),
+    )
+    writeFixture(path.join(sharedBinDir, 'tsx'), `#!/bin/sh\nexec "${realTsx}" "$@"\n`)
+    fs.chmodSync(path.join(sharedBinDir, 'tsx'), 0o755)
+    const dockerBinDir = path.join(fixtureRoot, 'fake-docker-bin')
+    fs.mkdirSync(dockerBinDir, { recursive: true })
+    const dockerPath = path.join(dockerBinDir, 'docker')
+    writeFixture(
+      dockerPath,
+      [
+        '#!/usr/bin/env node',
+        'import fs from "node:fs"',
+        'const args = process.argv.slice(2)',
+        'fs.appendFileSync(process.env.DOCKER_ARGS_FILE, JSON.stringify(args) + "\\n")',
+        'if (["volume", "image", "network", "ps"].includes(args[0])) process.exit(0)',
+        'if (args[0] === "container") process.exit(1)',
+        'if (args[0] === "run") { const cidIndex = args.indexOf("--cidfile"); if (cidIndex >= 0) fs.writeFileSync(args[cidIndex + 1], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n"); process.exit(Number(process.env.DOCKER_RUN_STATUS ?? 0)) }',
+        'process.exit(0)',
+        '',
+      ].join('\n'),
+    )
+    fs.chmodSync(dockerPath, 0o755)
+    sandboxDockerArgsPath = path.join(fixtureRoot, 'sandbox-docker-args.log')
   })
 
   afterAll(() => {
+    if (pushedWorktreeRoot && fs.existsSync(pushedWorktreeRoot)) {
+      git(['worktree', 'remove', '--force', pushedWorktreeRoot], { cwd: fixtureRoot })
+    }
+    if (sharedOwnerRoot && fs.existsSync(sharedOwnerRoot)) {
+      git(['worktree', 'remove', '--force', sharedOwnerRoot], { cwd: fixtureRoot })
+    }
+    if (pushedWorktreeParent) fs.rmSync(pushedWorktreeParent, { recursive: true, force: true })
     fs.rmSync(fixtureRoot, { recursive: true, force: true })
   })
 
@@ -576,6 +636,40 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     }
   }
 
+  function runHookThroughSharedSandbox(
+    dockerRunStatus = 0,
+  ): { status: number; stderr: string; dockerCalls: string[][] } {
+    fs.rmSync(sandboxDockerArgsPath, { force: true })
+    fs.writeFileSync(fakeCargoLog, '')
+    const hookPath = path.join(sharedOwnerRoot, 'scripts/hooks/pre-push')
+    const res = spawnSync('bash', [hookPath], {
+      input: `refs/heads/x ${rustSha} refs/heads/x ${baseSha}\n`,
+      env: {
+        ...process.env,
+        PATH: `${path.join(fixtureRoot, 'fake-docker-bin')}:${fakeBinDir}:${path.join(sharedOwnerRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
+        FAKE_CARGO_LOG: fakeCargoLog,
+        FAKE_CARGO_METADATA: fakeCargoMetadata,
+        CARGO_METADATA_FILE: cargoMetadataPath,
+        DOCKER_ARGS_FILE: sandboxDockerArgsPath,
+        DOCKER_RUN_STATUS: String(dockerRunStatus),
+        TMPDIR: fixtureRoot,
+        FRESHELL_PREPUSH_DEBUG: '0',
+      },
+      encoding: 'utf8',
+      cwd: pushedWorktreeRoot,
+      timeout: 120_000,
+      killSignal: 'SIGKILL',
+    })
+    const dockerCalls = fs.existsSync(sandboxDockerArgsPath)
+      ? fs.readFileSync(sandboxDockerArgsPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+      : []
+    return {
+      status: res.status ?? -1,
+      stderr: `${res.stderr ?? ''}${res.error ? `\n${res.error.message}` : ''}`,
+      dockerCalls,
+    }
+  }
+
   it('skips all checks for a docs-only range', () => {
     const out = runHook(docsSha, rustSha)
     expect(out.status).toBe(0)
@@ -599,6 +693,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.sandboxEvents).toMatchObject([
       {
         args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
+        workspaceRoot: fixtureRoot,
         cwd: fixtureRoot,
       },
     ])
@@ -616,6 +711,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.sandboxEvents).toMatchObject([
       {
         args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --workspace --exclude freshell-tauri --locked'],
+        workspaceRoot: fixtureRoot,
         cwd: fixtureRoot,
       },
     ])
@@ -625,6 +721,26 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
         buildJobs: '3', testThreads: '4', tokioThreads: '2', sandboxActive: '1',
       },
     ])
+  })
+
+  it('uses the shared owner sandbox wrapper to mount the pushed worktree', () => {
+    const out = runHookThroughSharedSandbox()
+    expect(out.status, out.stderr).toBe(0)
+    const runArgs = out.dockerCalls.find(([operation]) => operation === 'run')
+    expect(runArgs).toBeDefined()
+    const workspaceMountIndex = runArgs?.indexOf('-v') ?? -1
+    expect(workspaceMountIndex).toBeGreaterThanOrEqual(0)
+    expect(runArgs?.[workspaceMountIndex + 1]).toBe(`${pushedWorktreeRoot}:/workspace`)
+    expect(runArgs).not.toContain(`${sharedOwnerRoot}:/workspace`)
+    expect(runArgs?.at(-1)).toContain(
+      'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws',
+    )
+  })
+
+  it('fails the hook when the shared sandbox command fails', () => {
+    const out = runHookThroughSharedSandbox(23)
+    expect(out.status).toBe(1)
+    expect(out.stderr).toContain('pre-push: FAILED — CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws (sandboxed)')
   })
 
   it('strips git hook env overrides (GIT_DIR et al) before any lane runs', () => {
@@ -679,6 +795,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       expect(sandboxEvents).toHaveLength(1)
       expect(sandboxEvents[0]).toMatchObject({
         args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
+        workspaceRoot: fixtureRoot,
         cwd: fixtureRoot,
       })
       expect(cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([{
@@ -738,6 +855,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.sandboxEvents).toMatchObject([
       {
         args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
+        workspaceRoot: fixtureRoot,
         cwd: fixtureRoot,
       },
     ])
@@ -791,6 +909,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.sandboxEvents).toMatchObject([
       {
         args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --workspace --exclude freshell-tauri --locked'],
+        workspaceRoot: fixtureRoot,
         cwd: fixtureRoot,
       },
     ])
