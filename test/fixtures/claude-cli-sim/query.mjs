@@ -53,6 +53,8 @@
 //                                       With no Stop it starts after T.coldStart.
 //   FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD '1': hold a queued cold command until
 //                                       it receives a Stop, bypassing T.coldStart.
+//   FRESHELL_CLAUDE_SIM_HOLD_COLD      '1': hold any cold command shape until
+//                                       it receives a Stop, bypassing T.coldStart.
 //                                       The default keeps the timed behavior above.
 //   FRESHELL_CLAUDE_SIM_STALL_STDIN     '1'/'boot' or 'prompt': the host process
 //                                       stops reading stdin after boot / at the
@@ -67,7 +69,9 @@
 //                                       reduced to key names plus short sha256
 //                                       digests of credential values and the
 //                                       Freshell context values), `boot` (the session id
-//                                       and the stand-in CLI's pid), `prompt` (each
+//                                       and the stand-in CLI's pid), `cold` (a
+//                                       cold-command shape entered its controllable
+//                                       boundary), `prompt` (each
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
 //                                       under), `can_use_tool` (each answer the host's
@@ -268,6 +272,7 @@ class SimulatedCli {
       throw new Error(`FRESHELL_CLAUDE_SIM_COLD_COMMAND must be one of ${[...COLD_COMMAND_SHAPES].join(', ')}, not ${JSON.stringify(this.coldShape)}`)
     }
     this.holdQueuedCold = this.env.FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD === '1'
+    this.holdColdCommands = this.env.FRESHELL_CLAUDE_SIM_HOLD_COLD === '1'
     // The cold command being started, while a Stop can still miss it, and the
     // receipt of a Stop that missed it, when it is answered at its start.
     this.cold = null
@@ -606,6 +611,7 @@ class SimulatedCli {
   async acceptCold(cmd, shape) {
     const cold = { shape, uuid: cmd.uuid, missed: false, stopped: deferred() }
     this.cold = cold
+    this.ledger('cold', { sessionId: this.sessionId, uuid: cmd.uuid, shape })
     if (shape === 'queued') {
       this.accept(cmd, { start: false })
       await this.holdCold(cold)
@@ -620,7 +626,7 @@ class SimulatedCli {
 
   /** Wait for a Stop to miss the cold command, or for the cold window to end. */
   async holdCold(cold) {
-    if (cold.shape === 'queued' && this.holdQueuedCold) {
+    if (this.holdColdCommands || (cold.shape === 'queued' && this.holdQueuedCold)) {
       await cold.stopped.promise
     } else {
       await Promise.race([cold.stopped.promise, this.sleep(T.coldStart)])
