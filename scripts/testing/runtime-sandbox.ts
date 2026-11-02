@@ -28,6 +28,12 @@ import { deferredProviders, loadCapabilityManifest } from './provider-certificat
 import { deriveNativeRecoveryOriginals, nativeRecoveryValidationDiagnostic, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
 import { hasSuccessfulNativeAnswer, type NativeHistory } from './provider-native-history.js'
 import { runtimeCargoBuildAndCopy, runtimeCargoTargetDirectory } from './runtime-cargo-artifacts.js'
+import {
+  DEFAULT_UPDATE_REMINDER, createJsonLogger, runManagedRuntimeUpdate, runManagedRuntimeWorker,
+  type ManagedRuntimeOwner as ManagedUpdateOwner,
+  type ManagedRuntimeUpdateDependencies, type ManagedUpdateMode, type ReopenCandidate,
+  type RuntimeView as ManagedUpdateView,
+} from '../update-managed-runtime.js'
 
 import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt, type BrokerSettlementFailure } from './runtime-test-broker.js'
@@ -124,6 +130,29 @@ function sha256(value: string): string {
 
 function sha1(value: string): string {
   return createHash('sha1').update(value).digest('hex')
+}
+
+async function managedUpdateDirectoryDigest(root: string): Promise<string> {
+  const digest = createHash('sha256')
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of (await fsp.readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const absolute = path.join(directory, entry.name)
+      const relative = path.relative(root, absolute).split(path.sep).join('/')
+      if (entry.isSymbolicLink()) {
+        digest.update(`link\0${relative}\0${await fsp.readlink(absolute)}\0`)
+      } else if (entry.isDirectory()) {
+        digest.update(`dir\0${relative}\0`)
+        await visit(absolute)
+      } else if (entry.isFile()) {
+        digest.update(`file\0${relative}\0`)
+        digest.update(await fsp.readFile(absolute))
+      } else {
+        throw new Error(`managed-update client contains an unsupported filesystem entry: ${relative}`)
+      }
+    }
+  }
+  await visit(root)
+  return `sha256:${digest.digest('hex')}`
 }
 
 export function seedManagedOpenCodeSource(input: SyntheticSourceInput & { batch: 'stopped-repair-seven-roots' }): SyntheticSevenRootSource
@@ -2713,6 +2742,7 @@ export class RuntimeHarness {
   private brokerStarted = false
   private buildProvenance: ReturnType<typeof preparedRuntimeBuildProvenance> | { source: 'mise'; command: { program: string; args: string[] }; hostMiseRustc: string }
   private readonly fixtureInputs: RuntimeFixtureInputs | undefined
+  private readonly additionalWorkspaceRoots = new Set<string>()
   private readonly providerFixtureHome: string | undefined
   private readonly ownerIsolation: RuntimeOwnerIsolation | undefined
   private task007Artifact?: Promise<Task007LibTestArtifact>
@@ -3669,6 +3699,12 @@ export class RuntimeHarness {
   recordLifecycle(event: string, data: unknown = {}): void {
     ensurePrivateDirectory(path.dirname(this.lifecyclePath))
     appendPrivateLine(this.lifecyclePath, { at: new Date().toISOString(), event, data })
+  }
+
+  /** Add one explicitly owned workspace to the runtime fixture's broker allowlist. */
+  allowOwnedWorkspaceRoot(selected: string): void {
+    if (this.brokerStarted) throw new Error('runtime workspace roots must be selected before preparation')
+    this.additionalWorkspaceRoots.add(validateOwnedFixturePath(selected, 'directory', 'additional workspace fixture'))
   }
 
   writeIncident(name: string, value: unknown): void {
@@ -4632,9 +4668,12 @@ export class RuntimeHarness {
 
   private phase2WorkspaceRoots(): string[] {
     if (this.fixtureInputs) {
-      return this.fixtureInputs.workspaceRoots.map(selected => validateOwnedFixturePath(selected, 'directory', 'workspace fixture root'))
+      return [...new Set([
+        ...this.fixtureInputs.workspaceRoots.map(selected => validateOwnedFixturePath(selected, 'directory', 'workspace fixture root')),
+        ...this.additionalWorkspaceRoots,
+      ])]
     }
-    if (this.task2FiniteFixtures) return [this.testRoot]
+    if (this.task2FiniteFixtures) return [...new Set([this.testRoot, ...this.additionalWorkspaceRoots])]
     const roots = new Set<string>([this.repoRoot, this.testRoot])
     try {
       const common = git(this.repoRoot, ['rev-parse', '--git-common-dir']).trim()
@@ -4642,6 +4681,7 @@ export class RuntimeHarness {
     } catch (error) {
       if (subprocessInterrupted(error)) throw error
     }
+    for (const workspaceRoot of this.additionalWorkspaceRoots) roots.add(workspaceRoot)
     return [...roots]
   }
 
@@ -5094,6 +5134,42 @@ function preservesFreshCodexSavedTranscript(raw: string, nativeId: string): bool
  */
 export type ManagedEnvironmentInputs = RuntimeFixtureInputs & { defaultCwd: string }
 
+export type ManagedUpdateFixtureOptions = {
+  /** Use the currently running owned web process and its authenticated API. */
+  liveWeb?: boolean
+  /** Add an outside-durable-soul pane to the initial or post-build census. */
+  hostPane?: 'before-build' | 'during-build'
+  /** Approval line read by the fixture-owned reset-mode operator. */
+  approvalLine?: string
+  /** Called after the simulated admission gate closes, before the census returns. */
+  onAdmissionHeld?: () => Promise<void>
+}
+
+export type ManagedUpdateFixtureReport = {
+  mode: ManagedUpdateMode
+  exitCode: number
+  effects: string[]
+  timeline: string[]
+  operatorLines: string[]
+  events: Record<string, unknown>[]
+  jsonlRows: Record<string, unknown>[]
+  approvalRead: string | null
+  approvalConsumed: boolean
+  supervisorBefore: { installationId: string; controlEpoch: number }
+  supervisorAfter: { installationId: string; controlEpoch: number }
+  viewsBefore: ManagedUpdateView[]
+  viewsAfter: ManagedUpdateView[]
+  clientDigestBefore: string
+  clientDigestAfter: string
+  webVersionBefore: string
+  webVersionAfter: string
+  callbackShapeBefore: string
+  callbackShapeAfter: string
+  reopenCalls: Array<{ requestId: string; candidate: ReopenCandidate; primaryViewVisibleImmediately: boolean }>
+  hostPaneProcess: { remainsRunning: boolean; response: string } | null
+  postReleaseCreateAccepted: boolean | null
+}
+
 export class ManagedRuntimeOwner {
   readonly repoRoot: string
   readonly runtime: RuntimeHarness
@@ -5102,12 +5178,16 @@ export class ManagedRuntimeOwner {
   info!: RuntimeWebInfo
   private serverBin = ''
   private readonly serverEnv: Record<string, string>
+  private managedUpdateClientFixtureRequested = false
+  private managedUpdateClientFixtureDirectory?: string
+  private managedUpdateClientBackupDirectory?: string
   private webHomeDir: string | undefined
   private readonly defaultCwd: string
   private readonly resolvedOperatorHome: string | undefined
   private readonly supervisorEnv: Record<string, string>
   private readonly supervisorBinaryKind: 'test' | 'release'
   private readonly enabledProviders: string[]
+  private readonly providerFreeFixture: boolean
   private readonly providerSettings: Record<string, Record<string, unknown>>
   private readonly freshAgentModes: string[]
   private readonly fixtureFreshAgentModes: string[]
@@ -5163,6 +5243,7 @@ export class ManagedRuntimeOwner {
       providerSettings?: Record<string, Record<string, unknown>>
       freshAgentModes?: string[]
       fixtureFreshAgentModes?: string[]
+      providerFreeFixture?: boolean
     } = { enabledProviders: ['opencode'] },
     webHomeDir?: string,
     fixtureInputsOrIsolation?: ManagedEnvironmentInputs | RuntimeOwnerIsolation,
@@ -5184,6 +5265,7 @@ export class ManagedRuntimeOwner {
     this.supervisorEnv = { ...supervisorEnv }
     this.supervisorBinaryKind = supervisorBinaryKind
     this.enabledProviders = [...qualificationProviders.enabledProviders]
+    this.providerFreeFixture = qualificationProviders.providerFreeFixture === true
     this.providerSettings = { ...qualificationProviders.providerSettings }
     this.freshAgentModes = [...(qualificationProviders.freshAgentModes ?? [])]
     this.fixtureFreshAgentModes = [...(qualificationProviders.fixtureFreshAgentModes ?? [])]
@@ -5220,6 +5302,376 @@ export class ManagedRuntimeOwner {
   }
 
   get workspaceCwd(): string { return this.stoppedRepairBatch?.input.workspacePath ?? this.defaultCwd }
+
+  /** Select an isolated static client directory before starting the web fixture. */
+  requestManagedUpdateClientFixture(): void {
+    if (this.web || this.runtimePreparation) throw new Error('managed-update client isolation must be requested before rig startup')
+    this.managedUpdateClientFixtureRequested = true
+  }
+
+  managedUpdateClientDirectory(): string {
+    if (!this.managedUpdateClientFixtureDirectory) throw new Error('isolated managed-update client fixture is not prepared')
+    return this.managedUpdateClientFixtureDirectory
+  }
+
+  /** Run the production updater orchestration against fixture-owned services. */
+  async runManagedUpdateFixture(
+    mode: ManagedUpdateMode,
+    options: ManagedUpdateFixtureOptions = {},
+  ): Promise<ManagedUpdateFixtureReport> {
+    const rig = this
+    const liveWeb = options.liveWeb === true
+    if (liveWeb && (mode !== 'client' || !this.web || !this.managedUpdateClientFixtureDirectory)) {
+      throw new Error('live web update fixtures require a running owned web and isolated client directory')
+    }
+    const testRoot = this.runtime.testRoot
+    await fsp.mkdir(testRoot, { recursive: true, mode: 0o700 })
+    const updateId = randomUUID()
+    const logPath = path.join(testRoot, `managed-update-${updateId}.jsonl`)
+    const paths = {
+      checkoutRoot: this.repoRoot, home: testRoot, runtimeDirectory: testRoot,
+      node: process.execPath, tsxEntry: path.join(this.repoRoot, 'node_modules/tsx/dist/cli.mjs'),
+      updaterScript: path.join(this.repoRoot, 'scripts/update-managed-runtime.ts'),
+      env: '/usr/bin/env', flock: '/usr/bin/flock', systemdRun: '/usr/bin/systemd-run',
+      systemctl: '/usr/bin/systemctl', pnpm: '/usr/bin/pnpm', cargo: '/usr/bin/cargo',
+      docker: '/usr/bin/docker', sqlite: '/usr/bin/sqlite3', toolPath: process.env.PATH ?? '/usr/bin:/bin',
+    }
+    const digestText = (value: string) => `sha256:${createHash('sha256').update(value).digest('hex')}`
+    const fixtureId = digestText(updateId).slice(7)
+    const syntheticViews = (): ManagedUpdateView[] => [
+      {
+        soulId: 'fixture-freshcodex-soul', incarnationId: 'fixture-freshcodex-incarnation-1',
+        launchState: 'running', cleanupState: 'none', intentRevision: 4, desiredState: 'running',
+        provider: 'codex', nativeSessionId: 'fixture-freshcodex-native', freshAgentSessionId: 'fixture-freshcodex-session',
+        providerStoreId: 'fixture-codex-provider-store', historyMessageCount: 2,
+      },
+      {
+        soulId: 'fixture-opencode-soul', incarnationId: 'fixture-opencode-incarnation-1',
+        launchState: 'running', cleanupState: 'none', intentRevision: 8, desiredState: 'running',
+        provider: 'opencode', nativeSessionId: 'fixture-opencode-native', terminalResumeSessionId: 'fixture-opencode-native',
+        providerStoreId: 'fixture-opencode-provider-store', historyMessageCount: 2,
+      },
+    ]
+    let views: ManagedUpdateView[] = liveWeb ? await this.inventory() as unknown as ManagedUpdateView[] : syntheticViews()
+    const viewsBefore = views.map(view => ({ ...view }))
+    const identity = { installationId: 'fixture-installation', controlEpoch: 11 }
+    let simulatedAdmission: 'open' | 'quiesced' | 'shutdown-latched' = 'open'
+    let hostPaneVisible = options.hostPane === 'before-build'
+    let webVersion = liveWeb ? 'owned-web-v1' : 'fixture-web-v1'
+    let callbackShape = liveWeb ? 'authenticated-runtime-readiness-v1' : 'fixture-callback-v1'
+    let clientDigestBefore = liveWeb
+      ? await managedUpdateDirectoryDigest(this.managedUpdateClientFixtureDirectory!)
+      : digestText('fixture-client-v1')
+    let clientDigestAfter = clientDigestBefore
+    const webVersionBefore = webVersion
+    const callbackShapeBefore = callbackShape
+    const identityBefore = liveWeb ? await this.managedUpdateSupervisorIdentity() : { ...identity }
+    const effects: string[] = []
+    const timeline: string[] = []
+    const operatorLines: string[] = []
+    const events: Record<string, unknown>[] = []
+    const reopenCalls: ManagedUpdateFixtureReport['reopenCalls'] = []
+    let approvalRead: string | null = null
+    let approvalConsumed = false
+    let admissionLease: { ownerId: string; leaseId: string } | undefined
+    let stagedClientDirectory: string | undefined
+    let fixtureChild: ChildProcess | undefined
+    let hostPaneProcess: ManagedUpdateFixtureReport['hostPaneProcess'] = null
+    let postReleaseCreateAccepted: boolean | null = null
+    const fixtureOwner: ManagedUpdateOwner = {
+      checkoutRoot: this.repoRoot,
+      webUnit: 'freshell-rust.service', supervisorUnit: 'freshell-supervisor.service',
+      webExecutable: path.join(this.repoRoot, 'target/release/freshell-server'),
+      supervisorExecutable: path.join(this.repoRoot, 'target/release/freshell-supervisor'),
+      adminCli: path.join(this.repoRoot, 'target/release/freshell-supervisor-admin'),
+      sessionHostBinary: path.join(this.repoRoot, 'target/release/freshell-session-host'),
+      clientDirectory: path.join(this.repoRoot, 'dist/client'),
+      dockerSocket: liveWeb ? this.runtime.broker.proxySocketPath : path.join(testRoot, 'fixture-docker.sock'),
+      controlSocket: liveWeb ? this.supervisor.controlSocket : path.join(testRoot, 'fixture-supervisor.sock'),
+      controlSecretFile: liveWeb ? this.supervisor.controlSecretFile : path.join(testRoot, 'fixture-secret'),
+      callbackSocket: path.join(testRoot, 'fixture-callback.sock'),
+      registryRoot: path.join(testRoot, 'registry'), runtimeRoot: path.join(testRoot, 'runtime'),
+      imageEnvironmentFile: path.join(testRoot, 'managed-runtime.env'),
+      environmentFile: path.join(this.repoRoot, '.env'),
+      imageReference: liveWeb ? this.runtime.imageRef : `sha256:${'a'.repeat(64)}`,
+      databasePath: path.join(testRoot, 'registry/registry.sqlite3'),
+      callbackAddress: liveWeb ? this.info.baseUrl : 'http://127.0.0.1:9',
+      providerRoots: [], workspaceRoots: [this.repoRoot],
+      ...(liveWeb ? { webMainPid: this.info.pid } : {}),
+    }
+
+    const readinessBody = () => {
+      const pane = hostPaneVisible ? [{ clientId: 'fixture-client', tabId: 'fixture-tab', paneId: 'host-agent-pane-17',
+        kind: 'fresh-agent', ownership: 'host-managed', provider: 'codex', sessionId: 'host-codex-session-17' }] : []
+      return {
+        installationId: identity.installationId, controlEpoch: identity.controlEpoch, revision: 1,
+        readiness: { initialScanState: 'complete', blockedSubsystems: [] },
+        paneOwnership: { complete: true, panes: pane, unattachedProcesses: [], readyToStop: pane.length === 0 },
+      }
+    }
+    const jsonLogger = createJsonLogger(logPath)
+    const dependencies: Record<string, any> = {
+      paths,
+      approval: {
+        async readLine() { approvalRead = options.approvalLine ?? 'APPROVED'; return approvalRead },
+        async create(content: string) {
+          const file = path.join(testRoot, `approval-${randomUUID()}`)
+          await fsp.writeFile(file, content, { mode: 0o600 })
+          return file
+        },
+        async consume(file: string) {
+          const content = await fsp.readFile(file, 'utf8').catch(() => '')
+          approvalConsumed = content === 'APPROVED\n'
+          return approvalConsumed
+        },
+        async remove(file: string) { await fsp.rm(file, { force: true }) },
+      },
+      handoff: {
+        async submit(request: { mode: ManagedUpdateMode; approvalFile?: string }) {
+          effects.push('handoff')
+          timeline.push('handoff')
+          return runManagedRuntimeWorker(request.mode, dependencies as unknown as ManagedRuntimeUpdateDependencies, request.approvalFile)
+        },
+        async runLockedWorker() { throw new Error('fixture does not run an external locked worker') },
+      },
+      owner: {
+        async resolve() { effects.push('owner'); return fixtureOwner },
+        async inspectGraph() { effects.push('graph'); return { units: {} } },
+        async loadPersistentResourceManifest() { effects.push('resource-manifest') },
+      },
+      artifacts: {
+        async build(_owner: ManagedUpdateOwner, selectedMode: ManagedUpdateMode) {
+          effects.push(`build:${selectedMode}`)
+          if (options.hostPane === 'during-build') hostPaneVisible = true
+          const stageRoot = path.join(testRoot, `staged-${randomUUID()}`)
+          await fsp.mkdir(stageRoot, { recursive: true, mode: 0o700 })
+          let clientDirectory: string | undefined
+          if (selectedMode !== 'durable-only') {
+            clientDirectory = path.join(stageRoot, 'client')
+            if (liveWeb) await fsp.cp(rig.managedUpdateClientFixtureDirectory!, clientDirectory, { recursive: true })
+            else await fsp.mkdir(clientDirectory, { recursive: true, mode: 0o700 })
+            const indexPath = path.join(clientDirectory, 'index.html')
+            let html = await fsp.readFile(indexPath, 'utf8').catch(() => '<!doctype html><html><head></head><body></body></html>')
+            const marker = `<meta name="managed-update-fixture" content="web-v2-${fixtureId}">`
+            html = /<meta name="managed-update-fixture"[^>]*>/i.test(html)
+              ? html.replace(/<meta name="managed-update-fixture"[^>]*>/i, marker)
+              : html.replace(/<head([^>]*)>/i, `<head$1>${marker}`)
+            await fsp.writeFile(indexPath, html)
+            stagedClientDirectory = clientDirectory
+          }
+          return {
+            stagingRoot: stageRoot,
+            ...(selectedMode === 'durable-only' ? {} : {
+              webExecutable: path.join(stageRoot, 'freshell-server'), clientDirectory,
+            }),
+            ...(selectedMode === 'client' ? {} : {
+              supervisorExecutable: path.join(stageRoot, 'freshell-supervisor'),
+              adminCli: path.join(stageRoot, 'freshell-supervisor-admin'),
+              sessionHostBinary: path.join(stageRoot, 'freshell-session-host'),
+              imageId: `sha256:${'b'.repeat(64)}`,
+            }),
+          }
+        },
+        async serverBuildInfo() { return { managedRuntimeV1: true, marker: 'fixture-web-v2' } },
+      },
+      filesystem: {
+        async webExecutableIdentity() {
+          return { live: { path: fixtureOwner.webExecutable, device: 1, inode: 1 }, selected: { path: fixtureOwner.webExecutable, device: 1, inode: 1 } }
+        },
+        async installExecutable(_source: string, target: string) {
+          effects.push(`install:${path.basename(target)}`)
+          if (target === fixtureOwner.webExecutable) webVersion = 'fixture-web-v2'
+          if (target === fixtureOwner.supervisorExecutable) callbackShape = 'fixture-callback-v2'
+        },
+        async swapClientDirectory(source: string) {
+          effects.push('client-swap')
+          if (liveWeb) {
+            const target = rig.managedUpdateClientFixtureDirectory!
+            await fsp.rm(target, { recursive: true, force: true })
+            await fsp.cp(source, target, { recursive: true })
+            clientDigestAfter = await managedUpdateDirectoryDigest(target)
+          } else {
+            clientDigestAfter = digestText('fixture-client-v2')
+          }
+        },
+        async installImageReference() { effects.push('install:image-ref') },
+      },
+      services: {
+        async stop(unit: string) {
+          effects.push(`stop:${unit}`)
+          if (liveWeb && unit === fixtureOwner.webUnit) await rig.web.kill('SIGTERM')
+        },
+        async start(unit: string) {
+          effects.push(`start:${unit}`)
+          if (liveWeb && unit === fixtureOwner.webUnit) {
+            rig.info = await rig.withManagedBin(() => rig.web.restart())
+            webVersion = 'owned-web-v2'
+          }
+          if (unit === fixtureOwner.supervisorUnit) {
+            identity.controlEpoch += 1
+            simulatedAdmission = 'open'
+            views = views.map(view => {
+              const containerId = typeof view.containerId === 'string' ? view.containerId : undefined
+              return { ...view, incarnationId: `${view.incarnationId}-updated`,
+                ...(containerId ? { containerId: `${containerId.slice(0, -1)}${containerId.endsWith('1') ? '2' : '1'}` } : {}) }
+            })
+          }
+        },
+        async restart(unit: string) { effects.push(`restart:${unit}`) },
+        async isActive(unit: string) { return unit === fixtureOwner.supervisorUnit || simulatedAdmission !== 'shutdown-latched' },
+        async state(unit: string) { return unit === fixtureOwner.supervisorUnit ? 'active' : 'inactive' },
+        async waitSupervisorReady() { effects.push('supervisor-ready') },
+        async waitWebReady() { effects.push('web-ready') },
+        async waitWebStopped() { effects.push('web-stopped') },
+        async waitCallbackReady() { effects.push('callback-ready') },
+      },
+      admin: {
+        async candidateSchemaVersion() { return 19 },
+        async currentSchemaVersion() { return 19 },
+        async health() {
+          if (liveWeb) return rig.managedUpdateSupervisorIdentity()
+          return { state: 'ok' as const, ...identity }
+        },
+        async inventory() { return views.map(view => ({ ...view })) },
+        async maintenanceInventory() { return [] },
+        async stop(soulId: string, expectedIntentRevision: number) {
+          const index = views.findIndex(view => view.soulId === soulId)
+          if (index < 0) return { outcome: 'backend_unavailable' as const }
+          const prior = views[index]!
+          const stopped = { ...prior, desiredState: 'stopped', launchState: 'stopped', cleanupState: 'verified_empty',
+            intentRevision: expectedIntentRevision + 1 }
+          views[index] = stopped
+          effects.push(`soul-stop:${soulId}`)
+          return { outcome: 'verified_empty' as const, view: stopped }
+        },
+        async reopen(candidate: ReopenCandidate) {
+          const requestId = `fixture-reopen-${randomUUID()}`
+          const index = views.findIndex(view => view.soulId === candidate.soulId)
+          if (index < 0) return { outcome: 'failed' as const }
+          const stopped = views[index]!
+          views[index] = { ...stopped, desiredState: 'running', launchState: 'running', cleanupState: 'none',
+            incarnationId: `${stopped.incarnationId.replace(/-updated$/, '')}-reopened`,
+            intentRevision: candidate.expectedIntentRevision + 1 }
+          reopenCalls.push({ requestId, candidate: { ...candidate }, primaryViewVisibleImmediately: true })
+          effects.push(`reopen:${requestId}`)
+          return { outcome: 'reopened' as const }
+        },
+      },
+      runtimeApi: {
+        async readAuthToken() { return liveWeb ? rig.info.token : 'fixture-auth-token' },
+        async request(_owner: ManagedUpdateOwner, token: string, method: 'GET' | 'POST', endpoint: string, body?: unknown) {
+          if (liveWeb) {
+            const response = await fetch(new URL(endpoint, rig.info.baseUrl), {
+              method, headers: { 'x-auth-token': token, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }), cache: 'no-store', redirect: 'error',
+            })
+            let responseBody: unknown
+            try { responseBody = await response.json() } catch { responseBody = undefined }
+            if (method === 'POST' && endpoint === '/api/runtime/maintenance/quiesce') await options.onAdmissionHeld?.()
+            return { status: response.status, body: responseBody }
+          }
+          if (method === 'GET' && endpoint === '/api/runtime/readiness') return { status: 200, body: readinessBody() }
+          if (method === 'POST' && endpoint === '/api/runtime/maintenance/quiesce') {
+            const selected = body as { ownerId: string }
+            simulatedAdmission = 'quiesced'
+            admissionLease = { ownerId: selected.ownerId, leaseId: `fixture-lease-${updateId}` }
+            await options.onAdmissionHeld?.()
+            const readiness = readinessBody()
+            return { status: 200, body: { drained: true, readyToStop: readiness.paneOwnership.readyToStop,
+              lease: { ...admissionLease, expiresInMs: 30_000 }, admission: { phase: 'quiesced', activePermits: 0 }, readiness } }
+          }
+          if (method === 'POST' && endpoint === '/api/runtime/maintenance/commit-stop') {
+            simulatedAdmission = 'shutdown-latched'
+            const readiness = readinessBody()
+            return { status: 200, body: { committed: true, admission: { phase: 'shutdown-latched' }, readiness } }
+          }
+          if (method === 'POST' && endpoint === '/api/runtime/maintenance/release') {
+            simulatedAdmission = 'open'
+            return { status: 200, body: { admission: { phase: 'open' } } }
+          }
+          if (method === 'GET' && endpoint === '/api/runtime/maintenance/status') {
+            return { status: 200, body: { phase: simulatedAdmission, activePermits: 0, leaseOwner: admissionLease?.ownerId ?? null } }
+          }
+          return { status: 404, body: {} }
+        },
+      },
+      docker: { async buildImage() { return `sha256:${'b'.repeat(64)}` }, async verifyDaemon() {} },
+      logger: {
+        async event(event: Record<string, unknown>) { events.push(event); await jsonLogger.event(event) },
+        async operator(line: string) {
+          operatorLines.push(line)
+          timeline.push(line === DEFAULT_UPDATE_REMINDER ? 'operator:default-reminder' : `operator:${line}`)
+        },
+      },
+      now: () => new Date('2026-11-01T12:34:56.789Z'),
+      randomSuffix: () => 'abc123def456',
+    }
+    try {
+      if (options.hostPane) {
+        fixtureChild = spawn(process.execPath, ['-e', "process.stdin.setEncoding('utf8');process.stdin.on('data',v=>process.stdout.write('host-agent-pong:'+v.trim()+'\\n'))"],
+          { stdio: ['pipe', 'pipe', 'ignore'] })
+      }
+      const args = mode === 'client' ? [] : [mode === 'all' ? '--all' : '--durable-only']
+      const exitCode = await runManagedRuntimeUpdate(args, dependencies as unknown as ManagedRuntimeUpdateDependencies)
+      let response = ''
+      const child = fixtureChild
+      const childStdin = child?.stdin
+      const childStdout = child?.stdout
+      if (child && childStdin && childStdout) {
+        const ping = `ping-${updateId}`
+        response = await new Promise<string>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('host-owned fixture process did not answer')), 5000)
+          const onData = (chunk: Buffer) => {
+            const lines = chunk.toString().split(/\r?\n/)
+            const match = lines.find(line => line.startsWith('host-agent-pong:'))
+            if (!match) return
+            clearTimeout(timeout)
+            childStdout.off('data', onData)
+            resolve(match)
+          }
+          childStdout.on('data', onData)
+          childStdin.write(`${ping}\n`)
+        })
+        hostPaneProcess = { remainsRunning: child.exitCode === null && child.signalCode === null, response }
+      }
+      if (options.hostPane === 'during-build') postReleaseCreateAccepted = simulatedAdmission === 'open'
+        && !effects.some(effect => effect.startsWith('stop:'))
+      const jsonl = await fsp.readFile(logPath, 'utf8').catch(() => '')
+      const jsonlRows = jsonl.split('\n').filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
+      const viewsAfter = liveWeb ? await this.inventory() as unknown as ManagedUpdateView[] : views.map(view => ({ ...view }))
+      const identityAfter = liveWeb ? await this.managedUpdateSupervisorIdentity() : { state: 'ok' as const, ...identity }
+      if (liveWeb) clientDigestAfter = await managedUpdateDirectoryDigest(this.managedUpdateClientFixtureDirectory!)
+      else if (mode === 'client' || mode === 'all') clientDigestAfter = digestText(mode === 'client' ? 'fixture-client-v2' : 'fixture-client-v2')
+      if (mode === 'all') webVersion = 'fixture-web-v2'
+      if (mode === 'durable-only') {
+        webVersion = webVersionBefore
+        callbackShape = callbackShapeBefore
+        clientDigestAfter = clientDigestBefore
+      }
+      if (options.hostPane === 'during-build') postReleaseCreateAccepted = simulatedAdmission === 'open'
+      return {
+        mode, exitCode, effects, timeline, operatorLines, events, jsonlRows, approvalRead, approvalConsumed,
+        supervisorBefore: { installationId: identityBefore.installationId, controlEpoch: identityBefore.controlEpoch },
+        supervisorAfter: { installationId: identityAfter.installationId, controlEpoch: identityAfter.controlEpoch },
+        viewsBefore, viewsAfter, clientDigestBefore, clientDigestAfter, webVersionBefore, webVersionAfter: webVersion,
+        callbackShapeBefore, callbackShapeAfter: callbackShape, reopenCalls, hostPaneProcess, postReleaseCreateAccepted,
+      }
+    } finally {
+      if (fixtureChild && fixtureChild.exitCode === null && fixtureChild.signalCode === null) {
+        fixtureChild.kill('SIGTERM')
+        await new Promise<void>(resolve => fixtureChild?.once('exit', () => resolve()))
+      }
+    }
+  }
+
+  private async managedUpdateSupervisorIdentity(): Promise<{ state: 'ok'; installationId: string; controlEpoch: number }> {
+    const health = await this.runtime.adminOk(this.supervisor, { method: 'health' })
+    const data = this.dataOf(health, 'health')
+    return {
+      state: 'ok', installationId: data.installationId ?? data.installation_id,
+      controlEpoch: data.controlEpoch ?? data.control_epoch,
+    }
+  }
 
   get operatorHomePath(): string | undefined { return this.resolvedOperatorHome }
 
@@ -5831,6 +6283,26 @@ export class ManagedRuntimeOwner {
   async start(): Promise<RuntimeWebInfo> {
     this.runtimePreparation ??= this.runtime.prepare(this.resolvedOperatorHome === undefined ? {} : { operatorHome: this.resolvedOperatorHome })
     await this.runtimePreparation
+    if (this.managedUpdateClientFixtureRequested) {
+      const clientDirectory = path.join(this.repoRoot, 'dist/client')
+      const backupDirectory = path.join(this.repoRoot, 'dist', `.managed-update-client-original-${randomUUID()}`)
+      await fsp.rename(clientDirectory, backupDirectory)
+      this.managedUpdateClientBackupDirectory = backupDirectory
+      this.managedUpdateClientFixtureDirectory = clientDirectory
+      try {
+        await fsp.cp(backupDirectory, clientDirectory, { recursive: true })
+        const indexPath = path.join(clientDirectory, 'index.html')
+        let html = await fsp.readFile(indexPath, 'utf8')
+        html = html.replace(/<head([^>]*)>/i, '<head$1><meta name="managed-update-fixture" content="web-v1">')
+        await fsp.writeFile(indexPath, html)
+      } catch (error) {
+        await fsp.rm(clientDirectory, { recursive: true, force: true })
+        await fsp.rename(backupDirectory, clientDirectory)
+        this.managedUpdateClientBackupDirectory = undefined
+        this.managedUpdateClientFixtureDirectory = undefined
+        throw error
+      }
+    }
     this.qualificationSupervisorBin = this.buildQualificationSupervisor()
     this.serverBin = this.buildManagedServer()
     const selected = this.pendingQualificationProviders()
@@ -5881,8 +6353,8 @@ export class ManagedRuntimeOwner {
       buildDirty: git(this.repoRoot, ['status', '--porcelain']).trim().length > 0,
       preserveHomeOnStop: true,
       writeDiagnosticArtifact: (fileName, value) => this.runtime.writeArtifact(fileName, value),
-      providerFreeFixture: this.fixtureFreshAgentModes.length > 0 && this.enabledProviders.length === 0
-        && this.freshAgentModes.every(mode => this.fixtureFreshAgentModes.includes(mode)),
+      providerFreeFixture: this.providerFreeFixture || (this.fixtureFreshAgentModes.length > 0 && this.enabledProviders.length === 0
+        && this.freshAgentModes.every(mode => this.fixtureFreshAgentModes.includes(mode))),
       homeDir: this.webHomeDir ?? this.resolvedOperatorHome,
       fixtureOnecliReferences: fixtureOnecliReferences(this.serverEnv, this.fixtureFreshAgentModes),
       env: {
@@ -6164,8 +6636,34 @@ export class ManagedRuntimeOwner {
         this.runtime.recordLifecycle('external.host_release_failed', { severity: 'error', ...handle })
       }
     }
-    try { await this.web?.stop() } catch (error) { errors.push(error) }
+    let webSettled = !this.web
+    try {
+      await this.web?.stop()
+      webSettled = true
+    } catch (error) {
+      errors.push(error)
+      try {
+        await this.web?.kill('SIGKILL')
+        await this.web?.stop()
+        webSettled = true
+      } catch (retryError) { errors.push(retryError) }
+    }
+    if (webSettled) {
+      try { await this.restoreManagedUpdateClientFixture() } catch (error) { errors.push(error) }
+    } else if (this.managedUpdateClientBackupDirectory) {
+      errors.push(new Error(`original dist/client is preserved at ${this.managedUpdateClientBackupDirectory} until the owned web process stops`))
+    }
     if (errors.length) throw new AggregateError(errors, 'held host release or web cleanup failed')
+  }
+
+  private async restoreManagedUpdateClientFixture(): Promise<void> {
+    const backup = this.managedUpdateClientBackupDirectory
+    const target = this.managedUpdateClientFixtureDirectory
+    if (!backup || !target) return
+    await fsp.rm(target, { recursive: true, force: true })
+    await fsp.rename(backup, target)
+    this.managedUpdateClientBackupDirectory = undefined
+    this.managedUpdateClientFixtureDirectory = undefined
   }
 
   async destroyTestRig(): Promise<{ ok: boolean; errors: string[] }> {

@@ -29,6 +29,161 @@ fn opencode_soul(terminal_id: &str) -> ManagedTerminalDescriptor {
     }
 }
 
+fn lifecycle(state: ManagedLifecycleState, reason: &str) -> ManagedLifecycle {
+    ManagedLifecycle {
+        state,
+        recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
+            desired_state: "running".into(),
+            recovery_state: match state {
+                ManagedLifecycleState::Blocked => "blocked",
+                ManagedLifecycleState::Ended => "stopped",
+                ManagedLifecycleState::Running => "live",
+                ManagedLifecycleState::Recovering => "recovering",
+            }
+            .into(),
+            reason: Some(reason.into()),
+            attempt_id: None,
+            incident_id: None,
+            durability_state: "unknown".into(),
+            allocation_state: "allocated".into(),
+        }),
+    }
+}
+
+struct InputController {
+    terminal: ManagedTerminalDescriptor,
+    lifecycle: ManagedLifecycle,
+    input_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ManagedTerminalController for InputController {
+    fn lifecycle_observation<'a>(
+        &'a self,
+        _: &'a ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Option<ManagedLifecycle>> {
+        Box::pin(std::future::ready(Some(self.lifecycle.clone())))
+    }
+
+    fn lookup_terminal<'a>(
+        &'a self,
+        _: &'a str,
+        _: Option<String>,
+    ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+        Box::pin(std::future::ready(Ok(Some(self.terminal.clone()))))
+    }
+
+    fn launch<'a>(
+        &'a self,
+        _: ManagedTerminalLaunch,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, ManagedTerminalLaunchError>>
+    {
+        panic!("input test must not launch a terminal")
+    }
+
+    fn input<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+        _: String,
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+        self.input_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn resize<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+        _: u16,
+        _: u16,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        panic!("input test must not resize a terminal")
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        panic!("input test must not stop a terminal")
+    }
+
+    fn read_output<'a>(
+        &'a self,
+        _: ManagedTerminalDescriptor,
+        _: i64,
+        _: u64,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+        panic!("input test must not read terminal output")
+    }
+}
+
+fn managed_input_reaches_controller(
+    descriptor: ManagedTerminalDescriptor,
+    lifecycle: ManagedLifecycle,
+) -> bool {
+    let registry = TerminalRegistry::new();
+    registry.register_managed(descriptor.clone(), descriptor.mode.clone());
+    let input_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    registry.set_managed_controller(Some(Arc::new(InputController {
+        terminal: descriptor.clone(),
+        lifecycle: lifecycle.clone(),
+        input_calls: Arc::clone(&input_calls),
+    })));
+    assert!(registry.publish_managed_lifecycle(&descriptor.terminal_id, Some(lifecycle),));
+
+    let result =
+        immediate(registry.managed_input(&descriptor.terminal_id, "safe test input".into()));
+    if result.is_ok() {
+        assert_eq!(input_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        true
+    } else {
+        assert_eq!(result, Err(ManagedTerminalInputError::RecoveryBlocked));
+        assert_eq!(input_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        false
+    }
+}
+
+#[test]
+fn blocked_fresh_opencode_startup_input_reaches_managed_controller() {
+    let mut descriptor = opencode_soul("T-open-first-input");
+    descriptor.resume_session_id = None;
+    assert!(managed_input_reaches_controller(
+        descriptor,
+        lifecycle(ManagedLifecycleState::Blocked, "CAPABILITY_PENDING"),
+    ));
+}
+
+#[test]
+fn ended_managed_terminal_input_stays_blocked_before_controller() {
+    let descriptor = opencode_soul("T-ended-input");
+    assert!(!managed_input_reaches_controller(
+        descriptor,
+        lifecycle(ManagedLifecycleState::Ended, "session_exited"),
+    ));
+}
+
+#[test]
+fn completed_managed_terminal_stays_blocked_when_cached_lifecycle_is_blocked() {
+    let descriptor = opencode_soul("T-completed-blocked-input");
+    let registry = TerminalRegistry::new();
+    registry.register_managed(descriptor.clone(), descriptor.mode.clone());
+    let input_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let blocked = lifecycle(ManagedLifecycleState::Blocked, "CAPABILITY_PENDING");
+    registry.set_managed_controller(Some(Arc::new(InputController {
+        terminal: descriptor.clone(),
+        lifecycle: blocked.clone(),
+        input_calls: Arc::clone(&input_calls),
+    })));
+
+    assert!(registry.finish_managed_completion(&descriptor.terminal_id, Some(17)));
+    assert!(registry.publish_managed_lifecycle(&descriptor.terminal_id, Some(blocked),));
+
+    assert_eq!(
+        immediate(registry.managed_input(&descriptor.terminal_id, "safe test input".into())),
+        Err(ManagedTerminalInputError::RecoveryBlocked)
+    );
+    assert_eq!(input_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// The supervisor's inventory after a web restart: lookup answers the soul.
 struct InventoryController {
     soul: ManagedTerminalDescriptor,

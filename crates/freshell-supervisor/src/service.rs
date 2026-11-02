@@ -1,8 +1,8 @@
 use crate::{
     admission::AdmissionPolicy,
     backend::{
-        host_actor_state_dir, BackendError, CreateFailureCertainty, CreateRuntimeFailure,
-        CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
+        host_actor_state_dir, BackendError, CreateFailureCertainty, CreateRuntimeSpec,
+        DockerEngineBackend, RuntimeBackend,
     },
     opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
@@ -130,6 +130,36 @@ impl LaunchWorkload {
                 .terminal
                 .as_ref()
                 .is_some_and(|terminal| terminal.mode == "opencode" && terminal.validate().is_ok())
+    }
+
+    pub(crate) fn requires_native_startup_observation(&self, provider: &str) -> bool {
+        let requires_native_identity = self.fixture.is_none()
+            && matches!(
+                provider,
+                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
+            )
+            && !self.fresh_agent.as_ref().is_some_and(|agent| {
+                crate::registry::deterministic_fresh_agent_fixture(provider, agent)
+            });
+        if !requires_native_identity {
+            return false;
+        }
+
+        // A new OpenCode TUI does not create its native session row until its
+        // first prompt. Waiting for that identity here blocks terminal.create,
+        // which is also the reply the browser needs before it can send input.
+        // Resume and Fresh Agent launches keep the exact startup identity check.
+        let fresh_opencode_terminal = provider == "opencode"
+            && self.fresh_agent.is_none()
+            && self.resume_spec.is_none()
+            && self.terminal.as_ref().is_some_and(|terminal| {
+                terminal.mode == "opencode"
+                    && terminal.resume_session_id.is_none()
+                    && terminal.opencode_transfer.is_none()
+                    && terminal.opencode_transfer_attempt_id.is_none()
+                    && terminal.opencode_adoption.is_none()
+            });
+        !fresh_opencode_terminal
     }
 }
 
@@ -1843,14 +1873,8 @@ impl Supervisor {
             .recovery_context(workload.soul_id.clone())
             .await
             .map_err(map_registry)?;
-        let requires_native_observation = workload.fixture.is_none()
-            && matches!(
-                native_context.provider.as_str(),
-                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
-            )
-            && !workload.fresh_agent.as_ref().is_some_and(|agent| {
-                crate::registry::deterministic_fresh_agent_fixture(&native_context.provider, agent)
-            });
+        let requires_native_observation =
+            workload.requires_native_startup_observation(&native_context.provider);
         if requires_native_observation {
             let wait = Box::pin(self.wait_for_native_startup(
                 &workload,
@@ -6001,6 +6025,7 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::CreateRuntimeFailure;
     use crate::registry::tests::materialize_test_runtime;
     use freshell_runtime_protocol::{
         AdminCommand, AdminResult, ControlRole, Envelope, ReopenOutcome, ReopenRequest, RequestId,
@@ -11815,6 +11840,94 @@ mod opencode_transfer_restart_tests {
             files,
             total_bytes: payload.len() as u64,
         }
+    }
+
+    #[test]
+    fn native_startup_observation_wait_exempts_only_fresh_opencode_terminals() {
+        use freshell_runtime_protocol::{
+            OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation, OpenCodeVerifiedRootTail,
+        };
+
+        fn terminal_workload(resume_session_id: Option<&str>) -> LaunchWorkload {
+            let mut terminal = serde_json::json!({
+                "terminalId": "terminal-opencode-policy",
+                "streamId": "stream-opencode-policy",
+                "mode": "opencode",
+                "program": "opencode",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "projectKey": "project-opencode-policy",
+                "runAsUid": 65534,
+                "runAsGid": 0,
+                "cols": 80,
+                "rows": 24
+            });
+            if let Some(session_id) = resume_session_id {
+                terminal["resumeSessionId"] = serde_json::json!(session_id);
+            }
+            LaunchWorkload {
+                soul_id: SoulId::new(),
+                fixture: None,
+                terminal: Some(serde_json::from_value(terminal).unwrap()),
+                fresh_agent: None,
+                resume_spec: None,
+            }
+        }
+
+        let fresh_terminal = terminal_workload(None);
+        assert!(!fresh_terminal.requires_native_startup_observation("opencode"));
+
+        let resumed_terminal = terminal_workload(Some("ses_existing"));
+        assert!(resumed_terminal.requires_native_startup_observation("opencode"));
+
+        let mut transferred_terminal = terminal_workload(Some("ses_exact"));
+        let transferred_spec = transferred_terminal.terminal.as_mut().unwrap();
+        transferred_spec.opencode_transfer = Some(descriptor());
+        transferred_spec.opencode_transfer_attempt_id = Some(ATTEMPT_A.into());
+        transferred_spec.validate().unwrap();
+        assert!(transferred_terminal.requires_native_startup_observation("opencode"));
+
+        let mut adopted_terminal = terminal_workload(Some("ses_exact"));
+        let baseline = OpenCodeAdoptionBaseline::from_descriptor(descriptor()).unwrap();
+        adopted_terminal
+            .terminal
+            .as_mut()
+            .unwrap()
+            .opencode_adoption = Some(OpenCodeAdoptionExpectation {
+            baseline,
+            root_session_id: "ses_exact".into(),
+            root_tail: OpenCodeVerifiedRootTail::QualifiedEmpty,
+            evidence_generation: "e".repeat(64),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: ATTEMPT_A.into(),
+        });
+        adopted_terminal
+            .terminal
+            .as_ref()
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(adopted_terminal.requires_native_startup_observation("opencode"));
+
+        let mut fresh_agent = terminal_workload(None);
+        fresh_agent.terminal = None;
+        fresh_agent.fresh_agent = Some(
+            serde_json::from_value(serde_json::json!({
+                "sessionId": "fresh-opencode-policy",
+                "provider": "opencode",
+                "sessionType": "freshopencode",
+                "runtimeVariant": "opencode-mcp",
+                "providerStoreId": "provider-store-policy",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0
+            }))
+            .unwrap(),
+        );
+        assert!(fresh_agent.requires_native_startup_observation("opencode"));
+
+        assert!(fresh_terminal.requires_native_startup_observation("codex"));
     }
 
     #[tokio::test]

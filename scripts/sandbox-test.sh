@@ -35,6 +35,32 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 IMAGE_TAG="freshell-sandbox:latest"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
 
+# A linked worktree's .git file points to its per-worktree admin directory,
+# which in turn resolves its objects and refs through the shared Git common
+# directory. The repo bind mount below does not expose that path. Mount only
+# the resolved common directory, at the same absolute path, and read-only so
+# Git can inspect this worktree without making host metadata writable.
+LINKED_WORKTREE_GIT_COMMON_DIR=""
+if [ -f "${REPO_ROOT}/.git" ]; then
+  WORKTREE_GIT_DIR="$(git -C "${REPO_ROOT}" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  WORKTREE_GIT_COMMON_DIR="$(git -C "${REPO_ROOT}" rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "${WORKTREE_GIT_DIR}" ] && [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
+    case "${WORKTREE_GIT_COMMON_DIR}" in
+      /*) ;;
+      *) WORKTREE_GIT_COMMON_DIR="${REPO_ROOT}/${WORKTREE_GIT_COMMON_DIR}" ;;
+    esac
+    WORKTREE_GIT_DIR="$(realpath -e "${WORKTREE_GIT_DIR}" 2>/dev/null || true)"
+    WORKTREE_GIT_COMMON_DIR="$(realpath -e "${WORKTREE_GIT_COMMON_DIR}" 2>/dev/null || true)"
+    case "${WORKTREE_GIT_DIR}" in
+      "${WORKTREE_GIT_COMMON_DIR}"/worktrees/*)
+        if [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
+          LINKED_WORKTREE_GIT_COMMON_DIR="${WORKTREE_GIT_COMMON_DIR}"
+        fi
+        ;;
+    esac
+  fi
+fi
+
 if [ "${1:-}" = "--provider-mountpoints" ]; then
   shift
   exec python3 "${REPO_ROOT}/scripts/testing/managed-provider-mountpoints-sandbox.py" "$@"
@@ -491,6 +517,7 @@ DOCKER_ARGS=(
   "${NETWORK_ARGS[@]}"
   --pids-limit 512
   --memory 8g
+  -e GIT_OPTIONAL_LOCKS=0
   -v "${REPO_ROOT}:/workspace"
   -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
   -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
@@ -505,6 +532,19 @@ DOCKER_ARGS=(
   -v "${CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules"
   -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
 )
+
+if [ -n "${LINKED_WORKTREE_GIT_COMMON_DIR}" ]; then
+  DOCKER_ARGS+=(
+    --mount "type=bind,src=${LINKED_WORKTREE_GIT_COMMON_DIR},dst=${LINKED_WORKTREE_GIT_COMMON_DIR},readonly"
+    # Rootless Docker presents the host-owned /workspace as container root,
+    # while the test command runs as the non-root sandbox user. Trust only
+    # this exact linked-worktree mount for Git's dubious-ownership check;
+    # nested fixture repositories remain subject to their own ownership.
+    -e GIT_CONFIG_COUNT=1
+    -e GIT_CONFIG_KEY_0=safe.directory
+    -e GIT_CONFIG_VALUE_0=/workspace
+  )
+fi
 
 if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
   # shellcheck disable=SC2054 # Commas belong to each single tmpfs option string.

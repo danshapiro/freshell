@@ -9567,18 +9567,12 @@ async fn handle_attach(
     // `attach.ready` from the shared identity registry (create-time
     // resume ids AND locator-associated ids both live here); the
     // registry crate is identity-agnostic, so it's resolved here.
-    let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
-
     // TERM-07 (`broker.ts:358-397` parity): the session-identity guard lives
     // here because this crate owns the identity registry. When it permits the
     // geometry, the registry applies it AND installs this subscriber in one
     // terminal-state handoff. That prevents concurrent first viewers from
     // both observing an empty subscriber map and silently replacing each
     // other's PTY dimensions before either attach reaches replay.
-    let geometry_identity_ok = attach_geometry_identity_ok(
-        attach.expected_session_ref.as_ref(),
-        canonical_session_ref.as_ref(),
-    );
     // TERM-07 seam: the client's replay-budget request rides both paths.
     let max_replay_bytes = attach.max_replay_bytes;
     // Round-2 finding F3: the negotiated forward-page upper bound rides
@@ -9590,51 +9584,98 @@ async fn handle_attach(
     // would race the very natural exit it exists to sequence), so a
     // natural exit while the deferral is armed can move this connection's
     // session into its exit-drain.
-    let paced_options = freshell_terminal::PacedAttachOptions {
-        replay_page_bytes: attach.replay_page_bytes,
-        paced_exit_notify,
+    let attach_registered = || {
+        let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
+        let geometry_identity_ok = attach_geometry_identity_ok(
+            attach.expected_session_ref.as_ref(),
+            canonical_session_ref.as_ref(),
+        );
+        let paced_options = freshell_terminal::PacedAttachOptions {
+            replay_page_bytes: attach.replay_page_bytes,
+            paced_exit_notify: paced_exit_notify.clone(),
+        };
+        let outcome = if geometry_identity_ok {
+            let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
+            let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
+            // `paced_terminal_replay_v1` gates the paced replay core
+            // (responsive-terminal-restore): a negotiated attach with an
+            // attachRequestId to a Running terminal returns the paced session
+            // start; every other shape keeps the legacy inline replay.
+            state.registry.attach_with_geometry(
+                &attach.terminal_id,
+                conn_id,
+                Arc::clone(conn_sink),
+                attach.attach_request_id.clone(),
+                attach.since_seq.unwrap_or(0),
+                terminal_output_batch_v1,
+                paced_terminal_replay_v1,
+                canonical_session_ref,
+                // Mode replay-sync: the client's positive surface-fresh marker
+                // (xterm recreation / user reset). Forwards the wire field 1:1; the
+                // registry owns the emit-vs-skip gating.
+                attach.surface_reset,
+                max_replay_bytes,
+                attach.intent,
+                cols,
+                rows,
+                paced_options,
+            )
+        } else {
+            state.registry.attach(
+                &attach.terminal_id,
+                conn_id,
+                Arc::clone(conn_sink),
+                attach.attach_request_id.clone(),
+                attach.since_seq.unwrap_or(0),
+                terminal_output_batch_v1,
+                paced_terminal_replay_v1,
+                canonical_session_ref,
+                attach.surface_reset,
+                max_replay_bytes,
+                paced_options,
+            )
+        };
+        (outcome, geometry_identity_ok)
     };
-    let outcome = if geometry_identity_ok {
-        let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
-        let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
-        // `paced_terminal_replay_v1` gates the paced replay core
-        // (responsive-terminal-restore): a negotiated attach with an
-        // attachRequestId to a Running terminal returns the paced session
-        // start; every other shape keeps the legacy inline replay.
-        state.registry.attach_with_geometry(
-            &attach.terminal_id,
-            conn_id,
-            Arc::clone(conn_sink),
-            attach.attach_request_id.clone(),
-            attach.since_seq.unwrap_or(0),
-            terminal_output_batch_v1,
-            paced_terminal_replay_v1,
-            canonical_session_ref,
-            // Mode replay-sync: the client's positive surface-fresh marker
-            // (xterm recreation / user reset). Forwards the wire field 1:1; the
-            // registry owns the emit-vs-skip gating.
-            attach.surface_reset,
-            max_replay_bytes,
-            attach.intent,
-            cols,
-            rows,
-            paced_options,
-        )
-    } else {
-        state.registry.attach(
-            &attach.terminal_id,
-            conn_id,
-            Arc::clone(conn_sink),
-            attach.attach_request_id.clone(),
-            attach.since_seq.unwrap_or(0),
-            terminal_output_batch_v1,
-            paced_terminal_replay_v1,
-            canonical_session_ref,
-            attach.surface_reset,
-            max_replay_bytes,
-            paced_options,
-        )
-    };
+    let (mut outcome, mut geometry_identity_ok) = attach_registered();
+
+    // A web-only update starts with an empty local registry while the
+    // supervisor still owns managed terminals. Reconstruct only the exact
+    // requested facade after the ordinary attach misses, then retry through
+    // the normal replay/geometry path. Never adopt based on a provider
+    // session id or a broad inventory scan.
+    if !outcome.found
+        && state.registry.managed_runtime_connection(conn_id)
+        && state.registry.has_managed_controller()
+    {
+        match state
+            .registry
+            .adopt_managed_for_reconcile(&attach.terminal_id, None, |mode| {
+                crate::terminal_naming::mode_title(state.cli_commands.as_ref(), mode)
+            })
+            .await
+        {
+            Ok(true) => {
+                if let Err(error) =
+                    refresh_managed_output_and_associate(state, &attach.terminal_id, 256 * 1024)
+                        .await
+                {
+                    return AttachReply::Error(Box::new(managed_runtime_error(
+                        &attach.terminal_id,
+                        &format!("output replay failed after attach recovery: {error}"),
+                    )));
+                }
+                (outcome, geometry_identity_ok) = attach_registered();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return AttachReply::Error(Box::new(managed_runtime_error(
+                    &attach.terminal_id,
+                    &format!("managed terminal lookup failed during attach recovery: {error}"),
+                )));
+            }
+        }
+    }
     // Read ownership and replay are already established. Project only the
     // registry's accepted canonical dimensions; a secondary viewer cannot
     // substitute its requested size. A refused or slow host command must not
@@ -14025,6 +14066,7 @@ mod managed_output_order_tests {
 
     struct ManagedOutputFixture {
         output: ManagedOutputRead,
+        lookup_descriptor: Option<ManagedTerminalDescriptor>,
         resize_result: StdMutex<Result<(), String>>,
         resizes: StdMutex<Vec<(String, u16, u16)>>,
         resize_completed: Arc<std::sync::atomic::AtomicUsize>,
@@ -14037,6 +14079,7 @@ mod managed_output_order_tests {
         fn new(output: ManagedOutputRead) -> Self {
             Self {
                 output,
+                lookup_descriptor: None,
                 resize_result: StdMutex::new(Err("unused resize".into())),
                 resizes: StdMutex::new(Vec::new()),
                 resize_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -14655,10 +14698,16 @@ mod managed_output_order_tests {
     impl ManagedTerminalController for ManagedOutputFixture {
         fn lookup_terminal<'a>(
             &'a self,
-            _: &'a str,
+            terminal_id: &'a str,
             _: Option<String>,
         ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
-            Box::pin(async { Err("unused lookup".into()) })
+            Box::pin(async move {
+                Ok(self
+                    .lookup_descriptor
+                    .as_ref()
+                    .filter(|descriptor| descriptor.terminal_id == terminal_id)
+                    .cloned())
+            })
         }
 
         fn launch<'a>(
@@ -14731,6 +14780,126 @@ mod managed_output_order_tests {
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
             Box::pin(async { Ok(self.output.clone()) })
         }
+    }
+
+    #[tokio::test]
+    async fn cold_registry_attach_adopts_exact_managed_opencode_view_before_resume_gate() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id = "T-cold-managed-opencode";
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-cold-opencode".into(),
+            incarnation_id: "incarnation-cold-opencode".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "stream-cold-opencode".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("sesColdOpenCode".into()),
+            create_request_id: Some("create-cold-opencode".into()),
+        };
+        let output = ManagedOutputRead {
+            lifecycle: Some(ManagedLifecycle {
+                state: ManagedLifecycleState::Running,
+                recovery_summary: None,
+            }),
+            completion: None,
+            stream_epoch: Some(descriptor.stream_id.clone()),
+            incarnation_id: Some(descriptor.incarnation_id.clone()),
+            reset_required: false,
+            truncated: false,
+            retained_from_seq: 0,
+            head_seq: 0,
+            exit_code: None,
+            native_session_id: descriptor.resume_session_id.clone(),
+            chunks: vec![],
+            opencode_activity: None,
+            codex_activity: None,
+        };
+        // The retained supervisor inventory is the only source of the
+        // descriptor; the new web process starts with an empty registry.
+        let controller = Arc::new(ManagedOutputFixture {
+            output,
+            lookup_descriptor: Some(descriptor.clone()),
+            resize_result: StdMutex::new(Ok(())),
+            resizes: StdMutex::new(Vec::new()),
+            resize_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            resize_gate: StdMutex::new(None),
+            resize_reply_gate: StdMutex::new(None),
+            host_geometry: Arc::new(StdMutex::new((80, 24))),
+        });
+        state.registry.set_managed_controller(Some(controller));
+        let conn_id = 41;
+        state.registry.set_managed_runtime_connection(conn_id, true);
+
+        let (mut ws_tx, _client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let frames = Arc::new(StdMutex::new(Vec::<ServerMessage>::new()));
+        let captured = Arc::clone(&frames);
+        let conn_sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+        let (interactive_create_tx, _interactive_create_rx) = mpsc::channel(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+        let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+
+        assert!(
+            handle_client_text(
+                &serde_json::json!({
+                    "type": "terminal.attach",
+                    "terminalId": terminal_id,
+                    "intent": "viewport_hydrate",
+                    "cols": 80,
+                    "rows": 24,
+                    "sinceSeq": 0,
+                    "attachRequestId": "attach-cold-opencode",
+                })
+                .to_string(),
+                &mut ws_tx,
+                &state,
+                conn_id,
+                &conn_sink,
+                false,
+                false,
+                false,
+                false,
+                &interactive_create_tx,
+                &create_cancel_rx,
+                &mut host_stats_last_refresh_at,
+                &mut conn_identity,
+                &mut paced_sessions,
+                &None,
+            )
+            .await
+        );
+        assert!(
+            frames.lock().unwrap().iter().any(|frame| matches!(
+                frame,
+                ServerMessage::TerminalAttachReady(ready) if ready.terminal_id == terminal_id
+            )),
+            "the first attach must restore the facade from exact supervisor inventory"
+        );
+        assert_eq!(
+            state
+                .registry
+                .live_session_owner(Some(&state.identity), "opencode", "sesColdOpenCode"),
+            Some(terminal_id.to_string()),
+            "the attached managed session must be visible to exact resume gating"
+        );
+
+        let mut resume_id = Some("sesColdOpenCode".to_string());
+        let mut launch_intent = super::LaunchIntent::Resume;
+        let mut claude_prealloc = false;
+        let gate = super::gate_wire_resume(
+            &state,
+            "opencode",
+            &mut resume_id,
+            &mut launch_intent,
+            &mut claude_prealloc,
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
+        )
+        .await;
+        assert!(gate.stale_session_id.is_none());
+        assert!(!gate.recovery_blocked);
+        assert_eq!(resume_id.as_deref(), Some("sesColdOpenCode"));
     }
 
     struct ExitedOpenCodeRead {

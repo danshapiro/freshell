@@ -4429,11 +4429,7 @@ fn prepare_provider_state_for_fresh_launch_at(
                     .as_ref()
                     .is_some_and(|context| context.prepared_inputs.is_some())
             {
-                verify_initialized_provider_home(
-                    &paths.provider_home,
-                    terminal.run_as_uid,
-                    terminal.run_as_gid,
-                )
+                prepare_initial_provider_home_for_fresh_terminal(terminal, &paths.provider_home)
             } else {
                 write_provider_bootstrap_files(
                     &terminal.mode,
@@ -4459,6 +4455,21 @@ fn prepare_provider_state_for_fresh_launch_at(
                 terminal.run_as_uid,
                 terminal.run_as_gid,
             )
+            .and_then(|()| {
+                if terminal.provider_bootstrap_files.is_empty()
+                    && terminal
+                        .provider_launch_context
+                        .as_ref()
+                        .is_some_and(|context| context.prepared_inputs.is_some())
+                {
+                    verify_initialized_provider_home(
+                        &paths.provider_home,
+                        terminal.run_as_uid,
+                        terminal.run_as_gid,
+                    )?;
+                }
+                Ok(())
+            })
         },
         |terminal| {
             prepare_files(terminal)?;
@@ -4687,6 +4698,57 @@ fn verify_initialized_provider_home(
         return Err("initialized provider HOME physical ownership changed".into());
     }
     Ok(Vec::new())
+}
+
+/// A brand-new terminal can have an empty prepared-input manifest, so no
+/// provider mountpoint helper has transferred the fresh volume root yet. Make
+/// that root private and hand it to the provider only for a launch without an
+/// existing native identity. A resumed/adopted session keeps the strict
+/// initialized-home check above.
+fn prepare_initial_provider_home_for_fresh_terminal(
+    terminal: &TerminalLaunchSpec,
+    home: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata =
+        std::fs::symlink_metadata(home).map_err(|_| "initialized provider HOME unavailable")?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || std::fs::canonicalize(home).map_err(|_| "initialized provider HOME unavailable")? != home
+    {
+        return Err("managed provider HOME must be a physical directory".into());
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    let provider_owned =
+        metadata.uid() == terminal.run_as_uid && metadata.gid() == terminal.run_as_gid;
+    if provider_owned && mode == 0o700 {
+        verify_initialized_provider_home(home, terminal.run_as_uid, terminal.run_as_gid)?;
+        return Ok(Vec::new());
+    }
+
+    let is_new_identity = terminal.resume_session_id.is_none()
+        && terminal.opencode_transfer.is_none()
+        && terminal.opencode_adoption.is_none();
+    if !is_new_identity {
+        return Err("initialized provider HOME physical ownership changed".into());
+    }
+
+    let initial_host_owned = metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.gid() == unsafe { libc::getegid() };
+    if !provider_owned && !initial_host_owned {
+        return Err("provider HOME is not owned by the selected provider or initial host".into());
+    }
+
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "initialized provider HOME mode setup failed")?;
+    if provider_owned {
+        verify_initialized_provider_home(home, terminal.run_as_uid, terminal.run_as_gid)?;
+        Ok(Vec::new())
+    } else {
+        Ok(vec![home.to_path_buf()])
+    }
 }
 
 fn prepare_fresh_opencode_provider_home_before_input_validation(
@@ -17932,6 +17994,99 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 "physical lchown must leave the target inode untouched"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_terminal_initializes_a_fresh_home_with_empty_prepared_inputs() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("provider");
+        std::fs::create_dir(&home).unwrap();
+        // A new Docker volume can begin with the image's broad root mode even
+        // when no provider files or configuration references were selected.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let private = root.path().join("private");
+        let paths = ProviderConfigPaths {
+            private_mount: private,
+            provider_home: home.clone(),
+        };
+        let provider_uid = if unsafe { libc::geteuid() } == 0 {
+            65534
+        } else {
+            unsafe { libc::geteuid() }
+        };
+        let provider_gid = if unsafe { libc::geteuid() } == 0 {
+            0
+        } else {
+            unsafe { libc::getegid() }
+        };
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"codex-empty-inputs", "streamId":"codex-empty-inputs-stream",
+            "mode":"codex", "program":"codex", "cwd":root.path(),
+            "runAsUid":provider_uid, "runAsGid":provider_gid, "cols":80, "rows":24,
+            "projectKey":"codex-empty-inputs", "workspacePath":root.path(),
+            "providerLaunchContext":{
+                "preparation":{"codex":{"tui_args":[],"sidecar_args":[]}},
+                "mcpCapability":{"grantId":"grant-codex-empty-inputs","endpoint":"http://host.docker.internal:3344","providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":"grant-codex-empty-inputs","manifest":{"relativePath":".freshell/input-manifest.json","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            }
+        })).unwrap();
+
+        let auth_dir = root.path().join("provider-auth-stage");
+        prepare_provider_state_for_fresh_launch_at(
+            &mut terminal,
+            &paths,
+            &root.path().join("inputs"),
+            |terminal| {
+                verify_initialized_provider_home(&home, provider_uid, provider_gid)?;
+                prepare_provider_files_at(
+                    &home,
+                    &auth_dir,
+                    &[(".codex/auth.json", b"fixture-auth".to_vec())],
+                    &[],
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                    false,
+                )
+            },
+        )
+        .expect("a new empty provider volume must be initialized for a Codex terminal");
+
+        let metadata = std::fs::metadata(&home).unwrap();
+        assert_eq!(metadata.uid(), provider_uid);
+        assert_eq!(metadata.gid(), provider_gid);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        let auth = home.join(".codex/auth.json");
+        let auth_metadata = std::fs::metadata(&auth).unwrap();
+        assert_eq!(auth_metadata.uid(), provider_uid);
+        assert_eq!(auth_metadata.gid(), provider_gid);
+        assert_eq!(auth_metadata.mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(auth).unwrap(), b"fixture-auth");
+
+        let resumed_home = root.path().join("resumed-provider");
+        std::fs::create_dir(&resumed_home).unwrap();
+        std::fs::set_permissions(&resumed_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resumed_before = std::fs::metadata(&resumed_home).unwrap();
+        let mut resumed_terminal = terminal.clone();
+        resumed_terminal.resume_session_id = Some("ses_existing_codex".into());
+        let resumed_paths = ProviderConfigPaths {
+            private_mount: root.path().join("resumed-private"),
+            provider_home: resumed_home.clone(),
+        };
+        let error = prepare_provider_state_for_fresh_launch_at(
+            &mut resumed_terminal,
+            &resumed_paths,
+            &root.path().join("resumed-inputs"),
+            |_| Ok(()),
+        )
+        .expect_err("a resumed terminal must keep the exact initialized-home check");
+        assert!(error.message.contains("initialized provider HOME"));
+        let resumed_after = std::fs::metadata(&resumed_home).unwrap();
+        assert_eq!(resumed_after.uid(), resumed_before.uid());
+        assert_eq!(resumed_after.gid(), resumed_before.gid());
+        assert_eq!(resumed_after.mode() & 0o777, 0o755);
     }
 
     #[cfg(unix)]

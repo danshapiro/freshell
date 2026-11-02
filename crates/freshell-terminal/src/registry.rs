@@ -4943,7 +4943,8 @@ impl TerminalRegistry {
         let terminal = self
             .managed_descriptor(terminal_id)
             .ok_or_else(|| "managed terminal not found".to_string())?;
-        if !self.is_pty_running(terminal_id) {
+        let admitted = self.managed_input_lifecycle_admits_controller(terminal_id);
+        if !admitted {
             return Err(ManagedTerminalInputError::RecoveryBlocked);
         }
         let controller = self
@@ -4953,6 +4954,23 @@ impl TerminalRegistry {
             .clone()
             .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
         controller.input(terminal, data).await
+    }
+
+    /// A managed `Blocked` lifecycle is a recovery verdict, not proof that the
+    /// session-host process exited. Let the controller recheck/recover it. An
+    /// `Ended` lifecycle remains fenced here because no managed process is
+    /// expected to accept more input.
+    fn managed_input_lifecycle_admits_controller(&self, terminal_id: &str) -> bool {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return false;
+        };
+        let state = shared.lock().expect("terminal lock");
+        state.status == TerminalRunStatus::Running
+            || (!state.managed_exit_notified
+                && state
+                    .managed_lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.state == ManagedLifecycleState::Blocked))
     }
 
     /// Reserve a single projection of accepted client geometry to the current

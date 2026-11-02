@@ -1823,7 +1823,14 @@ fn classify_fresh_agent_pane(
     let session_type = pane.session_type.as_deref();
     let matching_views = runtime_views
         .iter()
-        .filter(|view| view.fresh_agent_session_id.as_deref() == Some(session_id))
+        .filter(|view| {
+            // The ordinary Fresh Agent pane changes `sessionId` from the
+            // launch/session identity to the provider's native session ID
+            // after materialization. Both identities are published by the
+            // same RuntimeView, so either exact match can establish ownership.
+            view.fresh_agent_session_id.as_deref() == Some(session_id)
+                || view.native_session_id.as_deref() == Some(session_id)
+        })
         .collect::<Vec<_>>();
     if !matching_views.is_empty() {
         let current_matches = matching_views
@@ -2975,6 +2982,54 @@ mod tests {
         assert_eq!(classification.ownership, PaneOwnership::Unknown);
         assert!(classification.soul_id.is_none());
         assert!(classification.incarnation_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_agent_native_session_identity_matches_exact_managed_view() {
+        use freshell_runtime_protocol::DesiredState;
+
+        let root = tempfile::tempdir().unwrap();
+        let (_registry, view) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
+            root.path(),
+            false,
+            "codex",
+            "freshcodex",
+            "managed-native-session",
+            false,
+        )
+        .await;
+        assert_eq!(view.desired_state, DesiredState::Running);
+        assert_eq!(
+            view.launch_state,
+            freshell_runtime_protocol::LaunchState::Running
+        );
+        let pane = AgentPaneOwnership {
+            client_id: "client".into(),
+            tab_id: "tab".into(),
+            pane_id: "pane".into(),
+            kind: "fresh-agent".into(),
+            provider: Some("codex".into()),
+            terminal_id: None,
+            session_id: view.native_session_id.clone(),
+            session_type: Some("freshcodex".into()),
+            identity_consistent: true,
+            ownership: PaneOwnership::Unknown,
+            soul_id: None,
+            incarnation_id: None,
+        };
+
+        let classification = classify_agent_pane(&pane, &[view.clone()], &[], None);
+
+        assert_eq!(classification.ownership, PaneOwnership::Durable);
+        assert_eq!(
+            classification.soul_id.as_deref(),
+            Some(view.soul_id.as_str())
+        );
+        assert_eq!(
+            classification.incarnation_id.as_deref(),
+            Some(view.incarnation_id.as_str())
+        );
     }
 
     #[cfg(unix)]
