@@ -127,20 +127,6 @@ if [ "$run_rust" = 0 ] && [ "$run_ts" = 0 ]; then
   exit 0
 fi
 
-run_selected_cargo_test() {
-  if [ "${FRESHELL_RUST_TEST_SANDBOX:-0}" = "1" ]; then
-    # The hook/planner may come from the shared hook owner, but both the
-    # launcher and sandbox wrapper must come from the pushing worktree.
-    local runner
-    runner="$PUSH_ROOT/scripts/testing/run-rust-tests.ts"
-    [ -f "$runner" ] || fail "pushing worktree is missing scripts/testing/run-rust-tests.ts"
-    [ -n "$TSX" ] || fail "sandboxed Rust tests require tsx to launch scripts/testing/run-rust-tests.ts"
-    "$TSX" "$runner" --pre-push-cargo-test "$@"
-  else
-    cargo test "$@"
-  fi
-}
-
 if [ "$run_rust" = 1 ]; then
   # cargo can live in ~/.cargo/bin, which stripped-environment hook contexts
   # (ssh, agents, IDEs, cron) don't always carry on PATH.
@@ -167,16 +153,18 @@ if [ "$run_rust" = 1 ]; then
         fail "rust test plan could not be computed (scripts/hooks/rust-test-targets.ts)"
         ;;
       workspace)
-        echo "pre-push: rust gate — cargo test --workspace --exclude freshell-tauri (the long one)" >&2
-        run_selected_cargo_test --workspace --exclude freshell-tauri --locked \
-          || fail "cargo test --workspace --exclude freshell-tauri --locked"
+        test_command="cargo test --workspace --exclude freshell-tauri --locked"
+        echo "pre-push: rust gate — sandboxed $test_command (the long one)" >&2
+        "$HOOK_DIR/../sandbox-test.sh" "$test_command" \
+          || fail "$test_command (sandboxed)"
         ;;
       packages)
-        pkgs_args=()
-        for p in $test_pkgs; do pkgs_args+=(-p "$p"); done
-        echo "pre-push: rust gate — targeted cargo test --locked ${pkgs_args[*]}" >&2
-        run_selected_cargo_test --locked "${pkgs_args[@]}" \
-          || fail "cargo test --locked ${pkgs_args[*]}"
+        pkgs_args=""
+        for p in $test_pkgs; do pkgs_args="$pkgs_args -p $p"; done
+        test_command="cargo test --locked${pkgs_args}"
+        echo "pre-push: rust gate — sandboxed targeted cargo test:$pkgs_args" >&2
+        "$HOOK_DIR/../sandbox-test.sh" "$test_command" \
+          || fail "$test_command (sandboxed)"
         ;;
       skip)
         ;;
