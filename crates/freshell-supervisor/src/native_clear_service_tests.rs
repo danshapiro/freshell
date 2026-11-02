@@ -363,6 +363,19 @@ impl Fixture {
 #[tokio::test]
 async fn resolve_attempt_id_crosses_the_supervisor_and_legacy_requests_still_work() {
     let fixture = Fixture::new().await;
+    {
+        let mut host = fixture.host.lock().unwrap();
+        host.root = PARENT.into();
+        host.journal_root = PARENT.into();
+        host.observation = Some(NativeIdentityObservation {
+            native_session_id: PARENT.into(),
+            incarnation_id: fixture.launch.incarnation_id.clone(),
+            launch_nonce: fixture.launch.launch_nonce.clone(),
+            evidence_revision: fixture.launch.evidence_revision,
+            source: NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        });
+    }
     for attempt in [None, Some("answer-attempt-2")] {
         let mut envelope = Envelope::new(
             RequestId::new(),
