@@ -1963,6 +1963,20 @@ async fn grant_execution_stages(
         })?;
         timeline.completed("resolve_secrets");
         if matches!(provider, "opencode" | "codex" | "claude" | "amplifier") {
+            if let Some(terminal) = terminal.as_ref() {
+                prepare_fresh_opencode_provider_home_before_input_validation(
+                    Some(terminal),
+                    resume_spec.is_some(),
+                    &state.provider_config_paths,
+                )
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("prepare managed provider state: {error}"),
+                    )
+                    .with_diagnostic_code(RuntimeDiagnosticCode::ProviderStatePrepareFailed)
+                })?;
+            }
             let generated = timeline
                 .run("prepare_provider_inputs", async {
                     provider_input_preparation::prepare_for_identity(
@@ -4673,6 +4687,90 @@ fn verify_initialized_provider_home(
         return Err("initialized provider HOME physical ownership changed".into());
     }
     Ok(Vec::new())
+}
+
+fn prepare_fresh_opencode_provider_home_before_input_validation(
+    terminal: Option<&TerminalLaunchSpec>,
+    is_resume: bool,
+    paths: &ProviderConfigPaths,
+) -> Result<(), String> {
+    let Some(terminal) = terminal else {
+        return Ok(());
+    };
+    if is_resume
+        || terminal.mode != "opencode"
+        || terminal.resume_session_id.is_some()
+        || terminal.opencode_transfer.is_some()
+        || terminal.opencode_transfer_attempt_id.is_some()
+        || terminal.opencode_adoption.is_some()
+        || !terminal.provider_bootstrap_files.is_empty()
+        || !terminal
+            .provider_launch_context
+            .as_ref()
+            .is_some_and(|context| context.prepared_inputs.is_some())
+    {
+        return Ok(());
+    }
+
+    initialize_empty_initial_host_provider_home(
+        &paths.provider_home,
+        (unsafe { libc::geteuid() }, unsafe { libc::getegid() }),
+        (terminal.run_as_uid, terminal.run_as_gid),
+    )
+}
+
+fn initialize_empty_initial_host_provider_home(
+    home: &Path,
+    initial_owner: (u32, u32),
+    selected_owner: (u32, u32),
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata =
+        std::fs::symlink_metadata(home).map_err(|_| "provider HOME is unavailable".to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || std::fs::canonicalize(home).map_err(|_| "provider HOME is not canonical")? != home
+    {
+        return Err("provider HOME must be a canonical physical directory".into());
+    }
+
+    let permissions = metadata.permissions().mode();
+    let mode = permissions & 0o777;
+    if (metadata.uid(), metadata.gid(), mode) == (selected_owner.0, selected_owner.1, 0o700) {
+        verify_initialized_provider_home(home, selected_owner.0, selected_owner.1)?;
+        emit_environment_event(serde_json::json!({
+            "severity": "info", "event": "provider.home.initialization.reused",
+            "stage": "session_host", "provider": "opencode",
+            "provider_uid": selected_owner.0, "provider_gid": selected_owner.1
+        }));
+        return Ok(());
+    }
+
+    if (metadata.uid(), metadata.gid(), permissions & 0o7777)
+        != (initial_owner.0, initial_owner.1, 0o755)
+    {
+        return Err("provider HOME is not in the known initial host-owned state".into());
+    }
+    if std::fs::read_dir(home)
+        .map_err(|_| "provider HOME emptiness is unknown".to_string())?
+        .next()
+        .is_some()
+    {
+        return Err("provider HOME is not empty".into());
+    }
+
+    set_mode(home, 0o700)?;
+    // Ownership is the final mutation: all metadata changes are complete
+    // before the private HOME becomes traversable by the provider identity.
+    set_owner(home, selected_owner.0, selected_owner.1)?;
+    verify_initialized_provider_home(home, selected_owner.0, selected_owner.1)?;
+    emit_environment_event(serde_json::json!({
+        "severity": "info", "event": "provider.home.initialization.completed",
+        "stage": "session_host", "provider": "opencode",
+        "provider_uid": selected_owner.0, "provider_gid": selected_owner.1
+    }));
+    Ok(())
 }
 
 fn create_codex_home_if_absent(home: &Path) -> Result<Option<PathBuf>, String> {
@@ -16885,6 +16983,385 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             .tempdir()
             .unwrap()
             .keep()
+    }
+
+    #[cfg(unix)]
+    mod provider_home_initialization {
+        use super::super::{ProviderConfigPaths, TerminalLaunchSpec};
+
+        fn opencode_terminal_with_prepared_inputs(
+            workspace: &std::path::Path,
+            uid: u32,
+            gid: u32,
+        ) -> TerminalLaunchSpec {
+            serde_json::from_value(serde_json::json!({
+                "terminalId":"provider-home-initialization",
+                "streamId":"provider-home-initialization",
+                "mode":"opencode",
+                "program":"opencode",
+                "args":[],
+                "cwd":workspace,
+                "workspacePath":workspace,
+                "projectKey":"provider-home-initialization",
+                "cols":80,
+                "rows":24,
+                "runAsUid":uid,
+                "runAsGid":gid,
+                "providerBootstrapFiles":[],
+                "providerLaunchContext":{
+                    "preparation":{"opencode":{"project_config":[],"tui_config":null,"tui_source":null,"inline_config":false}},
+                    "config":[],
+                    "mcpCapability":{
+                        "grantId":"grant-provider-home-initialization",
+                        "endpoint":"http://host.docker.internal:4000",
+                        "providerRelativePath":".freshell/mcp-capability.json"
+                    },
+                    "preparedInputs":{
+                        "generationId":"grant-provider-home-initialization",
+                        "manifest":{
+                            "relativePath":".freshell/input-manifest.json",
+                            "sha256":"0000000000000000000000000000000000000000000000000000000000000000",
+                            "sourceCount":0,
+                            "aliasCount":0,
+                            "recipeCount":0
+                        }
+                    }
+                }
+            }))
+            .unwrap()
+        }
+
+        fn initialize(
+            home: &std::path::Path,
+            initial_owner: (u32, u32),
+            selected_owner: (u32, u32),
+        ) -> Result<(), String> {
+            super::super::initialize_empty_initial_host_provider_home(
+                home,
+                initial_owner,
+                selected_owner,
+            )
+        }
+
+        #[tokio::test]
+        async fn provider_home_initialization_empty_home_precedes_prepared_input_validation() {
+            use sha2::Digest;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let mut terminal = opencode_terminal_with_prepared_inputs(root.path(), uid, gid);
+            let user_provider = root.path().join("private/user-provider");
+            let manifest_dir = user_provider.join(".freshell");
+            std::fs::create_dir_all(&manifest_dir).unwrap();
+            let manifest = freshell_platform::opencode_recipe::SourceManifest {
+                version: 1,
+                cwd: root.path().to_path_buf(),
+                original_home: home.clone(),
+                global_config_root: None,
+                sources: vec![],
+                files: vec![],
+                frozen_inputs: vec![],
+                user_owns_freshell_mcp: false,
+                native_source_flags: vec![],
+                resource_roots: vec![],
+                rebind_enabled: true,
+                inline_edits: Default::default(),
+            };
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(manifest_dir.join("input-manifest.json"), &manifest_bytes).unwrap();
+            terminal
+                .provider_launch_context
+                .as_mut()
+                .unwrap()
+                .prepared_inputs
+                .as_mut()
+                .unwrap()
+                .manifest
+                .sha256 = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+            let paths = ProviderConfigPaths {
+                private_mount: root.path().join("private"),
+                provider_home: home.clone(),
+            };
+            let provider_state_preparation_called = std::cell::Cell::new(false);
+
+            super::super::prepare_fresh_opencode_provider_home_before_input_validation(
+                Some(&terminal),
+                false,
+                &paths,
+            )
+            .expect("fresh empty host-owned HOME should be initialized before input checks");
+
+            super::super::provider_input_preparation::prepare_for_identity(
+                terminal.provider_launch_context.as_ref(),
+                &mut super::super::provider_secret_resolution::ResolvedProviderSecrets::default(),
+                &freshell_runtime_protocol::ProviderPathInputs::default(),
+                &user_provider,
+                &home,
+                (uid, gid),
+            )
+            .await
+            .expect("prepared input validation runs after HOME initialization");
+
+            let result = super::super::prepare_provider_state_for_fresh_launch_at(
+                &mut terminal,
+                &paths,
+                &root.path().join("bootstrap"),
+                |_| {
+                    let metadata = std::fs::metadata(&home).unwrap();
+                    assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+                    assert_eq!(metadata.mode() & 0o777, 0o700);
+                    provider_state_preparation_called.set(true);
+                    Ok(())
+                },
+            );
+
+            assert!(
+                result.is_ok(),
+                "fresh empty HOME should be initialized before prepared input validation: {result:?}"
+            );
+            assert!(provider_state_preparation_called.get());
+            let metadata = std::fs::metadata(&home).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+
+        #[test]
+        fn provider_home_initialization_refuses_nonempty_initial_home_without_mutation() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let sentinel = home.join("native-state");
+            std::fs::write(&sentinel, b"preserve-existing-provider-state").unwrap();
+            let before = std::fs::symlink_metadata(&home).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+
+            let error = initialize(&home, (uid, gid), (uid, gid)).unwrap_err();
+
+            assert!(error.contains("not empty"), "{error}");
+            let after = std::fs::symlink_metadata(&home).unwrap();
+            assert_eq!(
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                (before.ino(), before.uid(), before.gid(), before.mode())
+            );
+            assert_eq!(
+                std::fs::read(sentinel).unwrap(),
+                b"preserve-existing-provider-state"
+            );
+        }
+
+        #[test]
+        fn provider_home_initialization_refuses_unknown_owner_without_mutation() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let before = std::fs::symlink_metadata(&home).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+
+            let error = initialize(
+                &home,
+                (uid.wrapping_add(1), gid),
+                (uid.wrapping_add(2), gid),
+            )
+            .unwrap_err();
+
+            assert!(error.contains("known initial"), "{error}");
+            let after = std::fs::symlink_metadata(&home).unwrap();
+            assert_eq!(
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                (before.ino(), before.uid(), before.gid(), before.mode())
+            );
+        }
+
+        #[test]
+        fn provider_home_initialization_refuses_symlink_and_non_directory_without_mutation() {
+            use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let real_home = root.path().join("real-provider");
+            std::fs::create_dir(&real_home).unwrap();
+            std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let real_before = std::fs::symlink_metadata(&real_home).unwrap();
+            let link = root.path().join("provider-link");
+            symlink(&real_home, &link).unwrap();
+            let link_before = std::fs::symlink_metadata(&link).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+
+            assert!(initialize(&link, (uid, gid), (uid, gid)).is_err());
+
+            let real_after = std::fs::symlink_metadata(&real_home).unwrap();
+            let link_after = std::fs::symlink_metadata(&link).unwrap();
+            assert_eq!(
+                (
+                    real_after.ino(),
+                    real_after.uid(),
+                    real_after.gid(),
+                    real_after.mode()
+                ),
+                (
+                    real_before.ino(),
+                    real_before.uid(),
+                    real_before.gid(),
+                    real_before.mode()
+                )
+            );
+            assert_eq!(
+                (
+                    link_after.ino(),
+                    link_after.uid(),
+                    link_after.gid(),
+                    link_after.mode()
+                ),
+                (
+                    link_before.ino(),
+                    link_before.uid(),
+                    link_before.gid(),
+                    link_before.mode()
+                )
+            );
+
+            let non_directory = root.path().join("not-a-directory");
+            std::fs::write(&non_directory, b"unchanged").unwrap();
+            let file_before = std::fs::symlink_metadata(&non_directory).unwrap();
+            assert!(initialize(&non_directory, (uid, gid), (uid, gid)).is_err());
+            let file_after = std::fs::symlink_metadata(&non_directory).unwrap();
+            assert_eq!(
+                (
+                    file_after.ino(),
+                    file_after.uid(),
+                    file_after.gid(),
+                    file_after.mode()
+                ),
+                (
+                    file_before.ino(),
+                    file_before.uid(),
+                    file_before.gid(),
+                    file_before.mode()
+                )
+            );
+            assert_eq!(std::fs::read(non_directory).unwrap(), b"unchanged");
+        }
+
+        #[test]
+        fn provider_home_initialization_refuses_ambiguous_initial_mode_without_mutation() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+
+            for mode in [0o750, 0o4755] {
+                let root = tempfile::tempdir().unwrap();
+                let home = root.path().join("provider");
+                std::fs::create_dir(&home).unwrap();
+                std::fs::set_permissions(&home, std::fs::Permissions::from_mode(mode)).unwrap();
+                let before = std::fs::symlink_metadata(&home).unwrap();
+
+                let error = initialize(&home, (uid, gid), (uid, gid)).unwrap_err();
+
+                assert!(error.contains("known initial"), "{error}");
+                let after = std::fs::symlink_metadata(&home).unwrap();
+                assert_eq!(
+                    (after.ino(), after.uid(), after.gid(), after.mode()),
+                    (before.ino(), before.uid(), before.gid(), before.mode())
+                );
+            }
+        }
+
+        #[test]
+        fn provider_home_initialization_reuses_initialized_home_without_mutation() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = home.join("native-state");
+            std::fs::write(&sentinel, b"retain-initialized-data").unwrap();
+            let before = std::fs::symlink_metadata(&home).unwrap();
+            let sentinel_before = std::fs::symlink_metadata(&sentinel).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+
+            initialize(&home, (uid.wrapping_add(1), gid), (uid, gid))
+                .expect("initialized provider-owned HOME is reused regardless of host identity");
+
+            let after = std::fs::symlink_metadata(&home).unwrap();
+            let sentinel_after = std::fs::symlink_metadata(&sentinel).unwrap();
+            assert_eq!(
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                (before.ino(), before.uid(), before.gid(), before.mode())
+            );
+            assert_eq!(
+                (
+                    sentinel_after.ino(),
+                    sentinel_after.uid(),
+                    sentinel_after.gid(),
+                    sentinel_after.mode()
+                ),
+                (
+                    sentinel_before.ino(),
+                    sentinel_before.uid(),
+                    sentinel_before.gid(),
+                    sentinel_before.mode()
+                )
+            );
+            assert_eq!(std::fs::read(sentinel).unwrap(), b"retain-initialized-data");
+        }
+
+        #[test]
+        fn provider_home_initialization_is_skipped_for_resume_and_other_paths() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            for (mode, is_resume, is_transfer) in [
+                ("opencode", true, false),
+                ("codex", false, false),
+                ("opencode", false, true),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let home = root.path().join("provider");
+                std::fs::create_dir(&home).unwrap();
+                std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let before = std::fs::symlink_metadata(&home).unwrap();
+                let uid = unsafe { libc::geteuid() };
+                let gid = unsafe { libc::getegid() };
+                let mut terminal = opencode_terminal_with_prepared_inputs(root.path(), uid, gid);
+                terminal.mode = mode.to_owned();
+                if is_transfer {
+                    terminal.opencode_transfer_attempt_id =
+                        Some("0123456789abcdef0123456789abcdef".into());
+                }
+                let paths = super::super::ProviderConfigPaths {
+                    private_mount: root.path().join("private"),
+                    provider_home: home.clone(),
+                };
+
+                super::super::prepare_fresh_opencode_provider_home_before_input_validation(
+                    Some(&terminal),
+                    is_resume,
+                    &paths,
+                )
+                .unwrap();
+
+                let after = std::fs::symlink_metadata(&home).unwrap();
+                assert_eq!(
+                    (after.ino(), after.uid(), after.gid(), after.mode()),
+                    (before.ino(), before.uid(), before.gid(), before.mode())
+                );
+            }
+        }
     }
 
     pub(crate) mod created_path_ownership {
