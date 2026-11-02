@@ -1537,6 +1537,7 @@ tool_timeout_sec = 120
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
     if (!beforeCrash.view) throw new Error('Owned Codex runtime is missing before the native crash')
     expect(beforeCrash.name).toEqual(canonicalName)
+    expect(beforeCrash.snapshot.status).toBe('idle')
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
     const lifecycleBeforeHostPause = readSupervisorLifecycle()
     const supervisorSequenceBeforeHostPause = lifecycleBeforeHostPause.reduce((latest, row) =>
@@ -1552,26 +1553,49 @@ tool_timeout_sec = 120
         pid: stoppedSessionHostPid,
       }
     }
-    // Kill only this receipt-owned, inspected release native PID. Archive its
-    // REAL native-generated history after exit, keeping every original byte.
-    rig.runtime.killOwnedRuntimePidExact(providerContainerId, beforeCrash.nativeContext.pid)
-    const nativeExit = await waitFor('exact native process terminal state before history archive', async () => {
-      const state = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
-        const fs=require('node:fs'),p='/proc/${beforeCrash.nativeContext.pid}/status';
-        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,state:fs.readFileSync(p,'utf8').split(String.fromCharCode(10)).find(line=>line.startsWith('State:')).slice(6).trim()}:{exists:false}));`]))
-      return !state.exists || state.state.startsWith('Z') ? state : undefined
-    })
-    const originalRollout = nativeMetadata.headers.find((header: any) => header.id === view.nativeSessionId).path
-    const archived = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    // Quarantine the complete exact native store before killing its writer.
+    // Otherwise recovery can probe the still-present rollout while the archive
+    // is in flight and mistake a stale readiness result for an absent session.
+    // Re-read the live process environment and find every exact session owner.
+    const quarantined = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
-      const root='/home/freshell/provider/.codex';const original=${JSON.stringify(originalRollout)};
-      const directory='/home/freshell/provider/.freshell-fixture/native-crash-history';fs.mkdirSync(directory,{mode:448});
-      const selected=[original,...fs.readdirSync(root).filter(name=>/^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(name)||name==='session_index.jsonl').map(name=>path.join(root,name))];
-      const files=selected.filter(file=>fs.existsSync(file)).map((file,index)=>{const bytes=fs.readFileSync(file);const destination=path.join(directory,String(index)+'-'+path.basename(file));fs.renameSync(file,destination);return{source:file,archive:destination,sha256:crypto.createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,base64:bytes.toString('base64')}});
-      if(!files.some(file=>file.source===original))throw Error('Exact real native rollout was not archived');process.stdout.write(JSON.stringify({directory,files}));`]))
+      const expected=${JSON.stringify(view.nativeSessionId)},pid=${beforeCrash.nativeContext.pid};
+      const env=Object.fromEntries(fs.readFileSync('/proc/'+pid+'/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
+        const at=entry.indexOf('=');const key=entry.slice(0,at);return ['HOME','CODEX_HOME'].includes(key)?[[key,entry.slice(at+1)]]:[];
+      }));
+      const providerHome=env.HOME,codexHome=env.CODEX_HOME||(providerHome&&path.join(providerHome,'.codex'));
+      if(!providerHome||!codexHome||!path.isAbsolute(codexHome))throw Error('Current native process has no absolute effective CODEX_HOME');
+      if(path.resolve(codexHome)!==path.resolve(path.join(providerHome,'.codex')))throw Error('Current CODEX_HOME differs from the managed recovery probe selection');
+      const sessionsRoot=path.join(codexHome,'sessions'),exactRollouts=[];let visited=0;
+      const scan=(dir,depth,found)=>{
+        if(depth>8||visited++>1024)throw Error('Codex sessions tree exceeded the bounded verification walk');
+        for(const entry of fs.readdirSync(dir,{withFileTypes:true})){
+          const file=path.join(dir,entry.name);if(entry.isDirectory()){scan(file,depth+1,found);continue}
+          if(!entry.isFile()||!entry.name.endsWith('.jsonl'))continue;
+          const fd=fs.openSync(file,'r');let first;try{const b=Buffer.alloc(65536);first=b.toString('utf8',0,fs.readSync(fd,b,0,b.length,0)).split(String.fromCharCode(10))[0]}finally{fs.closeSync(fd)}
+          let meta;try{meta=JSON.parse(first)}catch{}
+          if(meta?.type==='session_meta'&&(meta.payload?.id===expected||meta.payload?.session_id===expected))found.push(file);
+        }
+      };
+      scan(sessionsRoot,0,exactRollouts);exactRollouts.sort();
+      if(!exactRollouts.length)throw Error('Current CODEX_HOME has no readable rollout for the exact native session');
+      const selected=[...exactRollouts,...fs.readdirSync(codexHome).filter(name=>/^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(name)||name==='session_index.jsonl').map(name=>path.join(codexHome,name))];
+      const directory=path.join(providerHome,'.freshell-fixture','native-crash-history');fs.mkdirSync(directory,{mode:448});
+      const files=[...new Set(selected)].filter(file=>fs.existsSync(file)).map((source,index)=>{
+        const bytes=fs.readFileSync(source),archive=path.join(directory,String(index)+'-'+path.basename(source));
+        fs.renameSync(source,archive);return{source,archive,sha256:crypto.createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,base64:bytes.toString('base64')};
+      });
+      if(!exactRollouts.every(source=>files.some(file=>file.source===source)))throw Error('Not every exact real native rollout was quarantined');
+      const remainingExact=[];visited=0;scan(sessionsRoot,0,remainingExact);
+      if(remainingExact.length)throw Error('An exact native session owner remains readable after quarantine');
+      process.stdout.write(JSON.stringify({effectiveCodexHome:codexHome,sessionsRoot,exactRollouts,remainingExact,files}));`]))
+    expect(quarantined.exactRollouts).not.toHaveLength(0)
+    expect(quarantined.remainingExact).toEqual([])
+    expect(quarantined.files.map((file: any) => file.source)).toEqual(expect.arrayContaining(quarantined.exactRollouts))
+    const exactRollouts: string[] = quarantined.exactRollouts
     const archiveDirectory = path.join(rig.runtime.evidenceDir, 'native-crash-history')
     fs.mkdirSync(archiveDirectory, { mode: 0o700 })
-    const archiveManifest = archived.files.map((file: any, index: number) => {
+    const archiveManifest = quarantined.files.map((file: any, index: number) => {
       const bytes = Buffer.from(file.base64, 'base64')
       expect(createHash('sha256').update(bytes).digest('hex')).toBe(file.sha256)
       const copy = path.join(archiveDirectory, `${index}-${path.basename(file.source)}`)
@@ -1593,7 +1617,7 @@ tool_timeout_sec = 120
         bytes: file.bytes,
       })),
       fileSamplesTruncated: archiveManifest.length > 16,
-      archivedTargetRollout: archiveManifest.some((file: any) => file.source === originalRollout),
+      archivedTargetRollout: exactRollouts.every(source => archiveManifest.some((file: any) => file.source === source)),
       archivedStateDatabaseCount: archiveManifest.filter((file: any) => /^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(path.basename(file.source))).length,
       archivedSessionIndex: archiveManifest.some((file: any) => path.basename(file.source) === 'session_index.jsonl'),
     }
@@ -1800,6 +1824,15 @@ tool_timeout_sec = 120
     expect(postArchiveCensus.complete).toBe(true)
     expect(postArchiveCensus.sessionDirectoryState).toBe('readable')
     expect(postArchiveCensus.targetHeaderCount).toBe(0)
+    // The bounded full census is the absence proof. Trigger the native exit
+    // only after it succeeds, so the recovery observer cannot race that proof.
+    rig.runtime.killOwnedRuntimePidExact(providerContainerId, beforeCrash.nativeContext.pid)
+    const nativeExit = await waitFor('exact native process terminal state after history quarantine', async () => {
+      const state = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+        const fs=require('node:fs'),p='/proc/${beforeCrash.nativeContext.pid}/status';
+        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,state:fs.readFileSync(p,'utf8').split(String.fromCharCode(10)).find(line=>line.startsWith('State:')).slice(6).trim()}:{exists:false}));`]))
+      return !state.exists || state.state.startsWith('Z') ? state : undefined
+    })
     let recovered: Awaited<ReturnType<typeof rig.runningViewForFreshSession>>
     let coldRecovery: { trigger: any; settled: any } | undefined
     if (recoveryOwner === 'warm host') {
