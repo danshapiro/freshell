@@ -342,11 +342,19 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const sendId = `send-${randomUUID()}`
     wire.send({ type: 'freshAgent.send', provider: row.provider, sessionType: row.sessionType,
       sessionId: created.sessionId, requestId: sendId, text: 'fixture prompt' })
-    const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
-      && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
-    expect(materialized.sessionId).toBe(recorded.nativeSessionId)
-    await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
-      && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    if (row.provider === 'codex') {
+      expect(created.sessionRef).toEqual({ provider: 'codex', sessionId: recorded.nativeSessionId })
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === 'codex' && frame.sessionId === created.sessionId)
+      expect(wire.frames.filter(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === 'codex' && frame.previousSessionId === created.sessionId)).toEqual([])
+    } else {
+      const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
+      expect(materialized.sessionId).toBe(recorded.nativeSessionId)
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    }
 
     const resumeId = `resume-${randomUUID()}`
     wire.send({ type: 'freshAgent.create', requestId: resumeId,
@@ -639,7 +647,7 @@ tool_timeout_sec = 120
         process.stdout.write(JSON.stringify({mcp:fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split(String.fromCharCode(10)).filter(Boolean).map(JSON.parse):[],effects:fs.readdirSync(${JSON.stringify(path.join(workspace, 'allowed'))}).map(name=>{const p=${JSON.stringify(path.join(workspace, 'allowed'))}+'/'+name;return{name,uid:fs.statSync(p).uid,content:fs.readFileSync(p,'utf8')}})}));`]))
       } catch (error) { nativeFiles = { error: String(error) } }
       let traffic: unknown = retainedModelTraffic
-      try { if (model) traffic = model.traffic } catch (error) { traffic = { retained: retainedModelTraffic, error: String(error) } }
+      try { if (model) traffic = await model.readTraffic() } catch (error) { traffic = { retained: retainedModelTraffic, error: String(error) } }
       const logDirectory = path.join(home, '.freshell', 'logs')
       const requestLogFiles = fs.readdirSync(logDirectory).filter(name => name.startsWith('rust-server.jsonl'))
       const publicHttpRequests = requestLogFiles.flatMap(name => fs.readFileSync(path.join(logDirectory, name), 'utf8').split('\n')).flatMap(line => {
@@ -673,7 +681,7 @@ tool_timeout_sec = 120
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed native final answer.') ? value : undefined
     })
     expect(saved.settings).toMatchObject({ model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted', cwd: workspace })
-    expect(model.traffic[0].body.reasoning.effort).toBe('xhigh')
+    expect((await model.readTraffic())[0].body.reasoning.effort).toBe('xhigh')
     await send('AWAITED_PLAN', { collaborationMode: 'plan' })
     const pending = await waitFor('managed native awaited Plan control', async () => {
       const value = await snapshot()
@@ -765,7 +773,7 @@ tool_timeout_sec = 120
     expect(hostMetadataAccess).toMatchObject({ uid: 0, root: { uid: 65534, mode: '700' }, readError: 'EACCES' })
     expect(nativeMetadata.headers).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'session_meta', id: view.nativeSessionId })]))
     rig.runtime.writeIncident('freshcodex-managed-native-before-naming', { created, view, nativeContext, nativeMetadata, fixtureContext: model.context, saved, asyncSnapshot,
-      hostMetadataAccess, traffic: model.traffic, final: await snapshot() })
+      hostMetadataAccess, traffic: await model.readTraffic(), final: await snapshot() })
     const durableName = await waitFor('managed native durable shared name', async () => {
       const record = await readName()
       return record?.ref?.sessionId === view.nativeSessionId ? record : undefined
@@ -797,7 +805,7 @@ tool_timeout_sec = 120
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
     }, 15_000)
     rig.runtime.writeIncident('freshcodex-managed-native-journey', { created, view, nativeContext, context: model.context,
-      traffic: model.traffic, saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
+      traffic: await model.readTraffic(), saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
 
     const approval = async (decision: 'accept' | 'cancel', threadId = view.nativeSessionId) => {
       const pending = await waitFor('actual managed native approval', async () => {
@@ -840,7 +848,7 @@ tool_timeout_sec = 120
         // Native0.164 can return a failed unifiedExec result to the model
         // without persisting a commandExecution history item. Read the real
         // native tool result, never the fixture's repeated assistant phrase.
-        const command = model.traffic.flatMap((row: any) => row.body?.input ?? [])
+        const command = (await model.readTraffic()).flatMap((row: any) => row.body?.input ?? [])
           .filter((item: any) => item.type === 'function_call_output' && item.call_id === 'call_effect_readonly').at(-1)
         expect(command?.output).toMatch(/Process exited with code [1-9][0-9]*/)
         expect(command?.output).toContain('Output:\n65534\n')
@@ -912,7 +920,7 @@ tool_timeout_sec = 120
     rig.runtime.writeIncident('freshcodex-managed-native-durable-child', { registered, childControl, childResponse, childSaved, parent: await snapshot() })
     const beforeRestart = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(), name: await readName() }
     expect(beforeRestart.name).toEqual(canonicalName)
-    const previousTraffic = model.traffic
+    const previousTraffic = await model.readTraffic()
     retainedModelTraffic = previousTraffic
     rig.runtime.writeIncident('freshcodex-managed-native-before-host-restart', { beforeRestart, canonicalName, effects, mcpResults, registered, childControl, childResponse, childSaved, traffic: previousTraffic })
     await model.stop()
@@ -945,9 +953,9 @@ tool_timeout_sec = 120
     expect(afterRestart.threadId).toBe(view.nativeSessionId)
     expect(JSON.stringify(afterRestart.turns)).toContain('MANAGED_NATIVE_FIRST')
     expect(await readName()).toEqual(canonicalName)
-    expect(model.traffic.filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
+    expect((await model.readTraffic()).filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
     rig.runtime.writeIncident('freshcodex-managed-native-tools-restart', { created, nativeContext, canonicalName, effects, mcpResults,
-      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: model.traffic, finalName: await readName() })
+      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: await model.readTraffic(), finalName: await readName() })
 
     const recoveryCwd = path.join(workspace, 'recovery-cwd')
     fs.mkdirSync(recoveryCwd)
@@ -961,7 +969,7 @@ tool_timeout_sec = 120
     expect(recoverySettings).toMatchObject({ cwd: recoveryCwd, model: 'contract-model', effort: 'xhigh',
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
-      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: model.traffic.length }
+      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
     // Kill only this receipt-owned, inspected release native PID. Archive its
@@ -996,7 +1004,7 @@ tool_timeout_sec = 120
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: model.traffic.slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
+      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
@@ -1045,7 +1053,7 @@ tool_timeout_sec = 120
     const capture = await recoveredCapture.text()
     expect(capture).toContain('Managed recovery second answer.')
     expect(capture).not.toContain('MANAGED_NATIVE_FIRST')
-    const newTraffic = model.traffic.slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
+    const newTraffic = (await model.readTraffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
     expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
     expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
     expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
