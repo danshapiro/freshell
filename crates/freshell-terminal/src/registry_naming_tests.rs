@@ -185,8 +185,16 @@ fn completed_managed_terminal_stays_blocked_when_cached_lifecycle_is_blocked() {
 }
 
 /// The supervisor's inventory after a web restart: lookup answers the soul.
+#[derive(Clone)]
+struct FirstLookupGate {
+    lookup_count: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct InventoryController {
     soul: ManagedTerminalDescriptor,
+    first_lookup_gate: Option<FirstLookupGate>,
 }
 
 impl ManagedTerminalController for InventoryController {
@@ -195,8 +203,22 @@ impl ManagedTerminalController for InventoryController {
         terminal_id: &'a str,
         _: Option<String>,
     ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+        let gate = self.first_lookup_gate.clone();
+        let lookup_index = gate.as_ref().map(|gate| {
+            gate.lookup_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        });
         let found = (terminal_id == self.soul.terminal_id).then(|| self.soul.clone());
-        Box::pin(std::future::ready(Ok(found)))
+        Box::pin(async move {
+            if let (Some(gate), Some(0)) = (gate, lookup_index) {
+                gate.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                while !gate.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            Ok(found)
+        })
     }
     fn launch<'a>(
         &'a self,
@@ -252,6 +274,7 @@ fn register_managed_through_reconcile_adoption_titles_from_the_mode_label() {
     let registry = TerminalRegistry::new();
     registry.set_managed_controller(Some(Arc::new(InventoryController {
         soul: opencode_soul("T-adopted"),
+        first_lookup_gate: None,
     })));
     let mut labelled_modes = Vec::new();
     let adopted = immediate(registry.adopt_managed_for_reconcile(
@@ -266,6 +289,98 @@ fn register_managed_through_reconcile_adoption_titles_from_the_mode_label() {
     assert!(adopted, "the soul is reconstructed");
     assert_eq!(labelled_modes, vec!["opencode".to_string()]);
     assert_eq!(registry.title_of("T-adopted").as_deref(), Some("OpenCode"));
+}
+
+fn run_until_ready<F: Future>(future: F) -> F::Output {
+    let mut future = Box::pin(future);
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+#[test]
+fn concurrent_reconcile_adoption_keeps_the_existing_live_facade() {
+    let registry = TerminalRegistry::new();
+    let first_lookup_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_first_lookup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    registry.set_managed_controller(Some(Arc::new(InventoryController {
+        soul: opencode_soul("T-concurrent-adopt"),
+        first_lookup_gate: Some(FirstLookupGate {
+            lookup_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            started: Arc::clone(&first_lookup_started),
+            release: Arc::clone(&release_first_lookup),
+        }),
+    })));
+
+    let first_registry = registry.clone();
+    let delayed_adoption = std::thread::spawn(move || {
+        run_until_ready(first_registry.adopt_managed_for_reconcile(
+            "T-concurrent-adopt",
+            Some("req-T-concurrent-adopt".into()),
+            |_| "OpenCode".into(),
+        ))
+    });
+
+    let started_at = std::time::Instant::now();
+    while !first_lookup_started.load(std::sync::atomic::Ordering::SeqCst)
+        && started_at.elapsed() < std::time::Duration::from_secs(2)
+    {
+        std::thread::yield_now();
+    }
+    let first_started = first_lookup_started.load(std::sync::atomic::Ordering::SeqCst);
+    if !first_started {
+        release_first_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    assert!(first_started, "first inventory lookup should be in flight");
+
+    assert!(immediate(registry.adopt_managed_for_reconcile(
+        "T-concurrent-adopt",
+        Some("req-T-concurrent-adopt".into()),
+        |_| "OpenCode".into(),
+    ))
+    .expect("second inventory lookup succeeds"));
+
+    assert!(
+        registry
+            .attach(
+                "T-concurrent-adopt",
+                7,
+                Arc::new(|_| {}),
+                None,
+                0,
+                false,
+                false,
+                None,
+                None,
+                None,
+                PacedAttachOptions::default(),
+            )
+            .found
+    );
+    assert!(registry.ingest_managed_output(
+        "T-concurrent-adopt",
+        1,
+        1,
+        "viewer output survives\n".into(),
+    ));
+
+    release_first_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(delayed_adoption
+        .join()
+        .expect("first adoption thread completes")
+        .expect("first inventory lookup succeeds"));
+
+    let row = registry
+        .directory()
+        .into_iter()
+        .find(|entry| entry.terminal_id == "T-concurrent-adopt")
+        .expect("managed facade remains registered");
+    assert!(row.has_clients, "the first viewer remains subscribed");
+    assert_eq!(row.snapshot, "viewer output survives\n");
 }
 
 #[test]

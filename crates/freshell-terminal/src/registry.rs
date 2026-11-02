@@ -4746,8 +4746,7 @@ impl TerminalRegistry {
             ));
         }
         let title = title_for_mode(&descriptor.mode);
-        self.register_managed(descriptor, title);
-        Ok(true)
+        Ok(self.register_managed_if_absent(descriptor, title))
     }
 
     pub fn managed_descriptor(&self, terminal_id: &str) -> Option<ManagedTerminalDescriptor> {
@@ -4794,6 +4793,29 @@ impl TerminalRegistry {
     /// label (never a hard-coded "Shell" for an agent soul); the naming bind
     /// replaces it with the saved name.
     pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor, title: String) {
+        self.register_managed_inner(descriptor, title, true);
+    }
+
+    /// Insert a reconstructed managed facade only when the registry still has
+    /// no row for its terminal. Inventory lookups happen asynchronously, so a
+    /// concurrent attach or reconciliation may have installed the live facade
+    /// while this caller was waiting. Returning the existing row's ownership
+    /// lets the delayed adopter report success without replacing its subscribers
+    /// or replay buffer.
+    fn register_managed_if_absent(
+        &self,
+        descriptor: ManagedTerminalDescriptor,
+        title: String,
+    ) -> bool {
+        self.register_managed_inner(descriptor, title, false)
+    }
+
+    fn register_managed_inner(
+        &self,
+        descriptor: ManagedTerminalDescriptor,
+        title: String,
+        replace_existing: bool,
+    ) -> bool {
         let created_at = now_ms();
         let created = ActivityEvent::Created {
             terminal_id: descriptor.terminal_id.clone(),
@@ -4847,6 +4869,11 @@ impl TerminalRegistry {
             session_name: None,
         }));
         let mut inner = self.inner.lock().expect("registry lock");
+        if !replace_existing {
+            if let Some(existing) = inner.terminals.get(&descriptor.terminal_id) {
+                return existing.managed.is_some();
+            }
+        }
         inner.terminals.insert(
             descriptor.terminal_id.clone(),
             TerminalHandle {
@@ -4862,6 +4889,7 @@ impl TerminalRegistry {
         inner.revision += 1;
         drop(inner);
         self.notify_activity(created);
+        true
     }
 
     /// Merge one host-spooled output chunk into the ordinary replay/fan-out
