@@ -51,6 +51,9 @@
 //                                       started). The command then runs to its result
 //                                       unless another interrupt arrives once it runs.
 //                                       With no Stop it starts after T.coldStart.
+//   FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD '1': hold a queued cold command until
+//                                       it receives a Stop, bypassing T.coldStart.
+//                                       The default keeps the timed behavior above.
 //   FRESHELL_CLAUDE_SIM_STALL_STDIN     '1'/'boot' or 'prompt': the host process
 //                                       stops reading stdin after boot / at the
 //                                       first prompt
@@ -264,6 +267,7 @@ class SimulatedCli {
     if (this.coldShape && !COLD_COMMAND_SHAPES.has(this.coldShape)) {
       throw new Error(`FRESHELL_CLAUDE_SIM_COLD_COMMAND must be one of ${[...COLD_COMMAND_SHAPES].join(', ')}, not ${JSON.stringify(this.coldShape)}`)
     }
+    this.holdQueuedCold = this.env.FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD === '1'
     // The cold command being started, while a Stop can still miss it, and the
     // receipt of a Stop that missed it, when it is answered at its start.
     this.cold = null
@@ -616,7 +620,11 @@ class SimulatedCli {
 
   /** Wait for a Stop to miss the cold command, or for the cold window to end. */
   async holdCold(cold) {
-    await Promise.race([cold.stopped.promise, this.sleep(T.coldStart)])
+    if (cold.shape === 'queued' && this.holdQueuedCold) {
+      await cold.stopped.promise
+    } else {
+      await Promise.race([cold.stopped.promise, this.sleep(T.coldStart)])
+    }
     if (this.cold === cold) this.cold = null
     // The receipt reaches the host before anything the command does next.
     await this.tick()
