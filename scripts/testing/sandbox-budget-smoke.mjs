@@ -5,8 +5,26 @@ import os from 'node:os'
 import path from 'node:path'
 
 const readControl = name => fs.readFileSync(`/sys/fs/cgroup/${name}`, 'utf8').trim()
+const readControlOrNull = name => {
+  try { return readControl(name) } catch { return null }
+}
+const unsignedInteger = value => {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return null
+  const number = Number(value)
+  return Number.isSafeInteger(number) ? number : null
+}
+const numericTime = value => typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value) : null
+const memoryLimitBytes = 8 * 1024 ** 3
+const peakLimitBytes = 2 * 1024 ** 3
+const pidsLimit = 512
 let root
 let stage = 'arguments'
+let failure
+const requireObservation = (condition, reason, values = {}) => {
+  if (condition) return
+  failure = { reason, ...values }
+  throw new Error('sandbox budget smoke validation failed')
+}
 try {
   const args = process.argv.slice(2)
   assert(args.length === 1 || args.length === 3)
@@ -25,12 +43,20 @@ try {
     : process.env.CARGO_BUILD_JOBS === undefined ? 'native' : 'environment'
 
   stage = 'controls'
-  const controls = Object.fromEntries(['cpu.max', 'memory.max', 'memory.swap.max', 'pids.max'].map(name => [name, readControl(name)]))
-  const [quota, period] = controls['cpu.max'].split(' ').map(Number)
-  assert.equal(quota / period, 2)
-  assert.equal(controls['memory.max'], '8589934592')
-  assert.equal(controls['memory.swap.max'], '8589934592')
-  assert.equal(controls['pids.max'], '512')
+  const cpu = /^(\d+) (\d+)$/.exec(readControlOrNull('cpu.max') ?? '')
+  const quota = unsignedInteger(cpu?.[1])
+  const period = unsignedInteger(cpu?.[2])
+  const observedCpus = quota !== null && period !== null && period > 0 ? quota / period : null
+  requireObservation(observedCpus === 2, 'cpu_limit', { expected_cpus: 2, observed_cpus: observedCpus })
+  const memory = unsignedInteger(readControlOrNull('memory.max'))
+  requireObservation(memory === memoryLimitBytes, 'memory_limit', { expected_bytes: memoryLimitBytes, observed_bytes: memory })
+  const swap = unsignedInteger(readControlOrNull('memory.swap.max'))
+  requireObservation(swap === memoryLimitBytes, 'swap_limit', { expected_bytes: memoryLimitBytes, observed_bytes: swap })
+  const pids = unsignedInteger(readControlOrNull('pids.max'))
+  requireObservation(pids === pidsLimit, 'pids_limit', { expected_pids: pidsLimit, observed_pids: pids })
+  // Preserve the existing success receipt shape using validated numeric data.
+  const controls = { 'cpu.max': `${quota} ${period}`, 'memory.max': String(memory),
+    'memory.swap.max': String(swap), 'pids.max': String(pids) }
 
   stage = 'fixture'
   // The runtime's /tmp is intentionally noexec. Use its existing executable
@@ -41,7 +67,9 @@ try {
     if (path.dirname(ancestor) === ancestor) break
   }
   const events = path.join(root, 'events')
+  const barrier = path.join(root, 'barrier')
   fs.mkdirSync(events)
+  fs.mkdirSync(barrier)
   fs.mkdirSync(path.join(root, 'cargo-home'))
   const members = Array.from({ length: 6 }, (_, index) => `unit${index}`)
   fs.writeFileSync(path.join(root, 'Cargo.toml'), `[workspace]\nresolver="2"\nmembers=${JSON.stringify(members)}\n`)
@@ -54,14 +82,27 @@ try {
     fs.writeFileSync(path.join(root, member, 'Cargo.toml'), `[package]\nname="${member}"\nversion="0.1.0"\nedition="2021"\n`)
     fs.writeFileSync(path.join(root, member, 'src/lib.rs'), 'pub fn value() -> u8 { 1 }\n')
     fs.writeFileSync(path.join(root, member, 'build.rs'), `
-use std::{env,fs,thread,time::{Duration,SystemTime,UNIX_EPOCH}};
+use std::{env,fs,thread,time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 fn main() {
+ let observed_jobs=env::var("NUM_JOBS").unwrap();
  let start=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
  let held=vec![1u8;8*1024*1024];
+ // The first two build scripts must both arrive before either completes.
+ // The deadline bounds a genuinely serial or stalled Cargo run; overlap is
+ // still measured from the completed records, not assumed from this wait.
+ if ${jobs} == 2 && observed_jobs == "2" {
+  let barrier=env::var("BUDGET_BARRIER").unwrap();
+  let dir=std::path::Path::new(&barrier);
+  fs::write(dir.join("${member}"),b"ready").unwrap();
+  let deadline=Instant::now()+Duration::from_secs(60);
+  while fs::read_dir(dir).unwrap().take(2).count()<2 && Instant::now()<deadline {
+   thread::sleep(Duration::from_millis(20));
+  }
+ }
  thread::sleep(Duration::from_millis(300));
  std::hint::black_box(&held);
  let end=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
- let line=format!("{{\\"name\\":\\"${member}\\",\\"jobs\\":{},\\"start\\":\\"{}\\",\\"end\\":\\"{}\\"}}\\n",env::var("NUM_JOBS").unwrap(),start,end);
+ let line=format!("{{\\"name\\":\\"${member}\\",\\"jobs\\":{},\\"start\\":\\"{}\\",\\"end\\":\\"{}\\"}}\\n",observed_jobs,start,end);
  fs::write(std::path::Path::new(&env::var("BUDGET_EVENTS").unwrap()).join("${member}.jsonl"),line).unwrap();
 }
 `)
@@ -71,20 +112,40 @@ fn main() {
   if (option === '--cli-jobs') cargoArgs.push('--jobs', args[2])
   // Running from this project is necessary for Cargo to discover its local
   // config; the private CARGO_HOME excludes inherited user configuration.
-  execFileSync('cargo', cargoArgs, {
-    cwd: root,
-    env: { ...process.env, BUDGET_EVENTS: events, CARGO_HOME: path.join(root, 'cargo-home'), CARGO_TARGET_DIR: path.join(root, 'target') },
-    stdio: 'inherit', timeout: 120_000,
-  })
-  stage = 'observations'
-  const rows = fs.readdirSync(events).flatMap(file => fs.readFileSync(path.join(events, file), 'utf8').trim().split('\n').map(line => JSON.parse(line)))
-  assert.equal(rows.length, 6)
-  assert.deepEqual(rows.map(row => row.name).sort(), members)
-  for (const row of rows) {
-    assert.equal(row.jobs, jobs)
-    assert(BigInt(row.end) > BigInt(row.start))
+  try {
+    execFileSync('cargo', cargoArgs, {
+      cwd: root,
+      env: { ...process.env, BUDGET_EVENTS: events, BUDGET_BARRIER: barrier,
+        CARGO_HOME: path.join(root, 'cargo-home'), CARGO_TARGET_DIR: path.join(root, 'target') },
+      stdio: 'inherit', timeout: 120_000,
+    })
+  } catch (error) {
+    const status = Number.isSafeInteger(error?.status) && error.status >= 0 && error.status <= 255 ? error.status : null
+    requireObservation(false, 'cargo_exit', { exit_status: status })
   }
-  const edges = rows.flatMap(row => [[BigInt(row.start), 1], [BigInt(row.end), -1]])
+  stage = 'observations'
+  let rows
+  try {
+    rows = fs.readdirSync(events).flatMap(file => fs.readFileSync(path.join(events, file), 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+  } catch {
+    requireObservation(false, 'invalid_observations')
+  }
+  requireObservation(rows.length === members.length, 'completion_count', { expected_count: members.length, observed_count: rows.length })
+  const seen = new Set()
+  const intervals = []
+  const completions = []
+  for (const row of rows) {
+    requireObservation(row && typeof row === 'object' && members.includes(row.name) && !seen.has(row.name), 'completion_identity')
+    seen.add(row.name)
+    const observedJobs = Number.isSafeInteger(row.jobs) ? row.jobs : null
+    requireObservation(row.jobs === jobs, 'jobs', { expected_jobs: jobs, observed_jobs: observedJobs })
+    const start = numericTime(row.start)
+    const end = numericTime(row.end)
+    requireObservation(start !== null && end !== null && end > start, 'interval')
+    intervals.push({ start, end })
+    completions.push({ name: row.name, jobs, start: start.toString(), end: end.toString() })
+  }
+  const edges = intervals.flatMap(row => [[row.start, 1], [row.end, -1]])
     .sort((left, right) => left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : left[1] - right[1])
   let running = 0
   let peakOverlap = 0
@@ -92,16 +153,19 @@ fn main() {
     running += delta
     peakOverlap = Math.max(peakOverlap, running)
   }
-  assert(peakOverlap >= 1 && peakOverlap <= jobs)
-  const pressure = readControl('memory.pressure')
-  const peakBytes = Number(readControl('memory.peak'))
-  const someAvg10 = Number(/^some avg10=([0-9.]+)/m.exec(pressure)?.[1])
-  assert(Number.isFinite(peakBytes) && peakBytes > 0 && peakBytes < 2 * 1024 ** 3)
-  assert(Number.isFinite(someAvg10) && someAvg10 < 5)
+  requireObservation(peakOverlap === jobs, 'overlap', { expected_jobs: jobs, observed_overlap: peakOverlap })
+  const peakBytes = unsignedInteger(readControlOrNull('memory.peak'))
+  requireObservation(peakBytes !== null && peakBytes > 0 && peakBytes < peakLimitBytes,
+    'memory_peak', { limit_bytes: peakLimitBytes, observed_bytes: peakBytes })
+  const pressure = readControlOrNull('memory.pressure')
+  const match = /^some avg10=(\d+(?:\.\d+)?)(?=\s|$)/m.exec(pressure ?? '')
+  const parsedAvg10 = match ? Number(match[1]) : null
+  const someAvg10 = Number.isFinite(parsedAvg10) ? parsedAvg10 : null
+  requireObservation(someAvg10 !== null && someAvg10 < 5, 'memory_pressure', { limit_avg10: 5, observed_avg10: someAvg10 })
   console.log(JSON.stringify({ severity: 'info', event: 'sandbox_budget_smoke_passed', mode,
-    jobs, peakOverlap, peakBytes, memoryPsiSomeAvg10: someAvg10, controls, completions: rows }))
+    jobs, peakOverlap, peakBytes, memoryPsiSomeAvg10: someAvg10, controls, completions }))
 } catch {
-  console.error(JSON.stringify({ severity: 'error', event: 'sandbox_budget_smoke_failed', stage }))
+  console.error(JSON.stringify({ severity: 'error', event: 'sandbox_budget_smoke_failed', stage, ...failure }))
   process.exitCode = 1
 } finally {
   if (root) fs.rmSync(root, { recursive: true, force: true })
