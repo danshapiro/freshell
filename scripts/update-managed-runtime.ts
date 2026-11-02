@@ -22,6 +22,10 @@ const GRAPH_REFUSAL =
   'The loaded systemd unit relationships could make a web action start, restart, or stop the durable supervisor. Deploy the ordering-only After= unit change and run systemctl --user daemon-reload before retrying.'
 const MANUAL_RECOVERY =
   'The update did not finish cleanly. Preserve registry, provider/history, runtime, and workspace data, then use the selected owner’s forward-recovery runbook. Reopen any saved conversations manually if needed.'
+const SHUTDOWN_GATE_RECOVERY =
+  'Host-agent admission may still be closed. Do not restart or reopen it while the old web process may be alive; verify that process and maintenance status, then use forward recovery.'
+const TEMPORARY_GATE_RECOVERY =
+  'The temporary host-agent admission lease may still be active. Verify release or expiry before retrying the update.'
 const CODING_PROVIDERS = new Set(['claude', 'kilroy', 'codex', 'opencode', 'amplifier'])
 const ACTIVE_LAUNCH_STATES = new Set(['prepared', 'created', 'starting', 'running', 'stopping'])
 const GRAPH_PROPERTIES = [
@@ -189,9 +193,11 @@ export interface ManagedRuntimeUpdateDependencies {
   owner: {
     resolve(mode: ManagedUpdateMode): Promise<ManagedRuntimeOwner>
     inspectGraph(owner: ManagedRuntimeOwner): Promise<SystemdUnitGraph>
+    loadPersistentResourceManifest(owner: ManagedRuntimeOwner, mode: ManagedUpdateMode): Promise<void>
   }
   artifacts: {
     build(owner: ManagedRuntimeOwner, mode: ManagedUpdateMode): Promise<StagedArtifacts>
+    serverBuildInfo(executable: string): Promise<unknown>
   }
   filesystem: {
     webExecutableIdentity(path: string): Promise<{ live: FileIdentity | null; selected: FileIdentity | null }>
@@ -207,16 +213,27 @@ export interface ManagedRuntimeUpdateDependencies {
     state(unit: string): Promise<string>
     waitSupervisorReady(owner: ManagedRuntimeOwner): Promise<void>
     waitWebReady(owner: ManagedRuntimeOwner): Promise<void>
+    waitWebStopped(owner: ManagedRuntimeOwner): Promise<void>
     waitCallbackReady(owner: ManagedRuntimeOwner): Promise<void>
   }
   admin: {
     candidateSchemaVersion(supervisorExecutable: string): Promise<number>
     currentSchemaVersion(databasePath: string): Promise<number>
-    health(owner: ManagedRuntimeOwner): Promise<{ state: 'ok' }>
+    health(owner: ManagedRuntimeOwner): Promise<{ state: 'ok'; installationId: string; controlEpoch: number }>
     inventory(owner: ManagedRuntimeOwner): Promise<RuntimeView[]>
     maintenanceInventory(supervisorExecutable: string, databasePath: string): Promise<NoRuntimeInventoryRecord[]>
     stop(soulId: string, expectedIntentRevision: number, owner: ManagedRuntimeOwner): Promise<StopResult>
     reopen(candidate: ReopenCandidate, owner: ManagedRuntimeOwner): Promise<{ outcome: 'reopened' | 'pending' | 'failed'; message?: string }>
+  }
+  runtimeApi: {
+    readAuthToken(owner: ManagedRuntimeOwner): Promise<string>
+    request(
+      owner: ManagedRuntimeOwner,
+      token: string,
+      method: 'GET' | 'POST',
+      endpoint: string,
+      body?: unknown,
+    ): Promise<{ status: number; body: unknown }>
   }
   docker: {
     buildImage(owner: ManagedRuntimeOwner, dockerSocket: string): Promise<string>
@@ -234,6 +251,7 @@ class UpdateRefusal extends Error {}
 class UpdateFailure extends Error {}
 
 interface WorkerExecutionState {
+  mode: ManagedUpdateMode
   phase: string
   owner?: ManagedRuntimeOwner
   stagedArtifacts?: StagedArtifacts
@@ -246,10 +264,33 @@ interface WorkerExecutionState {
   attemptedStops: string[]
   verifiedEmptyStops: string[]
   stoppedIntentRevisions: Map<string, number>
+  preUpdateSupervisorIdentity?: SupervisorIdentity
+  postUpdateSupervisorIdentity?: SupervisorIdentity
+  maintenanceLease?: MaintenanceLease
+  shutdownGateState: 'open' | 'temporary' | 'latched' | 'unknown'
+  shutdownCommitAttempted: boolean
+  webProcessExitConfirmed: boolean
 }
 
-function createWorkerExecutionState(): WorkerExecutionState {
+interface SupervisorIdentity {
+  installationId: string
+  controlEpoch: number
+}
+
+interface MaintenanceLease {
+  ownerId: string
+  leaseId: string
+}
+
+interface ReadinessReport {
+  identity: SupervisorIdentity
+  readiness: Record<string, unknown>
+  paneOwnership: Record<string, unknown>
+}
+
+function createWorkerExecutionState(mode: ManagedUpdateMode): WorkerExecutionState {
   return {
+    mode,
     phase: 'approval',
     webStopAttempted: false,
     supervisorShutdownComplete: false,
@@ -259,6 +300,9 @@ function createWorkerExecutionState(): WorkerExecutionState {
     attemptedStops: [],
     verifiedEmptyStops: [],
     stoppedIntentRevisions: new Map(),
+    shutdownGateState: 'open',
+    shutdownCommitAttempted: false,
+    webProcessExitConfirmed: false,
   }
 }
 
@@ -397,8 +441,9 @@ export async function runManagedRuntimeWorker(
   dependencies: ManagedRuntimeUpdateDependencies,
   approvalFile?: string,
 ): Promise<number> {
-  const execution = createWorkerExecutionState()
+  const execution = createWorkerExecutionState(mode)
   const resetMode = mode !== 'client'
+  let authToken: string | undefined
 
   try {
     if (resetMode) {
@@ -421,13 +466,16 @@ export async function runManagedRuntimeWorker(
 
     execution.phase = 'graph'
     await assertWebActionsSafe(dependencies, owner, mode, execution.phase)
-    if (resetMode) {
-      try {
-        await dependencies.docker.verifyDaemon(owner, owner.dockerSocket)
-      } catch {
-        throw new UpdateRefusal('The selected Docker daemon could not be verified as the managed-runtime owner.')
-      }
-    }
+
+    execution.phase = 'live_readiness'
+    authToken = await dependencies.runtimeApi.readAuthToken(owner)
+    const initialReadiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
+    assertReadinessForSafeShutdown(initialReadiness)
+    execution.preUpdateSupervisorIdentity = initialReadiness.identity
+    await record(dependencies, mode, execution.phase, 'update.live_ownership_verified', 'info')
+
+    execution.phase = 'owner_resources'
+    await dependencies.owner.loadPersistentResourceManifest(owner, mode)
 
     execution.phase = 'build'
     const artifacts = await dependencies.artifacts.build(owner, mode)
@@ -451,6 +499,18 @@ export async function runManagedRuntimeWorker(
       }
     }
 
+    execution.phase = 'candidate_build_info'
+    const webCandidate = mode === 'durable-only' ? owner.webExecutable : artifacts.webExecutable!
+    let buildInfo: unknown
+    try {
+      buildInfo = await dependencies.artifacts.serverBuildInfo(webCandidate)
+    } catch {
+      throw new UpdateRefusal('The selected web server candidate could not prove it was built with managed-runtime-v1.')
+    }
+    if (!isRecord(buildInfo) || buildInfo.managedRuntimeV1 !== true) {
+      throw new UpdateRefusal('The selected web server candidate was not built with managed-runtime-v1.')
+    }
+
     if (mode === 'durable-only') {
       execution.phase = 'web_binary_identity'
       const identity = await dependencies.filesystem.webExecutableIdentity(owner.webExecutable)
@@ -459,10 +519,29 @@ export async function runManagedRuntimeWorker(
       }
     }
 
+    execution.phase = 'maintenance_quiesce'
+    const quiesce = await acquireMaintenanceLease(dependencies, owner, authToken, execution)
+    assertSameIdentity(
+      quiesce.readiness.identity,
+      execution.preUpdateSupervisorIdentity,
+      'The supervisor changed before host-agent shutdown was committed.',
+    )
+
+    execution.phase = 'graph_final'
+    await assertWebActionsSafe(dependencies, owner, mode, execution.phase)
+
+    execution.phase = 'maintenance_commit_stop'
+    await commitMaintenanceLease(dependencies, owner, authToken, quiesce.lease, execution)
+
     return mode === 'client'
-      ? await runClientUpdate(dependencies, owner, artifacts, execution)
-      : await runResetUpdate(mode, dependencies, owner, artifacts, execution, execution.stoppedIntentRevisions)
+      ? await runClientUpdate(dependencies, owner, artifacts, execution, authToken, initialReadiness.identity)
+      : await runResetUpdate(mode, dependencies, owner, artifacts, execution, execution.stoppedIntentRevisions, authToken)
   } catch (error) {
+    if (execution.shutdownCommitAttempted && execution.shutdownGateState !== 'latched') {
+      await reconcileAmbiguousCommit(dependencies, execution, authToken)
+    } else if (execution.maintenanceLease && execution.shutdownGateState !== 'latched') {
+      await releaseTemporaryLease(dependencies, execution, authToken)
+    }
     return handleWorkerFailure(mode, dependencies, execution, error)
   } finally {
     await cleanupStagingArtifacts(execution.stagedArtifacts)
@@ -481,22 +560,374 @@ async function resolveManagedRuntimeOwner(
   }
 }
 
+const MAINTENANCE_LEASE_DURATION_MS = 60_000
+const MAINTENANCE_DRAIN_TIMEOUT_MS = 10_000
+
+async function readAuthenticatedReadiness(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  owner: ManagedRuntimeOwner,
+  token: string,
+): Promise<ReadinessReport> {
+  const before = await directSupervisorIdentity(dependencies, owner)
+  const response = await runtimeApiRequest(dependencies, owner, token, 'GET', '/api/runtime/readiness')
+  const after = await directSupervisorIdentity(dependencies, owner)
+  if (response.status !== 200) {
+    throw new UpdateRefusal('Authenticated live runtime readiness is unavailable; the selected web server may be legacy or featureless.')
+  }
+  const report = parseReadinessReport(response.body)
+  assertSameIdentity(after, before, 'The supervisor changed while live runtime readiness was being checked.')
+  assertSameIdentity(report.identity, before, 'Live runtime readiness did not match the selected supervisor control socket.')
+  assertRuntimeReadiness(report)
+  return report
+}
+
+async function acquireMaintenanceLease(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  owner: ManagedRuntimeOwner,
+  token: string,
+  execution: WorkerExecutionState,
+): Promise<{ lease: MaintenanceLease; readiness: ReadinessReport }> {
+  const ownerId = `updater-${makeUpdateId(dependencies.now(), dependencies.randomSuffix())}`
+  const before = await directSupervisorIdentity(dependencies, owner)
+  let response: { status: number; body: unknown }
+  try {
+    response = await runtimeApiRequest(dependencies, owner, token, 'POST', '/api/runtime/maintenance/quiesce', {
+      ownerId,
+      leaseDurationMs: MAINTENANCE_LEASE_DURATION_MS,
+      drainTimeoutMs: MAINTENANCE_DRAIN_TIMEOUT_MS,
+    })
+  } catch {
+    execution.shutdownGateState = 'unknown'
+    await waitForUnreportedLeaseToExpire(dependencies, owner, token, ownerId, execution)
+    throw new UpdateRefusal('The host-agent quiesce lease result was ambiguous; no service stop was submitted.')
+  }
+  const body = isRecord(response.body) ? response.body : {}
+  const lease = parseLease(body.lease)
+  if (lease && lease.ownerId === ownerId) {
+    execution.maintenanceLease = lease
+    execution.shutdownGateState = 'temporary'
+  }
+  const after = await directSupervisorIdentity(dependencies, owner)
+  assertSameIdentity(after, before, 'The supervisor changed while host-agent admission was being quiesced.')
+
+  if (!lease || lease.ownerId !== ownerId) {
+    await waitForUnreportedLeaseToExpire(dependencies, owner, token, ownerId, execution)
+    throw new UpdateRefusal('The host-agent quiesce response did not include this updater’s live lease.')
+  }
+  if (response.status !== 200 || body.drained !== true || body.readyToStop !== true) {
+    if (isRecord(body.readiness)) {
+      throw readinessBlockerRefusal(body.readiness, 'The final host-agent census blocks shutdown.')
+    }
+    throw new UpdateRefusal('Host-agent admission could not be quiesced and drained safely; no service stop was submitted.')
+  }
+  const readiness = parseReadinessReport(body.readiness)
+  assertSameIdentity(readiness.identity, before, 'The final host-agent census did not match the selected supervisor.')
+  assertReadinessForSafeShutdown(readiness)
+  const admission = isRecord(body.admission) ? body.admission : {}
+  if (admission.phase !== 'quiesced' || admission.activePermits !== 0) {
+    throw new UpdateRefusal('The host-agent quiesce lease did not confirm that admission was closed and in-flight work drained.')
+  }
+  return { lease, readiness }
+}
+
+async function commitMaintenanceLease(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  owner: ManagedRuntimeOwner,
+  token: string,
+  lease: MaintenanceLease,
+  execution: WorkerExecutionState,
+): Promise<void> {
+  const before = await directSupervisorIdentity(dependencies, owner)
+  execution.shutdownCommitAttempted = true
+  execution.shutdownGateState = 'unknown'
+  let response: { status: number; body: unknown }
+  try {
+    response = await runtimeApiRequest(dependencies, owner, token, 'POST', '/api/runtime/maintenance/commit-stop', lease)
+  } catch {
+    throw new UpdateFailure('Host-agent shutdown commitment could not be confirmed; the updater did not stop the web service.')
+  }
+  const body = isRecord(response.body) ? response.body : {}
+  if (response.status === 200 && body.committed === true) {
+    execution.shutdownGateState = 'latched'
+  } else if ([400, 401, 404, 409, 503].includes(response.status)
+    || (response.status === 200 && body.committed === false)) {
+    execution.shutdownCommitAttempted = false
+    execution.shutdownGateState = 'temporary'
+  } else {
+    execution.shutdownGateState = 'temporary'
+  }
+  const after = await directSupervisorIdentity(dependencies, owner)
+  assertSameIdentity(after, before, 'The supervisor changed while shutdown commitment was being checked.')
+  if (response.status !== 200 || body.committed !== true) {
+    if (isRecord(body.readiness)) {
+      throw readinessBlockerRefusal(body.readiness, 'The final commit-stop census blocks shutdown.')
+    }
+    throw new UpdateRefusal('The host-agent shutdown lease was not committed; no service stop was submitted.')
+  }
+  const readiness = parseReadinessReport(body.readiness)
+  assertSameIdentity(readiness.identity, before, 'The committed shutdown census did not match the selected supervisor.')
+  assertReadinessForSafeShutdown(readiness)
+  const admission = isRecord(body.admission) ? body.admission : {}
+  if (admission.phase !== 'shutdown-latched') {
+    throw new UpdateFailure('The shutdown lease response did not confirm that host-agent admission is latched closed.')
+  }
+  execution.maintenanceLease = lease
+}
+
+async function directSupervisorIdentity(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  owner: ManagedRuntimeOwner,
+): Promise<SupervisorIdentity> {
+  try {
+    const health = await dependencies.admin.health(owner)
+    if (health.state !== 'ok') throw new Error('not healthy')
+    return parseSupervisorIdentity(health)
+  } catch {
+    throw new UpdateRefusal('The selected supervisor control socket did not provide a usable Health identity.')
+  }
+}
+
+async function runtimeApiRequest(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  owner: ManagedRuntimeOwner,
+  token: string,
+  method: 'GET' | 'POST',
+  endpoint: string,
+  body?: unknown,
+): Promise<{ status: number; body: unknown }> {
+  try {
+    return await dependencies.runtimeApi.request(owner, token, method, endpoint, body)
+  } catch {
+    throw new UpdateRefusal(`Authenticated runtime API request ${endpoint} failed.`)
+  }
+}
+
+function parseReadinessReport(value: unknown): ReadinessReport {
+  if (!isRecord(value) || !isRecord(value.readiness) || !isRecord(value.paneOwnership)) {
+    throw new UpdateRefusal('Runtime readiness omitted supervisor identity, runtime scan state, or pane/process ownership.')
+  }
+  const identity = parseSupervisorIdentity(value)
+  const paneOwnership = value.paneOwnership
+  if (paneOwnership.complete !== true || !Array.isArray(paneOwnership.panes)
+    || !Array.isArray(paneOwnership.unattachedProcesses) || typeof paneOwnership.readyToStop !== 'boolean') {
+    throw new UpdateRefusal('Runtime readiness did not include a complete pane and process ownership census.')
+  }
+  for (const pane of paneOwnership.panes) {
+    if (!isRecord(pane) || !nonEmpty(pane.clientId) || !nonEmpty(pane.tabId)
+      || !nonEmpty(pane.paneId) || !nonEmpty(pane.kind) || !isPaneOwnership(pane.ownership)) {
+      throw new UpdateRefusal('Runtime readiness contained an invalid pane ownership record.')
+    }
+  }
+  for (const process of paneOwnership.unattachedProcesses) {
+    if (!isRecord(process) || !nonEmpty(process.kind) || !nonEmpty(process.source)
+      || !nonEmpty(process.reason) || !isPaneOwnership(process.ownership)) {
+      throw new UpdateRefusal('Runtime readiness contained an invalid unattached-process ownership record.')
+    }
+  }
+  return { identity, readiness: value.readiness, paneOwnership }
+}
+
+function parseSupervisorIdentity(value: unknown): SupervisorIdentity {
+  if (!isRecord(value) || !nonEmpty(value.installationId)
+    || !Number.isSafeInteger(value.controlEpoch) || Number(value.controlEpoch) < 0) {
+    throw new UpdateRefusal('Supervisor Health or runtime readiness omitted a valid installationId/controlEpoch identity.')
+  }
+  return { installationId: value.installationId, controlEpoch: Number(value.controlEpoch) }
+}
+
+function parseLease(value: unknown): MaintenanceLease | undefined {
+  if (!isRecord(value) || !nonEmpty(value.ownerId) || !nonEmpty(value.leaseId)) return undefined
+  return { ownerId: value.ownerId, leaseId: value.leaseId }
+}
+
+function isPaneOwnership(value: unknown): value is 'durable' | 'host-managed' | 'unknown' {
+  return value === 'durable' || value === 'host-managed' || value === 'unknown'
+}
+
+function assertSameIdentity(actual: SupervisorIdentity, expected: SupervisorIdentity | undefined, message: string): void {
+  if (!expected || actual.installationId !== expected.installationId || actual.controlEpoch !== expected.controlEpoch) {
+    throw new UpdateRefusal(message)
+  }
+}
+
+function assertReadinessForSafeShutdown(report: ReadinessReport): void {
+  assertRuntimeReadiness(report)
+  const panes = report.paneOwnership.panes as unknown[]
+  const unattached = report.paneOwnership.unattachedProcesses as unknown[]
+  const blocked: string[] = []
+  for (const pane of panes) {
+    if (!isRecord(pane)) throw new UpdateRefusal('The pane ownership census contains an invalid pane record.')
+    const ownership = pane.ownership
+    if (ownership !== 'durable') {
+      const paneId = safeIdentifier(pane.paneId)
+      const kind = safeIdentifier(pane.kind)
+      const classification = ownership === 'host-managed' ? 'host-managed' : 'unknown'
+      blocked.push(`pane ${paneId} (${kind}, ${classification})`)
+    }
+  }
+  for (const process of unattached) {
+    if (!isRecord(process)) throw new UpdateRefusal('The process ownership census contains an invalid process record.')
+    const kind = safeIdentifier(process.kind)
+    const provider = safeIdentifier(process.provider)
+    const terminalId = safeIdentifier(process.terminalId)
+    const classification = process.ownership === 'host-managed' ? 'host-managed' : 'unknown'
+    blocked.push(`unattached ${kind} ${provider} ${terminalId} (${classification})`)
+  }
+  if (blocked.length > 0) {
+    throw new UpdateRefusal(`Host-managed, unknown, or unattached coding work prevents shutdown: ${blocked.join('; ')}`)
+  }
+  if (report.paneOwnership.readyToStop !== true) {
+    throw new UpdateRefusal('Runtime readiness did not confirm that the current pane and process census is safe to stop.')
+  }
+}
+
+function assertRuntimeReadiness(report: ReadinessReport): void {
+  const blockedSubsystems = report.readiness.blockedSubsystems
+  if (report.readiness.initialScanState !== 'complete' || !Array.isArray(blockedSubsystems) || blockedSubsystems.length > 0) {
+    throw new UpdateRefusal('The managed runtime initial scan is incomplete or has blocked subsystems.')
+  }
+}
+
+function readinessBlockerRefusal(value: unknown, fallback: string): UpdateRefusal {
+  try {
+    const report = parseReadinessReport(value)
+    assertReadinessForSafeShutdown(report)
+  } catch (error) {
+    if (error instanceof UpdateRefusal) return error
+  }
+  return new UpdateRefusal(fallback)
+}
+
+function safeIdentifier(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim()) return 'unknown'
+  const safe = value.trim().replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 80)
+  return safe || 'unknown'
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+async function releaseTemporaryLease(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  execution: WorkerExecutionState,
+  token: string | undefined,
+): Promise<void> {
+  const lease = execution.maintenanceLease
+  const owner = execution.owner
+  if (!lease || !owner || !token || execution.shutdownGateState === 'latched') return
+  try {
+    const response = await runtimeApiRequest(dependencies, owner, token, 'POST', '/api/runtime/maintenance/release', lease)
+    const body = isRecord(response.body) ? response.body : {}
+    const admission = isRecord(body.admission) ? body.admission : {}
+    if (response.status === 200 && admission.phase === 'open') {
+      execution.maintenanceLease = undefined
+      execution.shutdownGateState = 'open'
+      return
+    }
+  } catch { /* the temporary lease expires; a failed release never authorizes stop */ }
+  execution.shutdownGateState = execution.shutdownGateState === 'unknown' ? 'unknown' : 'temporary'
+  await record(dependencies, execution.mode, execution.phase, 'update.maintenance_lease_release_failed', 'error', {
+    error_code: 'maintenance_lease_release_failed',
+  })
+}
+
+async function reconcileAmbiguousCommit(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  execution: WorkerExecutionState,
+  token: string | undefined,
+): Promise<void> {
+  const owner = execution.owner
+  const lease = execution.maintenanceLease
+  if (!owner || !token) {
+    execution.shutdownGateState = 'unknown'
+    return
+  }
+  try {
+    const status = await runtimeApiRequest(dependencies, owner, token, 'GET', '/api/runtime/maintenance/status')
+    const body = isRecord(status.body) ? status.body : {}
+    if (status.status !== 200) throw new Error('status unavailable')
+    if (body.phase === 'shutdown-latched') {
+      execution.shutdownGateState = 'latched'
+      return
+    }
+    if (body.phase === 'quiesced' && lease && body.leaseOwner === lease.ownerId) {
+      execution.shutdownGateState = 'temporary'
+      await releaseTemporaryLease(dependencies, execution, token)
+      return
+    }
+    if (body.phase === 'open') {
+      execution.shutdownGateState = 'open'
+      execution.maintenanceLease = undefined
+      return
+    }
+  } catch { /* preserve a possible latch if the commit outcome cannot be recovered */ }
+  execution.shutdownGateState = 'unknown'
+}
+
+async function waitForUnreportedLeaseToExpire(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  owner: ManagedRuntimeOwner,
+  token: string,
+  ownerId: string,
+  execution: WorkerExecutionState,
+): Promise<void> {
+  execution.shutdownGateState = 'unknown'
+  const deadline = Date.now() + MAINTENANCE_LEASE_DURATION_MS + 2_000
+  while (Date.now() < deadline) {
+    let status: { status: number; body: unknown }
+    try {
+      status = await runtimeApiRequest(dependencies, owner, token, 'GET', '/api/runtime/maintenance/status')
+    } catch {
+      return
+    }
+    const body = isRecord(status.body) ? status.body : {}
+    if (status.status === 200 && body.phase === 'open') {
+      execution.shutdownGateState = 'open'
+      return
+    }
+    if (status.status === 200 && body.phase === 'shutdown-latched') {
+      execution.shutdownGateState = 'latched'
+      return
+    }
+    if (status.status === 200 && body.phase === 'quiesced' && body.leaseOwner === ownerId) {
+      execution.shutdownGateState = 'temporary'
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      continue
+    }
+    return
+  }
+  execution.shutdownGateState = 'unknown'
+}
+
 async function runClientUpdate(
   dependencies: ManagedRuntimeUpdateDependencies,
   owner: ManagedRuntimeOwner,
   artifacts: StagedArtifacts,
   execution: WorkerExecutionState,
+  authToken: string,
+  expectedIdentity: SupervisorIdentity,
 ): Promise<number> {
+  execution.phase = 'stop_web'
+  execution.webStopAttempted = true
+  await dependencies.services.stop(owner.webUnit)
+  await dependencies.services.waitWebStopped(owner)
+  markOldWebProcessExited(execution)
+  await record(dependencies, 'client', execution.phase, 'update.web_stopped', 'info')
+
   execution.phase = 'install_web'
   execution.filesInstalled = true
   await dependencies.filesystem.installExecutable(artifacts.webExecutable!, owner.webExecutable)
   await dependencies.filesystem.swapClientDirectory(artifacts.clientDirectory!, owner.clientDirectory)
-  execution.phase = 'restart_web'
-  await assertWebActionsSafe(dependencies, owner, 'client', execution.phase)
-  await dependencies.services.restart(owner.webUnit)
+
+  execution.phase = 'start_web'
+  await dependencies.services.start(owner.webUnit)
   execution.phase = 'web_readiness'
   await dependencies.services.waitWebReady(owner)
   await dependencies.services.waitCallbackReady(owner)
+  const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
+  assertSameIdentity(readiness.identity, expectedIdentity, 'Default web-only update changed the durable supervisor identity.')
+  execution.postUpdateSupervisorIdentity = readiness.identity
   await record(dependencies, 'client', 'complete', 'update.completed', 'info', { reminder: DEFAULT_UPDATE_REMINDER })
   await dependencies.logger.operator(DEFAULT_UPDATE_REMINDER)
   return 0
@@ -509,11 +940,13 @@ async function runResetUpdate(
   artifacts: StagedArtifacts,
   execution: WorkerExecutionState,
   stoppedIntentRevisions: Map<string, number>,
+  authToken: string,
 ): Promise<number> {
   execution.phase = 'stop_web'
-  await assertWebActionsSafe(dependencies, owner, mode, execution.phase)
   execution.webStopAttempted = true
   await dependencies.services.stop(owner.webUnit)
+  await dependencies.services.waitWebStopped(owner)
+  markOldWebProcessExited(execution)
   await record(dependencies, mode, execution.phase, 'update.web_stopped', 'info')
 
   execution.phase = 'inventory'
@@ -530,7 +963,7 @@ async function runResetUpdate(
 
   await stopManagedCodingSouls(mode, dependencies, owner, execution, stoppedIntentRevisions)
   await replaceDurableRuntime(mode, dependencies, owner, artifacts, execution)
-  await startUpdatedRuntime(mode, dependencies, owner, execution)
+  await startUpdatedRuntime(mode, dependencies, owner, execution, authToken)
   return reopenSavedConversations(mode, dependencies, owner, inventory, groups, execution, stoppedIntentRevisions)
 }
 
@@ -611,18 +1044,21 @@ async function startUpdatedRuntime(
   dependencies: ManagedRuntimeUpdateDependencies,
   owner: ManagedRuntimeOwner,
   execution: WorkerExecutionState,
+  authToken: string,
 ): Promise<void> {
   execution.phase = 'start_supervisor'
   await dependencies.services.start(owner.supervisorUnit)
   await dependencies.services.waitSupervisorReady(owner)
-  const health = await dependencies.admin.health(owner)
-  if (health.state !== 'ok') throw new UpdateFailure('The updated supervisor did not pass its control-socket health check.')
+  const supervisorIdentity = await directSupervisorIdentity(dependencies, owner)
+  execution.postUpdateSupervisorIdentity = supervisorIdentity
 
   execution.phase = 'start_web'
-  await assertWebActionsSafe(dependencies, owner, mode, execution.phase)
   await dependencies.services.start(owner.webUnit)
   await dependencies.services.waitWebReady(owner)
   await dependencies.services.waitCallbackReady(owner)
+  const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
+  assertSameIdentity(readiness.identity, supervisorIdentity, 'Updated web readiness did not match the deliberately restarted supervisor.')
+  execution.postUpdateSupervisorIdentity = readiness.identity
 }
 
 async function reopenSavedConversations(
@@ -690,9 +1126,14 @@ async function handleWorkerFailure(
   error: unknown,
 ): Promise<number> {
   const refusal = error instanceof UpdateRefusal
-  const partialState = mode !== 'client'
-    && (execution.supervisorShutdownAttempted || execution.supervisorShutdownComplete || execution.filesInstalled)
-  if (execution.webStopAttempted && !execution.supervisorShutdownComplete && execution.owner) {
+  const gateMayRemainClosed = !execution.webProcessExitConfirmed
+    && ['temporary', 'latched', 'unknown'].includes(execution.shutdownGateState)
+  const gateRecovery = execution.shutdownGateState === 'temporary' ? TEMPORARY_GATE_RECOVERY : SHUTDOWN_GATE_RECOVERY
+  const partialState = (mode !== 'client'
+    && (execution.supervisorShutdownAttempted || execution.supervisorShutdownComplete || execution.filesInstalled))
+    || gateMayRemainClosed
+  if (execution.webStopAttempted && execution.webProcessExitConfirmed
+    && !execution.supervisorShutdownComplete && execution.owner) {
     const restoration = await restoreWebAfterAbort(dependencies, execution.owner, mode)
     await record(dependencies, mode, execution.phase, 'update.web_restore_after_abort', restoration.restored ? 'info' : 'error', {
       restored: restoration.restored, original_error_code: refusal ? 'preflight_refused_after_web_stop' : 'update_failed',
@@ -704,15 +1145,26 @@ async function handleWorkerFailure(
     error_code: refusal ? 'preflight_refused' : 'update_failed',
     attempted_prefix: execution.attemptedStops,
     verified_empty_stopped: execution.verifiedEmptyStops,
+    maintenance_gate_state: execution.shutdownGateState,
     ...(execution.supervisorStateAfterStopFailure ? { supervisor_unit_state: execution.supervisorStateAfterStopFailure } : {}),
-    ...(partialState ? { partial_state: true, manual_recovery: MANUAL_RECOVERY } : {}),
+    ...(partialState ? {
+      partial_state: true,
+      manual_recovery: gateMayRemainClosed ? gateRecovery : MANUAL_RECOVERY,
+    } : {}),
   })
   const safeMessage = error instanceof Error ? error.message : 'Unknown updater failure.'
   await dependencies.logger.operator(safeMessage)
   if (partialState) {
-    await dependencies.logger.operator(MANUAL_RECOVERY)
+    await dependencies.logger.operator(gateMayRemainClosed ? gateRecovery : MANUAL_RECOVERY)
   }
-  return refusal && !execution.webStopAttempted && !execution.filesInstalled ? 2 : 1
+  return refusal && !execution.webStopAttempted && !execution.filesInstalled && !gateMayRemainClosed ? 2 : 1
+}
+
+function markOldWebProcessExited(execution: WorkerExecutionState): void {
+  execution.webProcessExitConfirmed = true
+  execution.shutdownGateState = 'open'
+  execution.shutdownCommitAttempted = false
+  execution.maintenanceLease = undefined
 }
 
 async function cleanupStagingArtifacts(artifacts?: StagedArtifacts): Promise<void> {
@@ -892,13 +1344,21 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
         const web = readSystemdUnit(paths, systemdShow, WEB_UNIT)
         const supervisor = readSystemdUnit(paths, systemdShow, SUPERVISOR_UNIT)
         const selected = deriveOwner(paths, web, supervisor)
-        await loadPersistentResourceManifest(paths, selected, dockerAdapter, run)
         await verifyOwnerFiles(selected, mode)
         return selected
       },
       async inspectGraph(selected) { return inspectEffectiveUnitGraph(paths, systemdShow, selected) },
+      async loadPersistentResourceManifest(selected, mode) {
+        await loadPersistentResourceManifest(paths, selected, dockerAdapter, run)
+        await verifyOwnerFiles(selected, mode)
+      },
     },
-    artifacts: { async build(selected, mode) { return buildSelectedArtifacts(paths, selected, mode, run, dockerAdapter) } },
+    artifacts: {
+      async build(selected, mode) { return buildSelectedArtifacts(paths, selected, mode, run, dockerAdapter) },
+      async serverBuildInfo(executable) {
+        return parseBuildInfoOutput(run(executable, ['--build-info']))
+      },
+    },
     filesystem: {
       async webExecutableIdentity(selectedPath) {
         const web = readSystemdUnit(paths, systemdShow, WEB_UNIT)
@@ -925,6 +1385,17 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
         })
       },
       async waitWebReady(selected) { await waitHttpReady(selected.callbackAddress) },
+      async waitWebStopped(selected) {
+        await waitUntil(async () => {
+          const state = systemdShow(WEB_UNIT, 'ActiveState')
+          if (state === 'active' || state === 'activating' || state === 'deactivating' || state === 'reloading') return false
+          if (!selected.webMainPid) return true
+          try {
+            const executable = (await fsp.readlink(`/proc/${selected.webMainPid}/exe`)).replace(/ \(deleted\)$/, '')
+            return path.resolve(executable) !== selected.webExecutable
+          } catch { return true }
+        })
+      },
       async waitCallbackReady(selected) {
         await waitUntil(() => probeUnixSocket(selected.callbackSocket))
       },
@@ -947,7 +1418,8 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
         const output = run(selected.adminCli, ['--socket', selected.controlSocket, '--secret-file', selected.controlSecretFile, 'health'])
         const value = parseJsonOutput(output)
         if (value.state !== 'ok') throw new UpdateFailure('Supervisor control-socket health check failed.')
-        return { state: 'ok' }
+        const identity = parseSupervisorIdentity(value)
+        return { state: 'ok', ...identity }
       },
       async inventory(selected) {
         const output = run(selected.adminCli, ['--socket', selected.controlSocket, '--secret-file', selected.controlSecretFile, 'inventory'])
@@ -981,6 +1453,39 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
         const outcome = value.outcome
         if (!['reopened', 'pending', 'failed'].includes(String(outcome))) throw new UpdateFailure('Supervisor Reopen returned an invalid typed result.')
         return { outcome: outcome as 'reopened' | 'pending' | 'failed', ...(typeof value.message === 'string' ? { message: value.message } : {}) }
+      },
+    },
+    runtimeApi: {
+      async readAuthToken(selected) {
+        const web = readSystemdUnit(paths, systemdShow, WEB_UNIT)
+        if (web.loadState !== 'loaded' || web.workingDirectory !== selected.checkoutRoot
+          || web.executable !== selected.webExecutable || !web.mainPid) {
+          throw new UpdateRefusal('The selected live web process could not be verified before reading its runtime token.')
+        }
+        await validateProcessOwner(web.mainPid, selected.webExecutable, selected.checkoutRoot)
+        const processEnvironment = await readProcessEnvironment(web.mainPid)
+        const processToken = processEnvironment.AUTH_TOKEN
+        const token = processToken !== undefined
+          ? processToken
+          : readEnvironmentValue(await fsp.readFile(selected.environmentFile, 'utf8'), 'AUTH_TOKEN')
+        if (!nonEmpty(token)) throw new UpdateRefusal('The selected web server has no usable AUTH_TOKEN in its verified process environment or checkout .env.')
+        return token
+      },
+      async request(selected, token, method, endpoint, body) {
+        const response = await fetch(new URL(endpoint, selected.callbackAddress), {
+          method,
+          headers: {
+            'x-auth-token': token,
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          redirect: 'error',
+          cache: 'no-store',
+          signal: AbortSignal.timeout(30_000),
+        })
+        let responseBody: unknown
+        try { responseBody = JSON.parse(await response.text()) } catch { responseBody = undefined }
+        return { status: response.status, body: responseBody }
       },
     },
     docker: dockerAdapter,
@@ -1631,6 +2136,14 @@ function parseJsonOutput(output: string): Record<string, unknown> {
   throw new UpdateFailure('The supervisor admin CLI returned invalid JSON.')
 }
 
+function parseBuildInfoOutput(output: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(output) as unknown
+    if (isRecord(value)) return value
+  } catch { /* use the fixed safe error below */ }
+  throw new UpdateRefusal('The selected web server returned invalid build-info JSON.')
+}
+
 function parseCandidateMaintenanceInventory(output: string): NoRuntimeInventoryRecord[] {
   const value = parseJsonOutput(output)
   if (!Array.isArray(value.noRuntime)) {
@@ -1747,6 +2260,24 @@ function readEnvironmentValue(contents: string, name: string): string | null {
   let value = matches[0]!.slice(name.length + 1).trim()
   if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1)
   return value
+}
+
+async function readProcessEnvironment(pid: number): Promise<Record<string, string>> {
+  let contents: Buffer
+  try { contents = await fsp.readFile(`/proc/${pid}/environ`) }
+  catch { throw new UpdateRefusal('The verified live web process environment could not be read.') }
+  const values = new Map<string, string>()
+  for (const entry of contents.toString('utf8').split('\0')) {
+    const separator = entry.indexOf('=')
+    if (separator <= 0) continue
+    const name = entry.slice(0, separator)
+    const value = entry.slice(separator + 1)
+    if (name === 'AUTH_TOKEN' && values.has(name) && values.get(name) !== value) {
+      throw new UpdateRefusal('The verified live web process has ambiguous AUTH_TOKEN values.')
+    }
+    values.set(name, value)
+  }
+  return Object.fromEntries(values)
 }
 
 function commandForProperty(paths: UpdatePaths, unit: string, property: string): string {
