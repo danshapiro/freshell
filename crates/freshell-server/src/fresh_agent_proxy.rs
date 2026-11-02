@@ -1570,9 +1570,7 @@ impl HostedFreshAgentProxy {
         session_type: &str,
         attention_since: Option<i64>,
     ) {
-        let materialized_session_id = (provider != "codex")
-            .then(|| materialized_session_id(&event))
-            .flatten();
+        let materialized_session_id = materialized_session_id(&event);
         let confirmed_clear = self
             .confirmed_claude_clear(soul, &event, provider, session_type)
             .await;

@@ -3025,6 +3025,7 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
             request_id: Some("fork-request-1".into()),
             cwd: Some("/workspace".into()),
             tab_id: Some("tab-one".into()),
+            view_id: None,
         }))
         .await;
 

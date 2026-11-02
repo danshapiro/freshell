@@ -267,3 +267,109 @@ async fn delayed_clear_events_materialize_the_latest_current_root_once() {
         LATEST
     );
 }
+
+#[tokio::test]
+async fn codex_materialization_rekeys_only_its_route_and_later_events_use_native_id() {
+    const MANAGED: &str = "managed-codex-session";
+    const NATIVE: &str = "native-codex-session";
+    const RETIRED: &str = "retired-codex-session";
+
+    let fixture = readiness_fixture().await;
+    let (proxy, mut receiver) = configure_proxy(&fixture.control_socket, HashMap::new());
+    let sibling_soul = stable_soul_id("codex", "sibling-view").unwrap();
+    {
+        let mut routes = proxy.presentation_routes.lock().await;
+        routes.insert(fixture.soul.clone(), PresentationRoute::initial(MANAGED));
+        routes.insert(
+            sibling_soul.clone(),
+            PresentationRoute::initial("sibling-managed-session"),
+        );
+    }
+
+    proxy
+        .forward_polled_event(
+            &fixture.soul,
+            AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.session.materialized",
+                    "provider":"codex",
+                    "sessionType":"freshcodex",
+                    "previousSessionId":MANAGED,
+                    "sessionId":NATIVE,
+                    "sessionRef":{"provider":"codex", "sessionId":NATIVE},
+                }),
+            },
+            "codex",
+            MANAGED,
+            "freshcodex",
+            None,
+        )
+        .await;
+    let materialized = next_frame(&mut receiver, "freshAgent.session.materialized").await;
+    assert_eq!(materialized["previousSessionId"], MANAGED);
+    assert_eq!(materialized["sessionId"], NATIVE);
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&fixture.soul)
+            .unwrap()
+            .session_id,
+        NATIVE
+    );
+
+    proxy
+        .forward_polled_event(
+            &fixture.soul,
+            AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.event",
+                    "provider":"codex",
+                    "sessionType":"freshcodex",
+                    "sessionId":MANAGED,
+                    "event":{"type":"freshAgent.turn.complete", "sessionId":MANAGED, "at":1},
+                }),
+            },
+            "codex",
+            MANAGED,
+            "freshcodex",
+            Some(1),
+        )
+        .await;
+    let completion = next_frame(&mut receiver, "freshAgent.event").await;
+    assert_eq!(completion["sessionId"], NATIVE);
+    assert_eq!(completion["event"]["type"], "freshAgent.turn.complete");
+    assert_eq!(completion["event"]["sessionId"], NATIVE);
+
+    // A retained parent materialization is stale for this soul and must not
+    // change its route. Other live views keep their independent presentation ID.
+    proxy
+        .forward_polled_event(
+            &fixture.soul,
+            AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.session.materialized",
+                    "provider":"codex",
+                    "sessionType":"freshcodex",
+                    "previousSessionId":MANAGED,
+                    "sessionId":RETIRED,
+                }),
+            },
+            "codex",
+            MANAGED,
+            "freshcodex",
+            None,
+        )
+        .await;
+    assert!(
+        receiver.try_recv().is_err(),
+        "retired materialization was broadcast"
+    );
+    let routes = proxy.presentation_routes.lock().await;
+    assert_eq!(routes.get(&fixture.soul).unwrap().session_id, NATIVE);
+    assert_eq!(
+        routes.get(&sibling_soul).unwrap().session_id,
+        "sibling-managed-session"
+    );
+}
