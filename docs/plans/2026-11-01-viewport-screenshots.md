@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Implement the manually tested approach for useful, efficient Freshell screenshots of background panes with large transcripts, show a toast throughout capture, provide useful screenshot diagnostics, and land the completed change on main through a PR.
+Implement the manually tested approach for useful, efficient Freshell screenshots of background panes with large transcripts, show a toast throughout capture, provide useful screenshot diagnostics, track the diagnosed Codex recovery failure separately in Kata, and land the completed change on main through a PR.
 
 ### Explicit constraints
 - A pane with 30,000 elements is typical and must produce a useful screenshot efficiently.
@@ -20,6 +20,7 @@ Implement the manually tested approach for useful, efficient Freshell screenshot
 - Show a toast while a screenshot is happening and remove it when capture finishes, including failure paths.
 - Provide good screenshot observability using the existing logging infrastructure.
 - When implementation and verification are complete, create a PR and land it on main; the user has explicitly authorized this operation.
+- File the diagnosed managed Codex recovery failure in Kata and proceed with the screenshot PR with that failure documented as an accepted exception; do not expand this task into a backend recovery repair.
 - Do not deploy or restart the production server.
 
 ### Accepted tradeoffs and residuals
@@ -27,6 +28,7 @@ Implement the manually tested approach for useful, efficient Freshell screenshot
 - Preserve the existing html2canvas level of visual accuracy, including its differences from native browser pixels.
 - Visible-line capture of a large code block may omit syntax colours.
 - Wrapped tool output still needs validation.
+- The installed-native Codex integration failure after a native crash and archived history is accepted for this screenshot change and tracked as freshell#gc1p. Its later recovery assertions remain unexecuted; all other required checks still apply.
 
 **Goal:** Capture the current visible content of a background Freshell pane with typical 30,000-element history efficiently, preserving the user's live selection, focus, active tab/pane, and scroll positions.
 
