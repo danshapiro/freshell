@@ -946,6 +946,7 @@ tool_timeout_sec = 120
     expect(JSON.stringify(afterRestart.turns)).toContain('MANAGED_NATIVE_FIRST')
     expect(await readName()).toEqual(canonicalName)
     expect((await model.getTraffic()).filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
+
     rig.runtime.writeIncident('freshcodex-managed-native-tools-restart', { created, nativeContext, canonicalName, effects, mcpResults,
       registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: await model.getTraffic(), finalName: await readName() })
 
@@ -963,28 +964,50 @@ tool_timeout_sec = 120
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.getTraffic()).length }
     expect(beforeCrash.name).toEqual(canonicalName)
+    expect(beforeCrash.snapshot.status).toBe('idle')
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
-    // Kill only this receipt-owned, inspected release native PID. Archive its
-    // REAL native-generated history after exit, keeping every original byte.
-    // The host stays live; no internal exited flag or Started event is forged.
-    rig.runtime.killOwnedRuntimePidExact(providerContainerId, beforeCrash.nativeContext.pid)
-    const nativeExit = await waitFor('exact native process terminal state before history archive', async () => {
-      const state = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
-        const fs=require('node:fs'),p='/proc/${beforeCrash.nativeContext.pid}/status';
-        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,state:fs.readFileSync(p,'utf8').split(String.fromCharCode(10)).find(line=>line.startsWith('State:')).slice(6).trim()}:{exists:false}));`]))
-      return !state.exists || state.state.startsWith('Z') ? state : undefined
-    })
-    const originalRollout = nativeMetadata.headers.find((header: any) => header.id === view.nativeSessionId).path
-    const archived = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    // Quarantine the current native store before killing its writer. Killing
+    // first lets automatic recovery probe the still-present rollout while the
+    // archive is in flight, turning a missing-store case into stale readiness.
+    // Re-read CODEX_HOME and every exact rollout from the post-restart process.
+    const quarantined = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
-      const root='/home/freshell/provider/.codex';const original=${JSON.stringify(originalRollout)};
-      const directory='/home/freshell/provider/.freshell-fixture/native-crash-history';fs.mkdirSync(directory,{mode:448});
-      const selected=[original,...fs.readdirSync(root).filter(name=>/^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(name)||name==='session_index.jsonl').map(name=>path.join(root,name))];
-      const files=selected.filter(file=>fs.existsSync(file)).map((file,index)=>{const bytes=fs.readFileSync(file);const destination=path.join(directory,String(index)+'-'+path.basename(file));fs.renameSync(file,destination);return{source:file,archive:destination,sha256:crypto.createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,base64:bytes.toString('base64')}});
-      if(!files.some(file=>file.source===original))throw Error('Exact real native rollout was not archived');process.stdout.write(JSON.stringify({directory,files}));`]))
+      const expected=${JSON.stringify(view.nativeSessionId)},pid=${beforeCrash.nativeContext.pid};
+      const env=Object.fromEntries(fs.readFileSync('/proc/'+pid+'/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
+        const at=entry.indexOf('=');const key=entry.slice(0,at);return ['HOME','CODEX_HOME'].includes(key)?[[key,entry.slice(at+1)]]:[];
+      }));
+      const providerHome=env.HOME,codexHome=env.CODEX_HOME||(providerHome&&path.join(providerHome,'.codex'));
+      if(!providerHome||!codexHome||!path.isAbsolute(codexHome))throw Error('Current native process has no absolute effective CODEX_HOME');
+      if(path.resolve(codexHome)!==path.resolve(path.join(providerHome,'.codex')))throw Error('Current CODEX_HOME differs from the managed recovery probe selection');
+      const sessionsRoot=path.join(codexHome,'sessions'),exactRollouts=[];let visited=0;
+      const scan=(dir,depth,found)=>{
+        if(depth>8||visited++>1024)throw Error('Codex sessions tree exceeded the bounded verification walk');
+        for(const entry of fs.readdirSync(dir,{withFileTypes:true})){
+          const file=path.join(dir,entry.name);if(entry.isDirectory()){scan(file,depth+1,found);continue}
+          if(!entry.isFile()||!entry.name.endsWith('.jsonl'))continue;
+          const fd=fs.openSync(file,'r');let first;try{const b=Buffer.alloc(65536);first=b.toString('utf8',0,fs.readSync(fd,b,0,b.length,0)).split(String.fromCharCode(10))[0]}finally{fs.closeSync(fd)}
+          let meta;try{meta=JSON.parse(first)}catch{}
+          if(meta?.type==='session_meta'&&(meta.payload?.id===expected||meta.payload?.session_id===expected))found.push(file);
+        }
+      };
+      scan(sessionsRoot,0,exactRollouts);exactRollouts.sort();
+      if(!exactRollouts.length)throw Error('Current CODEX_HOME has no readable rollout for the exact native session');
+      const selected=[...exactRollouts,...fs.readdirSync(codexHome).filter(name=>/^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(name)||name==='session_index.jsonl').map(name=>path.join(codexHome,name))];
+      const directory=path.join(providerHome,'.freshell-fixture','native-crash-history');fs.mkdirSync(directory,{mode:448});
+      const files=[...new Set(selected)].filter(file=>fs.existsSync(file)).map((source,index)=>{
+        const bytes=fs.readFileSync(source),archive=path.join(directory,String(index)+'-'+path.basename(source));
+        fs.renameSync(source,archive);return{source,archive,sha256:crypto.createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,base64:bytes.toString('base64')};
+      });
+      if(!exactRollouts.every(source=>files.some(file=>file.source===source)))throw Error('Not every exact real native rollout was quarantined');
+      const remainingExact=[];visited=0;scan(sessionsRoot,0,remainingExact);
+      if(remainingExact.length)throw Error('An exact native session owner remains readable after quarantine');
+      process.stdout.write(JSON.stringify({effectiveCodexHome:codexHome,sessionsRoot,exactRollouts,remainingExact,files}));`]))
+    expect(quarantined.exactRollouts).not.toHaveLength(0)
+    expect(quarantined.remainingExact).toEqual([])
+    expect(quarantined.files.map((file: any) => file.source)).toEqual(expect.arrayContaining(quarantined.exactRollouts))
     const archiveDirectory = path.join(rig.runtime.evidenceDir, 'native-crash-history')
     fs.mkdirSync(archiveDirectory, { mode: 0o700 })
-    const archiveManifest = archived.files.map((file: any, index: number) => {
+    const archiveManifest = quarantined.files.map((file: any, index: number) => {
       const bytes = Buffer.from(file.base64, 'base64')
       expect(createHash('sha256').update(bytes).digest('hex')).toBe(file.sha256)
       const copy = path.join(archiveDirectory, `${index}-${path.basename(file.source)}`)
@@ -993,66 +1016,56 @@ tool_timeout_sec = 120
       return { ...metadata, copy }
     })
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
-    const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
-    const recovered = await rig.runningViewForFreshSession(created.sessionId)
-    rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: (await model.getTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
-    // Acceptance must durably commit the new native source before returning.
-    expect(recovered?.nativeSessionId).toBeTruthy()
-    expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
-    expect(recovered!.freshAgentSessionId).toBe(created.sessionId)
-    const recoveredId = recovered!.nativeSessionId!
-    const recoveryControl = await waitFor('new native source control through original durable user reference', async () => {
-      const value = await snapshot()
-      expect(value.threadId).toBe(recoveredId)
-      expect(value.settings).toEqual(recoverySettings)
-      return value.pendingQuestions?.find((question: any) => question.providerRequest.threadId === recoveredId)
+    // All exact-root files are now outside CODEX_HOME. The session was idle
+    // during quarantine; terminate only its exact observed native PID now.
+    rig.runtime.killOwnedRuntimePidExact(providerContainerId, beforeCrash.nativeContext.pid)
+    const nativeExit = await waitFor('exact native process terminal state after history quarantine', async () => {
+      const state = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+        const fs=require('node:fs'),p='/proc/${beforeCrash.nativeContext.pid}/status';
+        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,state:fs.readFileSync(p,'utf8').split(String.fromCharCode(10)).find(line=>line.startsWith('State:')).slice(6).trim()}:{exists:false}));`]))
+      return !state.exists || state.state.startsWith('Z') ? state : undefined
     })
-    wire.send({ type: 'freshAgent.question.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
-      requestId: recoveryControl.requestId, answers: { managed_choice: 'Alpha' } })
-    await waitFor('recovered native exact control resolution', async () => {
-      const value = await snapshot()
-      return value.status === 'idle' && !value.pendingQuestions.length ? true : undefined
+    const recoveryFrameCursor = wire.frames.length
+    const recoveryRequestId = `send-${randomUUID()}`
+    wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex', sessionId: created.sessionId,
+      requestId: recoveryRequestId, text: 'AWAITED_PLAN_RECOVERY' })
+    const recoveryRefusal = await wire.wait(frame => frame.type === 'freshAgent.event'
+      && frame.provider === 'codex' && frame.sessionType === 'freshcodex' && frame.sessionId === created.sessionId
+      && frame.event?.type === 'freshAgent.error')
+    expect(recoveryRefusal).toMatchObject({
+      type: 'freshAgent.event', provider: 'codex', sessionId: created.sessionId, sessionType: 'freshcodex',
+      event: { type: 'freshAgent.error', code: 'MANAGED_FRESH_AGENT_ERROR', message: 'managed fresh-agent input was not accepted' },
     })
-    await send('MANAGED_RECOVERY_SECOND')
-    const second = await waitFor('second send on same durable user reference', async () => {
-      const value = await snapshot()
-      return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed recovery second answer.') ? value : undefined
+    const blockedView = await waitFor('missing exact native Codex store blocks recovery', async () => {
+      const views = await rig.inventory()
+      return views.find(row => row.soulId === beforeCrash.view.soulId
+        && row.freshAgentSessionId === created.sessionId && row.nativeSessionId === view.nativeSessionId
+        && row.recoveryState === 'blocked' && row.recoveryReason === 'STORE_UNREADABLE')
     })
-    expect(second.threadId).toBe(recoveredId)
-    expect(second.settings).toEqual(recoverySettings)
-    expect(JSON.stringify(second.turns)).not.toContain('MANAGED_NATIVE_FIRST')
+    const recoveryFrames = wire.frames.slice(recoveryFrameCursor)
+    const recoveryTraffic = (await model.getTraffic()).slice(beforeCrash.trafficCursor)
+      .filter((row: any) => row.path === '/v1/responses')
+    const sessionViews = (await rig.inventory()).filter(row => row.freshAgentSessionId === created.sessionId)
+    expect(blockedView).toMatchObject({
+      soulId: beforeCrash.view.soulId, freshAgentSessionId: created.sessionId,
+      nativeSessionId: view.nativeSessionId, recoveryState: 'blocked', recoveryReason: 'STORE_UNREADABLE',
+    })
+    expect(new Set(sessionViews.map(row => row.nativeSessionId).filter(Boolean))).toEqual(new Set([view.nativeSessionId]))
+    expect(recoveryFrames.some(frame => frame.type === 'freshAgent.send.accepted' && frame.requestId === recoveryRequestId)).toBe(false)
+    expect(recoveryFrames.some(frame => {
+      const event = frame.type === 'freshAgent.event' ? frame.event : frame
+      return event.type === 'freshAgent.transcript.patch' && JSON.stringify(event.ops).includes('AWAITED_PLAN_RECOVERY')
+    })).toBe(false)
+    expect(recoveryTraffic).toHaveLength(0)
+    expect(beforeCrash.snapshot.threadId).toBe(view.nativeSessionId)
+    expect(beforeCrash.snapshot.settings).toEqual(recoverySettings)
+    expect(JSON.stringify(beforeCrash.snapshot.turns)).toContain('MANAGED_NATIVE_FIRST')
+    expect(JSON.stringify(beforeCrash.snapshot.turns)).toContain('MANAGED_RECOVERY_READY')
+    expect(archiveManifest.map(file => file.source)).toEqual(expect.arrayContaining(quarantined.exactRollouts))
     expect(await readName()).toEqual(canonicalName)
-    const recoveredNameRef = { kind: 'session', provider: 'codex', sessionId: recoveredId }
-    const recoveredName = await waitFor('policy-correct new conversation name record', async () => {
-      const name = await readNameFor(recoveredNameRef)
-      return name?.ref?.sessionId === recoveredId ? name : undefined
-    })
-    expect(recoveredName.ref).toEqual(recoveredNameRef)
-    expect(recoveredName.name).not.toBe(canonicalName.name)
-    const renamedRecovery = await fetch(`${rig.info.baseUrl}/api/session-names`, { method: 'PATCH',
-      headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ target: recoveredNameRef,
-        name: 'Managed recovered saved name', nameIntent: 'user' }) })
-    expect(renamedRecovery.ok, await renamedRecovery.clone().text()).toBe(true)
-    rig.runtime.writeIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
-      oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await readName(), firstNewName: recoveredName,
-      manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archiveManifest })
-    const recoveredNativeContext = await inspectNativeContext()
-    expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
-    await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
-    const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
-    expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)
-    const capture = await recoveredCapture.text()
-    expect(capture).toContain('Managed recovery second answer.')
-    expect(capture).not.toContain('MANAGED_NATIVE_FIRST')
-    const newTraffic = (await model.getTraffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
-    expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
-    expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
-    expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
-    rig.runtime.writeIncident('freshcodex-managed-native-recovery', { userRef: created.sessionId, oldNativeRef: created.sessionRef,
-      newNativeRef: recoveredNameRef, beforeCrash, archiveManifest, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
-      oldName: await readName(), firstNewName: recoveredName, finalNewName: await readNameFor(recoveredNameRef),
-      nativeName: await readNativeName(recoveredId, recoveredNativeContext), recoveredNativeContext, newTraffic })
+    rig.runtime.writeIncident('freshcodex-managed-native-crash-recovery-blocked', { userRef: created.sessionId,
+      beforeCrash, quarantined: { ...quarantined, files: archiveManifest }, archiveManifest, nativeExit, recoveryRequestId, recoveryRefusal, blockedView,
+      sessionViews, recoveryFrames, recoveryTraffic, nameAfterRefusal: await readName() })
 
   }, 360_000)
 })
