@@ -1,18 +1,46 @@
 //! Antigravity terminal-mode activity (antigravity plan Task 8): the
 //! transcript-record lane.
 //!
-// Stage-1 candidate contract: the record vocabulary below comes from the
-//! antigravity CLI's fixture-format transcripts (brain/<id>/.system_generated/
-//! logs/transcript.jsonl) as pinned by `crates/freshell-sessions`'s parser
-//! and the Task 6 locator — `user_message` and `turn_settled{outcome,
-//! fullyIdle}` records. No pinned real binary was available at planning time,
-//! so the classification is deliberately CONSERVATIVE:
+//! REAL-BINARY record contract (corrected 2026-11-02 against real agy
+//! 1.2.11 + 1.4.12 transcripts; evidence:
+//! `.worktrees/.the-usual-logs/antigravity-transcript-validation/reports/
+//! real-binary-transcript-evidence.md`): the transcript
+//! (brain/<id>/.system_generated/logs/transcript.jsonl) carries
+//! step-indexed records — USER_INPUT / PLANNER_RESPONSE / GENERIC /
+//! SYSTEM_MESSAGE / CHECKPOINT — every record with `source`, `status`,
+//! `step_index`, and a SECOND-granularity RFC3339 `created_at`. Two
+//! structures the real binary does NOT write remain as LABELED
+//! FAKE-CONTRACT extensions the e2e/rebind fakes append so this machinery
+//! has its signals (both carry the real-shaped field discipline —
+//! `created_at` + `step_index` — so the identity-pair dedupe below is
+//! exercised end to end):
 //!
-//! * `user_message` ⇒ Busy (a new submit — the pane's prompt landed).
-//! * `turn_settled{fullyIdle:true}` ⇒ exactly ONE TurnComplete, deduped per
-//!   settle (a settle while not Busy is a no-op, and a settle whose `at` is
-//!   at/before the last COMPLETED settle's `at` is a replayed record —
-//!   inert in every phase; replayed/duplicate settles never ring twice).
+//! * `session_start` — the fake's ownership anchor (never consumed here).
+//! * `turn_settled{outcome, fullyIdle}` — the fake's SETTLE record. Real
+//!   transcripts carry NO settle record (binary evidence): a real turn is
+//!   USER_INPUT → a run of MODEL records (an errored turn ends on a
+//!   status:"ERROR" record), so on real-format sessions the busy light is
+//!   kept honest by the deadman/exit/submit-grace paths instead of a
+//!   settle edge — a recorded limitation of the fake contract, never a
+//!   claim about the binary.
+//!
+//! Classification (deliberately CONSERVATIVE):
+//!
+//! * `USER_INPUT{source:"USER_EXPLICIT"}` ⇒ Busy (a new submit — the
+//!   pane's prompt landed). A USER_INPUT with any other/absent source is
+//!   NOT classified (conservative — injected/system input is not the
+//!   pane's own submit).
+//! * `turn_settled{fullyIdle:true}` ⇒ exactly ONE TurnComplete, deduped
+//!   per settle on the record identity (created_at, step_index) — a
+//!   settle while not Busy is a no-op, and a settle whose identity is
+//!   at/before a known watermark (the last settle this track consumed,
+//!   the attach-baseline seed, or the ledger's at-only defense-in-depth)
+//!   is a replayed record — inert in every phase; replayed/duplicate
+//!   settles never ring twice. The identity pair is collision-proof by
+//!   construction: `step_index` is unique per record and strictly
+//!   increases across turns (binary evidence), while `created_at` alone
+//!   is SECOND-granularity and collides routinely within one second — an
+//!   at-only watermark would swallow a genuine same-second settle.
 //! * `turn_settled{fullyIdle:false}` ⇒ stay Busy (outstanding async work —
 //!   invocation completion is NOT turn completion).
 //! * `turn_settled{outcome:"errored"}` ⇒ TurnComplete (attention is
@@ -25,7 +53,7 @@
 //! submit) is a PROVISIONAL busy with a submit-grace reversion (the amplifier
 //! [`AmplifierActivityTracker`](crate::amplifier::tracker) model — an empty or
 //! rejected submit can never wedge the pane busy), confirmed by the
-//! transcript's own `user_message`.
+//! transcript's own `USER_INPUT`.
 //!
 //! ATTACH BASELINE, SUBMIT-ANCHORED (whole-delta review round 2, Major 2;
 //! round 1 established the baseline itself): the records already on a
@@ -121,13 +149,13 @@ pub const ANTIGRAVITY_SUBMIT_GRACE_MS: i64 = 2_000;
 pub type AntigravityEffect = TrackerEffect<AntigravityActivityRecord>;
 
 /// One classified lifecycle record from the pane's bound transcript.
-/// Every other record type (`session_start`, `assistant_message`, tool
+/// Every other record type (`session_start`, `PLANNER_RESPONSE`, tool
 /// records, ...) is intentionally NOT represented: the classification is
 /// conservative and those records carry no turn-boundary information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntigravityRecordKind {
-    /// `{"type":"user_message",...}` — the pane's prompt landed (a submit).
-    UserMessage,
+    /// `{"type":"USER_INPUT",...}` — the pane's prompt landed (a submit).
+    UserInput,
     /// `{"type":"turn_settled",...}` — an invocation settled. `fully_idle`
     /// mirrors the record's `fullyIdle` (absent ⇒ false — conservative);
     /// `errored` mirrors `outcome == "errored"` (anything else ⇒ false).
@@ -137,20 +165,34 @@ pub enum AntigravityRecordKind {
 /// One tailer-parsed transcript record with its coerced `at` timestamp
 /// (`None` when absent/unparseable — the tracker then folds in `now`; the
 /// timestamp is only carried onto `updatedAt`/effect fields, never used to
-/// gate transitions).
+/// gate transitions) and its `step_index` (the real binary's per-record
+/// identity; `None` when absent — records without one compare through the
+/// dedupe's MIN stand-in).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AntigravityTranscriptRecord {
     pub kind: AntigravityRecordKind,
     pub at: Option<i64>,
+    pub step_index: Option<i64>,
 }
 
 /// Classify one parsed transcript JSON line into a lifecycle record.
 /// `None` for every non-lifecycle type (the tailer's prefilter skips those
 /// lines before parsing, so this is the single classification seam).
+///
+/// `USER_INPUT` is the REAL vocabulary (binary v1.4.12) and is classified
+/// only when `source == "USER_EXPLICIT"` (the pane's own prompt — an
+/// absent or other source is NOT a submit, conservatively).
+/// `turn_settled` is the LABELED FAKE-CONTRACT settle record (the
+/// e2e/rebind fakes' extension — real transcripts carry no settle
+/// record; see the module header), unchanged in shape.
 pub fn parse_transcript_record(value: &serde_json::Value) -> Option<AntigravityRecordKind> {
     let kind = value.get("type")?.as_str()?;
     match kind {
-        "user_message" => Some(AntigravityRecordKind::UserMessage),
+        "USER_INPUT"
+            if value.get("source").and_then(serde_json::Value::as_str) == Some("USER_EXPLICIT") =>
+        {
+            Some(AntigravityRecordKind::UserInput)
+        }
         "turn_settled" => Some(AntigravityRecordKind::TurnSettled {
             fully_idle: value
                 .get("fullyIdle")
@@ -166,8 +208,10 @@ pub fn parse_transcript_record(value: &serde_json::Value) -> Option<AntigravityR
     }
 }
 
-/// Coerce a record's `at` field to epoch-ms: numeric epoch-ms (the rebind
-/// fixtures' shape) or an ISO-8601 string (the CLI's documented shape).
+/// Coerce a record's `created_at` field to epoch-ms: numeric epoch-ms (the
+/// rebind fixtures' shape) or an ISO-8601 string (the real binary's
+/// shape — second-granularity RFC3339, e.g. `2026-10-29T20:00:01Z`; the
+/// coercion also accepts the fractional form the fakes write).
 /// `None` for anything else.
 pub fn record_at_ms(value: &serde_json::Value) -> Option<i64> {
     match value {
@@ -194,9 +238,11 @@ pub const READ_BATCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Lifecycle record types the classifier consumes; checked with plain
 /// substring scans (both `"type":"x` and `"type": "x` forms) so the
-/// transcript's other records (assistant/tool noise, potentially large) are
-/// skipped without parsing.
-const LIFECYCLE_TYPE_PREFIXES: [&str; 2] = ["user_message", "turn_settled"];
+/// transcript's other records (PLANNER_RESPONSE/GENERIC step noise,
+/// potentially large) are skipped without parsing. `USER_INPUT` is the
+/// real binary's user record; `turn_settled` is the labeled fake-contract
+/// settle (see the module header).
+const LIFECYCLE_TYPE_PREFIXES: [&str; 2] = ["USER_INPUT", "turn_settled"];
 
 fn matches_prefilter(line: &str) -> bool {
     LIFECYCLE_TYPE_PREFIXES.iter().any(|record_type| {
@@ -415,8 +461,18 @@ impl AntigravityTranscriptTailer {
                     skipped_lines += 1;
                     continue;
                 };
-                let at = value.get("at").and_then(record_at_ms);
-                records.push(AntigravityTranscriptRecord { kind, at });
+                // Real-shaped field discipline (binary v1.4.12): the
+                // timestamp lives in `created_at` and the per-record
+                // identity in `step_index` (the dedupe's second
+                // component; `None` when absent — records without one
+                // compare through the MIN stand-in).
+                let at = value.get("created_at").and_then(record_at_ms);
+                let step_index = value.get("step_index").and_then(serde_json::Value::as_i64);
+                records.push(AntigravityTranscriptRecord {
+                    kind,
+                    at,
+                    step_index,
+                });
             }
         }
 
@@ -464,6 +520,30 @@ fn read_range(path: &PathBuf, position: u64, length: u64) -> std::io::Result<Vec
 
 // ── the tracker ────────────────────────────────────────────────────────────
 
+/// The identity of one settling record: (created_at_ms, step_index) —
+/// a per-record pair two GENUINE turns can never share (binary v1.4.12
+/// evidence: step_index is unique per record and strictly increases
+/// across turns, while created_at is SECOND-granularity and collides
+/// routinely within one second — an at-only watermark swallows a
+/// genuine same-second settle as a replay). A byte-faithful re-append
+/// shares BOTH components. Records without a step_index (none exist in
+/// the corrected contract) compare through the MIN stand-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleIdentity {
+    pub at: i64,
+    pub step_index: Option<i64>,
+}
+
+impl SettleIdentity {
+    fn order_key(self) -> (i64, i64) {
+        (self.at, self.step_index.unwrap_or(i64::MIN))
+    }
+    /// `self` is the same (replayed) record as `watermark`, or older.
+    fn is_replay_of(self, watermark: SettleIdentity) -> bool {
+        self.order_key() <= watermark.order_key()
+    }
+}
+
 #[derive(Debug)]
 struct TerminalActivity {
     terminal_id: String,
@@ -476,16 +556,22 @@ struct TerminalActivity {
     submit_grace_retried: bool,
     force_read_logged: bool,
     next_force_read_at: Option<i64>,
+    /// The identity of the last settle THIS track consumed to a
+    /// completion. The primary per-settle dedupe watermark: a record
+    /// whose identity is at/before it is a REPLAY of that settle, never
+    /// a second ring.
+    last_completed_settle: Option<SettleIdentity>,
     /// The attach-time BASELINE watermark (whole-delta review Major 1,
-    /// submit-anchored in round 2): the `at` of the last COMPLETING
-    /// settle among the records that PREDATE the boundary submit when
-    /// the lane attached. Consulted beside the ledger's
-    /// `last_completion_at` by the per-settle dedupe, so replays of
-    /// pre-submit settles are inert and the FIRST live settle after the
-    /// boundary must postdate every historical one. Resides on the
-    /// per-track state (a respawn re-seeds it), unlike the ledger's
-    /// deliberately-surviving snapshots.
-    attach_baseline_completed_at: Option<i64>,
+    /// submit-anchored in round 2): the identity
+    /// (created_at, step_index) of the last COMPLETING settle among the
+    /// records that PREDATE the boundary submit when the lane attached.
+    /// Consulted beside the ledger's `last_completion_at` (which folds
+    /// in as the at-only defense-in-depth branch) by the per-settle
+    /// dedupe, so replays of pre-submit settles are inert and the FIRST
+    /// live settle after the boundary must postdate every historical
+    /// one. Resides on the per-track state (a respawn re-seeds it),
+    /// unlike the ledger's deliberately-surviving snapshots.
+    attach_baseline_settle: Option<SettleIdentity>,
 }
 
 impl TerminalActivity {
@@ -588,7 +674,8 @@ impl AntigravityActivityTracker {
             submit_grace_retried: false,
             force_read_logged: false,
             next_force_read_at: None,
-            attach_baseline_completed_at: None,
+            last_completed_settle: None,
+            attach_baseline_settle: None,
         };
         let next = state.to_record();
         self.states.insert(terminal_id.to_string(), state);
@@ -678,18 +765,18 @@ impl AntigravityActivityTracker {
     ///
     /// * HISTORICAL records (own `at` before `submit_at - tolerance`,
     ///   or `at` unparseable — unprovable recency fails toward silence):
-    ///   the per-settle dedupe watermark (the `at` of the last
-    ///   completing settle among them; replays of pre-window settles are
-    ///   inert forever after) and the busy state, judged from their
-    ///   sequence: a user record after the last completing settle means
-    ///   the turn was in flight at the submit — the pane arms confirmed
-    ///   busy (the [`Self::note_confirm_busy`] transition, flap-free
-    ///   when the pane is already provisionally busy); otherwise the
-    ///   pre-submit history ended settled and the pane seeds idle — a
-    ///   provisionally-busy pane whose pre-submit history ended settled
-    ///   resolves with a public Busy→Idle upsert but NO completion and
-    ///   NO attention boundary (the gate treats an idle phase report as
-    ///   inert, so this rings nothing).
+    ///   the per-settle dedupe watermark (the (created_at, step_index)
+    ///   identity of the last completing settle among them; replays of
+    ///   pre-window settles are inert forever after) and the busy state,
+    ///   judged from their sequence: a user record after the last
+    ///   completing settle means the turn was in flight at the submit —
+    ///   the pane arms confirmed busy (the [`Self::note_confirm_busy`]
+    ///   transition, flap-free when the pane is already provisionally
+    ///   busy); otherwise the pre-submit history ended settled and the
+    ///   pane seeds idle — a provisionally-busy pane whose pre-submit
+    ///   history ended settled resolves with a public Busy→Idle upsert
+    ///   but NO completion and NO attention boundary (the gate treats an
+    ///   idle phase report as inert, so this rings nothing).
     /// * LIVE records (own `at` at/after `submit_at - tolerance` — the
     ///   locator's exact recency rule, same operator, same shared
     ///   constant): replayed through [`Self::note_record`] exactly as if
@@ -728,7 +815,7 @@ impl AntigravityActivityTracker {
             None => records
                 .iter()
                 .rev()
-                .find(|record| matches!(record.kind, AntigravityRecordKind::UserMessage))
+                .find(|record| matches!(record.kind, AntigravityRecordKind::UserInput))
                 .and_then(|record| record.at)
                 .unwrap_or(now),
         };
@@ -750,7 +837,7 @@ impl AntigravityActivityTracker {
         // the live floor — plus unparseable-`at` records (unprovable
         // recency fails toward silence). Live records are collected for
         // the replay below.
-        let mut baseline_completed_at: Option<i64> = None;
+        let mut baseline_settle: Option<SettleIdentity> = None;
         let mut in_flight = false;
         let mut live: Vec<AntigravityTranscriptRecord> = Vec::new();
         for record in records {
@@ -761,15 +848,25 @@ impl AntigravityActivityTracker {
             }
             let at = record.at.unwrap_or(now);
             match record.kind {
-                AntigravityRecordKind::UserMessage => in_flight = true,
+                AntigravityRecordKind::UserInput => in_flight = true,
                 AntigravityRecordKind::TurnSettled {
                     fully_idle,
                     errored,
                 } => {
                     if fully_idle || errored {
                         in_flight = false;
-                        baseline_completed_at =
-                            Some(baseline_completed_at.map_or(at, |prev: i64| prev.max(at)));
+                        let id = SettleIdentity {
+                            at,
+                            step_index: record.step_index,
+                        };
+                        baseline_settle =
+                            Some(baseline_settle.map_or(id, |prev: SettleIdentity| {
+                                if id.order_key() > prev.order_key() {
+                                    id
+                                } else {
+                                    prev
+                                }
+                            }));
                     }
                     // A partial settle (outstanding async work) never ends
                     // a turn: in_flight holds.
@@ -780,7 +877,7 @@ impl AntigravityActivityTracker {
             let Some(state) = self.states.get_mut(terminal_id) else {
                 return Vec::new();
             };
-            state.attach_baseline_completed_at = baseline_completed_at;
+            state.attach_baseline_settle = baseline_settle;
         }
         // LIVE replay: records at/after the submit flow through
         // `note_record` exactly as a streamed record would — minting the
@@ -839,7 +936,7 @@ impl AntigravityActivityTracker {
         };
         let at = record.at.unwrap_or(now);
         match record.kind {
-            AntigravityRecordKind::UserMessage => {
+            AntigravityRecordKind::UserInput => {
                 // The transcript's own user record confirms the submit —
                 // provisional busy becomes confirmed; a record-armed busy
                 // (Start-attach replay) is idempotent.
@@ -870,27 +967,36 @@ impl AntigravityActivityTracker {
                     state.last_observed_at = at;
                     return Vec::new();
                 }
-                // Per-settle dedupe (plan Task 13's `/dup:` scenario): a
-                // settle whose `at` is at/before the last COMPLETED settle's
-                // `at` for this terminal is a REPLAY of that settle record
-                // (a byte-faithful duplicate the CLI re-appended — the
-                // same `at` by construction), not a new turn end. The
-                // replay is inert even while Busy (the `/dup:` line's own
-                // Enter arms the provisional busy before the record lands,
-                // so the phase no-op above cannot catch it): no second
-                // completion, no phase flap, no liveness feed — a stale
-                // record is not evidence the running turn is alive.
-                // The watermark is the LEDGER's last completion OR the
-                // attach baseline (whole-delta review Major 1, round 2)
-                // — a replay of a pre-submit settle is the same settle.
-                let last_completed_at = self
-                    .ledger
-                    .last_completion_at(terminal_id)
-                    .max(state.attach_baseline_completed_at);
-                if let Some(last_completed_at) = last_completed_at {
-                    if at <= last_completed_at {
-                        return Vec::new();
-                    }
+                // Per-settle dedupe, keyed on the record identity
+                // (created_at, step_index): a record whose identity is
+                // at/before ANY known watermark (the last settle this
+                // track consumed, the attach-baseline seed, or the
+                // ledger's at-only defense-in-depth) is a REPLAY of an
+                // already-consumed settle — inert in every phase. Two
+                // genuine turns can never share an identity (step_index
+                // is unique per record — binary evidence), so a genuine
+                // same-second settle with a fresh step RINGS where the
+                // old at-only rule swallowed it.
+                let record_id = SettleIdentity {
+                    at,
+                    step_index: record.step_index,
+                };
+                let watermarks = [
+                    state.last_completed_settle,
+                    state.attach_baseline_settle,
+                    self.ledger
+                        .last_completion_at(terminal_id)
+                        .map(|at| SettleIdentity {
+                            at,
+                            step_index: None,
+                        }),
+                ];
+                if watermarks
+                    .iter()
+                    .flatten()
+                    .any(|w| record_id.is_replay_of(*w))
+                {
+                    return Vec::new();
                 }
                 state.last_observed_at = at;
                 if state.phase != AntigravityPhase::Busy {
@@ -904,6 +1010,7 @@ impl AntigravityActivityTracker {
                 state.next_force_read_at = None;
                 state.updated_at = at;
                 let seq = self.ledger.record_turn_completion(terminal_id, at);
+                state.last_completed_settle = Some(record_id);
                 let session_id = self
                     .states
                     .get(terminal_id)
@@ -1041,7 +1148,7 @@ impl AntigravityActivityTracker {
         for state in self.states.values_mut() {
             // Submit-grace: first expiry force-reads and extends once; the
             // second silently reverts (no completion) — a submit that never
-            // became a transcript user_message.
+            // became a transcript USER_INPUT record.
             if let Some(deadline) = state.submit_grace_deadline {
                 if at >= deadline && state.phase == AntigravityPhase::Busy && !state.busy_confirmed
                 {
@@ -1164,20 +1271,27 @@ mod tests {
             .count()
     }
 
-    fn user_message(at: Option<i64>) -> AntigravityTranscriptRecord {
+    fn user_input(at: Option<i64>, step: Option<i64>) -> AntigravityTranscriptRecord {
         AntigravityTranscriptRecord {
-            kind: AntigravityRecordKind::UserMessage,
+            kind: AntigravityRecordKind::UserInput,
             at,
+            step_index: step,
         }
     }
 
-    fn settled(fully_idle: bool, errored: bool, at: Option<i64>) -> AntigravityTranscriptRecord {
+    fn settled(
+        fully_idle: bool,
+        errored: bool,
+        at: Option<i64>,
+        step: Option<i64>,
+    ) -> AntigravityTranscriptRecord {
         AntigravityTranscriptRecord {
             kind: AntigravityRecordKind::TurnSettled {
                 fully_idle,
                 errored,
             },
             at,
+            step_index: step,
         }
     }
 
@@ -1195,24 +1309,24 @@ mod tests {
         let effects = tracker.note_submit("t1", 10);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
 
-        // The transcript's own user_message confirms — no public flap.
-        let effects = tracker.note_record("t1", &user_message(Some(20)), 20);
+        // The transcript's own USER_INPUT record confirms — no public flap.
+        let effects = tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
         assert!(effects.is_empty());
 
-        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 900);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900), Some(1)), 900);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
         assert_eq!(completions(&effects), vec![1]);
 
         // A duplicate settle replayed while idle NEVER completes again.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(950)), 950);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(950), Some(2)), 950);
         assert!(effects.is_empty());
 
         // A second turn mints the next monotonic seq.
         tracker.note_submit("t1", 1_000);
-        let effects = tracker.note_record("t1", &user_message(Some(1_010)), 1_010);
+        let effects = tracker.note_record("t1", &user_input(Some(1_010), Some(3)), 1_010);
         assert!(effects.is_empty());
 
-        let effects = tracker.note_record("t1", &settled(true, false, Some(2_000)), 2_000);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(2_000), Some(4)), 2_000);
         assert_eq!(completions(&effects), vec![2]);
         assert_eq!(tracker.list_latest_completions()[0].completion_seq, 2);
     }
@@ -1231,15 +1345,15 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", Some("conv-1"), 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 900);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900), Some(1)), 900);
         assert_eq!(completions(&effects), vec![1]);
 
         // The `/dup:` shape: a fresh submit arms the provisional busy, then
         // the byte-faithful copy of the SAME settle (same `at`) lands.
         let effects = tracker.note_submit("t1", 5_000);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 5_000);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900), Some(1)), 5_000);
         assert!(
             effects.is_empty(),
             "the replayed settle is inert: no completion, no phase flap — got {effects:?}"
@@ -1252,8 +1366,8 @@ mod tests {
 
         // The next GENUINE settle (a fresh `at` past the last completed one)
         // still completes exactly once, with the next monotonic seq.
-        tracker.note_record("t1", &user_message(Some(5_010)), 5_010);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(6_000)), 6_000);
+        tracker.note_record("t1", &user_input(Some(5_010), Some(2)), 5_010);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(6_000), Some(3)), 6_000);
         assert_eq!(completions(&effects), vec![2]);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
     }
@@ -1266,14 +1380,14 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", Some("conv-1"), 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
-        tracker.note_record("t1", &settled(true, false, Some(900)), 900);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
+        tracker.note_record("t1", &settled(true, false, Some(900), Some(1)), 900);
 
-        // A new CONFIRMED turn starts (submit + user_message)…
+        // A new CONFIRMED turn starts (submit + USER_INPUT record)…
         tracker.note_submit("t1", 5_000);
-        tracker.note_record("t1", &user_message(Some(5_010)), 5_010);
+        tracker.note_record("t1", &user_input(Some(5_010), Some(2)), 5_010);
         // …and the dead launch's stale settle copy lands mid-turn.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 5_050);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900), Some(1)), 5_050);
         assert!(
             effects.is_empty(),
             "a stale replay never completes or clears the running turn — got {effects:?}"
@@ -1281,8 +1395,102 @@ mod tests {
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Busy);
 
         // The running turn's OWN settle completes exactly once.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(7_000)), 7_000);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(7_000), Some(3)), 7_000);
         assert_eq!(completions(&effects), vec![2]);
+    }
+
+    #[test]
+    fn same_second_settles_with_distinct_step_indexes_both_complete() {
+        // THE binary-evidenced collision pin: real created_at is
+        // SECOND-granularity and collides within one second, so two genuine
+        // turns CAN settle at the same wall-clock value. The dedupe key is
+        // the record identity (created_at, step_index) — step_index is
+        // unique per record and strictly increases across turns (binary
+        // evidence, real-binary-transcript-evidence.md) — so the second
+        // genuine settle rings, where the at-only watermark swallowed it.
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv"), 0);
+        let second = 1_793_304_005_000i64;
+        tracker.note_record("t1", &user_input(Some(second), Some(0)), second);
+        let first = tracker.note_record(
+            "t1",
+            &settled(true, false, Some(second), Some(1)),
+            second + 1,
+        );
+        assert_eq!(completions(&first), vec![1]);
+        // The next turn's user record lands in the SAME second.
+        tracker.note_record("t1", &user_input(Some(second), Some(2)), second + 1);
+        let second_settle = tracker.note_record(
+            "t1",
+            &settled(true, false, Some(second), Some(3)),
+            second + 2,
+        );
+        assert_eq!(
+            completions(&second_settle),
+            vec![2],
+            "a genuine same-second settle with a fresh step_index is NEVER a replay"
+        );
+    }
+
+    #[test]
+    fn byte_faithful_settle_replay_shares_the_identity_and_stays_inert() {
+        // The /dup: shape: a byte-faithful duplicate shares BOTH identity
+        // components (created_at AND step_index) — still a replay, never a
+        // second ring, even while the replay's own Enter armed busy.
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv"), 0);
+        let at = 5_000i64;
+        tracker.note_record("t1", &user_input(Some(at), Some(0)), at);
+        let first = tracker.note_record("t1", &settled(true, false, Some(at), Some(1)), at);
+        assert_eq!(completions(&first), vec![1]);
+        tracker.note_record("t1", &user_input(Some(at + 10), Some(2)), at + 10);
+        let replay = tracker.note_record("t1", &settled(true, false, Some(at), Some(1)), at + 11);
+        assert_eq!(
+            completions(&replay),
+            Vec::<i64>::new(),
+            "the byte-faithful duplicate settle is inert"
+        );
+        // The next GENUINE settle (new step) still rings.
+        let genuine =
+            tracker.note_record("t1", &settled(true, false, Some(at + 10), Some(3)), at + 12);
+        assert_eq!(completions(&genuine), vec![2]);
+    }
+
+    #[test]
+    fn replayed_pre_submit_settle_after_respawn_stays_inert_via_the_baseline_pair() {
+        // The attach baseline seeds the (created_at, step_index) pair of the
+        // last completing HISTORICAL settle; a byte-faithful re-append of
+        // that historical record (equal at AND equal step) never rings —
+        // proven while BUSY, so the swallow is the dedupe watermark, not
+        // the idle-phase no-op. The next genuine settle still rings.
+        let mut tracker = AntigravityActivityTracker::new();
+        tracker.track_terminal("t1", Some("conv"), 0);
+        let submit_at = 100_000i64;
+        let history = vec![
+            user_input(Some(10_000), Some(0)),
+            settled(true, false, Some(30_000), Some(1)),
+        ];
+        let _ = tracker.note_attach_baseline("t1", &history, submit_at, Some(submit_at));
+        // The respawned pane's user submits again — the turn is live.
+        tracker.note_record(
+            "t1",
+            &user_input(Some(submit_at + 10), Some(2)),
+            submit_at + 10,
+        );
+        // A byte-faithful replay of the HISTORICAL settle (same at AND step):
+        let replay = tracker.note_record(
+            "t1",
+            &settled(true, false, Some(30_000), Some(1)),
+            submit_at + 11,
+        );
+        assert_eq!(completions(&replay), Vec::<i64>::new());
+        // The next GENUINE settle (fresh identity) still rings.
+        let genuine = tracker.note_record(
+            "t1",
+            &settled(true, false, Some(120_000), Some(3)),
+            submit_at + 12,
+        );
+        assert_eq!(completions(&genuine), vec![1]);
     }
 
     #[test]
@@ -1290,20 +1498,20 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
 
         // Invocation completion is NOT turn completion: async work remains.
-        let effects = tracker.note_record("t1", &settled(false, false, Some(100)), 100);
+        let effects = tracker.note_record("t1", &settled(false, false, Some(100), Some(1)), 100);
         assert!(completions(&effects).is_empty());
         assert!(phases(&effects).is_empty(), "no public flap — stays busy");
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Busy);
 
         // A repeated partial settle changes nothing.
-        let effects = tracker.note_record("t1", &settled(false, false, Some(110)), 110);
+        let effects = tracker.note_record("t1", &settled(false, false, Some(110), Some(2)), 110);
         assert!(effects.is_empty());
 
         // The full settle completes exactly once.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(500)), 500);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(500), Some(3)), 500);
         assert_eq!(completions(&effects), vec![1]);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
     }
@@ -1314,9 +1522,9 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
 
-        let effects = tracker.note_record("t1", &settled(false, true, Some(300)), 300);
+        let effects = tracker.note_record("t1", &settled(false, true, Some(300), Some(1)), 300);
         assert_eq!(completions(&effects), vec![1]);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
     }
@@ -1326,7 +1534,7 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
 
         let effects = tracker.expire(20 + ANTIGRAVITY_BUSY_DEADMAN_MS + 1);
         assert_eq!(force_reads(&effects), 1);
@@ -1352,10 +1560,10 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         assert!(tracker.note_submit("t-unknown", 10).is_empty());
         assert!(tracker
-            .note_record("t-unknown", &user_message(Some(20)), 20)
+            .note_record("t-unknown", &user_input(Some(20), Some(0)), 20)
             .is_empty());
         assert!(tracker
-            .note_record("t-unknown", &settled(true, false, Some(30)), 30)
+            .note_record("t-unknown", &settled(true, false, Some(30), Some(1)), 30)
             .is_empty());
         tracker.note_output("t-unknown", 40);
         assert!(tracker
@@ -1390,12 +1598,12 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
         assert_eq!(
             force_reads(&tracker.expire(20 + ANTIGRAVITY_BUSY_DEADMAN_MS + 1)),
             1
         );
-        let effects = tracker.note_record("t1", &settled(true, false, Some(500)), 500);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(500), Some(1)), 500);
         assert_eq!(completions(&effects), vec![1]);
     }
 
@@ -1404,7 +1612,7 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
         tracker.note_output("t1", 100_000);
         assert!(tracker
             .expire(20 + ANTIGRAVITY_BUSY_DEADMAN_MS + 1)
@@ -1433,7 +1641,7 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
         let effects = tracker.note_verify_failed("t1", 5000);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
         assert!(completions(&effects).is_empty());
@@ -1478,7 +1686,7 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", Some("conv-old"), 0);
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Busy);
 
         // The failed rebind: the lane never attaches to conv-new.
@@ -1525,8 +1733,8 @@ mod tests {
         tracker.bind_session("t1", "conv-new");
         assert_eq!(tracker.list()[0].session_id, Some("conv-new".to_string()));
         tracker.note_submit("t1", 1_000);
-        tracker.note_record("t1", &user_message(Some(1_010)), 1_010);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(2_000)), 2_000);
+        tracker.note_record("t1", &user_input(Some(1_010), Some(1)), 1_010);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(2_000), Some(2)), 2_000);
         assert_eq!(completions(&effects), vec![1]);
         let session = effects.iter().find_map(|e| match e {
             TrackerEffect::TurnComplete { session_id, .. } => Some(session_id.clone()),
@@ -1614,7 +1822,7 @@ mod tests {
             .expire(10 + 2 * ANTIGRAVITY_SUBMIT_GRACE_MS)
             .is_empty());
         // A later full settle in the new conversation completes once.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(900)), 900);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(900), Some(0)), 900);
         assert_eq!(completions(&effects), vec![1]);
         let session = effects.iter().find_map(|e| match e {
             TrackerEffect::TurnComplete { session_id, .. } => Some(session_id.clone()),
@@ -1644,11 +1852,11 @@ mod tests {
         // On disk at attach: two settled historical turns, then the pane's
         // own prompt as the latest record (the in-flight turn).
         let records = vec![
-            user_message(Some(10_000)),
-            settled(true, false, Some(20_000)),
-            user_message(Some(30_000)),
-            settled(true, false, Some(40_000)),
-            user_message(Some(100_050)),
+            user_input(Some(10_000), Some(0)),
+            settled(true, false, Some(20_000), Some(1)),
+            user_input(Some(30_000), Some(2)),
+            settled(true, false, Some(40_000), Some(3)),
+            user_input(Some(100_050), Some(4)),
         ];
         // The boundary is the pane's submit (100_000): everything on disk
         // except the pane's own prompt predates it by more than the
@@ -1669,7 +1877,8 @@ mod tests {
 
         // A byte-faithful replay of a HISTORICAL settle (its old `at`,
         // at/before the seeded baseline watermark) is inert.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(20_000)), 200_000);
+        let effects =
+            tracker.note_record("t1", &settled(true, false, Some(20_000), Some(1)), 200_000);
         assert!(
             effects.is_empty(),
             "the seeded dedupe baseline swallows replays of historical settles: {effects:?}"
@@ -1678,7 +1887,8 @@ mod tests {
 
         // The in-flight turn's own settle completes exactly once, and the
         // historical settles consumed none of the sequence.
-        let effects = tracker.note_record("t1", &settled(true, false, Some(300_000)), 300_000);
+        let effects =
+            tracker.note_record("t1", &settled(true, false, Some(300_000), Some(5)), 300_000);
         assert_eq!(completions(&effects), vec![1]);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
     }
@@ -1702,8 +1912,8 @@ mod tests {
         tracker.note_submit("t1", 100_000);
 
         let records = vec![
-            user_message(Some(10_000)),
-            settled(true, false, Some(20_000)),
+            user_input(Some(10_000), Some(0)),
+            settled(true, false, Some(20_000), Some(1)),
         ];
         let effects = tracker.note_attach_baseline("t1", &records, 100_100, Some(100_000));
         assert_eq!(
@@ -1726,14 +1936,15 @@ mod tests {
         // A byte-faithful replay of the SAME settle (same `at`) is inert
         // against the seeded watermark.
         assert!(tracker
-            .note_record("t1", &settled(true, false, Some(20_000)), 200_000)
+            .note_record("t1", &settled(true, false, Some(20_000), Some(1)), 200_000)
             .is_empty());
 
         // The next genuine turn completes exactly once, with seq 1 (the
         // baseline settle consumed none of the sequence).
         tracker.note_submit("t1", 300_000);
-        tracker.note_record("t1", &user_message(Some(300_050)), 300_050);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(400_000)), 400_000);
+        tracker.note_record("t1", &user_input(Some(300_050), Some(2)), 300_050);
+        let effects =
+            tracker.note_record("t1", &settled(true, false, Some(400_000), Some(3)), 400_000);
         assert_eq!(completions(&effects), vec![1]);
     }
 
@@ -1764,10 +1975,10 @@ mod tests {
         // pane's own prompt + its QUICK settle, both written during the
         // locator's window (their `at`s postdate the submit — live).
         let records = vec![
-            user_message(Some(10_000)),
-            settled(true, false, Some(20_000)),
-            user_message(Some(100_010)),
-            settled(true, false, Some(100_050)),
+            user_input(Some(10_000), Some(0)),
+            settled(true, false, Some(20_000), Some(1)),
+            user_input(Some(100_010), Some(2)),
+            settled(true, false, Some(100_050), Some(3)),
         ];
         let effects = tracker.note_attach_baseline("t1", &records, 100_200, Some(100_000));
         assert_eq!(
@@ -1782,19 +1993,20 @@ mod tests {
         // Exactly once: a byte-faithful replay of the rung settle (same
         // `at`) is inert against the ledger's recorded completion.
         assert!(tracker
-            .note_record("t1", &settled(true, false, Some(100_050)), 200_000)
+            .note_record("t1", &settled(true, false, Some(100_050), Some(3)), 200_000)
             .is_empty());
         // The pre-window settle rang nothing either — a replay of it is
         // inert too (the seeded historical watermark).
         assert!(tracker
-            .note_record("t1", &settled(true, false, Some(20_000)), 200_100)
+            .note_record("t1", &settled(true, false, Some(20_000), Some(1)), 200_100)
             .is_empty());
 
         // The FOLLOW-UP turn completes exactly once, with seq 2 (the
         // window settle consumed seq 1).
         tracker.note_submit("t1", 300_000);
-        tracker.note_record("t1", &user_message(Some(300_050)), 300_050);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(400_000)), 400_000);
+        tracker.note_record("t1", &user_input(Some(300_050), Some(4)), 300_050);
+        let effects =
+            tracker.note_record("t1", &settled(true, false, Some(400_000), Some(5)), 400_000);
         assert_eq!(completions(&effects), vec![2]);
     }
 
@@ -1822,10 +2034,10 @@ mod tests {
         // stamped within the tolerance BEFORE the captured submit (the
         // write→stamp skew the tolerance exists for).
         let records = vec![
-            user_message(Some(10_000)),
-            settled(true, false, Some(20_000)),
-            user_message(Some(submit_at - 4_000)),
-            settled(true, false, Some(submit_at - 3_500)),
+            user_input(Some(10_000), Some(0)),
+            settled(true, false, Some(20_000), Some(1)),
+            user_input(Some(submit_at - 4_000), Some(2)),
+            settled(true, false, Some(submit_at - 3_500), Some(3)),
         ];
         let effects = tracker.note_attach_baseline("t1", &records, 100_200, Some(submit_at));
         assert_eq!(
@@ -1843,21 +2055,22 @@ mod tests {
         assert!(tracker
             .note_record(
                 "t1",
-                &settled(true, false, Some(submit_at - 3_500)),
+                &settled(true, false, Some(submit_at - 3_500), Some(3)),
                 200_000
             )
             .is_empty());
         // The PRE-WINDOW settle rang nothing — a replay of it is inert
         // too (the seeded historical watermark).
         assert!(tracker
-            .note_record("t1", &settled(true, false, Some(20_000)), 200_100)
+            .note_record("t1", &settled(true, false, Some(20_000), Some(1)), 200_100)
             .is_empty());
 
         // The FOLLOW-UP turn completes exactly once, with seq 2 (the
         // tolerance-window settle consumed seq 1).
         tracker.note_submit("t1", 300_000);
-        tracker.note_record("t1", &user_message(Some(300_050)), 300_050);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(400_000)), 400_000);
+        tracker.note_record("t1", &user_input(Some(300_050), Some(4)), 300_050);
+        let effects =
+            tracker.note_record("t1", &settled(true, false, Some(400_000), Some(5)), 400_000);
         assert_eq!(completions(&effects), vec![2]);
     }
 
@@ -1876,8 +2089,8 @@ mod tests {
         tracker.note_submit("t1", submit_at);
         let floor = submit_at - ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS;
         let records = vec![
-            user_message(Some(floor)),
-            settled(true, false, Some(floor + 100)),
+            user_input(Some(floor), Some(0)),
+            settled(true, false, Some(floor + 100), Some(1)),
         ];
         let effects = tracker.note_attach_baseline("t1", &records, 100_200, Some(submit_at));
         assert_eq!(
@@ -1896,8 +2109,8 @@ mod tests {
         tracker.track_terminal("t2", Some("conv-2"), 0);
         tracker.note_submit("t2", submit_at);
         let records = vec![
-            user_message(Some(floor - 101)),
-            settled(true, false, Some(floor - 1)),
+            user_input(Some(floor - 101), Some(0)),
+            settled(true, false, Some(floor - 1), Some(1)),
         ];
         let effects = tracker.note_attach_baseline("t2", &records, 100_200, Some(submit_at));
         assert!(
@@ -1907,7 +2120,11 @@ mod tests {
         );
         assert_eq!(phases(&effects), vec![AntigravityPhase::Idle]);
         assert!(tracker
-            .note_record("t2", &settled(true, false, Some(floor - 1)), 200_000)
+            .note_record(
+                "t2",
+                &settled(true, false, Some(floor - 1), Some(1)),
+                200_000
+            )
             .is_empty());
     }
 
@@ -1925,8 +2142,8 @@ mod tests {
             .is_empty());
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
         tracker.note_submit("t1", 1_000);
-        tracker.note_record("t1", &user_message(Some(1_050)), 1_050);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(2_000)), 2_000);
+        tracker.note_record("t1", &user_input(Some(1_050), Some(0)), 1_050);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(2_000), Some(1)), 2_000);
         assert_eq!(completions(&effects), vec![1]);
 
         // Partial settle outstanding: the turn has NOT ended — busy seeds.
@@ -1935,13 +2152,16 @@ mod tests {
         // replay LIVE and arm busy on the previously-idle pane.
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t2", Some("conv-2"), 0);
-        let records = vec![user_message(Some(100)), settled(false, false, Some(200))];
+        let records = vec![
+            user_input(Some(100), Some(0)),
+            settled(false, false, Some(200), Some(1)),
+        ];
         let effects = tracker.note_attach_baseline("t2", &records, 300, None);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
         assert!(completions(&effects).is_empty());
         // No completing settle was on disk: the watermark stays unset and
         // the turn's eventual full settle mints seq 1.
-        let effects = tracker.note_record("t2", &settled(true, false, Some(1_000)), 1_000);
+        let effects = tracker.note_record("t2", &settled(true, false, Some(1_000), Some(2)), 1_000);
         assert_eq!(completions(&effects), vec![1]);
 
         // An errored HISTORICAL settle (before the live floor at an
@@ -1953,20 +2173,20 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t3", Some("conv-3"), 0);
         let records = vec![
-            user_message(Some(10_000)),
-            settled(false, true, Some(20_000)),
+            user_input(Some(10_000), Some(0)),
+            settled(false, true, Some(20_000), Some(1)),
         ];
         let effects = tracker.note_attach_baseline("t3", &records, 700_000, Some(700_000));
         assert!(effects.is_empty());
         assert_eq!(tracker.list()[0].phase, AntigravityPhase::Idle);
         assert!(tracker
-            .note_record("t3", &settled(false, true, Some(20_000)), 800_000)
+            .note_record("t3", &settled(false, true, Some(20_000), Some(1)), 800_000)
             .is_empty());
 
         // Untracked terminal: a no-op like every other note.
         let mut tracker = AntigravityActivityTracker::new();
         assert!(tracker
-            .note_attach_baseline("t-unknown", &[user_message(Some(10))], 20, None)
+            .note_attach_baseline("t-unknown", &[user_input(Some(10), Some(0))], 20, None)
             .is_empty());
         assert!(tracker.list().is_empty());
     }
@@ -1984,10 +2204,10 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t1", Some("conv-1"), 0);
         let records = vec![
-            user_message(Some(100)),
-            settled(true, false, Some(200)),
-            user_message(Some(300)),
-            settled(true, false, Some(400)),
+            user_input(Some(100), Some(0)),
+            settled(true, false, Some(200), Some(1)),
+            user_input(Some(300), Some(2)),
+            settled(true, false, Some(400), Some(3)),
         ];
         let effects = tracker.note_attach_baseline("t1", &records, 500, None);
         assert_eq!(
@@ -2006,17 +2226,17 @@ mod tests {
         // Replays are inert: the rung settle via the LEDGER, the older
         // settle via the seeded historical watermark.
         assert!(tracker
-            .note_record("t1", &settled(true, false, Some(400)), 600)
+            .note_record("t1", &settled(true, false, Some(400), Some(3)), 600)
             .is_empty());
         assert!(tracker
-            .note_record("t1", &settled(true, false, Some(200)), 700)
+            .note_record("t1", &settled(true, false, Some(200), Some(1)), 700)
             .is_empty());
 
         // No user record at all: no provable user action, everything is
         // history — silent, and the pane seeds from the settled fold.
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t2", Some("conv-2"), 0);
-        let records = vec![settled(true, false, Some(150))];
+        let records = vec![settled(true, false, Some(150), Some(0))];
         let effects = tracker.note_attach_baseline("t2", &records, 300, None);
         assert!(
             effects.is_empty(),
@@ -2030,9 +2250,9 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t3", Some("conv-3"), 0);
         let records = vec![
-            user_message(Some(100)),
-            settled(true, false, Some(200)),
-            user_message(Some(250)),
+            user_input(Some(100), Some(0)),
+            settled(true, false, Some(200), Some(1)),
+            user_input(Some(250), Some(2)),
         ];
         let effects = tracker.note_attach_baseline("t3", &records, 300, None);
         assert_eq!(phases(&effects), vec![AntigravityPhase::Busy]);
@@ -2049,9 +2269,9 @@ mod tests {
         let mut tracker = AntigravityActivityTracker::new();
         tracker.track_terminal("t4", Some("conv-4"), 0);
         let records = vec![
-            user_message(Some(10_000)),
-            settled(true, false, Some(10_000 + 100)),
-            user_message(Some(10_000 + 4_999)),
+            user_input(Some(10_000), Some(0)),
+            settled(true, false, Some(10_000 + 100), Some(1)),
+            user_input(Some(10_000 + 4_999), Some(2)),
         ];
         let effects = tracker.note_attach_baseline("t4", &records, 10_000 + 5_000, None);
         assert!(
@@ -2078,13 +2298,13 @@ mod tests {
             Some(10 + ANTIGRAVITY_SUBMIT_GRACE_MS)
         );
 
-        tracker.note_record("t1", &user_message(Some(20)), 20);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
         assert_eq!(
             tracker.next_deadline(),
             Some(20 + ANTIGRAVITY_BUSY_DEADMAN_MS + 1)
         );
 
-        tracker.note_record("t1", &settled(true, false, Some(30)), 30);
+        tracker.note_record("t1", &settled(true, false, Some(30), Some(1)), 30);
         assert_eq!(tracker.next_deadline(), None);
     }
 
@@ -2094,8 +2314,8 @@ mod tests {
         tracker.track_terminal("t1", None, 0);
         tracker.bind_session("t1", "conv-7");
         tracker.note_submit("t1", 10);
-        tracker.note_record("t1", &user_message(Some(20)), 20);
-        let effects = tracker.note_record("t1", &settled(true, false, Some(30)), 30);
+        tracker.note_record("t1", &user_input(Some(20), Some(0)), 20);
+        let effects = tracker.note_record("t1", &settled(true, false, Some(30), Some(1)), 30);
         let session = effects.iter().find_map(|e| match e {
             TrackerEffect::TurnComplete { session_id, .. } => Some(session_id.clone()),
             _ => None,
@@ -2121,18 +2341,37 @@ mod tests {
 
     #[test]
     fn classify_is_conservative() {
-        // user_message arms a submit.
+        // USER_INPUT (the real vocabulary) arms a submit — only when the
+        // record's own source is USER_EXPLICIT (the pane's prompt).
         assert_eq!(
             parse_transcript_record(&serde_json::json!({
-                "type": "user_message", "conversationId": "c", "text": "hi", "at": 5
+                "type": "USER_INPUT", "source": "USER_EXPLICIT", "status": "DONE",
+                "step_index": 0, "created_at": "2026-10-29T20:00:01Z", "content": "hi"
             })),
-            Some(AntigravityRecordKind::UserMessage)
+            Some(AntigravityRecordKind::UserInput)
         );
-        // turn_settled with both flags.
+        // A SYSTEM-authored (or absent-source) USER_INPUT is NOT the
+        // pane's own submit — not classified, conservatively.
         assert_eq!(
             parse_transcript_record(&serde_json::json!({
-                "type": "turn_settled", "conversationId": "c",
-                "outcome": "completed", "fullyIdle": true, "at": 5
+                "type": "USER_INPUT", "source": "SYSTEM", "status": "DONE",
+                "step_index": 0, "created_at": "2026-10-29T20:00:01Z", "content": "injected"
+            })),
+            None
+        );
+        assert_eq!(
+            parse_transcript_record(&serde_json::json!({
+                "type": "USER_INPUT", "status": "DONE",
+                "step_index": 0, "created_at": "2026-10-29T20:00:01Z", "content": "hi"
+            })),
+            None
+        );
+        // turn_settled (the labeled fake-contract settle) with both flags.
+        assert_eq!(
+            parse_transcript_record(&serde_json::json!({
+                "type": "turn_settled", "step_index": 1,
+                "created_at": "2026-10-29T20:00:05Z",
+                "outcome": "completed", "fullyIdle": true
             })),
             Some(AntigravityRecordKind::TurnSettled {
                 fully_idle: true,
@@ -2141,8 +2380,9 @@ mod tests {
         );
         assert_eq!(
             parse_transcript_record(&serde_json::json!({
-                "type": "turn_settled", "conversationId": "c",
-                "outcome": "errored", "fullyIdle": false, "at": 5
+                "type": "turn_settled", "step_index": 1,
+                "created_at": "2026-10-29T20:00:05Z",
+                "outcome": "errored", "fullyIdle": false
             })),
             Some(AntigravityRecordKind::TurnSettled {
                 fully_idle: false,
@@ -2153,7 +2393,7 @@ mod tests {
         // unknown outcome is NOT an error.
         assert_eq!(
             parse_transcript_record(&serde_json::json!({
-                "type": "turn_settled", "conversationId": "c", "at": 5
+                "type": "turn_settled", "step_index": 1, "created_at": "2026-10-29T20:00:05Z"
             })),
             Some(AntigravityRecordKind::TurnSettled {
                 fully_idle: false,
@@ -2163,7 +2403,8 @@ mod tests {
         // Unknown record types and non-objects are not lifecycle records.
         assert_eq!(
             parse_transcript_record(&serde_json::json!({
-                "type": "assistant_message", "conversationId": "c", "at": 5
+                "type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE",
+                "step_index": 2, "created_at": "2026-10-29T20:00:02Z", "content": "reply"
             })),
             None
         );
@@ -2175,10 +2416,24 @@ mod tests {
 
     // ── the transcript tailer (the amplifier tailer model) ─────────────
 
+    /// One real-shaped transcript line (binary v1.4.12 vocabulary): the
+    /// fake-contract `session_start` anchor, a `USER_INPUT` user record
+    /// (source USER_EXPLICIT — the classifier's gate), or the labeled
+    /// fake-contract `turn_settled` settle. All carry the real-shaped
+    /// field discipline: `created_at` + `step_index`.
     fn transcript_line(kind: &str, extra: &str) -> String {
-        format!(
-            "{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":\"2026-10-29T20:00:01.000Z\"{extra}}}\n"
-        )
+        match kind {
+            "session_start" => {
+                "{\"type\":\"session_start\",\"conversationId\":\"conv-1\",\"workspacePaths\":[\"/w\"],\"startedAt\":\"2026-10-29T20:00:00.000Z\"}\n".to_string()
+            }
+            "USER_INPUT" => format!(
+                "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":0,\"created_at\":\"2026-10-29T20:00:01Z\"{extra}}}\n"
+            ),
+            "turn_settled" => format!(
+                "{{\"type\":\"turn_settled\",\"step_index\":1,\"created_at\":\"2026-10-29T20:00:02Z\"{extra}}}\n"
+            ),
+            other => panic!("unknown transcript line kind {other}"),
+        }
     }
 
     #[test]
@@ -2189,7 +2444,7 @@ mod tests {
             &path,
             [
                 transcript_line("session_start", ""),
-                transcript_line("user_message", ",\"text\":\"first prompt\""),
+                transcript_line("USER_INPUT", ",\"content\":\"first prompt\""),
             ]
             .concat(),
         )
@@ -2204,7 +2459,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(records.len(), 1, "the prefilter skips session_start");
-                assert_eq!(records[0].kind, AntigravityRecordKind::UserMessage);
+                assert_eq!(records[0].kind, AntigravityRecordKind::UserInput);
                 assert_eq!(skipped_lines, 1);
                 assert_eq!(records[0].at, Some(1_793_304_001_000));
             }
@@ -2260,7 +2515,7 @@ mod tests {
         std::fs::write(
             &path,
             [
-                transcript_line("user_message", ",\"text\":\"old\""),
+                transcript_line("USER_INPUT", ",\"content\":\"old\""),
                 transcript_line(
                     "turn_settled",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
@@ -2314,7 +2569,7 @@ mod tests {
     fn tailer_file_reset_degrades_never_guesses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
-        std::fs::write(&path, transcript_line("user_message", ",\"text\":\"x\"")).unwrap();
+        std::fs::write(&path, transcript_line("USER_INPUT", ",\"content\":\"x\"")).unwrap();
 
         let mut tailer = AntigravityTranscriptTailer::new(&path);
         tailer.attach(AttachAt::Start).unwrap();
@@ -2335,7 +2590,7 @@ mod tests {
     fn tailer_oversized_line_is_dropped_without_degrading() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
-        let mut oversized = String::from("{\"type\":\"user_message\",\"pad\":\"");
+        let mut oversized = String::from("{\"type\":\"USER_INPUT\",\"pad\":\"");
         oversized.push_str(&"x".repeat(PARTIAL_MAX_BYTES + 1024));
         std::fs::write(&path, &oversized).unwrap();
 
@@ -2352,7 +2607,7 @@ mod tests {
             .open(&path)
             .unwrap();
         f.write_all(b"\"}\n").unwrap();
-        f.write_all(transcript_line("user_message", ",\"text\":\"after\"").as_bytes())
+        f.write_all(transcript_line("USER_INPUT", ",\"content\":\"after\"").as_bytes())
             .unwrap();
         drop(f);
         match tailer.read() {

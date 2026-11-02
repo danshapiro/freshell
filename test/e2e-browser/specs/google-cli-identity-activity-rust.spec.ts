@@ -1070,10 +1070,12 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         const staleWriteAt = new Date(Date.now() - 60_000).toISOString()
         const convOneTranscript = path.join(brainRootOf(info), convOne, '.system_generated', 'logs', 'transcript.jsonl')
         await fs.appendFile(convOneTranscript, `${JSON.stringify({
-          type: 'user_message',
-          conversationId: convOne,
-          text: 'bravo anchor prompt two',
-          at: staleWriteAt,
+          type: 'USER_INPUT',
+          source: 'USER_EXPLICIT',
+          status: 'DONE',
+          step_index: 99,
+          created_at: staleWriteAt,
+          content: 'bravo anchor prompt two',
         })}\n`)
         // Let the locator sweep (a 150 ms poll) see the write, plus settle.
         await settleWindow(page, 4_000)
@@ -1108,7 +1110,9 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
         // discipline in freshell-ownership's begin). The supported
         // existing-conversation target mirrors the Task 6 rebind suite's
         // scenario 3c: a planted, never-owned conversation in the same
-        // cwd (the fake's own record format, an aged first record).
+        // cwd (the corrected record vocabulary — the fake-contract
+        // ownership anchor plus a real-shaped USER_INPUT record, an aged
+        // first record).
         const convExisting = 'conv-resume-existing-e2e'
         const plantedTranscriptDir = path.join(brainRootOf(info), convExisting, '.system_generated', 'logs')
         await fs.mkdir(plantedTranscriptDir, { recursive: true })
@@ -1122,10 +1126,12 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
             startedAt: plantedAt,
           }),
           JSON.stringify({
-            type: 'user_message',
-            conversationId: convExisting,
-            text: 'the earlier conversation own prompt',
-            at: plantedAt,
+            type: 'USER_INPUT',
+            source: 'USER_EXPLICIT',
+            status: 'DONE',
+            step_index: 0,
+            created_at: plantedAt,
+            content: 'the earlier conversation own prompt',
           }),
         ].map((line) => `${line}\n`).join(''))
 

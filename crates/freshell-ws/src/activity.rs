@@ -4160,24 +4160,41 @@ mod tests {
     /// `claude_submit_bel_turn_complete_and_terminal_idle_flow` model, but
     /// driven by transcript records, never BEL bytes): a flushed submit arms
     /// provisional busy, the lane attach replays the young transcript (the
-    /// user_message confirms busy), a `turn_settled{fullyIdle:true}` record
+    /// USER_INPUT confirms busy), a `turn_settled{fullyIdle:true}` record
     /// drives `terminal.turn.complete` then exactly one
     /// `terminal.idle{reason:"grace"}` — all driven by inotify.
     #[tokio::test(flavor = "multi_thread")]
     async fn antigravity_transcript_lane_drives_busy_complete_and_idle_via_inotify() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
-        let line = |kind: &str, extra: &str| {
-            format!(
-                "{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":\"{ts}\"{extra}}}\n",
-                ts = crate::now_iso(),
-            )
+        // Real-shaped records (binary v1.4.12; the `session_start` line is
+        // the labeled fake-contract ownership anchor): each appended record
+        // carries a fresh step_index (the per-record identity the tracker's
+        // dedupe keys on) and its timestamp in `created_at`.
+        let mut step = 0i64;
+        let mut line = |kind: &str, extra: &str| match kind {
+            "start" => "{\"type\":\"session_start\",\"conversationId\":\"conv-1\"}\n".to_string(),
+            "user" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":\"{ts}\"{extra}}}\n",
+                        ts = crate::now_iso(),
+                    )
+            }
+            "settle" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"turn_settled\",\"step_index\":{step},\"created_at\":\"{ts}\"{extra}}}\n",
+                        ts = crate::now_iso(),
+                    )
+            }
+            other => panic!("unknown plant kind {other}"),
         };
         std::fs::write(
             &transcript,
             [
-                line("session_start", ""),
-                line("user_message", ",\"text\":\"unit flow prompt\""),
+                line("start", ""),
+                line("user", ",\"content\":\"unit flow prompt\""),
             ]
             .concat(),
         )
@@ -4223,7 +4240,7 @@ mod tests {
         assert_eq!(busy["upsert"][0]["terminalId"], "t1");
 
         // Association resolves: the lane attaches at Start and replays the
-        // young transcript (the user_message — which predates the submit
+        // young transcript (the USER_INPUT record — which predates the submit
         // boundary — confirms busy via the historical in-flight fold: no
         // public flap).
         hub.attach_antigravity_association("t1", "conv-1", &transcript, Some(submit_at));
@@ -4240,14 +4257,8 @@ mod tests {
             .append(true)
             .open(&transcript)
             .unwrap();
-        f.write_all(
-            line(
-                "turn_settled",
-                ",\"outcome\":\"completed\",\"fullyIdle\":true",
-            )
-            .as_bytes(),
-        )
-        .unwrap();
+        f.write_all(line("settle", ",\"outcome\":\"completed\",\"fullyIdle\":true").as_bytes())
+            .unwrap();
         drop(f);
 
         let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 5_000)
@@ -4286,7 +4297,7 @@ mod tests {
     /// carries HISTORY (exact resume, rebind, restart-restore) must seed
     /// the tracker from a BASELINE, never replay history as live
     /// attention. The pre-fix Start-attach fed every historical
-    /// `user_message`/`turn_settled` record to a FRESH per-terminal
+    /// `USER_INPUT`/`turn_settled` record to a FRESH per-terminal
     /// tracker: each old settle minted a phantom `terminal.turn.complete`
     /// — old turns ringing as live attention after resume/rebind. The
     /// baseline seeds the per-settle dedupe watermark and the busy state
@@ -4299,40 +4310,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
         let t0 = now_ms();
-        let line = |kind: &str, extra: &str, at: i64| {
-            format!("{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":{at}{extra}}}\n")
+        // Real-shaped records (binary v1.4.12; the `session_start` line is
+        // the labeled fake-contract ownership anchor): each appended record
+        // carries a fresh step_index (the per-record identity the tracker's
+        // dedupe keys on) and its timestamp in `created_at` (numeric
+        // epoch-ms — the shared coercion's documented second form).
+        let mut step = 0i64;
+        let mut line = |kind: &str, extra: &str, at: i64| match kind {
+            "start" => "{\"type\":\"session_start\",\"conversationId\":\"conv-1\"}\n".to_string(),
+            "user" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":{at}{extra}}}\n"
+                    )
+            }
+            "settle" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"turn_settled\",\"step_index\":{step},\"created_at\":{at}{extra}}}\n"
+                    )
+            }
+            other => panic!("unknown plant kind {other}"),
         };
         // Two settled historical turns, then the pane's own prompt as the
         // LATEST record: a turn is in flight.
         std::fs::write(
             &transcript,
             [
-                line("session_start", "", t0 - 120_000),
+                line("start", "", t0 - 120_000),
                 line(
-                    "user_message",
-                    ",\"text\":\"historical prompt one\"",
+                    "user",
+                    ",\"content\":\"historical prompt one\"",
                     t0 - 60_000,
                 ),
                 line(
-                    "turn_settled",
+                    "settle",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
                     t0 - 59_000,
                 ),
                 line(
-                    "user_message",
-                    ",\"text\":\"historical prompt two\"",
+                    "user",
+                    ",\"content\":\"historical prompt two\"",
                     t0 - 30_000,
                 ),
                 line(
-                    "turn_settled",
+                    "settle",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
                     t0 - 29_000,
                 ),
-                line(
-                    "user_message",
-                    ",\"text\":\"baseline in-flight prompt\"",
-                    t0,
-                ),
+                line("user", ",\"content\":\"baseline in-flight prompt\"", t0),
             ]
             .concat(),
         )
@@ -4426,7 +4452,7 @@ mod tests {
             .unwrap();
         f.write_all(
             line(
-                "turn_settled",
+                "settle",
                 ",\"outcome\":\"completed\",\"fullyIdle\":true",
                 now_ms(),
             )
@@ -4505,20 +4531,35 @@ mod tests {
         // sweep ever attaches the lane. Their `at`s are AFTER the submit.
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
-        let line = |kind: &str, extra: &str, at: i64| {
-            format!("{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":{at}{extra}}}\n")
+        // Real-shaped records (binary v1.4.12; the `session_start` line is
+        // the labeled fake-contract ownership anchor): each appended record
+        // carries a fresh step_index (the per-record identity the tracker's
+        // dedupe keys on) and its timestamp in `created_at` (numeric
+        // epoch-ms — the shared coercion's documented second form).
+        let mut step = 0i64;
+        let mut line = |kind: &str, extra: &str, at: i64| match kind {
+            "start" => "{\"type\":\"session_start\",\"conversationId\":\"conv-1\"}\n".to_string(),
+            "user" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":{at}{extra}}}\n"
+                    )
+            }
+            "settle" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"turn_settled\",\"step_index\":{step},\"created_at\":{at}{extra}}}\n"
+                    )
+            }
+            other => panic!("unknown plant kind {other}"),
         };
         std::fs::write(
             &transcript,
             [
-                line("session_start", "", t0 - 1_000),
+                line("start", "", t0 - 1_000),
+                line("user", ",\"content\":\"delayed settle prompt\"", t0 + 10),
                 line(
-                    "user_message",
-                    ",\"text\":\"delayed settle prompt\"",
-                    t0 + 10,
-                ),
-                line(
-                    "turn_settled",
+                    "settle",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
                     t0 + 50,
                 ),
@@ -4596,9 +4637,9 @@ mod tests {
             .unwrap();
         f.write_all(
             [
-                line("user_message", ",\"text\":\"follow up prompt\"", now_ms()),
+                line("user", ",\"content\":\"follow up prompt\"", now_ms()),
                 line(
-                    "turn_settled",
+                    "settle",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
                     now_ms(),
                 ),
@@ -4680,30 +4721,41 @@ mod tests {
         // write→stamp skew the tolerance exists for).
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
-        let line = |kind: &str, extra: &str, at: i64| {
-            format!("{{\"type\":\"{kind}\",\"conversationId\":\"conv-1\",\"at\":{at}{extra}}}\n")
+        // Real-shaped records (binary v1.4.12; the `session_start` line is
+        // the labeled fake-contract ownership anchor): each appended record
+        // carries a fresh step_index (the per-record identity the tracker's
+        // dedupe keys on) and its timestamp in `created_at` (numeric
+        // epoch-ms — the shared coercion's documented second form).
+        let mut step = 0i64;
+        let mut line = |kind: &str, extra: &str, at: i64| match kind {
+            "start" => "{\"type\":\"session_start\",\"conversationId\":\"conv-1\"}\n".to_string(),
+            "user" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":{at}{extra}}}\n"
+                    )
+            }
+            "settle" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"turn_settled\",\"step_index\":{step},\"created_at\":{at}{extra}}}\n"
+                    )
+            }
+            other => panic!("unknown plant kind {other}"),
         };
         std::fs::write(
             &transcript,
             [
-                line("session_start", "", t0 - 120_000),
+                line("start", "", t0 - 120_000),
+                line("user", ",\"content\":\"old history prompt\"", t0 - 80_000),
                 line(
-                    "user_message",
-                    ",\"text\":\"old history prompt\"",
-                    t0 - 80_000,
-                ),
-                line(
-                    "turn_settled",
+                    "settle",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
                     t0 - 79_000,
                 ),
+                line("user", ",\"content\":\"skewed settle prompt\"", t0 - 3_000),
                 line(
-                    "user_message",
-                    ",\"text\":\"skewed settle prompt\"",
-                    t0 - 3_000,
-                ),
-                line(
-                    "turn_settled",
+                    "settle",
                     ",\"outcome\":\"completed\",\"fullyIdle\":true",
                     t0 - 2_500,
                 ),
@@ -4842,17 +4894,34 @@ mod tests {
     async fn antigravity_failed_rebind_attach_drops_the_superseded_lane() {
         let dir = tempfile::tempdir().unwrap();
         let transcript_a = dir.path().join("transcript-a.jsonl");
-        let line = |kind: &str, extra: &str| {
-            format!(
-                "{{\"type\":\"{kind}\",\"conversationId\":\"conv-a\",\"at\":\"{ts}\"{extra}}}\n",
-                ts = crate::now_iso(),
-            )
+        // Real-shaped records (binary v1.4.12; the `session_start` line is
+        // the labeled fake-contract ownership anchor): each appended record
+        // carries a fresh step_index (the per-record identity the tracker's
+        // dedupe keys on) and its timestamp in `created_at`.
+        let mut step = 0i64;
+        let mut line = |kind: &str, extra: &str| match kind {
+            "start" => "{\"type\":\"session_start\",\"conversationId\":\"conv-a\"}\n".to_string(),
+            "user" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":\"{ts}\"{extra}}}\n",
+                        ts = crate::now_iso(),
+                    )
+            }
+            "settle" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"turn_settled\",\"step_index\":{step},\"created_at\":\"{ts}\"{extra}}}\n",
+                        ts = crate::now_iso(),
+                    )
+            }
+            other => panic!("unknown plant kind {other}"),
         };
         std::fs::write(
             &transcript_a,
             [
-                line("session_start", ""),
-                line("user_message", ",\"text\":\"first prompt\""),
+                line("start", ""),
+                line("user", ",\"content\":\"first prompt\""),
             ]
             .concat(),
         )
@@ -4889,7 +4958,7 @@ mod tests {
         .expect("the flushed submit arms the tracker's provisional busy");
 
         // Conversation A binds: the lane replays the young transcript (the
-        // user_message — written before the submit — confirms the busy
+        // USER_INPUT record — written before the submit — confirms the busy
         // through the historical in-flight fold).
         hub.attach_antigravity_association("t1", "conv-a", &transcript_a, Some(submit_at));
         next_frame_matching(&mut rx, "antigravity.activity.updated", 3_000, |v| {
@@ -4937,14 +5006,8 @@ mod tests {
             .append(true)
             .open(&transcript_a)
             .unwrap();
-        f.write_all(
-            line(
-                "turn_settled",
-                ",\"outcome\":\"completed\",\"fullyIdle\":true",
-            )
-            .as_bytes(),
-        )
-        .unwrap();
+        f.write_all(line("settle", ",\"outcome\":\"completed\",\"fullyIdle\":true").as_bytes())
+            .unwrap();
         drop(f);
 
         assert!(
@@ -4991,10 +5054,7 @@ mod tests {
         let transcript_b = dir.path().join("transcript-b.jsonl");
         std::fs::write(
             &transcript_b,
-            format!(
-                "{{\"type\":\"session_start\",\"conversationId\":\"conv-b\",\"at\":{}}}\n",
-                now_ms()
-            ),
+            "{\"type\":\"session_start\",\"conversationId\":\"conv-b\"}\n",
         )
         .unwrap();
         hub.attach_antigravity_association("t1", "conv-b", &transcript_b, Some(submit_at));
@@ -5013,8 +5073,8 @@ mod tests {
         f.write_all(
             format!(
                 concat!(
-                    "{{\"type\":\"user_message\",\"conversationId\":\"conv-b\",\"text\":\"re-established prompt\",\"at\":{}}}\n",
-                    "{{\"type\":\"turn_settled\",\"conversationId\":\"conv-b\",\"outcome\":\"completed\",\"fullyIdle\":true,\"at\":{}}}\n",
+                    "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":0,\"created_at\":{},\"content\":\"re-established prompt\"}}\n",
+                    "{{\"type\":\"turn_settled\",\"step_index\":1,\"created_at\":{},\"outcome\":\"completed\",\"fullyIdle\":true}}\n",
                 ),
                 at_b + 10,
                 at_b + 50,
@@ -5046,24 +5106,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let confirmed_transcript = dir.path().join("confirmed.jsonl");
         let provisional_transcript = dir.path().join("provisional.jsonl");
-        let line = |kind: &str, extra: &str| {
-            format!(
-                "{{\"type\":\"{kind}\",\"conversationId\":\"conv\",\"at\":\"{ts}\"{extra}}}\n",
-                ts = crate::now_iso(),
-            )
+        // Real-shaped records (binary v1.4.12; the `session_start` line is
+        // the labeled fake-contract ownership anchor): each appended record
+        // carries a fresh step_index (the per-record identity the tracker's
+        // dedupe keys on) and its timestamp in `created_at`.
+        let mut step = 0i64;
+        let mut line = |kind: &str, extra: &str| match kind {
+            "start" => "{\"type\":\"session_start\",\"conversationId\":\"conv\"}\n".to_string(),
+            "user" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":\"{ts}\"{extra}}}\n",
+                        ts = crate::now_iso(),
+                    )
+            }
+            "settle" => {
+                step += 1;
+                format!(
+                        "{{\"type\":\"turn_settled\",\"step_index\":{step},\"created_at\":\"{ts}\"{extra}}}\n",
+                        ts = crate::now_iso(),
+                    )
+            }
+            other => panic!("unknown plant kind {other}"),
         };
         std::fs::write(
             &confirmed_transcript,
             [
-                line("session_start", ""),
-                line("user_message", ",\"text\":\"confirmed pane prompt\""),
+                line("start", ""),
+                line("user", ",\"content\":\"confirmed pane prompt\""),
             ]
             .concat(),
         )
         .unwrap();
-        // No user_message record: the lane attaches and drains, but this
+        // No USER_INPUT record: the lane attaches and drains, but this
         // pane's busy stays PROVISIONAL (submit-grace only).
-        std::fs::write(&provisional_transcript, line("session_start", "")).unwrap();
+        std::fs::write(&provisional_transcript, line("start", "")).unwrap();
 
         let (hub, mut rx) = hub();
         let home = unique_temp_dir("agy-degrade-seam");
@@ -5071,7 +5148,7 @@ mod tests {
             crate::antigravity_association::AntigravityAssociation::new(home.clone()),
         ));
 
-        // t1 → CONFIRMED busy: submit + the transcript's user_message.
+        // t1 → CONFIRMED busy: submit + the transcript's USER_INPUT record.
         observer_send(
             &hub,
             ActivityEvent::Created {

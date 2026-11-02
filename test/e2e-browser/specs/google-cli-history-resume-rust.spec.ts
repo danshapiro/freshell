@@ -41,10 +41,10 @@ import type { Page } from '@playwright/test'
  *   3. A `userMessages`-tier search hits the NORMALIZED conversation, not a
  *      raw JSON grep: the nonce row matches (matchedIn `userMessage`),
  *      an UPPERCASE query still matches (case-insensitive text
- *      normalization), the literal record-type string `user_message` —
- *      present in EVERY raw transcript line, present in NO user text —
- *      matches NOTHING, and assistant-only text never matches the
- *      userMessages tier.
+ *      normalization), the literal record-type string `USER_INPUT` —
+ *      present in every raw user-record transcript line, present in no
+ *      user-authored text — matches NOTHING, and assistant-only text
+ *      never matches the userMessages tier.
  *
  * TEST 2 — stop, exact resume across restart, adjacency, zero-turn:
  *   4. Stop the owned fixture process (WS `terminal.kill` with
@@ -657,11 +657,11 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         })
 
         // (c) NOT a raw JSON grep: the literal record-type string
-        // `user_message` appears in EVERY raw transcript line
-        // (`"type":"user_message"`) but in NO user-authored text — a raw
+        // `USER_INPUT` appears in every raw user-record transcript line
+        // (`"type":"USER_INPUT"`) but in NO user-authored text — a raw
         // file grep would return both conversations; the normalized tier
         // returns NOTHING.
-        const hitStructural = await runSearch('user_message', 'userMessages')
+        const hitStructural = await runSearch('USER_INPUT', 'userMessages')
         expect(hitStructural).toEqual([])
 
         // (d) tier scoping: assistant-only text never matches the

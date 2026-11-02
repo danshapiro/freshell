@@ -140,9 +140,13 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   the requested dead id (the pre-round-7 fake invented one, a
 ///   contract no real binary has; scenario 4b pins the rebind that
 ///   follows).
-/// - Per stdin line: appends a `user_message` record (ms-precision ISO
-///   `at` — the parser's documented timestamp shape) carrying the line
-///   text and the active conversation id.
+/// - Per stdin line: appends a `USER_INPUT` record (real binary v1.4.12
+///   vocabulary: `source`/`status`/`step_index` + a `created_at`
+///   ms-precision ISO stamp — the shared coercion's documented shape)
+///   carrying the line text in `content`. A per-conversation STEP
+///   counter (reset at each conversation mint, incremented per appended
+///   record) gives every record a unique step_index — the real binary's
+///   per-record identity the tracker's dedupe keys on.
 /// - `/switch:<id>` (the documented new-conversation switch) mints a NEW
 ///   conversation: initializes its ownership record and makes it active —
 ///   the NEXT stdin line lands as that conversation's first user record.
@@ -151,7 +155,11 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   stdin line is appended as that transcript's LATEST user record.
 /// - `settle:<text>` (Task 8's activity phase) appends the user record AND
 ///   a `turn_settled{outcome:"completed",fullyIdle:true}` record — a turn
-///   that fully settles.
+///   that fully settles. The settle record is the LABELED FAKE-CONTRACT
+///   settle (real transcripts carry no settle record — binary evidence,
+///   real-binary-transcript-evidence.md); it keeps the real-shaped field
+///   discipline (`step_index` + `created_at`) so the tracker's
+///   identity-pair dedupe is exercised end to end.
 /// - `async:<text>` (Task 8's activity phase) appends the user record AND a
 ///   `turn_settled{fullyIdle:false}` record — invocation completion with
 ///   outstanding async work (NOT turn completion).
@@ -187,7 +195,13 @@ fn write_fake_agy() -> std::path::PathBuf {
 AGY_BRAIN="$AGY_HOME/brain"
 CONV="conv-$FRESHELL_TERMINAL_ID"
 AGY_CWD="$(pwd)"
+# Per-conversation record counter: the real binary's step_index identity
+# (unique per record, reset per conversation mint — synthetic precision
+# for the recency tests; the real binary writes second-granularity
+# created_at stamps, which the shared coercion also accepts).
+STEP=-1
 now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+next_step() { STEP=$((STEP + 1)); }
 if [ -n "$AGY_ARGV_CAPTURE" ]; then
   printf '%s\n' "$*" >> "$AGY_ARGV_CAPTURE"
 fi
@@ -229,6 +243,22 @@ case "$prev" in
 esac
 transcript_of() { printf '%s/%s/.system_generated/logs/transcript.jsonl' "$AGY_BRAIN" "$CONV"; }
 TRANSCRIPT="$(transcript_of)"
+mint_conversation() {
+  mkdir -p "$(dirname "$TRANSCRIPT")"
+  printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
+    "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
+  STEP=-1
+}
+append_user_record() {
+  next_step
+  printf '{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":%s,"created_at":"%s","content":"%s"}\n' \
+    "$STEP" "$(now)" "$1" >> "$TRANSCRIPT"
+}
+append_settle_record() {
+  next_step
+  printf '{"type":"turn_settled","step_index":%s,"created_at":"%s","outcome":"completed","fullyIdle":%s}\n' \
+    "$STEP" "$(now)" "$1" >> "$TRANSCRIPT"
+}
 if [ ! -f "$TRANSCRIPT" ]; then
   if [ "$RESUMED" = "1" ]; then
     # The PROBED missing-id contract (round 7, Major 1; real binaries
@@ -243,9 +273,7 @@ if [ ! -f "$TRANSCRIPT" ]; then
     CONV="conv-$FRESHELL_TERMINAL_ID"
     TRANSCRIPT="$(transcript_of)"
   fi
-  mkdir -p "$(dirname "$TRANSCRIPT")"
-  printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
-    "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
+  mint_conversation
 else
   printf 'agy-resumed:%s\n' "$CONV"
 fi
@@ -254,9 +282,7 @@ while IFS= read -r line; do
     "/switch:"*)
       CONV="${line#/switch:}"
       TRANSCRIPT="$(transcript_of)"
-      mkdir -p "$(dirname "$TRANSCRIPT")"
-      printf '{"type":"session_start","conversationId":"%s","workspacePaths":["%s"],"startedAt":"%s"}\n' \
-        "$CONV" "$AGY_CWD" "$(now)" > "$TRANSCRIPT"
+      mint_conversation
       ;;
     "/resume "*)
       CONV="${line#/resume }"
@@ -266,16 +292,12 @@ while IFS= read -r line; do
       # The user record's text is the FULL input line (the locator
       # content-matches the pane's captured submit line — a stripped prefix
       # could never associate); the settle record follows it.
-      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
-        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
-      printf '{"type":"turn_settled","conversationId":"%s","at":"%s","outcome":"completed","fullyIdle":true}\n' \
-        "$CONV" "$(now)" >> "$TRANSCRIPT"
+      append_user_record "$line"
+      append_settle_record true
       ;;
     "async:"*)
-      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
-        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
-      printf '{"type":"turn_settled","conversationId":"%s","at":"%s","outcome":"completed","fullyIdle":false}\n' \
-        "$CONV" "$(now)" >> "$TRANSCRIPT"
+      append_user_record "$line"
+      append_settle_record false
       ;;
     "/crash")
       exit 1
@@ -284,8 +306,7 @@ while IFS= read -r line; do
       exit 0
       ;;
     *)
-      printf '{"type":"user_message","conversationId":"%s","text":"%s","at":"%s"}\n' \
-        "$CONV" "$line" "$(now)" >> "$TRANSCRIPT"
+      append_user_record "$line"
       ;;
   esac
 done
@@ -457,10 +478,11 @@ async fn spawn_antigravity_server(
 }
 
 /// Plant an UNBOUND transcript (the concurrently-appearing / decoy /
-/// late-write shapes the tests fabricate): the fixture-format ownership
-/// record plus ONE user record with the given text, timestamped at `at_ms`
-/// (numeric epoch-ms `at` — the shared timestamp coercion's documented
-/// second form, `freshell_sessions::time::parse_timestamp_ms`).
+/// late-write shapes the tests fabricate): the fake-contract ownership
+/// anchor plus ONE real-shaped user record with the given text,
+/// timestamped at `at_ms` (numeric epoch-ms `created_at` — the shared
+/// timestamp coercion's documented second form,
+/// `freshell_sessions::time::parse_timestamp_ms`).
 fn plant_transcript(
     home: &std::path::Path,
     conv: &str,
@@ -474,7 +496,7 @@ fn plant_transcript(
         concat!(
             r#"{{"type":"session_start","conversationId":"{conv}","workspacePaths":["{cwd}"],"startedAt":{at}}}"#,
             "\n",
-            r#"{{"type":"user_message","conversationId":"{conv}","text":"{text}","at":{at}}}"#,
+            r#"{{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":{at},"content":"{text}"}}"#,
             "\n",
         ),
         conv = conv,

@@ -1833,8 +1833,11 @@ mod tests {
         );
     }
 
-    /// Plant a fixture-format transcript under the association's brain
-    /// root (numeric epoch-ms `at` — the coercion's second form).
+    /// Plant a transcript in the corrected record vocabulary under the
+    /// association's brain root: the fake-contract `session_start`
+    /// ownership anchor plus real-shaped `USER_INPUT` user records
+    /// (numeric epoch-ms `created_at` — the coercion's second form;
+    /// each record's step_index unique per transcript).
     fn plant_transcript(
         home: &std::path::Path,
         conv: &str,
@@ -1854,9 +1857,9 @@ mod tests {
             cwd = cwd,
             start = records.first().map(|r| r.1).unwrap_or(0),
         );
-        for (text, at) in records {
+        for (step, (text, at)) in records.iter().enumerate() {
             body.push_str(&format!(
-                "\n{{\"type\":\"user_message\",\"conversationId\":\"{conv}\",\"text\":\"{text}\",\"at\":{at}}}",
+                "\n{{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":{step},\"created_at\":{at},\"content\":\"{text}\"}}",
             ));
         }
         body.push('\n');
