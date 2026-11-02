@@ -153,6 +153,45 @@ fn fresh_agent_maintenance_error(request_id: String) -> ServerMessage {
     })
 }
 
+async fn dispatch_hosted_fresh_agent(
+    message: &ClientMessage,
+    ws_tx: &mut WsSink,
+    admission: &freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
+    gateway: Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+) -> Option<bool> {
+    let crate::hosted_fresh_agent::HostedRoute::Gateway(command) =
+        crate::hosted_fresh_agent::hosted_route(message)
+    else {
+        return None;
+    };
+
+    let host_agent_permit = match command.as_ref() {
+        crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) => {
+            match admission.try_admit() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Some(
+                        send(
+                            ws_tx,
+                            &fresh_agent_maintenance_error(create.request_id.clone()),
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+        _ => None,
+    };
+    let task = gateway.dispatch(*command);
+    tokio::spawn(async move {
+        // Keep maintenance admission active through the hosted provider's
+        // create future, so quiesce cannot report drained while it is running.
+        let _host_agent_permit = host_agent_permit;
+        task.await;
+    });
+    Some(true)
+}
+
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
 /// reused by the locator association seams and the identity invariant
 /// sweep -- one wall-clock source for the whole crate.
@@ -1139,8 +1178,17 @@ async fn handle_client_text(
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
     // consumed by the external gateway when installed. It is never allowed
     // to fall through and mint a competing web-owned provider writer.
-    if crate::hosted_fresh_agent::dispatch_if_installed(&message) {
-        return true;
+    if let Some(gateway) = crate::hosted_fresh_agent::installed_gateway() {
+        if let Some(handled) = dispatch_hosted_fresh_agent(
+            &message,
+            ws_tx,
+            &state.fresh_opencode.host_agent_admission(),
+            gateway,
+        )
+        .await
+        {
+            return handled;
+        }
     }
     match message {
         ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
@@ -13722,6 +13770,43 @@ mod pane_reconcile_gate_tests {
 mod host_agent_admission_tests {
     use super::*;
     use freshell_freshagent::host_agent_admission::HostAgentAdmissionGate;
+    use futures::future::BoxFuture;
+
+    struct HostedCreateGateway {
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+        deliveries: StdMutex<Vec<crate::hosted_fresh_agent::HostedFreshAgentCommand>>,
+        hold: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        settled: tokio::sync::Notify,
+    }
+
+    impl crate::hosted_fresh_agent::HostedFreshAgentGateway for HostedCreateGateway {
+        fn dispatch(
+            self: Arc<Self>,
+            command: crate::hosted_fresh_agent::HostedFreshAgentCommand,
+        ) -> BoxFuture<'static, ()> {
+            if let crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) = &command {
+                let _ = self.broadcast_tx.send(
+                    serde_json::json!({
+                        "type": "freshAgent.created",
+                        "provider": "codex",
+                        "runtimeProvider": "codex",
+                        "sessionId": "hosted-session-1",
+                        "sessionType": "freshcodex",
+                        "requestId": create.request_id,
+                    })
+                    .to_string(),
+                );
+            }
+            self.deliveries.lock().unwrap().push(command);
+            let hold = self.hold.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    let _ = hold.await;
+                }
+                self.settled.notify_one();
+            })
+        }
+    }
 
     async fn dispatch(
         text: &str,
@@ -13829,6 +13914,104 @@ mod host_agent_admission_tests {
         assert_eq!(gate.status().phase, "quiesced");
         gate.release(&lease).unwrap();
         assert!(gate.try_admit().is_ok());
+    }
+
+    #[tokio::test]
+    async fn hosted_fresh_agent_create_obeys_quiesce_and_holds_permit_until_dispatch_settles() {
+        use std::time::Duration;
+
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let state = super::pane_reconcile_gate_tests::state();
+        let gate = state.fresh_opencode.host_agent_admission();
+        let lease = gate
+            .begin_quiesce("hosted-ws-maintenance-test", Duration::from_secs(30))
+            .unwrap();
+        gate.drain(&lease, Duration::from_secs(1)).await.unwrap();
+
+        let mut broadcasts = state.broadcast_tx.subscribe();
+        let (release_gateway_tx, release_gateway_rx) = tokio::sync::oneshot::channel();
+        let gateway = Arc::new(HostedCreateGateway {
+            broadcast_tx: Arc::clone(&state.broadcast_tx),
+            deliveries: StdMutex::new(Vec::new()),
+            hold: StdMutex::new(Some(release_gateway_rx)),
+            settled: tokio::sync::Notify::new(),
+        });
+
+        let rejected_request: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "freshAgent.create",
+            "provider": "codex",
+            "sessionType": "freshcodex",
+            "requestId": "hosted-create-quiesced",
+        }))
+        .expect("hosted freshAgent.create frame decodes");
+        let handled = super::dispatch_hosted_fresh_agent(
+            &rejected_request,
+            &mut ws_tx,
+            &gate,
+            Arc::clone(&gateway) as Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+        )
+        .await;
+        assert_eq!(handled, Some(true));
+
+        assert!(
+            gateway.deliveries.lock().unwrap().is_empty(),
+            "quiesced maintenance must refuse hosted creates before gateway dispatch"
+        );
+        assert_eq!(gate.status().active_permits, 0);
+        let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+        assert_eq!(refusal["type"], "freshAgent.create.failed");
+        assert_eq!(refusal["requestId"], "hosted-create-quiesced");
+        assert_eq!(refusal["code"], "HOST_AGENT_MAINTENANCE");
+        assert_eq!(refusal["retryable"], true);
+        assert!(matches!(
+            broadcasts.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        gate.release(&lease).unwrap();
+        let admitted_request: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "freshAgent.create",
+            "provider": "codex",
+            "sessionType": "freshcodex",
+            "requestId": "hosted-create-admitted",
+        }))
+        .expect("hosted freshAgent.create frame decodes");
+        let handled = super::dispatch_hosted_fresh_agent(
+            &admitted_request,
+            &mut ws_tx,
+            &gate,
+            Arc::clone(&gateway) as Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+        )
+        .await;
+        assert_eq!(handled, Some(true));
+
+        let created = tokio::time::timeout(Duration::from_secs(1), broadcasts.recv())
+            .await
+            .expect("hosted gateway published a created acknowledgement")
+            .expect("created acknowledgement broadcast remains open");
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        assert_eq!(created["type"], "freshAgent.created");
+        assert_eq!(created["requestId"], "hosted-create-admitted");
+
+        let deliveries = gateway.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        match &deliveries[0] {
+            crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) => {
+                assert_eq!(create.request_id, "hosted-create-admitted");
+            }
+            other => panic!("expected one hosted create delivery, got {other:?}"),
+        }
+        drop(deliveries);
+        assert_eq!(gate.status().active_permits, 1);
+
+        release_gateway_tx
+            .send(())
+            .expect("hosted create future is still waiting");
+        tokio::time::timeout(Duration::from_secs(1), gateway.settled.notified())
+            .await
+            .expect("hosted create future settled");
+        assert_eq!(gate.status().active_permits, 0);
     }
 }
 
