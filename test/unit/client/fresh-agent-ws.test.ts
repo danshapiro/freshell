@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer from '@/store/freshAgentSlice'
+import freshAgentReducer, { clearSessionError } from '@/store/freshAgentSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 
 describe('fresh-agent websocket public contract', () => {
@@ -87,6 +87,251 @@ describe('fresh-agent websocket public contract', () => {
     send(earlier)
     session = store.getState().freshAgent.sessions['freshcodex:codex:thread-reused-question']
     expect(session.lastError).toBe(`${earlier.message} ${fallback.message}`)
+  })
+
+  it('keeps repeated answer failures attributed to the same attempt across browsers', () => {
+    const browsers = [0, 1].map(() => configureStore({ reducer: { freshAgent: freshAgentReducer } }))
+    const locator = { sessionId: 'thread-two-browsers', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const broadcast = (event: Record<string, unknown>) => {
+      for (const browser of browsers) handleFreshAgentMessage(browser.dispatch, { ...outer, event })
+    }
+    const session = (index: number) => browsers[index].getState().freshAgent.sessions['freshcodex:codex:thread-two-browsers']
+    broadcast({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    broadcast({ type: 'freshAgent.question.request', requestId: 'question-1', questions: [{ question: 'Continue?', options: [] }] })
+    broadcast({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-1' })
+    const previous = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      operationAttemptId: 'attempt-1', code: 'INVALID_ANSWER', message: 'The first answer was invalid.' }
+    broadcast(previous)
+    expect(session(0).lastError).toBe(previous.message)
+    expect(session(1).lastError).toBe(previous.message)
+
+    // The second browser observes the retry but does not initiate it.
+    broadcast({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2' })
+    const fallback = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      operationAttemptId: 'attempt-2', operationFallback: true, operationOutcomeUncertain: true,
+      code: 'COMMAND_AMBIGUOUS', message: 'Sending the answer could not be confirmed.' }
+    broadcast(fallback)
+    broadcast(previous) // an old provider event may be delayed in the host journal
+    broadcast({ ...previous, operationReceiptReplay: true })
+    for (const index of [0, 1]) {
+      expect(session(index).lastError).toBe(fallback.message)
+      expect(session(index).status).toBe('running')
+      expect(session(index).pendingQuestions['question-1']).toBeDefined()
+    }
+
+    const current = { ...previous, operationAttemptId: 'attempt-2', message: 'The second answer was invalid.' }
+    broadcast(current)
+    broadcast({ ...current, operationReceiptReplay: true })
+    for (const index of [0, 1]) {
+      expect(session(index).lastError).toBe(`${current.message} ${fallback.message}`)
+    }
+
+    // Retrying does not settle the previous uncertain delivery. Keep it
+    // separately labeled when a later attempt receives a definite refusal.
+    broadcast({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-3' })
+    const newest = { ...previous, operationAttemptId: 'attempt-3', message: 'The third answer was invalid.' }
+    broadcast(newest)
+    for (const index of [0, 1]) {
+      expect(session(index).lastError).toBe(`${newest.message} Earlier attempt: ${fallback.message}`)
+    }
+  })
+
+  it('keeps an older host receipt visible without attributing it to a tagged attempt', () => {
+    for (const [providerFirst, startSeen] of [[true, true], [false, true], [true, false], [false, false]]) {
+      const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+      const locator = { sessionId: 'old-host', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const outer = { type: 'freshAgent.event' as const, ...locator }
+      const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+      send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+      if (startSeen) send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2' })
+      const native = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+        code: 'INVALID_ANSWER', message: 'The provider reported an invalid answer.' }
+      const fallback = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+        operationAttemptId: 'attempt-2', operationFallback: true, operationOutcomeUncertain: true,
+        code: 'COMMAND_AMBIGUOUS', message: 'Sending the answer could not be confirmed.' }
+      for (const event of providerFirst ? [native, fallback] : [fallback, native]) send(event)
+      const session = store.getState().freshAgent.sessions['freshcodex:codex:old-host']
+      expect(session.lastError).toContain(fallback.message)
+      expect(session.lastError).toContain(native.message)
+      expect(session.lastError).toContain('answer attempt unknown')
+      expect(session.status).toBe('running')
+    }
+  })
+
+  it('recovers the current answer when a pane joins after its start event', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const locator = { sessionId: 'late-join', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    send({ type: 'freshAgent.question.request', requestId: 'question-1', questions: [{ question: 'Continue?', options: [] }] })
+    const older = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      operationAttemptId: 'attempt-1', code: 'INVALID_ANSWER', message: 'The first answer was invalid.' }
+    const current = { ...older, operationAttemptId: 'attempt-2', message: 'The second answer was invalid.' }
+    // A fresh pane can see journal receipts before its attach replay settles.
+    send(older)
+    send({ type: 'freshAgent.operation.error', requestId: 'question-1', operationAttemptId: 'attempt-1', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS', message: 'The first answer could not be confirmed.' })
+    send(current)
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2', operationAttemptReplay: true })
+    send({ type: 'freshAgent.operation.error', requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, operationReceiptReplay: true,
+      code: 'COMMAND_AMBIGUOUS', message: 'The second answer could not be confirmed.' })
+    send({ ...older, operationReceiptReplay: true })
+    const session = store.getState().freshAgent.sessions['freshcodex:codex:late-join']
+    expect(session.lastError).toContain(current.message)
+    expect(session.lastError).toContain('The second answer could not be confirmed.')
+    expect(session.lastError).toContain('Earlier attempt: The first answer could not be confirmed.')
+    expect(session.lastError).not.toContain(older.message)
+    expect(session.pendingQuestions['question-1']).toBeDefined()
+    expect(session.status).toBe('running')
+  })
+
+  it('does not move an unrelated uncertain answer onto an untagged older-host receipt', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const locator = { sessionId: 'different-controls', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-a', operationAttemptId: 'attempt-a' })
+    send({ type: 'freshAgent.error', requestId: 'question-a', operationAttemptId: 'attempt-a', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS', message: 'Answer A is unconfirmed.' })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-b', operationAttemptId: 'attempt-b' })
+    send({ type: 'freshAgent.error', requestId: 'question-b', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'Answer B was invalid.' })
+    let session = store.getState().freshAgent.sessions['freshcodex:codex:different-controls']
+    expect(session.lastError).toContain('Answer B was invalid.')
+    expect(session.lastError).toContain('Another request: Answer A is unconfirmed.')
+    expect(session.lastErrorOperationUncertain).not.toBe(true)
+    send({ type: 'freshAgent.operation.started', requestId: 'question-b', operationAttemptId: 'attempt-b2' })
+    session = store.getState().freshAgent.sessions['freshcodex:codex:different-controls']
+    expect(session.lastError).toContain('Another request: Answer A is unconfirmed.')
+    expect(session.lastError).not.toContain('Earlier attempt: Answer A')
+  })
+
+  it('does not redisplay a dismissed answer warning when another pane attaches', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const locator = { sessionId: 'dismissed-replay', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const start = { type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2' }
+    const fallback = { type: 'freshAgent.operation.error', requestId: 'question-1', operationAttemptId: 'attempt-2',
+      operationReceipt: true, operationFallback: true, operationOutcomeUncertain: true,
+      code: 'COMMAND_AMBIGUOUS', message: 'Second answer unconfirmed.' }
+    handleFreshAgentMessage(store.dispatch, { ...outer, event: start })
+    handleFreshAgentMessage(store.dispatch, { ...outer, event: fallback })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:dismissed-replay'].lastError).toContain('Second answer unconfirmed.')
+    store.dispatch(clearSessionError(locator))
+    handleFreshAgentMessage(store.dispatch, { ...outer, event: { ...start, operationAttemptReplay: true } })
+    handleFreshAgentMessage(store.dispatch, { ...outer, event: { ...fallback, operationReceiptReplay: true } })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:dismissed-replay'].lastError).toBeUndefined()
+  })
+
+  it('keeps a fallback separate until the matching host admission is observed', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const locator = { sessionId: 'unconfirmed-attempt', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-1',
+      operationJournalId: 'journal-1', operationJournalSequence: 1 })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-1', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The first answer was invalid.' })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS', message: 'The second answer is unconfirmed.' })
+    let session = store.getState().freshAgent.sessions['freshcodex:codex:unconfirmed-attempt']
+    expect(session.lastError).toContain('Another answer attempt: The second answer is unconfirmed.')
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2',
+      operationAttemptReplay: true, operationJournalId: 'journal-1', operationJournalSequence: 3 })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The second answer was invalid.' })
+    session = store.getState().freshAgent.sessions['freshcodex:codex:unconfirmed-attempt']
+    expect(session.lastError).toBe('The second answer was invalid. The second answer is unconfirmed.')
+  })
+
+  it('attributes a pre-replay fallback after the matching journal start arrives', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const outer = { type: 'freshAgent.event' as const, sessionId: 'fallback-before-replay', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS', message: 'The second answer is unconfirmed.' })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-1', operationAttemptReplay: true })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-1', operationReceipt: true,
+      operationReceiptReplay: true, code: 'INVALID_ANSWER', message: 'The first answer was invalid.' })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2', operationAttemptReplay: true })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+      operationReceiptReplay: true, code: 'INVALID_ANSWER', message: 'The second answer was invalid.' })
+    const session = store.getState().freshAgent.sessions['freshcodex:codex:fallback-before-replay']
+    expect(session.lastError).toBe('The second answer was invalid. The second answer is unconfirmed.')
+    expect(session.lastErrorOperationUncertain).toBe(true)
+  })
+
+  it('shows a replayed still-running answer as provisional and clears it when the request ends', () => {
+    for (const settled of ['question-cancelled', 'provider-error'] as const) {
+      const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+      const outer = { type: 'freshAgent.event' as const, sessionId: `pending-${settled}`, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+      send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+      send({ type: 'freshAgent.question.request', requestId: 'question-1', questions: [{ question: 'Continue?', options: [] }] })
+      send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-1',
+        operationJournalId: 'journal-1', operationJournalSequence: 1, operationAttemptReplay: true, operationPending: true })
+      let session = store.getState().freshAgent.sessions[`freshcodex:codex:pending-${settled}`]
+      expect(session.lastError).toContain('outcome is not yet confirmed')
+      expect(session.pendingQuestions['question-1']).toBeDefined()
+      if (settled === 'question-cancelled') {
+        send({ type: 'freshAgent.question.cancelled', requestId: 'question-1' })
+      } else {
+        send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'attempt-1', operationReceipt: true,
+          code: 'INVALID_ANSWER', message: 'The answer was invalid.' })
+      }
+      session = store.getState().freshAgent.sessions[`freshcodex:codex:pending-${settled}`]
+      expect(session.lastError).toBe(settled === 'provider-error' ? 'The answer was invalid.' : undefined)
+      expect(session.status).toBe('running')
+    }
+  })
+
+  it('does not resurrect a settled answer from a delayed pending replay', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const outer = { type: 'freshAgent.event' as const, sessionId: 'stale-pending', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    send({ type: 'freshAgent.question.request', requestId: 'question-1', questions: [{ question: 'Continue?', options: [] }] })
+    send({ type: 'freshAgent.question.cancelled', requestId: 'question-1', operationAttemptId: 'attempt-1',
+      operationJournalId: 'journal-1', operationJournalSequence: 5 })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-1',
+      operationJournalId: 'journal-1', operationJournalSequence: 3, operationAttemptReplay: true, operationPending: true })
+    let session = store.getState().freshAgent.sessions['freshcodex:codex:stale-pending']
+    expect(session.lastError).toBeUndefined()
+    expect(session.pendingQuestions['question-1']).toBeUndefined()
+
+    // Reusing the question ID for a genuinely newer request remains possible.
+    send({ type: 'freshAgent.question.request', requestId: 'question-1', questions: [{ question: 'Continue again?', options: [] }] })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'attempt-2',
+      operationJournalId: 'journal-1', operationJournalSequence: 6, operationAttemptReplay: true, operationPending: true })
+    send({ type: 'freshAgent.question.cancelled', requestId: 'question-1', operationAttemptId: 'attempt-1',
+      operationJournalId: 'journal-1', operationJournalSequence: 5 })
+    session = store.getState().freshAgent.sessions['freshcodex:codex:stale-pending']
+    expect(session.lastError).toContain('outcome is not yet confirmed')
+    expect(session.pendingQuestions['question-1']).toBeDefined()
+  })
+
+  it('ignores delayed starts from a retired host journal', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    const outer = { type: 'freshAgent.event' as const, sessionId: 'replaced-journal', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.session.snapshot', status: 'running', revision: 1, latestTurnId: null })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'old-attempt',
+      operationJournalId: 'old-journal', operationJournalSequence: 10 })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'new-attempt',
+      operationJournalId: 'new-journal', operationJournalSequence: 1, operationAttemptReplay: true })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'new-attempt', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The current answer was invalid.' })
+    send({ type: 'freshAgent.operation.started', requestId: 'question-1', operationAttemptId: 'late-old-attempt',
+      operationJournalId: 'old-journal', operationJournalSequence: 11 })
+    send({ type: 'freshAgent.error', requestId: 'question-1', operationAttemptId: 'late-old-attempt', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'An older source answer was invalid.' })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:replaced-journal'].lastError).toBe('The current answer was invalid.')
   })
 
   it('keeps a running turn and pending question while preferring a control provider error over its fallback in either order', () => {

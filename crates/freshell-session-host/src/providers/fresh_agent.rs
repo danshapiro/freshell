@@ -1611,6 +1611,16 @@ impl FreshAgentTransport for HostedTransport {
         decision_id: &str,
         decision: Value,
     ) -> Result<(), DispatchFailure> {
+        self.resolve_permission_with_attempt_id(decision_id, decision, None)
+            .await
+    }
+
+    async fn resolve_permission_with_attempt_id(
+        &self,
+        decision_id: &str,
+        decision: Value,
+        operation_attempt_id: Option<&str>,
+    ) -> Result<(), DispatchFailure> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
             return delegate.resolve_permission(decision_id, decision).await;
@@ -1648,7 +1658,13 @@ impl FreshAgentTransport for HostedTransport {
             };
             return match &self.state {
                 ProviderState::Codex(state) => {
-                    if state.try_handle_elicitation_respond(message).await {
+                    if state
+                        .try_handle_elicitation_respond_with_attempt_id(
+                            message,
+                            operation_attempt_id,
+                        )
+                        .await
+                    {
                         Ok(())
                     } else {
                         Err(DispatchFailure { provider_diagnostic: None, message:"Codex did not accept this elicitation response; the request remains pending.".into(), acceptance_ambiguous:false })
@@ -1684,7 +1700,10 @@ impl FreshAgentTransport for HostedTransport {
                         acceptance_ambiguous: failure.acceptance_ambiguous,
                     })?,
                 ProviderState::Codex(state) => {
-                    if !state.try_handle_question_respond(message).await {
+                    if !state
+                        .try_handle_question_respond_with_attempt_id(message, operation_attempt_id)
+                        .await
+                    {
                         return Err(DispatchFailure { provider_diagnostic: None,message:"Codex did not accept this question answer; the request remains pending.".into(),acceptance_ambiguous:false});
                     }
                 }
@@ -1715,7 +1734,10 @@ impl FreshAgentTransport for HostedTransport {
                         acceptance_ambiguous: failure.acceptance_ambiguous,
                     })?,
                 ProviderState::Codex(state) => {
-                    if !state.try_handle_approval_respond(message).await {
+                    if !state
+                        .try_handle_approval_respond_with_attempt_id(message, operation_attempt_id)
+                        .await
+                    {
                         return Err(DispatchFailure { provider_diagnostic: None,message:"Codex did not accept this approval decision; the request remains pending.".into(),acceptance_ambiguous:false});
                     }
                 }
@@ -5389,7 +5411,13 @@ await import(parameters.source)
         assert_eq!(payload["providerRequest"]["id"], 41);
         // Reading from a reconnect's cursor yields the exact same public/native IDs.
         assert!(actor.read_events(0,256).await.events.iter().any(|entry| matches!(&entry.event,AgentEvent::PermissionRequested{decision_id:id,payload:p} if id==&decision_id && p==&payload)));
-        let invalid = actor.resolve_permission(&decision_id, invalid_answer).await;
+        let invalid = actor
+            .resolve_permission_with_attempt_id(
+                &decision_id,
+                invalid_answer.clone(),
+                Some("control-attempt-one"),
+            )
+            .await;
         assert!(
             invalid.is_err(),
             "an invalid native answer must not resolve its durable decision"
@@ -5402,7 +5430,7 @@ await import(parameters.source)
                         if payload["event"]["type"] == "freshAgent.error"
                             && payload["event"]["requestId"] == decision_id =>
                     {
-                        Some(payload.clone())
+                        Some((entry.sequence, payload.clone()))
                     }
                     _ => None,
                 }) {
@@ -5412,7 +5440,7 @@ await import(parameters.source)
             }
         })
         .await;
-        let refusal = match refusal {
+        let (refusal_sequence, refusal) = match refusal {
             Ok(refusal) => refusal,
             Err(_) => {
                 actor.stop().await.unwrap();
@@ -5425,6 +5453,37 @@ await import(parameters.source)
             .as_str()
             .unwrap_or_default()
             .is_empty());
+        assert_eq!(
+            refusal["event"]["operationAttemptId"],
+            "control-attempt-one"
+        );
+        assert!(actor.read_events(0, 256).await.events.iter().any(|entry| matches!(&entry.event,
+            AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.operation.started"
+                && payload["event"]["operationAttemptId"] == "control-attempt-one"
+                && entry.sequence < refusal_sequence)), "the source-owned start must be journaled before the provider refusal");
+        assert!(actor
+            .resolve_permission_with_attempt_id(
+                &decision_id,
+                invalid_answer,
+                Some("control-attempt-two")
+            )
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if actor.read_events(0, 256).await.events.iter().any(|entry| {
+                    matches!(&entry.event,
+                    AgentEvent::Provider { payload } if payload["event"]["requestId"] == decision_id
+                        && payload["event"]["type"] == "freshAgent.error"
+                        && payload["event"]["operationAttemptId"] == "control-attempt-two")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second refusal must retain its own attempt ID in the host journal");
         assert!(!actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,AgentEvent::DecisionResolved{decision_id:id} if id==&decision_id)));
         actor
             .resolve_permission(&decision_id, valid_answer.clone())

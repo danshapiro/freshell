@@ -21,6 +21,8 @@ import {
   addElicitationRequest,
   removeElicitation,
   applyRuntimeOwner,
+  beginOperationAttempt,
+  markControlAttemptPending,
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
@@ -686,6 +688,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(removePermission({
         ...locator,
         requestId: event.requestId as string,
+        ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+        ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+        ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+          ? { operationJournalSequence: event.operationJournalSequence } : {}),
       }))
       return true
     case 'freshAgent.question.request':
@@ -697,11 +703,27 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         providerRequest: event,
       }))
       return true
+    case 'freshAgent.operation.started':
+      if (typeof event.requestId === 'string' && typeof event.operationAttemptId === 'string') {
+        dispatch(beginOperationAttempt({ ...locator, requestId: event.requestId, operationAttemptId: event.operationAttemptId,
+          ...(event.operationAttemptReplay === true ? { operationAttemptReplay: true } : {}),
+          ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+          ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+            ? { operationJournalSequence: event.operationJournalSequence } : {}) }))
+        if (event.operationAttemptReplay === true && event.operationPending === true) {
+          dispatch(markControlAttemptPending({ ...locator, requestId: event.requestId, operationAttemptId: event.operationAttemptId }))
+        }
+      }
+      return true
     case 'freshAgent.elicitation.request':
       dispatch(addElicitationRequest({ ...locator, ...event, requestId: event.requestId as string } as never))
       return true
     case 'freshAgent.elicitation.cancelled':
-      dispatch(removeElicitation({ ...locator, requestId: event.requestId as string }))
+      dispatch(removeElicitation({ ...locator, requestId: event.requestId as string,
+        ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+        ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+        ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+          ? { operationJournalSequence: event.operationJournalSequence } : {}) }))
       return true
     case 'freshAgent.question.cancelled':
       // Provider-originated cancellation: the Rust claude/kilroy slice forwards
@@ -710,6 +732,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(removeQuestion({
         ...locator,
         requestId: event.requestId as string,
+        ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+        ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+        ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+          ? { operationJournalSequence: event.operationJournalSequence } : {}),
       }))
       return true
     case 'freshAgent.exit':
@@ -733,6 +759,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
           ...(event.operationFallback === true ? { operationFallback: true } : {}),
           ...(event.operationOutcomeUncertain === true ? { operationOutcomeUncertain: true } : {}),
           ...(event.operationReceiptReplay === true ? { operationReceiptReplay: true } : {}),
+          ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
           ...(typeof event.requestId === 'string' ? { requestId: event.requestId } : {}),
         }))
       }

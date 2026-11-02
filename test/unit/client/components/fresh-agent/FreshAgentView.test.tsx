@@ -2866,6 +2866,35 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('shows an unmatched answer warning even after a hidden attach reservation', async () => {
+    const store = createStore()
+    const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      ...locator, status: 'running', capabilities: { send: true, interrupt: true, questions: true },
+      pendingQuestions: [{ requestId: 'question-1', questions: [{ header: 'Next', question: 'Continue?',
+        options: [{ label: 'Yes', description: 'Proceed' }], multiSelect: false }] }], turns: [],
+    })
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'req-answer-reservation', status: 'connected',
+    }} /></Provider>)
+    await screen.findByRole('button', { name: 'Yes' })
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.status', status: 'running' } })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.operation.started',
+        requestId: 'question-1', operationAttemptId: 'attempt-1' } })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.error',
+        code: 'SESSION_RESERVED', message: 'Attach is reserved.' } })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.error',
+        requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+        operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+        message: 'The answer could not be confirmed.' } })
+    })
+    expect(screen.getByText(/Another answer attempt: The answer could not be confirmed\..*Agent error/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument()
+    expect(store.getState().freshAgent.sessions[`freshclaude:claude:${CLAUDE_THREAD_ID}`].status).toBe('running')
+  })
+
   it('starts a new answer without associating an older refusal with its uncertain outcome', async () => {
     const store = createStore()
     const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }

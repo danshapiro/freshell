@@ -623,7 +623,12 @@ impl Supervisor {
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 let state = self
-                    .fresh_agent_resolve(request.soul_id, request.decision_id, request.decision)
+                    .fresh_agent_resolve(
+                        request.soul_id,
+                        request.decision_id,
+                        request.decision,
+                        request.operation_attempt_id,
+                    )
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
             }
@@ -3555,6 +3560,7 @@ impl Supervisor {
         soul_id: SoulId,
         decision_id: String,
         decision: serde_json::Value,
+        operation_attempt_id: Option<String>,
     ) -> Result<CommandState, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -3585,6 +3591,7 @@ impl Supervisor {
                     incarnation_id: handle.incarnation_id().clone(),
                     decision_id,
                     decision,
+                    operation_attempt_id,
                 },
             )
             .await?
@@ -9183,7 +9190,8 @@ mod opencode_transfer_restart_tests {
                 .fresh_agent_resolve(
                     soul.clone(),
                     "uncommitted-decision".into(),
-                    serde_json::json!({"behavior":"allow"})
+                    serde_json::json!({"behavior":"allow"}),
+                    None,
                 )
                 .await
                 .unwrap_err()

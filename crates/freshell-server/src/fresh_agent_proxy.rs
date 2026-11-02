@@ -395,6 +395,7 @@ impl HostedFreshAgentProxy {
                         "Stopping the agent",
                         message.request_id.as_deref(),
                         false,
+                        None,
                     );
                 }
             }
@@ -438,6 +439,7 @@ impl HostedFreshAgentProxy {
                         "Changing agent settings",
                         Some(request_id.as_str()),
                         false,
+                        None,
                     );
                 }
             }
@@ -544,6 +546,7 @@ impl HostedFreshAgentProxy {
                         "Compacting the conversation",
                         Some(request_id.as_str()),
                         false,
+                        None,
                     );
                 }
             }
@@ -611,6 +614,7 @@ impl HostedFreshAgentProxy {
                         "Forking the conversation",
                         Some(request_id.as_str()),
                         false,
+                        None,
                     ),
                 }
             }
@@ -1212,13 +1216,21 @@ impl HostedFreshAgentProxy {
         decision_id: String,
         decision: serde_json::Value,
     ) {
+        // This ID identifies one answer attempt; the question ID is reused on
+        // retry. Only the host journal can establish which source admitted it.
+        let attempt_id = RequestId::new().as_str().to_owned();
         let result = match self
             .resolve_soul(&provider, session_type, &session_id)
             .await
         {
             Some(soul) => self
                 .client
-                .fresh_agent_resolve(soul, decision_id.clone(), decision)
+                .fresh_agent_resolve_with_attempt_id(
+                    soul,
+                    decision_id.clone(),
+                    decision,
+                    Some(attempt_id.clone()),
+                )
                 .await
                 .map(|_| ()),
             None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
@@ -1232,6 +1244,7 @@ impl HostedFreshAgentProxy {
                 "Sending the answer",
                 Some(&decision_id),
                 false,
+                Some(&attempt_id),
             );
         }
     }
@@ -1286,6 +1299,7 @@ impl HostedFreshAgentProxy {
                 },
                 Some(&request_id),
                 true,
+                None,
             );
         }
     }
@@ -1344,6 +1358,7 @@ impl HostedFreshAgentProxy {
         tokio::spawn(async move {
             let mut cursor = 0;
             let mut retained_through = 0;
+            let mut replay_through = None;
             let mut source_before = if provider == "codex" {
                 proxy.current_source(&soul).await
             } else {
@@ -1368,10 +1383,12 @@ impl HostedFreshAgentProxy {
                                 tracing::warn!(provider, soul_id=%soul, "freshagent.gateway.retained_source_changed");
                                 cursor = 0;
                                 retained_through = 0;
+                                replay_through = None;
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
                         }
+                        let replay_through = *replay_through.get_or_insert(batch.head);
                         if let Some(retained) = batch.retained_state {
                             let presentation = proxy
                                 .presentation_routes
@@ -1427,10 +1444,14 @@ impl HostedFreshAgentProxy {
                             // Materialization is the explicit event transition at which the
                             // client rekeys its pane to the provider-native session id. Keep
                             // subsequent invalidators on that same route.
+                            let mut forwarded_event = event.event;
+                            if event.sequence <= replay_through {
+                                mark_replayed_control_receipt(&mut forwarded_event);
+                            }
                             proxy
                                 .forward_polled_event(
                                     &soul,
-                                    event.event,
+                                    forwarded_event,
                                     &provider,
                                     &presentation_session_id,
                                     &session_type,
@@ -1608,18 +1629,7 @@ impl HostedFreshAgentProxy {
                     // A newly attaching pane causes this journal replay to be
                     // broadcast to existing panes too. Identify historical
                     // operation receipts so those panes can keep newer errors.
-                    if let AgentEvent::Provider { payload } = &mut replayed_event {
-                        if payload["type"] == "freshAgent.event"
-                            && matches!(
-                                payload["event"]["type"].as_str(),
-                                Some("freshAgent.error" | "freshAgent.operation.error")
-                            )
-                            && payload["event"]["operationReceipt"] == true
-                            && payload["event"]["rollback"] != true
-                        {
-                            payload["event"]["operationReceiptReplay"] = serde_json::json!(true);
-                        }
-                    }
+                    mark_replayed_control_receipt(&mut replayed_event);
                     self.forward_polled_event(
                         &soul,
                         replayed_event,
@@ -2052,33 +2062,10 @@ impl HostedFreshAgentProxy {
         operation: &str,
         request_id: Option<&str>,
         rollback: bool,
+        operation_attempt_id: Option<&str>,
     ) {
-        let code = operation_error_code(error);
-        let uncertain = operation_outcome_uncertain(error);
-        let message = if uncertain {
-            format!(
-                "{operation} could not be confirmed. Check the conversation before trying again."
-            )
-        } else {
-            match code {
-                "UNSUPPORTED_CAPABILITY" => format!("{operation} is not supported for this agent."),
-                "IMPLEMENTATION_UNAVAILABLE" => format!("{operation} is not currently available."),
-                "REQUEST_ID_CONFLICT" => format!("{operation} conflicts with an earlier request. Refresh the conversation before trying again."),
-                _ => format!("{operation} could not be completed."),
-            }
-        };
-        let mut event = fresh_agent_error_payload(code, &message);
-        event["operationReceipt"] = serde_json::json!(true);
-        event["operationFallback"] = serde_json::json!(true);
-        if uncertain {
-            event["operationOutcomeUncertain"] = serde_json::json!(true);
-        }
-        if let Some(request_id) = request_id {
-            event["requestId"] = serde_json::json!(request_id);
-        }
-        if rollback {
-            event["rollback"] = serde_json::json!(true);
-        }
+        let event =
+            operation_error_payload(error, operation, request_id, rollback, operation_attempt_id);
         self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
             event,
             provider: provider_wire(provider),
@@ -2471,6 +2458,43 @@ fn operation_outcome_uncertain(error: &freshell_runtime_client::ClientError) -> 
     )
 }
 
+fn operation_error_payload(
+    error: &freshell_runtime_client::ClientError,
+    operation: &str,
+    request_id: Option<&str>,
+    rollback: bool,
+    operation_attempt_id: Option<&str>,
+) -> serde_json::Value {
+    let code = operation_error_code(error);
+    let uncertain = operation_outcome_uncertain(error);
+    let message = if uncertain {
+        format!("{operation} could not be confirmed. Check the conversation before trying again.")
+    } else {
+        match code {
+            "UNSUPPORTED_CAPABILITY" => format!("{operation} is not supported for this agent."),
+            "IMPLEMENTATION_UNAVAILABLE" => format!("{operation} is not currently available."),
+            "REQUEST_ID_CONFLICT" => format!("{operation} conflicts with an earlier request. Refresh the conversation before trying again."),
+            _ => format!("{operation} could not be completed."),
+        }
+    };
+    let mut event = fresh_agent_error_payload(code, &message);
+    event["operationReceipt"] = serde_json::json!(true);
+    event["operationFallback"] = serde_json::json!(true);
+    if uncertain {
+        event["operationOutcomeUncertain"] = serde_json::json!(true);
+    }
+    if let Some(request_id) = request_id {
+        event["requestId"] = serde_json::json!(request_id);
+    }
+    if let Some(attempt_id) = operation_attempt_id {
+        event["operationAttemptId"] = serde_json::json!(attempt_id);
+    }
+    if rollback {
+        event["rollback"] = serde_json::json!(true);
+    }
+    event
+}
+
 fn create_client_error_reason(error: &freshell_runtime_client::ClientError) -> &'static str {
     use freshell_runtime_client::ClientError;
     match error {
@@ -2509,6 +2533,7 @@ fn is_request_receipt(event: &AgentEvent) -> bool {
             payload["event"]["type"].as_str(),
             Some(
                 "checkpointTurnIdentity"
+                    | "freshAgent.operation.started"
                     | "freshAgent.rolledBack"
                     | "freshAgent.redone"
                     | "freshAgent.error"
@@ -2527,6 +2552,27 @@ fn is_request_receipt(event: &AgentEvent) -> bool {
     receipt["requestId"]
         .as_str()
         .is_some_and(|id| !id.is_empty())
+}
+
+fn mark_replayed_control_receipt(event: &mut AgentEvent) {
+    let AgentEvent::Provider { payload } = event else {
+        return;
+    };
+    if payload["type"] != "freshAgent.event"
+        || payload["event"]["operationReceipt"] != true
+        || payload["event"]["rollback"] == true
+    {
+        return;
+    }
+    match payload["event"]["type"].as_str() {
+        Some("freshAgent.operation.started") => {
+            payload["event"]["operationAttemptReplay"] = serde_json::json!(true)
+        }
+        Some("freshAgent.error" | "freshAgent.operation.error") => {
+            payload["event"]["operationReceiptReplay"] = serde_json::json!(true)
+        }
+        _ => {}
+    }
 }
 
 fn retained_batch_matches_source(

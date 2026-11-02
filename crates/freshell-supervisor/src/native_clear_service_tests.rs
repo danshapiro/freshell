@@ -23,6 +23,7 @@ struct CurrentHost {
     stop_on_prepare: bool,
     inputs: Vec<String>,
     interrupt_ids: Vec<Option<String>>,
+    resolve_attempts: Vec<(String, Option<String>)>,
     rollback_requests: Vec<(
         String,
         FreshAgentRollbackDirection,
@@ -107,6 +108,7 @@ impl Fixture {
             stop_on_prepare: false,
             inputs: Vec::new(),
             interrupt_ids: Vec::new(),
+            resolve_attempts: Vec::new(),
             rollback_requests: Vec::new(),
             events_read_count: 0,
             events_gate: None,
@@ -236,6 +238,23 @@ impl Fixture {
                             .push(wire["params"]["request_id"].as_str().map(str::to_owned));
                         Ok(HostResult::FreshAgentInterrupted)
                     }
+                    HostCommand::FreshAgentResolve {
+                        decision_id,
+                        operation_attempt_id,
+                        ..
+                    } => {
+                        current
+                            .lock()
+                            .unwrap()
+                            .resolve_attempts
+                            .push((decision_id, operation_attempt_id));
+                        Ok(HostResult::FreshAgentCommand {
+                            native_identity: None,
+                            state: CommandState::Completed,
+                            native_session_id: None,
+                            claude_fork: None,
+                        })
+                    }
                     HostCommand::FreshAgentRollback {
                         request_id,
                         direction,
@@ -339,6 +358,43 @@ impl Fixture {
             reply.result
         );
     }
+}
+
+#[tokio::test]
+async fn resolve_attempt_id_crosses_the_supervisor_and_legacy_requests_still_work() {
+    let fixture = Fixture::new().await;
+    for attempt in [None, Some("answer-attempt-2")] {
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentResolve(FreshAgentResolveRequest {
+                soul_id: fixture.soul.clone(),
+                decision_id: "question-1".into(),
+                decision: serde_json::json!({"answers":{"choice":"yes"}}),
+                operation_attempt_id: attempt.map(str::to_owned),
+                expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+            }),
+        );
+        envelope.auth = Some(CONTROL_SECRET.into());
+        let reply = fixture.supervisor.dispatch(envelope).await;
+        assert!(
+            matches!(
+                reply.result,
+                Ok(AdminResult::FreshAgentCommand {
+                    state: CommandState::Completed
+                })
+            ),
+            "{:?}",
+            reply.result
+        );
+    }
+    assert_eq!(
+        fixture.host.lock().unwrap().resolve_attempts,
+        vec![
+            ("question-1".into(), None),
+            ("question-1".into(), Some("answer-attempt-2".into())),
+        ]
+    );
 }
 
 #[tokio::test]

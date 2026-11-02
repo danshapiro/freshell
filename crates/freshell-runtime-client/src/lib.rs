@@ -1252,6 +1252,17 @@ impl RuntimeClient {
         decision_id: String,
         decision: serde_json::Value,
     ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        self.fresh_agent_resolve_with_attempt_id(soul_id, decision_id, decision, None)
+            .await
+    }
+
+    pub async fn fresh_agent_resolve_with_attempt_id(
+        &self,
+        soul_id: SoulId,
+        decision_id: String,
+        decision: serde_json::Value,
+        operation_attempt_id: Option<String>,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
         let epoch = self.current_epoch().await?;
         match self
             .request(
@@ -1260,6 +1271,7 @@ impl RuntimeClient {
                     soul_id,
                     decision_id,
                     decision,
+                    operation_attempt_id,
                     expected_control_epoch: Some(epoch),
                 }),
             )

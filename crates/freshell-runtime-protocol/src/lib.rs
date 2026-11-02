@@ -3424,6 +3424,8 @@ pub struct FreshAgentResolveRequest {
     pub soul_id: SoulId,
     pub decision_id: String,
     pub decision: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_attempt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -5194,6 +5196,8 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         decision_id: String,
         decision: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_attempt_id: Option<String>,
     },
     FreshAgentInterrupt {
         incarnation_id: IncarnationId,
@@ -6418,6 +6422,7 @@ mod tests {
             incarnation_id: IncarnationId::parse("incarnation-agent-rpc").unwrap(),
             decision_id: "decision-7".into(),
             decision: serde_json::json!({"behavior":"allow"}),
+            operation_attempt_id: None,
         };
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["method"], "fresh_agent_resolve");

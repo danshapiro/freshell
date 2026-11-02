@@ -820,7 +820,16 @@ impl FreshCodexState {
     }
 
     pub async fn try_handle_approval_respond(&self, msg: FreshAgentApprovalRespond) -> bool {
-        self.respond_control(&msg.session_id, &response_key(&msg.request_id), ControlKind::Approval, |request| {
+        self.try_handle_approval_respond_with_attempt_id(msg, None)
+            .await
+    }
+
+    pub async fn try_handle_approval_respond_with_attempt_id(
+        &self,
+        msg: FreshAgentApprovalRespond,
+        operation_attempt_id: Option<&str>,
+    ) -> bool {
+        self.respond_control(&msg.session_id, &response_key(&msg.request_id), ControlKind::Approval, operation_attempt_id, |request| {
             let decision = msg.decision.get("nativeDecision").and_then(Value::as_str).or_else(|| {
                 match msg.decision.get("behavior").and_then(Value::as_str) {
                     Some("allow") => Some("accept"), Some("deny") => Some("decline"), _ => None,
@@ -852,10 +861,20 @@ impl FreshCodexState {
     }
 
     pub async fn try_handle_question_respond(&self, msg: FreshAgentQuestionRespond) -> bool {
+        self.try_handle_question_respond_with_attempt_id(msg, None)
+            .await
+    }
+
+    pub async fn try_handle_question_respond_with_attempt_id(
+        &self,
+        msg: FreshAgentQuestionRespond,
+        operation_attempt_id: Option<&str>,
+    ) -> bool {
         self.respond_control(
             &msg.session_id,
             &response_key(&msg.request_id),
             ControlKind::Question,
+            operation_attempt_id,
             |request| {
                 let mut answers = Map::new();
                 for question in request.public["questions"]
@@ -889,10 +908,20 @@ impl FreshCodexState {
     }
 
     pub async fn try_handle_elicitation_respond(&self, msg: FreshAgentElicitationRespond) -> bool {
+        self.try_handle_elicitation_respond_with_attempt_id(msg, None)
+            .await
+    }
+
+    pub async fn try_handle_elicitation_respond_with_attempt_id(
+        &self,
+        msg: FreshAgentElicitationRespond,
+        operation_attempt_id: Option<&str>,
+    ) -> bool {
         self.respond_control(
             &msg.session_id,
             &response_key(&msg.request_id),
             ControlKind::Elicitation,
+            operation_attempt_id,
             |request| elicitation::response(&request.params, &msg.action, &msg.content),
         )
         .await
@@ -903,6 +932,7 @@ impl FreshCodexState {
         session_id: &str,
         key: &str,
         kind: ControlKind,
+        operation_attempt_id: Option<&str>,
         build: impl FnOnce(&PendingRequest) -> Result<Value, &'static str>,
     ) -> bool {
         let client = self
@@ -912,9 +942,10 @@ impl FreshCodexState {
             .get(session_id)
             .map(|s| s.client.clone());
         let Some(client) = client else {
-            self.emit_fresh_agent_error_for_request(
+            self.emit_control_answer_error(
                 session_id,
-                Some(key),
+                key,
+                operation_attempt_id,
                 "INVALID_SESSION_ID",
                 "Codex session is no longer available.",
             );
@@ -929,9 +960,10 @@ impl FreshCodexState {
             .iter()
             .position(|r| r.public["requestId"].as_str() == Some(key) && r.kind == kind)
         else {
-            self.emit_fresh_agent_error_for_request(
+            self.emit_control_answer_error(
                 session_id,
-                Some(key),
+                key,
+                operation_attempt_id,
                 "REQUEST_UNAVAILABLE",
                 "This Codex request is no longer waiting for an answer.",
             );
@@ -939,9 +971,10 @@ impl FreshCodexState {
         };
         let request = &pending.requests[index];
         let Some(source) = request.source.upgrade() else {
-            self.emit_fresh_agent_error_for_request(
+            self.emit_control_answer_error(
                 session_id,
-                Some(key),
+                key,
+                operation_attempt_id,
                 "REQUEST_UNAVAILABLE",
                 "This Codex request belongs to an earlier native source.",
             );
@@ -958,9 +991,10 @@ impl FreshCodexState {
                 )
                 .await
         {
-            self.emit_fresh_agent_error_for_request(
+            self.emit_control_answer_error(
                 session_id,
-                Some(key),
+                key,
+                operation_attempt_id,
                 "REQUEST_UNAVAILABLE",
                 "This Codex request belongs to an earlier native session or turn.",
             );
@@ -970,9 +1004,10 @@ impl FreshCodexState {
             Ok(value) => value,
             Err(message) => {
                 tracing::warn!(provider=PROVIDER,session_id,request_id=%key,method=%request.method,native_turn_id=request.params.get("turnId").and_then(|value| value.as_str()),native_item_id=request.params.get("itemId").and_then(|value| value.as_str()),"freshagent.codex.invalid_control_answer");
-                self.emit_fresh_agent_error_for_request(
+                self.emit_control_answer_error(
                     session_id,
-                    Some(key),
+                    key,
+                    operation_attempt_id,
                     "INVALID_ANSWER",
                     message,
                 );
@@ -981,9 +1016,10 @@ impl FreshCodexState {
         };
         if let Err(error) = request.native_client.respond(&request.id, result).await {
             tracing::warn!(provider = PROVIDER, session_id, request_id = %key, error = %error, "freshagent.codex.respond_failed");
-            self.emit_fresh_agent_error_for_request(
+            self.emit_control_answer_error(
                 session_id,
-                Some(key),
+                key,
+                operation_attempt_id,
                 "RESPONSE_FAILED",
                 &format!("Could not send your answer to Codex: {error}"),
             );

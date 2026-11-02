@@ -1,9 +1,9 @@
 use super::*;
 use freshell_protocol::{FreshAgentFork, FreshAgentRecoveryStop};
 use freshell_runtime_protocol::{
-    read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
-    FreshAgentForkResult, FreshAgentProviderStartDiagnostic, InstallationId, RuntimeDiagnosticCode,
-    RuntimeErrorCode,
+    read_frame, write_frame, AdminCommand, AdminReply, AdminResult, AgentEventBatch,
+    AgentJournalEvent, ControlRole, Envelope, FreshAgentForkResult,
+    FreshAgentProviderStartDiagnostic, InstallationId, RuntimeDiagnosticCode, RuntimeErrorCode,
 };
 use tokio::net::UnixListener;
 
@@ -3280,6 +3280,303 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
 }
 
 #[tokio::test]
+async fn hosted_answer_attempts_broadcast_distinct_correlated_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("answer-attempts.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        while attempts.len() < 2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<serde_json::Value> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body["method"].as_str() {
+                Some("health") => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                Some("fresh_agent_resolve") => {
+                    assert_eq!(request.body["params"]["decisionId"], "question-1");
+                    attempts.push(request.body["params"]["operationAttemptId"].clone());
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::CommandAmbiguous,
+                        "private host failure must not be broadcast",
+                    ))
+                }
+                other => panic!("unexpected answer request: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        attempts
+    });
+    let (proxy, mut first_browser) = configure_proxy(
+        &socket,
+        HashMap::from([(("codex".into(), "public-thread".into()), SoulId::new())]),
+    );
+    let mut other_browser = proxy.broadcast.subscribe();
+    for _ in 0..2 {
+        proxy
+            .clone()
+            .handle(HostedFreshAgentCommand::Question(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"codex", "sessionType":"freshcodex", "sessionId":"public-thread",
+                    "requestId":"question-1", "answers":{"answer":"yes"}
+                }))
+                .unwrap(),
+            ))
+            .await;
+    }
+    let attempts = settled(server).await;
+    let mut first_ids = Vec::new();
+    for _ in 0..2 {
+        let raw = tokio::time::timeout(Duration::from_secs(2), first_browser.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, other_browser.recv().await.unwrap());
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        let attempt = frame["event"]["operationAttemptId"].as_str().unwrap();
+        assert!(!attempt.is_empty());
+        assert_eq!(frame["event"]["requestId"], "question-1");
+        assert_eq!(frame["event"]["operationFallback"], true);
+        assert_eq!(frame["event"]["operationOutcomeUncertain"], true);
+        assert!(!frame.to_string().contains("private host failure"));
+        first_ids.push(attempt.to_owned());
+    }
+    assert_ne!(first_ids[0], first_ids[1]);
+    assert_eq!(
+        attempts,
+        first_ids
+            .iter()
+            .map(|id| serde_json::json!(id))
+            .collect::<Vec<_>>()
+    );
+}
+
+async fn hosted_attach_answer_journal_case(source_replaced: bool, blocked: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("answer-journal.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::new();
+    let expected_soul = soul.clone();
+    let server = tokio::spawn(async move {
+        let mut inventory_reads = 0;
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<serde_json::Value> = read_frame(&mut stream).await.unwrap();
+            let mut done = false;
+            let result = match request.body["method"].as_str() {
+                Some("health") => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                Some("inventory") => {
+                    inventory_reads += 1;
+                    done = inventory_reads == 2;
+                    Ok(AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                        "soulId":expected_soul, "incarnationId":if source_replaced && inventory_reads == 2 { "replacement-incarnation" } else { "answer-incarnation" },
+                        "hostBootId":"answer-boot", "launchState":"running", "cleanupState":"none", "intentRevision":1,
+                        "executionGeneration":1, "desiredState":"running", "recoveryState":"live",
+                        "durabilityState":"unknown", "allocationState":"allocated", "evidenceRevision":0,
+                        "successfulRecoveriesInWindow":0, "provider":"codex", "nativeSessionId":"public-thread",
+                        "freshAgentSessionId":"public-thread", "freshAgentSessionType":"freshcodex"
+                    })).unwrap()]))
+                }
+                Some("fresh_agent_read_events") => {
+                    assert_eq!(request.body["params"]["soulId"], expected_soul.as_str());
+                    let mut receipts = vec![
+                        serde_json::json!({"type":"freshAgent.operation.started", "requestId":"question-1", "operationAttemptId":"attempt-1", "operationReceipt":true, "operationJournalId":"owned-journal", "operationJournalSequence":1}),
+                        serde_json::json!({"type":"freshAgent.error", "requestId":"question-1", "operationAttemptId":"attempt-1", "operationReceipt":true, "code":"INVALID_ANSWER", "message":"The first answer was invalid."}),
+                        serde_json::json!({"type":"freshAgent.operation.started", "requestId":"question-1", "operationAttemptId":"attempt-2", "operationReceipt":true, "operationJournalId":"owned-journal", "operationJournalSequence":3, "operationPending":blocked}),
+                        serde_json::json!({"type":"freshAgent.operation.error", "requestId":"question-1", "operationAttemptId":"attempt-2", "operationReceipt":true, "operationFallback":true, "operationOutcomeUncertain":true, "code":"COMMAND_AMBIGUOUS", "message":"Sending the answer could not be confirmed."}),
+                        serde_json::json!({"type":"freshAgent.error", "requestId":"question-1", "operationAttemptId":"attempt-2", "operationReceipt":true, "code":"INVALID_ANSWER", "message":"The second answer was invalid."}),
+                        serde_json::json!({"type":"freshAgent.error", "requestId":"question-1", "operationAttemptId":"attempt-1", "operationReceipt":true, "code":"INVALID_ANSWER", "message":"A delayed first-answer error."}),
+                    ];
+                    if blocked {
+                        receipts.truncate(3);
+                    }
+                    Ok(AdminResult::FreshAgentEvents(AgentEventBatch {
+                        retained_state: Some(serde_json::json!({
+                            "source":{"soulId":expected_soul,"incarnationId":"answer-incarnation","hostBootId":"answer-boot"},
+                            "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"public-thread","turns":[]},
+                            "pendingControls":[]
+                        })),
+                        retained_from:1, head:receipts.len() as u64, reset_required:true,
+                        events:receipts.into_iter().enumerate().map(|(index,event)| AgentJournalEvent {
+                            sequence:index as u64 + 1,
+                            event:AgentEvent::Provider { payload:serde_json::json!({
+                                "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+                                "sessionId":"public-thread", "event":event
+                            }) },
+                        }).collect(),
+                    }))
+                }
+                other => panic!("unexpected answer journal command: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+            if done {
+                break;
+            }
+        }
+    });
+    let (proxy, mut joining_browser) = configure_proxy(
+        &socket,
+        HashMap::from([(("codex".into(), "public-thread".into()), soul.clone())]),
+    );
+    proxy.pollers.lock().await.insert(soul);
+    proxy
+        .clone()
+        .handle(HostedFreshAgentCommand::Attach(
+            serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"public-thread"
+            }))
+            .unwrap(),
+        ))
+        .await;
+    settled(server).await;
+    let mut frames = Vec::new();
+    while let Ok(frame) = joining_browser.try_recv() {
+        frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+    }
+    if source_replaced {
+        assert!(
+            frames.is_empty(),
+            "a replacement source must not receive the prior journal: {frames:?}"
+        );
+        return;
+    }
+    assert_eq!(frames.len(), if blocked { 4 } else { 7 }, "{frames:?}");
+    assert_eq!(frames[0]["event"]["type"], "freshAgent.host.backpressure");
+    for index in [1, 3] {
+        assert_eq!(
+            frames[index]["event"]["type"],
+            "freshAgent.operation.started"
+        );
+        assert_eq!(frames[index]["event"]["operationAttemptReplay"], true);
+    }
+    assert_eq!(frames[3]["event"]["operationAttemptId"], "attempt-2");
+    if blocked {
+        assert_eq!(frames[3]["event"]["operationPending"], true);
+        return;
+    }
+    for index in [2, 4, 5, 6] {
+        assert_eq!(frames[index]["event"]["operationReceiptReplay"], true);
+    }
+    assert_eq!(
+        frames[5]["event"]["message"],
+        "The second answer was invalid."
+    );
+    assert_eq!(frames[6]["event"]["operationAttemptId"], "attempt-1");
+}
+
+#[tokio::test]
+async fn hosted_attach_replays_source_fenced_answer_starts_and_delayed_receipts() {
+    hosted_attach_answer_journal_case(false, false).await;
+    hosted_attach_answer_journal_case(true, false).await;
+    hosted_attach_answer_journal_case(false, true).await;
+}
+
+#[tokio::test]
+async fn restarted_gateway_poller_marks_its_initial_answer_starts_as_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("replacement-poller.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::new();
+    let expected_soul = soul.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let mut done = false;
+            let result = match request.body {
+                AdminCommand::Health => AdminResult::Health { control_epoch: 77, installation_id: InstallationId::new() },
+                AdminCommand::Inventory => AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                    "soulId":expected_soul, "incarnationId":"answer-incarnation", "hostBootId":"answer-boot",
+                    "launchState":"running", "cleanupState":"none", "intentRevision":1,
+                    "executionGeneration":1, "desiredState":"running", "recoveryState":"live",
+                    "durabilityState":"unknown", "allocationState":"allocated", "evidenceRevision":0,
+                    "successfulRecoveriesInWindow":0, "provider":"codex", "nativeSessionId":"public-thread",
+                    "freshAgentSessionId":"public-thread", "freshAgentSessionType":"freshcodex"
+                })).unwrap()]),
+                AdminCommand::FreshAgentReadEvents(_) => {
+                    done = true;
+                    AdminResult::FreshAgentEvents(AgentEventBatch {
+                        retained_state:None, retained_from:1, head:3, reset_required:false,
+                        events:[(1, "attempt-1"), (3, "attempt-2")].into_iter().map(|(sequence,attempt)| AgentJournalEvent {
+                            sequence, event:AgentEvent::Provider { payload:serde_json::json!({
+                                "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"public-thread",
+                                "event":{"type":"freshAgent.operation.started", "requestId":"question-1", "operationAttemptId":attempt,
+                                    "operationReceipt":true, "operationJournalId":"owned-journal", "operationJournalSequence":sequence}
+                            }) }
+                        }).collect(),
+                    })
+                }
+                other => panic!("unexpected replacement poller request: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+            if done {
+                break;
+            }
+        }
+    });
+    let (proxy, mut receiver) = configure_proxy(&socket, HashMap::new());
+    assert!(
+        proxy
+            .start_poller(
+                soul.clone(),
+                "codex".into(),
+                "public-thread".into(),
+                "freshcodex".into(),
+                0
+            )
+            .await
+    );
+    for expected in [1, 3] {
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"]["operationAttemptReplay"], true);
+        assert_eq!(frame["event"]["operationJournalSequence"], expected);
+    }
+    settled(server).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while proxy.pollers.lock().await.contains(&soul) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement poller must exit when its supervisor closes");
+}
+
+#[tokio::test]
 async fn hosted_non_send_failures_keep_operation_correlation_and_uncertain_outcomes() {
     for operation in [
         "undo",
@@ -3405,6 +3702,14 @@ async fn hosted_non_send_failures_keep_operation_correlation_and_uncertain_outco
             frame["event"]["requestId"], "control-request",
             "{operation}: {frame}"
         );
+        if ["approval", "question", "elicitation"].contains(&operation) {
+            assert!(
+                frame["event"]["operationAttemptId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                "{operation}: {frame}"
+            );
+        }
         if operation == "undo" || operation == "redo" {
             assert_eq!(frame["event"]["rollback"], true, "{operation}: {frame}");
         }

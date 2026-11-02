@@ -1384,6 +1384,7 @@ async fn dispatch_with_effects(
                     incarnation_id,
                     decision_id,
                     decision,
+                    operation_attempt_id,
                 } => {
                     let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
@@ -1395,7 +1396,11 @@ async fn dispatch_with_effects(
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
                     actor
-                        .resolve_permission(&decision_id, decision)
+                        .resolve_permission_with_attempt_id(
+                            &decision_id,
+                            decision,
+                            operation_attempt_id.as_deref(),
+                        )
                         .await
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
@@ -11384,6 +11389,7 @@ mod tests {
                         incarnation_id: state.incarnation_id.clone(),
                         decision_id: "permission-1".into(),
                         decision: serde_json::json!({"behavior":"allow"}),
+                        operation_attempt_id: None,
                     },
                 ),
                 &state,

@@ -1056,7 +1056,9 @@ struct FakeTransport {
     dispatches: AtomicUsize,
     checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
     decisions: AtomicUsize,
+    decision_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     retained: std::sync::Mutex<Option<Value>>,
+    retained_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     dispatch_identity: std::sync::Mutex<Option<NativeDispatchIdentity>>,
     dispatch_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     stops: AtomicUsize,
@@ -1163,7 +1165,9 @@ impl FakeTransport {
             dispatches: AtomicUsize::new(0),
             checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
+            decision_gate: std::sync::Mutex::new(None),
             retained: std::sync::Mutex::new(None),
+            retained_gate: std::sync::Mutex::new(None),
             dispatch_identity: std::sync::Mutex::new(None),
             dispatch_gate: std::sync::Mutex::new(None),
             stops: AtomicUsize::new(0),
@@ -1187,7 +1191,9 @@ impl FakeTransport {
                 dispatches: AtomicUsize::new(0),
                 checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
                 decisions: AtomicUsize::new(0),
+                decision_gate: std::sync::Mutex::new(None),
                 retained: std::sync::Mutex::new(None),
+                retained_gate: std::sync::Mutex::new(None),
                 dispatch_identity: std::sync::Mutex::new(None),
                 dispatch_gate: std::sync::Mutex::new(None),
                 stops: AtomicUsize::new(0),
@@ -1278,6 +1284,11 @@ impl FreshAgentTransport for FakeTransport {
         _decision: Value,
     ) -> Result<(), DispatchFailure> {
         self.decisions.fetch_add(1, Ordering::SeqCst);
+        let gate = self.decision_gate.lock().unwrap().clone();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(())
     }
     async fn interrupt(&self) -> Result<(), String> {
@@ -1287,6 +1298,11 @@ impl FreshAgentTransport for FakeTransport {
         self.live.load(Ordering::SeqCst)
     }
     async fn retained_state(&self) -> Result<Option<Value>, String> {
+        let gate = self.retained_gate.lock().unwrap().clone();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(self.retained.lock().unwrap().clone())
     }
     async fn stop(self: Arc<Self>) -> Result<(), String> {
@@ -3838,4 +3854,255 @@ async fn stop_fences_a_late_native_fork_acknowledgement() {
         Some("native-parent")
     );
     assert_eq!(actor.observed_native_session_id().await, None);
+}
+
+#[tokio::test]
+async fn interrupted_answer_attempt_reopens_with_its_exact_uncertainty_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved_profile = profile(FreshProvider::Codex, "answer-recovery-store", None);
+    let transport = FakeTransport::new("answer-native-root");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *transport.decision_gate.lock().unwrap() = Some((entered.clone(), release));
+    let actor = FreshAgentHostActor::open(dir.path(), saved_profile.clone(), transport)
+        .await
+        .unwrap();
+    actor
+        .record_permission(
+            "question-1".into(),
+            serde_json::json!({
+                "type":"freshAgent.question.request", "requestId":"question-1"
+            }),
+        )
+        .await
+        .unwrap();
+    let pending = tokio::spawn({
+        let actor = actor.clone();
+        async move {
+            actor
+                .resolve_permission_with_attempt_id(
+                    "question-1",
+                    serde_json::json!({"answers":{"choice":"private-answer"}}),
+                    Some("answer-attempt-1"),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    let blocked = actor.read_events(0, 64).await;
+    let started = blocked
+        .events
+        .iter()
+        .find_map(|entry| match &entry.event {
+            AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.operation.started"
+                    && payload["event"]["operationAttemptId"] == "answer-attempt-1" =>
+            {
+                Some((entry.sequence, payload))
+            }
+            _ => None,
+        })
+        .expect("a blocked answer must be visible in the source-owned journal");
+    assert_eq!(started.1["event"]["operationPending"], true);
+    assert_eq!(started.1["event"]["operationJournalSequence"], started.0);
+    assert!(started.1["event"]["operationJournalId"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    pending.abort();
+    let _ = pending.await;
+    drop(actor);
+
+    let replacement = FakeTransport::new("answer-native-root");
+    let actor = FreshAgentHostActor::open(dir.path(), saved_profile.clone(), replacement.clone())
+        .await
+        .unwrap();
+    let batch = actor.read_events(0, 64).await;
+    let replayed_start = batch
+        .events
+        .iter()
+        .find_map(|entry| match &entry.event {
+            AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.operation.started"
+                    && payload["event"]["operationAttemptId"] == "answer-attempt-1" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        replayed_start["event"].get("operationPending").is_none(),
+        "a recovered ambiguous answer is no longer dispatching"
+    );
+    let warnings: Vec<_> = batch
+        .events
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.operation.error"
+                    && payload["event"]["operationAttemptId"] == "answer-attempt-1" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["event"]["operationOutcomeUncertain"], true);
+    assert!(!warnings[0].to_string().contains("private-answer"));
+    assert_eq!(
+        actor
+            .resolve_permission_with_attempt_id(
+                "question-1",
+                serde_json::json!({"answers":{"choice":"different"}}),
+                Some("answer-attempt-2")
+            )
+            .await,
+        Err(ActorError::AmbiguousDispatch)
+    );
+    assert_eq!(
+        replacement.decisions.load(Ordering::SeqCst),
+        0,
+        "a recovered ambiguous answer must not be resent"
+    );
+    drop(actor);
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        saved_profile,
+        FakeTransport::new("answer-native-root"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        actor
+            .read_events(0, 64)
+            .await
+            .events
+            .iter()
+            .filter(|entry| matches!(&entry.event,
+        AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.operation.error"
+            && payload["event"]["operationAttemptId"] == "answer-attempt-1"))
+            .count(),
+        1,
+        "reopening again must not duplicate the uncertainty receipt"
+    );
+}
+
+#[tokio::test]
+async fn delayed_pending_snapshot_carries_an_older_revision_than_the_real_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("revision-native-root");
+    let decision_entered = Arc::new(tokio::sync::Notify::new());
+    let decision_release = Arc::new(tokio::sync::Notify::new());
+    *transport.decision_gate.lock().unwrap() = Some((decision_entered.clone(), decision_release));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "revision-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    actor
+        .record_permission(
+            "question-1".into(),
+            serde_json::json!({"type":"freshAgent.question.request", "requestId":"question-1"}),
+        )
+        .await
+        .unwrap();
+    let pending = tokio::spawn({
+        let actor = actor.clone();
+        async move {
+            actor
+                .resolve_permission_with_attempt_id(
+                    "question-1",
+                    serde_json::json!({"answers":{"choice":"yes"}}),
+                    Some("answer-attempt-1"),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        decision_entered.notified(),
+    )
+    .await
+    .unwrap();
+    let before = actor.read_events(0, 64).await;
+    let start_sequence = before
+        .events
+        .iter()
+        .find_map(|entry| match &entry.event {
+            AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.operation.started" =>
+            {
+                Some(entry.sequence)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let retained_entered = Arc::new(tokio::sync::Notify::new());
+    let retained_release = Arc::new(tokio::sync::Notify::new());
+    *transport.retained_gate.lock().unwrap() =
+        Some((retained_entered.clone(), retained_release.clone()));
+    let delayed = tokio::spawn({
+        let actor = actor.clone();
+        async move { actor.read_events(0, 64).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        retained_entered.notified(),
+    )
+    .await
+    .unwrap();
+    actor.record_event(AgentEvent::Provider { payload:serde_json::json!({
+        "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"revision-native-root",
+        "event":{"type":"freshAgent.question.cancelled", "requestId":"question-1"}
+    }) }).await.unwrap();
+    let cancellation = actor
+        .read_events(start_sequence, 64)
+        .await
+        .events
+        .into_iter()
+        .find_map(|entry| match entry.event {
+            AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.question.cancelled" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    retained_release.notify_one();
+    let stale = delayed.await.unwrap();
+    let start = stale
+        .events
+        .iter()
+        .find_map(|entry| match &entry.event {
+            AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.operation.started" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(start["event"]["operationPending"], true);
+    assert_eq!(
+        cancellation["event"]["operationAttemptId"],
+        "answer-attempt-1"
+    );
+    assert_eq!(
+        cancellation["event"]["operationJournalId"],
+        start["event"]["operationJournalId"]
+    );
+    assert!(
+        cancellation["event"]["operationJournalSequence"]
+            .as_u64()
+            .unwrap()
+            > start["event"]["operationJournalSequence"].as_u64().unwrap()
+    );
+    pending.abort();
+    let _ = pending.await;
 }
