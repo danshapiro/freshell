@@ -67,7 +67,11 @@ class FreshWire {
   }
 
   wait(predicate: (frame: any) => boolean): Promise<any> {
-    return waitFor('fresh-agent frame', () => this.frames.find(predicate)).catch(error => {
+    return this.waitFrom(0, predicate)
+  }
+
+  waitFrom(startCursor: number, predicate: (frame: any) => boolean): Promise<any> {
+    return waitFor('fresh-agent frame', () => this.frames.slice(startCursor).find(predicate)).catch(error => {
       throw new Error(`${String(error)}; recent frames: ${JSON.stringify(this.frames.slice(-12))}`)
     })
   }
@@ -1029,9 +1033,11 @@ tool_timeout_sec = 120
     const recoveryRequestId = `send-${randomUUID()}`
     wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex', sessionId: created.sessionId,
       requestId: recoveryRequestId, text: 'AWAITED_PLAN_RECOVERY' })
-    const recoveryRefusal = await wire.wait(frame => frame.type === 'freshAgent.event'
+    const recoveryRefusal = await wire.waitFrom(recoveryFrameCursor, frame => frame.type === 'freshAgent.event'
       && frame.provider === 'codex' && frame.sessionType === 'freshcodex' && frame.sessionId === created.sessionId
       && frame.event?.type === 'freshAgent.error')
+    const recoveryFrames = wire.frames.slice(recoveryFrameCursor)
+    expect(recoveryFrames).toContain(recoveryRefusal)
     expect(recoveryRefusal).toMatchObject({
       type: 'freshAgent.event', provider: 'codex', sessionId: created.sessionId, sessionType: 'freshcodex',
       event: { type: 'freshAgent.error', code: 'MANAGED_FRESH_AGENT_ERROR', message: 'managed fresh-agent input was not accepted' },
@@ -1042,7 +1048,6 @@ tool_timeout_sec = 120
         && row.freshAgentSessionId === created.sessionId && row.nativeSessionId === view.nativeSessionId
         && row.recoveryState === 'blocked' && row.recoveryReason === 'STORE_UNREADABLE')
     })
-    const recoveryFrames = wire.frames.slice(recoveryFrameCursor)
     const recoveryTraffic = (await model.getTraffic()).slice(beforeCrash.trafficCursor)
       .filter((row: any) => row.path === '/v1/responses')
     const sessionViews = (await rig.inventory()).filter(row => row.freshAgentSessionId === created.sessionId)
