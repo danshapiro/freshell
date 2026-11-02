@@ -499,7 +499,7 @@ for (const [sessionType, provider, populated] of [['freshclaude', 'claude', fals
     await fitRoot(page,{width:size.width})
     await fitRoot(page,{height:size.height})
     const errors=page.getByRole('region',{name:'Agent errors'})
-    const count=errors.getByLabel('2 errors',{exact:true})
+    const count=errors.getByRole('img',{name:'2 errors'})
     await expect(count).toHaveText('2')
     expect(await count.evaluate(el=>{const b=el.getBoundingClientRect();const hit=document.elementFromPoint(b.x+b.width/2,b.y+b.height/2);return b.width>0&&b.height>0&&(hit===el||el.contains(hit))})).toBe(true)
     await page.evaluate(text => {
@@ -526,6 +526,50 @@ for (const [sessionType, provider, populated] of [['freshclaude', 'claude', fals
       await assertUsefulSpace(page)
     }
   }
+  await page.evaluate(({sessionType,provider}) => {
+    const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{createError:undefined}}})
+    h.receiveWsMessage?.({type:'freshAgent.event',sessionId:`compact-${sessionType}`,sessionType,provider,event:{type:'freshAgent.notice',level:'warning',code:'mixed-severity',message:'Provider warning'}})
+  },{sessionType,provider})
+  const errors=page.getByRole('region',{name:'Agent errors'})
+  const mixedCount=errors.getByRole('img',{name:'1 error, 1 warning'})
+  await expect(mixedCount).toHaveText('2')
+  expect(await mixedCount.ariaSnapshot()).toContain('img "1 error, 1 warning"')
+  await page.evaluate(() => {
+    const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{closeError:undefined}}})
+  })
+  await expect(errors.getByRole('img',{name:'1 warning'})).toHaveText('1')
+  await expect(mixedCount).toHaveCount(0)
+})
+
+test('routine feedback stays in the closed summary beside prominent reconciliation', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  await page.evaluate(() => {
+    const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:undefined}}})
+    h.receiveWsMessage?.({type:'freshAgent.event',sessionId:'compact-freshclaude',sessionType:'freshclaude',provider:'claude',event:{type:'freshAgent.notice',level:'info',code:'SETTINGS_UPDATED',message:'Provider settings updated'}})
+  })
+  const notices=page.getByRole('status',{name:'Agent notices'})
+  const summary=notices.locator('summary')
+  const body=notices.locator('.fresh-agent-diagnostic-body')
+  await expect(summary).toContainText('Provider settings updated')
+  await expect(summary.locator('..')).not.toHaveAttribute('open','')
+  await hitAndClick(summary)
+  await expect(body).toContainText('Provider settings updated')
+  await page.evaluate(() => {
+    const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:'Session restored'}}})
+  })
+  await hitAndClick(summary)
+  await expect(summary.locator('..')).not.toHaveAttribute('open','')
+  await expect(summary).toContainText('Provider settings updated')
+  await expect(summary).toContainText('Session restored')
+  await hitAndClick(summary)
+  await expect(body).toContainText('Provider settings updated')
+  await expect(body).toContainText('Session restored')
 })
 
 test('requests remain clickable and native disclosures use keyboard defaults', async ({ freshellPage, page, terminal }) => {
@@ -750,6 +794,57 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     await page.keyboard.press('Escape')
     await stack.getByText('Notice details', {exact: true}).click()
     await assertUsefulSpace(page)
+  })
+}
+
+for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
+  test(`ambiguous Codex delivery keeps the original prompt and instruction at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      style: 'sans',
+      theme: 'light',
+      snapshot: { pendingApprovals: [], pendingQuestions: [], pendingElicitations: [] },
+    })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+    await page.evaluate(() => {
+      const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
+      h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{createError:undefined,reconcileNotice:undefined}}})
+    })
+    const pane=page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
+    const composer=pane.getByRole('textbox',{name:'Chat message input'})
+    const sendButton=pane.getByRole('button',{name:'Send',exact:true})
+    const prompt='Keep this original Codex prompt'
+    await composer.fill(prompt)
+    await hitAndClick(sendButton)
+    const matchingSends=async () => page.evaluate(prompt => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.().filter(frame =>
+      typeof frame==='object'&&frame!==null&&'type' in frame&&frame.type==='freshAgent.send'&&'text' in frame&&frame.text===prompt,
+    ) ?? [],prompt)
+    await expect.poll(matchingSends).toHaveLength(1)
+    const [sent]=await matchingSends() as Array<{ requestId?: string; text?: string }>
+    const reason='Long explanation '.repeat(30).trim()
+    await page.evaluate(({requestId,reason}) => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type:'error',code:'INTERNAL_ERROR',requestId,message:`CODEX_DELIVERY_AMBIGUOUS: ${reason}`,
+    }),{requestId:sent.requestId,reason})
+    const summary=pane.locator('[data-agent-error="notice"] summary')
+    await expect(summary).toHaveText(/^Check the conversation before sending again\. Delivery is uncertain\./)
+    await expect(composer).toHaveValue(prompt)
+    await page.waitForTimeout(7_000)
+    await expect(summary).toHaveText(/^Check the conversation before sending again\. Delivery is uncertain\./)
+    await expect(composer).toHaveValue(prompt)
+    const allSends=await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.().filter(frame =>
+      typeof frame==='object'&&frame!==null&&'type' in frame&&frame.type==='freshAgent.send',
+    ) ?? [])
+    expect(allSends).toHaveLength(1)
+    expect(await matchingSends()).toHaveLength(1)
+    await hitAndClick(summary)
+    const fullDiagnostic=`Delivery uncertain (${sent.requestId}): ${reason}. Check the conversation before sending again.`
+    await expect(summary.locator('..').locator('.fresh-agent-diagnostic-body')).toHaveText(fullDiagnostic)
+    expect(await matchingSends()).toHaveLength(1)
   })
 }
 

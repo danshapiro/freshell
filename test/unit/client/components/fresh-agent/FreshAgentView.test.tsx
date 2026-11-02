@@ -2043,8 +2043,12 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input'))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
-      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)
-      expect(screen.getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeVisible()
+      const warning = screen.getByRole('alert', { name: 'Agent warning' })
+      const summary = warning.closest('summary')!
+      expect(summary).toHaveTextContent(/^Check the conversation before sending again\. Delivery is uncertain\./)
+      fireEvent.click(summary)
+      expect(within(summary.closest('details')!).getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeVisible()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
       expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
@@ -13992,9 +13996,17 @@ describe('FreshAgentView', () => {
     })
 
     await waitFor(() => expect(composer).toHaveValue(provider === 'codex' ? 'please keep this\nnewer draft' : 'please keep this'))
-    expect(screen.getByText(message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
-      ? `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`
-      : `Message not sent: ${reason}`)).toBeVisible()
+    if (message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')) {
+      const warning = within(screen.getByRole('region', { name: 'Agent errors' })).getByRole('alert', { name: 'Agent warning' })
+      const summary = warning.closest('summary')!
+      expect(summary).toHaveTextContent(/^Check the conversation before sending again\. Delivery is uncertain\./)
+      fireEvent.click(summary)
+      expect(within(summary.closest('details')!).getByText(
+        `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`,
+      )).toBeVisible()
+    } else {
+      expect(screen.getByText(`Message not sent: ${reason}`)).toBeVisible()
+    }
     expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
   })
@@ -15895,7 +15907,9 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
     })
 
     await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
-    expect(screen.getByText(UNDO_REFILL_NOTICE)).toBeInTheDocument()
+    const refillNotice = screen.getByRole('status', { name: 'Agent notices' })
+    expect(refillNotice.querySelector('summary')).toHaveTextContent(UNDO_REFILL_NOTICE)
+    expect(refillNotice.querySelector('[data-agent-notice="notice"]')).toHaveTextContent(UNDO_REFILL_NOTICE)
     // a11y: the refilled composer regains focus for immediate editing.
     await waitFor(() => expect(document.activeElement).toBe(getComposer()))
   })
