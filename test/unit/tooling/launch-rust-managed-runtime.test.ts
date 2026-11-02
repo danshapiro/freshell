@@ -133,6 +133,16 @@ describe('launch-rust managed runtime feature guard', () => {
     expect(Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())).toBe(pid)
   })
 
+  it('lets an explicit empty process value override the .env request', () => {
+    const fixture = createFixture('{"managedRuntimeV1":false}')
+    fs.writeFileSync(path.join(fixture.root, '.env'), 'AUTH_TOKEN=fixture-token\nFRESHELL_MANAGED_RUNTIME_V1=1\n')
+
+    const result = run(fixture, ['--skip-build'], false)
+
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+    expect(fs.existsSync(pidFile(fixture))).toBe(true)
+  })
+
   it('keeps featureless launches working when managed runtime is not requested', () => {
     const fixture = createFixture('{"managedRuntimeV1":false}')
 
