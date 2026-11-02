@@ -20,6 +20,7 @@ import type { InitialProviderVolumeAuthorization } from '../../../scripts/testin
 import { startInManagedContext } from '../providers/codex-local-provider.mjs'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
 import { cleanupManagedCodexParity, collectManagedCodexProviderDiagnostics, createManagedCodexFixtureWork, readManagedCodexFixtureTraffic } from '../../helpers/codex-managed-cleanup.js'
+import { awaitManagedCodexWork, initializeManagedCodexStandaloneMcp, readManagedCodexCreateFailureFiles, recordManagedCodexMcpResults, runManagedCodexAwaitedPlanControl, runManagedCodexParityBody, sendManagedCodexMessage, waitForManagedCodexContextualAnswer } from '../../helpers/codex-managed-body.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -29,14 +30,25 @@ const providers = [
   { provider: 'opencode', sessionType: 'freshopencode', config: 'custom-xdg/opencode/opencode.jsonc' },
 ] as const
 
-async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000): Promise<T> {
+type ManagedCodexTrafficRecord = {
+  index: number
+  method?: string
+  path?: string
+  loopback: boolean
+  body: unknown
+}
+
+async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000, signal?: AbortSignal): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    signal?.throwIfAborted()
     const value = await probe()
+    signal?.throwIfAborted()
     if (value !== undefined) return value
     // Pace one-read observation callbacks; other API calls share the budget.
     await new Promise(resolve => setTimeout(resolve, 250))
   }
+  signal?.throwIfAborted()
   throw new Error(`timed out waiting for ${label}`)
 }
 
@@ -67,8 +79,9 @@ class FreshWire {
     this.socket.send(JSON.stringify(frame))
   }
 
-  wait(predicate: (frame: any) => boolean): Promise<any> {
-    return waitFor('fresh-agent frame', () => this.frames.find(predicate)).catch(error => {
+  wait(predicate: (frame: any) => boolean, signal?: AbortSignal): Promise<any> {
+    return waitFor('fresh-agent frame', () => this.frames.find(predicate), 90_000, signal).catch(error => {
+      if (signal?.aborted) throw error
       throw new Error(`${String(error)}; recent frames: ${JSON.stringify(this.frames.slice(-12))}`)
     })
   }
@@ -411,7 +424,7 @@ describe('installed Codex through the managed gateway and durable actor', () => 
   let wire: FreshWire
   let model: Awaited<ReturnType<typeof startInManagedContext>> | undefined
   let naming: http.Server
-  let retainedModelTraffic: any[] = []
+  let retainedModelTraffic: ManagedCodexTrafficRecord[] = []
   let finalObservation: ((signal: AbortSignal) => Promise<unknown>) | undefined
   const fixtureWork = createManagedCodexFixtureWork()
   const namingRequests: string[] = []
@@ -508,35 +521,48 @@ tool_timeout_sec = 120
     grantsDirectory: grants?.directory, home,
   }), 600_000)
 
-  it('uses the installed wrapper for catalog, settings, saved output and exact native controls', async () => {
+  it('uses the installed wrapper for catalog, settings, saved output and exact native controls', ({ signal }) => runManagedCodexParityBody(fixtureWork, signal, async () => {
+    const managedWaitFor: typeof waitFor = (label, probe, timeoutMs) => waitFor(label, probe, timeoutMs, fixtureWork.signal)
+    const step = <T,>(operation: () => Promise<T>) => awaitManagedCodexWork(fixtureWork, operation)
+    const bodyFetch = (input: RequestInfo | URL, init: RequestInit = {}) => {
+      fixtureWork.throwIfAborted()
+      return fetch(input, { ...init, signal: fixtureWork.signal })
+    }
+    const sendBodyFrame = (frame: unknown) => {
+      fixtureWork.throwIfAborted()
+      wire.send(frame)
+    }
+    const writeBodyIncident = (name: string, value: unknown) => {
+      fixtureWork.throwIfAborted()
+      rig.runtime.writeIncident(name, value)
+    }
     const requestId = `native-managed-${randomUUID()}`
     owners.push(authorizeFreshAgentParityRequest(rig.runtime.broker, source, 'codex', requestId))
-    wire.send({ type: 'freshAgent.create', requestId, provider: 'codex', sessionType: 'freshcodex',
+    sendBodyFrame({ type: 'freshAgent.create', requestId, provider: 'codex', sessionType: 'freshcodex',
       cwd: workspace, model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted',
       namingHandle: `name-${requestId}`, tabId: `tab-${requestId}` })
-    const created = await wire.wait(frame => frame.requestId === requestId
-      && ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type))
+    const created = await step(() => wire.wait(frame => frame.requestId === requestId
+      && ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type), fixtureWork.signal))
     if (created.type !== 'freshAgent.created') {
-      const inventory = await rig.inventory()
-      const providerFiles = await Promise.all(inventory.filter(row => row.containerId).map(async row => {
-        try { return { containerId: row.containerId, files: await rig.ownedProviderExec(row.containerId!, ['node', '-e', `const fs=require('node:fs');process.stdout.write(JSON.stringify({mcpModulePresent:fs.existsSync(${JSON.stringify(path.join(workspace, 'managed-mcp.mjs'))}),config:fs.readFileSync('/home/freshell/provider/.codex/config.toml','utf8')}))`]) } }
-        catch { return { containerId: row.containerId, unavailable: true } }
-      }))
+      const inventory = await step(() => rig.inventory())
+      const providerFiles = await step(() => readManagedCodexCreateFailureFiles(fixtureWork, inventory,
+        containerId => rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(JSON.stringify({mcpModulePresent:fs.existsSync(${JSON.stringify(path.join(workspace, 'managed-mcp.mjs'))}),config:fs.readFileSync('/home/freshell/provider/.codex/config.toml','utf8')}))`])))
+      fixtureWork.throwIfAborted()
       const nativeLogs = [...rig.runtime.broker.receiptIds()].map(containerId => {
         try { return { containerId, logs: rig.runtime.containerLogs(containerId) } }
         catch { return { containerId, unavailable: true } }
       })
-      rig.runtime.writeIncident('freshcodex-managed-native-create-failure', { created, inventory, nativeLogs, providerFiles,
+      writeBodyIncident('freshcodex-managed-native-create-failure', { created, inventory, nativeLogs, providerFiles,
         supervisor: rig.runtime.containerLogs(rig.supervisor.containerId), web: rig.web.capturedOutput() })
     }
     expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
-    const view = await waitFor('native managed provider', async () => {
-      const row = await rig.runningViewForFreshSession(created.sessionId)
+    const view = await step(() => managedWaitFor('native managed provider', async () => {
+      const row = await step(() => rig.runningViewForFreshSession(created.sessionId))
       return row?.containerId && row.nativeSessionId ? row : undefined
-    })
+    }))
     let providerContainerId = view.containerId!
-    expect(await rig.ownedProviderExec(providerContainerId, ['/opt/freshell-codex/launch', '--version'])).toContain('0.164.0')
-    const inspectNativeContext = async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    expect(await step(() => rig.ownedProviderExec(providerContainerId, ['/opt/freshell-codex/launch', '--version']))).toContain('0.164.0')
+    const inspectNativeContext = async () => JSON.parse(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs');const layout=JSON.parse(fs.readFileSync('/opt/freshell-codex/layout.json','utf8'));
       const candidates=fs.readdirSync('/proc').filter(p=>Number.isInteger(Number(p))).flatMap(pid=>{try{
         const status=fs.readFileSync('/proc/'+pid+'/status','utf8');const field=k=>status.split(String.fromCharCode(10)).find(line=>line.startsWith(k+':'))?.slice(k.length+1).trim();
@@ -547,8 +573,8 @@ tool_timeout_sec = 120
         return[{pid:Number(pid),parentPid:Number(field('PPid')),state:field('State'),uid:Number(field('Uid')?.split(String.fromCharCode(9))[0]),gid:Number(field('Gid')?.split(String.fromCharCode(9))[0]),
           executable,exeError,appServer,cwd,cwdError,workspace,noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff')}];
       }catch{return[]}});const found=candidates.filter(row=>row.executable===layout.nativeExecutable&&row.appServer);
-      if(found.length!==1)throw Error('Expected one actual installed native Codex app-server: '+JSON.stringify({expectedNative:layout.nativeExecutable,matches:found.length,candidates}));process.stdout.write(JSON.stringify(found[0]));`]))
-    const nativeContext = await inspectNativeContext()
+      if(found.length!==1)throw Error('Expected one actual installed native Codex app-server: '+JSON.stringify({expectedNative:layout.nativeExecutable,matches:found.length,candidates}));process.stdout.write(JSON.stringify(found[0]));`])))
+    const nativeContext = await step(() => inspectNativeContext())
     expect(nativeContext).toMatchObject({ uid: 65534, gid: 0, cwd: workspace, noNewPrivs: '1', capEff: '0000000000000000',
       workspace: { gid: 0, mode: '770', writable: true } })
     const handlerSource = `async record => {
@@ -572,25 +598,34 @@ tool_timeout_sec = 120
       if(prompt.includes('MANAGED_RECOVERY_SECOND'))return{text:'Managed recovery second answer.'};
       return {text:prompt.includes('ASYNC_QUESTION')?'Managed work continued before the answer.':prompt.includes('AWAITED_PLAN')?'Managed awaited answer completed.':'Managed native final answer.'};
     }`
-    const initialModel = await fixtureWork.run(signal => startInManagedContext(rig, { containerId: providerContainerId, handlerSource, signal }))
+    const initialModel = await step(() => fixtureWork.run(signal => startInManagedContext(rig, { containerId: providerContainerId, handlerSource, signal })))
     fixtureWork.throwIfAborted()
     model = initialModel
-    const readModelTraffic = () => readManagedCodexFixtureTraffic(fixtureWork, model!)
+    const readModelTraffic = () => readManagedCodexFixtureTraffic<ManagedCodexTrafficRecord[]>(fixtureWork, model!)
     expect(model.context).toMatchObject({ uid: 65534, gid: 0 })
     const headers = { 'x-auth-token': rig.info.token }
     const observationReadTraffic: { route: string; requestedAt: number; completedAt: number; status: number; retryAfter: string | null }[] = []
     const observeRead = async (route: string, init: RequestInit) => {
+      const signal = init.signal ?? fixtureWork.signal
+      signal.throwIfAborted()
       const requestedAt = Date.now()
-      const response = await fetch(`${rig.info.baseUrl}${route}`, init)
+      const response = await fetch(`${rig.info.baseUrl}${route}`, { ...init, signal })
+      signal.throwIfAborted()
       observationReadTraffic.push({ route, requestedAt, completedAt: Date.now(), status: response.status, retryAfter: response.headers.get('retry-after') })
       return response
     }
-    const snapshot = async (signal?: AbortSignal) => {
+    const snapshot = async (signal = fixtureWork.signal) => {
       const response = await observeRead(`/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}`, { headers, signal })
-      expect(response.ok, await response.clone().text()).toBe(true)
-      return response.json()
+      signal.throwIfAborted()
+      const detail = await response.clone().text()
+      signal.throwIfAborted()
+      expect(response.ok, detail).toBe(true)
+      const value = await response.json()
+      signal.throwIfAborted()
+      return value
     }
-    const ownedHostEvidence = () => {
+    const ownedHostEvidence = (signal = fixtureWork.signal) => {
+      signal.throwIfAborted()
       const runtimeRoot = rig.supervisor.runtimeRoot
       const lifecycle = fs.readdirSync(runtimeRoot, { withFileTypes: true })
         .filter(entry => entry.isDirectory() && entry.name.startsWith('incarnation-'))
@@ -666,90 +701,74 @@ tool_timeout_sec = 120
         byStatus: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.status] = (counts[row.status] ?? 0) + 1; return counts }, {}) }
       return { created, initialView: view, currentViews, nativeContext, final,
         fixtureContext: model?.context, traffic, sentControls: wire.sentControls, frames: wire.frames,
-        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, ownedHostEvidence: ownedHostEvidence() }
+        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, ownedHostEvidence: ownedHostEvidence(signal) }
     }
-    const catalogResponse = await fetch(`${rig.info.baseUrl}/api/fresh-agent/model-capabilities/freshcodex?${new URLSearchParams({ sessionId: created.sessionId, sessionRef: JSON.stringify(created.sessionRef), cwd: workspace })}`, { headers })
-    expect(catalogResponse.ok, await catalogResponse.clone().text()).toBe(true)
-    expect((await catalogResponse.json()).models).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'contract-model', supportedEffortLevels: ['low', 'xhigh'] })]))
-    const send = async (text: string, settings?: unknown) => {
-      const id = `send-${randomUUID()}`
-      wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex', sessionId: created.sessionId, requestId: id, text, ...(settings ? { settings } : {}) })
-      const accepted = await wire.wait(frame => frame.requestId === id && ['freshAgent.send.accepted', 'error'].includes(frame.type))
-      expect(accepted.type, JSON.stringify(accepted)).toBe('freshAgent.send.accepted')
-      return accepted
-    }
-    await send('MANAGED_NATIVE_FIRST')
-    const saved = await waitFor('managed native saved first answer', async () => {
-      const value = await snapshot()
+    const catalogResponse = await step(() => bodyFetch(`${rig.info.baseUrl}/api/fresh-agent/model-capabilities/freshcodex?${new URLSearchParams({ sessionId: created.sessionId, sessionRef: JSON.stringify(created.sessionRef), cwd: workspace })}`, { headers }))
+    expect(catalogResponse.ok, await step(() => catalogResponse.clone().text())).toBe(true)
+    expect((await step(() => catalogResponse.json())).models).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'contract-model', supportedEffortLevels: ['low', 'xhigh'] })]))
+    const send = (text: string, settings?: unknown) => sendManagedCodexMessage({ fixtureWork, wire, sessionId: created.sessionId, text, settings })
+    await step(() => send('MANAGED_NATIVE_FIRST'))
+    const saved = await step(() => managedWaitFor('managed native saved first answer', async () => {
+      const value = await step(() => snapshot())
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed native final answer.') ? value : undefined
-    })
+    }))
     expect(saved.settings).toMatchObject({ model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted', cwd: workspace })
-    const firstModelTraffic = await readModelTraffic()
+    const firstModelTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
-    expect(firstModelTraffic[0].body.reasoning.effort).toBe('xhigh')
-    await send('AWAITED_PLAN', { collaborationMode: 'plan' })
-    const pending = await waitFor('managed native awaited Plan control', async () => {
-      const value = await snapshot()
-      return value.pendingQuestions?.length ? value.pendingQuestions[0] : undefined
-    })
-    expect(pending.questions[0].id).toBe('managed_choice')
-    wire.send({ type: 'freshAgent.question.respond', sessionType: 'freshcodex', provider: 'codex', sessionId: created.sessionId,
-      requestId: pending.requestId, answers: { managed_choice: 'Alpha' } })
-    await waitFor('managed native awaited decision drained', async () => {
-      const value = await snapshot()
-      return value.status === 'idle' && !value.pendingQuestions.length && JSON.stringify(value.turns).includes('Managed awaited answer completed.') ? true : undefined
-    })
-    await send('ASYNC_QUESTION', { collaborationMode: 'default' })
-    const asyncSnapshot = await waitFor('managed native async continuation without answer', async () => {
-      const value = await snapshot()
+    expect((firstModelTraffic[0].body as { reasoning: { effort: unknown } }).reasoning.effort).toBe('xhigh')
+    await step(() => runManagedCodexAwaitedPlanControl({ fixtureWork, send, snapshot, waitFor: managedWaitFor, wire, sessionId: created.sessionId }))
+    const asyncSnapshot = await step(() => managedWaitFor('managed native async continuation without answer', async () => {
+      const value = await step(() => snapshot())
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed work continued before the answer.') ? value : undefined
-    })
+    }))
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
-    await send('Question: Which managed environment? Answer: Staging.', { effort: null })
-    await waitFor('managed contextual answer at loopback model', () => model!.traffic.some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
-    await waitFor('managed contextual answer completion', async () => (await snapshot()).status === 'idle' ? true : undefined)
-    const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
-    expect(resumedResponse.ok, await resumedResponse.clone().text()).toBe(true)
-    const resumed = await resumedResponse.json()
+    await step(() => send('Question: Which managed environment? Answer: Staging.', { effort: null }))
+    await step(() => waitForManagedCodexContextualAnswer({ readModelTraffic, waitFor: managedWaitFor }))
+    await step(() => managedWaitFor('managed contextual answer completion', async () => (await step(() => snapshot())).status === 'idle' ? true : undefined))
+    const resumedResponse = await step(() => bodyFetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) }))
+    expect(resumedResponse.ok, await step(() => resumedResponse.clone().text())).toBe(true)
+    const resumed = await step(() => resumedResponse.json())
     const paneId = resumed.data?.paneId ?? resumed.paneId
     expect(paneId).toBeTruthy()
-    const captureResponse = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
-    expect(captureResponse.ok, await captureResponse.clone().text()).toBe(true)
-    expect(await captureResponse.text()).toContain('Managed native final answer.')
+    const captureResponse = await step(() => bodyFetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers }))
+    expect(captureResponse.ok, await step(() => captureResponse.clone().text())).toBe(true)
+    expect(await step(() => captureResponse.text())).toContain('Managed native final answer.')
+    fixtureWork.throwIfAborted()
     const standalone = ensureMcpServerBuilt(root)
     const standaloneEnvironment = { ...process.env, FRESHELL_URL: rig.info.baseUrl, FRESHELL_TOKEN: rig.info.token }
     const cliEntry = path.join(root, 'dist/tools/freshell-cli/index.js')
-    const cliCapture = await runFile(process.execPath, [cliEntry, 'capture-pane', '--target', paneId], {
-      cwd: root, env: standaloneEnvironment, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
-    })
+    const cliCapture = await step(() => runFile(process.execPath, [cliEntry, 'capture-pane', '--target', paneId], {
+      cwd: root, env: standaloneEnvironment, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, signal: fixtureWork.signal,
+    }))
     expect(cliCapture.stdout).toContain('MANAGED_NATIVE_FIRST')
     expect(cliCapture.stdout).toContain('Managed native final answer.')
+    fixtureWork.throwIfAborted()
     const standaloneMcp = new McpStdioClient({ command: process.execPath, args: [standalone.path], env: standaloneEnvironment, requestTimeoutMs: 60_000 })
     try {
-      await standaloneMcp.initialize()
-      const mcpCapture = await standaloneMcp.callFreshellAction('capture-pane', { target: paneId })
+      await step(() => initializeManagedCodexStandaloneMcp(fixtureWork, standaloneMcp))
+      const mcpCapture = await step(() => standaloneMcp.callFreshellAction('capture-pane', { target: paneId }))
       expect(mcpCapture).toContain('MANAGED_NATIVE_FIRST')
       expect(mcpCapture).toContain('Managed native final answer.')
-      const mcpWait = await standaloneMcp.callFreshellAction('wait-for', { target: paneId, pattern: 'Managed native final answer.', timeout: 0 })
+      const mcpWait = await step(() => standaloneMcp.callFreshellAction('wait-for', { target: paneId, pattern: 'Managed native final answer.', timeout: 0 }))
       expect(mcpWait).toMatchObject({ status: 'ok', data: { matched: true } })
-      rig.runtime.writeIncident('freshcodex-managed-native-standalone-integration', { paneId, userRef: created.sessionId,
+      writeBodyIncident('freshcodex-managed-native-standalone-integration', { paneId, userRef: created.sessionId,
         nativeSessionId: view.nativeSessionId, cli: { entry: cliEntry, capture: cliCapture.stdout },
         mcp: { entry: standalone.path, capture: mcpCapture, wait: mcpWait } })
     } finally {
       await standaloneMcp.close()
     }
-    expect((await inspectNativeContext()).pid).toBe(nativeContext.pid)
+    expect((await step(() => inspectNativeContext())).pid).toBe(nativeContext.pid)
     const durableNameRef = { kind: 'session', provider: 'codex', sessionId: view.nativeSessionId }
     const readNameFor = async (ref: unknown) => {
-      const response = await observeRead('/api/session-names/read', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
-        body: JSON.stringify({ refs: [ref] }) })
-      expect(response.ok, `name read ${response.status}: ${await response.clone().text()}`).toBe(true)
-      return (await response.json()).names[0]?.record
+      const response = await step(() => observeRead('/api/session-names/read', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ refs: [ref] }) }))
+      expect(response.ok, `name read ${response.status}: ${await step(() => response.clone().text())}`).toBe(true)
+      return (await step(() => response.json())).names[0]?.record
     }
     const readName = () => readNameFor(durableNameRef)
-    const nativeMetadata = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    const nativeMetadata = JSON.parse(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path');
       const env=Object.fromEntries(fs.readFileSync('/proc/${nativeContext.pid}/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
         const at=entry.indexOf('=');const key=entry.slice(0,at);return ['HOME','CODEX_HOME'].includes(key)?[[key,entry.slice(at+1)]]:[];
@@ -770,29 +789,30 @@ tool_timeout_sec = 120
       }catch(error){errors.push({path:dir,code:error.code})}};
       for(const root of roots)walk(path.join(root,'sessions'),0);
       const hostStatus=fs.readFileSync('/proc/1/status','utf8').split(String.fromCharCode(10)).filter(line=>/^(Uid|Gid|CapEff|NoNewPrivs):/.test(line));
-      process.stdout.write(JSON.stringify({env,roots,directories,headers,errors,hostStatus}));`]))
+      process.stdout.write(JSON.stringify({env,roots,directories,headers,errors,hostStatus}));`])))
+    fixtureWork.throwIfAborted()
     const hostMetadataAccess = JSON.parse(rig.ownedContainerExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs');const root='/home/freshell/provider';const s=fs.statSync(root);
       let readError;try{fs.readdirSync(root+'/.codex/sessions')}catch(error){readError=error.code}
       process.stdout.write(JSON.stringify({uid:process.getuid(),root:{uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8)},readError}));`]))
     expect(hostMetadataAccess).toMatchObject({ uid: 0, root: { uid: 65534, mode: '700' }, readError: 'EACCES' })
     expect(nativeMetadata.headers).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'session_meta', id: view.nativeSessionId })]))
-    const beforeNamingTraffic = await readModelTraffic()
+    const beforeNamingTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
-    rig.runtime.writeIncident('freshcodex-managed-native-before-naming', { created, view, nativeContext, nativeMetadata, fixtureContext: model.context, saved, asyncSnapshot,
-      hostMetadataAccess, traffic: beforeNamingTraffic, final: await snapshot() })
-    const durableName = await waitFor('managed native durable shared name', async () => {
-      const record = await readName()
+    writeBodyIncident('freshcodex-managed-native-before-naming', { created, view, nativeContext, nativeMetadata, fixtureContext: model.context, saved, asyncSnapshot,
+      hostMetadataAccess, traffic: beforeNamingTraffic, final: await step(() => snapshot()) })
+    const durableName = await step(() => managedWaitFor('managed native durable shared name', async () => {
+      const record = await step(() => readName())
       return record?.ref?.sessionId === view.nativeSessionId ? record : undefined
-    }, 15_000)
+    }, 15_000))
     expect(durableName.ref).toEqual(durableNameRef)
-    await waitFor('managed first-message naming request', () => namingRequests.some(body => body.includes('MANAGED_NATIVE_FIRST')) ? true : undefined)
-    const renamed = await fetch(`${rig.info.baseUrl}/api/session-names`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify({ target: durableNameRef, name: 'Managed native saved name', nameIntent: 'user' }) })
-    expect(renamed.ok, await renamed.clone().text()).toBe(true)
-    const canonicalName = await readName()
+    await step(() => managedWaitFor('managed first-message naming request', () => namingRequests.some(body => body.includes('MANAGED_NATIVE_FIRST')) ? true : undefined))
+    const renamed = await step(() => bodyFetch(`${rig.info.baseUrl}/api/session-names`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ target: durableNameRef, name: 'Managed native saved name', nameIntent: 'user' }) }))
+    expect(renamed.ok, await step(() => renamed.clone().text())).toBe(true)
+    const canonicalName = await step(() => readName())
     expect(canonicalName).toMatchObject({ ref: durableNameRef, name: 'Managed native saved name', source: 'manual' })
-    const readNativeName = async (nativeId = view.nativeSessionId, context = nativeContext) => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    const readNativeName = async (nativeId = view.nativeSessionId, context = nativeContext) => JSON.parse(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs');const argv=fs.readFileSync('/proc/${context.pid}/cmdline','utf8').split(String.fromCharCode(0));
       const endpoint=argv[argv.indexOf('--listen')+1];const target=new URL(endpoint);
       if(target.protocol!=='ws:'||target.hostname!=='127.0.0.1'||!target.port)throw Error('Expected the existing native loopback endpoint');
@@ -804,42 +824,42 @@ tool_timeout_sec = 120
       socket.addEventListener('open',()=>socket.send(JSON.stringify({id:1,method:'initialize',params:{clientInfo:{name:'freshell_name_read_probe',version:'1'}}})));
       socket.addEventListener('message',event=>{const frame=JSON.parse(String(event.data));if(frame.error)return finish(frame.error.message);
         if(frame.id===1){socket.send(JSON.stringify({method:'initialized'}));socket.send(JSON.stringify({id:2,method:'thread/read',params:{threadId:${JSON.stringify(nativeId)},includeTurns:false}}));}
-        if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
-    const nativeNameBeforeWait = await readNativeName()
-    rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
-    await waitFor('managed native name writeback', async () => {
-      const observation = await readNativeName()
+        if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`])))
+    const nativeNameBeforeWait = await step(() => readNativeName())
+    writeBodyIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
+    await step(() => managedWaitFor('managed native name writeback', async () => {
+      const observation = await step(() => readNativeName())
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
-    }, 15_000)
-    const journeyTraffic = await readModelTraffic()
+    }, 15_000))
+    const journeyTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
-    rig.runtime.writeIncident('freshcodex-managed-native-journey', { created, view, nativeContext, context: model.context,
-      traffic: journeyTraffic, saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
+    writeBodyIncident('freshcodex-managed-native-journey', { created, view, nativeContext, context: model.context,
+      traffic: journeyTraffic, saved, asyncSnapshot, canonicalName, nativeName: await step(() => readNativeName()), final: await step(() => snapshot()) })
 
     const approval = async (decision: 'accept' | 'cancel', threadId = view.nativeSessionId) => {
-      const pending = await waitFor('actual managed native approval', async () => {
-        const value = await snapshot()
+      const pending = await step(() => managedWaitFor('actual managed native approval', async () => {
+        const value = await step(() => snapshot())
         return value.pendingApprovals?.find((item: any) => item.providerRequest?.threadId === threadId)
-      })
+      }))
       expect(pending.providerRequest.threadId).toBe(threadId)
       expect(pending.native.availableDecisions).toContain(decision)
-      wire.send({ type: 'freshAgent.approval.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
+      sendBodyFrame({ type: 'freshAgent.approval.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
         requestId: pending.requestId, decision: { nativeDecision: decision } })
       return pending
     }
     const effects: any[] = []
     for (const choice of ['ACCEPT', 'DECLINE', 'RESTRICTED', 'READONLY'] as const) {
       const file = `effect_${choice.toLowerCase() === 'readonly' ? 'readonly' : choice.toLowerCase()}`
-      const physical = async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+      const physical = async () => JSON.parse(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `
         const fs=require('node:fs'),p=${JSON.stringify(path.join(workspace, 'allowed'))}+'/'+${JSON.stringify(file)};
-        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,uid:fs.statSync(p).uid,content:fs.readFileSync(p,'utf8')}:{exists:false}));`]))
-      expect(await physical()).toEqual({ exists: false })
+        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,uid:fs.statSync(p).uid,content:fs.readFileSync(p,'utf8')}:{exists:false}));`])))
+      expect(await step(() => physical())).toEqual({ exists: false })
       const frameCursor = wire.frames.length
-      const accepted = await send(`MANAGED_EFFECT_${choice}`, { sandbox: choice === 'READONLY' ? 'read-only' : 'workspace-write', permissionMode: choice === 'READONLY' || choice === 'RESTRICTED' ? 'never' : 'untrusted' })
+      const accepted = await step(() => send(`MANAGED_EFFECT_${choice}`, { sandbox: choice === 'READONLY' ? 'read-only' : 'workspace-write', permissionMode: choice === 'READONLY' || choice === 'RESTRICTED' ? 'never' : 'untrusted' }))
       const decision = choice === 'ACCEPT' ? 'accept' : 'cancel'
-      const control = choice === 'READONLY' || choice === 'RESTRICTED' ? undefined : await approval(decision)
-      const completed = await waitFor(`managed ${choice} command result`, async () => {
-        const value = await snapshot()
+      const control = choice === 'READONLY' || choice === 'RESTRICTED' ? undefined : await step(() => approval(decision))
+      const completed = await step(() => managedWaitFor(`managed ${choice} command result`, async () => {
+        const value = await step(() => snapshot())
         return value.status === 'idle' && JSON.stringify(value.turns).includes('MANAGED_EFFECT_'+choice)
           && !value.pendingApprovals.some((pending: any) => pending.requestId === control?.requestId)
           && wire.frames.slice(frameCursor).some(frame => {
@@ -849,15 +869,15 @@ tool_timeout_sec = 120
               && event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurn && ['completed', 'interrupted', 'failed'].includes(op.status))
           })
           && (choice === 'DECLINE' || JSON.stringify(value.turns).includes('Managed '+file+' result:')) ? value : undefined
-      })
-      const effect = await physical()
+      }))
+      const effect = await step(() => physical())
       if (choice === 'ACCEPT' || choice === 'RESTRICTED') expect(effect).toMatchObject({ exists: true, uid: 65534, content: 'managed-'+file })
       else expect(effect).toEqual({ exists: false })
       if (choice === 'READONLY') {
         // Native0.164 can return a failed unifiedExec result to the model
         // without persisting a commandExecution history item. Read the real
         // native tool result, never the fixture's repeated assistant phrase.
-        const traffic = await readModelTraffic()
+        const traffic = await step(() => readModelTraffic())
         fixtureWork.throwIfAborted()
         const command = traffic.flatMap((row: any) => row.body?.input ?? [])
           .filter((item: any) => item.type === 'function_call_output' && item.call_id === 'call_effect_readonly').at(-1)
@@ -870,85 +890,84 @@ tool_timeout_sec = 120
         type: 'freshAgent.approval.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
         requestId: control.requestId, decision: { nativeDecision: decision },
       }])
+      fixtureWork.throwIfAborted()
       effects.push({ choice, nativeDecision: control ? decision : null, accepted, control, effect, terminal: completed, settings: completed.settings })
-      rig.runtime.writeIncident('freshcodex-managed-native-command-effects', effects)
+      writeBodyIncident('freshcodex-managed-native-command-effects', effects)
     }
     const mcpResults: any[] = []
     for (const route of ['form', 'openai/form', 'openaiForm', 'url']) {
-      await send(`MANAGED_MCP_${route}`, { sandbox: 'workspace-write', permissionMode: 'untrusted' })
+      await step(() => send(`MANAGED_MCP_${route}`, { sandbox: 'workspace-write', permissionMode: 'untrusted' }))
       const ids = new Set<string>()
       for (const action of ['accept', 'decline', 'cancel']) {
-        const pending = await waitFor(`managed ${route} ${action} elicitation`, async () => {
-          const value = await snapshot()
+        const pending = await step(() => managedWaitFor(`managed ${route} ${action} elicitation`, async () => {
+          const value = await step(() => snapshot())
           return value.pendingElicitations?.find((item: any) => !ids.has(item.requestId))
-        })
+        }))
         ids.add(pending.requestId)
         // Fetching the URL is a read; the explicit native decision is separate.
         if (route === 'url') {
-          expect(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `fetch('http://127.0.0.1:51991/elicitation/example').then(r=>{if(!r.ok)throw Error('URL fixture failed');process.stdout.write('opened')})`])).toBe('opened')
-          expect((await snapshot()).pendingElicitations.some((item: any) => item.requestId === pending.requestId)).toBe(true)
+          expect(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `fetch('http://127.0.0.1:51991/elicitation/example').then(r=>{if(!r.ok)throw Error('URL fixture failed');process.stdout.write('opened')})`]))).toBe('opened')
+          expect((await step(() => snapshot())).pendingElicitations.some((item: any) => item.requestId === pending.requestId)).toBe(true)
         }
-        wire.send({ type: 'freshAgent.elicitation.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
+        sendBodyFrame({ type: 'freshAgent.elicitation.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
           requestId: pending.requestId, action, content: action === 'accept' && route !== 'url' ? { name: 'fixture', count: 2.5, enabled: true, color: 'blue' } : null })
       }
-      await waitFor(`managed ${route} MCP completion`, async () => {
-        const value = await snapshot()
+      await step(() => managedWaitFor(`managed ${route} MCP completion`, async () => {
+        const value = await step(() => snapshot())
         return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed MCP '+route+' completed.') ? true : undefined
-      })
-      const traffic = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(JSON.stringify(fs.readFileSync('/home/freshell/provider/.codex/managed-mcp-traffic.jsonl','utf8').trim().split(String.fromCharCode(10)).map(JSON.parse)))`]))
-      const results = traffic.filter((row: any) => row.event === 'elicitation_result' && row.route === route)
-      expect(results.map((row: any) => row.result.action)).toEqual(['accept', 'decline', 'cancel'])
-      expect(traffic.some((row: any) => row.event === 'fixture_error')).toBe(false)
-      mcpResults.push({ route, results })
-      rig.runtime.writeIncident('freshcodex-managed-native-mcp-results', mcpResults)
+      }))
+      await step(() => recordManagedCodexMcpResults({ fixtureWork, route, mcpResults,
+        readTraffic: () => rig.ownedProviderExec(providerContainerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(JSON.stringify(fs.readFileSync('/home/freshell/provider/.codex/managed-mcp-traffic.jsonl','utf8').trim().split(String.fromCharCode(10)).map(JSON.parse)))`]),
+        writeIncident: (name, value) => writeBodyIncident(name, value),
+      }))
     }
-    await send('MANAGED_DURABLE_CHILD')
-    const registered = await waitFor('public managed registered child', async () => {
-      const value = await snapshot()
+    await step(() => send('MANAGED_DURABLE_CHILD'))
+    const registered = await step(() => managedWaitFor('public managed registered child', async () => {
+      const value = await step(() => snapshot())
       return value.childThreads?.find((item: any) => item.threadId) ? value : undefined
-    })
+    }))
     const child = registered.childThreads[0]
     const childId = child.threadId
-    const childControl = await approval('accept', childId)
-    const childResponse = await waitFor('public managed active child read', async () => {
-      const response = await fetch(`${rig.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}/children/${childId}`, { headers })
-      expect(response.ok, await response.clone().text()).toBe(true)
-      const value = await response.json()
+    const childControl = await step(() => approval('accept', childId))
+    const childResponse = await step(() => managedWaitFor('public managed active child read', async () => {
+      const response = await step(() => bodyFetch(`${rig.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}/children/${childId}`, { headers }))
+      expect(response.ok, await step(() => response.clone().text())).toBe(true)
+      const value = await step(() => response.json())
       return value.status === 'live' && JSON.stringify(value.snapshot?.turns).includes('MANAGED_CHILD_NATIVE') ? value : undefined
-    })
+    }))
     expect(childResponse).toMatchObject({ parentThreadId: view.nativeSessionId, childThreadId: childId, status: 'live',
       snapshot: { threadId: childId, capabilities: { send: false, interrupt: false, fork: false, undo: false } } })
-    expect((await inspectNativeContext()).pid).toBe(nativeContext.pid)
-    await rig.ownedProviderExec(providerContainerId, ['node', '-e', "require('node:fs').writeFileSync('/home/freshell/provider/.freshell-fixture/release-child','release')"])
-    const childSaved = await waitFor('public managed saved child after completion', async () => {
-      const response = await fetch(`${rig.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}/children/${childId}`, { headers })
+    expect((await step(() => inspectNativeContext())).pid).toBe(nativeContext.pid)
+    await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', "require('node:fs').writeFileSync('/home/freshell/provider/.freshell-fixture/release-child','release')"]))
+    const childSaved = await step(() => managedWaitFor('public managed saved child after completion', async () => {
+      const response = await step(() => bodyFetch(`${rig.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}/children/${childId}`, { headers }))
       expect(response.ok).toBe(true)
-      const value = await response.json()
+      const value = await step(() => response.json())
       return value.status === 'saved' && JSON.stringify(value).includes('Managed child final answer.') ? value : undefined
-    })
+    }))
     expect(childSaved).toMatchObject({ parentThreadId: view.nativeSessionId, childThreadId: childId, status: 'saved' })
-    await waitFor('managed child control drained', async () => !(await snapshot()).pendingApprovals.length ? true : undefined)
-    rig.runtime.writeIncident('freshcodex-managed-native-durable-child', { registered, childControl, childResponse, childSaved, parent: await snapshot() })
-    const beforeRestart = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(), name: await readName() }
+    await step(() => managedWaitFor('managed child control drained', async () => !(await step(() => snapshot())).pendingApprovals.length ? true : undefined))
+    writeBodyIncident('freshcodex-managed-native-durable-child', { registered, childControl, childResponse, childSaved, parent: await step(() => snapshot()) })
+    const beforeRestart = { view: await step(() => rig.runningViewForFreshSession(created.sessionId)), snapshot: await step(() => snapshot()), name: await step(() => readName()) }
     expect(beforeRestart.name).toEqual(canonicalName)
-    const previousTraffic = await readModelTraffic()
+    const previousTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
     retainedModelTraffic = previousTraffic
-    rig.runtime.writeIncident('freshcodex-managed-native-before-host-restart', { beforeRestart, canonicalName, effects, mcpResults, registered, childControl, childResponse, childSaved, traffic: previousTraffic })
-    const restarted = await fixtureWork.run(async signal => {
-      await model!.stop(signal)
+    writeBodyIncident('freshcodex-managed-native-before-host-restart', { beforeRestart, canonicalName, effects, mcpResults, registered, childControl, childResponse, childSaved, traffic: previousTraffic })
+    const restarted = await step(() => fixtureWork.run(async signal => {
+      await step(() => model!.stop(signal))
       signal.throwIfAborted()
       model = undefined
       rig.runtime.restartOwnedRuntimeExact(providerContainerId)
       signal.throwIfAborted()
-      const currentHost = await waitFor('ordinary same-conversation host recovery readiness', async () => {
+      const currentHost = await step(() => managedWaitFor('ordinary same-conversation host recovery readiness', async () => {
         signal.throwIfAborted()
-        const current = await rig.runningViewForFreshSession(created.sessionId)
+        const current = await step(() => rig.runningViewForFreshSession(created.sessionId))
         signal.throwIfAborted()
         const diagnostics: { containerId: string; logs: string }[] = []
         for (const containerId of rig.runtime.broker.receiptIds()) {
           let logs: string
-          try { logs = await rig.ownedContainerLogs(containerId) }
+          try { logs = await step(() => rig.ownedContainerLogs(containerId)) }
           catch (error) {
             if (signal.aborted) throw error
             logs = `container logs unavailable: ${String(error)}`
@@ -956,11 +975,11 @@ tool_timeout_sec = 120
           signal.throwIfAborted()
           diagnostics.push({ containerId, logs })
         }
-        rig.runtime.writeIncident('freshcodex-managed-native-host-restart-status', { current, diagnostics, ownedHostEvidence: ownedHostEvidence() })
+        writeBodyIncident('freshcodex-managed-native-host-restart-status', { current, diagnostics, ownedHostEvidence: ownedHostEvidence() })
         if (!current?.containerId || !current.hostBootId
           || current.hostBootId === beforeRestart.view!.hostBootId) return undefined
         let running: boolean
-        try { running = await rig.ownedContainerRunning(current.containerId) }
+        try { running = await step(() => rig.ownedContainerRunning(current.containerId!)) }
         catch (error) {
           if (signal.aborted) throw error
           return undefined
@@ -969,77 +988,80 @@ tool_timeout_sec = 120
         if (!running) return undefined
         providerContainerId = current.containerId
         try {
-          const context = await inspectNativeContext()
+          const context = await step(() => inspectNativeContext())
           signal.throwIfAborted()
           expect(context).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
-          const value = await snapshot(signal)
+          const value = await step(() => snapshot(signal))
           signal.throwIfAborted()
           return value.threadId === view.nativeSessionId && value.status !== 'unavailable' ? current : undefined
         } catch (error) {
           if (signal.aborted) throw error
           return undefined
         }
-      })
+      }))
       signal.throwIfAborted()
-      const nextModel = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource, signal })
+      const nextModel = await step(() => startInManagedContext(rig, { containerId: providerContainerId, handlerSource, signal }))
       signal.throwIfAborted()
       model = nextModel
       return currentHost
-    })
+    }))
     fixtureWork.throwIfAborted()
     expect(restarted.nativeSessionId).toBe(view.nativeSessionId)
     if (!model) throw new Error('managed Codex fixture did not restart')
-    await send('MANAGED_AFTER_HOST_RESTART')
-    const afterRestart = await waitFor('same-conversation restarted send saved', async () => {
-      const value = await snapshot()
+    await step(() => send('MANAGED_AFTER_HOST_RESTART'))
+    const afterRestart = await step(() => managedWaitFor('same-conversation restarted send saved', async () => {
+      const value = await step(() => snapshot())
       return value.status === 'idle' && JSON.stringify(value.turns).includes('MANAGED_AFTER_HOST_RESTART') ? value : undefined
-    })
+    }))
     expect(afterRestart.settings).toEqual(beforeRestart.snapshot.settings)
     expect(afterRestart.threadId).toBe(view.nativeSessionId)
     expect(JSON.stringify(afterRestart.turns)).toContain('MANAGED_NATIVE_FIRST')
-    expect(await readName()).toEqual(canonicalName)
-    const postRestartTraffic = await readModelTraffic()
+    expect(await step(() => readName())).toEqual(canonicalName)
+    const postRestartTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
     expect(postRestartTraffic.filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
-    const restartIncidentTraffic = await readModelTraffic()
+    const restartIncidentTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
-    rig.runtime.writeIncident('freshcodex-managed-native-tools-restart', { created, nativeContext, canonicalName, effects, mcpResults,
-      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: restartIncidentTraffic, finalName: await readName() })
+    writeBodyIncident('freshcodex-managed-native-tools-restart', { created, nativeContext, canonicalName, effects, mcpResults,
+      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: restartIncidentTraffic, finalName: await step(() => readName()) })
 
+    fixtureWork.throwIfAborted()
     const recoveryCwd = path.join(workspace, 'recovery-cwd')
     fs.mkdirSync(recoveryCwd)
     fs.chmodSync(recoveryCwd, 0o755)
-    await send('MANAGED_RECOVERY_READY', { cwd: recoveryCwd, model: 'contract-model', effort: 'xhigh',
-      collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
-    const recoverySettings = await waitFor('saved exact settings before native crash', async () => {
-      const value = await snapshot()
+    await step(() => send('MANAGED_RECOVERY_READY', { cwd: recoveryCwd, model: 'contract-model', effort: 'xhigh',
+      collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' }))
+    const recoverySettings = await step(() => managedWaitFor('saved exact settings before native crash', async () => {
+      const value = await step(() => snapshot())
       return value.status === 'idle' && value.settings?.cwd === recoveryCwd ? value.settings : undefined
-    })
+    }))
     expect(recoverySettings).toMatchObject({ cwd: recoveryCwd, model: 'contract-model', effort: 'xhigh',
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
-    const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
-      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await readModelTraffic()).length }
+    const beforeCrash = { view: await step(() => rig.runningViewForFreshSession(created.sessionId)), snapshot: await step(() => snapshot()),
+      name: await step(() => readName()), nativeContext: await step(() => inspectNativeContext()), trafficCursor: (await step(() => readModelTraffic())).length }
     fixtureWork.throwIfAborted()
     expect(beforeCrash.name).toEqual(canonicalName)
-    rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
+    writeBodyIncident('freshcodex-managed-native-before-crash', beforeCrash)
     // Kill only this receipt-owned, inspected release native PID. Archive its
     // REAL native-generated history after exit, keeping every original byte.
     // The host stays live; no internal exited flag or Started event is forged.
+    fixtureWork.throwIfAborted()
     rig.runtime.killOwnedRuntimePidExact(providerContainerId, beforeCrash.nativeContext.pid)
-    const nativeExit = await waitFor('exact native process terminal state before history archive', async () => {
-      const state = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    const nativeExit = await step(() => managedWaitFor('exact native process terminal state before history archive', async () => {
+      const state = JSON.parse(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `
         const fs=require('node:fs'),p='/proc/${beforeCrash.nativeContext.pid}/status';
-        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,state:fs.readFileSync(p,'utf8').split(String.fromCharCode(10)).find(line=>line.startsWith('State:')).slice(6).trim()}:{exists:false}));`]))
+        process.stdout.write(JSON.stringify(fs.existsSync(p)?{exists:true,state:fs.readFileSync(p,'utf8').split(String.fromCharCode(10)).find(line=>line.startsWith('State:')).slice(6).trim()}:{exists:false}));`])))
       return !state.exists || state.state.startsWith('Z') ? state : undefined
-    })
+    }))
     const originalRollout = nativeMetadata.headers.find((header: any) => header.id === view.nativeSessionId).path
-    const archived = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    const archived = JSON.parse(await step(() => rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
       const root='/home/freshell/provider/.codex';const original=${JSON.stringify(originalRollout)};
       const directory='/home/freshell/provider/.freshell-fixture/native-crash-history';fs.mkdirSync(directory,{mode:448});
       const selected=[original,...fs.readdirSync(root).filter(name=>/^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(name)||name==='session_index.jsonl').map(name=>path.join(root,name))];
       const files=selected.filter(file=>fs.existsSync(file)).map((file,index)=>{const bytes=fs.readFileSync(file);const destination=path.join(directory,String(index)+'-'+path.basename(file));fs.renameSync(file,destination);return{source:file,archive:destination,sha256:crypto.createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,base64:bytes.toString('base64')}});
-      if(!files.some(file=>file.source===original))throw Error('Exact real native rollout was not archived');process.stdout.write(JSON.stringify({directory,files}));`]))
+      if(!files.some(file=>file.source===original))throw Error('Exact real native rollout was not archived');process.stdout.write(JSON.stringify({directory,files}));`])))
+    fixtureWork.throwIfAborted()
     const archiveDirectory = path.join(rig.runtime.evidenceDir, 'native-crash-history')
     fs.mkdirSync(archiveDirectory, { mode: 0o700 })
     const archiveManifest = archived.files.map((file: any, index: number) => {
@@ -1051,69 +1073,69 @@ tool_timeout_sec = 120
       return { ...metadata, copy }
     })
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
-    const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
-    const recovered = await rig.runningViewForFreshSession(created.sessionId)
-    const recoveryTraffic = await readModelTraffic()
+    const recoveryAccepted = await step(() => send('AWAITED_PLAN_RECOVERY'))
+    const recovered = await step(() => rig.runningViewForFreshSession(created.sessionId))
+    const recoveryTraffic = await step(() => readModelTraffic())
     fixtureWork.throwIfAborted()
-    rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
+    writeBodyIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
       archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: recoveryTraffic.slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
     expect(recovered!.freshAgentSessionId).toBe(created.sessionId)
     const recoveredId = recovered!.nativeSessionId!
-    const recoveryControl = await waitFor('new native source control through original durable user reference', async () => {
-      const value = await snapshot()
+    const recoveryControl = await step(() => managedWaitFor('new native source control through original durable user reference', async () => {
+      const value = await step(() => snapshot())
       expect(value.threadId).toBe(recoveredId)
       expect(value.settings).toEqual(recoverySettings)
       return value.pendingQuestions?.find((question: any) => question.providerRequest.threadId === recoveredId)
-    })
-    wire.send({ type: 'freshAgent.question.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
+    }))
+    sendBodyFrame({ type: 'freshAgent.question.respond', provider: 'codex', sessionType: 'freshcodex', sessionId: created.sessionId,
       requestId: recoveryControl.requestId, answers: { managed_choice: 'Alpha' } })
-    await waitFor('recovered native exact control resolution', async () => {
-      const value = await snapshot()
+    await step(() => managedWaitFor('recovered native exact control resolution', async () => {
+      const value = await step(() => snapshot())
       return value.status === 'idle' && !value.pendingQuestions.length ? true : undefined
-    })
-    await send('MANAGED_RECOVERY_SECOND')
-    const second = await waitFor('second send on same durable user reference', async () => {
-      const value = await snapshot()
+    }))
+    await step(() => send('MANAGED_RECOVERY_SECOND'))
+    const second = await step(() => managedWaitFor('second send on same durable user reference', async () => {
+      const value = await step(() => snapshot())
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed recovery second answer.') ? value : undefined
-    })
+    }))
     expect(second.threadId).toBe(recoveredId)
     expect(second.settings).toEqual(recoverySettings)
     expect(JSON.stringify(second.turns)).not.toContain('MANAGED_NATIVE_FIRST')
-    expect(await readName()).toEqual(canonicalName)
+    expect(await step(() => readName())).toEqual(canonicalName)
     const recoveredNameRef = { kind: 'session', provider: 'codex', sessionId: recoveredId }
-    const recoveredName = await waitFor('policy-correct new conversation name record', async () => {
-      const name = await readNameFor(recoveredNameRef)
+    const recoveredName = await step(() => managedWaitFor('policy-correct new conversation name record', async () => {
+      const name = await step(() => readNameFor(recoveredNameRef))
       return name?.ref?.sessionId === recoveredId ? name : undefined
-    })
+    }))
     expect(recoveredName.ref).toEqual(recoveredNameRef)
     expect(recoveredName.name).not.toBe(canonicalName.name)
-    const renamedRecovery = await fetch(`${rig.info.baseUrl}/api/session-names`, { method: 'PATCH',
+    const renamedRecovery = await step(() => bodyFetch(`${rig.info.baseUrl}/api/session-names`, { method: 'PATCH',
       headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ target: recoveredNameRef,
-        name: 'Managed recovered saved name', nameIntent: 'user' }) })
-    expect(renamedRecovery.ok, await renamedRecovery.clone().text()).toBe(true)
-    rig.runtime.writeIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
-      oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await readName(), firstNewName: recoveredName,
-      manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archiveManifest })
-    const recoveredNativeContext = await inspectNativeContext()
+        name: 'Managed recovered saved name', nameIntent: 'user' }) }))
+    expect(renamedRecovery.ok, await step(() => renamedRecovery.clone().text())).toBe(true)
+    writeBodyIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
+      oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await step(() => readName()), firstNewName: recoveredName,
+      manualNewName: await step(() => readNameFor(recoveredNameRef)), recovered, recoveryControl, second, archiveManifest })
+    const recoveredNativeContext = await step(() => inspectNativeContext())
     expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
-    await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
-    const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
-    expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)
-    const capture = await recoveredCapture.text()
+    await step(() => managedWaitFor('recovered source native name writeback', async () => (await step(() => readNativeName(recoveredId, recoveredNativeContext))).title === 'Managed recovered saved name' ? true : undefined, 15_000))
+    const recoveredCapture = await step(() => bodyFetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers }))
+    expect(recoveredCapture.ok, await step(() => recoveredCapture.clone().text())).toBe(true)
+    const capture = await step(() => recoveredCapture.text())
     expect(capture).toContain('Managed recovery second answer.')
     expect(capture).not.toContain('MANAGED_NATIVE_FIRST')
-    const newTraffic = (await readModelTraffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
+    const newTraffic = (await step(() => readModelTraffic())).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
     fixtureWork.throwIfAborted()
     expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
     expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
-    expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
-    rig.runtime.writeIncident('freshcodex-managed-native-recovery', { userRef: created.sessionId, oldNativeRef: created.sessionRef,
+    expect((await step(() => rig.inventory())).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
+    writeBodyIncident('freshcodex-managed-native-recovery', { userRef: created.sessionId, oldNativeRef: created.sessionRef,
       newNativeRef: recoveredNameRef, beforeCrash, archiveManifest, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
-      oldName: await readName(), firstNewName: recoveredName, finalNewName: await readNameFor(recoveredNameRef),
-      nativeName: await readNativeName(recoveredId, recoveredNativeContext), recoveredNativeContext, newTraffic })
+      oldName: await step(() => readName()), firstNewName: recoveredName, finalNewName: await step(() => readNameFor(recoveredNameRef)),
+      nativeName: await step(() => readNativeName(recoveredId, recoveredNativeContext)), recoveredNativeContext, newTraffic })
 
-  }, 360_000)
+  }), 360_000)
 })

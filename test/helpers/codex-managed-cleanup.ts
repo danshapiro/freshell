@@ -47,6 +47,7 @@ export function createManagedCodexFixtureWork() {
   let settlement: Promise<PromiseSettledResult<unknown>[]> | undefined
   let activeAtCancellation = false
   return {
+    get signal(): AbortSignal { return controller.signal },
     throwIfAborted(): void { controller.signal.throwIfAborted() },
     run<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
       controller.signal.throwIfAborted()
