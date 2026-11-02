@@ -267,6 +267,7 @@ interface WorkerExecutionState {
   preUpdateSupervisorIdentity?: SupervisorIdentity
   postUpdateSupervisorIdentity?: SupervisorIdentity
   maintenanceLease?: MaintenanceLease
+  postStartOwnership?: PostStartOwnershipSummary
   shutdownGateState: 'open' | 'temporary' | 'latched' | 'unknown'
   shutdownCommitAttempted: boolean
   webProcessExitConfirmed: boolean
@@ -280,6 +281,36 @@ interface SupervisorIdentity {
 interface MaintenanceLease {
   ownerId: string
   leaseId: string
+}
+
+type NonDurableOwnership = 'host-managed' | 'unknown'
+
+interface PostStartPaneOwnership {
+  client_id: string
+  tab_id: string
+  pane_id: string
+  kind: string
+  ownership: NonDurableOwnership
+  provider?: string
+  terminal_id?: string
+  session_id?: string
+}
+
+interface PostStartProcessOwnership {
+  kind: string
+  ownership: NonDurableOwnership
+  provider?: string
+  terminal_id?: string
+  session_id?: string
+}
+
+interface PostStartOwnershipSummary {
+  observed_after_replacement_startup: true
+  outside_durable_soul_ownership: true
+  remain_running: true
+  covered_by_prior_maintenance_lease: false
+  panes: PostStartPaneOwnership[]
+  unattached_processes: PostStartProcessOwnership[]
 }
 
 interface ReadinessReport {
@@ -804,6 +835,74 @@ function safeIdentifier(value: unknown): string {
   return safe || 'unknown'
 }
 
+function optionalSafeIdentifier(value: unknown): string | undefined {
+  return nonEmpty(value) ? safeIdentifier(value) : undefined
+}
+
+function summarizePostStartOwnership(report: ReadinessReport): PostStartOwnershipSummary | undefined {
+  const panes: PostStartPaneOwnership[] = []
+  for (const value of report.paneOwnership.panes as unknown[]) {
+    if (!isRecord(value) || (value.ownership !== 'host-managed' && value.ownership !== 'unknown')) continue
+    const provider = optionalSafeIdentifier(value.provider)
+    const terminalId = optionalSafeIdentifier(value.terminalId)
+    const sessionId = optionalSafeIdentifier(value.sessionId)
+    panes.push({
+      client_id: safeIdentifier(value.clientId),
+      tab_id: safeIdentifier(value.tabId),
+      pane_id: safeIdentifier(value.paneId),
+      kind: safeIdentifier(value.kind),
+      ownership: value.ownership,
+      ...(provider ? { provider } : {}),
+      ...(terminalId ? { terminal_id: terminalId } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
+    })
+  }
+
+  const unattachedProcesses: PostStartProcessOwnership[] = []
+  for (const value of report.paneOwnership.unattachedProcesses as unknown[]) {
+    if (!isRecord(value) || (value.ownership !== 'host-managed' && value.ownership !== 'unknown')) continue
+    const provider = optionalSafeIdentifier(value.provider)
+    const terminalId = optionalSafeIdentifier(value.terminalId)
+    const sessionId = optionalSafeIdentifier(value.sessionId)
+    unattachedProcesses.push({
+      kind: safeIdentifier(value.kind),
+      ownership: value.ownership,
+      ...(provider ? { provider } : {}),
+      ...(terminalId ? { terminal_id: terminalId } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
+    })
+  }
+  if (panes.length === 0 && unattachedProcesses.length === 0) return undefined
+  return {
+    observed_after_replacement_startup: true,
+    outside_durable_soul_ownership: true,
+    remain_running: true,
+    covered_by_prior_maintenance_lease: false,
+    panes,
+    unattached_processes: unattachedProcesses,
+  }
+}
+
+function postStartOwnershipEventFields(summary?: PostStartOwnershipSummary): Record<string, unknown> {
+  return summary ? { post_start_ownership: summary } : {}
+}
+
+async function reportPostStartOwnership(
+  dependencies: ManagedRuntimeUpdateDependencies,
+  summary?: PostStartOwnershipSummary,
+): Promise<void> {
+  if (!summary) return
+  const rows = [
+    ...summary.panes.map((pane) => `pane ${JSON.stringify(pane)}`),
+    ...summary.unattached_processes.map((process) => `unattached process ${JSON.stringify(process)}`),
+  ]
+  await dependencies.logger.operator(
+    'Post-start ownership notice: host-managed or unknown work was observed after replacement startup. '
+    + 'These rows are outside durable-soul ownership, remain running, and were not covered by the prior maintenance lease. '
+    + rows.join('; '),
+  )
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
@@ -928,7 +1027,12 @@ async function runClientUpdate(
   const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
   assertSameIdentity(readiness.identity, expectedIdentity, 'Default web-only update changed the durable supervisor identity.')
   execution.postUpdateSupervisorIdentity = readiness.identity
-  await record(dependencies, 'client', 'complete', 'update.completed', 'info', { reminder: DEFAULT_UPDATE_REMINDER })
+  execution.postStartOwnership = summarizePostStartOwnership(readiness)
+  await record(dependencies, 'client', 'complete', 'update.completed', 'info', {
+    reminder: DEFAULT_UPDATE_REMINDER,
+    ...postStartOwnershipEventFields(execution.postStartOwnership),
+  })
+  await reportPostStartOwnership(dependencies, execution.postStartOwnership)
   await dependencies.logger.operator(DEFAULT_UPDATE_REMINDER)
   return 0
 }
@@ -1059,6 +1163,7 @@ async function startUpdatedRuntime(
   const readiness = await readAuthenticatedReadiness(dependencies, owner, authToken)
   assertSameIdentity(readiness.identity, supervisorIdentity, 'Updated web readiness did not match the deliberately restarted supervisor.')
   execution.postUpdateSupervisorIdentity = readiness.identity
+  execution.postStartOwnership = summarizePostStartOwnership(readiness)
 }
 
 async function reopenSavedConversations(
@@ -1108,14 +1213,18 @@ async function reopenSavedConversations(
       unavailable: reopenResults.filter(result => result.outcome === 'unavailable').length,
       failed: reopenResults.filter(result => result.outcome === 'failed').length,
       manual_recovery: MANUAL_RECOVERY,
+      ...postStartOwnershipEventFields(execution.postStartOwnership),
     })
+    await reportPostStartOwnership(dependencies, execution.postStartOwnership)
     await dependencies.logger.operator(MANUAL_RECOVERY)
     return 1
   }
   await record(dependencies, mode, 'complete', 'update.completed', 'info', {
     reset_target_count: execution.resetTargets.length,
     reopened_count: reopenResults.length,
+    ...postStartOwnershipEventFields(execution.postStartOwnership),
   })
+  await reportPostStartOwnership(dependencies, execution.postStartOwnership)
   return 0
 }
 
