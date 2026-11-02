@@ -294,7 +294,7 @@ async fn create_terminal_or_content_tab_with_delivery(
     } else {
         match crate::try_host_agent_admission(&state) {
             Ok(permit) => Some(std::sync::Arc::new(permit)),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     };
     create_terminal_tab(
@@ -8667,7 +8667,18 @@ if (args.includes('app-server')) {{
 
         // `create_terminal_tab` takes this lock only after the detached
         // settle returns, immediately before attaching the pane content.
-        let held_tabs = state.tabs.lock().expect("tabs mutex");
+        let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_lock_tx, release_lock_rx) = std::sync::mpsc::channel();
+        let lock_state = state.clone();
+        let lock_holder = std::thread::spawn(move || {
+            let held_tabs = lock_state.tabs.lock().expect("tabs mutex");
+            let _ = lock_acquired_tx.send(());
+            let _ = release_lock_rx.recv();
+            drop(held_tabs);
+        });
+        lock_acquired_rx
+            .await
+            .expect("test thread acquired the tabs mutex");
         let request = tokio::spawn(async move {
             post(router, "/api/tabs", json!({"mode":"admissioncli"}), true).await
         });
@@ -8694,7 +8705,12 @@ if (args.includes('app-server')) {{
             .drain(&lease, std::time::Duration::from_millis(30))
             .await;
 
-        drop(held_tabs);
+        release_lock_tx
+            .send(())
+            .expect("release the test thread's tabs mutex");
+        lock_holder
+            .join()
+            .expect("tabs mutex holder thread completes");
         let (status, body) = request.await.expect("REST request task");
         assert_eq!(status, StatusCode::OK, "{body}");
         let terminal_id = body["data"]["terminalId"]
