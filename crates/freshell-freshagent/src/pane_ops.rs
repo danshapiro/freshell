@@ -178,7 +178,7 @@ pub(crate) async fn split_pane(
     let host_agent_permit = if needs_host_admission {
         match crate::try_host_agent_admission(&state) {
             Ok(permit) => Some(std::sync::Arc::new(permit)),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     } else {
         None
@@ -986,7 +986,7 @@ pub(crate) async fn respawn_pane(
     } else {
         match crate::try_host_agent_admission(&state) {
             Ok(permit) => Some(std::sync::Arc::new(permit)),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     };
 

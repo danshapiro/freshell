@@ -5097,16 +5097,16 @@ pub(crate) fn fail_json_code_retry_after(
 /// Shell terminal and stateless content requests deliberately do not call this.
 pub(crate) fn try_host_agent_admission(
     state: &FreshAgentState,
-) -> Result<host_agent_admission::HostAgentAdmissionPermit, Response> {
+) -> Result<host_agent_admission::HostAgentAdmissionPermit, Box<Response>> {
     state.host_agent_admission.try_admit().map_err(|error| {
-        fail_json_code_retry_after(
+        Box::new(fail_json_code_retry_after(
             StatusCode::SERVICE_UNAVAILABLE,
             "HOST_AGENT_MAINTENANCE",
             format!(
                 "Host coding-agent starts are temporarily paused for maintenance; retry shortly ({error})"
             ),
             Duration::from_secs(1),
-        )
+        ))
     })
 }
 
@@ -5163,7 +5163,7 @@ async fn create_tab(
     // identity/layout publication, and the reply/broadcast.
     let _host_agent_permit = match try_host_agent_admission(&state) {
         Ok(permit) => permit,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
@@ -6665,7 +6665,7 @@ async fn send_keys(
     // unchanged.
     let _host_agent_permit = match try_host_agent_admission(&state) {
         Ok(permit) => permit,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let turn_timeout = body
