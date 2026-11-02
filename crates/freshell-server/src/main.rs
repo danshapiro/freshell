@@ -1207,6 +1207,7 @@ async fn main() -> ExitCode {
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
             .with_layout(layout_store.clone())
             .with_ownership(Arc::clone(&ownership));
+    let host_agent_admission = fresh_agent_state.host_agent_admission();
     fresh_agent_state
         .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
         .expect("OpenCode checkpoint event persister is installed once");
@@ -3222,7 +3223,8 @@ async fn main() -> ExitCode {
             layout_store.clone(),
             registry.clone(),
             Arc::clone(&ownership),
-        );
+        )
+        .with_host_agent_admission(host_agent_admission.clone());
         state.spawn_projector();
         managed_runtime_api::router(state)
     };
@@ -3584,6 +3586,7 @@ async fn main() -> ExitCode {
     shutdown_signal(
         Arc::clone(&shutdown_notify),
         std::sync::Arc::clone(&shutdown_started),
+        host_agent_admission.clone(),
     )
     .await;
     rebind.shutdown_all().await;
@@ -3685,6 +3688,14 @@ async fn main() -> ExitCode {
 /// nonzero if the process is still alive once it elapses.
 const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn latch_host_admission_for_shutdown(
+    gate: &freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
+    shutdown_started: &std::sync::atomic::AtomicBool,
+) {
+    gate.latch_shutdown();
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Resolve once a shutdown signal arrives (SIGTERM from the oracle harness's
 /// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so every owned
 /// child (PTY terminals, the Codex/claude/opencode sidecars) is reaped before
@@ -3692,6 +3703,7 @@ const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 async fn shutdown_signal(
     notify_ws: Arc<tokio::sync::Notify>,
     shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+    host_agent_admission: freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
 ) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -3737,9 +3749,12 @@ async fn shutdown_signal(
     // server stop intentionally, and on which signal".
     tracing::info!(signal = signal_name, "server.stopping");
 
+    // Close host-agent admission before any teardown starts. This is the
+    // signal-path backstop for creates that entered before the updater's
+    // pre-stop maintenance API ran.
     // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
     // creates consult this flag around registry.create.
-    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+    latch_host_admission_for_shutdown(&host_agent_admission, &shutdown_started);
 
     // Forensics FIRST, before any teardown step, so the record survives even
     // if teardown hangs. Sync + bounded (a handful of tiny /proc reads) —
@@ -4931,6 +4946,20 @@ mod tests {
         assert!(error.contains("--features managed-runtime-v1"));
         assert!(managed_runtime_feature_error(Some("1"), true).is_none());
         assert!(managed_runtime_feature_error(Some("true"), false).is_none());
+    }
+
+    #[test]
+    fn signal_shutdown_latches_host_agent_admission_before_teardown() {
+        let gate = freshell_freshagent::host_agent_admission::HostAgentAdmissionGate::new();
+        let shutdown_started = std::sync::atomic::AtomicBool::new(false);
+
+        latch_host_admission_for_shutdown(&gate, &shutdown_started);
+
+        assert!(shutdown_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            gate.try_admit(),
+            Err(freshell_freshagent::host_agent_admission::AdmissionError::ShutdownLatched)
+        ));
     }
 
     #[test]
