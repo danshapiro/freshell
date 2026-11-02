@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +11,137 @@ const BUILD_SCRIPTS = [
   { crate: 'freshell-ws', variable: 'FRESHELL_WS_BUILD_COMMIT' },
   { crate: 'freshell-server', variable: 'FRESHELL_BUILD_COMMIT' },
 ] as const
+
+type ProcIssue = { operation: string; pid?: number; fd?: string; code: string }
+type ProcFileDescriptor = {
+  pid: number
+  fd: string
+  flags: string | null
+  accessMode: 'read-only' | 'write-only' | 'read-write' | 'unknown'
+  processExecutableBasename: string | null
+}
+
+function inspectOpenFileDescriptors(filePath: string) {
+  const target = path.resolve(filePath)
+  const matchingFileDescriptors: ProcFileDescriptor[] = []
+  const inaccessibleByCode: Record<string, number> = {}
+  const inaccessibleSamples: ProcIssue[] = []
+  let inaccessibleCount = 0
+  let racedEntryCount = 0
+  let scannedProcessCount = 0
+  if (process.platform !== 'linux') {
+    return { status: 'unavailable' as const, target, rootError: 'unsupported-platform', scannedProcessCount,
+      matchingFileDescriptors, inaccessibleCount, inaccessibleByCode,
+      inaccessibleSamples: [{ operation: 'scan-process-file-descriptors', code: 'unsupported-platform' }],
+      inaccessibleSamplesOmitted: 0, racedEntryCount }
+  }
+
+  const recordProcIssue = (operation: string, pid: number | undefined, fd: string | undefined, error: unknown) => {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? 'UNKNOWN') : 'UNKNOWN'
+    if (code === 'ENOENT') {
+      racedEntryCount += 1
+      return
+    }
+    inaccessibleCount += 1
+    inaccessibleByCode[code] = (inaccessibleByCode[code] ?? 0) + 1
+    if (inaccessibleSamples.length < 32) {
+      inaccessibleSamples.push({ operation,
+        ...(pid === undefined ? {} : { pid }), ...(fd === undefined ? {} : { fd }), code })
+    }
+  }
+
+  let processes: fs.Dirent[]
+  try {
+    processes = fs.readdirSync('/proc', { withFileTypes: true })
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? 'UNKNOWN') : 'UNKNOWN'
+    return { status: 'unavailable' as const, target, rootError: code, scannedProcessCount,
+      matchingFileDescriptors, inaccessibleCount: 1, inaccessibleByCode: { [code]: 1 },
+      inaccessibleSamples: [{ operation: 'list-processes', code }], racedEntryCount }
+  }
+
+  for (const process of processes) {
+    if (!/^\d+$/.test(process.name)) continue
+    const pid = Number(process.name)
+    scannedProcessCount += 1
+    const fdDirectory = path.join('/proc', process.name, 'fd')
+    let descriptors: fs.Dirent[]
+    try {
+      descriptors = fs.readdirSync(fdDirectory, { withFileTypes: true })
+    } catch (error) {
+      recordProcIssue('list-file-descriptors', pid, undefined, error)
+      continue
+    }
+
+    for (const descriptor of descriptors) {
+      const fd = descriptor.name
+      const descriptorPath = path.join(fdDirectory, fd)
+      let linkedPath: string
+      try {
+        linkedPath = fs.readlinkSync(descriptorPath).replace(/ \(deleted\)$/, '')
+      } catch (error) {
+        recordProcIssue('read-file-descriptor-link', pid, fd, error)
+        continue
+      }
+      if (path.resolve(linkedPath) !== target) continue
+
+      let flags: string | null = null
+      try {
+        const info = fs.readFileSync(path.join('/proc', process.name, 'fdinfo', fd), 'utf8')
+        flags = /^flags:\s*([0-7]+)/m.exec(info)?.[1] ?? null
+      } catch (error) {
+        recordProcIssue('read-file-descriptor-flags', pid, fd, error)
+      }
+      let processExecutableBasename: string | null = null
+      try {
+        const executable = fs.readlinkSync(path.join('/proc', process.name, 'exe')).replace(/ \(deleted\)$/, '')
+        processExecutableBasename = path.basename(executable)
+      } catch (error) {
+        recordProcIssue('read-process-executable', pid, undefined, error)
+      }
+      const access = flags === null ? Number.NaN : Number.parseInt(flags, 8) & 0b11
+      matchingFileDescriptors.push({ pid, fd, flags,
+        accessMode: access === 0 ? 'read-only' : access === 1 ? 'write-only' : access === 2 ? 'read-write' : 'unknown',
+        processExecutableBasename })
+    }
+  }
+
+  return { status: 'complete' as const, target, scannedProcessCount, matchingFileDescriptors,
+    inaccessibleCount, inaccessibleByCode, inaccessibleSamples,
+    inaccessibleSamplesOmitted: Math.max(0, inaccessibleCount - inaccessibleSamples.length),
+    racedEntryCount }
+}
+
+function copiedBuildScriptTextFileBusyDiagnostic(error: unknown, project: string) {
+  const failure = error as { code?: string; errno?: number; stderr?: Buffer | string }
+  const stderr = Buffer.isBuffer(failure?.stderr) ? failure.stderr.toString('utf8') : String(failure?.stderr ?? '')
+  if (!stderr.includes('Text file busy (os error 26)')) return undefined
+  const executable = /could not execute process [`"]([^`"\r\n]+[\\/]build-script-build(?:\.exe)?)[`"]/.exec(stderr)?.[1]
+  const targetDirectory = path.join(project, 'target', 'debug', 'build')
+  let copiedExecutables: string[] = []
+  try {
+    copiedExecutables = fs.readdirSync(targetDirectory, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => path.join(targetDirectory, entry.name, 'build-script-build'))
+      .filter(file => fs.existsSync(file))
+  } catch {
+    // The Cargo error remains primary; the JSONL diagnostic below records
+    // whether /proc was also inaccessible when an exact path is available.
+  }
+  const procScan = executable ? inspectOpenFileDescriptors(executable)
+    : { status: 'not-run' as const,
+      reason: 'Cargo stderr did not identify a build-script-build path', copiedExecutables }
+  return { severity: 'error' as const, event: 'build_stamp.copied_build_script_etxtbsy',
+    executable: executable ?? null,
+    cargoError: { code: failure?.code ?? null, errno: failure?.errno ?? null }, procScan }
+}
+
+function reportCopiedBuildScriptTextFileBusy(error: unknown, project: string): void {
+  const diagnostic = copiedBuildScriptTextFileBusyDiagnostic(error, project)
+  if (diagnostic) process.stderr.write(`${JSON.stringify(diagnostic)}\n`)
+}
 
 function stampFromBuildScript(
   sourceCrate: (typeof BUILD_SCRIPTS)[number],
@@ -49,6 +180,57 @@ afterEach(() => {
 })
 
 describe('Rust artifact build provenance', () => {
+  it('reports a writable /proc descriptor or an explicit unsupported-platform diagnostic', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-script-holder-'))
+    roots.push(root)
+    const executable = path.join(root, 'build-script-build')
+    fs.writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    let writableFd: number | undefined
+    try {
+      const windowsExecutable = String.raw`C:\tmp\freshell\target\debug\build\fixture\build-script-build.exe`
+      const windowsDiagnostic = copiedBuildScriptTextFileBusyDiagnostic({
+        code: 1,
+        stderr: `could not execute process \`${windowsExecutable}\` (never executed)\nText file busy (os error 26)`,
+      }, root)
+      expect(windowsDiagnostic?.executable).toBe(windowsExecutable)
+
+      if (process.platform !== 'linux') {
+        const diagnostic = copiedBuildScriptTextFileBusyDiagnostic({
+          code: 1,
+          stderr: `could not execute process \`${executable}\` (never executed)\nText file busy (os error 26)`,
+        }, root)
+        if (!diagnostic) throw new Error('ETXTBSY diagnostic was not generated for the matching Cargo failure')
+        expect(diagnostic.procScan).toMatchObject({ status: 'unavailable', rootError: 'unsupported-platform' })
+        return
+      }
+
+      writableFd = fs.openSync(executable, 'r+')
+      const execution = spawnSync(executable, [], { encoding: 'utf8' })
+      expect(execution.error?.code).toBe('ETXTBSY')
+      const diagnostic = copiedBuildScriptTextFileBusyDiagnostic({
+        code: 1,
+        stderr: `could not execute process \`${executable}\` (never executed)\nText file busy (os error 26)`,
+      }, root)
+      if (!diagnostic) throw new Error('ETXTBSY diagnostic was not generated for the matching Cargo failure')
+      expect(diagnostic).toMatchObject({
+        severity: 'error', event: 'build_stamp.copied_build_script_etxtbsy', executable,
+      })
+      if (diagnostic.procScan.status !== 'complete') throw new Error('Linux /proc scan was not completed')
+      expect(diagnostic.procScan.matchingFileDescriptors).toContainEqual(expect.objectContaining({
+        pid: process.pid, fd: String(writableFd), accessMode: 'read-write',
+        processExecutableBasename: path.basename(fs.realpathSync(process.execPath)),
+      }))
+      const holderDescriptor = diagnostic.procScan.matchingFileDescriptors.find(descriptor =>
+        descriptor.pid === process.pid && descriptor.fd === String(writableFd))
+      if (!holderDescriptor) throw new Error('writable holder descriptor was not included in the diagnostic')
+      expect(holderDescriptor.flags).toMatch(/^[0-7]+$/)
+      expect(diagnostic.procScan).toHaveProperty('inaccessibleCount')
+      expect(diagnostic.procScan).toHaveProperty('racedEntryCount')
+    } finally {
+      if (writableFd !== undefined) fs.closeSync(writableFd)
+    }
+  })
+
   it.each(BUILD_SCRIPTS)('restamps $crate when the managed source-state trigger changes after a linked-worktree cache copy', (sourceCrate) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-stamp-worktrees-'))
     roots.push(root)
@@ -77,9 +259,15 @@ describe('Rust artifact build provenance', () => {
     const initialCommit = git(original, 'rev-parse', 'HEAD')
     const build = (worktree: string, sourceState: string) => {
       const project = path.join(worktree, crate)
-      const output = execFileSync('cargo', ['build', '--quiet', '--offline', '--message-format=json'], {
-        cwd: project, env: { ...env, FRESHELL_BUILD_SOURCE_STATE: sourceState }, encoding: 'utf8', stdio: 'pipe',
-      })
+      let output: string
+      try {
+        output = execFileSync('cargo', ['build', '--quiet', '--offline', '--message-format=json'], {
+          cwd: project, env: { ...env, FRESHELL_BUILD_SOURCE_STATE: sourceState }, encoding: 'utf8', stdio: 'pipe',
+        })
+      } catch (error) {
+        reportCopiedBuildScriptTextFileBusy(error, project)
+        throw error
+      }
       const artifact = output.trim().split('\n').map(line => JSON.parse(line))
         .find(message => message.reason === 'compiler-artifact' && message.target.name === 'worktree-stamp-check')
       expect(artifact).toBeDefined()
