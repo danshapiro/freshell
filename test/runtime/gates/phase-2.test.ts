@@ -377,6 +377,17 @@ async function gate06MemoryOomChildOnly(h: RuntimeHarness): Promise<void> {
     expectedControlEpoch: epoch,
   }), { requestId: shell.launchRequestId }), 'launch')
   h.assert(caseId, replay.view.launchState === 'running' && replay.view.containerId === shell.containerId, 'child OOM is not misclassified as a lost/replaced soul', replay)
+  const postOomInventory = dataOf(await h.adminOk(supervisor, h.inventorySnapshotBody()), 'inventory_snapshot')
+  const postOomSoul = postOomInventory.souls.find((row: any) => row.soulId === shell.soulId)
+  h.assert(
+    caseId,
+    postOomSoul?.desiredState === 'running'
+      && postOomSoul?.recoveryState === 'live'
+      && postOomSoul?.incarnationId === shell.incarnationId
+      && postOomSoul?.containerId === shell.containerId,
+    'durable registry retains the exact running incarnation after child OOM',
+    { identity: { soulId: shell.soulId, incarnationId: shell.incarnationId, containerId: shell.containerId }, postOomSoul },
+  )
   const stop = dataOf(await h.adminOk(supervisor, h.stopBody(shell.soulId, epoch)), 'stop')
   h.assert(caseId, stop.outcome === 'verified_empty', 'OOM-tested runtime still cleans up by exact enclosure')
 
