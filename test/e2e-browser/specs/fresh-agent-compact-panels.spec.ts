@@ -53,21 +53,41 @@ function freshAgentSnapshot(sessionType: string, provider: string, threadId: str
   }
 }
 
+type SnapshotRead = {
+  sessionType: string
+  provider: string
+  threadId: string
+  trigger: string | null
+  revision: number
+  turnIds: string[]
+  ownerKind: unknown
+  nativeHistoryAvailable: boolean
+  unattributedError: unknown
+  unattributedErrorAuthoritative: boolean
+}
+
 /** Serve schema-validated snapshots and expose request hits as a setup gate. */
-async function routeThreads(page: Page, overrides?: Record<string, unknown> | (() => Record<string, unknown>)): Promise<() => number> {
+async function routeThreads(page: Page, overrides?: Record<string, unknown> | (() => Record<string, unknown>), recordRead?: (read: SnapshotRead) => void): Promise<() => number> {
   let hits = 0
   await page.route('**/api/fresh-agent/threads/**', async (route) => {
     const url = new URL(route.request().url())
     const [, sessionType = 'freshopencode', provider = 'opencode', threadId = 'ses_e2e'] =
       url.pathname.match(/\/api\/fresh-agent\/threads\/([^/]+)\/([^/]+)\/([^/?]+)/) ?? []
+    const snapshot = FreshAgentSnapshotSchema.parse({
+      ...freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId)),
+      ...(typeof overrides === 'function' ? overrides() : overrides ?? {}),
+    })
     hits += 1
+    recordRead?.({ sessionType, provider, threadId: snapshot.threadId, trigger: url.searchParams.get('trigger'),
+      revision: snapshot.revision, turnIds: snapshot.turns.map(turn => turn.turnId),
+      ownerKind: snapshot.extensions?.codex?.ownerKind,
+      nativeHistoryAvailable: snapshot.extensions?.codex?.nativeHistoryAvailable === true,
+      unattributedError: snapshot.extensions?.codex?.unattributedProviderError,
+      unattributedErrorAuthoritative: snapshot.extensions?.codex?.unattributedProviderErrorAuthoritative === true })
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(FreshAgentSnapshotSchema.parse({
-        ...freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId)),
-        ...(typeof overrides === 'function' ? overrides() : overrides ?? {}),
-      })),
+      body: JSON.stringify(snapshot),
     })
   })
   return () => hits
@@ -124,6 +144,7 @@ function latestUserTurn() {
 async function seedCompactPane(page: Page, variant: Variant): Promise<{
   update: (changes: Record<string, unknown>) => Promise<void>
   setSnapshot: (changes: Record<string, unknown>) => void
+  snapshotReads: () => SnapshotRead[]
 }> {
   await enableFreshClientsAndOpencode(page)
   await routeFileApis(page, '/tmp')
@@ -143,7 +164,8 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{
     turns: [latestUserTurn()],
     ...variant.snapshot,
   }
-  const hits = await routeThreads(page, () => current)
+  const reads: SnapshotRead[] = []
+  const hits = await routeThreads(page, () => current, read => reads.push(read))
   await page.route('**/api/fresh-agent/diff**', route => route.fulfill({ json: { diff: patch } }))
   await createFreshopencodePane(page, '/tmp')
   await page.evaluate(v => {
@@ -177,7 +199,7 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{
   const setSnapshot = (changes: Record<string, unknown>) => {
     current = { ...current, ...changes, revision: Number(current.revision ?? 1) + 1 }
   }
-  return { setSnapshot, update: async changes => {
+  return { setSnapshot, snapshotReads: () => [...reads], update: async changes => {
     const previousHits = hits()
     setSnapshot(changes)
     await page.evaluate(v => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({ type: 'freshAgent.event', sessionId: `compact-${v.sessionType}`, sessionType: v.sessionType, provider: v.provider, event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: v.revision } }), { ...variant, revision: Number(current.revision) })
@@ -284,10 +306,15 @@ async function hitAndClick(control: Locator): Promise<void> {
   await control.click()
 }
 
-for (const size of [{ width: 390, height: 700 }, { width: 390, height: 320 }, { width: 560, height: 320 }, { width: 1100, height: 700 }]) {
+for (const size of [
+  { width: 390, height: 700 }, { width: 390, height: 320 },
+  { width: 450, height: 700 }, { width: 450, height: 320 },
+  { width: 451, height: 700 }, { width: 451, height: 320 },
+  { width: 560, height: 320 }, { width: 1100, height: 700 },
+]) {
   test(`provider error cause stays readable with pending controls at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
     void freshellPage
-    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    if (size.width <= 451) await page.setViewportSize({ width: size.width, height: 844 })
     await terminal.waitForTerminal()
     await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light' })
     await page.evaluate(() => {
@@ -765,8 +792,61 @@ test('retained unattributed Codex errors remain visible after a browser reload',
   await page.addInitScript(() => {
     ;(window as typeof window & { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = true
   })
+  // The snapshots model a live Codex session, but its synthetic UUID does not
+  // exist on the fixture server. Model the matching live reconcile verdict too,
+  // leaving every other pane and WebSocket frame on the real server path.
+  const requests = new Map<string, string>()
+  const reconciled: Array<{ reconcileId: string; paneKey: string; originalVerdict: string }> = []
+  await page.routeWebSocket('**/ws', client => {
+    const server = client.connectToServer()
+    client.onMessage(data => {
+      try {
+        const frame = JSON.parse(String(data)) as { type?: string; reconcileId?: string;
+          panes?: Array<{ paneKey: string; kind?: string; sessionRef?: { provider?: string; sessionId?: string } }> }
+        const pane = frame.panes?.find(entry => entry.kind === 'fresh-agent'
+          && entry.sessionRef?.provider === 'codex' && entry.sessionRef.sessionId === sessionId)
+        if (frame.type === 'pane.reconcile.request' && frame.reconcileId && pane) requests.set(frame.reconcileId, pane.paneKey)
+      } catch {
+        // Non-JSON frames still pass through to the server.
+      }
+      server.send(data)
+    })
+    server.onMessage(data => {
+      let outgoing = data
+      try {
+        const frame = JSON.parse(String(data)) as { type?: string; reconcileId?: string;
+          verdicts?: Array<{ paneKey: string; verdict: string }> }
+        const paneKey = frame.reconcileId ? requests.get(frame.reconcileId) : undefined
+        const original = frame.verdicts?.find(verdict => verdict.paneKey === paneKey)
+        if (frame.type === 'pane.reconcile.result' && frame.reconcileId && paneKey && original) {
+          reconciled.push({ reconcileId: frame.reconcileId, paneKey, originalVerdict: original.verdict })
+          frame.verdicts = frame.verdicts!.map(verdict => verdict.paneKey === paneKey
+            ? { paneKey, verdict: 'attach', sessionRef: { provider: 'codex', sessionId } } : verdict)
+          outgoing = JSON.stringify(frame)
+        }
+      } catch {
+        // Non-JSON frames still pass through to the browser.
+      }
+      client.send(outgoing)
+    })
+    client.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
+    server.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
+  })
   await page.reload()
   await expect(error.locator('summary')).toContainText(message, { timeout: 30_000 })
+  await expect.poll(() => reconciled.length, { message: 'the restored synthetic pane must receive its matching live reconcile verdict' }).toBeGreaterThan(0)
+  expect(requests.get(reconciled[0].reconcileId)).toBe(reconciled[0].paneKey)
+  await expect.poll(() => page.evaluate(({ reconcileId, paneKey, sessionId }) => (
+    (window.__FRESHELL_TEST_HARNESS__!.getReceivedWsMessages?.() ?? []).some(entry => {
+      const frame = entry as { type?: string; reconcileId?: string;
+        verdicts?: Array<{ paneKey?: string; verdict?: string; sessionRef?: { provider?: string; sessionId?: string } }> }
+      return frame.type === 'pane.reconcile.result' && frame.reconcileId === reconcileId
+        && frame.verdicts?.some(verdict => verdict.paneKey === paneKey && verdict.verdict === 'attach'
+          && verdict.sessionRef?.provider === 'codex' && verdict.sessionRef.sessionId === sessionId)
+    })
+  ), { reconcileId: reconciled[0].reconcileId, paneKey: reconciled[0].paneKey, sessionId }),
+  { message: 'the browser must apply the live reconcile result for the restored session' }).toBe(true)
+  await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-session-id', sessionId)
   await hitAndClick(error.locator('summary'))
   await expect(error).toContainText('the associated turn could not be confirmed')
   await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
@@ -774,22 +854,40 @@ test('retained unattributed Codex errors remain visible after a browser reload',
 
   const savedHistory = { id: 'saved-answer', turnId: 'saved-answer', role: 'assistant', summary: 'Saved history is still available',
     items: [{ id: 'saved-answer-text', kind: 'text', text: 'Saved history is still available' }] }
+  const readsBeforeHistory = state.snapshotReads().length
   state.setSnapshot({ turns: [latestUserTurn(), savedHistory],
     extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true } } })
-  await page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
-    type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
-    event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: 2 },
-  }), sessionId)
+  await page.evaluate(id => {
+    const receive = window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage
+    if (!receive) throw new Error('The test harness cannot deliver a FreshAgent event')
+    receive({ type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: 2 } })
+  }, sessionId)
+  await expect.poll(() => state.snapshotReads().slice(readsBeforeHistory).some(read => read.threadId === sessionId
+    && read.trigger === 'event' && read.revision === 2 && read.ownerKind === 'vacant'
+    && read.nativeHistoryAvailable && read.turnIds.join(',') === 'user-1,saved-answer'
+    && read.unattributedError === undefined && !read.unattributedErrorAuthoritative),
+  { message: 'the event must fetch the saved-only history for the restored session' }).toBe(true)
   await expect(page.getByText('Saved history is still available', { exact: true })).toBeVisible()
+  await expect(error.locator('summary')).toBeVisible()
   await expect(error.locator('summary')).toContainText(message)
 
+  const readsBeforeClear = state.snapshotReads().length
   state.setSnapshot({ extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true, unattributedProviderErrorAuthoritative: true } } })
-  await page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
-    type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
-    event: { type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' },
-  }), sessionId)
+  await page.evaluate(id => {
+    const receive = window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage
+    if (!receive) throw new Error('The test harness cannot deliver a FreshAgent event')
+    receive({ type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' } })
+  }, sessionId)
+  await expect.poll(() => state.snapshotReads().slice(readsBeforeClear).some(read => read.threadId === sessionId
+    && read.trigger === 'event' && read.revision === 3 && read.ownerKind === 'vacant'
+    && read.nativeHistoryAvailable && read.turnIds.join(',') === 'user-1,saved-answer'
+    && read.unattributedError === undefined && read.unattributedErrorAuthoritative),
+  { message: 'the clear notice must fetch the authoritative saved-only diagnostic state' }).toBe(true)
   await expect(error).toHaveCount(0)
   await expect(page.getByText('The provider warning was cleared.', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Saved history is still available', { exact: true })).toBeVisible()
   await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
   await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
 })
