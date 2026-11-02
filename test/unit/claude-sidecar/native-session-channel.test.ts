@@ -3,6 +3,7 @@ import { nativeProtocolRequest } from './native-protocol.js'
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -23,7 +24,7 @@ async function hook(channel: any, input = native) {
   child.stdin.end(JSON.stringify(input))
   expect(await exited).toBe(0)
 }
-function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false) {
+function checkpointSidecar(directory: string, nativeRequestId = 'native-current', delayedTranscript = false, delayedNativeExit = false, providerHome = directory, eagerResume = false, eagerCallbackOnly = false, splitBatch: boolean | 'incomplete' = false, queryEnv: NodeJS.ProcessEnv = {}) {
   const child = spawn(process.execPath, [resolve('crates/freshell-claude-sidecar/index.mjs')], {
     env: { ...process.env, HOME: providerHome, FRESHELL_SIDECAR_TEST_CHECKPOINT: '1',
       FRESHELL_SIDECAR_TEST_NATIVE_REQUEST_ID: nativeRequestId,
@@ -33,10 +34,13 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_CALLBACK_ONLY: eagerCallbackOnly ? '1' : '0',
       FRESHELL_SIDECAR_TEST_SPLIT_BATCH: splitBatch === 'incomplete' ? splitBatch : splitBatch ? '1' : '0',
       FRESHELL_NATIVE_IDENTITY_LAUNCH: JSON.stringify(launch),
-      FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs') },
+      FRESHELL_CLAUDE_SDK_QUERY_MODULE: resolve('test/unit/claude-sidecar/fixtures/native-startup-query.mjs'),
+      ...queryEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   const frames: any[] = []
+  const stderrChunks: Buffer[] = []
+  child.stderr.on('data', (chunk) => stderrChunks.push(Buffer.from(chunk)))
   let buffer = ''
   child.stdout.on('data', (chunk) => {
     buffer += chunk
@@ -46,9 +50,9 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       buffer = buffer.slice(boundary + 1)
     }
   })
-  const exited = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('exit', () => resolve()) })
+  const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve) })
   const send = (value: unknown) => child.stdin.write(JSON.stringify(nativeProtocolRequest(value)) + '\n')
-  return { frames, send,
+  return { frames, send, waitExit: () => exited, stderr: () => Buffer.concat(stderrChunks).toString('utf8'),
     wait: async (type: string) => {
       for (let attempt = 0; attempt < 300; attempt++) {
         const frame = frames.find((frame) => frame.type === type)
@@ -63,7 +67,7 @@ function checkpointSidecar(directory: string, nativeRequestId = 'native-current'
       if (child.exitCode === null && !frames.some(frame => frame.type === 'create.failed' || frame.type === 'sdk.stream.ended')) {
         send({ type: 'shutdown', awaitNativeShutdown })
       }
-      await exited
+      return await exited
     },
   }
 }
@@ -406,6 +410,115 @@ describe('production sidecar native checkpoint continuation', () => {
       expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([{}, {}])
       expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
     } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('keeps concurrent callbacks for the same native tool-use ID fenced', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-duplicate-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-batch-duplicate', false, false, directory, false, false,
+      'incomplete', { FRESHELL_SIDECAR_TEST_DUPLICATE_TOOL_USE_ID: '1' })
+    try {
+      worker.send({ type: 'create', requestId: 'batch-duplicate-create', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const created = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: created.sessionId, text: 'duplicate native tool use' })
+      const denied = { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: 'Original native checkpoint has no current fenced release' } }
+      expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([{}, denied])
+      expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('keeps overlapping hooks fenced when checkpoint state is unreadable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-batch-fenced-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    const worker = checkpointSidecar(directory, 'native-batch-fenced', false, false, directory, false, false,
+      'incomplete', { FRESHELL_SIDECAR_TEST_CORRUPT_CHECKPOINT_BEFORE_TOOL: '1' })
+    try {
+      worker.send({ type: 'create', requestId: 'batch-fenced-create', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const created = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: created.sessionId, text: 'two independent operations' })
+      const denied = { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: 'Original native checkpoint has no current fenced release' } }
+      expect((await worker.wait('probe.batch-hooks')).outcomes).toEqual([denied, denied])
+      expect(worker.frames.some((frame) => frame.nativeCheckpoint)).toBe(false)
+    } finally { await worker.close(); await rm(directory, { recursive: true, force: true }) }
+  })
+  it('leaves pending native hook callbacks unresolved when their SDK stream ends', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-stream-end-checkpoint-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    let worker = checkpointSidecar(directory, 'native-stream-end-seed')
+    try {
+      worker.send({ type: 'create', requestId: 'stream-end-seed', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const seed = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: seed.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.toolUseID).toBe('toolu_original1')
+      const transcriptPath = join(directory, 'native.jsonl')
+      const checkpointPath = join(directory, '.freshell', 'native-checkpoints', 'claude', root + '.json')
+      const transcriptBefore = await readFile(transcriptPath)
+      const checkpointBefore = await readFile(checkpointPath)
+      expect(JSON.parse(checkpointBefore.toString()).checkpoint.toolUseID).toBe(card.nativeCheckpoint.toolUseID)
+      expect(await worker.close()).toBe(0)
+
+      worker = checkpointSidecar(directory, 'native-stream-end-current', false, false, directory, true, false, false,
+        { FRESHELL_SIDECAR_TEST_END_STREAM_AFTER_TWO_HOOKS: '1' })
+      worker.send({ type: 'create', requestId: 'stream-end-current', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      await worker.wait('probe.native-hooks-started')
+      expect((await worker.wait('sdk.stream.ended')).reason).toBe('stream_eof')
+      expect(await worker.waitExit()).toBe(3)
+      expect(existsSync(join(directory, 'late-native-hook-resolution'))).toBe(false)
+      expect(worker.stderr()).not.toMatch(/UnhandledPromiseRejection|ERR_UNHANDLED_REJECTION/i)
+      expect(await readFile(transcriptPath)).toEqual(transcriptBefore)
+      expect(await readFile(checkpointPath)).toEqual(checkpointBefore)
+      expect(worker.frames.some((frame) => frame.type === 'sdk.permission.request')).toBe(false)
+    } finally {
+      await worker.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+  it('leaves parked native hook callbacks unresolved while shutdown closes the SDK transport', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'sidecar-native-shutdown-checkpoint-'))
+    await writeFile(join(directory, 'native.jsonl'), JSON.stringify({ type: 'system', sessionId: root }) + '\n')
+    let worker = checkpointSidecar(directory, 'native-shutdown-seed')
+    try {
+      worker.send({ type: 'create', requestId: 'shutdown-seed', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const seed = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId: seed.sessionId, text: 'owned original operation' })
+      const card = await worker.wait('sdk.permission.request')
+      expect(card.nativeCheckpoint.toolUseID).toBe('toolu_original1')
+      const transcriptPath = join(directory, 'native.jsonl')
+      const checkpointPath = join(directory, '.freshell', 'native-checkpoints', 'claude', root + '.json')
+      const transcriptBefore = await readFile(transcriptPath)
+      const checkpointBefore = await readFile(checkpointPath)
+      expect(await worker.close()).toBe(0)
+
+      worker = checkpointSidecar(directory, 'native-shutdown-current', false, true, directory, true, false, false,
+        { FRESHELL_SIDECAR_TEST_PARK_TWO_HOOKS_UNTIL_SHUTDOWN: '1' })
+      worker.send({ type: 'create', requestId: 'shutdown-current', cwd: directory,
+        resumeSessionId: root, permissionMode: 'default' })
+      const current = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      await worker.wait('probe.native-child')
+      worker.send({ type: 'send', sessionId: current.sessionId, text: 'resume owned checkpoint' })
+      await worker.wait('probe.native-hooks-parked')
+      expect(await worker.close()).toBe(0)
+      expect(existsSync(join(directory, 'late-native-hook-resolution'))).toBe(false)
+      expect(worker.stderr()).not.toMatch(/UnhandledPromiseRejection|ERR_UNHANDLED_REJECTION/i)
+      expect(await readFile(transcriptPath)).toEqual(transcriptBefore)
+      expect(await readFile(checkpointPath)).toEqual(checkpointBefore)
+    } finally {
+      await worker.close()
+      await rm(directory, { recursive: true, force: true })
+    }
   })
   it('persists managed continuation state outside provider-native project artifacts', async () => {
     const home = await mkdtemp(join(tmpdir(), 'sidecar-native-census-'))

@@ -1,7 +1,7 @@
 // Controlled loader used only to exercise the real sidecar/native-hook boundary.
 import { exec } from 'node:child_process'
 import { appendFileSync, existsSync } from 'node:fs'
-import { appendFile, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 const nativeChildren = new Set()
 let nativeForks = 0
@@ -109,6 +109,13 @@ export function query({ prompt, options }) {
       }
       for await (const message of inputs()) {
         await logNativeInput(message)
+        if (process.env.FRESHELL_SIDECAR_TEST_CORRUPT_CHECKPOINT_BEFORE_TOOL === '1') {
+          // The ordinary send was admitted against the clear store; make the
+          // state ambiguous only at the later native hook boundary.
+          const checkpointDirectory = join(process.env.HOME, '.freshell', 'native-checkpoints', 'claude')
+          await mkdir(checkpointDirectory, { recursive: true })
+          await writeFile(join(checkpointDirectory, nativeRoot + '.json'), '{ unreadable checkpoint state')
+        }
         const inputText = typeof message.message?.content === 'string' ? message.message.content
           : message.message?.content?.filter(block => block.type === 'text').map(block => block.text).join('')
         if (process.env.FRESHELL_SIDECAR_TEST_NATIVE_CLEAR === '1' && inputText?.startsWith('/compact')) {
@@ -138,16 +145,47 @@ export function query({ prompt, options }) {
           ? undefined : options.hooks?.PreToolUse?.[0]?.hooks?.[0]
         const hookInput = { hook_event_name: 'PreToolUse', session_id: nativeRoot,
           tool_name: 'Bash', tool_input: input, tool_use_id: toolUseID }
+        if (callback && process.env.FRESHELL_SIDECAR_TEST_END_STREAM_AFTER_TWO_HOOKS === '1') {
+          const first = callback(hookInput, toolUseID, { signal: options.abortController.signal })
+          const secondInput = { command: 'second owned harmless counter' }
+          const second = callback({ ...hookInput, tool_use_id: 'toolu_second1', tool_input: secondInput },
+            'toolu_second1', { signal: options.abortController.signal })
+          for (const pending of [first, second]) {
+            void pending.then(
+              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'resolved\n'),
+              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'rejected\n'))
+          }
+          process.stdout.write(JSON.stringify({ type: 'probe.native-hooks-started' }) + '\n')
+          return
+        }
+        if (callback && process.env.FRESHELL_SIDECAR_TEST_PARK_TWO_HOOKS_UNTIL_SHUTDOWN === '1') {
+          const first = callback(hookInput, toolUseID, { signal: options.abortController.signal })
+          const secondInput = { command: 'second owned harmless counter' }
+          const second = callback({ ...hookInput, tool_use_id: 'toolu_second1', tool_input: secondInput },
+            'toolu_second1', { signal: options.abortController.signal })
+          for (const pending of [first, second]) {
+            void pending.then(
+              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'resolved\n'),
+              () => appendFileSync(join(options.cwd, 'late-native-hook-resolution'), 'rejected\n'))
+          }
+          process.stdout.write(JSON.stringify({ type: 'probe.native-hooks-parked' }) + '\n')
+          await new Promise((resolve) => options.abortController.signal.addEventListener('abort', resolve, { once: true }))
+          return
+        }
         if (['1', 'incomplete'].includes(process.env.FRESHELL_SIDECAR_TEST_SPLIT_BATCH)) {
           yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_start', message: { id: assistant.message.id } } }
           yield assistant
           const first = callback(hookInput, toolUseID, { signal: options.abortController.signal })
-          await new Promise((resolve) => setTimeout(resolve, 20))
+          // Deliver the other row while the first hook's async checkpoint
+          // inspection may still be in flight; don't rely on a timer to pick
+          // whether these callbacks overlap.
           const secondInput = { command: 'second owned harmless counter' }
+          const secondToolUseID = process.env.FRESHELL_SIDECAR_TEST_DUPLICATE_TOOL_USE_ID === '1'
+            ? toolUseID : 'toolu_second1'
           yield { ...assistant, uuid: 'assistant-second', message: { id: assistant.message.id,
-            content: [{ type: 'tool_use', id: 'toolu_second1', name: 'Bash', input: secondInput }] } }
-          const second = callback({ ...hookInput, tool_use_id: 'toolu_second1', tool_input: secondInput },
-            'toolu_second1', { signal: options.abortController.signal })
+            content: [{ type: 'tool_use', id: secondToolUseID, name: 'Bash', input: secondInput }] } }
+          const second = callback({ ...hookInput, tool_use_id: secondToolUseID, tool_input: secondInput },
+            secondToolUseID, { signal: options.abortController.signal })
           if (process.env.FRESHELL_SIDECAR_TEST_SPLIT_BATCH !== 'incomplete') {
             yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_stop' } }
           }
@@ -161,8 +199,9 @@ export function query({ prompt, options }) {
           yield assistant
           yield { type: 'stream_event', session_id: nativeRoot, event: { type: 'message_stop' } }
         }
-        const outcome = hookFirst ? await hookFirst : callback ? await callback(hookInput, toolUseID,
-          { signal: options.abortController.signal }) : {}
+        const outcomePromise = hookFirst ?? (callback ? callback(hookInput, toolUseID,
+          { signal: options.abortController.signal }) : undefined)
+        const outcome = outcomePromise ? await outcomePromise : {}
         if (outcome.hookSpecificOutput?.permissionDecision === 'defer') {
           const attachment = { type: 'attachment', sessionId: nativeRoot, uuid: 'checkpoint-original', version: '2.1.237',
             attachment: { type: 'hook_deferred_tool', toolUseID, toolName: 'Bash', toolInput: input,
