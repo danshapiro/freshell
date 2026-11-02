@@ -1,0 +1,1157 @@
+import { spawn, spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { once } from 'node:events'
+import { expect, it, vi } from 'vitest'
+import {
+  DEFAULT_UPDATE_REMINDER,
+  RESET_UPDATE_REMINDER,
+  buildSelectedArtifacts,
+  buildReopenCandidates,
+  createJsonLogger,
+  parseManagedUpdateMode,
+  runManagedUpdateBootstrap,
+  runManagedRuntimeUpdate,
+  runManagedRuntimeWorker,
+  swapDirectoryOnDestination,
+  webActionCanReachSupervisor,
+  type ManagedRuntimeUpdateDependencies,
+  type RuntimeView,
+  type SystemdUnitGraph,
+} from '../../../scripts/update-managed-runtime.js'
+
+const owner = {
+  checkoutRoot: '/srv/freshell',
+  webUnit: 'freshell-rust.service',
+  supervisorUnit: 'freshell-supervisor.service',
+  webExecutable: '/srv/freshell/target/release/freshell-server',
+  supervisorExecutable: '/srv/freshell/target/release/freshell-supervisor',
+  adminCli: '/srv/freshell/target/release/freshell-supervisor-admin',
+  sessionHostBinary: '/srv/freshell/target/release/freshell-session-host',
+  clientDirectory: '/srv/freshell/dist/client',
+  dockerSocket: '/run/user/1000/docker.sock',
+  controlSocket: '/home/operator/.freshell/managed-runtime/control/supervisor.sock',
+  callbackSocket: '/home/operator/.freshell/managed-runtime/control/mcp.sock',
+  controlSecretFile: '/home/operator/.freshell/managed-runtime/control/secret',
+  registryRoot: '/home/operator/.freshell/managed-runtime/registry',
+  runtimeRoot: '/home/operator/.freshell/managed-runtime/runtime',
+  providerRoot: '/home/operator/.freshell/managed-runtime/providers',
+  workspaceRoot: '/home/operator/workspaces',
+  environmentFile: '/srv/freshell/.env',
+  imageEnvironmentFile: '/home/operator/.config/freshell/managed-runtime.env',
+  imageReference: 'sha256:' + 'a'.repeat(64),
+  databasePath: '/home/operator/.freshell/managed-runtime/registry/registry.sqlite3',
+  callbackAddress: 'http://127.0.0.1:3001',
+}
+
+function view(overrides: Partial<RuntimeView> = {}): RuntimeView {
+  return {
+    soulId: 'soul-codex',
+    incarnationId: 'incarnation-1',
+    launchState: 'running',
+    cleanupState: 'none',
+    intentRevision: 12,
+    desiredState: 'running',
+    provider: 'codex',
+    nativeSessionId: 'native-session-1',
+    terminalResumeSessionId: 'native-session-1',
+    freshAgentSessionId: null,
+    ...overrides,
+  }
+}
+
+function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {}) {
+  const effects: string[] = []
+  const events: Record<string, unknown>[] = []
+  const defaultDeps: ManagedRuntimeUpdateDependencies = {
+    paths: {
+      checkoutRoot: '/srv/freshell',
+      home: '/home/operator',
+      runtimeDirectory: '/run/user/1000',
+      node: '/usr/bin/node',
+      tsxEntry: '/srv/freshell/node_modules/tsx/dist/cli.mjs',
+      updaterScript: '/srv/freshell/scripts/update-managed-runtime.ts',
+      env: '/usr/bin/env',
+      flock: '/usr/bin/flock',
+      systemdRun: '/usr/bin/systemd-run',
+      systemctl: '/usr/bin/systemctl',
+      pnpm: '/home/operator/.local/share/pnpm/pnpm',
+      cargo: '/home/operator/.cargo/bin/cargo',
+      docker: '/usr/bin/docker',
+      sqlite: '/usr/bin/sqlite3',
+      toolPath: '/home/operator/.local/share/pnpm:/home/operator/.cargo/bin:/usr/local/bin:/usr/bin:/bin',
+      pnpmHome: '/home/operator/.local/share/pnpm',
+      cargoHome: '/home/operator/.cargo',
+      rustupHome: '/home/operator/.rustup',
+      cargoTargetDirectory: '/tmp/freshell-update/cargo-target',
+    },
+    approval: {
+      readLine: vi.fn(async () => 'APPROVED'),
+      create: vi.fn(async () => '/run/user/1000/freshell-update-approval-one'),
+      consume: vi.fn(async () => true),
+      remove: vi.fn(async () => undefined),
+    },
+    handoff: {
+      submit: vi.fn(async (_request) => {
+        effects.push('handoff')
+        return 0
+      }),
+      runLockedWorker: vi.fn(async () => 0),
+    },
+    owner: {
+      resolve: vi.fn(async () => {
+        effects.push('owner')
+        return owner
+      }),
+      inspectGraph: vi.fn(async () => {
+        effects.push('graph')
+        return { units: {} }
+      }),
+    },
+    artifacts: {
+      build: vi.fn(async (_selectedOwner, mode) => {
+        effects.push(`build:${mode}`)
+        return {
+          webExecutable: '/tmp/stage/freshell-server',
+          clientDirectory: '/tmp/stage/client',
+          supervisorExecutable: '/tmp/stage/freshell-supervisor',
+          adminCli: '/tmp/stage/freshell-supervisor-admin',
+          sessionHostBinary: '/tmp/stage/freshell-session-host',
+          imageId: 'sha256:' + 'b'.repeat(64),
+        }
+      }),
+    },
+    filesystem: {
+      webExecutableIdentity: vi.fn(async () => ({
+        live: { path: owner.webExecutable, device: 1, inode: 10 },
+        selected: { path: owner.webExecutable, device: 1, inode: 10 },
+      })),
+      installExecutable: vi.fn(async (_source, target) => { effects.push(`install:${target}`) }),
+      swapClientDirectory: vi.fn(async (_source, target) => { effects.push(`client:${target}`) }),
+      installImageReference: vi.fn(async (_environmentFile, _imageId) => { effects.push('install:image-ref') }),
+    },
+    services: {
+      stop: vi.fn(async (unit) => { effects.push(`stop:${unit}`) }),
+      start: vi.fn(async (unit) => { effects.push(`start:${unit}`) }),
+      restart: vi.fn(async (unit) => { effects.push(`restart:${unit}`) }),
+      isActive: vi.fn(async (unit) => unit === owner.supervisorUnit),
+      waitSupervisorReady: vi.fn(async () => { effects.push('supervisor-ready') }),
+      waitWebReady: vi.fn(async () => { effects.push('web-ready') }),
+      waitCallbackReady: vi.fn(async () => { effects.push('callback-ready') }),
+    },
+    admin: {
+      candidateSchemaVersion: vi.fn(async () => 19),
+      currentSchemaVersion: vi.fn(async () => 19),
+      health: vi.fn(async () => ({ state: 'ok' as const })),
+      inventory: vi.fn(async () => [view()]),
+      stop: vi.fn(async (soulId, expectedIntentRevision) => ({
+        outcome: 'verified_empty' as const,
+        view: view({ soulId, intentRevision: expectedIntentRevision + 1, desiredState: 'stopped', launchState: 'stopped', cleanupState: 'verified_empty' }),
+      })),
+      reopen: vi.fn(async (_candidate) => ({ outcome: 'reopened' as const })),
+    },
+    docker: {
+      buildImage: vi.fn(async () => 'sha256:' + 'b'.repeat(64)),
+      verifyDaemon: vi.fn(async () => undefined),
+    },
+    logger: {
+      event: vi.fn(async (event) => { events.push(event) }),
+      operator: vi.fn(async (line) => { effects.push(`operator:${line}`) }),
+    },
+    now: vi.fn(() => new Date('2026-11-01T12:34:56.789Z')),
+    randomSuffix: vi.fn(() => 'abc123def456'),
+    ...overrides,
+  }
+  return { deps: defaultDeps, effects, events }
+}
+
+it('reset abort restores web before supervisor shutdown', async () => {
+    const f = dependencies()
+    const addressed = view({
+      soulId: 'soul-already-stopped',
+      desiredState: 'stopped',
+      launchState: 'running',
+      cleanupState: 'termination_unconfirmed',
+      nativeSessionId: null,
+      terminalResumeSessionId: null,
+    })
+    f.deps.admin.inventory = vi.fn(async () => {
+      f.effects.push('inventory')
+      return [addressed]
+    })
+
+    const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+    expect(result).toBe(1)
+    expect(f.effects.indexOf('stop:freshell-rust.service')).toBeLessThan(f.effects.indexOf('inventory'))
+    expect(f.effects.indexOf('start:freshell-rust.service')).toBeGreaterThan(f.effects.indexOf('inventory'))
+    expect(f.effects).not.toContain('stop:freshell-supervisor.service')
+    expect(f.deps.admin.stop).not.toHaveBeenCalled()
+})
+
+it('stop batch halts after first nonverified outcome', async () => {
+    const f = dependencies()
+    f.deps.admin.inventory = vi.fn(async () => [
+      view({ soulId: 'soul-first', incarnationId: 'incarnation-first', provider: 'codex', intentRevision: 4 }),
+      view({ soulId: 'soul-second', incarnationId: 'incarnation-second', provider: 'claude', intentRevision: 9 }),
+    ])
+    f.deps.admin.stop = vi.fn(async (soulId) => {
+      f.effects.push(`admin-stop:${soulId}`)
+      return { outcome: 'blocked_ownership' as const, view: view({ soulId }) }
+    })
+
+    const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+    expect(result).toBe(1)
+    expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
+    expect(f.deps.admin.stop).toHaveBeenCalledWith('soul-first', 4, owner)
+    expect(f.effects).not.toContain('admin-stop:soul-second')
+    expect(f.effects).not.toContain('stop:freshell-supervisor.service')
+    expect(f.effects.indexOf('start:freshell-rust.service')).toBeGreaterThan(f.effects.indexOf('admin-stop:soul-first'))
+})
+
+it('stop failure reports the attempted prefix and verified-empty set', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [
+    view({ soulId: 'soul-first', intentRevision: 4 }),
+    view({ soulId: 'soul-second', intentRevision: 9 }),
+    view({ soulId: 'soul-third', intentRevision: 15 }),
+  ])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => {
+    f.effects.push(`admin-stop:${soulId}`)
+    if (soulId === 'soul-second') return { outcome: 'backend_unavailable' as const }
+    return {
+      outcome: 'verified_empty' as const,
+      view: view({
+        soulId,
+        intentRevision: expectedIntentRevision + 1,
+        desiredState: 'stopped',
+        launchState: 'stopped',
+        cleanupState: 'verified_empty',
+      }),
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.inventory).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.stop).toHaveBeenCalledTimes(2)
+  expect(f.effects).not.toContain('admin-stop:soul-third')
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.stop_failed',
+    attempted_prefix: ['soul-first', 'soul-second'],
+    verified_empty_stopped: ['soul-first'],
+  }))
+})
+
+it('unverified Stop view restores web and prevents the next soul or supervisor action', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [
+    view({ soulId: 'soul-first' }),
+    view({ soulId: 'soul-second', provider: 'claude' }),
+  ])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'running',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.stop).not.toHaveBeenCalledWith('soul-second', expect.anything(), expect.anything())
+  expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+})
+
+it('durable-only refuses changed web executable', async () => {
+    const f = dependencies()
+    f.deps.filesystem.webExecutableIdentity = vi.fn(async () => ({
+      live: { path: '/srv/freshell/target/release/old-server', device: 1, inode: 10 },
+      selected: { path: owner.webExecutable, device: 1, inode: 11 },
+    }))
+
+    const result = await runManagedRuntimeWorker('durable-only', f.deps, '/run/user/1000/approval')
+
+    expect(result).toBe(2)
+    expect(f.deps.filesystem.webExecutableIdentity).toHaveBeenCalledWith(owner.webExecutable)
+    expect(f.effects).not.toContain('stop:freshell-rust.service')
+    expect(f.effects).not.toContain('stop:freshell-supervisor.service')
+    expect(f.deps.admin.inventory).not.toHaveBeenCalled()
+})
+
+it('default completion event includes reminder', async () => {
+    const f = dependencies()
+
+    const result = await runManagedRuntimeWorker('client', f.deps)
+
+    expect(result).toBe(0)
+    expect(f.deps.services.restart).toHaveBeenCalledWith(owner.webUnit)
+    expect(f.deps.services.restart).not.toHaveBeenCalledWith(owner.supervisorUnit)
+    expect(f.events).toContainEqual(expect.objectContaining({
+      event: 'update.completed',
+      mode: 'client',
+      reminder: DEFAULT_UPDATE_REMINDER,
+    }))
+})
+
+it('bootstrap invokes resolved tsx entrypoint with pinned node', async () => {
+    const f = dependencies()
+
+    const result = await runManagedRuntimeUpdate([], f.deps)
+
+    expect(result).toBe(0)
+    expect(f.deps.handoff.submit).toHaveBeenCalledTimes(1)
+    const request = vi.mocked(f.deps.handoff.submit).mock.calls[0]?.[0]
+    expect(request?.unit).toMatch(/^freshell-update-managed-runtime-20261101T123456789Z-abc123def456\.service$/)
+    expect(request?.args).toContain('--wait')
+    expect(request?.args).not.toContain('--pipe')
+    expect(request?.args).not.toContain('--collect')
+    expect(request?.args).toContain('/usr/bin/node')
+    expect(request?.args).toContain('/srv/freshell/node_modules/tsx/dist/cli.mjs')
+    expect(request?.args).not.toContain('/srv/freshell/node_modules/.bin/tsx')
+    expect(request?.environment).not.toHaveProperty('APPROVED')
+})
+
+it('invalid update modes refuse before approval or handoff', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeUpdate(['--all', '--durable-only'], f.deps)
+
+  expect(result).toBe(2)
+  expect(f.deps.approval.readLine).not.toHaveBeenCalled()
+  expect(f.deps.approval.create).not.toHaveBeenCalled()
+  expect(f.deps.handoff.submit).not.toHaveBeenCalled()
+})
+
+it('reset mode requires the exact approval line and creates a mode-0600 handoff file', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeUpdate(['--all'], f.deps)
+
+  expect(result).toBe(0)
+  expect(f.deps.approval.create).toHaveBeenCalledWith('APPROVED\n', 0o600)
+  expect(f.deps.approval.remove).toHaveBeenCalledWith('/run/user/1000/freshell-update-approval-one')
+  const request = vi.mocked(f.deps.handoff.submit).mock.calls[0]?.[0]
+  expect(request?.args).toContain('/run/user/1000/freshell-update-approval-one')
+  expect(request?.args).not.toContain('APPROVED')
+  expect(Object.values(request?.environment ?? {})).not.toContain('APPROVED')
+  expect(f.effects.indexOf(`operator:Durable log: ${request?.logPath}`)).toBeLessThan(f.effects.indexOf('handoff'))
+  expect(f.effects.findIndex((effect) => effect.startsWith(`operator:${RESET_UPDATE_REMINDER}`))).toBeLessThan(f.effects.indexOf('handoff'))
+})
+
+it('inexact reset approval refuses before file creation and handoff', async () => {
+  const f = dependencies()
+  f.deps.approval.readLine = vi.fn(async () => 'APPROVED ')
+
+  const result = await runManagedRuntimeUpdate(['--durable-only'], f.deps)
+
+  expect(result).toBe(2)
+  expect(f.deps.approval.create).not.toHaveBeenCalled()
+  expect(f.deps.handoff.submit).not.toHaveBeenCalled()
+})
+
+it('flock contention logs and removes only this invocation approval without worker effects', async () => {
+  const f = dependencies()
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-lock-'))
+  const lockPath = path.join(temp, 'freshell-update-managed-runtime.lock')
+  const markerPath = path.join(temp, 'holder-ready')
+  const approvalPath = path.join(temp, 'this-approval')
+  const otherApprovalPath = path.join(temp, 'other-approval')
+  fs.writeFileSync(approvalPath, 'APPROVED\n', { mode: 0o600 })
+  fs.writeFileSync(otherApprovalPath, 'APPROVED\n', { mode: 0o600 })
+  f.deps.paths.runtimeDirectory = temp
+  f.deps.approval.remove = vi.fn(async (filePath) => { await fs.promises.unlink(filePath) })
+  f.deps.approval.consume = vi.fn(async () => { throw new Error('contention must not read approval') })
+  f.deps.handoff.runLockedWorker = vi.fn(async (request) => {
+    const result = spawnSync(f.deps.paths.flock, ['-n', '-E', '75', request.lockPath, ...request.command], {
+      env: request.environment,
+      stdio: 'ignore',
+    })
+    return result.status ?? 1
+  })
+  const holderScript = "require('node:fs').writeFileSync(process.argv[1], 'locked'); setTimeout(() => {}, 60000)"
+  const holder = spawn(f.deps.paths.flock, [
+    '-n', lockPath, process.execPath, '-e', holderScript, markerPath,
+  ], { detached: true, stdio: 'ignore' })
+
+  try {
+    await once(holder, 'spawn')
+    const deadline = Date.now() + 5_000
+    while (!fs.existsSync(markerPath) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+    expect(fs.existsSync(markerPath)).toBe(true)
+
+    const result = await runManagedUpdateBootstrap({
+      mode: 'all',
+      unitName: 'freshell-update-managed-runtime-20261101T123456789Z-abc123def456.service',
+      runId: '20261101T123456789Z-abc123def456',
+      approvalFile: approvalPath,
+    }, f.deps)
+
+    expect(result).toBe(75)
+    expect(f.events).toContainEqual({
+      event: 'update.lock_contention',
+      severity: 'error',
+      mode: 'all',
+      phase: 'lock',
+      error_code: 'update_lock_busy',
+    })
+    expect(f.deps.approval.consume).not.toHaveBeenCalled()
+    expect(f.deps.approval.remove).toHaveBeenCalledExactlyOnceWith(approvalPath)
+    expect(fs.existsSync(approvalPath)).toBe(false)
+    expect(fs.existsSync(otherApprovalPath)).toBe(true)
+    expect(f.deps.owner.resolve).not.toHaveBeenCalled()
+    expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+    expect(f.effects).toEqual([])
+  } finally {
+    if (holder.exitCode === null) {
+      try { process.kill(-holder.pid!, 'SIGTERM') } catch { /* the holder may have exited */ }
+      await once(holder, 'exit').catch(() => undefined)
+    }
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 15_000)
+
+it('handoff completion and JSONL logging survive the launcher process exit', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-boundary-'))
+  const modulePath = path.resolve('scripts/update-managed-runtime.ts')
+  const tsxEntry = fs.realpathSync('node_modules/tsx/dist/cli.mjs')
+  const workerPath = path.join(temp, 'worker.mts')
+  const launcherPath = path.join(temp, 'launcher.mts')
+  const runId = '20261101T123456789Z-abc123def456'
+  const logPath = path.join(temp, '.freshell', 'logs', `managed-runtime-update-${runId}.jsonl`)
+  fs.writeFileSync(workerPath, `
+import { createJsonLogger } from ${JSON.stringify(modulePath)}
+await createJsonLogger(process.argv[2]).event({ event: 'update.completed', severity: 'info', mode: 'client', phase: 'complete' })
+`)
+  fs.writeFileSync(launcherPath, `
+import { spawn } from 'node:child_process'
+import { runManagedRuntimeUpdate } from ${JSON.stringify(modulePath)}
+const home = ${JSON.stringify(temp)}
+const deps = {
+  paths: { checkoutRoot: home, home, runtimeDirectory: home, node: process.execPath, tsxEntry: ${JSON.stringify(tsxEntry)}, updaterScript: ${JSON.stringify(modulePath)}, env: '/usr/bin/env', flock: '/usr/bin/flock', systemdRun: '/usr/bin/systemd-run', systemctl: '/usr/bin/systemctl', pnpm: '/usr/bin/pnpm', cargo: '/usr/bin/cargo', docker: '/usr/bin/docker', sqlite: '/usr/bin/sqlite3', toolPath: '/usr/bin' },
+  approval: { async readLine() { throw new Error('default mode must not prompt') }, async create() { throw new Error('default mode must not create approval') }, async consume() { return false }, async remove() {} },
+  handoff: { submit(request) { const child = spawn(process.execPath, [${JSON.stringify(tsxEntry)}, ${JSON.stringify(workerPath)}, request.logPath], { detached: true, stdio: 'ignore' }); child.unref(); return Promise.resolve(0) }, async runLockedWorker() { return 0 } },
+  owner: { async resolve() { throw new Error('handoff worker owns update actions') }, async inspectGraph() { return { units: {} } } },
+  artifacts: { async build() { throw new Error('handoff worker owns update actions') } },
+  filesystem: { async webExecutableIdentity() { return { live: null, selected: null } }, async installExecutable() {}, async swapClientDirectory() {}, async installImageReference() {} },
+  services: { async stop() {}, async start() {}, async restart() {}, async isActive() { return false }, async waitSupervisorReady() {}, async waitWebReady() {}, async waitCallbackReady() {} },
+  admin: { async candidateSchemaVersion() { return 19 }, async currentSchemaVersion() { return 19 }, async health() { return { state: 'ok' } }, async inventory() { return [] }, async stop() { return { outcome: 'backend_unavailable' } }, async reopen() { return { outcome: 'failed' } } },
+  docker: { async buildImage() { return 'sha256:' + 'b'.repeat(64) }, async verifyDaemon() {} },
+  logger: { async event() {}, async operator() {} },
+  now() { return new Date('2026-11-01T12:34:56.789Z') }, randomSuffix() { return 'abc123def456' },
+}
+await runManagedRuntimeUpdate([], deps)
+`)
+
+  try {
+    const launcher = spawn(process.execPath, [tsxEntry, launcherPath], { stdio: 'pipe' })
+    let launcherOutput = ''
+    launcher.stdout?.on('data', (chunk: Buffer) => { launcherOutput += chunk.toString() })
+    launcher.stderr?.on('data', (chunk: Buffer) => { launcherOutput += chunk.toString() })
+    const [exitCode] = await once(launcher, 'exit') as [number]
+    expect(exitCode, launcherOutput).toBe(0)
+    const deadline = Date.now() + 5_000
+    while (!fs.existsSync(logPath) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+    expect(fs.existsSync(logPath)).toBe(true)
+    expect(fs.readFileSync(logPath, 'utf8')).toContain('"event":"update.completed"')
+    expect(fs.statSync(logPath).mode & 0o777).toBe(0o600)
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 15_000)
+
+it('worker consumes approval before owner inspection', async () => {
+  const f = dependencies()
+  f.deps.approval.consume = vi.fn(async () => {
+    f.effects.push('consume-approval')
+    return true
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.effects.indexOf('consume-approval')).toBeLessThan(f.effects.indexOf('owner'))
+  expect(f.deps.approval.consume).toHaveBeenCalledWith('/run/user/1000/approval')
+})
+
+it('worker approval refusal does not inspect or mutate the owner', async () => {
+  const f = dependencies()
+  f.deps.approval.consume = vi.fn(async () => false)
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/invalid-approval')
+
+  expect(result).toBe(2)
+  expect(f.deps.owner.resolve).not.toHaveBeenCalled()
+  expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+  expect(f.effects).toEqual([])
+})
+
+it('owner inspection errors refuse before building or service effects', async () => {
+  const f = dependencies()
+  f.deps.owner.resolve = vi.fn(async () => {
+    throw new Error('selected runtime owner could not be verified')
+  })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+  expect(f.deps.services.restart).not.toHaveBeenCalled()
+})
+
+it('candidate schema read errors refuse before stopping web ingress', async () => {
+  const f = dependencies()
+  f.deps.admin.candidateSchemaVersion = vi.fn(async () => {
+    throw new Error('candidate schema could not be verified')
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.effects).not.toContain('stop:freshell-rust.service')
+  expect(f.effects).not.toContain('stop:freshell-supervisor.service')
+  expect(f.deps.admin.inventory).not.toHaveBeenCalled()
+})
+
+it('schema mismatch refuses before web ingress or session mutation', async () => {
+  const f = dependencies()
+  f.deps.admin.candidateSchemaVersion = vi.fn(async () => 20)
+  f.deps.admin.currentSchemaVersion = vi.fn(async () => 19)
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(2)
+  expect(f.deps.admin.candidateSchemaVersion).toHaveBeenCalledWith('/tmp/stage/freshell-supervisor')
+  expect(f.deps.admin.currentSchemaVersion).toHaveBeenCalledWith(owner.databasePath)
+  expect(f.deps.services.stop).not.toHaveBeenCalled()
+  expect(f.deps.admin.inventory).not.toHaveBeenCalled()
+})
+
+it('owner path mismatch refuses before building or changing a service', async () => {
+  const f = dependencies()
+  f.deps.owner.resolve = vi.fn(async () => ({ ...owner, webExecutable: '/other/freshell-server' }))
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+  expect(f.deps.services.restart).not.toHaveBeenCalled()
+})
+
+it('reopen uses the stopped revision returned by the fenced Stop', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [view({ intentRevision: 12 })])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.admin.reopen).toHaveBeenCalledWith(expect.objectContaining({
+    soulId: 'soul-codex',
+    expectedIntentRevision: 13,
+  }), owner)
+})
+
+it.each([
+  ['Requires', 'web', 'supervisor'],
+  ['Wants', 'web', 'supervisor'],
+  ['Requisite', 'web', 'supervisor'],
+  ['PartOf', 'supervisor', 'web'],
+  ['BindsTo', 'web', 'supervisor'],
+  ['BindsTo', 'supervisor', 'web'],
+  ['Upholds', 'web', 'supervisor'],
+  ['PropagatesStopTo', 'web', 'supervisor'],
+  ['ConsistsOf', 'web', 'supervisor'],
+  ['BoundBy', 'web', 'supervisor'],
+  ['UpheldBy', 'supervisor', 'web'],
+  ['StopPropagatedFrom', 'supervisor', 'web'],
+])('web action rejects effective %s relationship from %s to %s', (property, source, target) => {
+  const web = 'freshell-rust.service'
+  const supervisor = 'freshell-supervisor.service'
+  const units: Record<string, Record<string, string[]>> = {
+    [web]: {},
+    [supervisor]: {},
+  }
+  const key = source === 'web' ? web : supervisor
+  const value = target === 'web' ? web : supervisor
+  units[key]![property] = [value]
+
+  expect(webActionCanReachSupervisor({ units } as SystemdUnitGraph, web, supervisor)).toBe(true)
+})
+
+it('ordering-only After does not make a web action reach the supervisor', () => {
+  const graph = {
+    units: {
+      'freshell-rust.service': { After: ['freshell-supervisor.service'] },
+      'freshell-supervisor.service': {},
+    },
+  } as SystemdUnitGraph
+
+  expect(webActionCanReachSupervisor(graph, 'freshell-rust.service', 'freshell-supervisor.service')).toBe(false)
+})
+
+it('transitive activation and stop relationships that reach the supervisor block web actions', () => {
+  const web = 'freshell-rust.service'
+  const supervisor = 'freshell-supervisor.service'
+  const activationGraph = {
+    units: {
+      [web]: { Wants: ['intermediate.service'] },
+      'intermediate.service': { Requisite: [supervisor] },
+      [supervisor]: {},
+    },
+  } as SystemdUnitGraph
+  const stopPropagationGraph = {
+    units: {
+      [web]: { ConsistsOf: ['intermediate.service'] },
+      'intermediate.service': { PropagatesStopTo: [supervisor] },
+      [supervisor]: {},
+    },
+  } as SystemdUnitGraph
+
+  expect(webActionCanReachSupervisor(activationGraph, web, supervisor)).toBe(true)
+  expect(webActionCanReachSupervisor(stopPropagationGraph, web, supervisor)).toBe(true)
+})
+
+it('all mode stops ingress, fences the coding-soul reset, then installs and reopens', async () => {
+  const f = dependencies()
+  f.deps.admin.candidateSchemaVersion = vi.fn(async () => { f.effects.push('candidate-schema'); return 19 })
+  f.deps.admin.currentSchemaVersion = vi.fn(async () => { f.effects.push('current-schema'); return 19 })
+  f.deps.docker.verifyDaemon = vi.fn(async () => { f.effects.push('verify-daemon') })
+  f.deps.admin.inventory = vi.fn(async () => {
+    f.effects.push('inventory')
+    return [view()]
+  })
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => {
+    f.effects.push(`admin-stop:${soulId}:${expectedIntentRevision}`)
+    return {
+      outcome: 'verified_empty' as const,
+      view: view({
+        soulId,
+        intentRevision: expectedIntentRevision + 1,
+        desiredState: 'stopped',
+        launchState: 'stopped',
+        cleanupState: 'verified_empty',
+      }),
+    }
+  })
+  f.deps.admin.health = vi.fn(async () => { f.effects.push('health'); return { state: 'ok' as const } })
+  f.deps.admin.reopen = vi.fn(async (candidate) => {
+    f.effects.push(`reopen:${candidate.soulId}:${candidate.expectedIntentRevision}`)
+    return { outcome: 'reopened' as const }
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.artifacts.build).toHaveBeenCalledWith(owner, 'all')
+  expect(f.deps.admin.inventory).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
+  expect(f.effects.indexOf('candidate-schema')).toBeLessThan(f.effects.indexOf('stop:freshell-rust.service'))
+  expect(f.effects.indexOf('current-schema')).toBeLessThan(f.effects.indexOf('stop:freshell-rust.service'))
+  expect(f.effects.indexOf('stop:freshell-rust.service')).toBeLessThan(f.effects.indexOf('inventory'))
+  expect(f.effects.indexOf('inventory')).toBeLessThan(f.effects.indexOf('admin-stop:soul-codex:12'))
+  expect(f.effects.indexOf('admin-stop:soul-codex:12')).toBeLessThan(f.effects.indexOf('stop:freshell-supervisor.service'))
+  expect(f.effects.indexOf('stop:freshell-supervisor.service')).toBeLessThan(f.effects.indexOf(`install:${owner.supervisorExecutable}`))
+  expect(f.effects.indexOf(`install:${owner.supervisorExecutable}`)).toBeLessThan(f.effects.indexOf('start:freshell-supervisor.service'))
+  expect(f.effects.indexOf('health')).toBeLessThan(f.effects.indexOf('start:freshell-rust.service'))
+  expect(f.effects.indexOf('callback-ready')).toBeLessThan(f.effects.indexOf('reopen:soul-codex:13'))
+})
+
+it('durable-only skips web artifact replacement and verifies the selected running executable', async () => {
+  const f = dependencies()
+  f.deps.filesystem.webExecutableIdentity = vi.fn(async (selectedPath) => {
+    f.effects.push('web-executable-identity')
+    return {
+      live: { path: selectedPath, device: 1, inode: 10 },
+      selected: { path: selectedPath, device: 1, inode: 10 },
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('durable-only', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.artifacts.build).toHaveBeenCalledWith(owner, 'durable-only')
+  expect(f.effects.indexOf('web-executable-identity')).toBeLessThan(f.effects.indexOf('stop:freshell-rust.service'))
+  expect(f.effects).not.toContain(`install:${owner.webExecutable}`)
+  expect(f.effects).not.toContain(`client:${owner.clientDirectory}`)
+  expect(f.effects).toContain('stop:freshell-rust.service')
+  expect(f.effects).toContain('start:freshell-rust.service')
+})
+
+it('client mode builds web assets and restarts only the web service', async () => {
+  const f = dependencies()
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(0)
+  expect(f.deps.artifacts.build).toHaveBeenCalledWith(owner, 'client')
+  expect(f.deps.services.restart).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.stop).not.toHaveBeenCalled()
+  expect(f.deps.services.start).not.toHaveBeenCalled()
+  expect(f.deps.admin.inventory).not.toHaveBeenCalled()
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.deps.admin.reopen).not.toHaveBeenCalled()
+  expect(f.effects).toContain('web-ready')
+  expect(f.effects).toContain('callback-ready')
+})
+
+it('coding-provider souls are reset across prepared and recovering states while shell is excluded', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [
+    view({
+      soulId: 'soul-prepared',
+      provider: 'kilroy',
+      launchState: 'prepared',
+      nativeSessionId: null,
+      terminalResumeSessionId: null,
+      recoveryState: 'recovering',
+    }),
+    view({ soulId: 'soul-shell', provider: 'shell', launchState: 'running' }),
+  ])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.stop).toHaveBeenCalledWith('soul-prepared', 12, owner)
+  expect(f.deps.admin.stop).not.toHaveBeenCalledWith('soul-shell', expect.anything(), expect.anything())
+})
+
+it('client directory swap preserves the old sibling and prevents web restart on activation failure', async () => {
+  const f = dependencies()
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-swap-'))
+  const source = path.join(temp, 'staged-client')
+  const target = path.join(temp, 'served-client')
+  fs.mkdirSync(source)
+  fs.mkdirSync(target)
+  fs.writeFileSync(path.join(source, 'index.html'), 'new client')
+  fs.writeFileSync(path.join(target, 'index.html'), 'old client')
+  let renameCount = 0
+  const rename = async (from: Parameters<typeof fs.promises.rename>[0], to: Parameters<typeof fs.promises.rename>[1]) => {
+    renameCount += 1
+    if (renameCount === 1) return fs.promises.rename(from, to)
+    throw new Error('simulated second rename failure')
+  }
+  f.deps.filesystem.swapClientDirectory = vi.fn(async () => swapDirectoryOnDestination(source, target, rename))
+
+  try {
+    const result = await runManagedRuntimeWorker('client', f.deps)
+
+    expect(result).toBe(1)
+    expect(renameCount).toBe(2)
+    expect(f.deps.services.restart).not.toHaveBeenCalled()
+    const message = f.effects.find((effect) => effect.startsWith('operator:Client directory activation failed;'))
+    const retained = message?.match(/prior directory remains at (.+)\. The web service was not restarted\./)?.[1]
+    expect(retained).toBeDefined()
+    expect(fs.readFileSync(path.join(retained!, 'index.html'), 'utf8')).toBe('old client')
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+})
+
+it('missing isolated Cargo target configuration leaves no staging directory', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-stage-'))
+  const paths = {
+    ...dependencies().deps.paths,
+    home: temp,
+    cargoTargetDirectory: undefined,
+  }
+  const docker = { buildImage: vi.fn(async () => 'sha256:' + 'b'.repeat(64)), verifyDaemon: vi.fn(async () => undefined) }
+
+  try {
+    await expect(buildSelectedArtifacts(paths, owner, 'client', vi.fn(() => ''), docker)).rejects.toThrow(
+      'An isolated Cargo target directory was not configured.',
+    )
+    const stageParent = path.join(temp, '.cache', 'freshell')
+    expect(fs.existsSync(stageParent) ? fs.readdirSync(stageParent) : []).toEqual([])
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+})
+
+it('artifact staging builds only the web or durable outputs selected by mode', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-artifacts-'))
+  const paths = {
+    ...dependencies().deps.paths,
+    home: temp,
+    cargoTargetDirectory: path.join(temp, 'cargo-target'),
+  }
+  const commands: Array<{ command: string; args: string[]; cwd?: string; target?: string }> = []
+  const run = (command: string, args: string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv }) => {
+    commands.push({ command, args, cwd: options?.cwd, target: options?.env?.CARGO_TARGET_DIR })
+    if (command === paths.pnpm) {
+      const outIndex = args.indexOf('--outDir')
+      const output = args[outIndex + 1]!
+      fs.mkdirSync(output, { recursive: true })
+      fs.writeFileSync(path.join(output, 'index.html'), 'client fixture')
+    }
+    if (command === paths.cargo) {
+      const release = path.join(paths.cargoTargetDirectory!, 'release')
+      fs.mkdirSync(release, { recursive: true })
+      if (args.includes('freshell-server')) fs.writeFileSync(path.join(release, 'freshell-server'), 'web executable')
+      if (args.includes('freshell-supervisor')) {
+        fs.writeFileSync(path.join(release, 'freshell-supervisor'), 'supervisor executable')
+        fs.writeFileSync(path.join(release, 'freshell-session-host'), 'session host')
+      }
+      if (args.includes('freshell-runtime-client')) fs.writeFileSync(path.join(release, 'freshell-supervisor-admin'), 'admin cli')
+    }
+    return ''
+  }
+  const docker = {
+    buildImage: vi.fn(async () => 'sha256:' + 'b'.repeat(64)),
+    verifyDaemon: vi.fn(async () => undefined),
+  }
+  const stagedRoots: string[] = []
+
+  try {
+    const clientArtifacts = await buildSelectedArtifacts(paths, owner, 'client', run, docker)
+    stagedRoots.push(clientArtifacts.stagingRoot!)
+    expect(clientArtifacts.webExecutable).toBeDefined()
+    expect(clientArtifacts.clientDirectory).toBeDefined()
+    expect(clientArtifacts.supervisorExecutable).toBeUndefined()
+    expect(clientArtifacts.imageId).toBeUndefined()
+    expect(commands.some(({ command }) => command === paths.pnpm)).toBe(true)
+    expect(commands.some(({ command, args }) => command === paths.cargo && args.includes('freshell-server'))).toBe(true)
+    expect(docker.buildImage).not.toHaveBeenCalled()
+
+    commands.length = 0
+    const durableArtifacts = await buildSelectedArtifacts(paths, owner, 'durable-only', run, docker)
+    stagedRoots.push(durableArtifacts.stagingRoot!)
+    expect(durableArtifacts.webExecutable).toBeUndefined()
+    expect(durableArtifacts.clientDirectory).toBeUndefined()
+    expect(durableArtifacts.supervisorExecutable).toBeDefined()
+    expect(durableArtifacts.adminCli).toBeDefined()
+    expect(durableArtifacts.sessionHostBinary).toBeDefined()
+    expect(durableArtifacts.imageId).toBe('sha256:' + 'b'.repeat(64))
+    expect(commands.some(({ command }) => command === paths.pnpm)).toBe(false)
+    expect(commands.some(({ command, args }) => command === paths.cargo && args.includes('freshell-server'))).toBe(false)
+    expect(commands.every(({ cwd, target }) => cwd === owner.checkoutRoot && target === paths.cargoTargetDirectory)).toBe(true)
+    expect(docker.buildImage).toHaveBeenCalledWith(owner, owner.dockerSocket)
+  } finally {
+    for (const root of stagedRoots) await fs.promises.rm(root, { recursive: true, force: true })
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+})
+
+it('historical failed incarnations do not replace the active stop and reopen reference', async () => {
+  const f = dependencies()
+  const history = view({
+    incarnationId: 'historical',
+    launchState: 'failed',
+    cleanupState: 'termination_unconfirmed',
+    nativeSessionId: 'historical-native',
+  })
+  const active = view({
+    incarnationId: 'current',
+    launchState: 'running',
+    nativeSessionId: 'current-native',
+    terminalResumeSessionId: 'current-resume',
+  })
+  f.deps.admin.inventory = vi.fn(async () => [history, active])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.admin.stop).toHaveBeenCalledWith('soul-codex', 12, owner)
+  expect(f.deps.admin.reopen).toHaveBeenCalledWith(expect.objectContaining({
+    conversation: { kind: 'terminal', nativeSessionId: 'current-native', resumeSessionId: 'current-resume' },
+    expectedIntentRevision: 13,
+  }), owner)
+})
+
+it('Reopen candidate uses the captured addressed view and post-Stop revision', () => {
+  const historical = view({
+    incarnationId: 'historical',
+    launchState: 'failed',
+    cleanupState: 'termination_unconfirmed',
+    nativeSessionId: 'historical-native',
+  })
+  const addressed = view({
+    incarnationId: 'current',
+    launchState: 'running',
+    nativeSessionId: 'current-native',
+    terminalResumeSessionId: 'current-resume',
+  })
+  const targets = [{
+    soulId: addressed.soulId,
+    expectedIntentRevision: addressed.intentRevision,
+    provider: addressed.provider!,
+    addressedView: addressed,
+  }]
+
+  const work = buildReopenCandidates([historical, addressed], targets, new Map([[addressed.soulId, 13]]))
+
+  expect(work.candidates).toEqual([{
+    soulId: addressed.soulId,
+    expectedIntentRevision: 13,
+    provider: 'codex',
+    conversation: { kind: 'terminal', nativeSessionId: 'current-native', resumeSessionId: 'current-resume' },
+  }])
+  expect(work.noReferenceCount).toBe(0)
+  expect(work.ineligibleReferenceCount).toBe(0)
+})
+
+it('fresh-agent session references remain saved conversation candidates', () => {
+  const addressed = view({
+    provider: 'amplifier',
+    nativeSessionId: null,
+    terminalResumeSessionId: null,
+    freshAgentSessionId: 'saved-fresh-agent-session',
+  })
+  const target = {
+    soulId: addressed.soulId,
+    expectedIntentRevision: addressed.intentRevision,
+    provider: 'amplifier',
+    addressedView: addressed,
+  }
+
+  const work = buildReopenCandidates([addressed], [target], new Map([[addressed.soulId, 13]]))
+
+  expect(work.candidates).toEqual([{
+    soulId: addressed.soulId,
+    expectedIntentRevision: 13,
+    provider: 'amplifier',
+    conversation: { kind: 'fresh_agent', sessionId: 'saved-fresh-agent-session' },
+  }])
+  expect(work.unavailable).toEqual([])
+})
+
+it('inventory failure restores web ingress without stopping the supervisor', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => {
+    f.effects.push('inventory')
+    throw new Error('supervisor control socket unavailable')
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.effects.indexOf('stop:freshell-rust.service')).toBeLessThan(f.effects.indexOf('inventory'))
+  expect(f.effects.indexOf('start:freshell-rust.service')).toBeGreaterThan(f.effects.indexOf('inventory'))
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.effects.some((effect) => effect.includes('supervisor control socket unavailable'))).toBe(true)
+})
+
+it('desired-stopped cleanup checks the addressed incarnation and restores web before any new stop', async () => {
+  const f = dependencies()
+  const addressed = view({
+    soulId: 'soul-already-stopped',
+    incarnationId: 'incarnation-current',
+    desiredState: 'stopped',
+    launchState: 'stopping',
+    cleanupState: 'termination_unconfirmed',
+    provider: 'codex',
+    nativeSessionId: null,
+    terminalResumeSessionId: null,
+  })
+  const historical = view({
+    soulId: 'soul-already-stopped',
+    incarnationId: 'incarnation-historical',
+    desiredState: 'stopped',
+    launchState: 'stopped',
+    cleanupState: 'verified_empty',
+    nativeSessionId: null,
+    terminalResumeSessionId: null,
+  })
+  f.deps.admin.inventory = vi.fn(async () => [historical, addressed])
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
+})
+
+it('an explicit no-runtime VerifiedEmpty record permits reset with no coding targets', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => ({
+    views: [],
+    noRuntime: [{ soulId: 'soul-no-runtime', desiredState: 'stopped' as const, outcome: 'verified_empty' as const }],
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.deps.admin.reopen).not.toHaveBeenCalled()
+  expect(f.deps.services.stop).toHaveBeenCalledWith(owner.supervisorUnit)
+})
+
+it('an unresolved no-runtime stopped soul refuses before new Stops and restores web', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => ({
+    views: [],
+    noRuntime: [{ soulId: 'soul-unresolved', desiredState: 'stopped' as const, outcome: 'unresolved' as const }],
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.deps.services.start).toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.stop).not.toHaveBeenCalledWith(owner.supervisorUnit)
+})
+
+it('web restoration failure reports the original error and the resulting unit state', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => { throw new Error('inventory read failed') })
+  f.deps.services.start = vi.fn(async (unit) => {
+    f.effects.push(`start:${unit}`)
+    if (unit === owner.webUnit) throw new Error('web start failed')
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.web_restore_after_abort',
+    restored: false,
+    unit_state: 'inactive',
+    restoration_error_code: 'web_restore_failed',
+  }))
+  expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.failed', phase: 'inventory' }))
+  expect(f.effects).toContain('operator:inventory read failed')
+})
+
+it('pending Reopen does not prevent later saved conversations from being attempted', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [
+    view({ soulId: 'soul-first', nativeSessionId: 'native-first' }),
+    view({ soulId: 'soul-second', provider: 'claude', nativeSessionId: 'native-second' }),
+  ])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+  f.deps.admin.reopen = vi.fn(async (candidate) => {
+    f.effects.push(`reopen:${candidate.soulId}`)
+    return { outcome: candidate.soulId === 'soul-first' ? 'pending' as const : 'reopened' as const }
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.reopen).toHaveBeenCalledTimes(2)
+  expect(f.effects.indexOf('reopen:soul-first')).toBeLessThan(f.effects.indexOf('reopen:soul-second'))
+  expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.completed_with_reopen_failures' }))
+})
+
+it('post-supervisor-stop failure reports partial state and forward recovery without rollback', async () => {
+  const f = dependencies()
+  f.deps.filesystem.installExecutable = vi.fn(async (_source, target) => {
+    f.effects.push(`install:${target}`)
+    if (target === owner.supervisorExecutable) throw new Error('updated supervisor install failed')
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.effects).toContain('stop:freshell-supervisor.service')
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.failed',
+    phase: 'install_durable',
+    manual_recovery: expect.any(String),
+  }))
+  expect(f.effects).toContain('operator:updated supervisor install failed')
+  expect(f.effects.some((effect) => effect.includes('forward-recovery runbook'))).toBe(true)
+})
+
+it('a resumable terminal context without native identity is unavailable without Reopen dispatch', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [view({ nativeSessionId: null, terminalResumeSessionId: 'resume-only' })])
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.admin.reopen).not.toHaveBeenCalled()
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.reopen_inventory_summary',
+    unavailable_count: 1,
+    eligible_count: 0,
+  }))
+})
+
+it('reset summary counts absent and ineligible saved conversation references', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [
+    view({ soulId: 'soul-no-reference', nativeSessionId: null, terminalResumeSessionId: null }),
+    view({
+      soulId: 'soul-already-stopped',
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+      nativeSessionId: 'stopped-native',
+    }),
+  ])
+  f.deps.admin.stop = vi.fn(async (soulId, expectedIntentRevision) => ({
+    outcome: 'verified_empty' as const,
+    view: view({
+      soulId,
+      intentRevision: expectedIntentRevision + 1,
+      desiredState: 'stopped',
+      launchState: 'stopped',
+      cleanupState: 'verified_empty',
+    }),
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  expect(f.deps.admin.reopen).not.toHaveBeenCalled()
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.reopen_inventory_summary',
+    no_reference_count: 1,
+    ineligible_reference_count: 1,
+    unavailable_count: 0,
+    eligible_count: 0,
+  }))
+})
