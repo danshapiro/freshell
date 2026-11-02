@@ -2612,6 +2612,7 @@ export function FreshAgentView({
     sendFreshAgentMessage({
       type: 'freshAgent.fork',
       requestId: current.createRequestId,
+      viewId: current.viewId ?? current.createRequestId,
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
@@ -3375,7 +3376,11 @@ export function FreshAgentView({
         }
         return
       }
-      if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
+      if (
+        message.type === 'freshAgent.created'
+        && message.requestId === paneContentRef.current.createRequestId
+        && message.viewId === (paneContentRef.current.viewId ?? paneContentRef.current.createRequestId)
+      ) {
         releasePendingRebind()
         clearReserveRedrive() // Task 14: a completed create ends the reservation window
         const current = paneContentRef.current
@@ -3402,7 +3407,11 @@ export function FreshAgentView({
           },
         }))
       }
-      if (message.type === 'freshAgent.create.failed' && message.requestId === paneContentRef.current.createRequestId) {
+      if (
+        message.type === 'freshAgent.create.failed'
+        && message.requestId === paneContentRef.current.createRequestId
+        && message.viewId === (paneContentRef.current.viewId ?? paneContentRef.current.createRequestId)
+      ) {
         releasePendingRebind()
         if (isManagedFreshAgentStopped(paneContentRef.current)) {
           clearReserveRedrive()
@@ -3932,6 +3941,7 @@ export function FreshAgentView({
         if (
           !isManagedFreshAgentStopped(current)
           && message.requestId === current.createRequestId
+          && message.viewId === (current.viewId ?? current.createRequestId)
           && message.parentSessionId === current.sessionId
           && message.sessionType === current.sessionType
           && message.provider === current.provider

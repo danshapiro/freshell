@@ -897,6 +897,9 @@ pub struct FreshAgentCreate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_mode: Option<String>,
     pub request_id: String,
+    /// Connection-scoped view identity, echoed by create acknowledgments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -1227,6 +1230,9 @@ pub struct FreshAgentFork {
     pub input: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Connection-scoped view identity, echoed by the fork result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// D8 (restore-open-sessions-only, focused-ep1-r5 Finding 1): the forking

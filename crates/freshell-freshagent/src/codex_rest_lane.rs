@@ -135,6 +135,7 @@ impl FreshAgentRestLane for CodexRestLane {
                     provider: Some(AgentProvider::Codex),
                     session_type: SessionType::Freshcodex,
                     request_id: request.request_id,
+                    view_id: None,
                     cwd: request.cwd,
                     model: request.model,
                     effort: request.effort,

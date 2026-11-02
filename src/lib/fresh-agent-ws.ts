@@ -7,6 +7,8 @@ import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwne
 import { createLogger } from '@/lib/client-logger'
 import {
   consumeCreateRoute,
+  getCreateRoute,
+  hasCreateRoute,
   rememberCreateRoute,
 } from '@/lib/create-cancellation'
 import { consumeCancelledFreshAgentCreateRoute } from '@/lib/fresh-agent-view-attachment'
@@ -56,6 +58,7 @@ const log = createLogger('fresh-agent-ws')
 type FreshAgentCreatedMessage = {
   type: 'freshAgent.created'
   requestId: string
+  viewId?: string
   sessionId: string
   sessionType: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
@@ -66,6 +69,7 @@ type FreshAgentCreatedMessage = {
 type FreshAgentCreateFailedMessage = {
   type: 'freshAgent.create.failed'
   requestId: string
+  viewId?: string
   code: string
   message: string
   retryable?: boolean
@@ -197,7 +201,7 @@ export function handleFreshAgentMessage(
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
       const provider = created.provider ?? created.runtimeProvider
-      const cancelledAttachment = consumeCancelledFreshAgentCreateRoute(created.requestId)
+      const cancelledAttachment = consumeCancelledFreshAgentCreateRoute(created.requestId, created.viewId)
       if (cancelledAttachment) {
         if (cancelledAttachment.matchesCurrentView) {
           dispatch(clearPendingCreate({ requestId: created.requestId }))
@@ -218,7 +222,9 @@ export function handleFreshAgentMessage(
         }
         return true
       }
-      const route = consumeCreateRoute(created.requestId)
+      const route = getCreateRoute(created.requestId, created.viewId)
+      if (hasCreateRoute(created.requestId) && (!route || route.viewId !== created.viewId)) return true
+      consumeCreateRoute(created.requestId, created.viewId)
       if (provider) dispatch(observeFreshAgentSession({ provider, sessionId: created.sessionId }))
       dispatch(sessionCreated({
         requestId: created.requestId,
@@ -230,6 +236,13 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.create.failed': {
       const failed = msg as FreshAgentCreateFailedMessage
+      const cancelledRoute = consumeCancelledFreshAgentCreateRoute(failed.requestId, failed.viewId)
+      if (cancelledRoute) {
+        if (cancelledRoute.matchesCurrentView) dispatch(clearPendingCreate({ requestId: failed.requestId }))
+        return true
+      }
+      const route = getCreateRoute(failed.requestId, failed.viewId)
+      if (hasCreateRoute(failed.requestId) && (!route || route.viewId !== failed.viewId)) return true
       if (failed.code === 'SESSION_RESERVED' && failed.retryable) {
         // Task 14: transient reservation -- no pendingCreateFailures entry (no
         // error card / no Retry racing the same-requestId re-drive), and the
@@ -238,7 +251,7 @@ export function handleFreshAgentMessage(
         // FreshAgentView owns the bounded re-drive.
         return true
       }
-      consumeCreateRoute(failed.requestId)
+      consumeCreateRoute(failed.requestId, failed.viewId)
       dispatch(createFailed({
         requestId: failed.requestId,
         code: failed.code,

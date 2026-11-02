@@ -8,6 +8,7 @@ import {
   consumeCancelledCreateRoute,
   consumeCreateRoute,
   getCreateRoute,
+  hasCreateRoute,
 } from '@/lib/create-cancellation'
 
 const log = createLogger('fresh-agent-view-attachment')
@@ -60,17 +61,18 @@ export function freshAgentViewAttachmentForPane(
 
 /** Consume a late create result only when it still belongs to the canceled
  * view; a replacement view may already own the same request route. */
-export function consumeCancelledFreshAgentCreateRoute(requestId: string): {
+export function consumeCancelledFreshAgentCreateRoute(requestId: string, responseViewId?: string): {
   viewId?: string
   matchesCurrentView: boolean
 } | undefined {
-  const cancelledRoute = consumeCancelledCreateRoute(requestId)
+  const cancelledRoute = consumeCancelledCreateRoute(requestId, responseViewId)
   if (!cancelledRoute) return undefined
 
   const currentRoute = getCreateRoute(requestId)
+  const hasCurrentRoute = hasCreateRoute(requestId)
   const matchesCurrentView = !cancelledRoute.viewId
-    || !currentRoute
-    || currentRoute.viewId === cancelledRoute.viewId
+    || !hasCurrentRoute
+    || currentRoute?.viewId === cancelledRoute.viewId
   const route = matchesCurrentView
     ? consumeCreateRoute(requestId, cancelledRoute.viewId)
     : undefined

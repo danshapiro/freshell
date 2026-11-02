@@ -796,7 +796,7 @@ describe('picker profile staging', () => {
           provider: content.provider, model: 'opencode/big-pickle', cwd: content.initialCwd })
         const createdSessionId = 'freshopencode-materializing-picker-request'
         const nativeSessionId = 'ses_exact_picker_native'
-        const created = { type: 'freshAgent.created', requestId: request.requestId, sessionType: content.sessionType,
+        const created = { type: 'freshAgent.created', requestId: request.requestId, viewId: request.viewId, sessionType: content.sessionType,
           provider: content.provider, sessionId: createdSessionId, sessionRef: { provider: content.provider, sessionId: createdSessionId } }
         const materialized = { type: 'freshAgent.session.materialized', previousSessionId: createdSessionId,
           sessionId: nativeSessionId, sessionType: content.sessionType, provider: content.provider,
@@ -1146,9 +1146,9 @@ describe('stopped managed history', () => {
     await act(async () => {
       held.resolve({ ...live, status: 'running' })
       reconnects.forEach((callback) => callback())
-      handlers.forEach((handler) => handler({ type: 'freshAgent.created', requestId: content.createRequestId,
+      handlers.forEach((handler) => handler({ type: 'freshAgent.created', requestId: content.createRequestId, viewId: getFreshAgentPaneContent(store).viewId,
         provider: 'codex', sessionType: 'freshcodex', sessionId: 'freshcodex-late-placeholder' }))
-      handlers.forEach((handler) => handler({ type: 'freshAgent.create.failed', requestId: content.createRequestId,
+      handlers.forEach((handler) => handler({ type: 'freshAgent.create.failed', requestId: content.createRequestId, viewId: getFreshAgentPaneContent(store).viewId,
         code: 'SESSION_RESERVED', retryable: true }))
       await vi.advanceTimersByTimeAsync(2_000)
       cold.resolve({ ...live, turns: [], status: 'idle' })
@@ -1181,7 +1181,7 @@ describe('stopped managed history', () => {
     const unrelated = vi.fn((release: () => void) => release())
     queue.enqueue({ key: 'after-stopped-create', run: unrelated })
     await act(async () => {
-      handlers.forEach((handler) => handler({ type, requestId: content.createRequestId,
+      handlers.forEach((handler) => handler({ type, requestId: content.createRequestId, viewId: content.viewId ?? content.createRequestId,
         sessionId: 'freshcodex-late-placeholder', sessionType: 'freshcodex', provider: 'codex',
         code: 'SESSION_RESERVED', retryable: true }))
       await vi.advanceTimersByTimeAsync(100)
@@ -1261,7 +1261,7 @@ describe('stopped managed history', () => {
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
     const originalFrame = sentFreshAgentMessages('freshAgent.create')[0]
     act(() => handlers.forEach((handler) => handler({ type: 'freshAgent.create.failed', requestId: content.createRequestId,
-      code: 'SESSION_RESERVED', retryable: true })))
+      viewId: getFreshAgentPaneContent(store).viewId, code: 'SESSION_RESERVED', retryable: true })))
     const stopped = { ...getFreshAgentPaneContent(store), recoverySummary: summary }
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: stopped })))
     act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
@@ -1418,7 +1418,7 @@ describe('managed bootstrap history', () => {
           requestId: 'bootstrap-original-request', sessionRef, tabId: 'tab-1', observedEpoch: 2, observedGeneration: 3,
         })])
         await act(async () => {
-          for (const handler of handlers) handler({ type: 'freshAgent.create.failed', requestId: 'bootstrap-original-request',
+          for (const handler of handlers) handler({ type: 'freshAgent.create.failed', requestId: 'bootstrap-original-request', viewId: getFreshAgentPaneContent(store).viewId,
             code: 'FRESH_AGENT_CREATE_FAILED', message: 'Owned host is temporarily unavailable', retryable: true })
         })
         expect(getFreshAgentPaneContent(store).status).toBe('create-failed')
@@ -1459,7 +1459,7 @@ describe('managed bootstrap history', () => {
       let mounted = fixture.mount()
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
-      await act(async () => fixture.emit({ type: 'freshAgent.create.failed', requestId: 'pending-original-request',
+      await act(async () => fixture.emit({ type: 'freshAgent.create.failed', requestId: 'pending-original-request', viewId: getFreshAgentPaneContent(fixture.store).viewId,
         code: 'FRESH_AGENT_CREATE_FAILED', message: 'Host unavailable', retryable: true }))
       await act(async () => { await vi.advanceTimersByTimeAsync(5_001); firstRead.resolve(fixture.native) })
       expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
@@ -1526,7 +1526,7 @@ describe('managed bootstrap history', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       const composer = screen.getByRole('textbox', { name: 'Chat message input' })
       fireEvent.change(composer, { target: { value: 'Same native Send after bootstrap' } })
-      await act(async () => fixture.emit({ type: 'freshAgent.created', requestId: 'pending-original-request',
+      await act(async () => fixture.emit({ type: 'freshAgent.created', requestId: 'pending-original-request', viewId: getFreshAgentPaneContent(fixture.store).viewId,
         ...fixture.locator, sessionRef: { provider: 'codex', sessionId: fixture.native.threadId } }))
       expect(getFreshAgentPaneContent(fixture.store).pendingReconcile).toBeUndefined()
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.at(-1)?.[3]?.soulId).toBeUndefined()
@@ -5645,6 +5645,7 @@ describe('FreshAgentView', () => {
     onMessage({
       type: 'freshAgent.created',
       requestId: 'req-create',
+      viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'thread-created',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -5685,6 +5686,7 @@ describe('FreshAgentView', () => {
       listeners.forEach((listener) => listener({
         type: 'freshAgent.created',
         requestId: 'req-created',
+        viewId: getFreshAgentPaneContent(store).viewId,
         sessionId: 'codex-thread-1',
         sessionType: 'freshcodex',
         provider: 'codex',
@@ -5729,6 +5731,7 @@ describe('FreshAgentView', () => {
       listeners.forEach((listener) => listener({
         type: 'freshAgent.created',
         requestId: 'req-created-no-ref',
+        viewId: getFreshAgentPaneContent(store).viewId,
         sessionId: 'codex-thread-no-ref-1',
         sessionType: 'freshcodex',
         provider: 'codex',
@@ -5775,6 +5778,7 @@ describe('FreshAgentView', () => {
         listeners.forEach((listener) => listener({
           type: 'freshAgent.created',
           requestId: 'req-created-log-failure',
+          viewId: getFreshAgentPaneContent(store).viewId,
           sessionId: 'codex-thread-log-failure-1',
           sessionType: 'freshcodex',
           provider: 'codex',
@@ -7410,6 +7414,7 @@ describe('FreshAgentView', () => {
       onMessage?.({
         type: 'freshAgent.created',
         requestId: 'req1',
+        viewId: getFreshAgentPaneContent(store).viewId,
         sessionId: 'freshopencode-req1',
         sessionType: 'freshopencode',
         provider: 'opencode',
@@ -8714,6 +8719,7 @@ describe('FreshAgentView', () => {
         onMessage?.({
           type: 'freshAgent.created',
           requestId: 'req-live-journey',
+          viewId: getFreshAgentPaneContent(store).viewId,
           sessionId: 'freshopencode-req-live-journey',
           sessionType: 'freshopencode',
           provider: 'opencode',
@@ -8892,6 +8898,7 @@ describe('FreshAgentView', () => {
         onMessage?.({
           type: 'freshAgent.created',
           requestId: 'req-slow-materialization',
+          viewId: getFreshAgentPaneContent(store).viewId,
           sessionId: 'freshopencode-req-slow-materialization',
           sessionType: 'freshopencode',
           provider: 'opencode',
@@ -11357,6 +11364,7 @@ describe('FreshAgentView', () => {
       onMessage({
         type: 'freshAgent.created',
         requestId: 'req-scoped-no-naming',
+        viewId: getFreshAgentPaneContent(store).viewId,
         sessionId: CLAUDE_THREAD_ID,
         sessionType: 'freshclaude',
         provider: 'claude',
@@ -11483,6 +11491,7 @@ describe('FreshAgentView', () => {
       onMessage({
         type: 'freshAgent.created',
         requestId: 'req-kilroy-title',
+        viewId: getFreshAgentPaneContent(store).viewId,
         sessionId: CLAUDE_THREAD_ID,
         sessionType: 'kilroy',
         provider: 'claude',
@@ -12971,6 +12980,7 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.fork',
       requestId: 'req-fork-route',
+      viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'ses_fork_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -14289,7 +14299,7 @@ describe('FreshAgentView', () => {
     act(() => store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { effort, effortIsNativeDefault } })))
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
     expect(onMessage).toBeTypeOf('function')
-    act(() => onMessage({ type: 'freshAgent.created', requestId: 'pre-ack-settings',
+    act(() => onMessage({ type: 'freshAgent.created', requestId: 'pre-ack-settings', viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'pre-ack-native', sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' }))
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
     await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
@@ -14333,6 +14343,7 @@ describe('FreshAgentView', () => {
       onMessage({
         type: 'freshAgent.created',
         requestId: 'req-stale-effort',
+        viewId: getFreshAgentPaneContent(store).viewId,
         sessionId: 'thread-stale-effort',
         sessionType: 'freshcodex',
         provider: 'codex',
@@ -14395,6 +14406,7 @@ describe('FreshAgentView', () => {
       onMessage?.({
         type: 'freshAgent.forked',
         requestId: 'req-2',
+        viewId: parentViewId,
         parentSessionId: 'thread-1',
         sessionId: 'thread-forked',
         sessionType: 'freshcodex',
@@ -14505,6 +14517,7 @@ describe('FreshAgentView', () => {
       onMessage?.({
         type: 'freshAgent.forked',
         requestId: 'req-claude-fork',
+        viewId: parentViewId,
         parentSessionId: parent,
         sessionId: child,
         sessionType,
@@ -14546,6 +14559,7 @@ describe('FreshAgentView', () => {
     wsMock.send.mockClear()
     act(() => onMessage?.({
       type: 'freshAgent.forked', requestId: 'managed-fork-request',
+      viewId: getFreshAgentPaneContent(store).viewId,
       parentSessionId: 'thread-parent', sessionId: 'thread-child',
       sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
       parentRetiredByRuntime: true,
@@ -14561,14 +14575,14 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
-  it('ignores a stale parent-retired fork reply after the pane has a replacement view', async () => {
+  it('ignores a stale create success when the replacement view reuses its request ID', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
     wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
     store.dispatch(initLayout({
       tabId: 'tab-1', paneId: 'pane-1', content: {
         kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
-        createRequestId: 'old-fork-request', viewId: 'old-view', sessionId: 'thread-parent', status: 'idle',
+        createRequestId: 'reused-create-request', viewId: 'old-view', status: 'creating',
       },
     }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
@@ -14576,17 +14590,71 @@ describe('FreshAgentView', () => {
 
     const replacement = {
       ...getFreshAgentPaneContent(store),
-      createRequestId: 'replacement-request',
       viewId: 'replacement-view',
     }
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
-    await waitFor(() => expect(getFreshAgentPaneContent(store)).toMatchObject({
-      createRequestId: 'replacement-request', viewId: 'replacement-view', sessionId: 'thread-parent',
+    await waitFor(() => expect(getFreshAgentPaneContent(store)).toEqual(replacement))
+
+    act(() => onMessage?.({
+      type: 'freshAgent.created', requestId: 'reused-create-request', viewId: 'old-view',
+      sessionId: 'stale-session', sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
     }))
+
+    expect(getFreshAgentPaneContent(store)).toEqual(replacement)
+    expect(getFreshAgentSessionId()).not.toBe('stale-session')
+  })
+
+  it('ignores a stale create failure when the replacement view reuses its request ID', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
+    store.dispatch(initLayout({
+      tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId: 'reused-create-request', viewId: 'old-view', status: 'creating',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+
+    const replacement = {
+      ...getFreshAgentPaneContent(store),
+      viewId: 'replacement-view',
+    }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
+    await waitFor(() => expect(getFreshAgentPaneContent(store)).toEqual(replacement))
+
+    act(() => onMessage?.({
+      type: 'freshAgent.create.failed', requestId: 'reused-create-request', viewId: 'old-view',
+      code: 'SPAWN_FAILED', message: 'stale failure', retryable: false,
+    }))
+
+    expect(getFreshAgentPaneContent(store)).toEqual(replacement)
+  })
+
+  it('ignores a stale parent-retired fork reply when the pane reuses its request ID', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
+    store.dispatch(initLayout({
+      tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId: 'reused-fork-request', viewId: 'old-view', sessionId: 'thread-parent', status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+
+    const replacement = {
+      ...getFreshAgentPaneContent(store),
+      viewId: 'replacement-view',
+    }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
+    await waitFor(() => expect(getFreshAgentPaneContent(store)).toEqual(replacement))
 
     wsMock.send.mockClear()
     act(() => onMessage?.({
-      type: 'freshAgent.forked', requestId: 'old-fork-request',
+      type: 'freshAgent.forked', requestId: 'reused-fork-request', viewId: 'old-view',
       parentSessionId: 'thread-parent', sessionId: 'thread-child',
       sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
       parentRetiredByRuntime: true,
@@ -14840,7 +14908,8 @@ describe('FreshAgentView', () => {
       })
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
       act(() => listeners.forEach((listener) => listener({ type: 'freshAgent.create.failed',
-        requestId: content.createRequestId, code: 'SESSION_RESERVED', retryable: true })))
+        requestId: content.createRequestId, viewId: getFreshAgentPaneContent(store).viewId,
+        code: 'SESSION_RESERVED', retryable: true })))
       const recovering = { ...getFreshAgentPaneContent(store), soulId: 'automatic-reserve-soul',
         recoverySummary: { desiredState: 'running' as const, recoveryState: 'recovering' as const,
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
@@ -16308,6 +16377,7 @@ describe('FreshAgentView', () => {
     wsMock.send.mockClear()
     act(() => onMessage?.({
       type: 'freshAgent.forked', requestId: 'other-view-request',
+      viewId: 'other-device-view',
       parentSessionId: 'thread-parent', sessionId: 'thread-child',
       sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
       parentRetiredByRuntime: true,
@@ -16368,6 +16438,7 @@ describe('FreshAgentView', () => {
       onMessage?.({
         type: 'freshAgent.forked',
         requestId: 'req-other-pane',
+        viewId: getFreshAgentPaneContent(store).viewId,
         parentSessionId: 'thread-1',
         sessionId: 'thread-forked',
         sessionType: 'freshcodex',
@@ -16930,6 +17001,7 @@ describe('FreshAgentView', () => {
     onMessage({
       type: 'freshAgent.created',
       requestId: 'req-sessionref-only',
+      viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'created-thread-456',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -16973,6 +17045,7 @@ describe('FreshAgentView', () => {
       onMessage({
         type: 'freshAgent.create.failed',
         requestId: 'req-disabled-create',
+        viewId: getFreshAgentPaneContent(store).viewId,
         code: 'FRESH_CLIENTS_DISABLED',
         message: 'Fresh clients are disabled',
         retryable: true,
@@ -17063,6 +17136,7 @@ describe('FreshAgentView', () => {
     onMessage({
       type: 'freshAgent.created',
       requestId: 'req-clear-error',
+      viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'created-789',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -17102,6 +17176,7 @@ describe('FreshAgentView', () => {
     onMessage({
       type: 'freshAgent.created',
       requestId: 'req-claude-noref',
+      viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'runtime-sdk-session-id',
       sessionType: 'freshclaude',
       provider: 'claude',
@@ -17144,6 +17219,7 @@ describe('FreshAgentView', () => {
     onMessage({
       type: 'freshAgent.created',
       requestId: 'req-late-created',
+      viewId: getFreshAgentPaneContent(store).viewId,
       sessionId: 'runtime-id',
       sessionType: 'freshclaude',
       provider: 'claude',
@@ -20350,6 +20426,7 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
         listener({
           type: 'freshAgent.create.failed',
           requestId: 'req-r35-redrive',
+          viewId: getFreshAgentPaneContent(store).viewId,
           code: 'SESSION_RESERVED',
           retryable: true,
         })
@@ -20484,6 +20561,7 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
         listener({
           type: 'freshAgent.create.failed',
           requestId: 'req-r37-recovery',
+          viewId: getFreshAgentPaneContent(store).viewId,
           code: 'SESSION_RESERVED',
           retryable: true,
         })
@@ -21390,6 +21468,7 @@ describe('b8ke ext r21 F2: the compact/undo/fork senders carry the observed fenc
       tabId: 'tab-1',
       cwd: '/repo/r21',
       input: { atTurnId: 'turn-r21-fork' },
+      viewId: expect.any(String),
       observedEpoch: 8,
       observedGeneration: 21,
     })

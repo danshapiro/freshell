@@ -308,6 +308,7 @@ impl HostedFreshAgentProxy {
         match command {
             HostedFreshAgentCommand::Create(message) => {
                 let request_id = message.request_id.clone();
+                let view_id = message.view_id.clone();
                 if let Err(mut error) = self.create(message).await {
                     tracing::warn!(request_id, code=%error.code, "fresh_agent.create.failed");
                     if error.code == "FRESH_AGENT_UNAVAILABLE" {
@@ -320,6 +321,7 @@ impl HostedFreshAgentProxy {
                             code: error.code,
                             message: error.message,
                             request_id,
+                            view_id,
                             retryable: error.retryable,
                             owner_kind: None,
                             owner_generation: None,
@@ -580,6 +582,7 @@ impl HostedFreshAgentProxy {
                         let provider_name = provider_wire(&provider);
                         let parent_session_id = transition.parent_session_id.clone();
                         let child_session_id = transition.child_session_id.clone();
+                        let view_id = message.view_id.clone();
                         let parent_retired_by_runtime = transition.parent_retired_by_runtime;
                         {
                             let mut aliases = self.aliases.lock().await;
@@ -597,6 +600,7 @@ impl HostedFreshAgentProxy {
                         );
                         self.send(ServerMessage::FreshAgentForked(FreshAgentForked {
                             request_id: message.request_id.clone(),
+                            view_id,
                             parent_session_id: parent_session_id.clone(),
                             session_id: child_session_id.clone(),
                             session_type: session_type_wire(session_type),
@@ -1150,6 +1154,7 @@ impl HostedFreshAgentProxy {
         self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: public_provider.into(),
             request_id: message.request_id.clone(),
+            view_id: message.view_id.clone(),
             runtime_provider: provider.as_str().into(),
             session_id: public_session_id.clone(),
             session_type: session_type.clone(),
@@ -1230,6 +1235,7 @@ impl HostedFreshAgentProxy {
         self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: provider_name.clone(),
             request_id: message.request_id.clone(),
+            view_id: message.view_id.clone(),
             runtime_provider: provider.as_str().into(),
             session_id: public_session_id.clone(),
             session_type: session_type_wire(message.session_type),
@@ -2489,10 +2495,7 @@ fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'stati
         Some(RuntimeErrorCode::OperationImplementationUnavailable) => "IMPLEMENTATION_UNAVAILABLE",
         Some(RuntimeErrorCode::CommandAmbiguous) => "COMMAND_AMBIGUOUS",
         Some(RuntimeErrorCode::RequestIdConflict) => "REQUEST_ID_CONFLICT",
-        Some(RuntimeErrorCode::UnknownSoul) => "UNKNOWN_SOUL",
         Some(RuntimeErrorCode::UnknownIncarnation) => "UNKNOWN_INCARNATION",
-        Some(RuntimeErrorCode::OwnershipMismatch) => "OWNERSHIP_MISMATCH",
-        Some(RuntimeErrorCode::HostUnreachable) => "HOST_UNREACHABLE",
         Some(RuntimeErrorCode::HostAuthenticationFailed) => "HOST_AUTHENTICATION_FAILED",
         Some(RuntimeErrorCode::RecoveryWrongIdentity) => "RECOVERY_WRONG_IDENTITY",
         Some(RuntimeErrorCode::StaleExecutionGrant) => "STALE_EXECUTION_GRANT",

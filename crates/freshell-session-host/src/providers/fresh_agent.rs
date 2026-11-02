@@ -2894,6 +2894,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
         collaboration_mode: profile.collaboration_mode.clone(),
         pane_id: None,
         request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
+        view_id: None,
         observed_epoch: None,
         observed_generation: None,
         naming_handle: profile.naming_handle.clone(),

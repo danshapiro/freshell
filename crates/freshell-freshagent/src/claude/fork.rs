@@ -552,6 +552,7 @@ impl FreshClaudeState {
         }
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
+            view_id: msg.view_id.clone(),
             parent_session_id: parent.reply_id,
             session_id: child.clone(),
             session_type: session_type.to_string(),

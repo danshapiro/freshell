@@ -1068,6 +1068,9 @@ pub struct FreshAgentCreateFailed {
     pub code: String,
     pub message: String,
     pub request_id: String,
+    /// The originating connection-scoped view when the request supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
     /// kata b8ke (carried finding): fresh-agent refusals ride THIS frame,
@@ -1087,6 +1090,9 @@ pub struct FreshAgentCreateFailed {
 pub struct FreshAgentCreated {
     pub provider: String,
     pub request_id: String,
+    /// The originating connection-scoped view when the request supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
     pub runtime_provider: String,
     pub session_id: String,
     /// Free string on the server side (unlike the client enum).
@@ -1142,6 +1148,9 @@ pub struct FreshAgentForked {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// The originating connection-scoped view when the request supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
     /// Managed runtimes set this only after the same soul has retired the old
     /// provider session. Legacy servers omit it, preserving legacy cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2569,12 +2578,14 @@ mod tests {
             code: "RESTORE_UNAVAILABLE".into(),
             message: "Session 01a0828d is still running on the server.".into(),
             request_id: "req-9".into(),
+            view_id: Some("view-9".into()),
             retryable: Some(true),
             owner_kind: Some("terminal".into()),
             owner_generation: Some(7),
             owner_epoch: Some(41),
         });
         let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""viewId":"view-9""#), "{json}");
         assert!(json.contains(r#""ownerKind":"terminal""#), "{json}");
         assert!(json.contains(r#""ownerEpoch":41"#), "{json}");
         let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
@@ -2584,6 +2595,7 @@ mod tests {
             code: "RESTORE_UNAVAILABLE".into(),
             message: "boom".into(),
             request_id: "req-10".into(),
+            view_id: None,
             retryable: None,
             owner_kind: None,
             owner_generation: None,

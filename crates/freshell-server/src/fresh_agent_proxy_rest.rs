@@ -314,6 +314,7 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             collaboration_mode: request.collaboration_mode,
             pane_id: request.pane_id,
             request_id: request.request_id,
+            view_id: None,
             session_type,
             cwd: request.cwd,
             effort: request.effort,

@@ -723,6 +723,7 @@ fn create_msg(sid: &str) -> FreshAgentCreate {
             session_id: sid.to_string(),
         }),
         tab_id: None,
+        view_id: None,
     }
 }
 
@@ -6982,6 +6983,7 @@ fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
         // sessionRef. Creation must establish its own durable UUID and owner.
         session_ref: None,
         tab_id: None,
+        view_id: None,
     }
 }
 

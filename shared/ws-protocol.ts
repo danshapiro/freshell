@@ -1123,6 +1123,8 @@ export type FreshAgentRecoveryStoppedMessage = z.infer<typeof FreshAgentRecovery
 export const FreshAgentForkSchema = z.object({
   type: z.literal('freshAgent.fork'),
   requestId: z.string().min(1).optional(),
+  /** Connection-scoped view identity echoed by the fork result. */
+  viewId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
@@ -2070,9 +2072,9 @@ export const FreshAgentCheckpointOutcomeSchema = z.object({
 export type FreshAgentCheckpointOutcome = z.infer<typeof FreshAgentCheckpointOutcomeSchema>
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
+  | { type: 'freshAgent.created'; requestId: string; viewId?: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.detached'; requestId: string; viewId: string; sessionRef?: { provider: string; sessionId: string }; success: boolean; code?: string; message?: string }
-  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
+  | { type: 'freshAgent.create.failed'; requestId: string; viewId?: string; code: string; message: string; retryable?: boolean
       /** kata b8ke: ownership-conflict refusals only — the owning kind, its
        *  generation, and the emitting server's boot epoch, so the client
        *  can refresh its observed fence from the refusal itself. Additive;
@@ -2084,7 +2086,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
-  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; parentRetiredByRuntime?: boolean; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.forked'; requestId?: string; viewId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; parentRetiredByRuntime?: boolean; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
 /**

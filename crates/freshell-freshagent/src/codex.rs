@@ -3297,6 +3297,7 @@ impl FreshCodexState {
         classify_native_readiness_not_found: bool,
     ) -> CodexCreateOutcome {
         let request_id = msg.request_id.clone();
+        let view_id = msg.view_id.clone();
         // Unified agent names (Task 2): the pane's pre-durable naming handle
         // (threaded to both create lanes; `None` = an unnamed pane).
         let naming_handle = msg.naming_handle.clone().filter(|h| !h.trim().is_empty());
@@ -3306,54 +3307,62 @@ impl FreshCodexState {
         // attempt below (including the `handle_create_resume` sub-call), so concurrent
         // duplicate `create`s for this requestId serialize instead of each spawning
         // their own sidecar.
-        let _dedup_guard =
-            match self.create_dedup.acquire_or_replay(&request_id).await {
-                FreshAgentCreateOutcome::Replay(cached) => {
-                    #[cfg(windows)]
-                    if self.windows_prior_blocks_create(&cached.session_id).await
-                        || !self.has_live_session(&cached.session_id).await
-                    {
-                        return self.fail_create(&request_id, "SESSION_RESERVED",
-                        "the previous Codex process tree has not been replaced; retry the session");
-                    }
-                    // Unified agent names: the replay re-answers with the SAME
-                    // naming projection the original create acknowledged (the
-                    // handle was stashed against this thread at admission).
-                    let projection = self.created_projection_for(&cached.session_id).await;
-                    let name_ref = projection.as_ref().map(|(r, _)| r.clone());
-                    let session_name = projection.map(|(_, record)| record);
-                    #[cfg(windows)]
-                    if self.windows_prior_blocks_create(&cached.session_id).await
-                        || !self.has_live_session(&cached.session_id).await
-                    {
-                        return self.fail_create(&request_id, "SESSION_RESERVED",
-                        "the previous Codex process tree has not been replaced; retry the session");
-                    }
-                    self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
-                        provider: PROVIDER.to_string(),
-                        request_id,
-                        runtime_provider: PROVIDER.to_string(),
-                        session_id: cached.session_id.clone(),
-                        session_type: SESSION_TYPE.to_string(),
-                        session_ref: Some(SessionLocator {
-                            provider: PROVIDER.to_string(),
-                            session_id: cached.session_id.clone(),
-                        }),
-                        name_ref: name_ref.clone(),
-                        session_name,
-                    }));
-                    return CodexCreateOutcome::Created {
-                        session_id: cached.session_id.clone(),
-                        session_ref: Some(SessionLocator {
-                            provider: PROVIDER.into(),
-                            session_id: cached.session_id,
-                        }),
-                        cleanup_ownership_id: None,
-                        name_ref,
-                    };
+        let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
+            FreshAgentCreateOutcome::Replay(cached) => {
+                #[cfg(windows)]
+                if self.windows_prior_blocks_create(&cached.session_id).await
+                    || !self.has_live_session(&cached.session_id).await
+                {
+                    return self.fail_create(
+                        &request_id,
+                        view_id.as_deref(),
+                        "SESSION_RESERVED",
+                        "the previous Codex process tree has not been replaced; retry the session",
+                    );
                 }
-                FreshAgentCreateOutcome::Proceed(guard) => guard,
-            };
+                // Unified agent names: the replay re-answers with the SAME
+                // naming projection the original create acknowledged (the
+                // handle was stashed against this thread at admission).
+                let projection = self.created_projection_for(&cached.session_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
+                #[cfg(windows)]
+                if self.windows_prior_blocks_create(&cached.session_id).await
+                    || !self.has_live_session(&cached.session_id).await
+                {
+                    return self.fail_create(
+                        &request_id,
+                        view_id.as_deref(),
+                        "SESSION_RESERVED",
+                        "the previous Codex process tree has not been replaced; retry the session",
+                    );
+                }
+                self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+                    provider: PROVIDER.to_string(),
+                    request_id,
+                    view_id: view_id.clone(),
+                    runtime_provider: PROVIDER.to_string(),
+                    session_id: cached.session_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.to_string(),
+                        session_id: cached.session_id.clone(),
+                    }),
+                    name_ref: name_ref.clone(),
+                    session_name,
+                }));
+                return CodexCreateOutcome::Created {
+                    session_id: cached.session_id.clone(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.into(),
+                        session_id: cached.session_id,
+                    }),
+                    cleanup_ownership_id: None,
+                    name_ref,
+                };
+            }
+            FreshAgentCreateOutcome::Proceed(guard) => guard,
+        };
 
         // Unified agent names (Task 8 acceptance): the pending RECORD for the
         // frame's handle exists from REQUEST RECEIPT — the pane content and
@@ -3433,7 +3442,12 @@ impl FreshCodexState {
         let effective = match CodexEffectiveSettings::resolve(&base, &patch) {
             Ok(settings) => settings,
             Err(error) => {
-                return self.fail_create(&request_id, error.code, &error.message);
+                return self.fail_create(
+                    &request_id,
+                    view_id.as_deref(),
+                    error.code,
+                    &error.message,
+                );
             }
         };
         let CodexEffectiveSettings {
@@ -3463,7 +3477,7 @@ impl FreshCodexState {
                 tracing::warn!(target: "freshell_freshagent::codex",
                     session_id = %resume_session_id, request_id = %request_id,
                     "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-                return self.fail_create_session_reserved(&request_id);
+                return self.fail_create_session_reserved(&request_id, view_id.as_deref());
             }
             // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
             // spawn -- exactly one in-flight resume (and one live rollout writer) per
@@ -3496,7 +3510,12 @@ impl FreshCodexState {
                         session_id = %resume_session_id, request_id = %request_id,
                         code = err.code(),
                         "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    return self.fail_create(&request_id, err.code(), err.message());
+                    return self.fail_create(
+                        &request_id,
+                        view_id.as_deref(),
+                        err.code(),
+                        err.message(),
+                    );
                 }
             };
             let own_ticket = match self.begin_lane_claim_at(
@@ -3569,6 +3588,7 @@ impl FreshCodexState {
                                 );
                                 return self.fail_create(
                                     &request_id,
+                                    view_id.as_deref(),
                                     "STALE_CLAIM",
                                     "ownership moved on while adopting the live session; refresh and retry",
                                 );
@@ -3579,7 +3599,12 @@ impl FreshCodexState {
                         // NEW tabIds, so the incumbent must not keep the old tab's
                         // attribution.
                         return self
-                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                            .adopt_live_create(
+                                &request_id,
+                                view_id.as_deref(),
+                                &resume_session_id,
+                                provenance.clone(),
+                            )
                             .await;
                     }
                     Some(ticket)
@@ -3590,7 +3615,12 @@ impl FreshCodexState {
                     // there is no fence to consult.
                     if self.has_live_session(&resume_session_id).await {
                         return self
-                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                            .adopt_live_create(
+                                &request_id,
+                                view_id.as_deref(),
+                                &resume_session_id,
+                                provenance.clone(),
+                            )
                             .await;
                     }
                     None
@@ -3600,7 +3630,12 @@ impl FreshCodexState {
                     // adopt it, spawn nothing (the COORDINATED map-hit:
                     // the claim already verified the key's state).
                     return self
-                        .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        .adopt_live_create(
+                            &request_id,
+                            view_id.as_deref(),
+                            &resume_session_id,
+                            provenance.clone(),
+                        )
                         .await;
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
@@ -3612,6 +3647,7 @@ impl FreshCodexState {
                     );
                     return self.fail_create_with_owner(
                         &request_id,
+                        view_id.as_deref(),
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                         crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
@@ -3643,11 +3679,16 @@ impl FreshCodexState {
                         // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
                         // CURRENT connection's provenance on the incumbent.
                         return self
-                            .adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                            .adopt_live_create(
+                                &request_id,
+                                view_id.as_deref(),
+                                &resume_session_id,
+                                provenance.clone(),
+                            )
                             .await;
                     }
                     crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        return self.fail_create_session_reserved(&request_id);
+                        return self.fail_create_session_reserved(&request_id, view_id.as_deref());
                     }
                     crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
                         pid,
@@ -3667,13 +3708,14 @@ impl FreshCodexState {
                         }
                         tracing::error!(target: "invariant", pid, session_id = %resume_session_id,
                             "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        return self.fail_create_session_reserved(&request_id);
+                        return self.fail_create_session_reserved(&request_id, view_id.as_deref());
                     }
                 }
             }
             return self
                 .handle_create_resume(
                     request_id,
+                    view_id,
                     resume_session_id,
                     cwd,
                     model,
@@ -3734,7 +3776,12 @@ impl FreshCodexState {
                 // Aliased{to: canonical}); the idempotent re-drive ADOPTS
                 // the live session, never a second spawn.
                 return self
-                    .adopt_live_create(&request_id, &claim_key, provenance.clone())
+                    .adopt_live_create(
+                        &request_id,
+                        view_id.as_deref(),
+                        &claim_key,
+                        provenance.clone(),
+                    )
                     .await;
             }
             crate::ownership_lane::LaneClaim::Refused(outcome) => {
@@ -3746,6 +3793,7 @@ impl FreshCodexState {
                 );
                 return self.fail_create_with_owner(
                     &request_id,
+                    view_id.as_deref(),
                     "SESSION_RESERVED",
                     "Another resume for this session is in flight",
                     crate::ownership_lane::fresh_agent_owner_fields_from_outcome(
@@ -3760,7 +3808,12 @@ impl FreshCodexState {
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
             Err(err) => {
-                return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
+                return self.fail_create(
+                    &request_id,
+                    view_id.as_deref(),
+                    "CODEX_APP_SERVER_START_FAILED",
+                    &err,
+                );
             }
         };
 
@@ -3802,6 +3855,7 @@ impl FreshCodexState {
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 return self.fail_create(
                     &request_id,
+                    view_id.as_deref(),
                     "CODEX_THREAD_START_FAILED",
                     &err.to_string(),
                 );
@@ -3875,6 +3929,7 @@ impl FreshCodexState {
                     crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                     return self.fail_create(
                         &request_id,
+                        view_id.as_deref(),
                         "FRESH_AGENT_CREATE_FAILED",
                         "the minted thread id was claimed by another owner during the create; torn down",
                     );
@@ -3884,6 +3939,7 @@ impl FreshCodexState {
 
         self.finish_create(
             request_id,
+            view_id,
             thread_id,
             client,
             notifs,
@@ -3934,6 +3990,7 @@ impl FreshCodexState {
     async fn handle_create_resume(
         &self,
         request_id: String,
+        view_id: Option<String>,
         resume_session_id: String,
         cwd: Option<String>,
         model: String,
@@ -3991,6 +4048,7 @@ impl FreshCodexState {
                 }
                 return self.fail_create(
                     &request_id,
+                    view_id.as_deref(),
                     "CODEX_APP_SERVER_START_FAILED",
                     "the previous Codex process tree is not yet confirmed stopped",
                 );
@@ -4002,6 +4060,7 @@ impl FreshCodexState {
             }
             return self.fail_create(
                 &request_id,
+                view_id.as_deref(),
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!("codex thread {resume_session_id} not found"),
             );
@@ -4047,7 +4106,12 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
+                return self.fail_create(
+                    &request_id,
+                    view_id.as_deref(),
+                    "CODEX_APP_SERVER_START_FAILED",
+                    &err,
+                );
             }
         };
         // Task 12: arm the TTL tree-kill path now that the child + its tag exist.
@@ -4101,6 +4165,7 @@ impl FreshCodexState {
                             }
                             return self.fail_create(
                                 &request_id,
+                                view_id.as_deref(),
                                 "CODEX_APP_SERVER_START_FAILED",
                                 "the exact Codex resume target was absent, but its app-server process group could not be confirmed stopped",
                             );
@@ -4124,7 +4189,7 @@ impl FreshCodexState {
                             } else {
                                 "FRESH_AGENT_CREATE_FAILED"
                             };
-                            return self.fail_create(&request_id, failure_code,
+                            return self.fail_create(&request_id, view_id.as_deref(), failure_code,
                                 "the exact Codex resume target was absent, but its app-server process tree could not be confirmed stopped");
                         }
                         resume_fence.disarm();
@@ -4151,6 +4216,7 @@ impl FreshCodexState {
                         };
                         return self.fail_create(
                             &request_id,
+                            view_id.as_deref(),
                             failure_code,
                             "the exact Codex resume target was absent, but its app-server process tree could not be confirmed stopped",
                         );
@@ -4169,7 +4235,7 @@ impl FreshCodexState {
                             if let Some(mut guard) = lease_guard.take() {
                                 guard.fail();
                             }
-                            return self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED",
+                            return self.fail_create(&request_id, view_id.as_deref(), "CODEX_APP_SERVER_START_FAILED",
                                 "the Codex resume failed and its process tree could not be confirmed stopped");
                         }
                         resume_fence.disarm();
@@ -4196,6 +4262,7 @@ impl FreshCodexState {
                 }
                 return self.fail_create(
                     &request_id,
+                    view_id.as_deref(),
                     "FRESH_AGENT_CREATE_FAILED",
                     &err.to_string(),
                 );
@@ -4221,6 +4288,7 @@ impl FreshCodexState {
             );
             return self.fail_create(
                 &request_id,
+                view_id.as_deref(),
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!(
                     "codex thread/resume returned wrong thread id {} (requested {}); \
@@ -4280,6 +4348,7 @@ impl FreshCodexState {
             }
             return self.fail_create(
                 &request_id,
+                view_id.as_deref(),
                 "FRESH_AGENT_CREATE_FAILED",
                 &format!(
                     "codex thread {thread_id} closed while the resume was in flight; torn down"
@@ -4307,6 +4376,7 @@ impl FreshCodexState {
         let outcome = self
             .finish_create(
                 request_id,
+                view_id,
                 thread_id.clone(),
                 client,
                 notifs,
@@ -4347,6 +4417,7 @@ impl FreshCodexState {
     async fn finish_create(
         &self,
         request_id: String,
+        view_id: Option<String>,
         thread_id: String,
         client: Arc<CodexAppServerClient>,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
@@ -4431,7 +4502,7 @@ impl FreshCodexState {
             // incumbent (this arm returns immediately, so moving `provenance`
             // in is safe).
             return self
-                .adopt_live_create(&request_id, &thread_id, provenance)
+                .adopt_live_create(&request_id, view_id.as_deref(), &thread_id, provenance)
                 .await;
         }
 
@@ -4602,6 +4673,7 @@ impl FreshCodexState {
                 }
                 return self.fail_create(
                     &request_id,
+                    view_id.as_deref(),
                     "FRESH_AGENT_CREATE_FAILED",
                     &format!(
                         "codex thread {thread_id} closed while the resume was in flight; torn down"
@@ -4632,6 +4704,7 @@ impl FreshCodexState {
                 }
                 return self.fail_create(
                     &request_id,
+                    view_id.as_deref(),
                     "FRESH_AGENT_CREATE_FAILED",
                     "session lease revoked during create; torn down",
                 );
@@ -4712,6 +4785,7 @@ impl FreshCodexState {
             }
             return self.fail_create(
                 &request_id,
+                view_id.as_deref(),
                 "FRESH_AGENT_CREATE_FAILED",
                 "the session's resume record could not be persisted; torn down",
             );
@@ -4735,6 +4809,7 @@ impl FreshCodexState {
             }
             return self.fail_create(
                 &request_id,
+                view_id.as_deref(),
                 "FRESH_AGENT_CREATE_FAILED",
                 "session ownership changed during create; torn down",
             );
@@ -4817,6 +4892,7 @@ impl FreshCodexState {
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
+            view_id: view_id.clone(),
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.clone(),
             session_type: SESSION_TYPE.to_string(),
@@ -4867,13 +4943,20 @@ impl FreshCodexState {
     /// so this was a real, user-visible gap: every Rust `fail_create` call previously sent
     /// no `retryable` field at all (serde omits `None`), silently hiding the retry button
     /// legacy always offers.
-    fn fail_create(&self, request_id: &str, code: &str, message: &str) -> CodexCreateOutcome {
-        self.fail_create_with_owner(request_id, code, message, None)
+    fn fail_create(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+        code: &str,
+        message: &str,
+    ) -> CodexCreateOutcome {
+        self.fail_create_with_owner(request_id, view_id, code, message, None)
     }
 
     fn fail_create_with_owner(
         &self,
         request_id: &str,
+        view_id: Option<&str>,
         code: &str,
         message: &str,
         owner: Option<crate::ownership_lane::TerminalOwnerFields>,
@@ -4899,6 +4982,7 @@ impl FreshCodexState {
                     code: code.clone(),
                     message: message.clone(),
                     request_id: request_id.into(),
+                    view_id: view_id.map(str::to_string),
                     retryable: *retryable,
                 },
             ));
@@ -4908,9 +4992,14 @@ impl FreshCodexState {
 
     /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
     /// fixed reservation code — NO new protocol fields.
-    fn fail_create_session_reserved(&self, request_id: &str) -> CodexCreateOutcome {
+    fn fail_create_session_reserved(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+    ) -> CodexCreateOutcome {
         self.fail_create(
             request_id,
+            view_id,
             "SESSION_RESERVED",
             "Another resume for this session is in flight",
         )
@@ -4936,6 +5025,7 @@ impl FreshCodexState {
     async fn adopt_live_create(
         &self,
         request_id: &str,
+        view_id: Option<&str>,
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
     ) -> CodexCreateOutcome {
@@ -4943,6 +5033,7 @@ impl FreshCodexState {
         if self.windows_prior_blocks_create(thread_id).await {
             return self.fail_create(
                 request_id,
+                view_id,
                 "SESSION_RESERVED",
                 "the previous Codex process tree has not been replaced; retry the session",
             );
@@ -4950,6 +5041,7 @@ impl FreshCodexState {
         if self.notification_drain_pending(thread_id).await {
             return self.fail_create(
                 request_id,
+                view_id,
                 "SESSION_RESERVED",
                 CODEX_DRAIN_RESERVATION_MESSAGE,
             );
@@ -5027,6 +5119,7 @@ impl FreshCodexState {
         if self.windows_prior_blocks_create(thread_id).await {
             return self.fail_create(
                 request_id,
+                view_id,
                 "SESSION_RESERVED",
                 "the previous Codex process tree has not been replaced; retry the session",
             );
@@ -5034,6 +5127,7 @@ impl FreshCodexState {
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id: request_id.to_string(),
+            view_id: view_id.map(str::to_string),
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
@@ -7400,6 +7494,7 @@ impl FreshCodexState {
         // correlation only matches THIS id.
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
+            view_id: msg.view_id.clone(),
             parent_session_id: parent_id.clone(),
             session_id: child_id.clone(),
             session_type: SESSION_TYPE.to_string(),
@@ -16691,6 +16786,7 @@ pub(crate) mod tests {
             pane_id: None,
             observed_epoch: None,
             observed_generation: None,
+            view_id: None,
             naming_handle: Some("handle-codex-early".to_string()),
             request_id: "req-codex-early".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -19718,7 +19814,9 @@ pub(crate) mod tests {
             Ok(Err(ResumeSessionError::Draining))
         );
         let adopt_reserved = matches!(
-            state.adopt_live_create("queued-exit-adopt", "thread-1", None).await,
+            state
+                .adopt_live_create("queued-exit-adopt", None, "thread-1", None)
+                .await,
             CodexCreateOutcome::Failed { code, message, .. }
                 if code == "SESSION_RESERVED" && message == "The previous session is finishing its remaining messages. Please try again."
         );
@@ -21439,6 +21537,7 @@ pub(crate) mod tests {
                     effort: None,
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 None,
             )
@@ -21616,6 +21715,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -21778,6 +21878,7 @@ pub(crate) mod tests {
                     effort: None,
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 None,
             )
@@ -23608,6 +23709,7 @@ pub(crate) mod tests {
             tab_id: None,
             observed_epoch: None,
             observed_generation: None,
+            view_id: None,
         }
     }
 
@@ -25037,6 +25139,7 @@ pub(crate) mod tests {
         // has-live check and registration) -> the :990 adopt arm.
         st.handle_create_resume(
             "req-evict-adopt".to_string(),
+            None,
             thread_id.clone(),
             None,
             "gpt-5.3-codex-spark".to_string(),
@@ -29773,6 +29876,7 @@ pub(crate) mod tests {
                     effort: None,
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 None,
             )
@@ -30516,6 +30620,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -30571,6 +30676,7 @@ pub(crate) mod tests {
             effort: None,
             plugins: None,
             tab_id: None,
+            view_id: None,
         }
     }
 
@@ -30943,6 +31049,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -31015,6 +31122,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -31098,6 +31206,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -31281,6 +31390,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -31976,6 +32086,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             provenance,
         )
@@ -32029,6 +32140,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -32238,6 +32350,7 @@ pub(crate) mod tests {
                     effort: Some(Some("high".to_string())),
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 None,
             )
@@ -32309,6 +32422,7 @@ pub(crate) mod tests {
                     effort: None,
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 Some(crate::BindProvenance::for_create(
                     Some("client-codex"),
@@ -32393,6 +32507,7 @@ pub(crate) mod tests {
                     effort: None,
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 None,
             )
@@ -33267,6 +33382,7 @@ pub(crate) mod tests {
                     effort: None,
                     plugins: None,
                     tab_id: None,
+                    view_id: None,
                 },
                 None,
             )
@@ -37880,6 +37996,7 @@ pub(crate) mod tests {
                         effort: None,
                         plugins: None,
                         tab_id: None,
+                        view_id: None,
                     },
                     None,
                 )
@@ -37992,6 +38109,7 @@ pub(crate) mod tests {
                         effort: None,
                         plugins: None,
                         tab_id: None,
+                        view_id: None,
                     },
                     None,
                 )
@@ -38109,6 +38227,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -38524,6 +38643,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
@@ -38616,6 +38736,7 @@ pub(crate) mod tests {
                 effort: None,
                 plugins: None,
                 tab_id: None,
+                view_id: None,
             },
             None,
         )
