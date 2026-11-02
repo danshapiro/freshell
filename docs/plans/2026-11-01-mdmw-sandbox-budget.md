@@ -242,7 +242,7 @@ Judge observed outcomes separately:
 
 The coordinator and independent review decide whether the actual evidence delivers the requested measured default and contained outcome. If it does not, lower concurrency only through scoped red/green/refactor and rerun affected final-source acceptance, or report FAILED/non-converged. Historical evidence cannot fill a current measurement gap.
 
-- [ ] **Step 4: Export, clean exact resources and obtain independent review**
+- [x] **Step 4: Export, clean exact resources and obtain independent review**
 
 Export commands/statuses, source/image/toolchain manifests, actual jobs, receipts, one-second/final kernel samples, complete workload logs, expected-negative cases and failed attempts before deleting temporary source/dependencies/disks. Keep necessary review evidence, not workspace/dependency copies.
 
@@ -250,7 +250,7 @@ Verify recorded containers/volumes are absent and unreferenced; QEMU/outer/sampl
 
 Obtain this task's the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding. Any further source correction is committed and receives affected verification and final-source cold acceptance before task completion.
 
-- [ ] **Step 5: Complete the scoped handoff**
+- [x] **Step 5: Complete the scoped handoff**
 
 Record actual commands, final commit, measured result or qualifying contained failure and limitations, task-review verdicts and evidence paths in the run record. The parent appends the final-HEAD full-suite disposition after both task reviews and before whole-branch review. Unresolved required proof is FAILED/non-converged, never silent success. Launcher/Docker/Cargo integration and smokes provide relevant end-to-end coverage; browser tests add no evidence for this unchanged UI.
 
@@ -296,10 +296,11 @@ were removed. The feature worktree and branch remain for review. No product
 correction, host-policy change, production restart, deployment, push or PR
 occurred during Task 2.
 
-Task 2 Step 4's fresh independent review and Step 5's review-dependent handoff
-remain pending for the coordinator, so those checkboxes remain unchecked.
-The final-HEAD full-suite gate and whole-branch review below are also pending;
-the earlier unidentified base failure grants no exemption.
+Task 2's fresh independent requirements review passed and quality review was
+approved with no findings. The review examined the actual source attribution,
+resource measurements, jobs, statuses, privacy, and cleanup evidence. The
+final-HEAD full-suite gate and whole-branch review below remain pending; the
+earlier unidentified base failure grants no exemption.
 
 ### Pending final gate
 
