@@ -7764,6 +7764,66 @@ export function query({ prompt, options }) {
         result.unwrap();
     }
 
+    /// Parse the native-input receipt's complete records. appendFile opens
+    /// the receipt before its asynchronous write completes, so a record
+    /// without its terminating newline is a torn write in progress and
+    /// never counts as consumed input.
+    fn parse_native_input_rows(receipt: &str) -> Vec<Value> {
+        let mut lines: Vec<&str> = receipt.lines().collect();
+        if !receipt.is_empty() && !receipt.ends_with('\n') {
+            lines.pop();
+        }
+        lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Render native-input rows as assertion evidence. The fixture writes
+    /// `text` either as a bare string or as a content-block array, and a
+    /// row without a uuid must stay visible as such (the cnr1 fourth-row
+    /// fingerprint: a uuid-less bare-string text sharing row 3's pid).
+    fn format_native_input_rows(rows: &[Value]) -> String {
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let text = row["text"].as_str().map(str::to_string).unwrap_or_else(|| {
+                    row["text"][0]["text"]
+                        .as_str()
+                        .unwrap_or("<no-text>")
+                        .to_string()
+                });
+                format!(
+                    "[{index}] uuid={} text={text:?} nativeSessionId={} pid={}",
+                    row["uuid"].as_str().unwrap_or("<no-uuid>"),
+                    row["nativeSessionId"]
+                        .as_str()
+                        .unwrap_or("<no-native-session-id>"),
+                    row["pid"],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn native_input_row_evidence_format_embeds_identity_fields() {
+        let rows: Vec<serde_json::Value> = vec![
+            serde_json::json!({"uuid": "u-1", "text": "/clear", "nativeSessionId": "root-A", "pid": 4242u32}),
+            serde_json::json!({"text": "Continue only the original pending native operation. Do not select another tool.", "nativeSessionId": "root-E", "pid": 4343u32}),
+        ];
+        let rendered = format_native_input_rows(&rows);
+        assert!(
+            rendered.contains("u-1")
+                && rendered.contains("/clear")
+                && rendered.contains("root-A")
+                && rendered.contains("4242")
+        );
+        assert!(rendered.contains("root-E") && rendered.contains("4343"));
+        // A row without a uuid must be visible as such (the cnr1 fourth-row fingerprint).
+        assert!(rendered.contains("<no-uuid>") || rendered.contains("no uuid"));
+    }
+
     #[tokio::test]
     async fn actual_claude_clear_backlog_replays_in_order_and_reopens_current_root() {
         let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
@@ -7955,28 +8015,33 @@ export function query({ prompt, options }) {
             )
             .await
             .unwrap();
-        let consumed = tokio::time::timeout(Duration::from_secs(5), async {
+        // The poll only establishes that three complete records are visible;
+        // it no longer decides the count. A fourth row landing after the
+        // poll's read would otherwise win the race the cnr1 failure rode.
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let rows: Vec<Value> = std::fs::read_to_string(&input_log)
-                    .unwrap_or_default()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                if rows.len() >= 3 {
-                    break rows;
+                if parse_native_input_rows(&std::fs::read_to_string(&input_log).unwrap_or_default())
+                    .len()
+                    >= 3
+                {
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await;
+        .await
+        .expect("the actual SDK must consume the original input");
+        // The sidecar is the receipt's writer, so its teardown quiesces the
+        // file: shutdown awaits the child's reaped exit before returning.
         if let ProviderState::Claude(state) = &replacement.state {
             state.shutdown().await;
         }
-        let consumed = consumed.expect("the actual SDK must consume the original input");
+        let consumed = parse_native_input_rows(&std::fs::read_to_string(&input_log).unwrap());
         assert_eq!(
             consumed.len(),
             3,
-            "two explicit clears and one original input"
+            "two explicit clears and one original input\n{}",
+            format_native_input_rows(&consumed)
         );
         assert_eq!(consumed[2]["nativeSessionId"], CURRENT);
         assert_eq!(
