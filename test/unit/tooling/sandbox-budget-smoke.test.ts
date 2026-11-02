@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { constants, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -71,7 +71,10 @@ async function runInProcess(rows: Observation[], readings: Record<string, string
         },
         existsSync: (file: string) => {
           // The fake Cargo ignores real ancestor configuration.
-          if (/\/\.cargo\/config(?:\.toml)?$/.test(file) && !file.startsWith(`${root}/cargo-budget-`)) return false
+          const configDir = path.dirname(file)
+          const project = path.dirname(configDir)
+          const ownProject = path.dirname(project) === root && path.basename(project).startsWith('cargo-budget-')
+          if (path.basename(configDir) === '.cargo' && ['config', 'config.toml'].includes(path.basename(file)) && !ownProject) return false
           return existsSync(file)
         },
       }
@@ -97,33 +100,67 @@ async function runInProcess(rows: Observation[], readings: Record<string, string
   }
 }
 
-// The CLI still creates and cleans its real temporary workspace. This finite
-// fake Cargo supplies controlled build-script observations; a preload supplies
-// cgroup readings, so failure cases do not consume memory or alter host limits.
-function runSmoke(options: {
+// The actual CLI creates and cleans its workspace. A preload intercepts its
+// Cargo boundary and supplies controlled observations and cgroup readings.
+type SmokeOptions = {
   rows: Observation[]
   args?: string[]
   cargoJobs?: string
   readings?: Record<string, string>
-}) {
+  fakeState?: 'missing' | 'unexecutable'
+  spaces?: boolean
+}
+
+function runSmoke(options: SmokeOptions) {
   const parent = process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir()
-  const root = mkdtempSync(path.join(parent, `sandbox-smoke-${secret}-`))
+  const root = mkdtempSync(path.join(parent, options.spaces ? 'sandbox smoke-' : `sandbox-smoke-${secret}-`))
+  try {
+    return runSmokeInRoot(root, options)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+function runSmokeInRoot(root: string, options: SmokeOptions) {
   const bin = path.join(root, 'bin')
   const work = path.join(root, 'work')
   mkdirSync(bin)
-  writeFileSync(path.join(bin, 'package.json'), JSON.stringify({ type: 'commonjs' }))
   mkdirSync(work)
   const preload = path.join(root, 'controls.cjs')
+  const fakeCargoMarker = path.join(root, 'fake-cargo-called')
   writeFileSync(preload, `
     const fs = require('node:fs')
+    const path = require('node:path')
+    const childProcess = require('node:child_process')
+    const { syncBuiltinESMExports } = require('node:module')
     const original = fs.readFileSync
     const originalExists = fs.existsSync
+    const originalMkdir = fs.mkdirSync
     const values = JSON.parse(process.env.FAKE_SMOKE_CONTROLS)
+    // If the smoke falls through to the harmless ambient sentinel, Node runs
+    // this marker script as its "build" argument.
+    fs.mkdirSync = function(directory) {
+      const result = originalMkdir.apply(this, arguments)
+      if (process.env.FAKE_SMOKE_AMBIENT_MARKER && typeof directory === 'string'
+          && path.basename(directory) === 'events'
+          && path.basename(path.dirname(directory)).startsWith('cargo-budget-')) {
+        const workspace = path.dirname(directory)
+        fs.writeFileSync(path.join(workspace, 'package.json'), JSON.stringify({ type: 'commonjs' }))
+        fs.writeFileSync(path.join(workspace, 'build'),
+          'require("node:fs").writeFileSync(process.env.FAKE_SMOKE_AMBIENT_MARKER, "reached")')
+      }
+      return result
+    }
     // The fixture runs a fake Cargo, so unrelated ancestor configs cannot
     // influence it. Ignore them while leaving its own project config visible.
     fs.existsSync = function(file) {
-      if (typeof file === 'string' && /\\/\\.cargo\\/config(?:\\.toml)?$/.test(file)
-          && !file.startsWith(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR + '/cargo-budget-')) return false
+      if (typeof file === 'string') {
+        const configDir = path.dirname(file)
+        const project = path.dirname(configDir)
+        const ownProject = path.dirname(project) === process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR
+          && path.basename(project).startsWith('cargo-budget-')
+        if (path.basename(configDir) === '.cargo' && ['config', 'config.toml'].includes(path.basename(file)) && !ownProject) return false
+      }
       return originalExists.apply(this, arguments)
     }
     fs.readFileSync = function(file, options) {
@@ -134,43 +171,105 @@ function runSmoke(options: {
       }
       return original.apply(this, arguments)
     }
-  `)
-  const cargo = path.join(bin, 'cargo')
-  writeFileSync(cargo, `#!/usr/bin/env node
-    const fs = require('node:fs')
-    const path = require('node:path')
-    const rows = JSON.parse(process.env.FAKE_SMOKE_ROWS)
-    for (const [index, row] of rows.entries()) {
-      fs.writeFileSync(path.join(process.env.BUDGET_EVENTS, String(index) + '.jsonl'), JSON.stringify(row) + '\\n')
+    childProcess.execFileSync = function(command, args, options) {
+      const cwd = options?.cwd
+      const env = options?.env
+      if (command !== 'cargo' || JSON.stringify(args) !== process.env.FAKE_SMOKE_CARGO_ARGS
+          || typeof cwd !== 'string' || path.dirname(cwd) !== process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR
+          || !path.basename(cwd).startsWith('cargo-budget-')
+          || env?.BUDGET_EVENTS !== path.join(cwd, 'events')
+          || env?.BUDGET_BARRIER !== path.join(cwd, 'barrier')
+          || env?.CARGO_HOME !== path.join(cwd, 'cargo-home')
+          || env?.CARGO_TARGET_DIR !== path.join(cwd, 'target')
+          || env?.CARGO_BUILD_JOBS !== process.env.CARGO_BUILD_JOBS) {
+        throw new Error('unexpected smoke Cargo invocation')
+      }
+      fs.appendFileSync(process.env.FAKE_SMOKE_CARGO_MARKER, '1')
+      for (const [index, row] of JSON.parse(process.env.FAKE_SMOKE_ROWS).entries()) {
+        fs.writeFileSync(path.join(env.BUDGET_EVENTS, String(index) + '.jsonl'), JSON.stringify(row) + '\\n')
+      }
+      return Buffer.alloc(0)
     }
+    syncBuiltinESMExports()
   `)
-  chmodSync(cargo, 0o755)
+  if (options.fakeState === 'unexecutable') writeFileSync(path.join(bin, 'cargo'), 'not an executable', { mode: 0o600 })
   const env = { ...process.env }
-  for (const key of ['CARGO_BUILD_JOBS', 'CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS']) delete env[key]
+  for (const key of Object.keys(env)) {
+    if (['PATH', 'NODE_OPTIONS', 'CARGO_BUILD_JOBS', 'CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS'].includes(key.toUpperCase())) delete env[key]
+  }
   if (options.cargoJobs !== undefined) env.CARGO_BUILD_JOBS = options.cargoJobs
+  const expectedCargoArgs = ['build', '--workspace', '--offline']
+  if (options.args?.[1] === '--cli-jobs') expectedCargoArgs.push('--jobs', options.args[2])
   Object.assign(env, {
-    PATH: `${bin}:${process.env.PATH}`,
-    NODE_OPTIONS: `--require=${preload}`,
+    PATH: bin,
+    NODE_OPTIONS: '',
     FRESHELL_TEST_EXECUTABLE_TMP_DIR: work,
     FAKE_SMOKE_ROWS: JSON.stringify(options.rows),
     FAKE_SMOKE_CONTROLS: JSON.stringify({ ...controls, ...options.readings }),
+    FAKE_SMOKE_CARGO_ARGS: JSON.stringify(expectedCargoArgs),
+    FAKE_SMOKE_CARGO_MARKER: fakeCargoMarker,
     FAKE_SECRET_INPUT: secret,
   })
-  try {
-    const result = spawnSync(process.execPath, [path.resolve('scripts/testing/sandbox-budget-smoke.mjs'), ...(options.args ?? ['2'])], {
-      env, encoding: 'utf8', timeout: 20_000,
+  let sentinelReady: boolean | undefined
+  const marker = path.join(root, 'ambient-reached')
+  if (options.fakeState || options.spaces) {
+    const ambient = path.join(root, 'ambient')
+    mkdirSync(ambient)
+    const sentinel = path.join(ambient, process.platform === 'win32' ? 'cargo.exe' : 'cargo')
+    try {
+      symlinkSync(process.execPath, sentinel, 'file')
+    } catch {
+      try {
+        linkSync(process.execPath, sentinel)
+      } catch {
+        copyFileSync(process.execPath, sentinel, constants.COPYFILE_EXCL)
+      }
+    }
+    env.PATH = `${bin}${path.delimiter}${ambient}`
+    env.FAKE_SMOKE_AMBIENT_MARKER = marker
+    const probe = spawnSync(sentinel, ['-e', 'require("node:fs").writeFileSync(process.argv[1], "reached")', marker], {
+      env: { ...env, NODE_OPTIONS: '' }, encoding: 'utf8', timeout: 10_000,
     })
-    const lines = `${result.stdout}\n${result.stderr}`.split('\n').flatMap(line => {
-      try { return [JSON.parse(line)] } catch { return [] }
-    })
-    const leftovers = readdirSync(work)
-    return { ...result, lines, leftovers }
-  } finally {
-    rmSync(root, { recursive: true, force: true })
+    sentinelReady = probe.status === 0 && existsSync(marker)
+    rmSync(marker, { force: true })
   }
+  const result = spawnSync(process.execPath, ['--require', preload, path.resolve('scripts/testing/sandbox-budget-smoke.mjs'), ...(options.args ?? ['2'])], {
+    env, encoding: 'utf8', timeout: 20_000,
+  })
+  const lines = `${result.stdout}\n${result.stderr}`.split('\n').flatMap(line => {
+    try { return [JSON.parse(line)] } catch { return [] }
+  })
+  const fakeCargoCalls = existsSync(fakeCargoMarker) ? readFileSync(fakeCargoMarker, 'utf8').length : 0
+  return { ...result, lines, leftovers: readdirSync(work), sentinelReady, ambientReached: existsSync(marker), fakeCargoCalls }
 }
 
 describe('sandbox build budget smoke observations', () => {
+  it.each(['missing', 'unexecutable'] as const)('fixture safety: %s fake cannot reach ambient Cargo', fakeState => {
+    const result = runSmoke({ rows: observations(2, true), fakeState })
+    expect(result.sentinelReady).toBe(true)
+    expect(result.ambientReached).toBe(false)
+    expect([0, 1]).toContain(result.status)
+    if (result.status === 0) {
+      expect(result.fakeCargoCalls).toBe(1)
+      expect(result.lines).toContainEqual(expect.objectContaining({ event: 'sandbox_budget_smoke_passed', jobs: 2, peakOverlap: 2 }))
+    } else {
+      expect(result.lines).toContainEqual(expect.objectContaining({ event: 'sandbox_budget_smoke_failed', stage: 'cargo', reason: 'cargo_exit' }))
+    }
+    expect(result.leftovers).toEqual([])
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(secret)
+  })
+
+  it('fixture safety: runs the real smoke CLI when the temporary path contains spaces', () => {
+    const result = runSmoke({ rows: observations(2, true), spaces: true })
+    expect(result.sentinelReady).toBe(true)
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.ambientReached).toBe(false)
+    expect(result.fakeCargoCalls).toBe(1)
+    expect(result.lines).toContainEqual(expect.objectContaining({ event: 'sandbox_budget_smoke_passed', jobs: 2, peakOverlap: 2 }))
+    expect(result.leftovers).toEqual([])
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(secret)
+  })
+
   it.each([
     ['serial', false, 1],
     ['overlapping', true, 0],
@@ -208,6 +307,7 @@ describe('sandbox build budget smoke observations', () => {
   it('rejects serial observations when two concurrent jobs are expected', () => {
     const result = runSmoke({ rows: observations(2) })
     expect(result.status, result.stderr).toBe(1)
+    expect(result.fakeCargoCalls).toBe(1)
     expect(result.lines).toContainEqual(expect.objectContaining({
       severity: 'error', event: 'sandbox_budget_smoke_failed', reason: 'overlap', expected_jobs: 2, observed_overlap: 1,
     }))
@@ -217,6 +317,7 @@ describe('sandbox build budget smoke observations', () => {
   it('accepts observed overlapping work when two jobs are expected', () => {
     const result = runSmoke({ rows: observations(2, true) })
     expect(result.status, result.stderr).toBe(0)
+    expect(result.fakeCargoCalls).toBe(1)
     expect(result.lines).toContainEqual(expect.objectContaining({ event: 'sandbox_budget_smoke_passed', jobs: 2, peakOverlap: 2 }))
     expect(result.leftovers).toEqual([])
   })
@@ -239,6 +340,7 @@ describe('sandbox build budget smoke observations', () => {
   ] as const)('retains the one-job %s case', (mode, args, cargoJobs) => {
     const result = runSmoke({ rows: observations(1), args: [...args], cargoJobs })
     expect(result.status, result.stderr).toBe(0)
+    expect(result.fakeCargoCalls).toBe(1)
     expect(result.lines).toContainEqual(expect.objectContaining({ event: 'sandbox_budget_smoke_passed', mode, jobs: 1, peakOverlap: 1 }))
     expect(result.leftovers).toEqual([])
   })
