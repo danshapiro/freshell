@@ -130,9 +130,9 @@ git commit -m "test: retain native-input evidence in clear-backlog count asserti
 - Consumes: the fixture's `logNativeInput` seam and checkpoint branch (Task 1's retention is already in place so any future mismatch is diagnosable).
 - Produces: a new fixture opt-out environment variable `FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION=1` under which the checkpoint iterator yields a plain result (no synthesized solo-tool `tool_use`+`defer`) for non-`/clear`, non-`/compact` inputs; the clear-backlog Rust test sets it.
 
-- [ ] **Step 1: Reproduce under controlled starvation (diagnostic only — no repo change)**
+- [ ] **Step 1: Reproduce under controlled starvation — a bounded multi-attempt campaign (diagnostic only — no repo change)**
 
-Run the exact clear-backlog test inside the runtime sandbox with deliberate CPU pressure against the test process (busy-loop helpers or `taskset` pinning, the retained driver-episode pattern) while a pre-opened read FD retains `native-inputs.jsonl` outside the TempDir. Success criterion: a fourth row appears matching the predicted fingerprint — no `uuid`, bare-string text `Continue only the original pending native operation. Do not select another tool.`, root E, row-3's PID. If the row differs or cannot be produced within a bounded episode, stop and re-investigate (the planning report §4.2–4.7 statically excludes all other writers); record the outcome either way in the task report — the isolation repair may proceed labeled "statically proven" if the episode is inconclusive.
+Run the exact clear-backlog test inside the runtime sandbox with deliberate CPU pressure against the test process (busy-loop helpers or `taskset` pinning, the retained driver-episode pattern) while a pre-opened read FD retains `native-inputs.jsonl` outside the TempDir. Make this a genuine campaign, not a single shot: at least three attempts with varied pressure strategies (e.g. different `taskset` CPU counts, different busy-loop intensities, a ~500 ms starvation window starting after row 3), each retaining its evidence. Success criterion: a fourth row appears matching the predicted fingerprint — no `uuid`, bare-string text `Continue only the original pending native operation. Do not select another tool.`, root E, row-3's PID. If a row appears that does NOT match the fingerprint, stop and re-investigate (the planning report §4.2–4.7 statically excludes all other writers; a mismatch is a genuinely new finding). If the campaign is inconclusive after all attempts, the isolation repair may still land (it removes the only statically-live racing writer and is defensively correct), but cnr1's Kata issue is NOT closed in this run: post an honest comment recording that the runtime fingerprint remains unconfirmed, that the retention changes now guarantee any recurrence retains the actual rows, and that the issue stays open pending a recurrence with retained evidence.
 
 - [ ] **Step 2: Write the failing behavioral test**
 
@@ -155,7 +155,9 @@ it('with FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION a plain input log
 
 - [ ] **Step 3: Run the test and verify the intended failure**
 
-Run: `pnpm run test:vitest run test/unit/claude-sidecar/native-continuation-lifecycle.test.ts --config config/vitest/vitest.config.ts`
+This test file spawns real native sidecar processes and states in its header that its regressions run only through the sandbox wrapper — every invocation of this file goes through `scripts/sandbox-test.sh` (see `docs/development/test-sandbox.md`).
+
+Run: `bash scripts/sandbox-test.sh "pnpm run test:vitest run test/unit/claude-sidecar/native-continuation-lifecycle.test.ts --config config/vitest/vitest.config.ts"`
 
 Expected: FAIL because the fixture ignores the unknown env var and still runs the synthesized solo-tool defer chain (extra row / deferred event present).
 
@@ -165,7 +167,7 @@ In `native-startup-query.mjs`'s checkpoint iterator, when `process.env.FRESHELL_
 
 - [ ] **Step 5: Run the focused test**
 
-Run: `pnpm run test:vitest run test/unit/claude-sidecar/native-continuation-lifecycle.test.ts --config config/vitest/vitest.config.ts`
+Run: `bash scripts/sandbox-test.sh "pnpm run test:vitest run test/unit/claude-sidecar/native-continuation-lifecycle.test.ts --config config/vitest/vitest.config.ts"`
 
 Expected: PASS — the new flag test green AND the existing no-flag defer→continuation chain tests stay green.
 
@@ -177,7 +179,7 @@ None expected; keep the fixture diff minimal.
 
 1. Rust clear-backlog case (now with the flag set): `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host providers::fresh_agent::tests::actual_claude_clear_backlog_replays_in_order_and_reopens_current_root -- --exact --nocapture"` — PASS, including once under the Step-1 starvation shape (deterministic 3 rows).
 2. The checkpoint-dependent Rust tests that must keep the chain (no flag): `... providers::fresh_agent::tests::hosted_checkpoint_recovery_stages_without_input_and_releases_current_native_ask_once -- --exact --nocapture` and `... providers::fresh_agent::tests::hosted_actor_checkpoint_recovery_preserves_the_created_root_and_current_card -- --exact --nocapture` — PASS.
-3. Full sidecar unit dir: `pnpm run test:vitest run test/unit/claude-sidecar --config config/vitest/vitest.config.ts` — PASS.
+3. Full sidecar unit dir (all files spawn real sidecar processes — same sandbox rule): `bash scripts/sandbox-test.sh "pnpm run test:vitest run test/unit/claude-sidecar --config config/vitest/vitest.config.ts"` — PASS.
 
 Expected: all PASS.
 
@@ -188,11 +190,11 @@ git add test/unit/claude-sidecar/fixtures/native-startup-query.mjs test/unit/cla
 git commit -m "test: isolate clear-backlog replay from fixture tool-continuation chain"
 ```
 
-- [ ] **Step 9: Post the cnr1 kata evidence comment** (`kata comment cnr1 --body "..."`) with the starvation-repro outcome, the fingerprint confirmation, and retained evidence paths.
+- [ ] **Step 9: Post the cnr1 kata evidence comment** (`kata comment cnr1 --body "..."`) with the campaign outcome (fingerprint confirmed with retained rows, or honestly unconfirmed), the isolation repair, and retained evidence paths. The issue is closed in this run ONLY if the fingerprint was confirmed at runtime; otherwise the comment explicitly states the issue remains open pending a recurrence with the now-guaranteed retained evidence.
 
 ---
 
-### Task 3: wjwa — bounded readiness wait for the initial parent observation
+### Task 3: wjwa — event-driven readiness before the initial parent observation
 
 **Files:**
 - Modify: `crates/freshell-session-host/src/providers/fresh_agent.rs` (test `hosted_claude_rejected_rollback_preserves_current_parent_and_followup`; base_ref: single-shot read at :6370, panic site :6517:24; sibling bounded poll at :7629-7638; near-identical polls at :6441-6448)
@@ -205,28 +207,24 @@ git commit -m "test: isolate clear-backlog replay from fixture tool-continuation
 
 Using a temporary local edit (never committed) that delays the sidecar's init/evidence frame (fixture or sidecar test knob if one already exists; otherwise a temporary insertion-point delay in the test's own fixture wiring), show that the current single-shot read at :6370 fails with `initial parent observation missing` when evidence publication is delayed past the announce — proving the test checks too early and the actor contract (announce at `start`, evidence one frame later) is intact. Record the observed failure verbatim in the task report. (Retained RED corroboration: `test-results/viewport-screenshots/claude-clear-evidence/original_target/failure-excerpt.txt` — group-run-only failure, 4/4 exact-run passes.)
 
-- [ ] **Step 2: Add the bounded wait**
+- [ ] **Step 2: Add the readiness wait — the production verb first**
 
-Mirror the sibling's exact bounded poll (:7629-7638) at :6370 — wait up to a bounded timeout (sibling's 8s/10ms cadence) for `fresh_native_observation(&launch, &actor)` to become `Some`, then bind `before` from it; keep the `ok_or("initial parent observation missing")` failure for a genuine timeout so the readiness contract stays falsifiable:
+Primary fix: mirror the production readiness gate (main.rs:2657-2698 `ensure_current_fresh_native_observation` → `prepare_native_readiness`, main.rs:1047) exactly like the czzp fix in Task 4 — call the actor's production readiness verb before the first observation read:
 
 ```rust
-let before = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-    loop {
-        if let Some(obs) = crate::fresh_native_observation(&launch, &actor) {
-            return obs;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-})
-.await
-.ok_or("initial parent observation missing")?;
+actor
+    .prepare_native_readiness()
+    .await
+    .expect("rollback test actor must reach native readiness");
+let before = crate::fresh_native_observation(&launch, &actor)
+    .ok_or("initial parent observation missing")?;
 ```
 
-(Adapt to the sibling's exact style/signatures; no sleeps on the success path beyond the poll cadence, no assertion changes.)
+(Adapt to the actor handle type the test actually holds; verify the verb is applicable to a freshly-opened resume actor in this test's state — production calls it on exactly this class of actor.) `prepare_native_readiness` is event-driven: it awaits the transport's evidence publication internally (fresh_agent.rs:790-856), which is why it is preferred over any test-side waiting loop. The `ok_or` failure stays so the readiness contract remains falsifiable. ONLY if the verb is demonstrably inapplicable to this test's actor state (record why, with the compiler/runtime evidence), fall back to the sibling's established bounded readiness wait (:7629-7638) — a condition-checked wait on `fresh_native_observation` becoming `Some`, the repo's own precedent for this exact window (commit a42917884) — and never a blind sleep. No blind sleeps in either case; no assertion changes.
 
 - [ ] **Step 3: Verify the wait is required and sufficient (GREEN)**
 
-With the same temporary delay from Step 1 still applied, run the test: the bounded wait must carry it to green. Then remove the temporary delay entirely and run again: PASS.
+With the same temporary delay from Step 1 still applied, run the test: the readiness wait must carry it to green. Then remove the temporary delay entirely and run again: PASS.
 
 Run (each): `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host providers::fresh_agent::tests::hosted_claude_rejected_rollback_preserves_current_parent_and_followup -- --exact --nocapture"`
 
@@ -234,7 +232,7 @@ Expected: PASS without the delay; with the temporary delay, passes only after th
 
 - [ ] **Step 4: Refactor while green**
 
-The poll now appears (near-identically) at :6370, :6441-6448, and :7629-7638 — factor a small `#[cfg(test)]` helper (e.g. `await_fresh_native_observation(&launch, &actor, timeout)`) and use it at all three sites; rerun the three focused tests.
+None. Do not spread the waiting pattern to other tests in this run; the sibling's existing wait at :7629-7638 stays untouched.
 
 - [ ] **Step 5: Run impacted-test verification**
 
@@ -321,62 +319,73 @@ git commit -m "test: gate checkpoint release on native readiness across build co
 ### Task 5: gc1p Fix C — typed, redacted replacement-open diagnostics end-to-end
 
 **Files:**
-- Modify: `crates/freshell-runtime-protocol/src/lib.rs` (near `FreshAgentOpenFailed` :1199 and `FreshAgentProviderStartDiagnostic` :1208-1232)
+- Modify: `crates/freshell-runtime-protocol/src/lib.rs` (near `FreshAgentOpenFailed` :1199 and `FreshAgentProviderStartDiagnostic` :1208-1232 — the wire enum + its serialization)
+- Modify: `crates/freshell-agent-runtime/src/host_actor.rs` (`ActorError` variants :422-445 and every `NativeIdentityMismatch` raise site — attach redacted field-name context)
 - Modify: `crates/freshell-session-host/src/main.rs` (`map_fresh_agent_open_error` :1522-1541; unit tests :9740-9762)
+- Modify: `crates/freshell-runtime-client/src/lib.rs` (`ClientError::Runtime` at :36-70 currently copies only `code`, `diagnostic_code`, `fresh_agent_provider_start_diagnostic` — add the new field + accessor so the subtype survives the RuntimeError→ClientError conversion)
 - Modify: `crates/freshell-supervisor/src/service.rs` (`activation_failure_data` :9961-9981)
 - Modify: `crates/freshell-supervisor/src/recovery.rs` (`recovery_activation_failure_data` :5885-5905)
 - Modify: `crates/freshell-server/src/fresh_agent_proxy.rs` (`dispatch_send` :169-219, error_event codes :177-185)
-- Test: `crates/freshell-server/src/freshell_proxy_tests.rs` (frame contract :1434+)
+- Test: `crates/freshell-server/src/freshell_proxy_tests.rs` (frame contract :1434+), runtime-client unit tests
 
 **Interfaces:**
-- Consumes: `ActorError` variants (host_actor.rs:422-445: NativeIdentityMismatch, WriterBusy, Persistence, AmbiguousDispatch, transport), the redaction rationale at main.rs:1517-1518, existing JSONL event fields.
-- Produces: a closed, body-free `FreshAgentOpenFailureSubtype` enum (`profile_mismatch`, `writer_busy`, `state_unreadable`, `ambiguous_identity`, `transport`, …) carried from actor-open through supervisor activation/recovery failure events to a typed gateway refusal code. Tasks 6–7 rely on these diagnostics to make their failures diagnosable.
+- Consumes: `ActorError` variants (host_actor.rs:422-445), the redaction rationale at main.rs:1517-1518, existing JSONL event fields.
+- Produces: a closed, body-free `FreshAgentOpenFailureSubtype` enum (`native_identity_mismatch`, `writer_busy`, `state_unreadable`, `ambiguous_identity`, `transport`, … — the value names the actual check class, NOT a guessed inner cause; `NativeIdentityMismatch` arises from several distinct checks — profile comparison, native-start identity, resume fences — so the shared variant maps to the honest coarse subtype `native_identity_mismatch`) plus a redacted field-NAMES payload attached at the raise sites. The subtype and field names must travel: actor-open error → RuntimeError (protocol crate) → runtime-client `ClientError::Runtime` (new field + accessor, mirroring the `fresh_agent_provider_start_diagnostic` pattern at :36-70) → supervisor activation/recovery failure events (`failureReason` + subtype) → a typed closed-enum gateway `error_event` code. Tasks 6–7 rely on these diagnostics to make their failures diagnosable.
 
-- [ ] **Step 1: Write the failing behavioral test (host mapping)**
+- [ ] **Step 1: Write the failing behavioral test (host mapping + redacted field names)**
 
-Extend the `map_fresh_agent_open_error` unit tests (main.rs:9740-9762): for each `ActorError` variant the mapping must emit the closed subtype — e.g. `NativeIdentityMismatch` → `profile_mismatch` including the mismatched field NAMES (never values), `WriterBusy` → `writer_busy`, `Persistence` → `state_unreadable`, `AmbiguousDispatch` → `ambiguous_identity`; and no provider prose, secrets, or values cross.
+Extend the `map_fresh_agent_open_error` unit tests (main.rs:9740-9762): each `ActorError` variant maps to its closed subtype — `NativeIdentityMismatch` → `native_identity_mismatch` including any mismatched field NAMES the raise site attached (names only, never values), `WriterBusy` → `writer_busy`, `Persistence` → `state_unreadable`, `AmbiguousDispatch` → `ambiguous_identity`; no provider prose, secrets, or values cross. Because the variant is fieldless today, first add a RED test at the raise-site level: a profile comparison that mismatches on `permission_mode` (for example) must surface that field NAME through the error context — fails today because the variant carries nothing.
 
-Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host map_fresh_agent_open_error -- --nocapture"` (adapt selector to the actual test names)
+Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host map_fresh_agent_open_error -- --nocapture"` (adapt selector to the actual test names) and the new raise-site test's narrowed selector
 
-Expected: FAIL because the mapping currently collapses everything into opaque `FRESH_AGENT_OPEN_FAILED` (the missing behavior is the typed subtype).
+Expected: FAIL (opaque `FRESH_AGENT_OPEN_FAILED`; no field names anywhere).
 
-- [ ] **Step 2: Implement the host-side subtype**
+- [ ] **Step 2: Implement the raise-site context + host-side subtype**
 
-Add the closed enum to `freshell-runtime-protocol` (mirroring `FreshAgentProviderStartDiagnostic`'s shape) and extend `map_fresh_agent_open_error` to emit it per variant; for `profile_mismatch` include only field names.
+Attach a redacted, closed-set field-NAMES payload to the `NativeIdentityMismatch` raise sites in host_actor.rs (each raise site knows which fields it compared), add the closed enum to `freshell-runtime-protocol` (mirroring `FreshAgentProviderStartDiagnostic`'s shape, including serialization), and extend `map_fresh_agent_open_error` to emit the subtype + field names per variant.
 
-- [ ] **Step 3: Write the failing tests (supervisor carry-through + gateway)**
+- [ ] **Step 3: Write the failing tests (client carry + supervisor carry-through + gateway)**
 
-1. Supervisor: `recovery_activation_failure_data` must carry `failureReason` (and the new subtype where the host provides it) — today it drops it entirely; `activation_failure_data` must include the subtype alongside `failureReason`. RED test asserting the event fields.
-2. Gateway: `fresh_agent_proxy_tests.rs` — a supervisor `RecoveryBlocked`/open-failure reason must surface as a typed closed-enum `error_event` code in the refusal frame instead of only the fixed `MANAGED_FRESH_AGENT_ERROR` message. RED test asserting the frame's code.
+1. Runtime client: a `ClientError::Runtime` constructed from a `RuntimeError` carrying the new subtype must expose it through a new accessor (mirroring `fresh_agent_provider_start_diagnostic` at :36-70) — RED: the conversion drops it today.
+2. Supervisor: `recovery_activation_failure_data` must carry `failureReason` (and the subtype where the host provides it) — today it drops it entirely; `activation_failure_data` must include the subtype alongside `failureReason`. RED tests asserting the event fields.
+3. Gateway: `fresh_agent_proxy_tests.rs` — a supervisor `RecoveryBlocked`/open-failure reason must surface as a typed closed-enum `error_event` code in the refusal frame instead of only the fixed `MANAGED_FRESH_AGENT_ERROR` message. RED test asserting the frame's code.
 
-Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-supervisor -- --nocapture"` and `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-server -- --nocapture"` (narrowed selectors)
+Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-runtime-client -- --nocapture"`, `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-supervisor -- --nocapture"`, and `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-server -- --nocapture"` (narrowed selectors)
 
-Expected: FAIL (fields/code absent).
+Expected: FAIL (field/accessor/code absent).
 
 - [ ] **Step 4: Implement the carry-through**
 
-Wire the subtype and failureReason through `activation_failure_data`, `recovery_activation_failure_data`, and the gateway's existing `error_event`/`error_event_code` mechanism (closed enum values only; the human-readable message may stay generic).
+Wire the subtype and field names through the protocol serialization, the runtime-client conversion (new field + accessor), `activation_failure_data`, `recovery_activation_failure_data`, and the gateway's existing `error_event`/`error_event_code` mechanism (closed enum values only; the human-readable message may stay generic).
 
 - [ ] **Step 5: Run the focused tests**
 
 Rerun the Step 1/3 selectors: all PASS.
 
-- [ ] **Step 6: Refactor while green**
+- [ ] **Step 6: Capture the ACTUAL replacement-open error from the real failing sequence**
+
+With the diagnostics in place and BEFORE Task 6 changes any recovery behavior, run the still-failing installed parity case in the disposable sandbox so the new diagnostics capture the actual error from the real three-replacement sequence:
+
+Run: `FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='gc1p actual-error capture' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: the case still FAILS at the first post-crash recovery send (the recovery fix has not landed), but the retained JSONL/frames now name the actual open-failure subtype and mismatched field names for each replacement attempt. Retain this capture (it is the gc1p-required "actual replacement-open error" evidence and runtime-confirms the Task 6 diagnosis; do not fix recovery in this step).
+
+- [ ] **Step 7: Refactor while green**
 
 Keep the enum closed and the mapping table-driven if the sibling diagnostic mapping is table-driven; no behavior additions.
 
-- [ ] **Step 7: Run impacted-test verification**
+- [ ] **Step 8: Run impacted-test verification**
 
-Redaction contracts that must stay green: `activation_failure_diagnostic_names_the_exact_stage_and_redacts_detail` (service.rs:7320), `codex_prepare_stage_diagnostics_reach_the_body_free_failure_reason` (service.rs:7372), `map_fresh_agent_open_error` secret-leak tests (main.rs:9740-9762), the whole `freshell_proxy_tests.rs` lane, and the supervisor recovery-retry unit set (`recovery.rs` retry tests, `registry.rs` budget tests).
+Redaction contracts that must stay green: `activation_failure_diagnostic_names_the_exact_stage_and_redacts_detail` (service.rs:7320), `codex_prepare_stage_diagnostics_reach_the_body_free_failure_reason` (service.rs:7372), `map_fresh_agent_open_error` secret-leak tests (main.rs:9740-9762), the whole `freshell_proxy_tests.rs` lane, the runtime-client unit tests, and the supervisor recovery-retry unit set (`recovery.rs` retry tests, `registry.rs` budget tests).
 
-Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host -p freshell-supervisor -p freshell-server -- --nocapture"`
+Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host -p freshell-supervisor -p freshell-server -p freshell-runtime-client -- --nocapture"`
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit the task**
+- [ ] **Step 9: Commit the task**
 
 ```bash
-git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-session-host/src/main.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/freshell_proxy_tests.rs
+git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-session-host/src/main.rs crates/freshell-runtime-client/src/lib.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/freshell_proxy_tests.rs
 git commit -m "feat: typed redacted fresh-agent open-failure diagnostics end-to-end"
 ```
 
@@ -389,20 +398,23 @@ git commit -m "feat: typed redacted fresh-agent open-failure diagnostics end-to-
 - Test: `crates/freshell-session-host/src/main.rs` (new focused grant test) and keep `crates/freshell-supervisor/src/registry.rs:9656` `accepted_fresh_agent_turn_settings_are_part_of_exact_recovery_profile` green (the invariant's reference).
 
 **Interfaces:**
-- Consumes: the stored soul-level resume spec (`souls.resume_spec`, frozen at creation), the incarnation's folded launch spec (`context.fresh_agent` recovery profile per service.rs:2897-2901), `build_resume_spec` terminal semantics (freshell-agent-runtime lib.rs:732-810).
-- Produces: grant-time composition rule — identity/environment/program come from the stored spec; turn settings (`model`, `reasoning_effort`/effort, `permission_mode`, `cwd`) come from the incarnation's folded launch spec when it carries them, and from the stored spec only for genuinely-absent fields (first-ever resume with no folded settings). Task 7 builds on this consistency.
+- Consumes: the stored soul-level resume spec (`souls.resume_spec`, frozen at creation), the incarnation's folded launch spec (`context.fresh_agent` recovery profile per service.rs:2897-2901), `build_resume_spec` terminal semantics (freshell-agent-runtime lib.rs:732-810), the `FreshAgentTurnSettings` presence semantics (a folded `None`/Default effort is an INTENTIONAL saved setting — e.g. the registry persists `spec.effort = None` for "Default" — not an absent field).
+- Produces: grant-time composition rule — identity/environment/program come from the stored spec; turn settings (`model`, `reasoning_effort`/effort, `permission_mode`, `cwd`) come from the incarnation's folded launch profile whenever the profile GOVERNS them, where governance is structural presence in the folded recovery profile (not Option-truthiness): a folded field that is present-but-`None`/Default (an intentional cleared setting) WINS over any stale stored value; the stored spec fills a field only when the folded profile structurally does not govern it (e.g. terminal-style first-ever resume with no fresh-agent settings). Task 7 builds on this consistency.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Write the failing behavioral test — three settings cases**
 
-A focused session-host test: save an actor, then update its turn settings (model/effort/permission/cwd — exactly the `fresh_agent_configure` recovery-profile fold), then drive a resume through the grant-execution path and assert the launched actor uses the FOLDED settings (and opens successfully), not the stale stored spec. This mirrors the registry invariant test at registry.rs:9656 but exercises the host-side grant composition end-to-end. RED: today the stored spec overwrites the folded fields and the actor-open profile comparison rejects the launch (`NativeIdentityMismatch` → `FRESH_AGENT_OPEN_FAILED`) or silently launches with stale settings.
+A focused session-host test set (one test per case, all through the grant-execution resume path):
+1. Populated: save an actor, update turn settings (model/effort/permission/cwd — the `fresh_agent_configure` recovery-profile fold), resume, and assert the launched actor uses the FOLDED settings and opens successfully. RED today: the stored spec overwrites the folded fields and the actor-open profile comparison rejects (`NativeIdentityMismatch` → `FRESH_AGENT_OPEN_FAILED`) or silently launches with stale settings.
+2. Intentionally cleared: folded profile explicitly clears a field the stored spec still carries (e.g. effort set to Default → folded `None` while the stale stored spec has `Some(...)`) — resume must launch with the CLEARED value, NOT resurrect the stored one. RED today: an Option-truthiness fallback restores the stale value.
+3. No folded profile at all (terminal-style first-ever resume): stored spec fills every field exactly as today — PASS today and must stay green (regression guard).
 
-Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host <new test name> -- --exact --nocapture"`
+Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host <new test names> -- --exact --nocapture"`
 
-Expected: FAIL (stale spec wins).
+Expected: cases 1 and 2 FAIL (stale spec wins); case 3 PASSes.
 
 - [ ] **Step 2: Add the minimal production implementation**
 
-In the grant-execution resume branch (main.rs:2326-2330), stop overwriting `model`/`effort`/`permission_mode`/`cwd` from the stored spec when the incoming launch spec already carries the incarnation's folded settings; keep populating fields that are genuinely absent (first-ever resume). Identity fields (`native_session_id`, provider/store identity, program) still come from the stored spec; the identity checks at :2310-2325 are untouched. State the rule in a doc comment citing service.rs:2897-2901 ("the launch's folded settings ARE the recovery profile").
+In the grant-execution resume branch (main.rs:2326-2330), make the folded launch profile win for every settings field it GOVERNS — presence by structural governance, not Option-truthiness — and keep the stored spec as the source only for fields the profile does not govern (first-ever resume). Identity fields (`native_session_id`, provider/store identity, program) still come from the stored spec; the identity checks at :2310-2325 are untouched. State the rule in a doc comment citing service.rs:2897-2901 ("the launch's folded settings ARE the recovery profile") and noting the cleared-vs-absent distinction.
 
 - [ ] **Step 3: Run the focused test**
 
@@ -438,7 +450,7 @@ git commit -m "fix: folded recovery settings win over stale stored resume spec a
 
 **Interfaces:**
 - Consumes: Task 5's typed diagnostics (failure visibility), Task 6's settings consistency (replacement launches, other failure classes, stay correct), the direct adapter's proven send path (`ensure_session_alive` mint-new on `threadNotFound`, codex.rs:7636-7667) and its typed `NativeDispatchIdentity` commit (providers/fresh_agent.rs:1189-1226 → service.rs:2511-2537), the `is_codex_thread_not_found` classifier, the owned-tree proof discipline (`task010_failed_resume_confirms_its_owned_tree_before_minting_again`, providers/fresh_agent.rs:3422).
-- Produces: a supervisor classification distinguishing (i) host-process death (or other whole-host classes) — existing whole-host replacement + RETRY_BUDGET semantics unchanged — from (ii) a codex native-provider exit while the host process and durable actor are intact: the soul remains send-admitted, no whole-host replacement, and the next send drives the existing recover-on-send path whose typed identity commit moves the native root durably. The SAME typed recoverable state must be recognized at BOTH gates on the send path: the supervisor admission gate AND the session-host send-time current-native-observation guard, which must route the send to the actor's recover-on-send (owned-tree proof → mint-new → typed commit) instead of refusing with `NATIVE_IDENTITY_UNOBSERVED` (`RecoveryWrongIdentity`). Scoped to codex managed sessions; claude/kilroy/opencode crash policies and the guard's Claude rescue arm are unchanged.
+- Produces: a supervisor classification distinguishing (i) host-process death (or other whole-host classes) — existing whole-host replacement + RETRY_BUDGET semantics unchanged — from (ii) a codex native-provider exit while the host process and durable actor are intact: the soul remains send-admitted, no whole-host replacement, and the next send drives the existing recover-on-send path whose typed identity commit moves the native root durably. The classification rule is defined once as a pure function over (provider, host liveness, native liveness) and enforced at BOTH gates on the send path — the supervisor admission gate and the session-host send-time current-native-observation guard — each deriving the class locally from facts it already holds (NO new wire/protocol field on `HostCommand::FreshAgentSend`/`FreshAgentPrepareNative`); the host-side guard routes a class-(ii) send to the actor's recover-on-send (owned-tree proof → mint-new → typed commit) instead of refusing with `NATIVE_IDENTITY_UNOBSERVED` (`RecoveryWrongIdentity`). Scoped to codex managed sessions; claude/kilroy/opencode crash policies and the guard's Claude rescue arm are unchanged.
 
 - [ ] **Step 1: Write the failing behavioral test (observer classification)**
 
@@ -466,15 +478,19 @@ In `authenticate_current_fresh_host` (:2582-2694), replace the blanket `status.e
 
 - [ ] **Step 5: Write the failing behavioral test (session-host send-time guard — the third blocker)**
 
-Session-host unit test: with a codex session whose host process and durable actor are alive but whose native process is dead (native root's history archived/absent), a `FreshAgentSend` that carries the typed recoverable state must reach the actor's recover-on-send (eventually minting a new native conversation and committing the typed identity) instead of being refused at `ensure_current_fresh_native_observation` with `NATIVE_IDENTITY_UNOBSERVED`; the same send WITHOUT the recoverable state (an unclassified dead-native session) must still refuse exactly as today (the identity fence stays intact for everyone else). RED: today the guard refuses unconditionally because `observed_native_session_id` is `None` when `!is_live` and the only rescue arm (`prepare_native_readiness`) is a no-op for codex.
+Session-host unit tests, driving the classification through the EXISTING `HostCommand::FreshAgentSend` interface (no new wire field — see Step 6):
+1. Recoverable class: a codex session whose host process and durable actor are alive but whose native process is dead (native root's history archived/absent) — the send must reach the actor's recover-on-send (eventually minting a new native conversation and committing the typed identity) instead of being refused at `ensure_current_fresh_native_observation` with `NATIVE_IDENTITY_UNOBSERVED`.
+2. Fence stays intact: a claude/kilroy session in the same dead-native state still refuses exactly as today; a codex send against a genuinely dead host still refuses exactly as today.
 
-Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host <new test name> -- --exact --nocapture"`
+RED: today the guard refuses unconditionally because `observed_native_session_id` is `None` when `!is_live` and the only rescue arm (`prepare_native_readiness`) is a no-op for codex.
 
-Expected: FAIL (send-time refusal).
+Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host <new test names> -- --exact --nocapture"`
 
-- [ ] **Step 6: Implement the send-guard routing**
+Expected: FAIL (send-time refusal in the recoverable class).
 
-Make the send-time guard recoverable-state-aware for the codex live-host class, mirroring the production Claude rescue shape: either the guard's `prepare_native_readiness` path gains a codex arm (no longer a no-op for a live-host/dead-native codex session, routing into the actor's recover-on-send) or the `FreshAgentSend`/`FreshAgentPrepareNative` handlers (main.rs:1078/:1021) accept the supervisor's typed recoverable marker and dispatch to the actor lane that runs `ensure_session_alive` (owned-tree proof → proved `threadNotFound` → mint-new → typed `NativeDispatchIdentity` commit). Choose the arm that keeps the guard's intent — never write into an identity you cannot prove you own; the mint path itself proves ownership through the durable actor/journal (`task010` discipline). Ownership invariants preserved: public alias and original reference survive; the native root moves ONLY through the typed commit; archived original bytes are never written. Watch the naming-handle interaction the validator flagged (new-assumption 2): a freshly minted thread's `pending_naming_handle` is expected `None` and the parity test's old/new name-policy assertions must still hold — cover it in this task's focused tests.
+- [ ] **Step 6: Implement the send-guard routing — locally derived classification, no protocol change**
+
+`HostCommand::FreshAgentSend` / `FreshAgentPrepareNative` carry no marker field and none is added: the session host derives the SAME recoverable class locally from facts it already has — provider is codex, the host process and durable actor are intact, and the native session is not live. Define the classification rule ONCE (a pure function shared by the supervisor and the session host — place it in the crate both already depend on, or duplicate it with a cross-crate parity test that pins both definitions to the same inputs/outputs) and enforce it at both gates: the guard routes a codex live-host/dead-native send to the actor's recover-on-send (`ensure_session_alive`: owned-tree proof → proved `threadNotFound` → mint-new → typed `NativeDispatchIdentity` commit) instead of refusing; the rescue arm mirrors the production Claude shape (`prepare_native_readiness`-style routing, or the handler branch at main.rs:1078/:1021 — choose the arm that keeps the guard's intent: never write into an identity you cannot prove you own; the mint path itself proves ownership through the durable actor/journal, `task010` discipline). Ownership invariants preserved: public alias and original reference survive; the native root moves ONLY through the typed commit; archived original bytes are never written. Watch the naming-handle interaction the validator flagged (new-assumption 2): a freshly minted thread's `pending_naming_handle` is expected `None` and the parity test's old/new name-policy assertions must still hold — cover it in this task's focused tests.
 
 - [ ] **Step 7: Run the focused tests**
 
@@ -540,6 +556,6 @@ If Step 1-3 required fix-ups, each is already committed with its focused test; o
 
 ## Verification summary (whole plan)
 
-- Focused lanes: the per-task commands above (sandboxed cargo selectors, repo-owned Vitest paths, sidecar lifecycle tests).
+- Focused lanes: the per-task commands above (sandboxed cargo selectors, sandbox-wrapped vitest paths for real-sidecar test files, repo-owned Vitest paths for server-integration lanes), plus Task 5 Step 6's pre-fix actual-error capture run.
 - Whole-branch: the coordinator-gated full suite at execution end (`GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY='...' pnpm run check` or `pnpm run test` per the gate procedure), green excluding nothing — the four tracked Kata failures must be FIXED, not excluded.
-- Kata closure after the final delta review passes: `kata close gc1p`, `kata close cnr1`, `kata close wjwa`, `kata close czzp` with closing comments referencing the branch commits and evidence; fy2w untouched.
+- Kata closure after the final delta review passes, per issue: `gc1p` closes when the full installed parity case passes post-fix with the actual-error capture retained; `wjwa` and `czzp` close when their cases are deterministic green in both build contexts; `cnr1` closes ONLY if the starvation campaign confirmed the fourth-row fingerprint at runtime — if unconfirmed, it stays open with an honest evidence comment (retention + isolation landed, runtime fingerprint pending a recurrence with retained rows). fy2w untouched in all cases.
