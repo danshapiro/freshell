@@ -9,6 +9,7 @@ import freshAgentReducer from '@/store/freshAgentSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
 import claudeActivityReducer from '@/store/claudeActivitySlice'
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
+import antigravityActivityReducer from '@/store/antigravityActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
@@ -92,6 +93,7 @@ function makeStore() {
       codexActivity: codexActivityReducer,
       claudeActivity: claudeActivityReducer,
       amplifierActivity: amplifierActivityReducer,
+      antigravityActivity: antigravityActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
       // The real controller's probeRepoIcons() dereferences these slices even

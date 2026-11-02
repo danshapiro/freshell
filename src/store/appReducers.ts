@@ -17,6 +17,7 @@ import repoIconsReducer from './repoIconsSlice'
 import codexActivityReducer from './codexActivitySlice'
 import claudeActivityReducer from './claudeActivitySlice'
 import amplifierActivityReducer from './amplifierActivitySlice'
+import antigravityActivityReducer from './antigravityActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import freshAgentReducer from './freshAgentSlice'
 import freshAgentLiveReducer from './freshAgentLiveSlice'
@@ -48,6 +49,10 @@ export const appReducers = {
   codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer,
   amplifierActivity: amplifierActivityReducer,
+  // Antigravity plan Task 8: the amplifier activity slice's additive twin —
+  // registration is load-bearing (an unregistered slice silently discards
+  // every dispatch, so busy never reaches the UI).
+  antigravityActivity: antigravityActivityReducer,
   opencodeActivity: opencodeActivityReducer,
   freshAgent: freshAgentReducer,
   // The live tail of running turns (streamed blocks, retries, notices): its

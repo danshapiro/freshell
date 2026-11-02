@@ -65,6 +65,7 @@ pub fn derive_pane_title(content: &Value) -> String {
             Some("gemini") => "Gemini".to_string(),
             Some("opencode") => "OpenCode".to_string(),
             Some("kimi") => "Kimi".to_string(),
+            Some("antigravity") => "Antigravity CLI".to_string(),
             _ => match obj.get("shell").and_then(Value::as_str) {
                 Some("powershell") => "PowerShell".to_string(),
                 Some("cmd") => "Command Prompt".to_string(),

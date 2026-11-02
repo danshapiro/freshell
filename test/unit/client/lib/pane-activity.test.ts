@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { collectBusySessionKeys, collectPaneIdentityActivity, isFreshAgentBusy, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
+import { collectBusySessionKeys, collectPaneIdentityActivity, isFreshAgentBusy, isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
+import { TerminalTurnCompleteSchema } from '@shared/ws-protocol'
 import type { FreshAgentPaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { Tab } from '@/store/types'
@@ -68,6 +69,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
 
@@ -81,6 +83,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
 
@@ -94,6 +97,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }).isBusy).toBe(false)
   })
@@ -148,6 +152,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: {},
     }).isBusy).toBe(false)
@@ -174,6 +179,7 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })).toMatchObject({ isBusy: true, source: 'opencode' })
 
@@ -187,6 +193,7 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }).isBusy).toBe(false)
   })
@@ -257,6 +264,7 @@ describe('pane activity', () => {
         'term-claude': { terminalId: 'term-claude', phase: 'busy', updatedAt: 1 },
       },
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: freshAgentSessionMap(
         { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-1' },
@@ -302,6 +310,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: freshAgentSessionMap(
         { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-1' },
@@ -345,6 +354,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: freshAgentSessionMap(
         { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-2' },
@@ -403,6 +413,7 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
 
@@ -448,6 +459,7 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
 
@@ -463,6 +475,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
     expect(result).toEqual({ isBusy: true, source: 'claude-terminal' })
@@ -476,6 +489,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }
     expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
@@ -491,6 +505,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
     expect(result).toEqual({ isBusy: true, source: 'amplifier' })
@@ -504,10 +519,96 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }
     expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
     expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: {} }).isBusy).toBe(false)
+  })
+
+  it('treats an antigravity terminal as busy when the activity record is busy', () => {
+    const result = resolvePaneActivity({
+      paneId: 'p1',
+      content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'antigravity', terminalId: 't1' } as any,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
+      paneRuntimeActivityByPaneId: {},
+    })
+    expect(result).toEqual({ isBusy: true, source: 'antigravity' })
+  })
+
+  it('treats an antigravity terminal as idle when the activity record is idle or absent', () => {
+    const base = {
+      paneId: 'p1',
+      content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'antigravity', terminalId: 't1' } as any,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+    }
+    expect(resolvePaneActivity({ ...base, antigravityActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
+    expect(resolvePaneActivity({ ...base, antigravityActivityByTerminalId: {} }).isBusy).toBe(false)
+  })
+
+  it('counts antigravity among the truly-idle CLI modes (server-authoritative alerting)', () => {
+    expect(isTrulyIdleCliMode('antigravity')).toBe(true)
+    // The status-inert pins stay inert.
+    expect(isTrulyIdleCliMode('gemini')).toBe(false)
+    expect(isTrulyIdleCliMode('kimi')).toBe(false)
+  })
+
+  it('accepts the antigravity provider on the terminal.turn.complete wire schema (protocol parity)', () => {
+    const frame = TerminalTurnCompleteSchema.parse({
+      type: 'terminal.turn.complete',
+      terminalId: 't1',
+      provider: 'antigravity',
+      sessionId: 'conv-1',
+      at: 1_000,
+      completionSeq: 1,
+    })
+    expect(frame.provider).toBe('antigravity')
+  })
+
+  it('collects the busy session key for a busy antigravity pane like a codex one', () => {
+    const tab: Tab = {
+      id: 'tab-agy',
+      title: 'tab-agy',
+      createRequestId: 'req-agy',
+      status: 'running',
+      mode: 'antigravity',
+      shell: 'system',
+      createdAt: 1,
+    }
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-agy',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-agy',
+        status: 'running',
+        mode: 'antigravity',
+        shell: 'system',
+        terminalId: 'term-agy',
+        sessionRef: { provider: 'antigravity', sessionId: 'conv-agy-1' },
+      },
+    }
+    const busyKeys = collectBusySessionKeys({
+      tabs: [tab],
+      paneLayouts: { 'tab-agy': layout },
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: { 'term-agy': { terminalId: 'term-agy', phase: 'busy', updatedAt: 1 } },
+      paneRuntimeActivityByPaneId: {},
+    })
+    expect(busyKeys).toEqual(['antigravity:conv-agy-1'])
   })
 
   describe('collectPaneIdentityActivity', () => {
@@ -516,6 +617,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }
 
@@ -858,6 +960,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }
 
@@ -988,6 +1091,17 @@ describe('pane activity', () => {
         isOnlyPane: true,
         ...emptyMaps,
         amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } },
+        antigravityActivityByTerminalId: {},
+      })).toBe(true)
+    })
+
+    it('is green for an antigravity pane with an idle activity record', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'antigravity' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+        antigravityActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } },
       })).toBe(true)
     })
   })

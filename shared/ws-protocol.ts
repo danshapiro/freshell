@@ -319,10 +319,34 @@ export const AmplifierActivityUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+// Antigravity plan Task 8: the amplifier activity family's additive twin
+// (same wire shapes, antigravity.* discriminants).
+export const AntigravityActivityRecordSchema = z.object({
+  terminalId: z.string().min(1),
+  sessionId: z.string().optional(),
+  phase: z.enum(['idle', 'busy']),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export type AntigravityActivityRecord = z.infer<typeof AntigravityActivityRecordSchema>
+
+export const AntigravityActivityListResponseSchema = z.object({
+  type: z.literal('antigravity.activity.list.response'),
+  requestId: z.string().min(1),
+  terminals: z.array(AntigravityActivityRecordSchema),
+  latestTurnCompletions: z.array(TerminalTurnCompletionSnapshotSchema).optional(),
+})
+
+export const AntigravityActivityUpdatedSchema = z.object({
+  type: z.literal('antigravity.activity.updated'),
+  upsert: z.array(AntigravityActivityRecordSchema),
+  remove: z.array(z.string().min(1)),
+})
+
 export const TerminalTurnCompleteSchema = z.object({
   type: z.literal('terminal.turn.complete'),
   terminalId: z.string().min(1),
-  provider: z.enum(['opencode', 'claude', 'codex', 'amplifier']),
+  provider: z.enum(['opencode', 'claude', 'codex', 'amplifier', 'antigravity']),
   sessionId: z.string().min(1).optional(),
   outcome: z.enum(['completed', 'failed']).optional(),
   at: z.number().int().nonnegative(),
@@ -770,6 +794,14 @@ export const ClaudeActivityListSchema = z.object({
 
 export const AmplifierActivityListSchema = z.object({
   type: z.literal('amplifier.activity.list'),
+  requestId: z.string().min(1),
+})
+
+// Antigravity plan Task 8: the reconnect-seeding list request (the
+// amplifier request's additive twin; the client sends it on every
+// (re)connect beside the other four).
+export const AntigravityActivityListSchema = z.object({
+  type: z.literal('antigravity.activity.list'),
   requestId: z.string().min(1),
 })
 
@@ -1289,6 +1321,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   OpencodeActivityListSchema,
   ClaudeActivityListSchema,
   AmplifierActivityListSchema,
+  AntigravityActivityListSchema,
   HostStatsSubscribeSchema,
   HostStatsUnsubscribeSchema,
   HostStatsRefreshSchema,
@@ -1740,6 +1773,10 @@ export type ClaudeActivityUpdatedMessage = z.infer<typeof ClaudeActivityUpdatedS
 export type AmplifierActivityListResponseMessage = z.infer<typeof AmplifierActivityListResponseSchema>
 export type AmplifierActivityUpdatedMessage = z.infer<typeof AmplifierActivityUpdatedSchema>
 
+// Antigravity plan Task 8: the amplifier family's additive twin.
+export type AntigravityActivityListResponseMessage = z.infer<typeof AntigravityActivityListResponseSchema>
+export type AntigravityActivityUpdatedMessage = z.infer<typeof AntigravityActivityUpdatedSchema>
+
 export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
 export type TerminalIdleMessage = z.infer<typeof TerminalIdleSchema>
 /**
@@ -2088,6 +2125,8 @@ export type ServerMessage =
   | ClaudeActivityUpdatedMessage
   | AmplifierActivityListResponseMessage
   | AmplifierActivityUpdatedMessage
+  | AntigravityActivityListResponseMessage
+  | AntigravityActivityUpdatedMessage
   | TerminalTurnCompleteMessage
   | TerminalIdleMessage
   | TerminalStuckMessage

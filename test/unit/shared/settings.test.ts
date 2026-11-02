@@ -133,6 +133,19 @@ describe('shared settings contract', () => {
     expect('agentChat' in merged).toBe(false)
   })
 
+  it('fresh-install default enabled CLI providers include antigravity', () => {
+    // `DEFAULT_ENABLED_CLI_PROVIDERS` is the fresh-install seed for
+    // `codingCli.enabledProviders`: fresh installs seed `knownProviders`
+    // from discovery but take `enabledProviders` from these defaults, so
+    // without antigravity here a fresh install never enables the provider
+    // and the picker tile never shows even with `agy` installed. (Existing
+    // installs are covered separately by the append-and-enable migration.)
+    const defaults = createDefaultServerSettings({ loggingDebug: false })
+    expect(defaults.codingCli.enabledProviders).toEqual([
+      'claude', 'codex', 'opencode', 'amplifier', 'antigravity',
+    ])
+  })
+
   it('migrates stored legacy agentChat input to canonical freshAgent settings', () => {
     const parsed = migrateLegacyFreshAgentSettingsInput({
       agentChat: {

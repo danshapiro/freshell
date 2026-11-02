@@ -1,0 +1,8 @@
+{"type":"session_start","conversationId":"22222222-3333-4444-5555-666666666666","workspacePaths":["/home/u/resumed"],"model":"gemini-3-pro","startedAt":"2026-10-29T21:00:00.000Z"}
+{"type":"user_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"First prompt before exit","at":"2026-10-29T21:00:01.000Z"}
+{"type":"assistant_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"First reply.","at":"2026-10-29T21:00:02.000Z","usage":{"inputTokens":5,"outputTokens":7,"cachedTokens":0,"totalTokens":12}}
+{"type":"turn_settled","conversationId":"22222222-3333-4444-5555-666666666666","at":"2026-10-29T21:00:02.500Z","outcome":"completed","fullyIdle":true}
+{"type":"session_start","conversationId":"22222222-3333-4444-5555-666666666666","workspacePaths":["/home/u/resumed"],"model":"gemini-3-pro","startedAt":"2026-10-29T21:30:00.000Z","source":"resume"}
+{"type":"user_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"Continue after resume","at":"2026-10-29T21:30:01.000Z"}
+{"type":"assistant_message","conversationId":"22222222-3333-4444-5555-666666666666","text":"Second reply.","at":"2026-10-29T21:30:02.000Z","usage":{"inputTokens":15,"outputTokens":25,"cachedTokens":0,"totalTokens":40}}
+{"type":"turn_settled","conversationId":"22222222-3333-4444-5555-666666666666","at":"2026-10-29T21:30:02.500Z","outcome":"completed","fullyIdle":true}

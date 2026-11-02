@@ -133,7 +133,10 @@ pub const FRESH_AGENT_DISABLED_REFUSAL: &str =
 /// The coding-agent providers (`claude | codex | opencode | amplifier`).
 /// `amplifier` matches the legacy `TerminalTurnCompleteSchema.provider` enum
 /// (`shared/ws-protocol.ts:192`) — required by the TERM-16 turn-complete
-/// broadcast for amplifier terminal panes.
+/// broadcast for amplifier terminal panes. `antigravity` (antigravity plan
+/// Task 8) extends the same enum in BOTH twins so the frame can be minted
+/// for antigravity terminal panes; it has NO fresh-agent runtime (the
+/// fresh-agent dispatch arms treat it like `amplifier`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentProvider {
@@ -141,6 +144,7 @@ pub enum AgentProvider {
     Codex,
     Opencode,
     Amplifier,
+    Antigravity,
 }
 
 /// Outcome for a provider-reported terminal turn completion, when available.
@@ -435,6 +439,50 @@ pub struct AmplifierActivityRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
+
+/// `AntigravityActivityRecordSchema` (`shared/ws-protocol.ts`) — the
+/// amplifier record's additive twin (antigravity plan Task 8): same wire
+/// shape, `antigravity.*` discriminants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AntigravityPhase {
+    Idle,
+    Busy,
+}
+
+/// `AntigravityActivityRecordSchema` — the amplifier record's additive twin
+/// (antigravity plan Task 8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityActivityRecord {
+    pub terminal_id: String,
+    pub phase: AntigravityPhase,
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Bounded BACKWARD tolerance for the antigravity recency rule (whole-delta
+/// review round 3, Major 1; shared by round 4, Minor 1): a matching user
+/// record whose own `at` is within this window BEFORE the captured submit
+/// timestamp still counts as at/after-that-submit. The registry writes input
+/// to the PTY BEFORE timestamping the `ActivityEvent::Input`
+/// (registry.rs:3890,3931), so the CLI child — on another core — can append
+/// its `user_message` record between the write and our stamp, with an `at`
+/// that precedes the submit. The bound covers cross-process/cross-clock
+/// skew (the CLI's own `at` granularity is a Stage-1 unknown; NTP slew adds
+/// seconds), NOT history: it is 12× below the 60 s pending lifetime, so
+/// minutes-old conversations stay rejected.
+///
+/// Canonical home (round 4, Minor 1 — one number, never forked):
+/// `freshell-sessions`' locator recency rule AND `freshell-activity`'s
+/// attach-baseline live/history classification must accept the SAME
+/// window, and this crate is the shared leaf both depend on. NOT a wire
+/// type (the crate's serialization charter is about message shapes; this
+/// is the cross-crate timing contract those two rules share).
+/// `freshell_sessions::antigravity_locator` re-exports it under its
+/// original path.
+pub const ANTIGRAVITY_RECENCY_BACKWARD_TOLERANCE_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

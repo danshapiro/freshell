@@ -85,11 +85,13 @@ impl NoIndexProbe {
 }
 
 impl Default for NoIndexProbe {
-    /// The four disk-indexed providers of `freshell-server::main`'s
-    /// `SessionIndex` construction.
+    /// The five disk-indexed providers of `freshell-server::main`'s
+    /// `SessionIndex` construction (the `freshell-server::existence`
+    /// `KNOWN_PROVIDERS` mirror — both lists must stay in lockstep or the
+    /// no-index fallback mis-adjudicates a provider the real probe knows).
     fn default() -> Self {
         Self::new(
-            ["claude", "codex", "opencode", "amplifier"]
+            ["claude", "codex", "opencode", "amplifier", "antigravity"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
@@ -123,6 +125,11 @@ mod tests {
         let probe = NoIndexProbe::default();
         assert_eq!(probe.exists("claude", "s1"), SessionExistence::Unknown);
         assert_eq!(probe.exists("amplifier", "s1"), SessionExistence::Unknown);
+        // Antigravity joined the disk-indexed provider set (plan Task 5):
+        // the ws-side fallback must answer for it or pane-reconcile
+        // mis-adjudicates a live antigravity session as unknown-provider
+        // Absent (dead-session evidence).
+        assert_eq!(probe.exists("antigravity", "s1"), SessionExistence::Unknown);
         // Unknown provider → Absent, NEVER Unknown (design §5.1 / change #4c).
         assert_eq!(
             probe.exists("not-a-provider", "s1"),

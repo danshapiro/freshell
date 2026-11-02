@@ -39,4 +39,29 @@ describe('coding CLI resume commands', () => {
     expect(isResumeCommandProvider('claude', extensions)).toBe(false)
     expect(buildResumeCommand('claude', 'session-1', extensions)).toBeNull()
   })
+
+  it('renders an antigravity registry entry resume command with no builtin fallback', () => {
+    // No builtin template exists for antigravity: before the extension
+    // registry hydrates, it is not a resume provider.
+    expect(isResumeCommandProvider('antigravity', [])).toBe(false)
+    expect(buildResumeCommand('antigravity', 'conv-9', [])).toBeNull()
+
+    // The registry entry (what the server's client_entry derives from the
+    // antigravity manifest's resumeArgs) wins and renders the exact
+    // `--conversation` resume command.
+    const extensions: ClientExtensionEntry[] = [{
+      name: 'antigravity',
+      version: '1.0.0',
+      label: 'Antigravity CLI',
+      description: '',
+      category: 'cli',
+      cli: {
+        supportsResume: true,
+        resumeCommandTemplate: ['agy', '--conversation', '{{sessionId}}'],
+      },
+    }]
+
+    expect(isResumeCommandProvider('antigravity', extensions)).toBe(true)
+    expect(buildResumeCommand('antigravity', 'conv-9', extensions)).toBe('agy --conversation conv-9')
+  })
 })

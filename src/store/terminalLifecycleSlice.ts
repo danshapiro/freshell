@@ -33,7 +33,7 @@ export interface TerminalStuckEntry {
   terminalId: string
 }
 
-interface TerminalLifecycleState {
+export interface TerminalLifecycleState {
   byPaneId: Record<string, PaneLifecycleEntry>
   /** Wedge-backstop: keyed by paneId (the exit handler clears
    * paneContent.terminalId, so an exited pane has no terminal id to key

@@ -2207,7 +2207,7 @@ impl TerminalRegistry {
     fn is_agent_mode(mode: &str) -> bool {
         matches!(
             mode,
-            "claude" | "codex" | "opencode" | "amplifier" | "gemini" | "kimi"
+            "claude" | "codex" | "opencode" | "amplifier" | "gemini" | "kimi" | "antigravity"
         )
     }
 
@@ -13204,7 +13204,15 @@ mod tests {
         // the 24 h hard cap they must be spared (999 min << 24 h).
         let reg = TerminalRegistry::new();
         reg.set_auto_kill_idle_minutes(5);
-        for mode in ["claude", "codex", "opencode", "amplifier", "gemini", "kimi"] {
+        for mode in [
+            "claude",
+            "codex",
+            "opencode",
+            "amplifier",
+            "gemini",
+            "kimi",
+            "antigravity",
+        ] {
             let id = format!("T-{mode}");
             reg.register_headless(HeadlessTerminal {
                 terminal_id: id.clone(),
@@ -13224,7 +13232,7 @@ mod tests {
             killed.is_empty(),
             "agent-mode terminals with a live child must never be idle-reaped, got {killed:?}"
         );
-        assert_eq!(reg.inventory().len(), 6);
+        assert_eq!(reg.inventory().len(), 7);
     }
 
     #[test]

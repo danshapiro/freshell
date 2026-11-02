@@ -1359,6 +1359,16 @@ mod title_scope_tests {
                                 owned_local_endpoint: None,
                             }
                         }
+                        freshell_protocol::session_names::NamedProvider::Antigravity => {
+                            NativeLocation::Antigravity {
+                                home: "/h/.gemini/antigravity-cli".into(),
+                                conversation_id: session_id.to_string(),
+                                transcript_path: Some(format!(
+                                    "/h/.gemini/antigravity-cli/brain/{session_id}/\
+                                     .system_generated/logs/transcript.jsonl"
+                                )),
+                            }
+                        }
                     },
                     evidence: NativeEvidenceKind::PersistedMetadata,
                     persistence: NativePersistence::Verified,

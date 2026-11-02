@@ -179,6 +179,7 @@ describe('turn completion across terminal.replaced fold', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: records,
       amplifierActivityByTerminalId: {},
+      antigravityActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
 

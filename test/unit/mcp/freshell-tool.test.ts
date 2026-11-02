@@ -225,6 +225,22 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
   })
 
+  // Antigravity exact-resume mapping (plan Task 7): the mode-keyed resume
+  // sugar resolves to the canonical antigravity sessionRef — the POST body
+  // the server's provider-matched acceptance + --conversation launch path
+  // consumes. Never the legacy field.
+  it('new-tab maps resume with mode antigravity to a canonical antigravity sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', { mode: 'antigravity', resume: 'conv-1' })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      mode: 'antigravity',
+      sessionRef: { provider: 'antigravity', sessionId: 'conv-1' },
+    }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+  })
+
   it('new-tab rejects raw Codex resume ids', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 

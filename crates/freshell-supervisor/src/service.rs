@@ -7153,7 +7153,7 @@ mod release_scope_tests {
         for provider in ["shell", "claude", "codex", "opencode"] {
             assert!(release_qualified_workload(provider, false, true, None));
         }
-        for provider in ["amplifier", "gemini", "kimi"] {
+        for provider in ["amplifier", "gemini", "kimi", "antigravity"] {
             assert!(
                 !release_qualified_workload(provider, false, true, None),
                 "{provider}"

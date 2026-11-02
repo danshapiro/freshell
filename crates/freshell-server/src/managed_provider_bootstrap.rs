@@ -98,6 +98,7 @@ pub(crate) fn provider_launch_context_from_home_at_with_selected_roots(
     mcp_capability: Option<McpCapabilityReference>,
     selected_roots: &[freshell_platform::opencode_recipe::DiscoveryRoot],
 ) -> Result<Option<ProviderLaunchContext>, String> {
+    let mcp_enabled = mcp_capability.is_some();
     let (root, entries, preparation) = match provider {
         "claude" => (
             ".claude",
@@ -372,6 +373,7 @@ pub(crate) fn with_managed_mcp_reference(
         ProviderPreparation::Codex {
             tui_args,
             sidecar_args,
+            ..
         } => {
             let args =
                 managed_codex_mcp_args().ok_or("managed Codex MCP preparation unavailable")?;

@@ -164,6 +164,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
     codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? {},
     claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? {},
     amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? {},
+    antigravityActivityByTerminalId: state.antigravityActivity?.byTerminalId ?? {},
     opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? {},
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? {},
     freshAgentSessions: state.freshAgent?.sessions,

@@ -264,15 +264,36 @@ describe('collectSessionNameRefs', () => {
               sessionRef: { provider: 'kimi', sessionId: 'kimi-1' },
             },
           } as never,
+          // An antigravity pane (Task 9: a scoped unified mode) — its
+          // sessionRef MUST be collected so the saved name bootstraps.
+          'tab-antigravity': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: {
+              kind: 'terminal',
+              mode: 'antigravity',
+              terminalId: 't-a',
+              createRequestId: 'cr-a',
+              status: 'running',
+              sessionRef: { provider: 'antigravity', sessionId: 'conv-agy-1' },
+            },
+          } as never,
         },
       },
     })
-    expect(refs).toEqual([pendingRef('h-claude'), sessionRef('s-claude')])
+    expect(refs).toEqual([
+      pendingRef('h-claude'),
+      sessionRef('s-claude'),
+      { kind: 'session', provider: 'antigravity', sessionId: 'conv-agy-1' },
+    ])
     // The provider typing itself must be sound: a validated whitelist, not
-    // an unsound cast that lets any string become a NamedProvider.
+    // an unsound cast that lets any string become a NamedProvider. The
+    // antigravity provider parses; the out-of-scope trio never does.
     expect(parseSessionNameRef({ kind: 'session', provider: 'gemini', sessionId: 'g' })).toBeUndefined()
     expect(parseSessionNameRef({ kind: 'session', provider: 'amplifier', sessionId: 'a' })).toBeUndefined()
     expect(parseSessionNameRef({ kind: 'session', provider: 'claude', sessionId: 'c' })).toEqual(sessionRef('c'))
+    expect(parseSessionNameRef({ kind: 'session', provider: 'antigravity', sessionId: 'conv-1' }))
+      .toEqual({ kind: 'session', provider: 'antigravity', sessionId: 'conv-1' })
   })
 })
 
@@ -353,6 +374,39 @@ describe('renameSessionName', () => {
       expect.anything(),
     )
     expect(result).toEqual(update)
+  })
+
+  it('PATCHes an antigravity target and parses its accepted update (Task 9: the fourth scoped CLI)', async () => {
+    // The wholesale rename route accepts {provider:'antigravity'} and the
+    // response update carries an antigravity record — both must parse, or a
+    // rename would surface as "the server returned an invalid session name
+    // update".
+    const agyUpdate: SessionNameUpdate = {
+      record: { ref: { kind: 'session', provider: 'antigravity', sessionId: 'conv-1' }, name: 'Antigravity rename', source: 'manual', revision: 2 },
+      documentGeneration: 10,
+      redirects: [],
+      changed: true,
+    }
+    apiMocks.patch.mockResolvedValueOnce(agyUpdate)
+
+    const result = await renameSessionName({
+      target: { kind: 'session', provider: 'antigravity', sessionId: 'conv-1' },
+      name: 'Antigravity rename',
+      nameIntent: 'user',
+      ifRevision: 1,
+    })
+
+    expect(apiMocks.patch).toHaveBeenCalledWith(
+      '/api/session-names',
+      {
+        target: { kind: 'session', provider: 'antigravity', sessionId: 'conv-1' },
+        name: 'Antigravity rename',
+        nameIntent: 'user',
+        ifRevision: 1,
+      },
+      expect.anything(),
+    )
+    expect(result).toEqual(agyUpdate)
   })
 
   it('keeps the rename outcome a server reports (name-reliability Task 4)', async () => {

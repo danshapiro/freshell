@@ -58,6 +58,18 @@ pub enum NativeLocation {
         #[serde(skip_serializing_if = "Option::is_none")]
         owned_local_endpoint: Option<String>,
     },
+    /// Antigravity: the resolved antigravity home (the `antigravity-cli`
+    /// subtree of `~/.gemini`), the conversation ID, and the optional
+    /// verified transcript path. Added by the antigravity plan (Task 6)
+    /// so the adoption tail's verified durable bind can carry the
+    /// acquisition location; Task 9 wires the naming surfaces.
+    #[serde(rename_all = "camelCase")]
+    Antigravity {
+        home: String,
+        conversation_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transcript_path: Option<String>,
+    },
 }
 
 /// What kind of evidence produced the acquisition.
@@ -89,4 +101,52 @@ pub struct NativeAcquisition {
     pub location: NativeLocation,
     pub evidence: NativeEvidenceKind,
     pub persistence: NativePersistence,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Antigravity plan Task 6 pin: the `NativeLocation::Antigravity`
+    /// variant (the verified durable bind's acquisition location) serializes
+    /// with the sibling camelCase field names under the `antigravity`
+    /// provider tag, round-trips exactly, and elides an absent transcript
+    /// path the way every sibling's optional fields do.
+    #[test]
+    fn antigravity_location_serde_is_camelcase_and_round_trips() {
+        let location = NativeLocation::Antigravity {
+            home: "/h/.gemini/antigravity-cli".to_string(),
+            conversation_id: "conv-1".to_string(),
+            transcript_path: Some(
+                "/h/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript.jsonl"
+                    .to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&location).expect("serialize");
+        assert_eq!(json["provider"], serde_json::json!("antigravity"));
+        assert_eq!(
+            json["home"],
+            serde_json::json!("/h/.gemini/antigravity-cli")
+        );
+        assert_eq!(json["conversationId"], serde_json::json!("conv-1"));
+        assert_eq!(
+            json["transcriptPath"],
+            serde_json::json!(
+                "/h/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript.jsonl"
+            )
+        );
+        let back: NativeLocation = serde_json::from_value(json.clone()).expect("round-trip parse");
+        assert_eq!(back, location);
+
+        // An absent transcript path is elided on the wire (sibling parity).
+        let pathless = NativeLocation::Antigravity {
+            home: "/h".to_string(),
+            conversation_id: "conv-2".to_string(),
+            transcript_path: None,
+        };
+        let json = serde_json::to_value(&pathless).expect("serialize pathless");
+        assert!(json.get("transcriptPath").is_none());
+        let back: NativeLocation = serde_json::from_value(json).expect("round-trip pathless");
+        assert_eq!(back, pathless);
+    }
 }

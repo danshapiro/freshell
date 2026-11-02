@@ -2180,6 +2180,7 @@ fn provider_wire(provider: &AgentProvider) -> String {
         AgentProvider::Codex => "codex",
         AgentProvider::Opencode => "opencode",
         AgentProvider::Amplifier => "amplifier",
+        AgentProvider::Antigravity => "antigravity",
     }
     .into()
 }

@@ -7,6 +7,11 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The shared antigravity recency tolerance (round 4, Minor 1): the locator's
+# canonical constant lives in the protocol crate (the shared leaf the
+# activity tracker also depends on) and is re-exported from
+# `antigravity_locator` under its original path.
+freshell-protocol = { path = "../freshell-protocol" }
 # JSON line parsing for the claude/codex JSONL transcripts (JSON.parse parity,
 # skip-on-error corruption tolerance). preserve_order matches the TS object model.
 serde_json = { workspace = true }
@@ -49,6 +54,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
 # equivalent) -- same version already used by `freshell-ws`.
 tracing = "0.1"
+# The antigravity locator's `antigravity_association_unmatched` fingerprint
+# (round 7, Minor 1): a sha256 PREFIX of the captured submit — content-free
+# log correlation (Global Constraint 7 forbids prompt contents in logs).
+# Same version already pinned by `freshell-ws` and `freshell-server`
+# (see the grouped `sha2` entry above).
 # Session-directory project grouping follows the shared git-root resolution
 # used by terminal metadata, so linked worktree sessions group under their
 # parent repository while preserving the checkout as `cwd`.
