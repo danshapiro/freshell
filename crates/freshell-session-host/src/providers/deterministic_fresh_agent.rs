@@ -187,26 +187,29 @@ impl DeterministicFreshAgentTransport {
         )
         .await
         .map_err(non_ambiguous)?;
-        // The same completed turn is now saved under this native identity.
-        // The existing proxy binds previousSessionId to its presentation ID.
-        let (wire_provider, session_type) = match self.provider {
-            FreshProvider::Claude => ("claude", "freshclaude"),
-            FreshProvider::Kilroy => ("claude", "kilroy"),
-            FreshProvider::Codex => ("codex", "freshcodex"),
-            FreshProvider::Opencode => ("opencode", "freshopencode"),
+        // Codex already has its native identity at create. Other providers
+        // materialize the saved identity; the proxy binds previousSessionId
+        // to its presentation ID.
+        let materialized_identity = match self.provider {
+            FreshProvider::Claude => Some(("claude", "freshclaude")),
+            FreshProvider::Kilroy => Some(("claude", "kilroy")),
+            FreshProvider::Codex => None,
+            FreshProvider::Opencode => Some(("opencode", "freshopencode")),
         };
-        self.event_tx
-            .send(AgentEvent::Provider {
-                payload: json!({
-                    "type":"freshAgent.session.materialized",
-                    "provider":wire_provider,
-                    "sessionType":session_type,
-                    "previousSessionId":native_session_id,
-                    "sessionId":native_session_id,
-                }),
-            })
-            .await
-            .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
+        if let Some((wire_provider, session_type)) = materialized_identity {
+            self.event_tx
+                .send(AgentEvent::Provider {
+                    payload: json!({
+                        "type":"freshAgent.session.materialized",
+                        "provider":wire_provider,
+                        "sessionType":session_type,
+                        "previousSessionId":native_session_id,
+                        "sessionId":native_session_id,
+                    }),
+                })
+                .await
+                .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
+        }
         self.event_tx
             .send(AgentEvent::Provider {
                 payload: json!({
@@ -1104,6 +1107,8 @@ mod tests {
 
     fn initial_profile(provider: FreshProvider) -> FreshAgentProfile {
         FreshAgentProfile {
+            naming_handle: None,
+            collaboration_mode: None,
             runtime_variant: match provider {
                 FreshProvider::Claude | FreshProvider::Kilroy => "claude-sdk",
                 FreshProvider::Codex => "codex-app-server",
@@ -1604,10 +1609,7 @@ mod tests {
                 .collect();
             let materialized = provider_events
                 .iter()
-                .position(|payload| payload["type"] == "freshAgent.session.materialized")
-                .expect(
-                    "saved fixture native identity must materialize through the existing UI event",
-                );
+                .position(|payload| payload["type"] == "freshAgent.session.materialized");
             let assistant = provider_events
                 .iter()
                 .position(|payload| payload["type"] == "freshAgent.event")
@@ -1616,23 +1618,36 @@ mod tests {
                 .iter()
                 .position(|payload| payload["type"] == "freshAgent.turn.complete")
                 .unwrap();
-            assert!(materialized < assistant && assistant < completed);
+            assert!(assistant < completed);
             assert_eq!(saved["threadId"], native_id);
-            for event in [materialized, assistant, completed] {
-                assert_eq!(provider_events[event]["sessionId"], saved["threadId"]);
-            }
-            assert_eq!(provider_events[materialized]["provider"], saved["provider"]);
-            assert_eq!(
-                provider_events[materialized]["sessionType"],
-                saved["sessionType"]
-            );
             for event in [assistant, completed] {
+                assert_eq!(provider_events[event]["sessionId"], saved["threadId"]);
                 assert_eq!(provider_events[event]["provider"], provider.as_str());
             }
-            assert_eq!(
-                provider_events[materialized]["previousSessionId"],
-                native_id
-            );
+            if provider == FreshProvider::Codex {
+                assert!(
+                    materialized.is_none(),
+                    "Codex has its native identity at create"
+                );
+            } else {
+                let materialized = materialized.expect(
+                    "saved fixture native identity must materialize through the existing UI event",
+                );
+                assert!(materialized < assistant);
+                assert_eq!(
+                    provider_events[materialized]["sessionId"],
+                    saved["threadId"]
+                );
+                assert_eq!(provider_events[materialized]["provider"], saved["provider"]);
+                assert_eq!(
+                    provider_events[materialized]["sessionType"],
+                    saved["sessionType"]
+                );
+                assert_eq!(
+                    provider_events[materialized]["previousSessionId"],
+                    native_id
+                );
+            }
             assert_eq!(
                 provider_events[assistant]["event"]["assistantMessageId"],
                 provider_events[completed]["assistantMessageId"]
