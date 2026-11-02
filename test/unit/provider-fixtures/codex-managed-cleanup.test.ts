@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { expect, it, vi } from 'vitest'
 
-import { cleanupManagedCodexParity } from '../../helpers/codex-managed-cleanup.js'
+import { cleanupManagedCodexParity, collectManagedCodexProviderDiagnostics } from '../../helpers/codex-managed-cleanup.js'
 
 function deferred() {
   let resolve!: () => void
@@ -87,6 +87,120 @@ it('awaits both failed closes and still stops the owned runtime, preserving both
   expect(f.dependencies.removeDirectory.mock.calls.map(([directory]) => directory))
     .toEqual(expect.arrayContaining(['/virtual/grants', '/virtual/home']))
   expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
+})
+
+it.each(['final observation', 'fixture stop'])(
+  'cancels and joins a stalled owned probe during %s before the hook expires', async stage => {
+    vi.useFakeTimers()
+    const f = fixture()
+    const probe = deferred()
+    const workFinishing = deferred()
+    const runtimeFinishing = deferred()
+    const cancelled = new Error(`owned ${stage} probe cancelled`)
+    let activeProbe = false
+    let workSettled = false
+    let runtimeSettled = false
+    let cleanupSettled = false
+
+    const stalledWork = async () => {
+      activeProbe = true
+      try { await probe.promise }
+      catch (error) {
+        activeProbe = false
+        // Probe settlement and its caller's settlement are separate events.
+        await workFinishing.promise
+        throw error
+      } finally { workSettled = true }
+    }
+    if (stage === 'final observation') {
+      f.resources.finalObservation.mockImplementation(async () => {
+        await stalledWork()
+        return { state: 'final' }
+      })
+    } else {
+      f.resources.model.stop.mockImplementation(stalledWork)
+    }
+    f.rig.stop.mockImplementation(async () => {
+      f.order.push('runtime')
+      // ManagedRuntimeOwner.stop cancels and joins its currently owned probes.
+      probe.reject(cancelled)
+      await probe.promise.catch(() => {})
+      await runtimeFinishing.promise
+      runtimeSettled = true
+      return { ok: true, errors: [] }
+    })
+    const observed = cleanupManagedCodexParity(f.resources, f.dependencies).then(
+      () => { cleanupSettled = true; return undefined },
+      error => { cleanupSettled = true; return error },
+    )
+    try {
+      await flushMicrotasks()
+      expect(activeProbe).toBe(true)
+      // Reaching the owner within the first minute leaves the rest of the
+      // real afterAll budget for its own cleanup and broker drain.
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(f.rig.stop).toHaveBeenCalledOnce()
+      expect(activeProbe).toBe(false)
+      expect(cleanupSettled).toBe(false)
+      expect(f.dependencies.removeDirectory).not.toHaveBeenCalled()
+
+      runtimeFinishing.resolve()
+      await flushMicrotasks()
+      expect(runtimeSettled).toBe(true)
+      expect(workSettled).toBe(false)
+      expect(cleanupSettled).toBe(false)
+      expect(f.dependencies.removeDirectory).not.toHaveBeenCalled()
+
+      workFinishing.resolve()
+      const result = await observed
+      expect(workSettled).toBe(true)
+      expect(activeProbe).toBe(false)
+      expect(cleanupSettled).toBe(true)
+      if (stage === 'final observation') {
+        expect(f.rig.runtime.writeIncident).toHaveBeenCalledWith(
+          'freshcodex-managed-native-final-state-error', { error: String(cancelled) },
+        )
+      } else {
+        expect(nestedErrors(result)).toContain(cancelled)
+      }
+      expect(f.resources.restoreGrants).toHaveBeenCalledOnce()
+      expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
+    } finally {
+      // Settle even the deliberately failing pre-fix path without starting
+      // any real process or leaving a pending test-owned promise.
+      probe.reject(cancelled)
+      workFinishing.resolve()
+      runtimeFinishing.resolve()
+      await flushMicrotasks()
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  },
+)
+
+it('does not begin a later provider diagnostic after cancellation of the first', async () => {
+  const first = deferred()
+  const failure = new Error('first owned provider read cancelled')
+  const controller = new AbortController()
+  const traffic = vi.fn(async () => [{ index: 1 }])
+  const observed = collectManagedCodexProviderDiagnostics(controller.signal, () => first.promise, traffic, [])
+    .then(value => value, error => error)
+
+  controller.abort()
+  first.reject(failure)
+  const result = await observed
+  expect(traffic).not.toHaveBeenCalled()
+  expect(result).toBe(failure)
+})
+
+it('retains a failed first provider diagnostic and still collects traffic when not cancelled', async () => {
+  const failure = new Error('first provider diagnostic failed')
+  const traffic = vi.fn(async () => [{ index: 1 }])
+  const result = await collectManagedCodexProviderDiagnostics(
+    new AbortController().signal, async () => { throw failure }, traffic, [],
+  )
+  expect(result).toEqual({ nativeFiles: { error: String(failure) }, traffic: [{ index: 1 }] })
+  expect(traffic).toHaveBeenCalledOnce()
 })
 
 it('records a final-observation failure and cleans up when startup never assigned a model', async () => {

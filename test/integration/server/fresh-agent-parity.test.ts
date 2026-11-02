@@ -19,7 +19,7 @@ import type { InitialProviderVolumeAuthorization } from '../../../scripts/testin
 // @ts-expect-error The native model-wire fixture is also used by the offline Node runner.
 import { startInManagedContext } from '../providers/codex-local-provider.mjs'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
-import { cleanupManagedCodexParity } from '../../helpers/codex-managed-cleanup.js'
+import { cleanupManagedCodexParity, collectManagedCodexProviderDiagnostics } from '../../helpers/codex-managed-cleanup.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -412,7 +412,7 @@ describe('installed Codex through the managed gateway and durable actor', () => 
   let model: Awaited<ReturnType<typeof startInManagedContext>> | undefined
   let naming: http.Server
   let retainedModelTraffic: any[] = []
-  let finalObservation: (() => Promise<unknown>) | undefined
+  let finalObservation: ((signal: AbortSignal) => Promise<unknown>) | undefined
   const namingRequests: string[] = []
   const owners: InitialProviderVolumeAuthorization[] = []
 
@@ -501,10 +501,11 @@ tool_timeout_sec = 120
     wire = await FreshWire.connect(rig.info)
   }, 900_000)
 
+  // The owner can also need time to settle native captures and drain its broker.
   afterAll(() => cleanupManagedCodexParity({
     rig, owners, wire, model, finalObservation, naming, restoreGrants,
     grantsDirectory: grants?.directory, home,
-  }), 180_000)
+  }), 600_000)
 
   it('uses the installed wrapper for catalog, settings, saved output and exact native controls', async () => {
     const requestId = `native-managed-${randomUUID()}`
@@ -580,8 +581,8 @@ tool_timeout_sec = 120
       observationReadTraffic.push({ route, requestedAt, completedAt: Date.now(), status: response.status, retryAfter: response.headers.get('retry-after') })
       return response
     }
-    const snapshot = async () => {
-      const response = await observeRead(`/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}`, { headers })
+    const snapshot = async (signal?: AbortSignal) => {
+      const response = await observeRead(`/api/fresh-agent/threads/freshcodex/codex/${created.sessionId}`, { headers, signal })
       expect(response.ok, await response.clone().text()).toBe(true)
       return response.json()
     }
@@ -604,23 +605,36 @@ tool_timeout_sec = 120
       }) : []
       return { lifecycle, actorProfiles }
     }
-    finalObservation = async () => {
+    finalObservation = async signal => {
       let final: unknown
-      try { final = await snapshot() } catch (error) { final = { error: String(error) } }
-      const currentViews = await rig.inventory()
+      try { final = await snapshot(signal) }
+      catch (error) {
+        if (signal.aborted) throw error
+        final = { error: String(error) }
+      }
+      signal.throwIfAborted()
+      // Unlike ordinary inventory reads, teardown cannot spend the owner's
+      // whole transport timeout waiting before it can finish joining work.
+      const inventory = await rig.runtime.adminOk(rig.supervisor, { method: 'inventory' }, { timeoutMs: 10_000 })
+      if (!inventory || inventory.kind !== 'inventory') throw new Error('managed Codex final inventory is unavailable')
+      const currentViews = inventory.data
+      signal.throwIfAborted()
       const hostDiagnostics = [...rig.runtime.broker.receiptIds()].map(containerId => {
         let state: unknown
         try { const inspected = rig.runtime.inspectContainer(containerId); state = inspected.State }
         catch (error) { state = { error: String(error) } }
         return { containerId, state, logs: rig.runtime.containerLogs(containerId).slice(-64 * 1024) }
       })
-      let nativeFiles: unknown
-      try { nativeFiles = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+      signal.throwIfAborted()
+      const { nativeFiles, traffic } = await collectManagedCodexProviderDiagnostics(
+        signal,
+        async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
         const fs=require('node:fs'),p='/home/freshell/provider/.codex/managed-mcp-traffic.jsonl';
-        process.stdout.write(JSON.stringify({mcp:fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split(String.fromCharCode(10)).filter(Boolean).map(JSON.parse):[],effects:fs.readdirSync(${JSON.stringify(path.join(workspace, 'allowed'))}).map(name=>{const p=${JSON.stringify(path.join(workspace, 'allowed'))}+'/'+name;return{name,uid:fs.statSync(p).uid,content:fs.readFileSync(p,'utf8')}})}));`]))
-      } catch (error) { nativeFiles = { error: String(error) } }
-      let traffic: unknown = retainedModelTraffic
-      try { if (model) traffic = await model.traffic() } catch (error) { traffic = { retained: retainedModelTraffic, error: String(error) } }
+        process.stdout.write(JSON.stringify({mcp:fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split(String.fromCharCode(10)).filter(Boolean).map(JSON.parse):[],effects:fs.readdirSync(${JSON.stringify(path.join(workspace, 'allowed'))}).map(name=>{const p=${JSON.stringify(path.join(workspace, 'allowed'))}+'/'+name;return{name,uid:fs.statSync(p).uid,content:fs.readFileSync(p,'utf8')}})}));`])),
+        async () => model ? model.traffic() : retainedModelTraffic,
+        retainedModelTraffic,
+      )
+      signal.throwIfAborted()
       const logDirectory = path.join(home, '.freshell', 'logs')
       const requestLogFiles = fs.readdirSync(logDirectory).filter(name => name.startsWith('rust-server.jsonl'))
       const publicHttpRequests = requestLogFiles.flatMap(name => fs.readFileSync(path.join(logDirectory, name), 'utf8').split('\n')).flatMap(line => {

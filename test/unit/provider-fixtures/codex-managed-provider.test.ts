@@ -20,7 +20,7 @@ function nestedErrors(value: unknown, seen = new Set<unknown>()): unknown[] {
 }
 
 /** The owned exec boundary runs only against these inert, in-memory objects. */
-function virtualOwnedRig({ runChild = false } = {}) {
+function virtualOwnedRig({ runChild = false, pauseChildStartup = false } = {}) {
   const files = new Map<string, string>()
   const signals: Array<{ pid: number; signal: string; target: 'fixture' | 'replacement' }> = []
   const spawned: Array<{ pid: number }> = []
@@ -36,6 +36,9 @@ function virtualOwnedRig({ runChild = false } = {}) {
   let inspectionError: Error | undefined
   let incarnation: 'fixture' | 'replacement' = 'fixture'
   let childHandler: ((record: unknown, context: unknown) => Promise<unknown>) | undefined
+  let resumeChildStartup!: () => void
+  const childStartup = new Promise<void>(resolve => { resumeChildStartup = resolve })
+  let readinessWriteObserver: (() => void) | undefined
   const childTimers = new Set<ReturnType<typeof setInterval>>()
   const handlers = new Map<string, () => unknown>()
   let resolveClose!: () => void
@@ -56,7 +59,30 @@ function virtualOwnedRig({ runChild = false } = {}) {
   const fs = {
     mkdirSync(target: string) { directory = String(target) },
     openSync(target: string) { files.set(String(target), ''); return 7 },
-    writeFileSync(target: string, data: unknown) { files.set(String(target), String(data)) },
+    writeFileSync(target: string, data: unknown) {
+      const file = String(target)
+      const text = String(data)
+      let isReadinessRecord = false
+      try {
+        const record = JSON.parse(text)
+        isReadinessRecord = typeof record?.baseUrl === 'string' && Number.isSafeInteger(record?.pid)
+      } catch { /* Other fixture files are not readiness records. */ }
+      if (isReadinessRecord && readinessWriteObserver) {
+        // Opening the writer exposes an empty file before its bytes are written.
+        // A separate provider exec can read in precisely that interval.
+        files.set(file, '')
+        const observe = readinessWriteObserver
+        readinessWriteObserver = undefined
+        observe()
+      }
+      files.set(file, text)
+    },
+    renameSync(source: string, destination: string) {
+      const value = files.get(String(source))
+      if (value === undefined) throw Object.assign(new Error('virtual file missing'), { code: 'ENOENT' })
+      files.delete(String(source))
+      files.set(String(destination), value)
+    },
     appendFileSync(target: string, data: unknown) {
       const file = String(target)
       files.set(file, (files.get(file) ?? '') + String(data))
@@ -88,6 +114,7 @@ function virtualOwnedRig({ runChild = false } = {}) {
         const imported = async () => ({
           createCodexLocalProvider: async (handler: typeof childHandler) => {
             childHandler = handler
+            if (pauseChildStartup) await childStartup
             return { baseUrl: 'http://127.0.0.1:51991/v1', close: () => close }
           },
         })
@@ -158,14 +185,32 @@ function virtualOwnedRig({ runChild = false } = {}) {
   }
 
   async function dispose() {
-    // Resolve any test-owned pending promises without running their commands.
-    // Rejections deliberately injected by tests are not silently observed here.
-    for (const call of calls) if (call.pending) { call.pending = false; call.resolve('null') }
+    resumeChildStartup()
     resolveClose()
-    await flushMicrotasks()
+    // A failed startup can begin a new cleanup probe after the previous one
+    // settles. Drain those virtual calls without executing their commands.
+    for (let round = 0; round < 4; round++) {
+      for (const call of calls) if (call.pending) { call.pending = false; call.resolve('null') }
+      await flushMicrotasks()
+    }
     stopTimers()
     vi.clearAllTimers()
     vi.useRealTimers()
+  }
+
+  function observeReadDuringReadinessWrite(index: number) {
+    let observed: string | undefined
+    readinessWriteObserver = () => {
+      const call = calls[index]
+      expect(call, `missing owned exec ${index}`).toBeDefined()
+      expect(call.pending, `owned exec ${index} already settled`).toBe(true)
+      call.pending = false
+      try {
+        observed = evaluate(call.args)
+        call.resolve(observed)
+      } catch (error) { call.reject(error as Error) }
+    }
+    return () => observed
   }
 
   return {
@@ -174,6 +219,7 @@ function virtualOwnedRig({ runChild = false } = {}) {
       return running
     }) } },
     calls, files, signals, spawned, childErrors, release, reject, dispose, resolveClose,
+    resumeChildStartup, observeReadDuringReadinessWrite,
     setRunning: (value: boolean) => { running = value },
     failInspection: (error: Error) => { inspectionError = error },
     replaceFixture: () => { stopTimers(); incarnation = 'replacement' },
@@ -248,6 +294,28 @@ it('awaits readiness output instead of parsing its unresolved promise', async ()
     h.files.set(`${h.directory()}/ready.json`, JSON.stringify(ready))
     await h.release(1)
     expect((await started).context).toEqual(ready)
+  } finally { await h.dispose() }
+})
+
+it('does not expose an incomplete readiness record to a concurrent provider probe', async () => {
+  vi.useFakeTimers()
+  const h = virtualOwnedRig({ runChild: true, pauseChildStartup: true })
+  try {
+    const started = begin(h)
+    await h.release(0)
+    expect(h.calls).toHaveLength(2)
+    const duringWrite = h.observeReadDuringReadinessWrite(1)
+    h.resumeChildStartup()
+    await flushMicrotasks()
+
+    // This is the generated owned readiness probe's actual result while the
+    // fixture is opening its record, not a simulated parse of test data.
+    expect(duringWrite()).toBe('null')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.calls).toHaveLength(3)
+    await h.release(2)
+    expect((await started).context).toMatchObject({ uid: 65534, gid: 0, pid: PID })
+    expect(h.childErrors).toEqual([])
   } finally { await h.dispose() }
 })
 
@@ -347,6 +415,25 @@ it('waits for the owned signal and a later closed marker', async () => {
     await stopping
     expect(settled).toBe(true)
     expect(h.childErrors).toEqual([])
+  } finally { await h.dispose() }
+})
+
+it('does not start a closed-state probe after fixture-stop cancellation', async () => {
+  vi.useFakeTimers()
+  const h = virtualOwnedRig({ runChild: true })
+  try {
+    const model = await startRunningChild(h)
+    const index = h.calls.length
+    const controller = new AbortController()
+    const reason = new Error('fixture stop cancelled by runtime owner')
+    const observed = model.stop(controller.signal).then(() => undefined, (error: unknown) => error)
+    await flushMicrotasks()
+    expect(h.calls).toHaveLength(index + 1)
+    controller.abort(reason)
+    // The in-flight stop request can complete normally even after cancellation.
+    await h.release(index)
+    expect(h.calls).toHaveLength(index + 1)
+    expect(await observed).toBe(reason)
   } finally { await h.dispose() }
 })
 

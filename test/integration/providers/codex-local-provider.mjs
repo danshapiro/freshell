@@ -154,19 +154,25 @@ export async function startInManagedContext(rig, source) {
       if (fs.existsSync(${JSON.stringify(stopPath)})) { clearInterval(stopTimer); process.kill(process.pid,'SIGTERM'); }
     }, 50);
     process.once('SIGTERM', async () => { clearInterval(stopTimer); await fixture.close(); fs.writeFileSync(${JSON.stringify(closedPath)},'closed');process.exit(0); });
-    fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({baseUrl:fixture.baseUrl,uid:process.getuid(),gid:process.getgid(),pid:process.pid,node:process.version}));`
+    fs.writeFileSync(${JSON.stringify(`${readyPath}.tmp`)}, JSON.stringify({baseUrl:fixture.baseUrl,uid:process.getuid(),gid:process.getgid(),pid:process.pid,node:process.version}));
+    fs.renameSync(${JSON.stringify(`${readyPath}.tmp`)}, ${JSON.stringify(readyPath)});`
 
   // Only the fixture itself signals its own process. Its private directory is
   // unique to this invocation, even if a previously recorded PID is reused.
-  async function stop(ready) {
+  async function stop(ready, signal) {
+    signal?.throwIfAborted()
     if (!rig.runtime.isContainerRunning(containerId, true)) return
+    signal?.throwIfAborted()
     const pidCheck = Number.isSafeInteger(ready?.pid)
       ? `const p=Number(fs.readFileSync(${JSON.stringify(`${directory}/pid`)},'utf8'));if(p!==${ready.pid})throw Error('fixture PID changed');`
       : ''
     await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');${pidCheck}fs.writeFileSync(${JSON.stringify(stopPath)},'stop',{mode:0o600})`])
+    signal?.throwIfAborted()
     const deadline = Date.now() + 10_000
     while (Date.now() < deadline) {
+      signal?.throwIfAborted()
       const closed = await rig.ownedProviderExec(containerId, ['node', '-e', `process.stdout.write(String(require('node:fs').existsSync(${JSON.stringify(closedPath)})))`])
+      signal?.throwIfAborted()
       if (closed === 'true') return
       assert.equal(closed, 'false', 'managed Codex fixture closed-state observation was malformed')
       await new Promise(resolve => setTimeout(resolve, 50))
@@ -212,7 +218,7 @@ export async function startInManagedContext(rig, source) {
       const text = await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=${JSON.stringify(trafficPath)};process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'')`])
       return text.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line))
     },
-    async stop() { await stop(ready) },
+    async stop(signal) { await stop(ready, signal) },
   }
 }
 
