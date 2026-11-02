@@ -337,4 +337,6 @@ Google coding CLI support (Antigravity CLI and existing Gemini CLI compatibility
 
 Fresh Agent compact panels: [implementation plan](docs/plans/2026-11-01-fresh-agent-compact-panels.md).
 
+Fresh Agent review polish (findings 7–12): [implementation plan](docs/plans/2026-11-01-fresh-agent-review-polish.md).
+
 When idle-waiting on subagents, always call `wait_agent` with `timeout_ms=3600000` (the 1-hour maximum). `wait_agent` wakes immediately on any subagent message or completion, so long timeouts add no latency — but every wait return (including a no-op timeout) costs a full model turn that re-sends the entire context. Never poll on shorter timeouts. Have workers `send_message` to `/root` at milestones so the parent wakes exactly when there is news.
