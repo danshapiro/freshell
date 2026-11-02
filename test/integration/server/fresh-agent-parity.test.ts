@@ -347,11 +347,19 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const sendId = `send-${randomUUID()}`
     wire.send({ type: 'freshAgent.send', provider: row.provider, sessionType: row.sessionType,
       sessionId: created.sessionId, requestId: sendId, text: 'fixture prompt' })
-    const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
-      && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
-    expect(materialized.sessionId).toBe(recorded.nativeSessionId)
-    await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
-      && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    if (row.provider === 'codex') {
+      expect(created.sessionRef).toEqual({ provider: 'codex', sessionId: recorded.nativeSessionId })
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === 'codex' && frame.sessionId === created.sessionId)
+      expect(wire.frames.filter(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === 'codex' && frame.previousSessionId === created.sessionId)).toEqual([])
+    } else {
+      const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
+      expect(materialized.sessionId).toBe(recorded.nativeSessionId)
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    }
 
     const resumeId = `resume-${randomUUID()}`
     wire.send({ type: 'freshAgent.create', requestId: resumeId,
@@ -710,22 +718,47 @@ tool_timeout_sec = 120
     })
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
-    const contextualAnswer = await send('Question: Which managed environment? Answer: Staging.', { effort: null })
-    expect(contextualAnswer.submittedTurnId).toBeTruthy()
+    const contextualAnswer = 'Question: Which managed environment? Answer: Staging.'
+    await send(contextualAnswer, { effort: null })
     await waitFor('managed contextual answer at loopback model', async () => (await model!.readTraffic()).some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
-    await wire.wait(frame => frame.type === 'freshAgent.event'
-      && frame.event?.type === 'freshAgent.transcript.patch'
-      && frame.provider === 'codex'
-      && frame.sessionType === 'freshcodex'
-      && frame.event.ops?.some((operation: any) => operation.op === 'settleTurn'
-        && operation.nativeTurnId === contextualAnswer.submittedTurnId
-        && operation.status === 'completed'))
+    const contextualTurnId = await waitFor('managed contextual answer completion', async () => {
+      const value = await snapshot()
+      const turn = value.turns.find((turn: any) => turn.role === 'user'
+        && turn.items?.some((item: any) => item.text === contextualAnswer))
+      return value.status === 'idle' && turn?.nativeTurnId ? turn.nativeTurnId as string : undefined
+    })
+    const contextualCompletion = await wire.wait(frame => frame.type === 'freshAgent.event'
+      && frame.provider === 'codex' && frame.sessionType === 'freshcodex' && frame.sessionId === created.sessionId
+      && frame.event?.type === 'freshAgent.transcript.patch' && frame.event.sessionId === created.sessionId
+      && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === contextualTurnId && op.status === 'completed'))
+    const adoptionFrameCursor = wire.frames.length
     const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
     expect(resumedResponse.ok, await resumedResponse.clone().text()).toBe(true)
     const resumed = await resumedResponse.json()
-    const paneId = resumed.data?.paneId ?? resumed.paneId
-    expect(paneId).toBeTruthy()
+    const { paneId, tabId, sessionId: adoptedStreamSessionId } = resumed.data
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    expect(paneId).toMatch(uuidPattern)
+    expect(tabId).toMatch(uuidPattern)
+    expect(adoptedStreamSessionId).toBe(view.nativeSessionId)
+    expect(adoptedStreamSessionId).toBe(created.sessionRef.sessionId)
+    const adoptedTab = await waitFor('native adoption tab acknowledgement', () => wire.frames.slice(adoptionFrameCursor)
+      .find(frame => frame.type === 'ui.command' && frame.command === 'tab.create'
+        && frame.payload?.id === tabId && frame.payload?.paneId === paneId))
+    expect(adoptedTab.payload.paneContent).toMatchObject({ kind: 'fresh-agent', provider: 'codex',
+      sessionType: 'freshcodex', sessionId: adoptedStreamSessionId, status: 'connected' })
+    const adoptionRequestId = adoptedTab.payload.paneContent.createRequestId
+    expect(adoptionRequestId).toEqual(expect.any(String))
+    expect(adoptionRequestId).not.toHaveLength(0)
+    const adoptedCreated = await waitFor('native adoption create acknowledgement', () => wire.frames.slice(adoptionFrameCursor)
+      .find(frame => frame.type === 'freshAgent.created' && frame.requestId === adoptionRequestId))
+    expect(adoptedCreated).toMatchObject({ provider: 'codex', runtimeProvider: 'codex',
+      sessionType: 'freshcodex', sessionId: adoptedStreamSessionId })
+    expect(adoptedCreated.sessionRef).toEqual({ provider: 'codex', sessionId: view.nativeSessionId })
+    const aliasView = await rig.runningViewForFreshSession(created.sessionId)
+    expect(aliasView).toMatchObject({ soulId: view.soulId, incarnationId: view.incarnationId,
+      containerId: providerContainerId, hostBootId: view.hostBootId, nativeSessionId: view.nativeSessionId,
+      provider: 'codex', freshAgentSessionType: 'freshcodex', freshAgentSessionId: created.sessionId })
     const captureResponse = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(captureResponse.ok, await captureResponse.clone().text()).toBe(true)
     expect(await captureResponse.text()).toContain('Managed native final answer.')
@@ -746,6 +779,8 @@ tool_timeout_sec = 120
       const mcpWait = await standaloneMcp.callFreshellAction('wait-for', { target: paneId, pattern: 'Managed native final answer.', timeout: 0 })
       expect(mcpWait).toMatchObject({ status: 'ok', data: { matched: true } })
       rig.runtime.writeIncident('freshcodex-managed-native-standalone-integration', { paneId, userRef: created.sessionId,
+        adoption: { response: resumed, tab: adoptedTab, created: adoptedCreated, aliasView,
+          before: { contextualTurnId, completion: contextualCompletion }, frameCursor: adoptionFrameCursor },
         nativeSessionId: view.nativeSessionId, cli: { entry: cliEntry, capture: cliCapture.stdout },
         mcp: { entry: standalone.path, capture: mcpCapture, wait: mcpWait } })
     } finally {
@@ -858,13 +893,16 @@ tool_timeout_sec = 120
       const control = choice === 'READONLY' || choice === 'RESTRICTED' ? undefined : await approval(decision)
       const completed = await waitFor(`managed ${choice} command result`, async () => {
         const value = await snapshot()
+        const nativeTurnId = value.turns.find((turn: any) => turn.role === 'user'
+          && turn.items?.some((item: any) => item.text === 'MANAGED_EFFECT_'+choice))?.nativeTurnId
         return value.status === 'idle' && JSON.stringify(value.turns).includes('MANAGED_EFFECT_'+choice)
+          && typeof nativeTurnId === 'string' && nativeTurnId.length > 0
           && !value.pendingApprovals.some((pending: any) => pending.requestId === control?.requestId)
           && wire.frames.slice(frameCursor).some(frame => {
-            const event = frame.type === 'freshAgent.event' ? frame.event : frame
-            const nativeTurn = value.turns.find((turn: any) => turn.role === 'user' && turn.items?.some((item: any) => item.text === 'MANAGED_EFFECT_'+choice))?.nativeTurnId
-            return event.type === 'freshAgent.transcript.patch' && event.sessionId === view.nativeSessionId
-              && event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurn && ['completed', 'interrupted', 'failed'].includes(op.status))
+            return frame.type === 'freshAgent.event' && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+              && frame.sessionId === adoptedStreamSessionId && frame.event?.type === 'freshAgent.transcript.patch'
+              && frame.event.sessionId === adoptedStreamSessionId
+              && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurnId && ['completed', 'interrupted', 'failed'].includes(op.status))
           })
           && (choice === 'DECLINE' || JSON.stringify(value.turns).includes('Managed '+file+' result:')) ? value : undefined
       })
