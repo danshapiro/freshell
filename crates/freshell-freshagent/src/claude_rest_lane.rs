@@ -40,6 +40,7 @@ impl ClaudeRestLane {
                 FreshAgentCreate {
                     collaboration_mode: None,
                     request_id: request.request_id,
+                    view_id: None,
                     provider: Some(AgentProvider::Claude),
                     session_type,
                     cwd: request.cwd,

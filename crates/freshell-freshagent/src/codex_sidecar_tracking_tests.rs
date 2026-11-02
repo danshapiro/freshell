@@ -114,6 +114,7 @@ async fn create_tracked_session_with_resume(
             effort: None,
             plugins: None,
             tab_id: None,
+            view_id: None,
         },
         None,
     )
@@ -247,6 +248,7 @@ async fn failed_spawn_leaves_no_record() {
             effort: None,
             plugins: None,
             tab_id: None,
+            view_id: None,
         },
         None,
     )
@@ -650,6 +652,7 @@ async fn create_bail_after_spawn_leaves_no_record() {
             effort: None,
             plugins: None,
             tab_id: None,
+            view_id: None,
         },
         None,
     )

@@ -1590,7 +1590,7 @@ impl FreshOpencodeState {
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
     /// `ws-handler.ts:3388-3405`'s generic catch -- always `retryable: true`,
     /// `ws-handler.ts:3403`).
-    fn fail_create(&self, request_id: &str, code: &str, message: &str) {
+    fn fail_create(&self, request_id: &str, view_id: Option<&str>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
                 owner_kind: None,
@@ -1599,6 +1599,7 @@ impl FreshOpencodeState {
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
+                view_id: view_id.map(str::to_string),
                 retryable: Some(true),
             },
         ));
@@ -1660,6 +1661,7 @@ impl FreshOpencodeState {
         provenance: Option<crate::BindProvenance>,
     ) {
         let request_id = msg.request_id.clone();
+        let view_id = msg.view_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
         // doc and [`Self::create_dedup`]'s field doc). Without this, a client resending
@@ -1677,6 +1679,7 @@ impl FreshOpencodeState {
                 self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
                     provider: PROVIDER.to_string(),
                     request_id,
+                    view_id: view_id.clone(),
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.placeholder_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
@@ -1788,6 +1791,7 @@ impl FreshOpencodeState {
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
+            view_id: view_id.clone(),
             runtime_provider: PROVIDER.to_string(),
             session_id: placeholder.clone(),
             session_type: SESSION_TYPE.to_string(),
@@ -1902,6 +1906,7 @@ impl FreshOpencodeState {
         msg: &FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
     ) {
+        let view_id = msg.view_id.as_deref();
         // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
         // HOLLOW `Some` (a partially initialized client's hello without
         // device/client fields) behaves like `None` on every gate below: the
@@ -1944,7 +1949,7 @@ impl FreshOpencodeState {
                     tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %durable_id, request_id = %request_id, code = err.code(),
                     "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    self.fail_create(&request_id, err.code(), err.message());
+                    self.fail_create(&request_id, view_id, err.code(), err.message());
                     return;
                 }
             };
@@ -1965,6 +1970,7 @@ impl FreshOpencodeState {
                          session — the in-memory fast path is blocked (typed)");
                     self.fail_create(
                         &request_id,
+                        view_id,
                         "SESSION_RESERVED",
                         "A lifecycle operation owns this session; retry after it settles",
                     );
@@ -2003,6 +2009,7 @@ impl FreshOpencodeState {
                                      reuse is refused (never a live writer left unowned)");
                                 self.fail_create(
                                     &request_id,
+                                    view_id,
                                     "SESSION_RESERVED",
                                     "A lifecycle operation owns this session; retry after it settles",
                                 );
@@ -2014,6 +2021,7 @@ impl FreshOpencodeState {
                         crate::ownership_lane::LaneClaim::Refused(_) => {
                             self.fail_create(
                                 &request_id,
+                                view_id,
                                 "SESSION_RESERVED",
                                 "A lifecycle operation owns this session; retry after it settles",
                             );
@@ -2036,6 +2044,7 @@ impl FreshOpencodeState {
                          typed refusal, never a Fresh Agent reassertion beside it");
                     self.fail_create(
                         &request_id,
+                        view_id,
                         "SESSION_RESERVED",
                         "The session is owned by a terminal runtime; reopen it as \
                          the terminal instead",
@@ -2062,19 +2071,26 @@ impl FreshOpencodeState {
                 Err(ResumeOpencodeError::NotFound) => {
                     self.fail_create(
                         &request_id,
+                        view_id,
                         "FRESH_AGENT_CREATE_FAILED",
                         &format!("opencode session {durable_id} not found"),
                     );
                     return;
                 }
                 Err(ResumeOpencodeError::Manager(err)) => {
-                    self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
+                    self.fail_create(
+                        &request_id,
+                        view_id,
+                        "FRESH_AGENT_CREATE_FAILED",
+                        &err.to_string(),
+                    );
                     return;
                 }
                 Err(ResumeOpencodeError::Reserved) => {
                     // Task 13 (D8): the create-resume loser answer -- retryable.
                     self.fail_create(
                         &request_id,
+                        view_id,
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                     );
@@ -2191,6 +2207,7 @@ impl FreshOpencodeState {
                      binding write is PREVENTED and the create answers typed");
                 self.fail_create(
                     &request_id,
+                    view_id,
                     "SESSION_RESERVED",
                     "A lifecycle operation committed while this create was in flight; \
                      retry after it settles",
@@ -2315,6 +2332,7 @@ impl FreshOpencodeState {
                      the committed owner)");
                 self.fail_create(
                     &request_id,
+                    view_id,
                     "SESSION_RESERVED",
                     "A lifecycle operation committed while this create was in flight; \
                      retry after it settles",
@@ -2343,6 +2361,7 @@ impl FreshOpencodeState {
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
+            view_id: msg.view_id.clone(),
             runtime_provider: PROVIDER.to_string(),
             session_id: durable_id.clone(),
             session_type: SESSION_TYPE.to_string(),
@@ -6530,6 +6549,7 @@ impl FreshOpencodeState {
 
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
+            view_id: msg.view_id.clone(),
             parent_session_id: msg.session_id.clone(),
             session_id: child.id.clone(),
             session_type: SESSION_TYPE.to_string(),
@@ -10211,6 +10231,7 @@ mod tests {
             sandbox: None,
             session_ref: None,
             tab_id: None,
+            view_id: None,
         }
     }
 
@@ -21666,6 +21687,7 @@ mod tests {
             tab_id: None,
             observed_epoch: None,
             observed_generation: None,
+            view_id: None,
         }
     }
 
@@ -21966,8 +21988,9 @@ mod tests {
         .await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), None, sink)
-            .await;
+        let mut fork_request = fork_msg("ses_parent", "fork-req-1", None);
+        fork_request.view_id = Some("view-fork-1".to_string());
+        st.handle_fork(fork_request, None, sink).await;
 
         // The exact `freshAgent.forked` reply — every field, request_id echoed
         // (the client matches on requestId + parentSessionId to repoint the pane).
@@ -21976,6 +21999,7 @@ mod tests {
             frames,
             vec![ServerMessage::FreshAgentForked(FreshAgentForked {
                 request_id: Some("fork-req-1".to_string()),
+                view_id: Some("view-fork-1".to_string()),
                 parent_session_id: "ses_parent".to_string(),
                 session_id: "ses_child".to_string(),
                 session_type: "freshopencode".to_string(),

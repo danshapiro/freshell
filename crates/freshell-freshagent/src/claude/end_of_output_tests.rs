@@ -271,6 +271,7 @@ fn create_msg(request_id: &str) -> FreshAgentCreate {
         effort: None,
         plugins: None,
         tab_id: None,
+        view_id: None,
     }
 }
 

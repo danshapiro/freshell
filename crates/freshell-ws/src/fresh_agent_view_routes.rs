@@ -22,7 +22,7 @@ struct PendingCreate {
 #[derive(Debug, Default)]
 pub(crate) struct FreshAgentViewRoutes {
     uses_view_ids: bool,
-    pending_creates: HashMap<String, PendingCreate>,
+    pending_creates: HashMap<(String, String), PendingCreate>,
     views: HashMap<Locator, HashSet<String>>,
 }
 
@@ -43,7 +43,7 @@ impl FreshAgentViewRoutes {
                 };
                 self.uses_view_ids = true;
                 self.pending_creates.insert(
-                    request_id.to_string(),
+                    (request_id.to_string(), view_id.to_string()),
                     PendingCreate {
                         view_id: view_id.to_string(),
                     },
@@ -78,8 +78,11 @@ impl FreshAgentViewRoutes {
         });
     }
 
-    pub(crate) fn forget_create(&mut self, request_id: &str) {
-        self.pending_creates.remove(request_id);
+    pub(crate) fn forget_create(&mut self, request_id: &str, view_id: Option<&str>) {
+        if let Some(view_id) = view_id {
+            self.pending_creates
+                .remove(&(request_id.to_string(), view_id.to_string()));
+        }
     }
 
     /// Apply requester-scoped routing to a received broadcast. A created
@@ -101,7 +104,13 @@ impl FreshAgentViewRoutes {
                 let Some(request_id) = value.get("requestId").and_then(Value::as_str) else {
                     return !self.uses_view_ids;
                 };
-                if let Some(pending) = self.pending_creates.remove(request_id) {
+                let Some(view_id) = value.get("viewId").and_then(Value::as_str) else {
+                    return !self.uses_view_ids;
+                };
+                if let Some(pending) = self
+                    .pending_creates
+                    .remove(&(request_id.to_string(), view_id.to_string()))
+                {
                     if let Some(locator) = locator_from(&value, "sessionId") {
                         self.views
                             .entry(locator)
@@ -116,7 +125,14 @@ impl FreshAgentViewRoutes {
                 let Some(request_id) = value.get("requestId").and_then(Value::as_str) else {
                     return !self.uses_view_ids;
                 };
-                if self.pending_creates.remove(request_id).is_some() {
+                let Some(view_id) = value.get("viewId").and_then(Value::as_str) else {
+                    return !self.uses_view_ids;
+                };
+                if self
+                    .pending_creates
+                    .remove(&(request_id.to_string(), view_id.to_string()))
+                    .is_some()
+                {
                     return true;
                 }
                 !self.uses_view_ids
@@ -196,11 +212,11 @@ mod tests {
         }));
         assert!(!routes.should_deliver(&frame(json!({
             "type":"freshAgent.created", "requestId":"create-b", "provider":"codex",
-            "sessionType":"freshcodex", "sessionId":"shared"
+            "sessionType":"freshcodex", "sessionId":"shared", "viewId":"view-a"
         }))));
         assert!(routes.should_deliver(&frame(json!({
             "type":"freshAgent.created", "requestId":"create-a", "provider":"codex",
-            "sessionType":"freshcodex", "sessionId":"shared"
+            "sessionType":"freshcodex", "sessionId":"shared", "viewId":"view-a"
         }))));
         assert!(routes.should_deliver(&frame(json!({
             "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
@@ -209,6 +225,82 @@ mod tests {
         assert!(!routes.should_deliver(&frame(json!({
             "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
             "sessionId":"other", "event":{"type":"freshAgent.stream"}
+        }))));
+    }
+
+    #[test]
+    fn reused_request_ids_are_routed_by_the_echoed_view_id() {
+        let mut routes = FreshAgentViewRoutes::default();
+        for view_id in ["view-old", "view-new"] {
+            routes.observe_client_value(&json!({
+                "type":"freshAgent.create", "requestId":"reused", "viewId":view_id
+            }));
+        }
+
+        assert!(!routes.should_deliver(&frame(json!({
+            "type":"freshAgent.created", "requestId":"reused", "viewId":"other-view",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"stale"
+        }))));
+        assert!(routes.should_deliver(&frame(json!({
+            "type":"freshAgent.created", "requestId":"reused", "viewId":"view-old",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"old-session"
+        }))));
+        assert!(routes.should_deliver(&frame(json!({
+            "type":"freshAgent.created", "requestId":"reused", "viewId":"view-new",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"new-session"
+        }))));
+        assert!(routes.views.contains_key(&super::Locator {
+            provider: "codex".into(),
+            session_type: "freshcodex".into(),
+            session_id: "old-session".into(),
+        }));
+        assert!(routes.views.contains_key(&super::Locator {
+            provider: "codex".into(),
+            session_type: "freshcodex".into(),
+            session_id: "new-session".into(),
+        }));
+    }
+
+    #[test]
+    fn reused_request_ids_route_create_failures_by_the_echoed_view_id() {
+        let mut routes = FreshAgentViewRoutes::default();
+        for view_id in ["view-old", "view-new"] {
+            routes.observe_client_value(&json!({
+                "type":"freshAgent.create", "requestId":"reused", "viewId":view_id
+            }));
+        }
+
+        assert!(!routes.should_deliver(&frame(json!({
+            "type":"freshAgent.create.failed", "requestId":"reused", "viewId":"other-view",
+            "code":"CREATE_FAILED", "message":"stale"
+        }))));
+        assert!(routes.should_deliver(&frame(json!({
+            "type":"freshAgent.create.failed", "requestId":"reused", "viewId":"view-old",
+            "code":"CREATE_FAILED", "message":"old view failed"
+        }))));
+        assert!(routes
+            .pending_creates
+            .contains_key(&("reused".into(), "view-new".into())));
+    }
+
+    #[test]
+    fn forgetting_a_create_keeps_another_view_with_the_same_request_id() {
+        let mut routes = FreshAgentViewRoutes::default();
+        for view_id in ["view-old", "view-new"] {
+            routes.observe_client_value(&json!({
+                "type":"freshAgent.create", "requestId":"reused", "viewId":view_id
+            }));
+        }
+
+        routes.forget_create("reused", Some("view-old"));
+
+        assert!(!routes.should_deliver(&frame(json!({
+            "type":"freshAgent.created", "requestId":"reused", "viewId":"view-old",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"old-session"
+        }))));
+        assert!(routes.should_deliver(&frame(json!({
+            "type":"freshAgent.created", "requestId":"reused", "viewId":"view-new",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"new-session"
         }))));
     }
 

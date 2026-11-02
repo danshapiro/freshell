@@ -1043,6 +1043,10 @@ async fn handle_client_text_with_view_routes(
                         .and_then(|r| r.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    view_id: value
+                        .get("viewId")
+                        .and_then(|view| view.as_str())
+                        .map(str::to_string),
                     retryable: Some(false),
                 });
                 return send(ws_tx, &reply).await;
@@ -1949,8 +1953,9 @@ async fn handle_client_text_with_view_routes(
         ClientMessage::FreshAgentCreate(create) => {
             if state.fresh_codex.is_enabled() {
                 let request_id = create.request_id.clone();
+                let view_id = create.view_id.clone();
                 let Some(create) = freshell_protocol::direct_provider_create(create) else {
-                    fresh_agent_views.forget_create(&request_id);
+                    fresh_agent_views.forget_create(&request_id, view_id.as_deref());
                     return true;
                 };
                 // D8 (restore-open-sessions-only): thread this connection's
@@ -2004,6 +2009,7 @@ async fn handle_client_text_with_view_routes(
                     code: "FRESH_AGENT_DISABLED".to_string(),
                     message: FRESH_AGENT_DISABLED_REFUSAL.to_string(),
                     request_id: create.request_id.clone(),
+                    view_id: create.view_id.clone(),
                     retryable: Some(true),
                     // The disabled-gate refusal is not an ownership conflict:
                     // no owner fence fields (kata b8ke additive surface).
@@ -2011,7 +2017,7 @@ async fn handle_client_text_with_view_routes(
                     owner_generation: None,
                     owner_epoch: None,
                 });
-                fresh_agent_views.forget_create(&create.request_id);
+                fresh_agent_views.forget_create(&create.request_id, create.view_id.as_deref());
                 return send(ws_tx, &reply).await;
             }
             true

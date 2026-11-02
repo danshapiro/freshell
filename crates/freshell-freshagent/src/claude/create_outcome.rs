@@ -38,7 +38,11 @@ pub enum ClaudeCreateOutcome {
 impl ClaudeCreateOutcome {
     /// The `freshAgent.create.failed` frame answering `request_id` for a failed
     /// create; `None` for a created one.
-    pub(super) fn create_failed_frame(&self, request_id: &str) -> Option<ServerMessage> {
+    pub(super) fn create_failed_frame(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+    ) -> Option<ServerMessage> {
         let Self::Failed {
             code,
             message,
@@ -56,6 +60,7 @@ impl ClaudeCreateOutcome {
                 code: code.clone(),
                 message: message.clone(),
                 request_id: request_id.to_string(),
+                view_id: view_id.map(str::to_string),
                 retryable: *retryable,
             },
         ))
@@ -79,12 +84,18 @@ mod tests {
             }),
         };
         assert_eq!(
-            serde_json::to_value(refused.create_failed_frame("req-1").unwrap()).unwrap(),
+            serde_json::to_value(
+                refused
+                    .create_failed_frame("req-1", Some("view-1"))
+                    .unwrap()
+            )
+            .unwrap(),
             serde_json::json!({
                 "type": "freshAgent.create.failed",
                 "code": "SESSION_RESERVED",
                 "message": "Another resume for this session is in flight",
                 "requestId": "req-1",
+                "viewId": "view-1",
                 "retryable": true,
                 "ownerKind": "terminal",
                 "ownerGeneration": 4,
@@ -100,7 +111,7 @@ mod tests {
             owner: None,
         };
         assert_eq!(
-            serde_json::to_value(failed.create_failed_frame("req-2").unwrap()).unwrap(),
+            serde_json::to_value(failed.create_failed_frame("req-2", None).unwrap()).unwrap(),
             serde_json::json!({
                 "type": "freshAgent.create.failed",
                 "code": "CLAUDE_CREATE_FAILED",
@@ -114,6 +125,6 @@ mod tests {
             session_ref: None,
             cleanup_ownership_id: None,
         };
-        assert!(created.create_failed_frame("req-3").is_none());
+        assert!(created.create_failed_frame("req-3", None).is_none());
     }
 }

@@ -207,6 +207,7 @@ describe('fresh-agent-ws', () => {
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-1',
+      viewId: 'view-1',
       sessionId: 'thread-1',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -216,6 +217,90 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.pendingCreates['req-1']).toMatchObject({
       sessionId: 'thread-1',
       expectsHistoryHydration: true,
+    })
+  })
+
+  it('does not fold create replies from another view that reuses the request ID', () => {
+    const store = createFreshAgentStore()
+    registerFreshAgentCreate(store.dispatch, 'req-reused-view', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'old-view',
+    })
+    cancelCreate('req-reused-view', 'old-view')
+    registerFreshAgentCreate(store.dispatch, 'req-reused-view', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'replacement-view',
+    })
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-reused-view',
+      viewId: 'old-view',
+      sessionId: 'stale-session',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+
+    expect(store.getState().freshAgent.pendingCreates['req-reused-view']).toMatchObject({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:stale-session']).toBeUndefined()
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-reused-view',
+      viewId: 'replacement-view',
+      sessionId: 'replacement-session',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    expect(store.getState().freshAgent.pendingCreates['req-reused-view']).toMatchObject({
+      sessionId: 'replacement-session',
+      provider: 'codex',
+    })
+  })
+
+  it('does not fold create failures from another view that reuses the request ID', () => {
+    const store = createFreshAgentStore()
+    registerFreshAgentCreate(store.dispatch, 'req-reused-view', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'old-view',
+    })
+    cancelCreate('req-reused-view', 'old-view')
+    registerFreshAgentCreate(store.dispatch, 'req-reused-view', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'replacement-view',
+    })
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.create.failed',
+      requestId: 'req-reused-view',
+      viewId: 'old-view',
+      code: 'SPAWN_FAILED',
+      message: 'stale failure',
+    })
+
+    expect(store.getState().freshAgent.pendingCreates['req-reused-view']).toMatchObject({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    expect(store.getState().freshAgent.pendingCreateFailures['req-reused-view']).toBeUndefined()
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.create.failed',
+      requestId: 'req-reused-view',
+      viewId: 'replacement-view',
+      code: 'SPAWN_FAILED',
+      message: 'replacement failure',
+    })
+    expect(store.getState().freshAgent.pendingCreateFailures['req-reused-view']).toMatchObject({
+      code: 'SPAWN_FAILED',
+      message: 'replacement failure',
     })
   })
 
@@ -231,6 +316,7 @@ describe('fresh-agent-ws', () => {
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-shared-b',
+      viewId: 'view-shared-b',
       sessionId: 'thread-shared',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -253,6 +339,7 @@ describe('fresh-agent-ws', () => {
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-orphan',
+      viewId: 'view-orphan',
       sessionId: 'thread-orphan',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -292,6 +379,7 @@ describe('fresh-agent-ws', () => {
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-opencode-b',
+      viewId: 'view-opencode-b',
       sessionId: 'ses_shared',
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -308,6 +396,7 @@ describe('fresh-agent-ws', () => {
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-opencode-orphan',
+      viewId: 'view-opencode-orphan',
       sessionId: 'ses_orphan',
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -353,6 +442,7 @@ describe('fresh-agent-ws', () => {
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-old-view',
+      viewId: 'view-old',
       sessionId: 'thread-old-view',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -407,6 +497,7 @@ describe('fresh-agent-ws', () => {
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.create.failed',
       requestId: 'req-reserved-1',
+      viewId: 'view-reserved-1',
       code: 'SESSION_RESERVED',
       message: 'Another resume for this session is in flight',
       retryable: true,
@@ -419,6 +510,7 @@ describe('fresh-agent-ws', () => {
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-reserved-1',
+      viewId: 'view-reserved-1',
       sessionId: 'ses_reserved_late',
       sessionType: 'freshclaude',
       provider: 'claude',
@@ -482,6 +574,7 @@ describe('fresh-agent-ws', () => {
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-placeholder',
+      viewId: 'view-placeholder',
       sessionId: placeholderId,
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -1641,6 +1734,7 @@ describe('runtime-owner folds (kata b8ke)', () => {
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.create.failed',
       requestId: 'req-owner-conflict',
+      viewId: 'view-owner-conflict',
       code: 'SESSION_OWNED_BY_TERMINAL',
       message: 'the session is owned by a terminal runtime',
       retryable: false,
@@ -1671,6 +1765,7 @@ describe('runtime-owner folds (kata b8ke)', () => {
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-orphan-fence',
+      viewId: 'view-orphan-fence',
       sessionId: 'thread-orphan-fence',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -1703,6 +1798,7 @@ describe('runtime-owner folds (kata b8ke)', () => {
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-orphan-plain',
+      viewId: 'view-orphan-plain',
       sessionId: 'thread-orphan-plain',
       sessionType: 'freshcodex',
       provider: 'codex',
