@@ -59,7 +59,7 @@ Stage 1 creates this agent plan and adds its link beside the existing compact-pa
 | File | Responsibility and owner |
 | --- | --- |
 | `src/components/fresh-agent/FreshAgentNoticeStack.tsx` | Task 1: one local details-state helper, routine summaries, actual reading-state notifications, accessible severity count. |
-| `src/components/fresh-agent/FreshAgentView.tsx` | Task 1: route its transient reading callback to the current containing disclosure and put genuine ambiguous-send instructions first. Task 3: preserve focus in its owned Changes portal during the scheduled adoption frame. |
+| `src/components/fresh-agent/FreshAgentView.tsx` | Task 1: route its transient reading callback to the current containing disclosure and put genuine ambiguous-send instructions first. Task 2: conditional shared layout wrapper only if measured CSS cannot preserve required geometry. Task 3: preserve focus in its owned Changes portal during the scheduled adoption frame. |
 | `src/index.css` | Task 2: shared compact header, metadata, tiny fallback and request-space allocation only. |
 | `src/components/fresh-agent/FreshAgentApprovalCard.tsx` | Task 2: generic preview wrapping and native presentation deduplication only. |
 | `test/unit/client/components/fresh-agent/FreshAgentNoticeStack.test.tsx` | Task 1: actual disclosure insertion/removal state, summary feedback, accessibility semantics/count derivation. |
@@ -70,6 +70,7 @@ Stage 1 creates this agent plan and adds its link beside the existing compact-pa
 | `test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts` | Tasks 1–3, sequentially: real shared rendering/keyboard geometry through existing fixture. Task 4 uses its unchanged screenshot transport for artifact reconstruction. |
 | `test/e2e-browser/specs/freshcodex-send-delivery-rust.spec.ts` | Task 1: server-backed send-delivery behavior, with the prevention instruction checked while closed and the full diagnostic checked after expansion. |
 | `test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts` | Task 1: server-backed rewind notice selectors scoped to the summary and expanded body. |
+| `test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts` | Task 1: scope the undo-refill notice assertion to its summary/body after the duplicate notice text is introduced. |
 | `test/e2e-browser/specs/agent-checkpoint-rewind.spec.ts` | Task 1: keep the cloud-excluded rewind assertion scoped to its summary/body; selector maintenance only, not claimed as configured-cloud coverage. |
 | `scripts/e2e-cloud.sh` | Task 4: human-display redaction, retaining raw storage and runner verdicts. |
 | `scripts/test/cloud-e2e-logging-receipt.test.sh` | Task 4: exercise the real runner using fake external gcloud responses, preserve/decode raw PNG data. |
@@ -80,7 +81,7 @@ No shared focus framework, Redux disclosure state, focus cache, MutationObserver
 ## Stage 2 decisions and implementation acceptance gates
 
 1. **Disclosure ownership verified within its planning boundary:** the exact helper and actual NoticeStack tree support keeping the existing timer in View with its stable React setter. The settled pause must follow the currently mounted containing details through insertion, removal, native queued toggles and severity transfers; the genuine ambiguous-delivery exemption stays independent. Keep the helper local and the callback stable. Task 1 still must execute the full View/provider and browser RED/GREEN cases; the in-memory ownership result is not that coverage. [Retained local lifecycle evidence](../../../.the-usual-logs/fresh-agent-review-polish/reports/load-bearing-validator-lb-f1.md).
-2. **Joint short-pane allocation is acceptable but genuinely unproven:** Stage 2 could inspect retained geometry, source constraints and sizing contracts, but measuring the unimplemented proposal requires source/build/browser/fixture changes outside read-only validation. Choose a provisional single shared pane-owned allocation and settle it in authorized Task 2 RED/GREEN at 560×320, 390×320, 390×400 and 560×400, with and without metadata. The same populated state must paint meaningful metadata and both concise diagnostic labels while preserving actual transcript, the complete composer and reachable pending answers/recoveries. The starting CSS below is not a verified fit; account for real borders, count/summary line boxes, fixed chrome, wrapping and scale rather than relying on nominal caps. If measurements defeat that allocation, permit the smallest shared local layout/markup adjustment coordinating intrinsic panel tracks with actual composer/transcript reservations. Keep independent intended scrolling, existing target sizes, ≥64px actual short transcript, tall-pane ≥40% transcript and ≤35% combined panels, and the existing style/theme/scale/split matrix. Do not manufacture a new full width/style/scale cross-product from reference arithmetic. Whole-layout scrolling remains accepted below 320px for pending-request recovery and below the measured composer minimum for no-request composer reachability; preserve immediate visibility in the no-panel 270px case. Task 2 cannot pass without combined real-browser geometry on the configured backend; if no compliant allocation passes, report FAILED/non-converged. [Retained local geometry decision/evidence](../../../.the-usual-logs/fresh-agent-review-polish/reports/load-bearing-validator-lb-f2.md).
+2. **Joint short-pane allocation is acceptable but genuinely unproven:** Stage 2 could inspect retained geometry, source constraints and sizing contracts, but measuring the unimplemented proposal requires source/build/browser/fixture changes outside read-only validation. Evaluate 560×320, 390×320, 390×400 and 560×400 in authorized Task 2 RED/GREEN. At 560×320, 390×400 and 560×400, require one populated state to paint meaningful metadata and both concise diagnostic labels while preserving the complete composer and reachable pending answers/recoveries. At 390×320, require both labels and reachable requests/composer in a metadata-absent state, and separately verify a metadata-bearing compact state with metadata values and Child links reachable after intentional scrolling; do not require the metadata line alongside all diagnostics and requests at that size, where the provisional panel estimate exceeds the protected budget. The starting CSS below is not a verified fit; account for real borders, count/summary line boxes, fixed chrome, wrapping and scale rather than relying on nominal caps. If measurements defeat that allocation, permit the smallest shared local layout/markup adjustment coordinating intrinsic panel tracks with actual composer/transcript reservations. Keep independent intended scrolling, existing target sizes, ≥64px actual short transcript, tall-pane ≥40% transcript and ≤35% combined panels, and the existing style/theme/scale/split matrix. Do not manufacture a new full width/style/scale cross-product from reference arithmetic. Whole-layout scrolling remains accepted below 320px for pending-request recovery and below the measured composer minimum for no-request composer reachability; preserve immediate visibility in the no-panel 270px case. Task 2 cannot pass without combined real-browser geometry on the configured backend; if no compliant allocation passes, report FAILED/non-converged. [Retained local geometry decision/evidence](../../../.the-usual-logs/fresh-agent-review-polish/reports/load-bearing-validator-lb-f2.md).
 3. **Focus boundary and optional traversal advice:** use the local View callback-time ownership guard for retained same-session/diff status changes, explicit same-pane epochs and opening Changes after that View frame is queued. Do not rely on a universal claim that this is the only asynchronous focus writer or suppress shared descriptor restoration, explicit delivery/undo editing focus, or intentional comment/close focus. The bounded retained-transition decision is supported; a modeled broader handoff interaction is not a demonstrated application defect. Preserve actual disabled/enabled setup, draft/control identity, foreign-owner adoption and all intentional closes in Task 3, without a settle-all-timers precondition on the pending-frame case. The live trap already reads style once per candidate and reflects dynamic controls. Lazy traversal could reduce per-Tab work for very large diffs. No demonstrated latency defect requires that optional change, so keep the trap and avoid a benchmark gate or speculative cache. [Bounded retained-focus evidence](../../../.the-usual-logs/fresh-agent-review-polish/reports/load-bearing-validator-lb-f3-fallback.md), [broader mechanism limits](../../../.the-usual-logs/fresh-agent-review-polish/reports/load-bearing-validator-lb-f3.md).
 4. **Screenshot evidence:** Cloud Run filesystem screenshots alone are not durable exports. Existing PNG chunks remain in raw Cloud Logging. Display redaction reduces terminal output only, not Cloud Logging storage/ingestion bytes. Verify extraction against both structured jsonPayload and reporter-prefixed textPayload and inspect reconstructed PNGs before claiming preserved evidence.
 
@@ -96,6 +97,7 @@ No shared focus framework, Redux disclosure state, focus cache, MutationObserver
 - Test: `test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts`
 - Test: `test/e2e-browser/specs/freshcodex-send-delivery-rust.spec.ts`
 - Test: `test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts`
+- Test: `test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts`
 - Update only: `test/e2e-browser/specs/agent-checkpoint-rewind.spec.ts` (cloud-excluded selector maintenance; do not claim it ran)
 
 **Interfaces:**
@@ -252,9 +254,12 @@ function NoticeDisclosure({ children, errorId, onExpandedChange }: {
 Add `onNoticesExpandedChange` to the stack's destructured props and type. Replace the routine `<details onToggle=...>` with `<NoticeDisclosure onExpandedChange={onNoticesExpandedChange}>` and the matching closing tag. Replace each error's `<details key={error.id} ...>` with `<NoticeDisclosure key={error.id} errorId={error.id} onExpandedChange={error.onToggle}>` and the matching closing tag; preserve all existing summary/body/recovery JSX. Replace the summary expression with:
 
 ```tsx
-const noticeSummary = notices.length === 1 ? notices[0].text : <>
+const summarizeNotice = (text: string) => text.length > 160 ? `${text.slice(0, 160)}…` : text
+const latestRoutineNotice = [...notices].reverse().find(notice => !notice.prominent)
+const noticeSummary = notices.length === 1 ? summarizeNotice(notices[0].text) : <>
   {notices.length} notices
-  {notices.filter(notice => notice.prominent).map(notice => <span key={notice.id} className="fresh-agent-notice-summary">{notice.text}</span>)}
+  {latestRoutineNotice ? <span className="fresh-agent-notice-summary">{summarizeNotice(latestRoutineNotice.text)}</span> : null}
+  {notices.filter(notice => notice.prominent).map(notice => <span key={notice.id} className="fresh-agent-notice-summary">{summarizeNotice(notice.text)}</span>)}
 </>
 ```
 
@@ -276,7 +281,9 @@ The transient diagnostic `content` becomes `(verboseNotice || uncertainDelivery)
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentNoticeStack.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.live-tail.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.approvals.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: PASS, including the previously existing pause, provider semantics, exact original diagnostic, restored draft, persistence, and no-replay checks.
+Run: `pnpm exec eslint src/components/fresh-agent/FreshAgentNoticeStack.tsx src/components/fresh-agent/FreshAgentView.tsx`
+
+Expected: PASS, including the previously existing pause, provider semantics, capped closed routine summaries with full expanded text, transient feedback alongside prominent notices, exact original diagnostic, restored draft, persistence, and no-replay checks.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -284,11 +291,11 @@ Keep the helper local and callback stable; remove obsolete entry-callback wiring
 
 - [ ] **Step 6: Run impacted verification and add browser feedback coverage**
 
-In the existing compact browser fixture, add single info feedback before expansion, mixed-severity count using `getByRole('img', {name:'1 error, 1 warning'})`, changed count after state updates, and an ARIA snapshot scoped to that count (assert a named `img`, not a whole-page snapshot). Existing count selectors become `getByRole('img', {name:'2 errors'})`.
+In the existing compact browser fixture, assert the transient info message in the closed summary both alone and while a prominent reconciliation notice is also present; opening the disclosure still exposes all original notice text. Add mixed-severity count using `getByRole('img', {name:'1 error, 1 warning'})`, changed count after state updates, and an ARIA snapshot scoped to that count (assert a named `img`, not a whole-page snapshot). Existing count selectors become `getByRole('img', {name:'2 errors'})`.
 
 Add a genuine ambiguous-send browser case using the existing `harness` fixture and `seedCompactPane` with Codex, no pending requests and no create error. The fixture intentionally suppresses network effects: `sendSuppressedAwareFreshAgentFrame` records the real submitted frame in the existing harness spy instead of sending it over WebSocket, so a routeWebSocket interceptor cannot observe this send. Keep that suppression in place, fill the real composer, press Send, and retrieve the unique matching `freshAgent.send` frame with `harness.getSentWsMessages()`. Inject the correlated top-level server error through the existing `harness.receiveWsMessage({type:'error', code:'INTERNAL_ERROR', requestId:sent.requestId, message:'CODEX_DELIVERY_AMBIGUOUS: ' + 'Long explanation '.repeat(30)})`. This is the production send-refusal/ambiguous-delivery handler, not a synthetic provider notice with a DELIVERY_UNCERTAIN code. At 560×320 and 390×700 assert the closed summary starts with the prevention instruction and also explains that delivery is uncertain; after 7 seconds assert persistence, restored draft, matching send count one, and full original diagnostic on expansion. Task 2 separately adds the painted-text assertion to this existing passing case when its layout implementation is ready. Keep the existing synthetic provider-warning test as ordinary provider behavior. This UI fixture covers real client send/error state while intentionally replacing provider transport; affected Rust-backed approval/rollback cases below retain server/provider integration coverage, with no claim that this fixture launches a real Codex provider.
 
-Update `freshcodex-send-delivery-rust.spec.ts` to assert the prevention instruction in the closed delivery notice, then expand it before checking the full native-response diagnostic. In `fresh-agent-checkpoint-unavailable-rust.spec.ts` and `FreshAgentView.test.tsx`, target the summary separately from the body so the same rendered message does not create an ambiguous text locator; retain the full diagnostic assertion on the expanded body. Apply the same summary/body scoping to the cloud-excluded `agent-checkpoint-rewind.spec.ts`, preserve its current cloud skip, and do not count it as executed coverage.
+Update `freshcodex-send-delivery-rust.spec.ts` to assert the prevention instruction in the closed delivery notice, then expand it before checking the full native-response diagnostic. In `fresh-agent-checkpoint-unavailable-rust.spec.ts`, `fresh-agent-rollback-rust.spec.ts`, and `FreshAgentView.test.tsx`, target the summary separately from the body so the same rendered message does not create an ambiguous text locator; retain full-diagnostic assertions on expanded bodies. Apply the same summary/body scoping to the cloud-excluded `agent-checkpoint-rewind.spec.ts`, preserve its current cloud skip, and do not count it as executed coverage.
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/ test/e2e/fresh-agent-turn-complete-notification.test.tsx --config config/vitest/vitest.config.ts`
 
@@ -301,7 +308,7 @@ Expected: PASS on cloud, nonzero intended cases with no recovered retry. Task 1 
 - [ ] **Step 7: Commit task**
 
 ```bash
-git add src/components/fresh-agent/FreshAgentNoticeStack.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentNoticeStack.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.live-tail.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.approvals.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts test/e2e-browser/specs/freshcodex-send-delivery-rust.spec.ts test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts test/e2e-browser/specs/agent-checkpoint-rewind.spec.ts
+git add src/components/fresh-agent/FreshAgentNoticeStack.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentNoticeStack.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.live-tail.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.approvals.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts test/e2e-browser/specs/freshcodex-send-delivery-rust.spec.ts test/e2e-browser/specs/fresh-agent-checkpoint-unavailable-rust.spec.ts test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts test/e2e-browser/specs/agent-checkpoint-rewind.spec.ts
 git commit -m "fix: make fresh agent feedback readable and expiry follow disclosures"
 ```
 
@@ -310,6 +317,7 @@ git commit -m "fix: make fresh agent feedback readable and expiry follow disclos
 **Files:**
 - Modify: `src/index.css:1606`
 - Modify: `src/components/fresh-agent/FreshAgentApprovalCard.tsx:72`
+- Modify conditionally: `src/components/fresh-agent/FreshAgentView.tsx` (only if browser measurements show the shared CSS wrappers cannot meet protected geometry)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx`
 - Test: `test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts`
 - Existing impacted test: `test/e2e-browser/specs/fresh-agent-control-rust.spec.ts` (real Codex native approval and decision path)
@@ -374,8 +382,8 @@ Strengthen/add the following existing-fixture cases, using the exact data and ob
 
 1. Existing two-provider multiple-diagnostic test: before opening/scrolling anything, call `assertPainted` on the alert spans for `Agent could not start` and `Close failed` at all existing 1100×700, 560×320, 390×700 sizes. Click the second summary, then its current Close-error recovery/dismiss action and assert the actual state/result; retain count and long prominent-status checks.
 2. New narrow request-space cases at 800×900 and 390×700: seed one short `Bash` approval `{requestId:'short-request', toolName:'Bash', input:{command:'echo ok'}}`, no questions/elicitations/diffs, and a routine notice `Settings saved`. Clear fixture create/reconcile errors through the existing pane merge action; inject info through `receiveWsMessage`. Assert Allow's full bounds are initially inside Pending requests and hit-test its center before calling `hitAndClick`; use `assertUsefulSpace`. Repeat after removing all diagnostic/routine content. This rejects an empty/flexible middle track reserving half the request budget.
-3. Short metadata cases at 320px and 400px root height, 560px and 390px width, populated Claude and Codex variants: put meaningful metadata, both concise diagnostics, and real pending requests/recoveries in the same fixture state. Before opening or scrolling the diagnostic/metadata surfaces, require at least one actual metadata value line and both concise diagnostic labels to have all glyphs painted; retain the metadata-absent neighbors. Any selected Child link must be hit-testable after intentionally navigating its metadata scroller. Use `assertUsefulSpace`, the complete composer and all request decisions through their intended internal surfaces. A title/empty rectangle or separate favorable fixtures are insufficient. Metadata may scroll internally; do not demand every metadata item appear at once. Retain the existing style/theme/scale/split matrix without silently claiming unexecuted combinations.
-4. Tiny cases: no requests, errors, notices, sidebar or diffs at 270px must show the complete composer/action row immediately. At 200px and 120px, assert that the complete composer/action row remains reachable by scrolling when there are no requests, after the final pending request is answered, and with a lone Diffs trigger or short info notice; these states must not depend on a request-scroller element. Scroll the existing `.fresh-agent-layout` container explicitly, then require all composer/action-row text and controls to be painted and hit-testable. At 200px and 270px, the lone trigger/notice must have no empty 68px request floor (assert the stack is no taller than its measured content plus actual padding). Existing nested 120px/200px real-request tests retain whole-layout scrolling, recovery, conversation/composer reachability and provider answers. Keep the immediate no-panel 270px checks separate from intentionally scrolling short-pane cases.
+3. Short metadata cases at 320px and 400px root height, 560px and 390px width, populated Claude and Codex variants: at 560×320, 390×400 and 560×400, put meaningful metadata, both concise diagnostics, and real pending requests/recoveries in the same fixture state. Before opening or scrolling the diagnostic/metadata surfaces, require at least one actual metadata value line and both concise diagnostic labels to have all glyphs painted. At 390×320, require both concise labels, real pending requests and composer reachability in a metadata-absent state; separately verify a metadata-bearing compact state without the diagnostic/request stack and confirm metadata values and any selected Child link after intentionally scrolling its metadata panel. This avoids requiring the estimated 89px combined metadata/header area when the protected 390×320 panel budget is about 81px, while retaining the narrow metadata and multiple-summary checks. Use `assertUsefulSpace`, the complete composer and all request decisions through their intended internal surfaces. A title/empty rectangle or separate favorable fixtures are insufficient. Metadata may scroll internally; do not demand every metadata item appear at once. Retain the existing style/theme/scale/split matrix without silently claiming unexecuted combinations.
+4. Tiny cases: no requests, errors, notices, sidebar or diffs at 270px must show the complete composer/action row immediately. At 200px and 120px, assert that the complete composer/action row remains reachable by scrolling when there are no requests, after the final pending request is answered, and with a lone Diffs trigger or info notice; these states must not depend on a request-scroller element. Use a long info notice at 390px width to assert the closed summary is ellipsized, the notices container has `scrollWidth <= clientWidth + 1`, and the full text remains in the expanded body. Scroll the existing `.fresh-agent-layout` container explicitly, then require all composer/action-row text and controls to be painted and hit-testable. At 200px and 270px, the lone trigger/notice must have no empty 68px request floor (assert the stack is no taller than its measured content plus actual padding). Existing nested 120px/200px real-request tests retain whole-layout scrolling, recovery, conversation/composer reachability and provider answers. Keep the immediate no-panel 270px checks separate from intentionally scrolling short-pane cases.
 5. Generic JSON matrix: tool/input pairs `['WebFetch',{url:'https://example.com/'+'a'.repeat(120)}]`, `['Write',{file_path:'/tmp/x',content:'b'.repeat(120)}]`, `['mcp__fixture__lookup',{key:'c'.repeat(120)}]`, at 390px and 560px. Keep total compact JSON below 240 characters, so it is initially visible. Use the existing Claude fixture with only that approval and no other requests; assert `JSON.parse(pre.textContent)` equals the exact input, `scrollWidth <= clientWidth + 1`, multi-line painted height, and all text rectangles inside the preview. Answer through Allow and use `harness.getSentWsMessages()` to assert `{type:'freshAgent.approval.respond',sessionId:'compact-freshclaude',sessionType:'freshclaude',provider:'claude',requestId,decision:{behavior:'allow'}}`. Retain verbose JSON disclosure tests and native desktop scope/answer behavior.
 6. Include Task 1's genuine ambiguous-send closed prevention instruction in the painted text checks; do not claim expanded-only text proves this requirement.
 
@@ -408,6 +416,13 @@ Apply these CSS replacements as a provisional starting layout in Task 2, then co
 }
 .fresh-agent-error-summaries > details { min-width: 0; max-width: 100%; }
 .fresh-agent-errors:has(details[open]) .fresh-agent-error-summaries { display: block; }
+.fresh-agent-notices { min-width: 0; max-width: 100%; }
+.fresh-agent-notices details:not([open]) > summary {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 ```
 
 In `@container (max-height:479px) or (min-width:900px)`, replace `grid-template-columns:auto repeat(3,minmax(0,1fr))` with `auto minmax(0,1fr) fit-content(55%) auto` and `grid-template-rows:20px minmax(44px,1fr)` with `minmax(0,max-content) minmax(44px,1fr)`. Preserve existing cell placement and independent request overflow. Closed concise errors flow side by side; long ordinary diagnostics retain the bounded closed summary plus full expansion. The special prevention instruction is short enough to paint in the diagnostic track; the browser must establish this, including metadata's influence.
@@ -471,6 +486,8 @@ The no-request stack has no request viewport/count floor. Keep the 270px empty-p
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx --config config/vitest/vitest.config.ts`
 
+Run: `pnpm exec eslint src/components/fresh-agent/FreshAgentApprovalCard.tsx src/components/fresh-agent/FreshAgentView.tsx`
+
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e fresh-agent-compact-panels.spec.ts`
 
 Expected: PASS with nonzero cloud cases covering the new matrix and every existing style/theme/scale/split/expanded/native/recovery case. Inspect selected reconstructed screenshots and measured text/control rectangles. Joint geometry failure is a production allocation defect to repair in this task, not authorization to change the protected test outcomes.
@@ -490,7 +507,7 @@ Expected: PASS on configured cloud. Preserve exact provider decisions, mobile ta
 - [ ] **Step 7: Commit task**
 
 ```bash
-git add src/index.css src/components/fresh-agent/FreshAgentApprovalCard.tsx test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts
+git add src/index.css src/components/fresh-agent/FreshAgentApprovalCard.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts
 git commit -m "fix: preserve compact fresh agent space and readable approval scope"
 ```
 
@@ -523,14 +540,14 @@ await page.evaluate(() => {
 })
 await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 await expect(close).toBeFocused()
-const composer = page.getByRole('textbox', { name: 'Chat message input' })
-await expect(composer).toBeEnabled()
+const statusComposer = page.getByRole('textbox', { name: 'Chat message input' })
+await expect(statusComposer).toBeEnabled()
 await state.update({ status: 'exited' })
-await expect(composer).toBeDisabled()
+await expect(statusComposer).toBeDisabled()
 await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 await expect(close).toBeFocused()
 await state.update({ status: 'idle' })
-await expect(composer).toBeEnabled()
+await expect(statusComposer).toBeEnabled()
 await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 await expect(close).toBeFocused()
 ```
@@ -569,6 +586,8 @@ Add `tabId` and `paneId` to that effect's dependency array, retaining the other 
 - [ ] **Step 4: Run focused tests**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx --config config/vitest/vitest.config.ts`
+
+Run: `pnpm exec eslint src/components/fresh-agent/FreshAgentView.tsx`
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e fresh-agent-compact-panels.spec.ts --grep 'keyboard drawer|Changes closes'`
 
@@ -617,7 +636,7 @@ if [ "${STUB_SCREENSHOT_DISPLAY:-0}" = 1 ]; then
 fi
 ```
 
-After `records_no_retry` is defined and before existing delayed-ingestion assertions, add a fixture that invokes the actual wrapper. Generate a valid large PNG so the real regression protects both terminal volume and reconstructable bytes, with structured and reporter-prefixed records:
+After `records_no_retry` is defined and before existing delayed-ingestion assertions, add a fixture that invokes the actual wrapper. Generate a valid large PNG so the display test uses realistic screenshot chunk volume, with structured and reporter-prefixed records; exact-execution raw image reconstruction is checked in Step 6:
 
 ```bash
 node - "$WORK/capture" <<'NODE'
@@ -651,7 +670,6 @@ for (let offset = 0; offset < base64.length; offset += 12000) {
   const payload = { event: 'compact_panel_screenshot', severity: 'INFO', path: 'test-results/review.png', offset, data: base64.slice(offset, offset + 12000) }
   records.push(offset === 0 ? { jsonPayload: payload } : { textPayload: '[chromium] ' + JSON.stringify(payload) })
 }
-fs.writeFileSync(root + '/raw-screenshot-records.json', JSON.stringify(records))
 const payload = record => record.jsonPayload ?? JSON.parse(record.textPayload.slice(record.textPayload.indexOf('{')))
 const displayedRecords = records.filter(record => record.textPayload)
 fs.writeFileSync(root + '/screenshot-display.log', displayedRecords.map(record => record.textPayload).join('\n') + '\n')
@@ -672,44 +690,9 @@ fi
 for retained in compact_panel_screenshot test-results/review.png offset retained-in-cloud-logging ordinary_diagnostic 'keep readable diagnostic'; do
   if ! grep -Fq "$retained" <<< "$OUT"; then echo "FAIL: lost display metadata/diagnostic: $retained"; exit 1; fi
 done
-node - "$WORK/capture/raw-screenshot-records.json" "$WORK/capture/reconstructed.png" <<'NODE'
-const fs = require('node:fs')
-const assert = require('node:assert/strict')
-const zlib = require('node:zlib')
-const records = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
-function payload(entry) { return entry.jsonPayload ?? JSON.parse(entry.textPayload.slice(entry.textPayload.indexOf('{'))) }
-function reconstruct(entries) {
-  const parts = new Map()
-  for (const entry of entries) {
-    const record = payload(entry)
-    if (parts.has(record.offset)) assert.equal(parts.get(record.offset), record.data, 'conflicting chunk')
-    parts.set(record.offset, record.data)
-  }
-  let offset = 0
-  const ordered = [...parts].sort(([a], [b]) => a - b)
-  for (const [actual, data] of ordered) { assert.equal(actual, offset, 'missing chunk'); offset += data.length }
-  return Buffer.from(ordered.map(([, data]) => data).join(''), 'base64')
-}
-assert.throws(() => reconstruct(records.slice(1)), /missing chunk/)
-const conflicting = { jsonPayload: { ...payload(records[0]), data: 'different' } }
-assert.throws(() => reconstruct([...records, conflicting]), /conflicting chunk/)
-const bytes = reconstruct(records)
-assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
-assert.equal(bytes.readUInt32BE(16), 1)
-assert.equal(bytes.readUInt32BE(20), 1)
-const idat = []
-for (let offset = 8; offset < bytes.length;) {
-  const length = bytes.readUInt32BE(offset)
-  const type = bytes.subarray(offset + 4, offset + 8).toString()
-  if (type === 'IDAT') idat.push(bytes.subarray(offset + 8, offset + 8 + length))
-  offset += 12 + length
-}
-assert.deepEqual(zlib.inflateSync(Buffer.concat(idat)), Buffer.from([0, 255, 0, 0, 255]))
-fs.writeFileSync(process.argv[3], bytes)
-NODE
 ```
 
-The human-display fixture includes only reporter-prefixed `textPayload` chunks; the structured first chunk is not printed by `executions logs read`. The shell assertions check the actual wrapper output for every screenshot data chunk that the formatter would display. Separately, the decoder rejects missing/conflicting offsets and verifies that the exact full raw record fixture supplied by the stubbed Cloud Logging call is a valid PNG; it does not claim to decode the redacted display. The later exact-execution cloud check reconstructs the records retained by Cloud Logging.
+The human-display fixture includes only reporter-prefixed `textPayload` chunks; the structured first chunk is not printed by `executions logs read`. The shell assertions check the actual wrapper output for every screenshot data chunk that the formatter would display. The local stub payload is only a fixture for those display assertions; its bytes are not decoded because the exact-execution cloud check reconstructs and inspects records retained by Cloud Logging.
 
 - [ ] **Step 2: Run test and verify intended failure**
 
@@ -742,7 +725,7 @@ Replace the historical baseline evidence strings with Markdown links to `../../t
 
 Run: `bash scripts/test/cloud-e2e-logging-receipt.test.sh`
 
-Expected: PASS; displayed screenshot metadata/ordinary diagnostics remain, every reporter-prefixed `textPayload` screenshot/trace data chunk is absent from wrapper display, and the raw stubbed Cloud Logging fixture reconstructs a valid PNG.
+Expected: PASS; displayed screenshot metadata/ordinary diagnostics remain and every reporter-prefixed `textPayload` screenshot/trace data chunk is absent from wrapper display. The real cloud preservation check in Step 6 reconstructs and inspects the exact execution's retained images.
 
 Run: `python3 -c 'from pathlib import Path; import subprocess; repo=Path(subprocess.check_output(["git","rev-parse","--git-common-dir"],text=True).strip()).resolve().parent; paths=["baseline-failure.md","workspace-baseline.md","load-bearing-validator-lb-2.md","landing-final.md","landing-verification.md","stage-5-final-gate-receipt.md"]; root=repo/"test-results/fresh-agent-compact-panels/workflow/reports"; print("\n".join(str((root/name).resolve()) for name in paths)); assert all((root/name).is_file() for name in paths)'`
 
@@ -773,6 +756,7 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e fresh-agent-compact-panels.spec.ts 2>&1
 Expected: nonzero cloud GREEN without bulky image bytes in default terminal output. Fetch only that exact execution's raw records, with the same identity ladder as the runner; do not query a latest shared job. The following evidence-only commands use repository-owned identity code and contain the complete extractor, so ignored historical tooling is not an execution dependency:
 
 ```bash
+set -euo pipefail
 GCP_PROJECT="${FRESHELL_GCP_PROJECT:-misc-puttering-project}"
 GCP_ACCOUNT="${FRESHELL_GCP_ACCOUNT:-}"
 export GCLOUD_ROBOT_REQUIRE=1
