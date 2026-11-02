@@ -105,6 +105,10 @@ pub struct SupervisorConfig {
     pub admission: AdmissionPolicy,
 }
 
+/// Native-name metadata work may wait briefly for a normal lifecycle probe,
+/// but it must not queue behind long lifecycle operations before dispatch.
+const NATIVE_NAME_LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(1);
+
 pub(crate) struct LaunchWorkload {
     pub(crate) soul_id: SoulId,
     pub(crate) fixture: Option<FixtureKind>,
@@ -3143,17 +3147,82 @@ impl Supervisor {
         &self,
         request: freshell_runtime_protocol::FreshAgentNativeNameRequest,
     ) -> Result<freshell_runtime_protocol::FreshAgentNativeNameReply, RuntimeError> {
-        use freshell_runtime_protocol::{FreshAgentNativeNameError, FreshAgentNativeNameReply};
-        let unavailable = || {
+        use freshell_runtime_protocol::{
+            FreshAgentNativeNameError, FreshAgentNativeNameReply, FreshProvider,
+        };
+        let unavailable = |reason: &'static str| {
             FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Unavailable {
-                message: "native naming source is no longer current".into(),
+                message: format!("native naming preflight refused: {reason}"),
             })
         };
+        let log_preflight_refusal =
+            |reason: &'static str,
+             observed: Option<&RuntimeView>,
+             provider: Option<&FreshProvider>,
+             authenticated_host_boot_id: Option<&HostBootId>,
+             lifecycle_lock_wait_ms: Option<u64>| {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.native_name_preflight_refused",
+                    serde_json::json!({
+                        "severity": "warn",
+                        "reason": reason,
+                        "soulId": request.soul_id,
+                        "requestedSource": {
+                            "incarnationId": request.source.incarnation_id.to_string(),
+                            "hostBootId": request.source.host_boot_id.to_string(),
+                            "executionGeneration": request.source.execution_generation,
+                            "intentRevision": request.source.intent_revision,
+                            "nativeSessionId": request.source.native_session_id,
+                        },
+                        "observedSource": observed.map(|view| serde_json::json!({
+                            "incarnationId": view.incarnation_id,
+                            "hostBootId": view.host_boot_id,
+                            "executionGeneration": view.execution_generation,
+                            "intentRevision": view.intent_revision,
+                            "nativeSessionId": view.native_session_id,
+                            "launchState": view.launch_state,
+                            "recoveryState": view.recovery_state,
+                            "desiredState": view.desired_state,
+                        })),
+                        "observedProvider": provider.map(|provider| format!("{provider:?}")),
+                        "authenticatedHostBootId": authenticated_host_boot_id,
+                        "requestedCodexHomeEmpty": request.codex_home.is_empty(),
+                        "lifecycleLockWaitMs": lifecycle_lock_wait_ms,
+                    }),
+                );
+            };
         let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
-        // Metadata discovery must not queue behind lifecycle work and then
-        // dispatch after the name worker's existing request budget expired.
-        let Ok(_guard) = lifecycle_lock.try_lock() else {
-            return Ok(unavailable());
+        // Brief contention from a normal recovery probe should not consume a
+        // native-name retry cycle. Still cap the wait so metadata discovery
+        // cannot queue behind long lifecycle work and dispatch after its
+        // request budget has expired.
+        let _guard = match lifecycle_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let started_waiting = Instant::now();
+                match tokio::time::timeout(NATIVE_NAME_LIFECYCLE_LOCK_WAIT, lifecycle_lock.lock())
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        log_preflight_refusal(
+                            "lifecycle_lock_busy",
+                            None,
+                            None,
+                            None,
+                            Some(
+                                started_waiting
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                            ),
+                        );
+                        return Ok(unavailable("lifecycle_lock_busy"));
+                    }
+                }
+            }
         };
         let handle = self
             .registry
@@ -3172,19 +3241,31 @@ impl Supervisor {
                 && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
                 && view.desired_state == freshell_runtime_protocol::DesiredState::Running
         };
-        if !matches_source(&before)
-            || !handle.fresh_agent().is_some_and(|agent| {
-                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
-            })
-            || request.codex_home.is_empty()
-        {
-            return Ok(unavailable());
+        if !matches_source(&before) {
+            log_preflight_refusal("runtime_source_mismatch", Some(&before), None, None, None);
+            return Ok(unavailable("runtime_source_mismatch"));
+        }
+        let provider = handle.fresh_agent().map(|agent| &agent.provider);
+        if provider != Some(&FreshProvider::Codex) {
+            log_preflight_refusal("provider_mismatch", Some(&before), provider, None, None);
+            return Ok(unavailable("provider_mismatch"));
+        }
+        if request.codex_home.is_empty() {
+            log_preflight_refusal("codex_home_missing", Some(&before), provider, None, None);
+            return Ok(unavailable("codex_home_missing"));
         }
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
         if host.host_boot_id != request.source.host_boot_id {
-            return Ok(unavailable());
+            log_preflight_refusal(
+                "authenticated_host_boot_mismatch",
+                Some(&before),
+                provider,
+                Some(&host.host_boot_id),
+                None,
+            );
+            return Ok(unavailable("authenticated_host_boot_mismatch"));
         }
         let reply = self
             .send_authenticated_host_command(
