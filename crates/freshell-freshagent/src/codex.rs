@@ -2497,13 +2497,74 @@ impl FreshCodexState {
     /// (locator resolution) and `message` is user-facing (the banner shows the message,
     /// never the code).
     fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str) {
+        self.emit_fresh_agent_error_inner(session_id, None, false, false, code, message);
+    }
+
+    fn emit_fresh_agent_error_for_request(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        code: &str,
+        message: &str,
+    ) {
+        self.emit_fresh_agent_error_inner(session_id, request_id, true, false, code, message);
+    }
+
+    // These Stop replies were previously only top-level errors. A distinct
+    // nested type lets current clients display them without changing how an
+    // older client observing the same session treats the running turn.
+    fn emit_new_stop_error(&self, session_id: &str, request_id: &str, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
             event: json!({
-                "type": "freshAgent.error",
+                "type": "freshAgent.operation.error",
                 "sessionId": session_id,
+                "requestId": request_id,
+                "operationReceipt": true,
                 "code": code,
                 "message": message,
             }),
+            provider: PROVIDER.to_string(),
+            session_id: session_id.to_string(),
+            session_type: SESSION_TYPE.to_string(),
+        }));
+    }
+
+    fn emit_uncertain_fresh_agent_error_for_request(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        code: &str,
+        message: &str,
+    ) {
+        self.emit_fresh_agent_error_inner(session_id, request_id, true, true, code, message);
+    }
+
+    fn emit_fresh_agent_error_inner(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        operation: bool,
+        uncertain: bool,
+        code: &str,
+        message: &str,
+    ) {
+        let mut event = json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": code,
+            "message": message,
+        });
+        if let Some(request_id) = request_id {
+            event["requestId"] = json!(request_id);
+        }
+        if operation {
+            event["operationReceipt"] = json!(true);
+        }
+        if uncertain {
+            event["operationOutcomeUncertain"] = json!(true);
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event,
             provider: PROVIDER.to_string(),
             session_id: session_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
@@ -4477,6 +4538,27 @@ impl FreshCodexState {
         self.turn_events.subscribe()
     }
 
+    /// Read only the matching incarnation's projected provider diagnostic.
+    /// The notification consumer projects an error before it settles the turn.
+    pub(crate) async fn turn_provider_error(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+        turn_id: &str,
+    ) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.sidecar_ownership_id != incarnation_id {
+            return None;
+        }
+        let diagnostic = session
+            .projection
+            .lock()
+            .expect("codex projection lock")
+            .turn_provider_error(turn_id);
+        diagnostic
+    }
+
     pub async fn handle_send(&self, msg: FreshAgentSend) -> CodexSendOutcome {
         let request_id = msg.request_id.clone();
         let checkpoint_identity_request = msg.checkpoint_intent.as_ref().and_then(|intent| {
@@ -4525,7 +4607,9 @@ impl FreshCodexState {
                 // retryable non-lost error channel; the client re-drive converges.
                 let message = error.reservation_message();
                 let outcome = self.refuse_send(&request_id, "SESSION_RESERVED", message);
-                self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
+                if request_id.as_deref().is_none_or(str::is_empty) {
+                    self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
+                }
                 return outcome;
             }
         }
@@ -4694,7 +4778,7 @@ impl FreshCodexState {
                     }
                     let expected = turns.active_turn_id().map(str::to_owned);
                     if expected.is_none() && turns.has_unknown_delivery() {
-                        return self.refuse_send(&request_id, "CODEX_DELIVERY_AMBIGUOUS", "Earlier input has unresolved native delivery; recover or inspect the conversation before sending again");
+                        return self.refuse_send(&request_id, "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS", "Earlier input has unresolved native delivery; recover or inspect the conversation before sending again");
                     }
                     Some((
                         expected,
@@ -5066,9 +5150,15 @@ impl FreshCodexState {
         // must remain free to observe terminal evidence while Stop is pending.
         drop(_event_emission);
         drop(_turn);
-        if let StopDisposition::Interrupt { dispatch, turn_id } = latched_stop {
+        if let StopDisposition::Interrupt {
+            dispatch,
+            turn_id,
+            request_id: stop_request_id,
+        } = latched_stop
+        {
             self.issue_codex_interrupt(
                 &session_id,
+                stop_request_id.as_deref(),
                 client.clone(),
                 turn_state.clone(),
                 dispatch,
@@ -5382,10 +5472,7 @@ impl FreshCodexState {
         code: &str,
         message: &str,
     ) {
-        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-            event: json!({"type":"freshAgent.error","sessionId":session_id,"requestId":request_id,"code":code,"message":message}),
-            provider: PROVIDER.into(), session_type: SESSION_TYPE.into(), session_id: session_id.into(),
-        }));
+        self.emit_fresh_agent_error_for_request(session_id, request_id, code, message);
     }
 
     fn publish_codex_settings(
@@ -5432,6 +5519,14 @@ impl FreshCodexState {
                 "SESSION_NOT_FOUND",
                 "codex session not found",
             );
+            if let Some(request_id) = msg.request_id.as_deref() {
+                self.emit_new_stop_error(
+                    &session_id,
+                    request_id,
+                    "SESSION_NOT_FOUND",
+                    "codex session not found",
+                );
+            }
             return;
         };
         let disposition = {
@@ -5440,13 +5535,24 @@ impl FreshCodexState {
             if let Some(id) = active.as_deref() {
                 state.observe_started(id);
             }
-            state.request_stop()
+            state.request_stop(msg.request_id.as_deref())
         };
         match disposition {
-            StopDisposition::Interrupt { dispatch, turn_id } => {
+            StopDisposition::Interrupt {
+                dispatch,
+                turn_id,
+                request_id,
+            } => {
                 marker.store(true, Ordering::SeqCst);
-                self.issue_codex_interrupt(&session_id, client, turns, dispatch, turn_id)
-                    .await;
+                self.issue_codex_interrupt(
+                    &session_id,
+                    request_id.as_deref(),
+                    client,
+                    turns,
+                    dispatch,
+                    turn_id,
+                )
+                .await;
             }
             StopDisposition::Latched => {
                 tracing::info!(provider=PROVIDER, session_id=%session_id, "freshagent.codex.stop_latched");
@@ -5458,6 +5564,14 @@ impl FreshCodexState {
                         "CODEX_INTERRUPT_FAILED",
                         &format!("No active Codex turn is tracked for {session_id}."),
                     );
+                    if let Some(request_id) = msg.request_id.as_deref() {
+                        self.emit_new_stop_error(
+                            &session_id,
+                            request_id,
+                            "CODEX_INTERRUPT_FAILED",
+                            &format!("No active Codex turn is tracked for {session_id}."),
+                        );
+                    }
                 }
             }
         }
@@ -5466,6 +5580,7 @@ impl FreshCodexState {
     async fn issue_codex_interrupt(
         &self,
         session_id: &str,
+        request_id: Option<&str>,
         client: Arc<CodexAppServerClient>,
         turns: SharedCodexTurnState,
         dispatch: DispatchToken,
@@ -5502,15 +5617,21 @@ impl FreshCodexState {
                     });
                 }
                 tracing::warn!(provider=PROVIDER, session_id, native_turn_id=%turn_id, dispatch=?dispatch, refused, error=%err, "freshagent.codex.interrupt_failed");
-                self.emit_fresh_agent_error(
-                    session_id,
-                    if refused {
-                        "CODEX_INTERRUPT_FAILED"
-                    } else {
-                        "CODEX_INTERRUPT_AMBIGUOUS"
-                    },
-                    &err.to_string(),
-                );
+                if refused {
+                    self.emit_fresh_agent_error_for_request(
+                        session_id,
+                        request_id,
+                        "CODEX_INTERRUPT_FAILED",
+                        &err.to_string(),
+                    );
+                } else {
+                    self.emit_uncertain_fresh_agent_error_for_request(
+                        session_id,
+                        request_id,
+                        "CODEX_INTERRUPT_AMBIGUOUS",
+                        &err.to_string(),
+                    );
+                }
             }
         }
     }
@@ -5577,7 +5698,12 @@ impl FreshCodexState {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %session_id, code = err.code(),
                         "fresh_agent_compact_refused: the observed fence is half-sent (invalid)");
-                    self.emit_fresh_agent_error(&session_id, err.code(), err.message());
+                    self.emit_fresh_agent_error_for_request(
+                        &session_id,
+                        msg.request_id.as_deref(),
+                        err.code(),
+                        err.message(),
+                    );
                     return;
                 }
             };
@@ -5597,20 +5723,31 @@ impl FreshCodexState {
                 // Review M-1: the lost-session shape (codex fork's own unknown-parent
                 // leg, legacy `requireOrRecoverSession` → `FreshAgentLostSessionError`
                 // parity) — `INVALID_SESSION_ID` engages the client's `markSessionLost`
-                // recovery. Broadcast: compact frames carry no requestId, so a top-level
-                // `error` frame would never reach any pane.
-                self.broadcast(&lost_session_frame(&session_id));
+                // recovery. Broadcast a session event, including the request ID
+                // when present, so both live panes and hosted replay can see it.
+                self.emit_fresh_agent_error_for_request(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    "INVALID_SESSION_ID",
+                    &format!("codex session {session_id} not found"),
+                );
                 return;
             }
             Err(EnsureAliveError::RespawnFailed(err)) => {
-                self.emit_fresh_agent_error(&session_id, "CODEX_RESPAWN_FAILED", &err);
+                self.emit_fresh_agent_error_for_request(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    "CODEX_RESPAWN_FAILED",
+                    &err,
+                );
                 return;
             }
             Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
                 // Task 13 (D8) discipline, mirrored from handle_send: another
                 // create/attach holds this sessionRef — retryable, never lost.
-                self.emit_fresh_agent_error(
+                self.emit_fresh_agent_error_for_request(
                     &session_id,
+                    msg.request_id.as_deref(),
                     "SESSION_RESERVED",
                     error.reservation_message(),
                 );
@@ -5634,7 +5771,12 @@ impl FreshCodexState {
         else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
             // lost-session leg, never silence.
-            self.broadcast(&lost_session_frame(&session_id));
+            self.emit_fresh_agent_error_for_request(
+                &session_id,
+                msg.request_id.as_deref(),
+                "INVALID_SESSION_ID",
+                &format!("codex session {session_id} not found"),
+            );
             return;
         };
 
@@ -5649,8 +5791,9 @@ impl FreshCodexState {
         let _turn = turn_lock.lock().await;
 
         if active_turn.lock().expect("active_turn mutex").is_some() {
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 &session_id,
+                msg.request_id.as_deref(),
                 "CODEX_COMPACT_FAILED",
                 &format!(
                     "Codex session {session_id} has an active turn; compact it after the turn completes."
@@ -5670,8 +5813,9 @@ impl FreshCodexState {
         // ownership: the failure-clear can now only ever run for the call that
         // armed the bit.
         if compact_in_flight.load(Ordering::SeqCst) {
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 &session_id,
+                msg.request_id.as_deref(),
                 "BUSY_TURN",
                 crate::rollback_record::ROLLBACK_BUSY_MESSAGE,
             );
@@ -5700,11 +5844,26 @@ impl FreshCodexState {
             // ambiguous-post-send shape; all stay fail-closed: the compact
             // turn's own notifications own the retirement (a never-
             // starting compact wedges conservatively, never silently).
-            if matches!(&err, CodexAppServerError::Rpc { .. }) {
+            let refused = matches!(&err, CodexAppServerError::Rpc { .. });
+            if refused {
                 compact_in_flight.store(false, Ordering::SeqCst);
                 *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
             }
-            self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
+            if refused {
+                self.emit_fresh_agent_error_for_request(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    "CODEX_COMPACT_FAILED",
+                    &err.to_string(),
+                );
+            } else {
+                self.emit_uncertain_fresh_agent_error_for_request(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    "CODEX_COMPACT_FAILED",
+                    &err.to_string(),
+                );
+            }
         } else if let Some(session) = self.sessions.lock().await.get(&session_id) {
             let mut p = session.projection.lock().expect("codex projection lock");
             let ops = p.invalidate_history(&[]);
@@ -13708,7 +13867,12 @@ fn reduce_notification(
                     if !user_stopped {
                         subscription.clear_user_interrupt();
                     }
-                    if let StopDisposition::Interrupt { dispatch, turn_id } = disposition {
+                    if let StopDisposition::Interrupt {
+                        dispatch,
+                        turn_id,
+                        request_id,
+                    } = disposition
+                    {
                         let state = state.clone();
                         let turns = turn_state.clone();
                         let session_id = event.thread_id.clone();
@@ -13724,6 +13888,7 @@ fn reduce_notification(
                                 state
                                     .issue_codex_interrupt(
                                         &session_id,
+                                        request_id.as_deref(),
                                         client,
                                         turns,
                                         dispatch,
@@ -14426,6 +14591,8 @@ pub(crate) mod tests {
     use crate::identity_sink::PaneIdentitySink;
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
+
+    include!("codex/stop_correlation_tests.rs");
 
     pub(crate) fn small_native_home(thread_id: &str) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
@@ -18394,7 +18561,7 @@ pub(crate) mod tests {
         .await;
 
         st.handle_interrupt(FreshAgentInterrupt {
-            request_id: None,
+            request_id: Some("stop-no-active".into()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -18411,6 +18578,21 @@ pub(crate) mod tests {
                 .contains("No active Codex turn is tracked for thread-1"),
             "{frame}"
         );
+        let session_error: Value = serde_json::from_str(
+            &rx.try_recv()
+                .expect("the pane also needs a session-scoped error"),
+        )
+        .unwrap();
+        assert_eq!(session_error["type"], "freshAgent.event");
+        assert_eq!(session_error["sessionId"], "thread-1");
+        assert_eq!(session_error["event"]["code"], "CODEX_INTERRUPT_FAILED");
+        assert_eq!(session_error["event"]["type"], "freshAgent.operation.error");
+        assert_eq!(session_error["event"]["requestId"], "stop-no-active");
+        assert_eq!(session_error["event"]["operationReceipt"], true);
+        assert!(session_error["event"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("No active Codex turn"));
     }
 
     #[tokio::test]
@@ -18418,7 +18600,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         st.handle_interrupt(FreshAgentInterrupt {
-            request_id: None,
+            request_id: Some("stop-missing".into()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -18428,6 +18610,17 @@ pub(crate) mod tests {
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "error");
+        let session_error: Value = serde_json::from_str(
+            &rx.try_recv()
+                .expect("the pane also needs a session-scoped error"),
+        )
+        .unwrap();
+        assert_eq!(session_error["type"], "freshAgent.event");
+        assert_eq!(session_error["sessionId"], "does-not-exist");
+        assert_eq!(session_error["event"]["code"], "SESSION_NOT_FOUND");
+        assert_eq!(session_error["event"]["type"], "freshAgent.operation.error");
+        assert_eq!(session_error["event"]["requestId"], "stop-missing");
+        assert_eq!(session_error["event"]["operationReceipt"], true);
     }
 
     #[tokio::test]
@@ -22128,6 +22321,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn compact_failure_preserves_request_id_for_hosted_event_replay() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-compact-receipt").await;
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut message = compact_msg("thread-compact-receipt");
+                message.request_id = Some("compact-receipt-id".into());
+                st.handle_compact(message).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond_error(&id, -32600, "the provider refused compact");
+        driver.await.unwrap();
+        let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(frame["event"]["requestId"], "compact-receipt-id", "{frame}");
+        assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+        assert_ne!(frame["event"]["operationOutcomeUncertain"], true);
+        assert!(frame["event"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the provider refused compact"));
+    }
+
+    #[tokio::test]
     async fn handle_compact_rpc_error_surfaces_the_error_path_and_no_fake_completion() {
         let (st, _rx_boot) = state_with_bus();
         let (peer, mut rx) = insert_idle_compact_session(&st, "thread-ce").await;
@@ -22200,7 +22420,9 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_compact(compact_msg("thread-cto")).await;
+                let mut message = compact_msg("thread-cto");
+                message.request_id = Some("compact-timeout-receipt".into());
+                st.handle_compact(message).await;
             })
         };
         answer_initialize(&peer).await;
@@ -22217,6 +22439,8 @@ pub(crate) mod tests {
             let frame: Value = serde_json::from_str(&raw).unwrap();
             if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
                 assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+                assert_eq!(frame["event"]["requestId"], "compact-timeout-receipt");
+                assert_eq!(frame["event"]["operationOutcomeUncertain"], true, "{frame}");
                 break;
             }
         }
@@ -24602,7 +24826,7 @@ pub(crate) mod tests {
             let mut state = turns.lock().unwrap();
             let old = state.begin_dispatch("old");
             state.accept(old, "old");
-            state.request_stop();
+            state.request_stop(None);
             state.settle_native("old", NativeSettlement::Completed);
             old
         };
@@ -24627,7 +24851,7 @@ pub(crate) mod tests {
             Ok(mut state) => {
                 let new = state.begin_dispatch("new");
                 state.accept(new, "new");
-                state.request_stop();
+                state.request_stop(None);
                 marker.store(true, Ordering::SeqCst);
                 admitted_new = true;
                 false
@@ -24641,7 +24865,7 @@ pub(crate) mod tests {
             let mut state = turns.lock().unwrap();
             let new = state.begin_dispatch("new");
             state.accept(new, "new");
-            state.request_stop();
+            state.request_stop(None);
             marker.store(true, Ordering::SeqCst);
         }
         assert!(
@@ -24927,7 +25151,11 @@ pub(crate) mod tests {
         .await;
         let stop = {
             let st = st.clone();
-            tokio::spawn(async move { st.handle_interrupt(task4_stop("thread-timeout")).await })
+            tokio::spawn(async move {
+                let mut message = task4_stop("thread-timeout");
+                message.request_id = Some("stop-timeout-receipt".into());
+                st.handle_interrupt(message).await
+            })
         };
         answer_initialize(&peer).await;
         let (_id, method, _) = peer.expect_request().await;
@@ -24936,6 +25164,17 @@ pub(crate) mod tests {
         tokio::time::advance(Duration::from_millis(200)).await;
         stop.await.unwrap();
         tokio::time::resume();
+        let failed = collect_frames_until(&mut rx, Duration::from_secs(2), |w| {
+            w["event"]["code"] == "CODEX_INTERRUPT_AMBIGUOUS"
+        })
+        .await;
+        assert!(
+            failed.matched,
+            "the uncertain stop must produce a provider receipt"
+        );
+        let receipt = &failed.frames.last().unwrap()["event"];
+        assert_eq!(receipt["operationOutcomeUncertain"], true, "{receipt}");
+        assert_eq!(receipt["requestId"], "stop-timeout-receipt", "{receipt}");
         peer.emit_notification(
             "turn/completed",
             json!({"threadId":"thread-timeout","turn":{"id":"old","status":"interrupted"}}),
@@ -35054,40 +35293,58 @@ pub(crate) mod tests {
             checkpoint_intent: None,
         })
         .await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut correlated_refusal = false;
-        loop {
-            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-                .await
-                .expect("a frame within budget")
-                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
-                .expect("the bus stays open");
-            if frame["type"] == "error" && frame["requestId"] == "req-r8-stale-send" {
-                assert!(frame["message"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("SESSION_RESERVED:"));
-                correlated_refusal = true;
-            }
-            if frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == json!("freshAgent.error")
-                && frame["event"]["code"] == json!("SESSION_RESERVED")
-            {
-                break;
-            }
-            assert!(
-                frame["type"] != "freshAgent.session.materialized",
-                "the stale send must never recreate: {frame}"
-            );
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the stale send never answered typed: {frame}"
-            );
+        let mut scoped = collect_frames_until(&mut rx, Duration::from_secs(15), |frame| {
+            frame["type"] == "error" && frame["requestId"] == "req-r8-stale-send"
+        })
+        .await;
+        assert!(
+            scoped.matched,
+            "the pane refusal must release its request-owned composer"
+        );
+        assert!(scoped.frames.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("SESSION_RESERVED:"));
+        while let Ok(raw) = rx.try_recv() {
+            scoped.frames.push(serde_json::from_str(&raw).unwrap());
         }
         assert!(
-            correlated_refusal,
-            "the pane refusal must also release its request-owned composer"
+            !scoped
+                .frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.session.materialized"
+                    || (frame["event"]["type"] == "freshAgent.error"
+                        && frame["event"]["code"] == "SESSION_RESERVED")),
+            "a stale request must neither recreate nor notify unrelated panes: {:?}",
+            scoped.frames
         );
+        st.handle_send(FreshAgentSend {
+            request_id: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "legacy delayed".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            checkpoint_intent: None,
+        })
+        .await;
+        let legacy = collect_frames_until(&mut rx, Duration::from_secs(15), |frame| {
+            frame["event"]["type"] == "freshAgent.error"
+                && frame["event"]["code"] == "SESSION_RESERVED"
+        })
+        .await;
+        assert!(
+            legacy.matched,
+            "legacy sends still receive the session reservation event"
+        );
+        assert!(!legacy
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.session.materialized"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -318,6 +318,22 @@ impl CodexProjection {
             .any(|turn| turn.raw["id"] == id && turn.raw["status"] == "failed")
     }
 
+    /// Only return a diagnostic belonging to this exact failed native turn.
+    /// Event-owned output wins; saved history can supply an omitted diagnostic.
+    pub(super) fn turn_provider_error(&self, id: &str) -> Option<String> {
+        self.turns
+            .iter()
+            .map(|turn| &turn.raw)
+            .chain(
+                self.last_native
+                    .iter()
+                    .flat_map(|native| native["thread"]["turns"].as_array().into_iter().flatten()),
+            )
+            .filter(|turn| turn["id"] == id && turn["status"] == "failed")
+            .filter(|turn| has_provider_error(turn))
+            .find_map(super::read_codex_turn_error)
+    }
+
     pub(super) fn restore_unattributed_provider_error(&mut self, message: String) {
         if self.unattributed_provider_error.is_none() {
             self.unattributed_provider_error = Some(message);

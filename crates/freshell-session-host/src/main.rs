@@ -1406,7 +1406,10 @@ async fn dispatch_with_effects(
                         native_session_id,
                     })
                 }
-                HostCommand::FreshAgentInterrupt { incarnation_id } => {
+                HostCommand::FreshAgentInterrupt {
+                    incarnation_id,
+                    request_id,
+                } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let actor = state
                         .fresh_agent
@@ -1414,7 +1417,10 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
-                    actor.interrupt().await.map_err(map_actor_error)?;
+                    actor
+                        .interrupt_with_request_id(request_id.as_deref())
+                        .await
+                        .map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentInterrupted)
                 }
                 HostCommand::FreshAgentReadEvents {
@@ -1554,6 +1560,30 @@ fn configure_outcome_event(
 
 fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> RuntimeError {
     use freshell_agent_runtime::host_actor::ActorError;
+    if let ActorError::SendRefused = error {
+        return RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent command failed",
+        )
+        .with_fresh_agent_send_diagnostic(
+            freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                message: None,
+            },
+        );
+    }
+    if let ActorError::ProviderSendDiagnostic(diagnostic) = error {
+        let code = match diagnostic.outcome {
+            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused => {
+                RuntimeErrorCode::HostUnreachable
+            }
+            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous => {
+                RuntimeErrorCode::CommandAmbiguous
+            }
+        };
+        return RuntimeError::new(code, "hosted fresh-agent command failed")
+            .with_fresh_agent_send_diagnostic(diagnostic);
+    }
     let code = match error {
         ActorError::RequestConflict => RuntimeErrorCode::RequestIdConflict,
         ActorError::AmbiguousDispatch => RuntimeErrorCode::CommandAmbiguous,
@@ -1567,6 +1597,9 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
         ActorError::ProviderStartFailed { .. }
         | ActorError::Transport(_)
         | ActorError::Persistence(_) => RuntimeErrorCode::HostUnreachable,
+        ActorError::ProviderSendDiagnostic(_) | ActorError::SendRefused => {
+            unreachable!("handled above")
+        }
     };
     // Provider error strings may contain request bodies, environment values,
     // or credentials. Keep the control payload typed and deliberately opaque.

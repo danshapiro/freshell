@@ -912,8 +912,9 @@ impl FreshCodexState {
             .get(session_id)
             .map(|s| s.client.clone());
         let Some(client) = client else {
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 session_id,
+                Some(key),
                 "INVALID_SESSION_ID",
                 "Codex session is no longer available.",
             );
@@ -928,8 +929,9 @@ impl FreshCodexState {
             .iter()
             .position(|r| r.public["requestId"].as_str() == Some(key) && r.kind == kind)
         else {
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 session_id,
+                Some(key),
                 "REQUEST_UNAVAILABLE",
                 "This Codex request is no longer waiting for an answer.",
             );
@@ -937,8 +939,9 @@ impl FreshCodexState {
         };
         let request = &pending.requests[index];
         let Some(source) = request.source.upgrade() else {
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 session_id,
+                Some(key),
                 "REQUEST_UNAVAILABLE",
                 "This Codex request belongs to an earlier native source.",
             );
@@ -955,8 +958,9 @@ impl FreshCodexState {
                 )
                 .await
         {
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 session_id,
+                Some(key),
                 "REQUEST_UNAVAILABLE",
                 "This Codex request belongs to an earlier native session or turn.",
             );
@@ -966,14 +970,20 @@ impl FreshCodexState {
             Ok(value) => value,
             Err(message) => {
                 tracing::warn!(provider=PROVIDER,session_id,request_id=%key,method=%request.method,native_turn_id=request.params.get("turnId").and_then(|value| value.as_str()),native_item_id=request.params.get("itemId").and_then(|value| value.as_str()),"freshagent.codex.invalid_control_answer");
-                self.emit_fresh_agent_error(session_id, "INVALID_ANSWER", message);
+                self.emit_fresh_agent_error_for_request(
+                    session_id,
+                    Some(key),
+                    "INVALID_ANSWER",
+                    message,
+                );
                 return false;
             }
         };
         if let Err(error) = request.native_client.respond(&request.id, result).await {
             tracing::warn!(provider = PROVIDER, session_id, request_id = %key, error = %error, "freshagent.codex.respond_failed");
-            self.emit_fresh_agent_error(
+            self.emit_fresh_agent_error_for_request(
                 session_id,
+                Some(key),
                 "RESPONSE_FAILED",
                 &format!("Could not send your answer to Codex: {error}"),
             );

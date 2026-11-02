@@ -915,6 +915,130 @@ test('a pending Codex error stays visible until the failed turn is shown', async
   await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
 })
 
+for (const fallbackFirst of [true, false]) test(`managed control keeps the provider cause and uncertain outcome with pending requests (fallback first: ${fallbackFirst})`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light' })
+  await state.update({ status: 'running' })
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+  const fallback = { type: 'freshAgent.error', requestId: 'question-1', code: 'COMMAND_AMBIGUOUS', operationReceipt: true,
+    operationFallback: true, operationOutcomeUncertain: true, message: 'Sending the answer could not be confirmed.' }
+  const native = { type: 'freshAgent.error', requestId: 'question-1', code: 'INVALID_ANSWER', operationReceipt: true,
+    message: 'Choose an offered answer.' }
+  await page.evaluate(events => {
+    for (const event of events) window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex', sessionId: 'compact-freshcodex', event,
+    })
+  }, fallbackFirst ? [fallback, native] : [native, fallback])
+  const error = page.locator('[data-agent-error="session"] summary')
+  await expect(error).toContainText('Choose an offered answer.')
+  await expect(error).toContainText('Sending the answer could not be confirmed.')
+  await expect(page.getByRole('status', { name: '3 pending requests' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Yes', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+})
+
+test('a reserved OpenCode compact reports its cause without retrying an attachment', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType: 'freshopencode', provider: 'opencode', style: 'sans', theme: 'light' })
+  await state.update({ status: 'running' })
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+  const composer = page.getByRole('textbox', { name: 'Chat message input' })
+  await composer.fill('/compact')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.compact').length ?? 0)).toBe(1)
+  const requestId = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>>)
+    .find(frame => frame.type === 'freshAgent.compact')?.requestId)
+  expect(requestId).toEqual(expect.any(String))
+  await page.evaluate(id => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    harness.clearSentWsMessages?.()
+    harness.receiveWsMessage?.({ type: 'freshAgent.event', sessionType: 'freshopencode', provider: 'opencode', sessionId: 'compact-freshopencode',
+      event: { type: 'freshAgent.error', code: 'SESSION_RESERVED', requestId: id as string, operationReceipt: true,
+        message: 'The conversation is reserved for a handoff.' } })
+  }, requestId)
+  await expect(page.locator('[data-agent-error="session"] summary')).toContainText('The conversation is reserved for a handoff.')
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+  // The attach-only redrive fires after one second; observe past that window.
+  await page.waitForTimeout(1_250)
+  const sent = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+  expect(sent?.filter(frame => frame.type === 'freshAgent.attach' || frame.type === 'pane.reconcile.request') ?? []).toEqual([])
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
+for (const fallbackFirst of [true, false]) test(`OpenCode Stop shows its provider error and uncertainty (fallback first: ${fallbackFirst})`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType: 'freshopencode', provider: 'opencode', style: 'sans', theme: 'light' })
+  await state.update({ status: 'running' })
+  const stop = page.getByRole('button', { name: 'Stop', exact: true })
+  await expect(stop).toBeEnabled()
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+  await stop.click()
+  await expect.poll(() => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.interrupt').length ?? 0)).toBe(1)
+  const requestId = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>>)
+    .find(frame => frame.type === 'freshAgent.interrupt')?.requestId)
+  expect(requestId).toEqual(expect.any(String))
+  const provider = { type: 'freshAgent.operation.error', requestId, code: 'OPENCODE_INTERRUPT_FAILED', operationReceipt: true,
+    operationOutcomeUncertain: true, message: 'The connection to OpenCode failed while stopping the turn.' }
+  const fallback = { type: 'freshAgent.error', requestId, code: 'COMMAND_AMBIGUOUS', operationReceipt: true,
+    operationFallback: true, operationOutcomeUncertain: true, message: 'Stopping the agent could not be confirmed.' }
+  await page.evaluate(events => {
+    for (const event of events) window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionType: 'freshopencode', provider: 'opencode', sessionId: 'compact-freshopencode', event,
+    })
+  }, fallbackFirst ? [fallback, provider] : [provider, fallback])
+  const error = page.locator('[data-agent-error="session"] summary')
+  await expect(error).toContainText('The connection to OpenCode failed while stopping the turn.')
+  await expect(error).toContainText('could not be confirmed')
+  await expect(stop).toBeEnabled()
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
+for (const { sessionType, provider } of [
+  { sessionType: 'freshclaude', provider: 'claude' },
+  { sessionType: 'freshopencode', provider: 'opencode' },
+]) test(`${provider} uncertain delivery keeps the draft and follow-up without resending`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType, provider, style: 'sans', theme: 'light' })
+  const composer = page.getByRole('textbox', { name: 'Chat message input' })
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+  await composer.fill('The original request')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.send').length ?? 0)).toBe(1)
+  const requestId = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>>)
+    .find(frame => frame.type === 'freshAgent.send')?.requestId)
+  expect(requestId).toEqual(expect.any(String))
+  await composer.fill('The queued follow-up')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await page.getByRole('button', { name: 'Show queued messages' }).click()
+  await expect(page.getByText('The queued follow-up', { exact: true })).toBeVisible()
+  await composer.fill('A newer draft')
+  await page.evaluate(({ sessionType, provider, requestId }) => {
+    const sessionId = `compact-${sessionType}`
+    window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionType, provider, sessionId,
+      event: { type: 'freshAgent.send.uncertain', sessionId, requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: The provider could not confirm delivery.' },
+    })
+  }, { sessionType, provider, requestId })
+  await expect(page.getByRole('alert', { name: 'Agent warning' })).toContainText('Delivery uncertain')
+  await expect(composer).toHaveValue('The original request\nA newer draft')
+  await expect(page.getByText('The queued follow-up', { exact: true })).toBeVisible()
+  await state.update({ status: 'idle' })
+  await expect(page.getByText('The queued follow-up', { exact: true })).toBeVisible()
+  const sends = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.send') ?? [])
+  expect(sends).toHaveLength(1)
+  expect(sends[0]).toMatchObject({ requestId, sessionId: `compact-${sessionType}`, text: 'The original request' })
+})
+
 test('routed OpenCode daemon loss exposes diagnostic and keeps the conversation recoverable', async ({ freshellPage, page, terminal }) => {
   void freshellPage
   await terminal.waitForTerminal()

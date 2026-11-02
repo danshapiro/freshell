@@ -255,6 +255,7 @@ async fn disconnected_interrupt_continues_its_mutating_host_work() {
             &state,
             HostCommand::FreshAgentInterrupt {
                 incarnation_id: state.incarnation_id.clone(),
+                request_id: None,
             },
         ),
     )

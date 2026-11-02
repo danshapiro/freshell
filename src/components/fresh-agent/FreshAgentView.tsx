@@ -45,7 +45,7 @@ import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import type { FreshAgentCodexCatalogContext } from '@shared/fresh-agent-model-capabilities'
-import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
+import { applyRefusalFence, beginOperationAttempt, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -1301,12 +1301,12 @@ export function FreshAgentView({
   }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
-  const [notice, setNoticeState] = useState<{ text: string; level: 'info' | 'warning' | 'error' } | null>(null)
+  const [notice, setNoticeState] = useState<{ text: string; level: 'info' | 'warning' | 'error'; prominent?: boolean } | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
   const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning') => {
     setNoticeState(current => text === null ? null : current?.text === text && current.level === level ? current : { text, level })
   }, [])
-  const deliveryNoticeRef = useRef<string | null>(null)
+  const deliveryNoticeRef = useRef<{ requestId: string; text: string } | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
   const openModelDialog = useCallback(() => setModelDialogOpen(true), [])
@@ -1788,7 +1788,12 @@ export function FreshAgentView({
   paneContentRef.current = paneContent
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
-    const current = paneContentRef.current
+    // A refusal and its later receipt can arrive in one React batch. Consult
+    // the store so a preceding clear is visible before deciding to skip this
+    // write; paneContentRef still reflects the preceding render in that case.
+    const root = appStore.getState().panes.layouts[tabId]
+    const latest = root ? findPaneContent(root, paneId) : null
+    const current = latest?.kind === 'fresh-agent' ? latest : paneContentRef.current
     // The persisted echo record carries the send boundary
     // (previousTurnKeys) alongside the identity fields: a reloaded pane
     // restores the echo WITH the turns that predate its send, so the
@@ -1810,7 +1815,7 @@ export function FreshAgentView({
       paneId,
       updates: { pendingLocalEcho: persisted },
     }))
-  }, [dispatch, paneId, tabId])
+  }, [appStore, dispatch, paneId, tabId])
   useEffect(() => {
     const next = paneContent.pendingLocalEcho ?? null
     if (sameLocalEcho(localEchoRef.current, next)) return
@@ -2498,7 +2503,9 @@ export function FreshAgentView({
   // kata 1wxv: rollback requests mint a requestId so the requesting-sink ack
   // (composer refill) and any rollback-flagged refusal route back to THIS pane;
   // sibling clients converge through the session.rolledBack broadcast instead.
-  const pendingRollbackRef = useRef<Map<string, { direction: 'undo' | 'redo' }>>(new Map())
+  const pendingRollbackRef = useRef<Map<string, {
+    direction: 'undo' | 'redo'; fallbackReceived?: boolean; uncertainty?: string; providerMessage?: string
+  }>>(new Map())
   // Busy mirror for the advisory rollback gate: isBusy is derived far below the
   // slash-command callback, so the gate reads the ref (same idiom as
   // agentSessionStatusRef above) — always the current render's value at call time.
@@ -2508,6 +2515,11 @@ export function FreshAgentView({
     if (!current.sessionId || isFreshAgentLifecycleBlocked(current)) return
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     const requestId = nanoid()
+    // A new action supersedes unresolved fallback-only notices; do not keep
+    // old receipts indefinitely or let them replace this newer action's UI.
+    for (const [id, pending] of pendingRollbackRef.current) {
+      if (pending.fallbackReceived || pending.providerMessage) pendingRollbackRef.current.delete(id)
+    }
     pendingRollbackRef.current.set(requestId, { direction })
     // b8ke ext r21 F2: the undo/redo delayed-request fence (the r8 F5
     // send/attach discipline): the observed pair rides the frame so a
@@ -3339,6 +3351,7 @@ export function FreshAgentView({
         && message.sessionId === paneContentRef.current.sessionId
         && (message.event as { type?: string; code?: string } | undefined)?.type === 'freshAgent.error'
         && (message.event as { code?: string }).code === 'SESSION_RESERVED'
+        && (message.event as { operationReceipt?: boolean }).operationReceipt !== true
       ) {
         // Task 14 (attach loser): a transient reservation re-drives the attach
         // after the floor; exhaustion resolves via the single-pane reconcile.
@@ -3396,6 +3409,25 @@ export function FreshAgentView({
           ? message.submittedTurnId
           : undefined
         const pending = pendingSendMetadataRef.current.get(message.requestId)
+        if (pending?.deliveryAmbiguous) {
+          // The send was restored as a draft while its outcome was unknown.
+          // Keep any edits, but replace the uncertainty when this exact send
+          // is later confirmed as accepted.
+          recordPendingSendMetadata(message.requestId, { deliveryAmbiguous: false })
+          const deliveryNotice = deliveryNoticeRef.current
+          if (deliveryNotice?.requestId === message.requestId) {
+            deliveryNoticeRef.current = null
+            setNoticeState(currentNotice => currentNotice?.text === deliveryNotice.text
+              ? { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true }
+              : currentNotice)
+          }
+          const outgoing = outgoingTurnRef.current
+          if ((!echo || echo.requestId === message.requestId) && outgoing?.requestId === message.requestId) {
+            setLocalEcho({ requestId: outgoing.requestId, text: outgoing.text,
+              previousTurnKeys: outgoing.previousTurns.map(getTurnKey),
+              ...(submittedTurnId ? { submittedTurnId } : {}) })
+          }
+        }
         if (pending?.asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(pending.asyncQuestionKeys!.map((key) => [key, 'accepted' as const])) }))
         if (pending && !pending.checkpointOutcome) {
           // Older servers may accept a send without the additive outcome
@@ -3429,7 +3461,20 @@ export function FreshAgentView({
           requestSnapshotRefresh('send-accepted')
         }
       }
-      if (message.type === 'error') {
+      const uncertainSend = message.type === 'freshAgent.event'
+        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
+        && isRecord(message.event)
+        && message.event.type === 'freshAgent.send.uncertain'
+        && typeof message.sessionId === 'string'
+        && message.event.sessionId === message.sessionId
+        && typeof message.event.message === 'string'
+        && message.event.message.startsWith('FRESH_AGENT_DELIVERY_AMBIGUOUS:')
+        ? { type: 'error' as const, code: 'INTERNAL_ERROR' as const,
+          requestId: message.event.requestId, message: message.event.message }
+        : undefined
+      const sendError = message.type === 'error' ? message : uncertainSend
+      if (sendError) {
+        const message = sendError
         // Task 10: owned send failures. `requestId` is the only correlation
         // handle on an error frame, and freshAgent.send is the only
         // fresh-agent path that threads it: frames whose requestId matches a
@@ -3471,17 +3516,17 @@ export function FreshAgentView({
             }
           }
         }
-        // Cleanup fall-through: every owned send failure that did not take
-        // the retry path (including a retried request failing again) releases
-        // the three leaks a failed send otherwise leaves behind -- the
-        // pending-metadata entry, the stale local echo (dual-write), and the
-        // optimistic `running` status.
-        const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
-        const asyncQuestionKeys = pendingSendMetadataRef.current.get(failedRequestId)?.asyncQuestionKeys
-        const ambiguous = current.provider === 'codex'
-          && typeof message.message === 'string' && message.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
+        const pending = pendingSendMetadataRef.current.get(failedRequestId)
+        const failedText = pending?.text
+        const asyncQuestionKeys = pending?.asyncQuestionKeys
+        const wasAmbiguous = pending?.deliveryAmbiguous === true
+        const ambiguous = typeof message.message === 'string'
+          && (message.message.startsWith('FRESH_AGENT_DELIVERY_AMBIGUOUS:')
+            || (current.provider === 'codex' && message.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')))
+        // A concrete acceptance or a prior ambiguity wins over a repeated or
+        // late uncertain fallback for this same request.
+        if (ambiguous && (wasAmbiguous || pending?.submittedTurnId || pending?.legacyAccepted)) return
         if (asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, ambiguous ? 'ambiguous' as const : 'refused' as const])) }))
-        if (ambiguous && pendingSendMetadataRef.current.get(failedRequestId)?.deliveryAmbiguous) return
         if (ambiguous) {
           // Keep the receipt and queue reservation: a lost response can follow
           // accepted native input. Only later lifecycle/history evidence may
@@ -3496,20 +3541,24 @@ export function FreshAgentView({
         if (localEchoRef.current?.requestId === failedRequestId) {
           setLocalEcho(null)
         }
-        if (current.provider === 'opencode' && current.status === 'running') {
+        if (!ambiguous && current.provider === 'opencode' && current.status === 'running') {
           dispatch(mergePaneContent({ tabId, paneId, updates: { status: 'idle' } }))
         }
-        // G05 (C09): a claude send the server refused was never sent — for
-        // example its session ended — so the text goes back into the
-        // composer with the reason instead of vanishing with the echo.
-        if ((current.provider === 'claude' || current.provider === 'codex') && failedText) {
-          composerRef.current?.restoreText(failedText)
+        // Preserve the submitted text beside any newer draft. A definitive
+        // refusal after an uncertain fallback must not restore it twice.
+        // Keep the existing OpenCode lost-session cleanup when no uncertain
+        // delivery preceded it; its retry path is handled above.
+        const existingLostSessionCleanup = current.provider === 'opencode'
+          && message.code === 'FRESH_AGENT_LOST_SESSION' && !ambiguous && !wasAmbiguous
+        if (failedText && !existingLostSessionCleanup) {
+          if (!wasAmbiguous) composerRef.current?.restoreText(failedText)
           const failureNotice = ambiguous
             ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(message.message)}. Check the conversation before sending again.`
             : `Message not sent: ${sendFailureReason(message.message)}`
-          deliveryNoticeRef.current = ambiguous ? failureNotice : null
+          if (ambiguous) deliveryNoticeRef.current = { requestId: failedRequestId, text: failureNotice }
+          else if (deliveryNoticeRef.current?.requestId === failedRequestId) deliveryNoticeRef.current = null
           setNotice(failureNotice)
-          log.warn('fresh_agent.send_refused', {
+          log.warn(ambiguous ? 'fresh_agent.send_delivery_ambiguous' : 'fresh_agent.send_refused', {
             provider: current.provider,
             sessionType: current.sessionType,
             sessionId: current.sessionId,
@@ -3618,14 +3667,32 @@ export function FreshAgentView({
           && typeof (message.event as { requestId?: unknown }).requestId === 'string'
           && pendingRollbackRef.current.has((message.event as { requestId: string }).requestId)
         ) {
-          pendingRollbackRef.current.delete((message.event as { requestId: string }).requestId)
-          // The server's supplied message is PINNED SERVER-SIDE and rendered VERBATIM —
-          // BUSY_TURN carries ROLLBACK_BUSY_MESSAGE; REDO_UNAVAILABLE carries the
-          // destroyed / empty / claude moved-tip copy; capability failures carry their
-          // exact copy (CODEX_LEGACY_THREAD_COPY / old-CLI copies / parity text). The
-          // client NEVER substitutes client-side guess copy for a supplied message.
-          const supplied = (message.event as { message?: unknown }).message
-          setNotice(typeof supplied === 'string' ? supplied : rollbackUnsupportedNotice(descriptor?.label ?? paneContentRef.current.provider))
+          const requestId = (message.event as { requestId: string }).requestId
+          const pending = pendingRollbackRef.current.get(requestId)!
+          const event = message.event as { operationFallback?: unknown; operationReceipt?: unknown; operationOutcomeUncertain?: unknown; message?: unknown }
+          const supplied = typeof event.message === 'string' ? event.message : rollbackUnsupportedNotice(descriptor?.label ?? paneContentRef.current.provider)
+          let shown = supplied
+          if (event.operationFallback === true) {
+            if (pending.fallbackReceived) return
+            if (pending.providerMessage) {
+              shown = event.operationOutcomeUncertain === true ? `${pending.providerMessage} ${supplied}` : pending.providerMessage
+              pendingRollbackRef.current.delete(requestId)
+            } else {
+              pendingRollbackRef.current.set(requestId, { ...pending, fallbackReceived: true,
+                ...(event.operationOutcomeUncertain === true ? { uncertainty: supplied } : {}) })
+            }
+          } else {
+            if (pending.providerMessage) return
+            if (pending.uncertainty) shown = `${supplied} ${pending.uncertainty}`
+            if (event.operationReceipt === true && !pending.fallbackReceived) {
+              pendingRollbackRef.current.set(requestId, { ...pending, providerMessage: supplied })
+            } else {
+              pendingRollbackRef.current.delete(requestId)
+            }
+          }
+          // Keep the provider's supplied message intact. If the managed host
+          // cannot confirm the outcome, retain that warning alongside it.
+          setNotice(shown)
         }
       }
       if (
@@ -4867,11 +4934,12 @@ export function FreshAgentView({
     undoSupported: canRollback,
     redoSupported: snapshot?.capabilities?.redo === true,
   }), [paneId, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo, paneContent.sessionId])
-  // Task 14: SESSION_RESERVED is a transient reservation the view re-drives
-  // through -- never surfaced as a pane-level error banner.
-  const sessionErrorMessage = (agentSession as { lastError?: string; lastErrorCode?: string } | undefined)?.lastErrorCode === 'SESSION_RESERVED'
+  // Attach reservations are silently re-driven. An operation receipt with
+  // the same code is a user-visible refusal, not an attach retry.
+  const sessionErrorMessage = agentSession?.lastErrorCode === 'SESSION_RESERVED'
+    && agentSession.lastErrorWasOperationFallback === undefined
     ? null
-    : (agentSession as { lastError?: string } | undefined)?.lastError ?? null
+    : agentSession?.lastError ?? null
   // sessionEnded gates everything: a stale snapshot can still claim
   // capabilities.send after the provider process died.
   const snapshotHistoryOnly = isNativeHistoryOnlySnapshot(snapshot)
@@ -4949,7 +5017,7 @@ export function FreshAgentView({
       setNoticeExpanded(false)
       return
     }
-    if (noticeExpanded || notice.text === deliveryNoticeRef.current) return
+    if (noticeExpanded || notice.text === deliveryNoticeRef.current?.text) return
     const timer = window.setTimeout(() => setNotice(null), 6000)
     return () => window.clearTimeout(timer)
   }, [notice, noticeExpanded, setNotice])
@@ -5308,6 +5376,7 @@ export function FreshAgentView({
       if (!paneContent.sessionId || !canInterrupt) return
       sendFreshAgentMessage({
         type: 'freshAgent.interrupt',
+        requestId: nanoid(),
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
@@ -5317,6 +5386,7 @@ export function FreshAgentView({
     const respondToApproval = (requestId: string | number, decision: FreshAgentApprovalDecision) => {
       dispatch(dismissTabGreen(tabId))
       if (isFreshAgentLifecycleBlocked(paneContentRef.current) || !paneContent.sessionId) return
+      dispatch(beginOperationAttempt({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider, requestId: String(requestId) }))
       sendFreshAgentMessage({
         type: 'freshAgent.approval.respond',
         sessionId: paneContent.sessionId,
@@ -5332,12 +5402,12 @@ export function FreshAgentView({
     const routineNotices = [
       ...(isRestoring ? [{ id: 'restoring', text: 'Restoring session...' }] : []),
       ...(paneContent.reconcileNotice ? [{ id: 'reconciliation', text: paneContent.reconcileNotice, prominent: true }] : []),
-      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text, onToggle: setNoticeExpanded }] : []),
+      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text, prominent: notice.prominent, onToggle: setNoticeExpanded }] : []),
       ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
     const verboseNotice = notice && isVerboseDiagnostic(notice.text)
     const noticeSummary = verboseNotice
-      ? `${summarizeDiagnostic(notice.text)}${notice.text === deliveryNoticeRef.current ? ' Check the conversation before sending again.' : ''}`
+      ? `${summarizeDiagnostic(notice.text)}${notice.text === deliveryNoticeRef.current?.text ? ' Check the conversation before sending again.' : ''}`
       : notice?.text
     const visibleErrors: FreshAgentError[] = [
       ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
@@ -5580,6 +5650,7 @@ export function FreshAgentView({
               {(snapshot?.pendingElicitations ?? []).map((request) => <FreshAgentElicitationBanner key={String(request.requestId)} request={request} disabled={!paneContent.sessionId} onRespond={(action, content) => {
                 if (!paneContent.sessionId) return
                 dispatch(dismissTabGreen(tabId))
+                dispatch(beginOperationAttempt({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider, requestId: String(request.requestId) }))
                 sendFreshAgentMessage({ type: 'freshAgent.elicitation.respond', sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider, requestId: request.requestId, action, content })
               }} />)}
               {pendingQuestions.map((question) => (
@@ -5601,6 +5672,7 @@ export function FreshAgentView({
                   onAnswer={(answers) => {
                     dispatch(dismissTabGreen(tabId))
                     if (isFreshAgentLifecycleBlocked(paneContentRef.current) || !paneContent.sessionId) return
+                    dispatch(beginOperationAttempt({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider, requestId: String(question.requestId) }))
                     sendFreshAgentMessage({
                       type: 'freshAgent.question.respond',
                       sessionId: paneContent.sessionId,

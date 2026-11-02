@@ -3109,28 +3109,6 @@ fn resume_reuses_only_the_exact_running_soul_identity() {
 }
 
 #[test]
-fn only_provider_terminal_edges_complete_a_rest_turn() {
-    assert!(provider_event_completes_turn(&AgentEvent::Provider {
-        payload: serde_json::json!({
-            "type":"freshAgent.event",
-            "event":{"type":"freshAgent.turn.complete"}
-        }),
-    }));
-    assert!(provider_event_completes_turn(&AgentEvent::Provider {
-        payload: serde_json::json!({
-            "type":"freshAgent.event",
-            "event":{"type":"freshAgent.status","status":"idle"}
-        }),
-    }));
-    assert!(!provider_event_completes_turn(&AgentEvent::Provider {
-        payload: serde_json::json!({
-            "type":"freshAgent.event",
-            "event":{"type":"freshAgent.status","status":"busy"}
-        }),
-    }));
-}
-
-#[test]
 fn provider_child_threads_remain_snapshot_topology_not_runtime_creation_intents() {
     let mut payload = serde_json::json!({
         "type":"freshAgent.event",
@@ -3301,6 +3279,258 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     assert_eq!(server.await.unwrap(), vec!["health", "fresh_agent_fork"]);
 }
 
+#[tokio::test]
+async fn hosted_non_send_failures_keep_operation_correlation_and_uncertain_outcomes() {
+    for operation in [
+        "undo",
+        "redo",
+        "compact",
+        "fork",
+        "interrupt",
+        "approval",
+        "question",
+        "elicitation",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control-error.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let soul = SoulId::new();
+        let expected_soul = soul.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let result = if index == 0 {
+                    assert!(matches!(request.body, AdminCommand::Health));
+                    Ok(AdminResult::Health {
+                        control_epoch: 77,
+                        installation_id: InstallationId::new(),
+                    })
+                } else {
+                    let actual_soul = match &request.body {
+                        AdminCommand::FreshAgentRollback(value)
+                            if operation == "undo" || operation == "redo" =>
+                        {
+                            &value.soul_id
+                        }
+                        AdminCommand::FreshAgentCompact(value) if operation == "compact" => {
+                            &value.soul_id
+                        }
+                        AdminCommand::FreshAgentFork(value) if operation == "fork" => {
+                            &value.soul_id
+                        }
+                        AdminCommand::FreshAgentInterrupt(value) if operation == "interrupt" => {
+                            &value.soul_id
+                        }
+                        AdminCommand::FreshAgentResolve(value)
+                            if ["approval", "question", "elicitation"].contains(&operation) =>
+                        {
+                            &value.soul_id
+                        }
+                        other => panic!("unexpected {operation} command: {other:?}"),
+                    };
+                    assert_eq!(actual_soul, &expected_soul);
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::CommandAmbiguous,
+                        "synthetic-private-token-must-not-escape",
+                    ))
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let (broadcast, mut receiver) = broadcast::channel(16);
+        let proxy = Arc::new(HostedFreshAgentProxy {
+            client: RuntimeClient::new(&socket, "0123456789abcdef"),
+            broadcast: Arc::new(broadcast),
+            aliases: Mutex::new(HashMap::from([(
+                ("codex".into(), "public-thread".into()),
+                soul,
+            )])),
+            presentation_routes: Mutex::new(HashMap::new()),
+            pollers: Mutex::new(HashSet::new()),
+            fixture_modes: HashSet::new(),
+            naming: OnceLock::new(),
+            checkpoint_barrier: OnceLock::new(),
+            ownership: OnceLock::new(),
+        });
+        let mut data = serde_json::json!({"provider":"codex", "sessionId":"public-thread",
+            "sessionType":"freshcodex", "requestId":"control-request"});
+        let command = match operation {
+            "undo" => HostedFreshAgentCommand::Undo(serde_json::from_value(data).unwrap()),
+            "redo" => HostedFreshAgentCommand::Redo(serde_json::from_value(data).unwrap()),
+            "compact" => HostedFreshAgentCommand::Compact(serde_json::from_value(data).unwrap()),
+            "fork" => HostedFreshAgentCommand::Fork(serde_json::from_value(data).unwrap()),
+            "interrupt" => {
+                HostedFreshAgentCommand::Interrupt(serde_json::from_value(data).unwrap())
+            }
+            "approval" => {
+                data["decision"] = serde_json::json!({"behavior":"allow"});
+                HostedFreshAgentCommand::Approval(serde_json::from_value(data).unwrap())
+            }
+            "question" => {
+                data["answers"] = serde_json::json!({"answer":"yes"});
+                HostedFreshAgentCommand::Question(serde_json::from_value(data).unwrap())
+            }
+            "elicitation" => {
+                data["action"] = serde_json::json!("decline");
+                HostedFreshAgentCommand::Elicitation(serde_json::from_value(data).unwrap())
+            }
+            _ => unreachable!(),
+        };
+        proxy.handle(command).await;
+        let raw = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event", "{operation}: {frame}");
+        assert_eq!(frame["sessionId"], "public-thread", "{operation}: {frame}");
+        assert_eq!(
+            frame["event"]["type"], "freshAgent.error",
+            "{operation}: {frame}"
+        );
+        assert_eq!(
+            frame["event"]["code"], "COMMAND_AMBIGUOUS",
+            "{operation}: {frame}"
+        );
+        assert_eq!(
+            frame["event"]["requestId"], "control-request",
+            "{operation}: {frame}"
+        );
+        if operation == "undo" || operation == "redo" {
+            assert_eq!(frame["event"]["rollback"], true, "{operation}: {frame}");
+        }
+        let message = frame["event"]["message"].as_str().unwrap().to_lowercase();
+        assert!(
+            !message.contains("synthetic-private-token"),
+            "{operation}: {frame}"
+        );
+        assert!(
+            message.contains("confirm") || message.contains("uncertain"),
+            "{operation}: {frame}"
+        );
+        assert!(
+            !message.contains("not accepted") && !message.contains("failed without"),
+            "{operation}: {frame}"
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn hosted_stop_lost_reply_keeps_the_same_request_id_and_an_uncertain_outcome() {
+    for supplied_id in [Some("stop-from-browser"), None] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("stop-control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let soul = SoulId::new();
+        let server = tokio::spawn(async move {
+            let (mut health, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut health).await.unwrap();
+            assert!(matches!(request.body, AdminCommand::Health));
+            write_frame(
+                &mut health,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(AdminResult::Health {
+                        control_epoch: 77,
+                        installation_id: InstallationId::new(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let AdminCommand::FreshAgentInterrupt(request) = request.body else {
+                panic!("expected Stop")
+            };
+            // Closing the authenticated control connection after receipt models
+            // a host reply that is lost after the Stop may have been applied.
+            serde_json::to_value(request).unwrap()["requestId"]
+                .as_str()
+                .map(str::to_owned)
+        });
+        let (broadcast, mut receiver) = broadcast::channel(16);
+        let proxy = Arc::new(HostedFreshAgentProxy {
+            client: RuntimeClient::new(&socket, "0123456789abcdef"),
+            broadcast: Arc::new(broadcast),
+            aliases: Mutex::new(HashMap::from([(
+                ("codex".into(), "public-thread".into()),
+                soul,
+            )])),
+            presentation_routes: Mutex::new(HashMap::new()),
+            pollers: Mutex::new(HashSet::new()),
+            fixture_modes: HashSet::new(),
+            naming: OnceLock::new(),
+            checkpoint_barrier: OnceLock::new(),
+            ownership: OnceLock::new(),
+        });
+        let mut data = serde_json::json!({"provider":"codex", "sessionId":"public-thread", "sessionType":"freshcodex"});
+        if let Some(id) = supplied_id {
+            data["requestId"] = serde_json::json!(id);
+        }
+        proxy
+            .handle(HostedFreshAgentCommand::Interrupt(
+                serde_json::from_value(data).unwrap(),
+            ))
+            .await;
+        let raw = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let forwarded_id = server.await.unwrap();
+        assert_eq!(
+            forwarded_id.as_deref(),
+            supplied_id,
+            "the public Stop ID must pass unchanged"
+        );
+        match supplied_id {
+            Some(id) => assert_eq!(frame["event"]["requestId"], id),
+            None => assert!(
+                frame["event"]["requestId"].is_null(),
+                "legacy Stop stays uncorrelated"
+            ),
+        }
+        assert_eq!(frame["event"]["operationOutcomeUncertain"], true);
+        assert!(frame["event"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be confirmed"));
+    }
+}
+
+#[tokio::test]
+async fn hosted_unsupported_elicitation_is_a_nonterminal_correlated_refusal() {
+    let proxy = snapshot_outage_proxy(std::path::Path::new("/unused-runtime-control"));
+    let mut receiver = proxy.broadcast.subscribe();
+    let command = serde_json::from_value(serde_json::json!({
+        "provider":"claude", "sessionId":"claude-thread", "sessionType":"freshclaude",
+        "requestId":"unsupported-decision", "action":"decline"
+    }))
+    .unwrap();
+    proxy
+        .handle(HostedFreshAgentCommand::Elicitation(command))
+        .await;
+    let frame: serde_json::Value = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+    assert_eq!(frame["event"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert_eq!(frame["event"]["requestId"], "unsupported-decision");
+    assert_eq!(frame["event"]["operationReceipt"], true);
+    assert!(frame["event"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not supported"));
+}
+
 #[test]
 fn semantic_operation_failures_keep_typed_public_codes() {
     use freshell_runtime_client::ClientError;
@@ -3310,6 +3540,7 @@ fn semantic_operation_failures_keep_typed_public_codes() {
             message: "redacted".into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_send_diagnostic: None,
         }),
         "UNSUPPORTED_CAPABILITY"
     );
@@ -3319,6 +3550,7 @@ fn semantic_operation_failures_keep_typed_public_codes() {
             message: "redacted".into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_send_diagnostic: None,
         }),
         "COMMAND_AMBIGUOUS"
     );
@@ -3328,6 +3560,7 @@ fn semantic_operation_failures_keep_typed_public_codes() {
             message: "redacted".into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_send_diagnostic: None,
         }),
         "IMPLEMENTATION_UNAVAILABLE"
     );
@@ -5229,7 +5462,10 @@ async fn task6_gateway_recovery_receipts(
         serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"checkpointTurnIdentity","requestId":"accepted-answer","logicalAttemptId":"logical-owned","sessionId":"native-owned","nativeTurnId":"native-turn","displayTurnId":"native-turn:row-0"}}),
         serde_json::json!({"type":"freshAgent.checkpoint.outcome","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","requestId":"accepted-answer","logicalAttemptId":"logical-owned","status":"available","checkpointId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nativeTurnId":"native-turn","displayTurnId":"native-turn:row-0"}),
         serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.rolledBack","requestId":"undo-owned","removedPromptText":"restore the exact prompt"}}),
-        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.error","requestId":"undo-refused","code":"BUSY_TURN","message":"The agent is still working."}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.error","requestId":"undo-refused","rollback":true,"code":"BUSY_TURN","message":"The agent is still working."}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.operation.error","requestId":"fork-refused","operationReceipt":true,"code":"INTERNAL_ERROR","message":"The provider refused this fork."}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.error","requestId":"compact-refused","operationReceipt":true,"code":"CODEX_COMPACT_FAILED","message":"The provider refused compact."}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-owned","event":{"type":"freshAgent.error","requestId":"question-refused","operationReceipt":true,"code":"INVALID_ANSWER","message":"Choose an offered answer."}}),
     ];
     let expected = receipts.clone();
     let server = tokio::spawn(async move {
@@ -5336,6 +5572,16 @@ async fn task6_gateway_recovery_receipts(
     );
     assert_eq!(observed[1]["event"]["requestId"], "current-control");
     for (actual, mut expected) in observed.into_iter().skip(2).zip(expected) {
+        if replay
+            && expected["event"]["operationReceipt"] == true
+            && expected["event"]["rollback"] != true
+            && matches!(
+                expected["event"]["type"].as_str(),
+                Some("freshAgent.error" | "freshAgent.operation.error")
+            )
+        {
+            expected["event"]["operationReceiptReplay"] = serde_json::json!(true);
+        }
         rewrite_presentation_id(&mut expected, "public-owned");
         assert_eq!(
             actual, expected,
@@ -5378,3 +5624,9 @@ mod readiness_tests;
 
 #[path = "fresh_agent_proxy_materialization_tests.rs"]
 mod materialization_tests;
+
+#[path = "fresh_agent_proxy_send_tests.rs"]
+mod send_tests;
+
+#[path = "fresh_agent_hosted_rest_send_tests.rs"]
+mod hosted_rest_send_tests;

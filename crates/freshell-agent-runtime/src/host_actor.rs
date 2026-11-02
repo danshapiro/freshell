@@ -233,6 +233,9 @@ pub struct DispatchFailure {
     /// True when the request crossed the transport's acceptance boundary or
     /// the transport cannot prove that it did not.
     pub acceptance_ambiguous: bool,
+    /// Only an already-published, request-correlated provider receipt may be
+    /// copied here. `message` itself is not safe for a control response.
+    pub provider_diagnostic: Option<freshell_runtime_protocol::FreshAgentSendDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,11 +358,17 @@ pub trait FreshAgentTransport: Send + Sync {
         _input: Option<Value>,
     ) -> Result<ForkTransition, DispatchFailure> {
         Err(DispatchFailure {
+            provider_diagnostic: None,
             message: "provider-native conversation fork is unsupported".into(),
             acceptance_ambiguous: false,
         })
     }
     async fn interrupt(&self) -> Result<(), String>;
+    /// Preserve the public request id when a provider can publish a receipt.
+    /// Existing transports may continue handling uncorrelated Stop requests.
+    async fn interrupt_with_request_id(&self, _request_id: Option<&str>) -> Result<(), String> {
+        self.interrupt().await
+    }
     async fn supports_operation(&self, _operation: &FreshAgentOperation) -> Result<bool, String> {
         Ok(false)
     }
@@ -430,6 +439,10 @@ pub enum ActorError {
     RequestConflict,
     #[error("command dispatch is ambiguous and will not be replayed")]
     AmbiguousDispatch,
+    #[error("provider published a send diagnostic")]
+    ProviderSendDiagnostic(freshell_runtime_protocol::FreshAgentSendDiagnostic),
+    #[error("provider refused the input")]
+    SendRefused,
     #[error("provider does not support this operation")]
     UnsupportedOperation,
     #[error("fresh-agent provider start failed (startup diagnostic: {diagnostic})")]
@@ -1267,10 +1280,19 @@ impl FreshAgentHostActor {
                     self.event_count_cap,
                 )?;
                 write_state(&self.state_dir, &state)?;
+                if let Some(diagnostic) = failure.provider_diagnostic {
+                    let diagnostic_is_ambiguous = matches!(
+                        diagnostic.outcome,
+                        freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous
+                    );
+                    if diagnostic_is_ambiguous == failure.acceptance_ambiguous {
+                        return Err(ActorError::ProviderSendDiagnostic(diagnostic));
+                    }
+                }
                 if failure.acceptance_ambiguous {
                     Err(ActorError::AmbiguousDispatch)
                 } else {
-                    Err(ActorError::Transport(failure.message))
+                    Err(ActorError::SendRefused)
                 }
             }
         }
@@ -2186,8 +2208,15 @@ impl FreshAgentHostActor {
     }
 
     pub async fn interrupt(&self) -> Result<(), ActorError> {
+        self.interrupt_with_request_id(None).await
+    }
+
+    pub async fn interrupt_with_request_id(
+        &self,
+        request_id: Option<&str>,
+    ) -> Result<(), ActorError> {
         self.transport
-            .interrupt()
+            .interrupt_with_request_id(request_id)
             .await
             .map_err(ActorError::Transport)?;
         self.record_event(AgentEvent::Interrupted).await?;

@@ -25,6 +25,75 @@ fn kilroy_actor_accepts_its_typed_claude_native_context() {
 }
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+struct RefusedInputTransport {
+    dispatches: AtomicUsize,
+}
+
+#[async_trait]
+impl FreshAgentTransport for RefusedInputTransport {
+    async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: Some("owned-native".into()),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        Err(DispatchFailure {
+            provider_diagnostic: None,
+            message: "private prompt and credential: do-not-publish".into(),
+            acceptance_ambiguous: false,
+        })
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        unreachable!()
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn definite_unpublished_send_refusal_keeps_its_outcome_without_exposing_private_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(RefusedInputTransport {
+        dispatches: AtomicUsize::new(0),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "owned-send", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request = RequestId::parse("owned-refused-input").unwrap();
+    let error = actor
+        .dispatch(request.clone(), "owned prompt".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "provider refused the input");
+    assert!(!format!("{error:?}").contains("do-not-publish"));
+    assert_eq!(
+        actor
+            .dispatch(request, "owned prompt".into(), None)
+            .await
+            .unwrap(),
+        CommandState::Cancelled
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+    actor.stop().await.unwrap();
+}
+
 struct StartupAcknowledgementGap {
     directory: PathBuf,
     starts: AtomicUsize,
@@ -575,6 +644,7 @@ impl FreshAgentTransport for ParentForkTransport {
                 .recovery_disabled
         );
         Err(DispatchFailure {
+            provider_diagnostic: None,
             message: "accepted input reply lost".into(),
             acceptance_ambiguous: true,
         })
@@ -1178,6 +1248,7 @@ impl FreshAgentTransport for FakeTransport {
         }
         if self.ambiguous_dispatch {
             Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "reply lost".into(),
                 acceptance_ambiguous: true,
             })
@@ -2450,6 +2521,7 @@ async fn native_checkpoint_release_failures_remain_fenced_without_replay() {
         for acceptance_ambiguous in [false, true] {
             let (_dir, actor, transport) = actor_with_recovered_checkpoint(provider.clone()).await;
             *transport.recovery_result.lock().unwrap() = Some(Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "native continuation failed".into(),
                 acceptance_ambiguous,
             }));

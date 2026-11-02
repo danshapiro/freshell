@@ -22,7 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -794,11 +794,12 @@ enum SettingsFold {
     Configure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputJournalDisposition {
     Dispatch,
     Completed,
     Ambiguous,
+    Refused(freshell_runtime_protocol::FreshAgentSendDiagnostic),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1936,9 +1937,9 @@ impl Registry {
         let protected_payload = data.to_vec();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some((existing_digest, existing_payload, state, recorded_incarnation)) = tx
+            if let Some((existing_digest, existing_payload, state, recorded_incarnation, refusal)) = tx
                 .query_row(
-                    "SELECT payload_digest,protected_payload,state,incarnation_id FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                    "SELECT payload_digest,protected_payload,state,incarnation_id,fresh_agent_send_refusal FROM input_commands WHERE soul_id=?1 AND request_id=?2",
                     params![soul_id.as_str(), request_id.as_str()],
                     |row| {
                         Ok((
@@ -1946,6 +1947,7 @@ impl Registry {
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
@@ -1964,6 +1966,11 @@ impl Registry {
                     "dispatching" | "ambiguous" => {
                         tx.commit()?;
                         return Ok((InputJournalDisposition::Ambiguous, recorded_incarnation));
+                    }
+                    "refused" => {
+                        let diagnostic = parse_fresh_input_refusal(refusal)?;
+                        tx.commit()?;
+                        return Ok((InputJournalDisposition::Refused(diagnostic), recorded_incarnation));
                     }
                     "queued" => {}
                     other => {
@@ -2020,14 +2027,14 @@ impl Registry {
         let digest = input_payload_digest(data, correlation);
         let payload = data.to_vec();
         self.run_blocking(move |conn| {
-            let row: Option<(String, Vec<u8>, String)> = conn
+            let row: Option<(String, Vec<u8>, String, Option<String>)> = conn
                 .query_row(
-                    "SELECT payload_digest,protected_payload,state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                    "SELECT payload_digest,protected_payload,state,fresh_agent_send_refusal FROM input_commands WHERE soul_id=?1 AND request_id=?2",
                     params![soul_id.as_str(), request_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            let Some((stored_digest, stored_payload, state)) = row else {
+            let Some((stored_digest, stored_payload, state, refusal)) = row else {
                 return Ok(None);
             };
             if stored_digest != digest || stored_payload != payload {
@@ -2036,6 +2043,7 @@ impl Registry {
             match state.as_str() {
                 "completed" => Ok(Some(InputJournalDisposition::Completed)),
                 "dispatching" | "ambiguous" => Ok(Some(InputJournalDisposition::Ambiguous)),
+                "refused" => Ok(Some(InputJournalDisposition::Refused(parse_fresh_input_refusal(refusal)?))),
                 "queued" => Ok(None),
                 _ => Err(RegistryError::Integrity(format!("unknown input command state {state}"))),
             }
@@ -2120,6 +2128,35 @@ impl Registry {
         request_id: RequestId,
     ) -> Result<(), RegistryError> {
         self.set_input_state(soul_id, request_id, "ambiguous").await
+    }
+
+    /// Commit a proven fresh-agent refusal and its optional already-public
+    /// diagnostic in the same transaction. This outcome is never requeued.
+    pub(crate) async fn mark_fresh_input_refused(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+    ) -> Result<(), RegistryError> {
+        if diagnostic.outcome != freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+        {
+            return Err(RegistryError::InvalidState(
+                "a non-refusal cannot settle a refused input".into(),
+            ));
+        }
+        let encoded = serde_json::to_string(&diagnostic)?;
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE input_commands SET state='refused',fresh_agent_send_refusal=?1,updated_at=?2 WHERE soul_id=?3 AND request_id=?4 AND state='dispatching'",
+                params![encoded, now_millis(), soul_id.as_str(), request_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(format!("input command {} is not dispatching", request_id)));
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
     }
 
     /// Atomically moves one never-dispatched command onto the replacement
@@ -4379,6 +4416,21 @@ fn update_fresh_agent_settings_in_tx(
     Ok(())
 }
 
+fn parse_fresh_input_refusal(
+    encoded: Option<String>,
+) -> Result<freshell_runtime_protocol::FreshAgentSendDiagnostic, RegistryError> {
+    let encoded = encoded
+        .ok_or_else(|| RegistryError::Integrity("refused input is missing its outcome".into()))?;
+    let diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic =
+        serde_json::from_str(&encoded)?;
+    if diagnostic.outcome != freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused {
+        return Err(RegistryError::Integrity(
+            "refused input has a non-refusal outcome".into(),
+        ));
+    }
+    Ok(diagnostic)
+}
+
 fn input_payload_digest(data: &[u8], correlation: Option<&[u8]>) -> String {
     let mut digest = Sha256::new();
     digest.update((data.len() as u64).to_be_bytes());
@@ -4963,6 +5015,7 @@ fn create_schema(
             protected_payload BLOB NOT NULL,
             incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
             state TEXT NOT NULL,
+            fresh_agent_send_refusal TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(soul_id, request_id)
@@ -5656,6 +5709,17 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.execute_batch("UPDATE installation SET schema_version=19,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
         tx.commit()?;
         schema = 19;
+    }
+    if schema == 19 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "input_commands", "fresh_agent_send_refusal")? {
+            tx.execute_batch(
+                "ALTER TABLE input_commands ADD COLUMN fresh_agent_send_refusal TEXT;",
+            )?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=20,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 20;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -7086,6 +7150,8 @@ pub(crate) fn stopped_repair_owner_candidates_in_connection(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("fresh_agent_send_migration_tests.rs");
+
     #[tokio::test]
     async fn recovery_initialization_grant_before_identity_is_not_pristine() {
         let dir = tempfile::tempdir().unwrap();

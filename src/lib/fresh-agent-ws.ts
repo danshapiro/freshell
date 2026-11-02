@@ -716,7 +716,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(sessionExited(locator))
       return true
     case 'freshAgent.error':
-      if (event.code === 'INVALID_SESSION_ID') {
+    case 'freshAgent.operation.error':
+      if (event.type === 'freshAgent.error' && event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
       } else if (event.rollback === true) {
         // kata 1wxv: rollback rejections route to the initiating pane's notice
@@ -728,6 +729,11 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
           ...locator,
           code: event.code as string | undefined,
           message: (event.message as string) || (event.error as string) || 'Unknown error',
+          ...(event.type === 'freshAgent.operation.error' || event.operationReceipt === true ? { operationReceipt: true } : {}),
+          ...(event.operationFallback === true ? { operationFallback: true } : {}),
+          ...(event.operationOutcomeUncertain === true ? { operationOutcomeUncertain: true } : {}),
+          ...(event.operationReceiptReplay === true ? { operationReceiptReplay: true } : {}),
+          ...(typeof event.requestId === 'string' ? { requestId: event.requestId } : {}),
         }))
       }
       return true

@@ -22,6 +22,7 @@ struct CurrentHost {
     wrong_root_on_prepare: bool,
     stop_on_prepare: bool,
     inputs: Vec<String>,
+    interrupt_ids: Vec<Option<String>>,
     events_read_count: usize,
     events_gate: Option<Arc<tokio::sync::Notify>>,
     events_started: Arc<tokio::sync::Notify>,
@@ -99,6 +100,7 @@ impl Fixture {
             wrong_root_on_prepare: false,
             stop_on_prepare: false,
             inputs: Vec::new(),
+            interrupt_ids: Vec::new(),
             events_read_count: 0,
             events_gate: None,
             events_started: Arc::new(tokio::sync::Notify::new()),
@@ -218,6 +220,15 @@ impl Fixture {
                             claude_fork: None,
                         })
                     }
+                    command @ HostCommand::FreshAgentInterrupt { .. } => {
+                        let wire = serde_json::to_value(command).unwrap();
+                        current
+                            .lock()
+                            .unwrap()
+                            .interrupt_ids
+                            .push(wire["params"]["request_id"].as_str().map(str::to_owned));
+                        Ok(HostResult::FreshAgentInterrupted)
+                    }
                     HostCommand::Status { .. } => {
                         let state = current.lock().unwrap();
                         Ok(HostResult::Status {
@@ -301,6 +312,36 @@ impl Fixture {
             reply.result
         );
     }
+}
+
+#[tokio::test]
+async fn stop_request_id_crosses_the_supervisor_and_legacy_stops_still_work() {
+    let fixture = Fixture::new().await;
+    for id in [Some("stop-from-browser"), None] {
+        let mut params = serde_json::json!({
+            "soulId": fixture.soul.as_str(),
+            "expectedControlEpoch": fixture.supervisor.registry.control_epoch(),
+        });
+        if let Some(id) = id {
+            params["requestId"] = serde_json::json!(id);
+        }
+        let command: AdminCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_interrupt", "params": params,
+        }))
+        .unwrap();
+        let mut envelope = Envelope::new(RequestId::new(), ControlRole::Web, command);
+        envelope.auth = Some(CONTROL_SECRET.into());
+        let reply = fixture.supervisor.dispatch(envelope).await;
+        assert!(
+            matches!(reply.result, Ok(AdminResult::FreshAgentInterrupted)),
+            "{:?}",
+            reply.result
+        );
+    }
+    assert_eq!(
+        fixture.host.lock().unwrap().interrupt_ids,
+        vec![Some("stop-from-browser".into()), None]
+    );
 }
 
 // Use the real control connection so the deadline must still release owned

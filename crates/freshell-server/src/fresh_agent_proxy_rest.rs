@@ -1,6 +1,7 @@
 //! REST/MCP ingress backed exclusively by the durable fresh-agent host.
 
 use super::*;
+use freshell_freshagent::rest_lane::RestLaneErrorCorrelation;
 
 #[async_trait::async_trait]
 impl FreshAgentRestLane for HostedFreshAgentProxy {
@@ -399,7 +400,7 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
 
     async fn send_agent(
         &self,
-        request: RestLaneSend,
+        mut request: RestLaneSend,
     ) -> Result<RestLaneSendResult, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
@@ -412,20 +413,103 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             .fresh_agent_events(soul.clone(), 0, 1)
             .await
             .map_err(|_| ())?;
-        let request_id = RequestId::parse(request.request_id).map_err(|_| ())?;
-        self.client
-            .fresh_agent_send(request_id, soul.clone(), request.text, None, None)
-            .await
-            .map_err(|_| ())?;
-        let completed = wait_for_completion(
+        let request_id = RequestId::parse(request.request_id.clone()).map_err(|_| ())?;
+        let text = std::mem::take(&mut request.text);
+        let dispatch = self
+            .client
+            .fresh_agent_send(request_id, soul.clone(), text, None, None)
+            .await;
+        // The supervisor uses Completed for a previously accepted request.
+        // Its matching settlement can predate this HTTP request's first read.
+        let replayed = matches!(&dispatch, Ok(CommandState::Completed));
+        match classify_hosted_send(provider, dispatch) {
+            HostedSendOutcome::Accepted => {}
+            HostedSendOutcome::Refused(message) => {
+                tracing::warn!(provider=?provider, session_id=%request.session_id,
+                    request_id=%request.request_id, "freshagent.hosted_rest.send_refused");
+                return Err(hosted_rest_send_error(&request, message, false));
+            }
+            HostedSendOutcome::Ambiguous(message) => {
+                tracing::warn!(provider=?provider, session_id=%request.session_id,
+                    request_id=%request.request_id, "freshagent.hosted_rest.send_ambiguous");
+                return Err(hosted_rest_send_error(&request, message, true));
+            }
+        }
+        let completion = wait_for_completion(
             &self.client,
             soul,
-            before.head,
+            if replayed { 0 } else { before.head },
+            &request.request_id,
             Duration::from_millis(request.timeout_ms),
         )
         .await;
+        if let Some(status @ (HostedTurnStatus::Refused | HostedTurnStatus::Ambiguous)) =
+            completion.status
+        {
+            let diagnostic = completion
+                .error
+                .unwrap_or_else(|| "The provider did not accept this message.".to_string());
+            return Err(hosted_rest_send_error(
+                &request,
+                diagnostic,
+                status == HostedTurnStatus::Ambiguous,
+            ));
+        }
+        if let Some(
+            status @ (HostedTurnStatus::Failed
+            | HostedTurnStatus::Interrupted
+            | HostedTurnStatus::Exited),
+        ) = completion.status
+        {
+            let (code, message) = match status {
+                HostedTurnStatus::Failed => (
+                    if provider == AgentProvider::Codex {
+                        "CODEX_TURN_FAILED"
+                    } else {
+                        "FRESH_AGENT_TURN_FAILED"
+                    },
+                    completion
+                        .error
+                        .unwrap_or_else(|| "the submitted turn failed".to_string()),
+                ),
+                HostedTurnStatus::Interrupted => (
+                    if provider == AgentProvider::Codex {
+                        "CODEX_TURN_INTERRUPTED"
+                    } else {
+                        "FRESH_AGENT_TURN_INTERRUPTED"
+                    },
+                    "the submitted turn was interrupted".to_string(),
+                ),
+                HostedTurnStatus::Exited => (
+                    "FRESH_AGENT_SESSION_ENDED",
+                    completion.error.unwrap_or_else(|| {
+                        "the hosted session ended before the submitted turn completed".to_string()
+                    }),
+                ),
+                HostedTurnStatus::Completed
+                | HostedTurnStatus::Refused
+                | HostedTurnStatus::Ambiguous => unreachable!(),
+            };
+            let mut error = RestLaneError::new(RestLaneErrorKind::Conflict, code, message);
+            error.retryable = Some(false);
+            tracing::warn!(provider=?provider, session_id=%request.session_id,
+                request_id=%request.request_id, native_turn_id=?completion.turn_id,
+                outcome=?status, "freshagent.hosted_rest.turn_failed");
+            error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+                session_id: Some(request.session_id),
+                request_id: Some(request.request_id),
+                submitted_turn_id: completion.turn_id,
+                ..Default::default()
+            }));
+            return Err(error);
+        }
+        let completed = completion.status == Some(HostedTurnStatus::Completed);
+        tracing::info!(provider=?provider, session_id=%request.session_id,
+            request_id=%request.request_id, native_turn_id=?completion.turn_id,
+            completed, "freshagent.hosted_rest.send_observed");
         Ok(RestLaneSendResult {
             session_id: request.session_id,
+            submitted_turn_id: completion.turn_id,
             completed,
             ..Default::default()
         })
@@ -784,41 +868,255 @@ pub(super) fn same_snapshot_source(
         && before.desired_state == after.desired_state
 }
 
+fn hosted_rest_send_error(
+    request: &RestLaneSend,
+    diagnostic: String,
+    ambiguous: bool,
+) -> RestLaneError {
+    // Only the typed, already-public provider diagnostic reaches this helper.
+    // Opaque host or transport errors were replaced by classify_hosted_send.
+    let (code, message) = diagnostic
+        .split_once(": ")
+        .filter(|(code, _)| {
+            !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or(("FRESH_AGENT_SEND_REFUSED", diagnostic.as_str()));
+    let kind = match code {
+        _ if ambiguous => RestLaneErrorKind::Conflict,
+        "SESSION_RESERVED" | "STALE_CLAIM" | "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS" => {
+            RestLaneErrorKind::Conflict
+        }
+        "SESSION_NOT_FOUND" => RestLaneErrorKind::NotFound,
+        code if code.starts_with("INVALID_") => RestLaneErrorKind::BadRequest,
+        _ => RestLaneErrorKind::Unavailable,
+    };
+    let mut error = RestLaneError::new(kind, code, message);
+    if ambiguous || code == "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS" {
+        error.retryable = Some(false);
+    }
+    error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+        session_id: Some(request.session_id.clone()),
+        request_id: Some(request.request_id.clone()),
+        ..Default::default()
+    }));
+    error
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedTurnStatus {
+    Completed,
+    Failed,
+    Interrupted,
+    Exited,
+    Refused,
+    Ambiguous,
+}
+
+#[derive(Default)]
+struct ObservedHostedTurn {
+    status: Option<HostedTurnStatus>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct HostedTurnObservation {
+    accepted_turn: Option<String>,
+    turns: HashMap<String, ObservedHostedTurn>,
+    request_settlement: Option<ObservedHostedTurn>,
+    refusal: Option<String>,
+    uncertainty: Option<String>,
+}
+
+struct HostedTurnCompletion {
+    turn_id: Option<String>,
+    status: Option<HostedTurnStatus>,
+    error: Option<String>,
+}
+
+impl HostedTurnObservation {
+    fn observe(&mut self, event: &AgentEvent, request_id: &str) {
+        let AgentEvent::Provider { payload } = event else {
+            return;
+        };
+        if payload["type"] == "error" && payload["requestId"] == request_id {
+            if let Some(message) = payload["message"]
+                .as_str()
+                .filter(|message| !message.is_empty())
+            {
+                if message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+                    || message.starts_with("FRESH_AGENT_DELIVERY_AMBIGUOUS:")
+                {
+                    self.uncertainty = Some(message.to_string());
+                    self.refusal = None;
+                } else {
+                    self.refusal = Some(message.to_string());
+                    self.uncertainty = None;
+                }
+            }
+            return;
+        }
+        if payload["type"] == "freshAgent.send.accepted" && payload["requestId"] == request_id {
+            if let Some(turn_id) = payload["submittedTurnId"]
+                .as_str()
+                .filter(|turn_id| !turn_id.is_empty())
+            {
+                self.accepted_turn = Some(turn_id.to_owned());
+            }
+        }
+        let event = payload.get("event").unwrap_or(payload);
+        if event["type"] == "freshAgent.send.uncertain" && event["requestId"] == request_id {
+            let message = event["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("Delivery could not be confirmed.");
+            self.uncertainty = Some(
+                if message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+                    || message.starts_with("FRESH_AGENT_DELIVERY_AMBIGUOUS:")
+                {
+                    message.to_string()
+                } else {
+                    format!("FRESH_AGENT_DELIVERY_AMBIGUOUS: {message}")
+                },
+            );
+            self.refusal = None;
+            return;
+        }
+        if event["type"] == "freshAgent.turn.settled"
+            && event["requestIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == request_id))
+        {
+            let status = match event["outcome"].as_str() {
+                Some("completed") => Some(HostedTurnStatus::Completed),
+                Some("failed") => Some(HostedTurnStatus::Failed),
+                Some("interrupted") => Some(HostedTurnStatus::Interrupted),
+                Some("exited") => Some(HostedTurnStatus::Exited),
+                _ => None,
+            };
+            if let Some(status) = status {
+                if status == HostedTurnStatus::Completed {
+                    // An exact successful settlement proves the send arrived.
+                    self.uncertainty = None;
+                }
+                self.refusal = None;
+                self.request_settlement = Some(ObservedHostedTurn {
+                    status: Some(status),
+                    error: event["message"]
+                        .as_str()
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_owned),
+                });
+            }
+            return;
+        }
+        if event["type"] != "freshAgent.transcript.patch" {
+            return;
+        }
+        for operation in event["ops"].as_array().into_iter().flatten() {
+            let Some(id) = operation["nativeTurnId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let turn = self.turns.entry(id.to_owned()).or_default();
+            match operation["op"].as_str() {
+                Some("resetTurn") => {
+                    let error = operation["turns"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|row| {
+                            row["error"]["message"]
+                                .as_str()
+                                .filter(|message| !message.trim().is_empty())
+                                .map(str::to_owned)
+                        });
+                    if let Some(error) = error {
+                        turn.error = Some(error);
+                        if operation["correctSettled"] == true {
+                            turn.status = Some(HostedTurnStatus::Failed);
+                        }
+                    }
+                }
+                Some("settleTurn") => match operation["status"].as_str() {
+                    Some("failed") => turn.status = Some(HostedTurnStatus::Failed),
+                    Some("interrupted") if turn.status != Some(HostedTurnStatus::Failed) => {
+                        turn.status = Some(HostedTurnStatus::Interrupted);
+                    }
+                    Some("completed") if turn.status.is_none() => {
+                        turn.status = Some(HostedTurnStatus::Completed);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn is_settled(&self) -> bool {
+        self.uncertainty.is_some()
+            || self.refusal.is_some()
+            || self.request_settlement.is_some()
+            || self
+                .accepted_turn
+                .as_ref()
+                .and_then(|turn_id| self.turns.get(turn_id))
+                .is_some_and(|turn| turn.status.is_some())
+    }
+
+    fn finish(mut self) -> HostedTurnCompletion {
+        let turn = self
+            .accepted_turn
+            .as_ref()
+            .and_then(|turn_id| self.turns.remove(turn_id))
+            .unwrap_or_default();
+        let (status, error) = if let Some(message) = self.uncertainty {
+            (Some(HostedTurnStatus::Ambiguous), Some(message))
+        } else if let Some(settlement) = self.request_settlement {
+            (settlement.status, settlement.error)
+        } else if turn.status.is_some() {
+            (turn.status, turn.error)
+        } else if let Some(message) = self.refusal {
+            (Some(HostedTurnStatus::Refused), Some(message))
+        } else {
+            (None, None)
+        };
+        HostedTurnCompletion {
+            turn_id: self.accepted_turn,
+            status,
+            error,
+        }
+    }
+}
+
 async fn wait_for_completion(
     client: &RuntimeClient,
     soul: SoulId,
     mut cursor: u64,
+    request_id: &str,
     budget: Duration,
-) -> bool {
+) -> HostedTurnCompletion {
     let deadline = tokio::time::Instant::now() + budget;
+    let mut observed = HostedTurnObservation::default();
     loop {
         let Ok(batch) = client.fresh_agent_events(soul.clone(), cursor, 128).await else {
-            return false;
+            return observed.finish();
         };
         for entry in batch.events {
             cursor = cursor.max(entry.sequence);
-            if provider_event_completes_turn(&entry.event) {
-                return true;
-            }
+            observed.observe(&entry.event, request_id);
+        }
+        if observed.is_settled() {
+            return observed.finish();
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return false;
+            return observed.finish();
         }
         tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
     }
-}
-
-pub(super) fn provider_event_completes_turn(event: &AgentEvent) -> bool {
-    let AgentEvent::Provider { payload } = event else {
-        return false;
-    };
-    let event = payload.get("event").unwrap_or(payload);
-    let event_type = event
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    event_type == "freshAgent.turn.complete"
-        || (event_type == "freshAgent.status"
-            && event.get("status").and_then(serde_json::Value::as_str) == Some("idle"))
 }

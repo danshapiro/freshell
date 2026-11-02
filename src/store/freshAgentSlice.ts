@@ -33,6 +33,28 @@ type SessionMutationPayload = {
   provider?: FreshAgentRuntimeProvider
 }
 
+// Keep replay deduplication bounded without retaining copies of provider text.
+function operationReceiptFingerprint(parts: readonly unknown[]): string {
+  const value = JSON.stringify(parts)
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value.charCodeAt(index)
+    first = Math.imul(first ^ character, 0x01000193)
+    second = Math.imul(second ^ character, 0x85ebca6b)
+  }
+  return `${value.length}:${first >>> 0}:${second >>> 0}`
+}
+
+function clearSessionErrorState(session: FreshAgentSessionState) {
+  session.lastError = undefined
+  session.lastErrorCode = undefined
+  session.lastErrorRequestId = undefined
+  session.lastErrorWasOperationFallback = undefined
+  session.lastErrorOperationUncertain = undefined
+  session.lastErrorOperationUncertainty = undefined
+}
+
 const initialState: FreshAgentState = {
   sessions: {},
   pendingCreates: {},
@@ -442,10 +464,54 @@ const freshAgentSlice = createSlice({
       if (key) delete state.sessions[key].pendingElicitations?.[String(action.payload.requestId)]
     },
 
-    sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string }>) {
+    sessionError(state, action: PayloadAction<SessionMutationPayload & {
+      code?: string; message: string; requestId?: string; operationReceipt?: boolean; operationFallback?: boolean; operationOutcomeUncertain?: boolean; operationReceiptReplay?: boolean
+    }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
-      session.lastError = action.payload.message
+      // A provider receipt is more informative than the managed host's
+      // body-free fallback for the same operation, in either arrival order.
+      const sameOperation = Boolean(action.payload.operationReceipt && action.payload.requestId
+        && session.lastErrorRequestId === action.payload.requestId)
+      if (action.payload.operationReceipt && action.payload.requestId) {
+        const fingerprint = operationReceiptFingerprint([
+          action.payload.requestId, action.payload.code ?? null, action.payload.message,
+          Boolean(action.payload.operationFallback), Boolean(action.payload.operationOutcomeUncertain),
+        ])
+        const recent = session.recentOperationReceiptFingerprints ??= []
+        const seen = recent.includes(fingerprint)
+        // A replay to another pane is broadcast to this pane too. Ignore an
+        // already-seen receipt even when a later attempt reused its request ID.
+        if (action.payload.operationReceiptReplay && seen) return
+        if (!seen) {
+          recent.push(fingerprint)
+          if (recent.length > 128) recent.shift()
+        }
+      }
+      if (action.payload.operationFallback && sameOperation && session.lastErrorWasOperationFallback === false) {
+        if (action.payload.operationOutcomeUncertain && !session.lastErrorOperationUncertain) {
+          session.lastError = `${session.lastError} ${action.payload.message}`
+          session.lastErrorOperationUncertain = true
+          session.lastErrorOperationUncertainty = action.payload.message
+        }
+        return
+      }
+      const priorUncertainty = !action.payload.operationFallback && sameOperation
+        && session.lastErrorOperationUncertain
+        ? session.lastErrorOperationUncertainty
+          ?? (session.lastErrorWasOperationFallback ? session.lastError : undefined)
+        : undefined
+      const nativeUncertainty = action.payload.operationReceipt && !action.payload.operationFallback
+        && action.payload.operationOutcomeUncertain && !priorUncertainty
+        ? 'The outcome could not be confirmed. Check the conversation before trying again.' : undefined
+      const uncertainty = priorUncertainty || nativeUncertainty
+        || (action.payload.operationFallback && action.payload.operationOutcomeUncertain ? action.payload.message : undefined)
+      session.lastError = [action.payload.message, priorUncertainty || nativeUncertainty].filter(Boolean).join(' ')
+      session.lastErrorRequestId = action.payload.operationReceipt ? action.payload.requestId : undefined
+      session.lastErrorWasOperationFallback = action.payload.operationReceipt ? Boolean(action.payload.operationFallback) : undefined
+      session.lastErrorOperationUncertain = action.payload.operationReceipt
+        ? Boolean(uncertainty) : undefined
+      session.lastErrorOperationUncertainty = action.payload.operationReceipt ? uncertainty : undefined
       // Task 14: the view filters SESSION_RESERVED out of the pane-level
       // error banner (a transient reservation is re-driven, never surfaced).
       session.lastErrorCode = action.payload.code
@@ -455,8 +521,9 @@ const freshAgentSlice = createSlice({
         session.historyLoading = false
         session.restoreFailureCode = action.payload.code
         session.restoreFailureMessage = action.payload.message
-      } else if (action.payload.code === 'SESSION_RESERVED') {
-        // A transient reservation does NOT end the turn. The fence-less
+      } else if (action.payload.code === 'SESSION_RESERVED' || action.payload.operationReceipt) {
+        // An operation failure does not prove the current turn has ended.
+        // A transient reservation likewise does NOT end the turn. The fence-less
         // mount-rebind attach for a just-materialized session answers this
         // typed refusal (FENCE_REQUIRED server-side — "re-observe the owner
         // record and retry with the pair") and the pane redrives the attach
@@ -507,8 +574,26 @@ const freshAgentSlice = createSlice({
       if (!key) return
       const session = state.sessions[key]
       if (!session) return
-      session.lastError = undefined
-      session.lastErrorCode = undefined
+      clearSessionErrorState(session)
+    },
+
+    beginOperationAttempt(state, action: PayloadAction<SessionMutationPayload & { requestId: string }>) {
+      const key = resolveSessionKey(state, action.payload)
+      if (!key) return
+      const session = state.sessions[key]
+      // Do not clear a failure belonging to another request.
+      if (!session || action.payload.requestId !== session.lastErrorRequestId) return
+      if (session.lastErrorOperationUncertain) {
+        // A new attempt does not resolve an earlier unconfirmed delivery.
+        // Retain its warning without carrying its old provider cause forward.
+        if (session.lastErrorOperationUncertainty) {
+          session.lastError = session.lastErrorOperationUncertainty
+          session.lastErrorCode = undefined
+          session.lastErrorWasOperationFallback = true
+        }
+        return
+      }
+      clearSessionErrorState(session)
     },
 
     /**
@@ -744,6 +829,7 @@ export const {
   applyRuntimeOwner,
   applyRuntimeOwnerFenceRefresh,
   applyRefusalFence,
+  beginOperationAttempt,
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,

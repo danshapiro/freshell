@@ -10,17 +10,18 @@ use freshell_runtime_protocol::{
     FreshAgentCompactRequest, FreshAgentConfigureRequest, FreshAgentForkRequest,
     FreshAgentInterruptRequest, FreshAgentProviderStartDiagnostic, FreshAgentReadEventsRequest,
     FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan,
-    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
-    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
-    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
-    RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode,
-    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
-    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
-    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
-    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    FreshAgentRollbackRequest, FreshAgentSendDiagnostic, FreshAgentSendRequest, IncidentId,
+    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, LostSoulRepairTarget,
+    ManagedRolloutMode, MigrationPlan, MigrationPlanRequest, NoticeDeliveryState, NoticeId,
+    NoticeReceiptRequest, OpenCodeTransferAction, OpenCodeTransferDescriptor,
+    OpenCodeTransferResult, PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest,
+    RecoveryProbeRequest, RecoveryTrigger, RepairAudit, RepairRequest, RequestId,
+    RestoreLostSoulsRequest, RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError,
+    RuntimeErrorCode, RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot,
+    RuntimeNotice, RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest,
+    TerminalReadOutputRequest, TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult,
+    UpdateViewVisibilityRequest, UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent,
+    CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -37,6 +38,7 @@ pub enum ClientError {
         message: String,
         diagnostic_code: Option<RuntimeDiagnosticCode>,
         fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
+        fresh_agent_send_diagnostic: Option<FreshAgentSendDiagnostic>,
     },
     #[error("runtime supervisor returned an unexpected result")]
     UnexpectedResult,
@@ -691,6 +693,7 @@ impl RuntimeClient {
                 message: error.message,
                 diagnostic_code: None,
                 fresh_agent_provider_start_diagnostic: None,
+                fresh_agent_send_diagnostic: None,
             })?;
         let original = request.clone();
         match self
@@ -1268,12 +1271,22 @@ impl RuntimeClient {
     }
 
     pub async fn fresh_agent_interrupt(&self, soul_id: SoulId) -> Result<(), ClientError> {
+        self.fresh_agent_interrupt_with_request_id(soul_id, None)
+            .await
+    }
+
+    pub async fn fresh_agent_interrupt_with_request_id(
+        &self,
+        soul_id: SoulId,
+        request_id: Option<String>,
+    ) -> Result<(), ClientError> {
         let epoch = self.current_epoch().await?;
         match self
             .request(
                 RequestId::new(),
                 AdminCommand::FreshAgentInterrupt(FreshAgentInterruptRequest {
                     soul_id,
+                    request_id,
                     expected_control_epoch: Some(epoch),
                 }),
             )
@@ -1291,6 +1304,7 @@ impl RuntimeClient {
                 RequestId::new(),
                 AdminCommand::FreshAgentPrepareNative(FreshAgentInterruptRequest {
                     soul_id,
+                    request_id: None,
                     expected_control_epoch: Some(epoch),
                 }),
             )
@@ -1580,6 +1594,7 @@ fn runtime_error(error: RuntimeError) -> ClientError {
         message: error.message,
         diagnostic_code: error.diagnostic_code,
         fresh_agent_provider_start_diagnostic: error.fresh_agent_provider_start_diagnostic,
+        fresh_agent_send_diagnostic: error.fresh_agent_send_diagnostic,
     }
 }
 

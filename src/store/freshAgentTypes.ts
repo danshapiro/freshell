@@ -131,6 +131,11 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   totalInputTokens: number
   totalOutputTokens: number
   lastError?: string
+  lastErrorRequestId?: string
+  lastErrorWasOperationFallback?: boolean
+  lastErrorOperationUncertain?: boolean
+  lastErrorOperationUncertainty?: string
+  recentOperationReceiptFingerprints?: string[]
   /// Task 14: the code that produced lastError -- the view filters
   /// SESSION_RESERVED out of the pane-level error banner (transient, re-driven).
   lastErrorCode?: string

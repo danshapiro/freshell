@@ -17,7 +17,7 @@ import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
-import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
@@ -2041,6 +2041,48 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ ...locator, text: 'Follow up after the current turn' })
     })
 
+    it('shows a new operation error while a legacy follower ignores it and queued work waits', async () => {
+      const queue = await setup('running')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const legacyStore = createStore()
+      handleFreshAgentMessage(legacyStore.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.status', status: 'running' } })
+      // The released receiver handles freshAgent.error, but ignores unknown
+      // nested event types and does not pass their additive fields to Redux.
+      const receiveLegacy = (event: Record<string, unknown>) => {
+        if (event.type === 'freshAgent.error') {
+          legacyStore.dispatch(sessionError({ ...locator, code: event.code as string, message: event.message as string }))
+        }
+      }
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+        receiveLegacy(message.event)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      queue.send('Follow up after the Stop request')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      deliver({ type: 'freshAgent.operation.error', requestId: 'stop-1', operationReceipt: true,
+        code: 'SESSION_NOT_FOUND', message: 'The Stop request could not find the session.' })
+
+      expect(document.querySelector('[data-agent-error="session"] summary')).toHaveTextContent('The Stop request could not find the session.')
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(legacyStore.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('button', { name: /stop/i })).toBeEnabled()
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      // Verify that the legacy receiver would treat the old error shape as
+      // terminal; the distinct subtype is what protects the follower.
+      act(() => receiveLegacy({ type: 'freshAgent.error', code: 'STOP_FAILED', message: 'Stop failed.' }))
+      expect(legacyStore.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('idle')
+      deliver({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle' })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ ...locator, text: 'Follow up after the Stop request' })
+    })
+
     it('keeps an active-turn provider diagnostic visible while its snapshot is delayed', async () => {
       const queue = await setup('running')
       queue.send('Follow up after this turn')
@@ -2824,6 +2866,89 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('starts a new answer without associating an older refusal with its uncertain outcome', async () => {
+    const store = createStore()
+    const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      ...locator,
+      status: 'running',
+      capabilities: { send: true, interrupt: true, questions: true },
+      pendingQuestions: [{ requestId: 'question-1', questions: [{
+        header: 'Next', question: 'Continue?', options: [{ label: 'Yes', description: 'Proceed' }], multiSelect: false,
+      }] }],
+      turns: [],
+    })
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'req-answer-retry', status: 'connected',
+    }} /></Provider>)
+    await screen.findByRole('button', { name: 'Yes' })
+
+    const earlier = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The earlier answer was rejected.' }
+    act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: earlier }))
+    expect(screen.getByText(/The earlier answer was rejected\..*Agent error/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(sentFreshAgentMessages('freshAgent.question.respond').at(-1)).toMatchObject({ requestId: 'question-1' })
+
+    const fallback = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+      message: 'Sending the answer could not be confirmed.' }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: fallback })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { ...earlier, operationReceiptReplay: true } })
+    })
+    const key = `freshclaude:claude:${CLAUDE_THREAD_ID}`
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(fallback.message)
+    expect(screen.getByText(/Sending the answer could not be confirmed\..*Agent error/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument()
+
+    // Another attempt must keep the unresolved delivery warning, while
+    // removing the earlier attempt's provider-specific cause.
+    const later = { ...earlier, message: 'The later answer was rejected.' }
+    act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: later }))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(`${later.message} ${fallback.message}`)
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(fallback.message)
+
+    // Answering this question must not dismiss an unrelated operation error.
+    const unrelated = { ...earlier, requestId: 'question-2', message: 'Another request failed.' }
+    act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: unrelated }))
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(unrelated.message)
+  })
+
+  it('clears the matching prior refusal when retrying an approval or elicitation', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'thread-retry-controls', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const key = 'freshcodex:codex:thread-retry-controls'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      ...locator,
+      status: 'running',
+      capabilities: { send: true, interrupt: true, approvals: true },
+      pendingApprovals: [{ requestId: 'approval-1', toolName: 'Bash', input: { command: 'echo ok' } }],
+      pendingElicitations: [{ requestId: 'elicitation-1', mode: 'form', serverName: 'MCP tool', message: 'Continue?', fields: [] }],
+      turns: [],
+    })
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'req-control-retry', status: 'connected',
+    }} /></Provider>)
+    await screen.findByRole('button', { name: /allow tool use/i })
+    const fail = (requestId: string) => act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: {
+      type: 'freshAgent.error', requestId, operationReceipt: true, code: 'CONTROL_FAILED', message: `Prior failure: ${requestId}`,
+    } }))
+    fail('approval-1')
+    fireEvent.click(screen.getByRole('button', { name: /allow tool use/i }))
+    expect(sentFreshAgentMessages('freshAgent.approval.respond').at(-1)).toMatchObject({ requestId: 'approval-1' })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+
+    fail('elicitation-1')
+    fireEvent.click(screen.getByRole('button', { name: 'Decline' }))
+    expect(sentFreshAgentMessages('freshAgent.elicitation.respond').at(-1)).toMatchObject({ requestId: 'elicitation-1' })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+  })
+
   it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -3477,14 +3602,59 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
 
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.interrupt',
+      requestId: expect.any(String),
       sessionId: 'ses_stop_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/route-aware',
     })
+    const stops = sentFreshAgentMessages('freshAgent.interrupt')
+    expect(stops).toHaveLength(2)
+    expect(stops[0].requestId).not.toBe(stops[1].requestId)
+  })
+
+  it.each([true, false])('keeps the Stop provider receipt and fallback in either order (fallback first: %s)', async (fallbackFirst) => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionId: 'ses_stop_receipt', sessionType: 'freshopencode' as const, provider: 'opencode' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...locator, threadId: locator.sessionId, status: 'running',
+      capabilities: { send: false, interrupt: true }, turns: [] })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'stop-receipt-pane', status: 'running',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+    const requestId = sentFreshAgentMessages('freshAgent.interrupt').at(-1)?.requestId
+    expect(requestId).toEqual(expect.any(String))
+    const provider = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.operation.error', sessionId: locator.sessionId,
+      requestId, operationReceipt: true, code: 'OPENCODE_INTERRUPT_FAILED', message: 'Provider could not stop this turn.' } }
+    const fallback = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.error', sessionId: locator.sessionId,
+      requestId, operationReceipt: true, operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+      message: 'Stopping the agent could not be confirmed. Check the conversation before trying again.' } }
+    for (const message of fallbackFirst ? [fallback, provider] : [provider, fallback]) {
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, message)
+        for (const handler of [...handlers]) handler(message)
+      })
+    }
+    const summary = document.querySelector('[data-agent-error="session"] summary')
+    expect(summary).toHaveTextContent('Provider could not stop this turn.')
+    expect(summary).toHaveTextContent('Stopping the agent could not be confirmed.')
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_stop_receipt'].status).toBe('running')
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+
+    // Older servers can still send the uncorrelated session-error shape.
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.error', sessionId: locator.sessionId, code: 'LEGACY_ERROR', message: 'Older server error',
+    } }))
+    expect(document.querySelector('[data-agent-error="session"] summary')).toHaveTextContent('Older server error')
   })
 
   it('marks the fresh-agent body with pane and session flavor context metadata', async () => {
@@ -16593,6 +16763,45 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
     expect(screen.getByText(serverCopy)).toBeInTheDocument()
   })
 
+  it.each([
+    ['freshAgent.error', true], ['freshAgent.error', false],
+    ['freshAgent.operation.error', true], ['freshAgent.operation.error', false],
+  ])('keeps the %s rollback cause and uncertainty in either receipt order (fallback first: %s)', async (providerType, fallbackFirst) => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const requestId = String(sentFreshAgentMessages('freshAgent.undo').at(-1)?.requestId)
+    const outer = { type: 'freshAgent.event', sessionId: 'ses_rollback', sessionType: 'freshopencode', provider: 'opencode' }
+    const fallback = { type: 'freshAgent.error', requestId, rollback: true, operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS', message: 'Undo could not be confirmed.' }
+    const native = { type: providerType, requestId, rollback: true, operationReceipt: true,
+      code: 'REDO_UNAVAILABLE', message: 'The provider cannot undo this turn.' }
+    const unrelated = { ...outer, event: { ...native, requestId: 'other-pane-request', message: 'Other pane rollback failure.' } }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, unrelated as never)
+      onMessage?.(unrelated)
+    })
+    expect(screen.queryByText('Other pane rollback failure.')).toBeNull()
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_rollback']?.lastError).toBeUndefined()
+    for (const event of fallbackFirst ? [fallback, native] : [native, fallback]) act(() => {
+      const message = { ...outer, event }
+      handleFreshAgentMessage(store.dispatch, message as never)
+      onMessage?.(message)
+    })
+    expect(screen.getByText(/The provider cannot undo this turn/)).toHaveTextContent('Undo could not be confirmed.')
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_rollback']?.lastError).toBeUndefined()
+  })
+
   it('a re-delivered rolledBack ack with the SAME requestId NEVER re-refills the composer (consume-once per requestId)', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -19481,6 +19690,514 @@ describe('task delegation open-session link (freshopencode tui parity)', () => {
 })
 
 describe('task6 hosted recovery in the mounted view', () => {
+  it('shows a reserved compact receipt without retrying an attach or ending the running turn', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionType: 'freshopencode' as const, provider: 'opencode' as const, sessionId: 'ses_reserved_compact' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...locator, threadId: locator.sessionId, status: 'running',
+      capabilities: { send: false, interrupt: true }, turns: [],
+      extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } } })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+    const content = (suffix: string): FreshAgentPaneContent => ({ kind: 'fresh-agent', ...locator,
+      sessionRef: { provider: 'opencode', sessionId: locator.sessionId }, createRequestId: `compact-reserved-${suffix}`,
+      status: 'running', soulId: 'compact-reserved-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: content('first') }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: content('second'), activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const current = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (current?.kind !== 'fresh-agent') throw new Error(`Missing pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={current} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="Compact requester"><Pane paneId="pane-1" /></section>
+      <section aria-label="Other conversation pane"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const requester = within(screen.getByRole('region', { name: 'Compact requester' }))
+    await waitFor(() => {
+      expect(requester.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+      expect(handlers.size).toBe(2)
+    })
+    fireEvent.change(requester.getByRole('textbox', { name: 'Chat message input' }), { target: { value: '/compact' } })
+    fireEvent.click(requester.getByRole('button', { name: 'Send', exact: true }))
+    const requestId = sentFreshAgentMessages('freshAgent.compact').at(-1)?.requestId
+    expect(requestId).toEqual(expect.any(String))
+    wsMock.send.mockClear()
+    const reason = 'The conversation is reserved for a handoff.'
+    const receipt = { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.error', sessionId: locator.sessionId, code: 'SESSION_RESERVED', message: reason,
+      requestId, operationReceipt: true,
+    } }
+    const legacy = { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.error', sessionId: locator.sessionId, code: 'SESSION_RESERVED', message: reason,
+    } }
+    const deliver = (message: typeof receipt | typeof legacy) => act(() => {
+      handleFreshAgentMessage(store.dispatch, message)
+      for (const handler of [...handlers]) handler(message)
+    })
+    vi.useFakeTimers()
+    try {
+      deliver(receipt)
+      expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_reserved_compact'].status).toBe('running')
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      const errors = document.querySelectorAll('[data-agent-error="session"] summary')
+      expect(errors).toHaveLength(2)
+      for (const error of errors) expect(error).toHaveTextContent(reason)
+
+      // A genuine legacy attach reservation remains hidden and redrives the
+      // same attachments; compact receipts must not be mistaken for it.
+      deliver(legacy)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach').map((frame) => frame.paneId).sort()).toEqual(['pane-1', 'pane-2'])
+      expect(document.querySelectorAll('[data-agent-error="session"]')).toHaveLength(0)
+      expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_reserved_compact'].status).toBe('running')
+    } finally {
+      vi.useRealTimers()
+      cleanup()
+    }
+  })
+
+  it('keeps a request-scoped reserved send from reattaching either pane and retains legacy reattachment', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: 'shared-reserved-thread' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } } })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    const content = (suffix: string): FreshAgentPaneContent => ({ kind: 'fresh-agent', ...locator,
+      sessionRef: { provider: 'codex', sessionId: locator.sessionId }, createRequestId: `reserved-pane-${suffix}`,
+      status: 'idle', soulId: 'shared-reserved-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: content('first') }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: content('second'), activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const current = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (current?.kind !== 'fresh-agent') throw new Error(`Missing pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={current} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="Refused sender"><Pane paneId="pane-1" /></section>
+      <section aria-label="Other sender"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const owner = within(screen.getByRole('region', { name: 'Refused sender' }))
+    const other = within(screen.getByRole('region', { name: 'Other sender' }))
+    const ownerComposer = owner.getByRole('textbox', { name: 'Chat message input' })
+    const otherComposer = other.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => {
+      expect(ownerComposer).toBeEnabled()
+      expect(otherComposer).toBeEnabled()
+      expect(handlers.size).toBe(2)
+    })
+    const send = (pane: typeof owner, composer: HTMLElement, text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(pane.getByRole('button', { name: 'Send', exact: true }))
+    }
+    send(owner, ownerComposer, 'Refused message')
+    send(other, otherComposer, 'Other pending message')
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    const [owned, unrelated] = sentFreshAgentMessages('freshAgent.send')
+    fireEvent.change(ownerComposer, { target: { value: 'Owner newer draft' } })
+    fireEvent.change(otherComposer, { target: { value: 'Other newer draft' } })
+    const otherBefore = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')
+    expect(otherBefore).toMatchObject({ pendingLocalEcho: { requestId: unrelated.requestId } })
+    const reason = 'Another resume for this session is in flight'
+    const refusal = { type: 'error', code: 'INTERNAL_ERROR', requestId: owned.requestId,
+      message: `SESSION_RESERVED: ${reason}` }
+    const legacy = { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', sessionId: locator.sessionId, code: 'SESSION_RESERVED', message: reason } }
+    wsMock.send.mockClear()
+    vi.useFakeTimers()
+    try {
+      act(() => { for (const handler of [...handlers]) handler(refusal) })
+      expect(ownerComposer).toHaveValue('Refused message\nOwner newer draft')
+      expect(owner.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Message not sent: ${reason}`)
+      expect(otherComposer).toHaveValue('Other newer draft')
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(otherBefore)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      // Legacy sends with no request ID still publish the existing
+      // session-scoped event and drive the established attachment retry.
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, legacy)
+        for (const handler of [...handlers]) handler(legacy)
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach').map((frame) => frame.paneId).sort()).toEqual(['pane-1', 'pane-2'])
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(otherComposer).toHaveValue('Other newer draft')
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(otherBefore)
+    } finally {
+      vi.useRealTimers()
+      cleanup()
+    }
+  })
+
+  it('preserves an earlier pane\'s uncertain send when another pane is definitely refused', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: 'shared-uncertain-thread' }
+    const snapshot = { ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } } }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    const content = (suffix: string): FreshAgentPaneContent => ({
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      createRequestId: `uncertain-pane-${suffix}`, status: 'idle', soulId: 'shared-uncertain-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: content('first') }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: content('second'), activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const current = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (current?.kind !== 'fresh-agent') throw new Error(`Missing pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={current} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="Earlier send pane"><Pane paneId="pane-1" /></section>
+      <section aria-label="Later send pane"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const earlier = within(screen.getByRole('region', { name: 'Earlier send pane' }))
+    const later = within(screen.getByRole('region', { name: 'Later send pane' }))
+    const earlierComposer = earlier.getByRole('textbox', { name: 'Chat message input' })
+    const laterComposer = later.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => {
+      expect(earlierComposer).toBeEnabled()
+      expect(laterComposer).toBeEnabled()
+      expect(handlers.size).toBe(2)
+    })
+    const heldSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldSnapshot.promise)
+    const send = (pane: typeof earlier, composer: HTMLElement, text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(pane.getByRole('button', { name: 'Send', exact: true }))
+    }
+    const deliver = (message: Record<string, unknown>) => act(() => { for (const handler of [...handlers]) handler(message) })
+    try {
+      send(earlier, earlierComposer, 'Earlier request')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      const earlierId = sentFreshAgentMessages('freshAgent.send')[0].requestId
+      send(earlier, earlierComposer, 'Earlier queued follow-up')
+      fireEvent.change(earlierComposer, { target: { value: 'Earlier newer draft' } })
+      deliver({ type: 'error', code: 'INTERNAL_ERROR', requestId: earlierId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost' })
+      expect(earlierComposer).toHaveValue('Earlier request\nEarlier newer draft')
+      expect(earlier.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${earlierId})`)
+      expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      send(later, laterComposer, 'Later request')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      const laterId = sentFreshAgentMessages('freshAgent.send')[1].requestId
+      expect(laterId).not.toBe(earlierId)
+      fireEvent.change(laterComposer, { target: { value: 'Later newer draft' } })
+      const refusal = { type: 'error', code: 'INTERNAL_ERROR', requestId: laterId,
+        message: 'CODEX_PREVIOUS_DELIVERY_AMBIGUOUS: Earlier input has unresolved native delivery; recover or inspect the conversation before sending again' }
+      // The native receipt and hosted response may both report this refusal.
+      act(() => { for (const handler of [...handlers]) handler(refusal); for (const handler of [...handlers]) handler(refusal) })
+      expect(laterComposer).toHaveValue('Later request\nLater newer draft')
+      expect(later.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(
+        'Message not sent: Earlier input has unresolved native delivery; recover or inspect the conversation before sending again',
+      )
+      expect(earlierComposer).toHaveValue('Earlier request\nEarlier newer draft')
+      expect(earlier.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${earlierId})`)
+      expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      // A repeated idle status is not evidence that the earlier input settled.
+      act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+      expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+    } finally {
+      cleanup()
+      await act(async () => heldSnapshot.resolve(snapshot))
+    }
+  })
+
+  it.each([
+    ['freshcodex', 'codex', 'refusal', 'CODEX_TURN_START_FAILED: native input refused'],
+    ['freshcodex', 'codex', 'uncertain delivery', 'CODEX_DELIVERY_AMBIGUOUS: native response was lost'],
+    ['freshclaude', 'claude', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost'],
+    ['freshopencode', 'opencode', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost'],
+    ['freshclaude', 'claude', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost', true],
+    ['freshopencode', 'opencode', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost', true],
+  ] as const)('scopes a hosted %s send %s %s to its initiating pane and preserves queued work (nested: %s)', async (sessionType, provider, outcome, message, nested = false) => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.add(handler)
+      return () => { handlers.delete(handler) }
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+      sessionType, provider, threadId: sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { [provider]: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    }))
+    const sessionId = (suffix: string) => provider === 'claude'
+      ? `550e8400-e29b-41d4-a716-44665544000${suffix === 'first' ? '1' : '2'}`
+      : provider === 'opencode' ? `ses_hosted_${suffix}` : `hosted-${suffix}`
+    const paneContent = (suffix: string): FreshAgentPaneContent => ({
+      kind: 'fresh-agent', sessionType, provider,
+      sessionId: sessionId(suffix), sessionRef: { provider, sessionId: sessionId(suffix) },
+      createRequestId: `hosted-create-${suffix}`, status: 'idle',
+      soulId: `hosted-soul-${suffix}`, soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    })
+    const first = paneContent('first')
+    const second = paneContent('second')
+    for (const content of [first, second]) {
+      const locator = { sessionId: content.sessionId!, sessionType: content.sessionType, provider: content.provider }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: second, activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const content = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (content?.kind !== 'fresh-agent') throw new Error(`Missing hosted pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={content} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="First hosted pane"><Pane paneId="pane-1" /></section>
+      <section aria-label="Second hosted pane"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const firstPane = within(screen.getByRole('region', { name: 'First hosted pane' }))
+    const secondPane = within(screen.getByRole('region', { name: 'Second hosted pane' }))
+    const firstComposer = firstPane.getByRole('textbox', { name: 'Chat message input' })
+    const secondComposer = secondPane.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => {
+      expect(firstComposer).toBeEnabled()
+      expect(secondComposer).toBeEnabled()
+      expect(handlers.size).toBe(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.map((call) => call[2]))
+        .toEqual(expect.arrayContaining([first.sessionId, second.sessionId]))
+    })
+    // Keep any recovery read pending so it cannot decide the uncertain send.
+    const heldSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldSnapshot.promise)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    const send = (pane: typeof firstPane, composer: HTMLElement, text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(pane.getByRole('button', { name: 'Send', exact: true }))
+    }
+    const status = (content: FreshAgentPaneContent, next: 'running' | 'idle') => {
+      store.dispatch(setSessionStatus({ sessionId: content.sessionId!, sessionType: content.sessionType,
+        provider: content.provider, status: next }))
+    }
+    try {
+      send(firstPane, firstComposer, 'First pane original')
+      send(secondPane, secondComposer, 'Second pane original')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      const [firstSend, secondSend] = sentFreshAgentMessages('freshAgent.send')
+      expect(firstSend).toMatchObject({ sessionId: first.sessionId, text: 'First pane original' })
+      expect(secondSend).toMatchObject({ sessionId: second.sessionId, text: 'Second pane original' })
+      expect(firstSend.requestId).not.toBe(secondSend.requestId)
+      // A definite refusal may arrive while another turn is still running.
+      // For uncertain delivery, leave the first session idle to prove that
+      // the pending send itself holds its queue until lifecycle evidence.
+      act(() => {
+        if (outcome === 'refusal') status(first, 'running')
+        status(second, 'running')
+      })
+      send(firstPane, firstComposer, 'First pane follow-up')
+      send(secondPane, secondComposer, 'Second pane follow-up')
+      fireEvent.change(firstComposer, { target: { value: 'First pane newer draft' } })
+      fireEvent.change(secondComposer, { target: { value: 'Second pane newer draft' } })
+      fireEvent.click(firstPane.getByRole('button', { name: 'Show queued messages' }))
+      fireEvent.click(secondPane.getByRole('button', { name: 'Show queued messages' }))
+      expect(firstPane.getByText('First pane follow-up')).toBeVisible()
+      expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
+      if (provider === 'opencode') expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1'))
+        .toMatchObject({ status: 'running' })
+      const secondBefore = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')
+      expect(secondBefore).toMatchObject({ pendingLocalEcho: { requestId: secondSend.requestId, text: 'Second pane original' } })
+
+      const error = nested ? { type: 'freshAgent.event', sessionId: first.sessionId, sessionType, provider,
+        event: { type: 'freshAgent.send.uncertain', sessionId: first.sessionId, requestId: firstSend.requestId, message } }
+        : { type: 'error', code: 'INTERNAL_ERROR', requestId: firstSend.requestId, message,
+          timestamp: '2026-10-26T00:00:00.000Z' }
+      if (nested) {
+        // The released receiver has no branch for this new nested type. It
+        // must leave its running session alone rather than infer refusal.
+        const legacyStore = createStore()
+        const legacyLocator = { sessionId: first.sessionId!, sessionType, provider }
+        legacyStore.dispatch(sessionInit(legacyLocator))
+        legacyStore.dispatch(setSessionStatus({ ...legacyLocator, status: 'running' }))
+        expect(handleFreshAgentMessage(legacyStore.dispatch, error as never)).toBe(false)
+        expect(legacyStore.getState().freshAgent.sessions[`${sessionType}:${provider}:${first.sessionId}`].status).toBe('running')
+        const foreign = { type: 'freshAgent.event', sessionId: second.sessionId, sessionType, provider,
+          event: { type: 'freshAgent.send.uncertain', sessionId: second.sessionId, requestId: firstSend.requestId, message } }
+        act(() => { for (const handler of [...handlers]) handler(foreign) })
+        expect(firstComposer).toHaveValue('First pane newer draft')
+        expect(secondComposer).toHaveValue('Second pane newer draft')
+        const mismatchedInner = { type: 'freshAgent.event', sessionId: first.sessionId, sessionType, provider,
+          event: { type: 'freshAgent.send.uncertain', sessionId: second.sessionId, requestId: firstSend.requestId, message } }
+        act(() => { for (const handler of [...handlers]) handler(mismatchedInner) })
+        expect(firstComposer).toHaveValue('First pane newer draft')
+        expect(firstPane.queryByRole('alert', { name: 'Agent warning' })).not.toBeInTheDocument()
+      }
+      act(() => { for (const handler of [...handlers]) handler(error) })
+      await waitFor(() => expect(firstComposer).toHaveValue('First pane original\nFirst pane newer draft'))
+      expect(firstPane.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(outcome === 'refusal'
+        ? 'Message not sent: native input refused'
+        : `Delivery uncertain (${firstSend.requestId}): native response was lost. Check the conversation before sending again.`)
+      expect(firstPane.getByText('First pane follow-up')).toBeVisible()
+      expect(secondComposer).toHaveValue('Second pane newer draft')
+      expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
+      expect(secondPane.queryByRole('alert', { name: 'Agent warning' })).not.toBeInTheDocument()
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(secondBefore)
+      if (provider === 'opencode') expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1'))
+        .toMatchObject({ status: 'running' })
+      expect(store.getState().freshAgent.sessions[`${sessionType}:${provider}:${second.sessionId}`].status).toBe('running')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+
+      // A duplicate must not restore the draft twice or replay either queue.
+      act(() => { for (const handler of [...handlers]) handler(error) })
+      expect(firstComposer).toHaveValue('First pane original\nFirst pane newer draft')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+
+      if (outcome === 'uncertain delivery') {
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.some((call) => call[2] === first.sessionId)).toBe(true))
+        // An idle report without a prior busy turn does not settle an
+        // uncertain send or let the follow-up overtake it.
+        act(() => status(first, 'idle'))
+        expect(firstPane.getByText('First pane follow-up')).toBeVisible()
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+        act(() => status(first, 'running'))
+      }
+      // The first queue resumes only after its actual running turn becomes idle.
+      act(() => status(first, 'idle'))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(3))
+      expect(sentFreshAgentMessages('freshAgent.send')[2]).toMatchObject({
+        sessionId: first.sessionId, text: 'First pane follow-up',
+      })
+      expect(secondComposer).toHaveValue('Second pane newer draft')
+      expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(secondBefore)
+    } finally {
+      cleanup()
+      await act(async () => heldSnapshot.resolve({ status: 'running', capabilities: { send: true, interrupt: true }, turns: [] }))
+    }
+  })
+
+  it.each(([
+    ['freshcodex', 'codex', 'CODEX_DELIVERY_AMBIGUOUS'],
+    ['freshclaude', 'claude', 'FRESH_AGENT_DELIVERY_AMBIGUOUS'],
+    ['freshopencode', 'opencode', 'FRESH_AGENT_DELIVERY_AMBIGUOUS'],
+  ] as const).flatMap((provider) => (['fallback then refusal', 'refusal then fallback', 'fallback then acceptance', 'acceptance then fallback',
+    'batched fallback and legacy acceptance'] as const)
+    .map((order) => [...provider, order] as const)))('resolves a hosted %s / %s receipt (%s; %s)', async (sessionType, provider, ambiguityCode, order) => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const sessionId = provider === 'claude' ? '550e8400-e29b-41d4-a716-446655440003'
+      : provider === 'opencode' ? 'ses_hosted_receipt' : 'hosted-receipt'
+    const locator = { sessionId, sessionType, provider }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...locator, threadId: sessionId, status: 'idle', capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { [provider]: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider, sessionId }, createRequestId: 'hosted-receipt-create',
+      status: 'idle', soulId: 'hosted-receipt-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).toBeEnabled())
+    const heldSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldSnapshot.promise)
+    const send = (text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    }
+    const broadcast = (message: Record<string, unknown>) => { for (const handler of [...handlers]) handler(message) }
+    const deliver = (message: Record<string, unknown>) => act(() => broadcast(message))
+    try {
+      send('Original hosted request')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      const requestId = sentFreshAgentMessages('freshAgent.send')[0].requestId
+      send('Queued hosted follow-up')
+      fireEvent.change(composer, { target: { value: 'Newer draft' } })
+      const ambiguityMessage = `${ambiguityCode}: host response was lost`
+      const fallback = provider === 'codex'
+        ? { type: 'error', code: 'INTERNAL_ERROR', requestId, message: ambiguityMessage }
+        : { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.send.uncertain', sessionId,
+          requestId, message: ambiguityMessage } }
+      const refusal = { type: 'error', code: 'INTERNAL_ERROR', requestId,
+        message: 'NATIVE_INPUT_REFUSED: provider refused the message' }
+      const acceptance = { type: 'freshAgent.send.accepted', ...locator, requestId, submittedTurnId: 'accepted-native-turn' }
+      const concrete = order.includes('refusal') ? refusal : acceptance
+      const batched = order.startsWith('batched')
+      const fallbackFirst = order.startsWith('fallback') || batched
+
+      if (batched) {
+        act(() => { broadcast(fallback); broadcast({ ...acceptance, submittedTurnId: undefined }) })
+        deliver(fallback)
+      } else if (fallbackFirst) {
+        deliver(fallback)
+        await waitFor(() => expect(composer).toHaveValue('Original hosted request\nNewer draft'))
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery uncertain')
+        // Edits made after the fallback must survive a later concrete receipt.
+        fireEvent.change(composer, { target: { value: 'Original hosted request\nNewer draft, edited' } })
+        deliver(concrete)
+      } else {
+        deliver(concrete)
+        deliver(fallback)
+      }
+
+      if (order.includes('refusal')) {
+        await waitFor(() => expect(composer).toHaveValue(fallbackFirst
+          ? 'Original hosted request\nNewer draft, edited'
+          : 'Original hosted request\nNewer draft'))
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Message not sent: provider refused the message')
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued hosted follow-up' })
+      } else {
+        expect(composer).toHaveValue(batched ? 'Original hosted request\nNewer draft'
+          : fallbackFirst ? 'Original hosted request\nNewer draft, edited' : 'Newer draft')
+        expect(screen.queryByText(/Delivery uncertain/)).not.toBeInTheDocument()
+        if (fallbackFirst) expect(screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary'))
+          .toHaveTextContent('Message accepted. Your restored draft was kept.')
+        if (fallbackFirst) expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+          requestId, text: 'Original hosted request', ...(batched ? {} : { submittedTurnId: 'accepted-native-turn' }),
+        })
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        // Acceptance records the receipt but the queue must wait for the turn.
+        act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+        act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued hosted follow-up' })
+      }
+    } finally {
+      cleanup()
+      await act(async () => heldSnapshot.resolve({ status: 'running', capabilities: { send: true, interrupt: true }, turns: [] }))
+    }
+  })
+
   it.each(['accepted', 'refused', 'ambiguous'] as const)('keeps per-request async answer %s visible after retained recovery', async (outcome) => {
     const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
     const snapshot = {...native,status:'idle',capabilities:{...native.capabilities,send:true,interrupt:true},extensions:{codex:{ownerKind:'fresh-agent',statusFromLiveState:true}},turns:[{id:'async-turn',turnId:'async-turn',role:'assistant',summary:'',items:[{id:'async-answer',kind:'text',text:'Work can continue.',extensions:{codex:{itemId:'async-answer',delivery:'async',questions:[{id:'where',title:'Where?',options:['Staging']}]}}}]}]}

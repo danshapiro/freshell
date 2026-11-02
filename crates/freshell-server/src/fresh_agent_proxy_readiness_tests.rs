@@ -109,6 +109,7 @@ pub(super) struct ReadinessFixture {
     pub(super) native: Arc<std::sync::Mutex<(String, NativeIdentityObservation)>>,
     pub(super) events: Arc<std::sync::Mutex<Vec<AgentJournalEvent>>>,
     pub(super) sent_roots: Arc<std::sync::Mutex<Vec<String>>>,
+    pub(super) send_failure: Arc<std::sync::Mutex<Option<freshell_runtime_protocol::RuntimeError>>>,
     _tasks: OwnedTasks,
 }
 
@@ -231,6 +232,8 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
     )));
     let events = Arc::new(std::sync::Mutex::new(Vec::<AgentJournalEvent>::new()));
     let sent_roots = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let send_failure = Arc::new(std::sync::Mutex::new(None));
+    let host_send_failure = send_failure.clone();
     let (host_native, host_events, host_sent_roots, host_launch) = (
         native.clone(),
         events.clone(),
@@ -292,6 +295,19 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                     assert!(live, "the original input cannot reach an ended query");
                     assert_eq!(text, "one original browser input");
                     host_sent_roots.lock().unwrap().push(native.clone());
+                    let failure = host_send_failure.lock().unwrap().take();
+                    if let Some(failure) = failure {
+                        write_frame(
+                            &mut stream,
+                            &HostReply {
+                                request_id: envelope.request_id,
+                                result: Err(failure),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        continue;
+                    }
                     HostResult::FreshAgentCommand {
                         native_identity: None,
                         state: CommandState::ProviderAcked,
@@ -392,6 +408,7 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
         native,
         events,
         sent_roots,
+        send_failure,
         _tasks,
     }
 }

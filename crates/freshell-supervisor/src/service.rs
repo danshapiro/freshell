@@ -979,7 +979,8 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.fresh_agent_interrupt(request.soul_id).await?;
+                self.fresh_agent_interrupt(request.soul_id, request.request_id)
+                    .await?;
                 Ok(AdminResult::FreshAgentInterrupted)
             }
             AdminCommand::FreshAgentPrepareNative(request) => {
@@ -2315,6 +2316,7 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Refused(_) => return Ok(CommandState::Cancelled),
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2464,6 +2466,9 @@ impl Supervisor {
         {
             Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
             Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
+            Some(InputJournalDisposition::Refused(diagnostic)) => {
+                return Err(fresh_send_refusal_error(diagnostic))
+            }
             Some(InputJournalDisposition::Dispatch) | None => {}
         }
         let active = self
@@ -2494,6 +2499,9 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Refused(diagnostic) => {
+                return Err(fresh_send_refusal_error(diagnostic))
+            }
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2575,6 +2583,24 @@ impl Supervisor {
                     .map_err(map_registry)?;
                 Ok(CommandState::ProviderAcked)
             }
+            Ok(HostResult::FreshAgentCommand {
+                state: CommandState::Cancelled,
+                ..
+            }) => {
+                self.registry
+                    .mark_fresh_input_refused(
+                        soul_id,
+                        request_id,
+                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                            outcome:
+                                freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                            message: None,
+                        },
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                Ok(CommandState::Cancelled)
+            }
             Ok(HostResult::FreshAgentCommand { state, .. }) => {
                 self.registry
                     .mark_input_ambiguous(soul_id, request_id)
@@ -2593,10 +2619,21 @@ impl Supervisor {
                 ))
             }
             Err(error) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
+                let refusal = error.fresh_agent_send_diagnostic.as_ref().filter(|diagnostic| {
+                    error.code != RuntimeErrorCode::CommandAmbiguous
+                        && diagnostic.outcome == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                });
+                if let Some(diagnostic) = refusal {
+                    self.registry
+                        .mark_fresh_input_refused(soul_id, request_id, diagnostic.clone())
+                        .await
+                        .map_err(map_registry)?;
+                } else {
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(map_registry)?;
+                }
                 Err(error)
             }
         }
@@ -3477,7 +3514,11 @@ impl Supervisor {
         }
     }
 
-    async fn fresh_agent_interrupt(&self, soul_id: SoulId) -> Result<(), RuntimeError> {
+    async fn fresh_agent_interrupt(
+        &self,
+        soul_id: SoulId,
+        request_id: Option<String>,
+    ) -> Result<(), RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
@@ -3495,6 +3536,7 @@ impl Supervisor {
                 &host,
                 HostCommand::FreshAgentInterrupt {
                     incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
                 },
             )
             .await?
@@ -9803,6 +9845,16 @@ fn map_opencode_transfer(error: crate::opencode_transfer::StagingError) -> Runti
         | crate::opencode_transfer::StagingError::Metadata(_) => RuntimeErrorCode::RegistryFailure,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+fn fresh_send_refusal_error(
+    diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::HostUnreachable,
+        "hosted fresh-agent command failed",
+    )
+    .with_fresh_agent_send_diagnostic(diagnostic)
 }
 
 fn map_registry(error: RegistryError) -> RuntimeError {
