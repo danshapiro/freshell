@@ -22,11 +22,21 @@
 //   key in the env. It skips (never fails) otherwise, and never runs in the
 //   default suite — the whole test/integration/real/ tree is excluded from the
 //   default config without the opt-in.
+// - "resumes a real conversation headlessly and appends to the same
+//   transcript" is the fourth tier, opt-in under the same double gate: it
+//   mints one fresh real conversation, resumes it with `--conversation <id>`,
+//   pins the transcript continuity receipts (same brain/<id> growth; unique,
+//   strictly-increasing USER_INPUT step indexes), and removes the
+//   conversation it created (brain/<id> + conversations/<id>.db) in a finally
+//   sweep — one real conversation created and then removed per gated run.
 //
-//   To run the full turn (CLI settings precondition: the real CLI's settings
-//   must select API-key auth — `modelProvider: "gemini"` — per the plan's
-//   Provider Contract Record, or the first paid attempt fails on CLI setup
-//   rather than a contract fact):
+//   To run the gated tiers 3-4 (CLI settings precondition: both tiers pass
+//   the session-scoped `--settings '{"modelProvider":"gemini"}'` overlay for
+//   API-key auth per the plan's Provider Contract Record — the shared
+//   settings.json is never mutated, and the binary REQUIRES GEMINI_API_KEY
+//   in the env for that overlay; argv shape: `--settings` earlier in argv,
+//   the prompt attached to its flag as `-p='<prompt>'` — the bare positional
+//   `-p <prompt>` form misparses and exits 2):
 //     FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 GEMINI_API_KEY=... \
 //       pnpm run test:vitest run test/integration/real/antigravity-launch-smoke.test.ts \
 //       --config config/vitest/vitest.config.ts
@@ -100,9 +110,136 @@ describe('antigravity real launch smoke', () => {
   itTurn('completes a headless turn and echoes the nonce', async () => {
     const { stdout } = await execFileAsync(
       agyCommand,
-      ['-p', 'Reply with exactly: antigravity-smoke-ok'],
+      // GC15: the session-scoped API-key-auth overlay — the shared settings.json
+      // is never mutated. Argv shape per the Task 1 receipts: --settings earlier
+      // in argv, the prompt attached to its flag (-p='<prompt>'); the bare
+      // positional form misparses and exits 2.
+      ['--settings', '{"modelProvider":"gemini"}', '-p=Reply with exactly: antigravity-smoke-ok'],
       { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
     )
     expect(stdout).toContain('antigravity-smoke-ok')
   }, 200_000)
+
+  // Resolves the store root the way the server's seam does
+  // (crates/freshell-sessions provider_layout.rs antigravity_home):
+  // FRESHELL_ANTIGRAVITY_HOME override > default root when it holds
+  // conversations > snap root when it does not. The snap binary pins its
+  // store under $HOME/snap regardless of a disposable HOME, so the live
+  // store is the snap root on this host (the contract-probe receipts).
+  async function resolveAgyStoreRoot(): Promise<string> {
+    if (process.env.FRESHELL_ANTIGRAVITY_HOME) return process.env.FRESHELL_ANTIGRAVITY_HOME
+    const home = os.homedir()
+    const defaultRoot = path.join(home, '.gemini', 'antigravity-cli')
+    const snapRoot = path.join(home, 'snap', 'antigravity-cli', 'common', '.gemini', 'antigravity-cli')
+    const hasConversations = async (root: string): Promise<boolean> => {
+      const brain = path.join(root, 'brain')
+      return await fs.readdir(brain).then((ids) => ids.length > 0).catch(() => false)
+    }
+    if (await hasConversations(defaultRoot)) return defaultRoot
+    if (await hasConversations(snapRoot)) return snapRoot
+    return defaultRoot
+  }
+
+  const runResume = available && realEnabled && hasProviderKey
+  const itResume = runResume ? it : it.skip
+  itResume(
+    'resumes a real conversation headlessly and appends to the same transcript',
+    async () => {
+      const nonce = `antigravity-smoke-resume-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const brainDir = path.join(await resolveAgyStoreRoot(), 'brain')
+      const before = new Set(await fs.readdir(brainDir).catch(() => [] as string[]))
+      // EVERY fresh conversation whose transcript carries the nonce — the
+      // cleanup sweep must remove them all even if the id resolution or any
+      // later assertion fails (a failed tier run must not leave its scratch
+      // data in the live store).
+      const nonceBearing = new Set<string>()
+      try {
+      // Turn 1: a fresh scratch conversation this run owns.
+      const first = await execFileAsync(
+        agyCommand,
+        ['--settings', '{"modelProvider":"gemini"}', `-p=Reply with exactly: ${nonce}`],
+        { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
+      )
+      expect(first.stdout).toContain(nonce)
+
+      // Find the NEW conversation(s) whose transcripts carry the nonce.
+      const after = await fs.readdir(brainDir)
+      const freshIds = after.filter((id) => !before.has(id))
+      let convId: string | undefined
+      for (const id of freshIds) {
+        const body = await fs
+          .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
+          .catch(() => '')
+        if (body.includes(nonce)) {
+          nonceBearing.add(id)
+          convId ??= id
+        }
+      }
+      expect(freshIds.length).toBeGreaterThanOrEqual(1)
+      expect(convId, 'the new conversation whose transcript carries the nonce').toBeTruthy()
+
+      // Binary record-schema pins on the run-owned transcript (the
+      // corrected contract; evidence: real-binary-transcript-evidence.md).
+      const transcriptPath = path.join(brainDir, convId!, '.system_generated', 'logs', 'transcript.jsonl')
+      const readRecords = async () =>
+        (await fs.readFile(transcriptPath, 'utf8'))
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+      const lines = await readRecords()
+      expect(lines[0].type).toBe('USER_INPUT')
+      expect(lines.some((r: { type: string }) => r.type === 'PLANNER_RESPONSE')).toBe(true)
+      const version = (await execFileAsync(agyCommand, ['--version'], { timeout: 15_000 })).stdout.trim()
+      const KNOWN_TYPES = new Set(['USER_INPUT', 'PLANNER_RESPONSE', 'GENERIC', 'SYSTEM_MESSAGE', 'CHECKPOINT'])
+      const unknownTypes = new Set<string>()
+      for (const record of lines) {
+        if (!KNOWN_TYPES.has(record.type)) { unknownTypes.add(record.type); continue }
+        // Stamps are asserted on the FIVE validated record types only: the contract
+        // says these types carry step_index and second-granularity created_at — it does
+        // not forbid a future CLI version from adding a sixth type. A stamp change on
+        // a KNOWN type still fails, and that failure is the drift alarm doing its job:
+        // record the version receipt and re-open the Provider Contract Record; never
+        // loosen the known-type assertions to get green.
+        expect(typeof record.step_index, `${record.type} step_index (agy ${version})`).toBe('number')
+        expect(record.created_at, `${record.type} created_at (agy ${version})`).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
+      }
+      if (unknownTypes.size > 0) console.log(`[tier4] unknown record types (recorded, not failed): ${[...unknownTypes].join(', ')} (agy ${version})`)
+
+      // THE real resume: same conversation, follow-up recall.
+      const linesBefore = lines.length
+      const second = await execFileAsync(
+        agyCommand,
+        ['--settings', '{"modelProvider":"gemini"}', '--conversation', convId!, '-p=Reply with exactly the string I asked you to reply with in the first message.'],
+        { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
+      )
+      expect(second.stdout).toContain(nonce)
+      expect(String(second.stderr ?? '')).not.toContain('warning: conversation')
+
+      // Continuity is transcript-level too: the SAME brain/<id> gained
+      // records, the USER_INPUT step indexes stay unique, and the
+      // resumed turn's are strictly greater (the collision-proof key).
+      const linesAfter = await readRecords()
+      expect(linesAfter.length).toBeGreaterThan(linesBefore)
+      const userSteps = linesAfter
+        .filter((r: { type: string }) => r.type === 'USER_INPUT')
+        .map((r: { step_index: number }) => r.step_index)
+      expect(new Set(userSteps).size).toBe(userSteps.length)
+      expect(userSteps[userSteps.length - 1]).toBeGreaterThan(userSteps[0])
+
+      // Cleanup (finally): this run owns every conversation it created (the
+      // contract-probe hygiene precedent). Remove BOTH store trees for EVERY
+      // nonce-bearing fresh conversation — success or any failure (Task 1
+      // Step 7 parity): brain/<id> (the transcript) and
+      // conversations/<id>.db (the per-conversation sidecar db — verified
+      // present per conversation in the real store).
+      } finally {
+        const storeRoot = await resolveAgyStoreRoot()
+        for (const id of nonceBearing) {
+          await fs.rm(path.join(brainDir, id), { recursive: true, force: true }).catch(() => {})
+          await fs.rm(path.join(storeRoot, 'conversations', `${id}.db`), { force: true }).catch(() => {})
+        }
+      }
+    },
+    420_000,
+  )
 })
