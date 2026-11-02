@@ -5330,7 +5330,7 @@ export class ManagedRuntimeOwner {
     const logPath = path.join(testRoot, `managed-update-${updateId}.jsonl`)
     const paths = {
       checkoutRoot: this.repoRoot, home: testRoot, runtimeDirectory: testRoot,
-      node: process.execPath, tsxEntry: path.join(this.repoRoot, 'node_modules/tsx/dist/cli.mjs'),
+      node: process.execPath, tsxLoader: path.join(this.repoRoot, 'node_modules/tsx/dist/loader.mjs'),
       updaterScript: path.join(this.repoRoot, 'scripts/update-managed-runtime.ts'),
       env: '/usr/bin/env', flock: '/usr/bin/flock', systemdRun: '/usr/bin/systemd-run',
       systemctl: '/usr/bin/systemctl', pnpm: '/usr/bin/pnpm', cargo: '/usr/bin/cargo',
@@ -5520,7 +5520,10 @@ export class ManagedRuntimeOwner {
         async restart(unit: string) { effects.push(`restart:${unit}`) },
         async isActive(unit: string) { return unit === fixtureOwner.supervisorUnit || simulatedAdmission !== 'shutdown-latched' },
         async state(unit: string) { return unit === fixtureOwner.supervisorUnit ? 'active' : 'inactive' },
-        async waitSupervisorReady() { effects.push('supervisor-ready') },
+        async waitSupervisorReady() {
+          effects.push('supervisor-ready')
+          return { ...identity }
+        },
         async waitWebReady() { effects.push('web-ready') },
         async waitWebStopped() { effects.push('web-stopped') },
         async waitCallbackReady() { effects.push('callback-ready') },

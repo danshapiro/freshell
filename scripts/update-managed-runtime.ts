@@ -140,7 +140,7 @@ export interface UpdatePaths {
   home: string
   runtimeDirectory: string
   node: string
-  tsxEntry: string
+  tsxLoader: string
   updaterScript: string
   env: string
   flock: string
@@ -211,7 +211,11 @@ export interface ManagedRuntimeUpdateDependencies {
     restart(unit: string): Promise<void>
     isActive(unit: string): Promise<boolean>
     state(unit: string): Promise<string>
-    waitSupervisorReady(owner: ManagedRuntimeOwner): Promise<void>
+    waitSupervisorReady(
+      owner: ManagedRuntimeOwner,
+      expectedImageReference: string,
+      previousIdentity: SupervisorIdentity,
+    ): Promise<SupervisorIdentity>
     waitWebReady(owner: ManagedRuntimeOwner): Promise<void>
     waitWebStopped(owner: ManagedRuntimeOwner): Promise<void>
     waitCallbackReady(owner: ManagedRuntimeOwner): Promise<void>
@@ -250,6 +254,12 @@ export interface ManagedRuntimeUpdateDependencies {
 class UpdateRefusal extends Error {}
 class UpdateFailure extends Error {}
 
+class ClientDirectoryActivationFailure extends UpdateFailure {
+  constructor(message: string, readonly priorDirectoryRestored: boolean) {
+    super(message)
+  }
+}
+
 interface WorkerExecutionState {
   mode: ManagedUpdateMode
   phase: string
@@ -271,6 +281,7 @@ interface WorkerExecutionState {
   shutdownGateState: 'open' | 'temporary' | 'latched' | 'unknown'
   shutdownCommitAttempted: boolean
   webProcessExitConfirmed: boolean
+  webRestoreBlocked?: 'client_directory_restore_failed' | 'client_directory_activation_failed' | 'mixed_client_server_versions'
 }
 
 interface SupervisorIdentity {
@@ -408,7 +419,7 @@ function createTransientServiceRequest(
   const args = [
     '--user', `--unit=${unit}`, `--working-directory=${dependencies.paths.checkoutRoot}`, '--wait', '--',
     dependencies.paths.env, '-i', ...Object.entries(environment).map(([key, value]) => `${key}=${value}`),
-    dependencies.paths.node, dependencies.paths.tsxEntry, dependencies.paths.updaterScript,
+    dependencies.paths.node, '--import', dependencies.paths.tsxLoader, dependencies.paths.updaterScript,
     '--bootstrap', '--mode', mode, '--unit-name', unit, '--run-id', id,
     ...(approvalFile ? ['--approval-file', approvalFile] : []),
   ]
@@ -444,7 +455,7 @@ export async function runManagedUpdateBootstrap(
     FRESHELL_UPDATE_LOG_PATH: logPath,
   }
   const command = [
-    dependencies.paths.node, dependencies.paths.tsxEntry, dependencies.paths.updaterScript,
+    dependencies.paths.node, '--import', dependencies.paths.tsxLoader, dependencies.paths.updaterScript,
     '--worker', '--mode', options.mode, '--unit-name', options.unitName, '--run-id', options.runId,
     ...(options.approvalFile ? ['--approval-file', options.approvalFile] : []),
   ]
@@ -789,6 +800,41 @@ function assertSameIdentity(actual: SupervisorIdentity, expected: SupervisorIden
   }
 }
 
+function assertSupervisorRestarted(
+  previous: SupervisorIdentity,
+  current: SupervisorIdentity,
+  message: string,
+): void {
+  if (current.installationId !== previous.installationId || current.controlEpoch <= previous.controlEpoch) {
+    throw new UpdateFailure(message)
+  }
+}
+
+export async function waitForSupervisorReadiness<T>(
+  check: (remainingMs: () => number) => Promise<T | undefined>,
+  options: {
+    timeoutMs?: number
+    intervalMs?: number
+    timeoutMessage?: string | (() => string)
+  } = {},
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? 30_000
+  const intervalMs = Math.max(1, options.intervalMs ?? 250)
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) break
+    const result = await check(() => Math.max(1, deadline - Date.now()))
+    if (result !== undefined) return result
+    const afterCheckMs = deadline - Date.now()
+    if (afterCheckMs <= 0) break
+    await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, afterCheckMs)))
+  }
+  const message = options.timeoutMessage
+    ?? 'The restarted managed-runtime supervisor did not become ready with its verified process and authenticated Health identity before the timeout.'
+  throw new UpdateFailure(typeof message === 'function' ? message() : message)
+}
+
 function assertReadinessForSafeShutdown(report: ReadinessReport): void {
   assertRuntimeReadiness(report)
   const panes = report.paneOwnership.panes as unknown[]
@@ -1037,7 +1083,17 @@ async function runClientUpdate(
   execution.phase = 'install_web'
   execution.filesInstalled = true
   await dependencies.filesystem.installExecutable(artifacts.webExecutable!, owner.webExecutable)
-  await dependencies.filesystem.swapClientDirectory(artifacts.clientDirectory!, owner.clientDirectory)
+  try {
+    await dependencies.filesystem.swapClientDirectory(artifacts.clientDirectory!, owner.clientDirectory)
+  } catch (error) {
+    execution.webRestoreBlocked = error instanceof ClientDirectoryActivationFailure
+      ? error.priorDirectoryRestored ? 'mixed_client_server_versions' : 'client_directory_restore_failed'
+      : 'client_directory_activation_failed'
+    const detail = describeClientDirectoryActivationFailure(error)
+    throw new UpdateFailure(
+      `${detail} The new server binary remains installed. The web service will remain stopped until the client and server artifacts are reconciled; manual recovery is required.`,
+    )
+  }
 
   execution.phase = 'start_web'
   await dependencies.services.start(owner.webUnit)
@@ -1087,7 +1143,7 @@ async function runResetUpdate(
 
   await stopManagedCodingSouls(mode, dependencies, owner, execution, stoppedIntentRevisions)
   await replaceDurableRuntime(mode, dependencies, owner, artifacts, execution)
-  await startUpdatedRuntime(mode, dependencies, owner, execution, authToken)
+  await startUpdatedRuntime(mode, dependencies, owner, artifacts, execution, authToken)
   return reopenSavedConversations(mode, dependencies, owner, inventory, groups, execution, stoppedIntentRevisions)
 }
 
@@ -1159,7 +1215,14 @@ async function replaceDurableRuntime(
   await dependencies.filesystem.installImageReference(owner.imageEnvironmentFile, artifacts.imageId!)
   if (mode === 'all') {
     await dependencies.filesystem.installExecutable(artifacts.webExecutable!, owner.webExecutable)
-    await dependencies.filesystem.swapClientDirectory(artifacts.clientDirectory!, owner.clientDirectory)
+    try {
+      await dependencies.filesystem.swapClientDirectory(artifacts.clientDirectory!, owner.clientDirectory)
+    } catch (error) {
+      const detail = describeClientDirectoryActivationFailure(error)
+      throw new UpdateFailure(
+        `${detail} The new managed-runtime binaries, workload image reference, and web server binary remain installed. The supervisor and web services remain stopped until the client and server artifacts are reconciled; manual recovery is required.`,
+      )
+    }
   }
 }
 
@@ -1167,13 +1230,19 @@ async function startUpdatedRuntime(
   mode: Exclude<ManagedUpdateMode, 'client'>,
   dependencies: ManagedRuntimeUpdateDependencies,
   owner: ManagedRuntimeOwner,
+  artifacts: StagedArtifacts,
   execution: WorkerExecutionState,
   authToken: string,
 ): Promise<void> {
   execution.phase = 'start_supervisor'
   await dependencies.services.start(owner.supervisorUnit)
-  await dependencies.services.waitSupervisorReady(owner)
-  const supervisorIdentity = await directSupervisorIdentity(dependencies, owner)
+  const previousIdentity = execution.preUpdateSupervisorIdentity
+  if (!previousIdentity) throw new UpdateFailure('The pre-update supervisor identity was not retained for restart verification.')
+  const supervisorIdentity = await dependencies.services.waitSupervisorReady(owner, artifacts.imageId!, previousIdentity)
+  assertSupervisorRestarted(
+    previousIdentity, supervisorIdentity,
+    'The systemd supervisor did not advance to a new control epoch after restart.',
+  )
   execution.postUpdateSupervisorIdentity = supervisorIdentity
 
   execution.phase = 'start_web'
@@ -1258,12 +1327,14 @@ async function handleWorkerFailure(
   const gateMayRemainClosed = !execution.webProcessExitConfirmed
     && ['temporary', 'latched', 'unknown'].includes(execution.shutdownGateState)
   const gateRecovery = execution.shutdownGateState === 'temporary' ? TEMPORARY_GATE_RECOVERY : SHUTDOWN_GATE_RECOVERY
-  const partialState = (mode !== 'client'
-    && (execution.supervisorShutdownAttempted || execution.supervisorShutdownComplete || execution.filesInstalled))
+  const partialState = execution.filesInstalled
+    || (mode !== 'client' && (execution.supervisorShutdownAttempted || execution.supervisorShutdownComplete))
     || gateMayRemainClosed
   if (execution.webStopAttempted && execution.webProcessExitConfirmed
     && !execution.supervisorShutdownComplete && execution.owner) {
-    const restoration = await restoreWebAfterAbort(dependencies, execution.owner, mode)
+    const restoration = execution.webRestoreBlocked
+      ? { restored: false, unitState: 'not-started', errorCode: execution.webRestoreBlocked }
+      : await restoreWebAfterAbort(dependencies, execution.owner, mode)
     await record(dependencies, mode, execution.phase, 'update.web_restore_after_abort', restoration.restored ? 'info' : 'error', {
       restored: restoration.restored, original_error_code: refusal ? 'preflight_refused_after_web_stop' : 'update_failed',
       unit_state: restoration.unitState,
@@ -1373,7 +1444,7 @@ export function createProductionDependencies(logPath?: string): ManagedRuntimeUp
   }
   const node = fs.realpathSync(process.execPath)
   const pnpm = resolveCommand('pnpm')
-  const cargo = resolveCommand('cargo')
+  const cargo = resolveCommand('cargo', { preserveSymlink: true })
   const docker = resolveCommand('docker')
   const sqlite = resolveCommand('sqlite3')
   const flock = resolveCommand('flock')
@@ -1381,7 +1452,7 @@ export function createProductionDependencies(logPath?: string): ManagedRuntimeUp
   const systemctl = resolveCommand('systemctl')
   const env = resolveCommand('env')
   const require = createRequire(import.meta.url)
-  const tsxEntry = fs.realpathSync(require.resolve('tsx/cli'))
+  const tsxLoader = fs.realpathSync(require.resolve('tsx'))
   const updaterScript = fs.realpathSync(fileURLToPath(import.meta.url))
   const pathEntries = [...new Set([
     path.dirname(node), path.dirname(pnpm), path.dirname(cargo), path.dirname(docker),
@@ -1391,7 +1462,7 @@ export function createProductionDependencies(logPath?: string): ManagedRuntimeUp
   const rustupHome = path.resolve(process.env.RUSTUP_HOME || path.join(home, '.rustup'))
   const pnpmHome = path.resolve(process.env.PNPM_HOME || path.dirname(pnpm))
   const paths: UpdatePaths = {
-    checkoutRoot, home, runtimeDirectory: path.resolve(runtimeDirectory), node, tsxEntry,
+    checkoutRoot, home, runtimeDirectory: path.resolve(runtimeDirectory), node, tsxLoader,
     updaterScript, env, flock, systemdRun, systemctl, pnpm, cargo, docker, sqlite,
     toolPath: pathEntries.join(path.delimiter), pnpmHome, cargoHome, rustupHome,
     cargoTargetDirectory: path.join(home, '.cache', 'freshell', 'managed-runtime-update', 'cargo-target'),
@@ -1399,22 +1470,36 @@ export function createProductionDependencies(logPath?: string): ManagedRuntimeUp
   return createProductionDependencyAdapters(paths, logPath)
 }
 
-function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: string): ManagedRuntimeUpdateDependencies {
+export function createProductionDependencyAdapters(
+  paths: UpdatePaths,
+  knownLogPath?: string,
+  readinessOptions: { supervisorReadinessTimeoutMs?: number; supervisorReadinessPollIntervalMs?: number } = {},
+): ManagedRuntimeUpdateDependencies {
   const logger = createJsonLogger(knownLogPath)
-  const run = (command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; input?: string } = {}) => {
+  const run = (command: string, args: string[], options: {
+    cwd?: string
+    env?: NodeJS.ProcessEnv
+    input?: string
+    timeoutMs?: number
+  } = {}) => {
     const result = spawnSync(command, args, {
       cwd: options.cwd,
       env: options.env ?? minimalEnvironment(paths),
       input: options.input,
+      ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs, killSignal: 'SIGKILL' as const }),
       encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024,
       stdio: options.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
     })
-    if (result.error) throw new UpdateFailure(`${path.basename(command)} could not run (${(result.error as NodeJS.ErrnoException).code ?? 'spawn_error'}).`)
+    if (result.error) {
+      const code = (result.error as NodeJS.ErrnoException).code ?? 'spawn_error'
+      if (code === 'ETIMEDOUT') throw new UpdateFailure(`${path.basename(command)} timed out after ${options.timeoutMs ?? 'the configured'} ms.`)
+      throw new UpdateFailure(`${path.basename(command)} could not run (${code}).`)
+    }
     if (result.status !== 0) throw new UpdateFailure(`${path.basename(command)} failed with status ${result.status ?? 'unknown'}.`)
     return result.stdout.trim()
   }
-  const systemdShow = (unit: string, property: string) => commandForProperty(paths, unit, property)
+  const systemdShow = (unit: string, property: string, timeoutMs?: number) => commandForProperty(paths, unit, property, timeoutMs)
   const dockerAdapter: ManagedRuntimeUpdateDependencies['docker'] = {
     async verifyDaemon(owner, socket) {
       const daemonId = run(paths.docker, ['--host', `unix://${socket}`, 'info', '--format', '{{.ID}}'])
@@ -1507,10 +1592,75 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
       async restart(unit) { run(paths.systemctl, ['--user', 'restart', unit]) },
       async isActive(unit) { return systemdShow(unit, 'ActiveState') === 'active' },
       async state(unit) { return systemdShow(unit, 'ActiveState') },
-      async waitSupervisorReady(selected) {
-        await waitUntil(async () => {
+      async waitSupervisorReady(selected, expectedImageReference, previousIdentity) {
+        let lastIssue = 'systemd has not reported an active supervisor'
+        return waitForSupervisorReadiness(async remainingMs => {
+          let activeState: string
+          try {
+            activeState = systemdShow(SUPERVISOR_UNIT, 'ActiveState', remainingMs())
+          } catch (error) {
+            lastIssue = error instanceof Error ? error.message : 'systemd ActiveState could not be read'
+            return undefined
+          }
+          if (activeState === 'activating' || activeState === 'reloading' || activeState === 'deactivating') {
+            lastIssue = `systemd reports ${activeState}`
+            return undefined
+          }
+          if (activeState !== 'active') {
+            throw new UpdateFailure(`The restarted managed-runtime supervisor is not active (systemd state ${activeState}).`)
+          }
+          let mainPid: number
+          try {
+            mainPid = Number(systemdShow(SUPERVISOR_UNIT, 'MainPID', remainingMs()))
+          } catch (error) {
+            lastIssue = error instanceof Error ? error.message : 'systemd MainPID could not be read'
+            return undefined
+          }
+          if (!Number.isSafeInteger(mainPid) || mainPid <= 0 || mainPid === selected.supervisorMainPid) {
+            lastIssue = 'systemd has not reported a new supervisor MainPID'
+            return undefined
+          }
+          try {
+            await assertRunningSupervisorProcess(mainPid, selected, expectedImageReference)
+          } catch (error) {
+            lastIssue = error instanceof Error ? error.message : 'the new supervisor process is not yet verified'
+            return undefined
+          }
           const socket = await fsp.stat(selected.controlSocket).catch(() => null)
-          return !!socket?.isSocket()
+          if (!socket?.isSocket()) {
+            lastIssue = 'the supervisor control socket is not ready'
+            return undefined
+          }
+          try {
+            const output = run(selected.adminCli, [
+              '--socket', selected.controlSocket, '--secret-file', selected.controlSecretFile, 'health',
+            ], { timeoutMs: remainingMs() })
+            const health = parseJsonOutput(output)
+            if (health.state !== 'ok') {
+              lastIssue = 'authenticated supervisor Health is not ready'
+              return undefined
+            }
+            const identity = parseSupervisorIdentity(health)
+            if (identity.installationId !== previousIdentity.installationId) {
+              lastIssue = 'authenticated supervisor Health identifies a different installation'
+              return undefined
+            }
+            if (identity.controlEpoch <= previousIdentity.controlEpoch) {
+              lastIssue = 'authenticated supervisor Health has not advanced to the new control epoch'
+              return undefined
+            }
+            return identity
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : 'the Health request failed'
+            lastIssue = /timed out/i.test(detail)
+              ? `authenticated Health request timed out (${detail})`
+              : `authenticated Health request failed (${detail})`
+            return undefined
+          }
+        }, {
+          timeoutMs: readinessOptions.supervisorReadinessTimeoutMs,
+          intervalMs: readinessOptions.supervisorReadinessPollIntervalMs,
+          timeoutMessage: () => `The restarted managed-runtime supervisor did not become ready with its verified process and authenticated Health identity before the timeout: ${lastIssue}.`,
         })
       },
       async waitWebReady(selected) { await waitHttpReady(selected.callbackAddress) },
@@ -1624,8 +1774,14 @@ function createProductionDependencyAdapters(paths: UpdatePaths, knownLogPath?: s
   }
 }
 
-function deriveOwner(paths: UpdatePaths, web: ParsedUnit, supervisor: ParsedUnit): ManagedRuntimeOwner {
+export function deriveOwner(paths: UpdatePaths, web: ParsedUnit, supervisor: ParsedUnit): ManagedRuntimeOwner {
   if (web.loadState !== 'loaded' || supervisor.loadState !== 'loaded') throw new UpdateRefusal('Both selected systemd units must be loaded.')
+  if (supervisor.activeState !== 'active' || supervisor.mainPid === null) {
+    throw new UpdateRefusal('The selected systemd supervisor must be active and have a MainPID.')
+  }
+  if (web.activeState !== 'active' || web.mainPid === null) {
+    throw new UpdateRefusal('The selected web unit must be active and have a MainPID.')
+  }
   const checkoutRoot = paths.checkoutRoot
   if (web.workingDirectory !== checkoutRoot || supervisor.workingDirectory !== checkoutRoot) {
     throw new UpdateRefusal('The selected unit working directories do not identify this deployment checkout.')
@@ -1663,7 +1819,9 @@ function deriveOwner(paths: UpdatePaths, web: ParsedUnit, supervisor: ParsedUnit
   const runtimeRoot = getRequired(supervisorArgs, '--runtime-root')
   const sessionHostBinary = getRequired(supervisorArgs, '--host-binary')
   const supervisorImage = getRequired(supervisorArgs, '--image-ref')
-  if (supervisorImage !== imageReference) throw new UpdateRefusal('The supervisor command and managed-runtime environment file disagree about the workload image.')
+  if (supervisorImage !== imageReference && supervisorImage !== '${FRESHELL_RUNTIME_IMAGE}') {
+    throw new UpdateRefusal('The supervisor command and managed-runtime environment file disagree about the workload image.')
+  }
   const port = webEnvironment.PORT ?? '3001'
   if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) throw new UpdateRefusal('The selected web unit has an invalid readiness port.')
   return {
@@ -1682,7 +1840,7 @@ function deriveOwner(paths: UpdatePaths, web: ParsedUnit, supervisor: ParsedUnit
   }
 }
 
-interface ParsedUnit {
+export interface ParsedUnit {
   loadState: string
   activeState: string
   mainPid: number | null
@@ -1849,23 +2007,57 @@ async function verifyOwnerFiles(owner: ManagedRuntimeOwner, mode: ManagedUpdateM
   }
   if (mode === 'durable-only' && owner.webMainPid === undefined) throw new UpdateRefusal('The web unit MainPID could not be identified.')
   await validateProcessOwner(owner.webMainPid, owner.webExecutable, owner.checkoutRoot)
-  await validateProcessOwner(owner.supervisorMainPid, owner.supervisorExecutable, owner.checkoutRoot)
+  if (owner.supervisorMainPid === undefined) throw new UpdateRefusal('The selected systemd supervisor MainPID could not be identified.')
+  await assertRunningSupervisorProcess(owner.supervisorMainPid, owner, owner.imageReference)
 }
 
 async function validateProcessOwner(pid: number | undefined, executable: string, checkoutRoot: string): Promise<void> {
   if (pid === undefined || pid === null) return
   let actualExecutable: string
   let workingDirectory: string
-  try {
-    actualExecutable = await fsp.readlink(`/proc/${pid}/exe`)
-    workingDirectory = await fsp.realpath(`/proc/${pid}/cwd`)
-  } catch {
-    throw new UpdateRefusal('A selected systemd MainPID no longer has a verifiable executable and working directory.')
-  }
+  try { actualExecutable = await fsp.readlink(`/proc/${pid}/exe`) }
+  catch { throw new UpdateRefusal('A selected systemd MainPID executable could not be verified.') }
+  try { workingDirectory = await fsp.realpath(`/proc/${pid}/cwd`) }
+  catch { throw new UpdateRefusal('A selected systemd MainPID working directory could not be verified.') }
   actualExecutable = actualExecutable.replace(/ \(deleted\)$/, '')
   if (path.resolve(actualExecutable) !== executable || workingDirectory !== checkoutRoot) {
     throw new UpdateRefusal('A selected systemd MainPID belongs to a different executable or checkout.')
   }
+  let liveExecutable: fs.Stats
+  let selectedExecutable: fs.Stats
+  try {
+    [liveExecutable, selectedExecutable] = await Promise.all([
+      fsp.stat(`/proc/${pid}/exe`),
+      fsp.stat(executable),
+    ])
+  } catch {
+    throw new UpdateRefusal('A selected systemd MainPID executable could not be compared with the installed file.')
+  }
+  if (liveExecutable.dev !== selectedExecutable.dev || liveExecutable.ino !== selectedExecutable.ino) {
+    throw new UpdateRefusal('A selected systemd MainPID is running a different executable image from the installed file.')
+  }
+}
+
+export async function assertRunningSupervisorProcess(
+  pid: number,
+  owner: ManagedRuntimeOwner,
+  expectedImageReference: string,
+): Promise<void> {
+  if (!isDigest(expectedImageReference)) throw new UpdateRefusal('The expected supervisor workload image is not an immutable digest.')
+  await validateProcessOwner(pid, owner.supervisorExecutable, owner.checkoutRoot)
+  const argv = await readProcessArguments(pid)
+  const imageIndex = argv.indexOf('--image-ref')
+  if (imageIndex < 0 || argv[imageIndex + 1] !== expectedImageReference) {
+    throw new UpdateRefusal('The live supervisor process image reference does not match the verified managed-runtime image.')
+  }
+}
+
+async function readProcessArguments(pid: number): Promise<string[]> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new UpdateRefusal('A selected supervisor process ID is invalid.')
+  let contents: Buffer
+  try { contents = await fsp.readFile(`/proc/${pid}/cmdline`) }
+  catch { throw new UpdateRefusal('The selected supervisor process arguments could not be read.') }
+  return contents.toString('utf8').split('\0').filter(argument => argument.length > 0)
 }
 
 function validateOwner(owner: ManagedRuntimeOwner, expectedCheckout: string): void {
@@ -2137,13 +2329,13 @@ function isDigest(value: unknown): value is string {
   return typeof value === 'string' && /^sha256:[0-9a-f]{64}$/.test(value)
 }
 
-function resolveCommand(name: string): string {
+export function resolveCommand(name: string, options: { preserveSymlink?: boolean } = {}): string {
   for (const directory of (process.env.PATH ?? '').split(path.delimiter)) {
     if (!directory) continue
-    const candidate = path.join(directory, name)
+    const candidate = path.resolve(directory, name)
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
-      return fs.realpathSync(candidate)
+      return options.preserveSymlink ? candidate : fs.realpathSync(candidate)
     } catch { /* try next path entry */ }
   }
   throw new Error(`Required updater command ${name} was not found.`)
@@ -2173,13 +2365,15 @@ export function createJsonLogger(knownLogPath?: string): ManagedRuntimeUpdateDep
   }
 }
 
-async function readExactApprovalLine(): Promise<string> {
+export async function readExactApprovalLine(): Promise<string> {
   return new Promise((resolve, reject) => {
     let buffer = ''
     const finish = (value: string) => {
       process.stdin.off('data', onData)
       process.stdin.off('end', onEnd)
       process.stdin.off('error', onError)
+      process.stdin.pause()
+      process.stdin.destroy()
       resolve(value)
     }
     const onData = (chunk: Buffer | string) => {
@@ -2192,6 +2386,8 @@ async function readExactApprovalLine(): Promise<string> {
     const onError = (error: Error) => {
       process.stdin.off('data', onData)
       process.stdin.off('end', onEnd)
+      process.stdin.pause()
+      process.stdin.destroy()
       reject(error)
     }
     process.stdin.on('data', onData)
@@ -2313,6 +2509,12 @@ async function replaceFileOnDestination(source: string, target: string): Promise
   await fsp.rename(sibling, target)
 }
 
+function describeClientDirectoryActivationFailure(error: unknown): string {
+  if (error instanceof ClientDirectoryActivationFailure) return error.message
+  const detail = error instanceof Error ? error.message : 'an unknown filesystem error occurred'
+  return `Client directory activation failed: ${detail}. The client directory state could not be verified.`
+}
+
 export async function swapDirectoryOnDestination(
   source: string,
   target: string,
@@ -2326,8 +2528,24 @@ export async function swapDirectoryOnDestination(
   await rename(target, old)
   try {
     await rename(replacement, target)
-  } catch (error) {
-    throw new UpdateFailure(`Client directory activation failed; the prior directory remains at ${old}. The web service was not restarted.`)
+  } catch {
+    let rollbackError: unknown
+    try {
+      await rename(old, target)
+    } catch (restoreError) {
+      rollbackError = restoreError
+    }
+    await fsp.rm(replacement, { recursive: true, force: true }).catch(() => undefined)
+    if (rollbackError) {
+      throw new ClientDirectoryActivationFailure(
+        `Client directory activation failed and the prior client directory could not be restored; it remains at ${old}.`,
+        false,
+      )
+    }
+    throw new ClientDirectoryActivationFailure(
+      'Client directory activation failed; the prior client directory was restored.',
+      true,
+    )
   }
   await fsp.rm(old, { recursive: true, force: true })
 }
@@ -2409,10 +2627,14 @@ async function readProcessEnvironment(pid: number): Promise<Record<string, strin
   return Object.fromEntries(values)
 }
 
-function commandForProperty(paths: UpdatePaths, unit: string, property: string): string {
+function commandForProperty(paths: UpdatePaths, unit: string, property: string, timeoutMs?: number): string {
   const result = spawnSync(paths.systemctl, ['--user', 'show', `--property=${property}`, '--value', unit], {
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, killSignal: 'SIGKILL' as const }),
     encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, env: minimalEnvironment(paths),
   })
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT') {
+    throw new UpdateFailure(`systemctl timed out reading ${property} for ${unit} after ${timeoutMs ?? 'the configured'} ms.`)
+  }
   if (result.error || result.status !== 0) throw new UpdateRefusal(`Effective systemd property ${property} could not be read for ${unit}.`)
   return result.stdout.trim()
 }
