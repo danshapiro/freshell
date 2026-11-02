@@ -150,7 +150,7 @@ export async function startInManagedContext(rig, source) {
     }, {port:${port}});
     fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({baseUrl:fixture.baseUrl,uid:process.getuid(),gid:process.getgid(),pid:process.pid,node:process.version}));
     process.once('SIGTERM', async () => { await fixture.close(); fs.writeFileSync(${JSON.stringify(`${directory}/closed`)},'closed');process.exit(0); });`
-  rig.ownedProviderExec(containerId, ['node', '-e', `
+  await rig.ownedProviderExec(containerId, ['node', '-e', `
     const fs=require('node:fs'),{spawn}=require('node:child_process');
     fs.mkdirSync(${JSON.stringify(directory)}, {recursive:true,mode:0o700});
     const log=fs.openSync(${JSON.stringify(`${directory}/stderr`)},'a',0o600);
@@ -159,25 +159,29 @@ export async function startInManagedContext(rig, source) {
   let ready
   const deadline = Date.now() + 30_000
   while (!ready && Date.now() < deadline) {
-    ready = JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(fs.existsSync(${JSON.stringify(readyPath)})?fs.readFileSync(${JSON.stringify(readyPath)},'utf8'):'null')`]))
+    ready = JSON.parse(await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');process.stdout.write(fs.existsSync(${JSON.stringify(readyPath)})?fs.readFileSync(${JSON.stringify(readyPath)},'utf8'):'null')`]))
     if (!ready) await new Promise(resolve => setTimeout(resolve, 50))
   }
-  assert(ready, `managed Codex loopback fixture did not start: ${rig.ownedProviderExec(containerId, ['cat', `${directory}/stderr`])}`)
+  if (!ready) {
+    const stderr = await rig.ownedProviderExec(containerId, ['cat', `${directory}/stderr`])
+    assert(ready, `managed Codex loopback fixture did not start: ${stderr}`)
+  }
   assert.equal(ready.uid, 65534)
   assert.equal(ready.gid, 0)
   return {
     baseUrl: ready.baseUrl,
     context: ready,
-    get traffic() {
-      return JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=${JSON.stringify(trafficPath)};process.stdout.write(JSON.stringify(fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse):[]))`]))
+    async getTraffic() {
+      const raw = await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=${JSON.stringify(trafficPath)};process.stdout.write(JSON.stringify(fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse):[]))`])
+      return JSON.parse(raw)
     },
     async stop() {
       if (!rig.runtime.isContainerRunning(containerId)) return
       // This PID was created and recorded by this invocation in the owned namespace.
-      rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=Number(fs.readFileSync(${JSON.stringify(`${directory}/pid`)},'utf8'));if(p!==${ready.pid})throw Error('fixture PID changed');try{process.kill(p,'SIGTERM')}catch(e){if(e.code!=='ESRCH')throw e}`])
+      await rig.ownedProviderExec(containerId, ['node', '-e', `const fs=require('node:fs');const p=Number(fs.readFileSync(${JSON.stringify(`${directory}/pid`)},'utf8'));if(p!==${ready.pid})throw Error('fixture PID changed');try{process.kill(p,'SIGTERM')}catch(e){if(e.code!=='ESRCH')throw e}`])
       const deadline = Date.now() + 10_000
       while (Date.now() < deadline) {
-        if (rig.ownedProviderExec(containerId, ['node', '-e', `process.stdout.write(String(require('node:fs').existsSync(${JSON.stringify(`${directory}/closed`)})))`]) === 'true') return
+        if (await rig.ownedProviderExec(containerId, ['node', '-e', `process.stdout.write(String(require('node:fs').existsSync(${JSON.stringify(`${directory}/closed`)})))`]) === 'true') return
         await new Promise(resolve => setTimeout(resolve, 50))
       }
       throw new Error(`managed Codex loopback fixture did not close: ${containerId}/${ready.pid}`)
