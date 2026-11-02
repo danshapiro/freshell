@@ -2041,6 +2041,23 @@ mod tests {
         layout_store: LayoutStore,
         ownership: Arc<RuntimeOwnershipRegistry>,
     ) -> (Router, tokio::task::JoinHandle<()>) {
+        maintenance_router_with_readiness_terminals(
+            root,
+            gate,
+            layout_store,
+            TerminalRegistry::new(),
+            ownership,
+        )
+        .await
+    }
+
+    async fn maintenance_router_with_readiness_terminals(
+        root: &std::path::Path,
+        gate: HostAgentAdmissionGate,
+        layout_store: LayoutStore,
+        readiness_terminals: TerminalRegistry,
+        ownership: Arc<RuntimeOwnershipRegistry>,
+    ) -> (Router, tokio::task::JoinHandle<()>) {
         use freshell_runtime_client::RuntimeClient;
         use freshell_supervisor::backend::DockerEngineBackend;
 
@@ -2065,7 +2082,7 @@ mod tests {
         )
         .await
         .unwrap()
-        .with_readiness_ownership_sources(layout_store, TerminalRegistry::new(), ownership)
+        .with_readiness_ownership_sources(layout_store, readiness_terminals, ownership)
         .with_host_agent_admission(gate);
         (router(state), control)
     }
@@ -2303,6 +2320,246 @@ mod tests {
 
         control.abort();
         let _ = control.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_quiesce_drains_detached_session_handoff_before_census() {
+        use freshell_freshagent::{HandoffRequest, HandoffTestHooks, SessionHandoffRunner};
+        use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
+        use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
+
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("handoff-terminal.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let layout_store = LayoutStore::default();
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let registry = TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(32);
+        let broadcast_tx = Arc::new(broadcast_tx);
+        let auth_token = Arc::new("maintenance-secret".to_string());
+        let cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "claude".into(),
+            label: "Claude CLI".into(),
+            env_var: None,
+            default_cmd: script.to_string_lossy().to_string(),
+            base_args: Vec::new(),
+            base_env: BTreeMap::new(),
+            resume_args: Some(vec!["--resume".into(), "{{sessionId}}".into()]),
+            create_session_args: Some(vec!["--session-id".into(), "{{sessionId}}".into()]),
+            model_args: None,
+            effort_args: None,
+            sandbox_args: None,
+            permission_mode_args: None,
+        }]);
+        let fresh_agent = freshell_freshagent::FreshAgentState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+        )
+        .with_ownership(Arc::clone(&ownership))
+        .with_terminal_registry(registry.clone())
+        .with_cli_commands(Arc::clone(&cli_commands));
+        let fresh_codex = freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": true } }),
+        );
+        let fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+        let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(fresh_agent.clone());
+        let spawn_pause = Arc::new(tokio::sync::Notify::new());
+        let hooks = Arc::new(HandoffTestHooks {
+            pause_in_target_spawn: Some(Arc::clone(&spawn_pause)),
+            ..HandoffTestHooks::default()
+        });
+        let runner = Arc::new(
+            SessionHandoffRunner::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                Arc::clone(&ownership),
+                registry.clone(),
+                fresh_codex,
+                fresh_claude,
+                fresh_opencode,
+                fresh_agent.clone(),
+                Arc::clone(&cli_commands),
+            )
+            .with_test_hooks(Arc::clone(&hooks)),
+        );
+        let (app, control) = maintenance_router_with_readiness_terminals(
+            root.path(),
+            fresh_agent.host_agent_admission(),
+            layout_store,
+            registry.clone(),
+            Arc::clone(&ownership),
+        )
+        .await;
+
+        let session_id = format!("handoff-race-{}", uuid::Uuid::new_v4());
+        let handle = runner.spawn_handoff(HandoffRequest {
+            action: freshell_freshagent::session_handoff::HandoffAction::Switch,
+            provider: "claude".into(),
+            session_id: session_id.clone(),
+            target_kind: RuntimeOwnerKind::Terminal,
+            session_type: None,
+            mode: Some("claude".into()),
+            cwd: Some(root.path().to_string_lossy().to_string()),
+            tab_id: None,
+            pane_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+            device_id: Some("maintenance-race-test".into()),
+        });
+        let freshell_freshagent::HandoffHandle { completion, task } = handle;
+        // The HTTP requester disconnected; the runner remains detached.
+        drop(completion);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let target_terminal = loop {
+            let published = hooks.published_terminal_for_test();
+            if published.is_some() {
+                break published;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let quiesce_app = app.clone();
+        let quiesce = tokio::spawn(async move {
+            maintenance_request(
+                &quiesce_app,
+                "POST",
+                "/api/runtime/maintenance/quiesce",
+                Some("maintenance-secret"),
+                Some(json!({
+                    "ownerId":"updater-handoff-race", "leaseDurationMs":60000,
+                    "drainTimeoutMs":5000
+                })),
+            )
+            .await
+        });
+        let quiesce_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fresh_agent.host_agent_admission().status().phase != "quiesced"
+            && tokio::time::Instant::now() < quiesce_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let admission_drain_waited = !quiesce.is_finished();
+        let permit_held_during_target_spawn =
+            fresh_agent.host_agent_admission().status().active_permits == 1;
+
+        // Always unpark the detached task before making assertions, so a red
+        // test does not leave a sleeper process behind.
+        spawn_pause.notify_one();
+        let handoff_join = tokio::time::timeout(Duration::from_secs(15), task).await;
+        let handoff_settled = matches!(handoff_join, Ok(Ok(())));
+        let quiesce_result = tokio::time::timeout(Duration::from_secs(15), quiesce).await;
+        let quiesce_result = match quiesce_result {
+            Ok(Ok(result)) => Some(result),
+            _ => None,
+        };
+        let (quiesce_status, quiesce_body) =
+            quiesce_result.unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, json!({})));
+        let lease = quiesce_body["lease"].clone();
+        let target_owned = match ownership.observe("claude", &session_id).state {
+            OwnershipState::Live { owner, .. } => {
+                owner.kind == RuntimeOwnerKind::Terminal
+                    && owner.terminal_id == target_terminal.clone()
+            }
+            _ => false,
+        };
+        let census_reports_target = quiesce_body["readiness"]["paneOwnership"]
+            ["unattachedProcesses"]
+            .as_array()
+            .is_some_and(|processes| {
+                processes.iter().any(|process| {
+                    process["terminalId"] == target_terminal.clone().unwrap_or_default()
+                        && process["ownership"] == "host-managed"
+                })
+            });
+        let ready_to_stop = quiesce_body["readyToStop"] == true;
+
+        let (commit_status, _) = if lease["leaseId"].is_string() {
+            maintenance_request(
+                &app,
+                "POST",
+                "/api/runtime/maintenance/commit-stop",
+                Some("maintenance-secret"),
+                Some(json!({
+                    "ownerId":lease["ownerId"], "leaseId":lease["leaseId"]
+                })),
+            )
+            .await
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({}))
+        };
+        if lease["leaseId"].is_string() {
+            let _ = maintenance_request(
+                &app,
+                "POST",
+                "/api/runtime/maintenance/release",
+                Some("maintenance-secret"),
+                Some(json!({
+                    "ownerId":lease["ownerId"], "leaseId":lease["leaseId"]
+                })),
+            )
+            .await;
+        }
+        if let Some(terminal_id) = target_terminal.as_ref() {
+            registry.kill(terminal_id);
+            let death_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !registry.terminal_is_dead(terminal_id)
+                && tokio::time::Instant::now() < death_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        control.abort();
+        let _ = control.await;
+
+        assert!(
+            permit_held_during_target_spawn,
+            "the detached handoff must hold admission while the target spawn is parked"
+        );
+        assert!(
+            admission_drain_waited,
+            "quiesce must wait for the detached handoff permit"
+        );
+        assert!(
+            handoff_settled,
+            "the detached handoff must settle after target spawn is released"
+        );
+        assert_eq!(quiesce_status, StatusCode::OK, "{quiesce_body}");
+        assert!(
+            target_owned,
+            "the handoff must commit the published terminal as owner"
+        );
+        assert!(
+            census_reports_target,
+            "the final census must report the host-owned target: {quiesce_body}"
+        );
+        assert!(
+            !ready_to_stop,
+            "the host-owned terminal must block commit-stop"
+        );
+        assert_eq!(
+            commit_status,
+            StatusCode::CONFLICT,
+            "host-owned work must refuse stop"
+        );
+        assert!(
+            target_terminal.is_some(),
+            "the target spawn hook must publish a terminal id"
+        );
+        assert!(
+            !hooks.events.lock().expect("handoff hooks lock").is_empty(),
+            "normal handoff completion must record its target start"
+        );
     }
 
     #[cfg(unix)]

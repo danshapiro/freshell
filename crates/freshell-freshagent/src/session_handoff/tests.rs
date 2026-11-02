@@ -3002,6 +3002,12 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
     // A SHORT reap budget: the pid-alive window deterministically fences
     // within the test instead of waiting the production budget.
     let rig = build_rig_inner(None, None, None, 50, None, false, None, None);
+    let admission_permit = Arc::new(
+        rig.fresh_agent
+            .host_agent_admission()
+            .try_admit()
+            .expect("test reap admission"),
+    );
     // The target's stand-in process: ALIVE, its registry row ABSENT —
     // the exact row-removed-but-not-yet-reaped shape a concurrent kill
     // produces.
@@ -3038,6 +3044,7 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
             &live_owner,
             "op-e4pc-f1",
             1,
+            &admission_permit,
         )
         .await;
     assert!(
@@ -3072,6 +3079,7 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
             &dead_owner,
             "op-e4pc-f1-dead",
             2,
+            &admission_permit,
         )
         .await;
     assert!(
@@ -4382,6 +4390,12 @@ async fn an_abort_with_a_published_target_pid_outliving_the_reap_budget_fences()
         target_spawn_begun: true,
         target: None,
         spawn_watch: Some(watch),
+        admission_permit: Arc::new(
+            rig.fresh_agent
+                .host_agent_admission()
+                .try_admit()
+                .expect("test abort cleanup admission"),
+        ),
     };
     let outcome = rig.runner.abort_reap_uncommitted_target(&payload).await;
 
@@ -5223,16 +5237,21 @@ async fn handoff_task_abort_leaves_zero_or_one_owner() {
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = ClaudeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
+    let abort_broadcast_pause = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks {
         pause_after_enter: Some(tokio::sync::Notify::new()),
+        pause_post_abort_broadcast: Some(Arc::clone(&abort_broadcast_pause)),
+        pause_post_abort_broadcast_once: std::sync::atomic::AtomicBool::new(true),
         ..HandoffTestHooks::default()
     });
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
     establish_fresh_claude_owner(&mut rig, &sid).await;
+    let gate = rig.fresh_agent.host_agent_admission();
 
     let handle = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    assert_eq!(gate.status().active_permits, 1);
     // Park proof: wait for the started broadcast so the abort lands mid-Handoff.
     let _started = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -5257,11 +5276,31 @@ async fn handoff_task_abort_leaves_zero_or_one_owner() {
     // Abort: the RAII guard fails the coordinator entry during the unwind.
     handle.abort();
     let _ = handle.task.await;
+    await_cond(
+        "aborted handoff reaches its detached failure publication",
+        || {
+            hooks
+                .pause_post_abort_broadcast_parked
+                .load(Ordering::SeqCst)
+        },
+    )
+    .await;
+    let abort_cleanup_kept_permit = gate.status().active_permits == 1;
+    abort_broadcast_pause.notify_one();
+    await_cond(
+        "aborted handoff releases admission after publication",
+        || gate.status().active_permits == 0,
+    )
+    .await;
 
     let state = rig.ownership.observe("claude", &sid).state;
     assert!(
         matches!(state, OwnershipState::Live { .. } | OwnershipState::Vacant),
         "abort must leave zero or one owner (Live prior or Vacant), got {state:?}"
+    );
+    assert!(
+        abort_cleanup_kept_permit,
+        "the detached abort publication must retain the handoff permit until it settles"
     );
 
     // The key reopens (not wedged): from Vacant a fresh begin_start is
@@ -8516,6 +8555,166 @@ async fn post_handoff_route(
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+/// A maintenance lease closes the same admission path used by ordinary
+/// Fresh Agent creates. Both supported handoff targets must refuse before
+/// the source is stopped or the ownership generation changes.
+#[tokio::test]
+async fn handoff_route_refuses_valid_switches_during_maintenance_without_mutation() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = ClaudeSidecarEnv::install();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    let fresh_source_sid = uuid::Uuid::new_v4().to_string();
+    let terminal_source_sid = uuid::Uuid::new_v4().to_string();
+    establish_fresh_claude_owner(&mut rig, &fresh_source_sid).await;
+
+    // Make a saved conversation for the Fresh Agent target while keeping a
+    // terminal as its current owner.
+    let store =
+        PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").expect("isolated Claude store"));
+    let project = store.join("projects").join("-handoff");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join(format!("{terminal_source_sid}.jsonl")),
+        format!(
+            "{}\n",
+            json!({
+                "type":"user", "uuid":uuid::Uuid::new_v4().to_string(),
+                "sessionId":terminal_source_sid, "cwd":"/tmp",
+                "promptSource":"sdk", "message":{"role":"user", "content":"saved handoff conversation"}
+            })
+        ),
+    )
+    .unwrap();
+
+    let terminal_source = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal(
+            "claude",
+            &terminal_source_sid,
+            "claude",
+        ))
+        .completion
+        .await
+        .expect("terminal source handoff completed");
+    assert_eq!(terminal_source["ok"], json!(true), "{terminal_source}");
+
+    let before_fresh_source = rig.ownership.observe("claude", &fresh_source_sid);
+    let before_terminal_source = rig.ownership.observe("claude", &terminal_source_sid);
+    let terminal_id = match &before_terminal_source.state {
+        OwnershipState::Live { owner, .. } => owner.terminal_id.clone().unwrap(),
+        other => panic!("expected live terminal source, got {other:?}"),
+    };
+    assert!(rig.registry.is_running(&terminal_id));
+    hooks.events.lock().unwrap().clear();
+    let gate = rig.fresh_agent.host_agent_admission();
+    let lease = gate
+        .begin_quiesce("handoff-maintenance-test", Duration::from_secs(60))
+        .unwrap();
+
+    let (terminal_status, terminal_response) = post_handoff_route(
+        super::handoff_router(Arc::clone(&rig.runner)),
+        json!({
+            "provider":"claude", "sessionId":fresh_source_sid,
+            "targetKind":"terminal", "mode":"claude"
+        }),
+        true,
+    )
+    .await;
+    let after_fresh_source = rig.ownership.observe("claude", &fresh_source_sid);
+    let fresh_source_alive = rig.fresh_claude.has_live_session(&fresh_source_sid).await;
+
+    let (fresh_status, fresh_response) = post_handoff_route(
+        super::handoff_router(Arc::clone(&rig.runner)),
+        json!({
+            "provider":"claude", "sessionId":terminal_source_sid,
+            "targetKind":"fresh-agent", "sessionType":"freshclaude", "cwd":"/tmp"
+        }),
+        true,
+    )
+    .await;
+    let after_terminal_source = rig.ownership.observe("claude", &terminal_source_sid);
+    let terminal_source_alive = rig.registry.is_running(&terminal_id);
+    let maintenance_events = hooks.events.lock().unwrap().clone();
+
+    // Capture all behavior first, then clean whichever owner a broken
+    // implementation left behind so a red run cannot leak a test process.
+    gate.release(&lease).unwrap();
+    for sid in [&fresh_source_sid, &terminal_source_sid] {
+        match rig.ownership.observe("claude", sid).state {
+            OwnershipState::Live { owner, .. } if owner.kind == RuntimeOwnerKind::Terminal => {
+                if let Some(id) = owner.terminal_id {
+                    rig.registry.kill(&id);
+                }
+            }
+            OwnershipState::Live { owner, .. } if owner.kind == RuntimeOwnerKind::FreshAgent => {
+                let _ = rig.fresh_claude.kill_for_handoff(sid, "test-cleanup").await;
+            }
+            _ => {}
+        }
+    }
+    let _ = env;
+
+    assert_eq!(
+        terminal_status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "terminal target must be refused during maintenance: {terminal_response}"
+    );
+    assert_eq!(
+        terminal_response["error"]["code"],
+        json!("HOST_AGENT_MAINTENANCE")
+    );
+    assert_eq!(terminal_response["error"]["retryable"], json!(true));
+    assert_eq!(
+        terminal_response["error"]["ownerGeneration"],
+        json!(before_fresh_source.generation)
+    );
+    assert!(
+        maintenance_events.is_empty(),
+        "a maintenance refusal must precede source reap and target spawn: {maintenance_events:?}"
+    );
+    assert_eq!(
+        after_fresh_source.generation, before_fresh_source.generation,
+        "the fresh source generation must not change"
+    );
+    assert!(
+        fresh_source_alive,
+        "the Fresh Agent source must remain live"
+    );
+    assert!(matches!(
+        after_fresh_source.state,
+        OwnershipState::Live { owner, .. } if owner.kind == RuntimeOwnerKind::FreshAgent
+    ));
+
+    assert_eq!(
+        fresh_status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "Fresh Agent target must be refused during maintenance: {fresh_response}"
+    );
+    assert_eq!(
+        fresh_response["error"]["code"],
+        json!("HOST_AGENT_MAINTENANCE")
+    );
+    assert_eq!(fresh_response["error"]["retryable"], json!(true));
+    assert_eq!(
+        fresh_response["error"]["ownerGeneration"],
+        json!(before_terminal_source.generation)
+    );
+    assert_eq!(
+        after_terminal_source.generation, before_terminal_source.generation,
+        "the terminal source generation must not change"
+    );
+    assert!(
+        terminal_source_alive,
+        "the terminal source must remain live"
+    );
+    assert!(matches!(
+        after_terminal_source.state,
+        OwnershipState::Live { owner, .. } if owner.kind == RuntimeOwnerKind::Terminal
+    ));
+}
+
 /// Round-3 review N-2: the 401 answers with a typed code that matches the
 /// status (`UNAUTHORIZED` — the plan sketch's `BAD_REQUEST` read oddly).
 #[tokio::test]
@@ -8855,6 +9054,12 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
     // A SHORT reap budget: the pid-alive window deterministically fences
     // within the test.
     let rig = build_rig_inner(None, None, None, 50, None, false, None, None);
+    let admission_permit = Arc::new(
+        rig.fresh_agent
+            .host_agent_admission()
+            .try_admit()
+            .expect("test stop admission"),
+    );
     // The prior's stand-in process: ALIVE, its registry row ABSENT — the
     // exact row-removed-but-not-yet-reaped shape a concurrent kill
     // produces.
@@ -8891,6 +9096,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
             "test",
             "op-r6-f2",
             1,
+            &admission_permit,
         )
         .await;
     assert!(
@@ -8923,6 +9129,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
             "test",
             "op-r6-f2-dead",
             2,
+            &admission_permit,
         )
         .await;
     assert!(
