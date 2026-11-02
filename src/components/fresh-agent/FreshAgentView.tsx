@@ -37,7 +37,7 @@ import {
   getFreshAgentThreadSnapshot,
   setSessionMetadata,
 } from '@/lib/api'
-import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
+import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, isPaneClosePending, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
@@ -2051,6 +2051,11 @@ export function FreshAgentView({
     // identity check observe the same store snapshot — nothing dispatches in
     // between. A queued callback may never upgrade itself to a newer fence.
     const state = appStore.getState()
+    // Close marks are set before detach and remain through durable close
+    // evidence. Rebind/reconnect work already queued before the close must
+    // re-check here, at the actual send boundary, so it cannot restore this
+    // view after the server acknowledged its detach.
+    if (isPaneClosePending(state.panes, tabId, paneId)) return false
     if (attachmentAttemptRef.current !== attempt) return false
     if (attachmentAttemptKey(state, content, attachDecisionSerialRef.current) !== attempt.key) return false
     if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence)) return false

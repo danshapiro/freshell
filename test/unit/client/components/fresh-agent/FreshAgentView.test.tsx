@@ -297,6 +297,7 @@ const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
   onMessage: vi.fn(() => () => {}),
+  onDisconnect: vi.fn(() => () => {}),
   onReconnect: vi.fn(() => () => {}),
 }))
 
@@ -430,6 +431,18 @@ function StoreBackedFreshAgentView({
   return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} />
 }
 
+function StoreBackedLayoutFreshAgentView({
+  tabId,
+  paneId,
+}: {
+  tabId: string
+  paneId: string
+}) {
+  const paneContent = useAppSelector((state) => findPaneContent(state.panes.layouts[tabId], paneId))
+  if (!paneContent || paneContent.kind !== 'fresh-agent') return null
+  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+}
+
 function StoreBackedFreshAgentSettingsButton({
   tabId,
   paneId,
@@ -557,8 +570,10 @@ beforeEach(() => {
   resetRebindQueueForTests()
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
+  wsMock.onDisconnect.mockReset()
   wsMock.onReconnect.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
+  wsMock.onDisconnect.mockImplementation(() => () => {})
   wsMock.onReconnect.mockImplementation(() => () => {})
   window.sessionStorage.clear()
   window.localStorage.removeItem('fresh-agent-prompt-history:freshcodex')
@@ -1658,6 +1673,15 @@ describe('new conversation close acceptance', () => {
     wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
     let closeMessage: Record<string, any> | undefined
     wsMock.send.mockImplementation((message) => {
+      if (message.type === 'freshAgent.detach') {
+        for (const handler of [...handlers]) handler({
+          type: 'freshAgent.detached',
+          requestId: message.requestId,
+          viewId: message.viewId,
+          sessionRef: message.sessionRef,
+          success: true,
+        })
+      }
       if (message.type === 'pane.closed' || message.type === 'panes.closed') closeMessage = message
     })
     const getContent = () => {
@@ -1698,21 +1722,31 @@ describe('new conversation close acceptance', () => {
       expect(fixture.isClosing()).toBe(true)
       await act(async () => fixture.stop.resolve(stopped))
       await waitFor(() => expect(screen.getByRole('button', { name: 'Start new conversation' })).toBeEnabled())
-      const assertRetained = () => {
+      const assertRetained = (reattached = false) => {
         expect(screen.getByText(historyText)).toBeInTheDocument()
         expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(draftText)
         expect(sessionStorage.getItem(fixture.draftKey)).toBe(draftText)
         expect(fixture.getContent()).toMatchObject(fixture.content)
         expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
-        for (const type of ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send', 'pane.reconcile.request']) {
-          expect(sentFreshAgentMessages(type)).toHaveLength(0)
+        expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+        expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(reattached ? 1 : 0)
+        if (reattached) {
+          expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+            type: 'freshAgent.attach',
+            viewId: fixture.getContent().viewId,
+            provider: fixture.content.provider,
+            sessionType: fixture.content.sessionType,
+            sessionId: fixture.content.sessionRef?.sessionId,
+          })
         }
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+        expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
       }
       assertRetained()
       await act(async () => { fixture.failClose(); await closing })
       expect(fixture.isClosing()).toBeFalsy()
       expect(await screen.findByText(/Close failed:/)).toBeInTheDocument()
-      assertRetained()
+      assertRetained(true)
     } finally {
       await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
       fixture.rendered.unmount()
@@ -1916,6 +1950,15 @@ describe('FreshAgentView', () => {
       return () => { handlers.delete(handler) }
     })
     wsMock.send.mockImplementation((message) => {
+      if (message.type === 'freshAgent.detach') {
+        for (const handler of [...handlers]) handler({
+          type: 'freshAgent.detached',
+          requestId: message.requestId,
+          viewId: message.viewId,
+          sessionRef: message.sessionRef,
+          success: true,
+        })
+      }
       if (message.type === 'panes.closed') {
         for (const handler of [...handlers]) handler({
           type: 'panes.closed.result', requestId: message.requestId, success: true,
@@ -4505,6 +4548,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith({
         type: 'freshAgent.attach',
+        viewId: expect.any(String),
         sessionId: 'ses_attach_route',
         sessionType: 'freshopencode',
         provider: 'opencode',
@@ -4524,6 +4568,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith({
         type: 'freshAgent.attach',
+        viewId: expect.any(String),
         sessionId: 'ses_attach_route',
         sessionType: 'freshopencode',
         provider: 'opencode',
@@ -10723,6 +10768,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith({
         type: 'freshAgent.attach',
+        viewId: expect.any(String),
         sessionId: 'thread-refresh',
         sessionType: 'freshcodex',
         provider: 'codex',
@@ -19137,5 +19183,91 @@ describe('Codex child observation in the parent view', () => {
     expect(await screen.findByText('Read-only child answer')).toBeVisible()
     expect(getFreshAgentPaneContent(store).sessionRef).toEqual({ provider: 'codex', sessionId: native.threadId })
     expect(wsMock.send.mock.calls.map(([message]) => message).filter((message) => message.sessionId === childId || message.sessionRef?.sessionId === childId)).toEqual([])
+  })
+})
+
+describe('Fresh Agent close attachment fencing', () => {
+  it('suppresses a reconnect attach after detach ack while durable close is pending', async () => {
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    const store = createStore()
+    const paneA = {
+      kind: 'fresh-agent' as const,
+      ...locator,
+      sessionRef: { provider: 'codex' as const, sessionId: native.threadId },
+      createRequestId: 'close-fence-a',
+      viewId: 'close-fence-view-a',
+      status: 'idle' as const,
+    }
+    const paneB = {
+      ...paneA,
+      createRequestId: 'close-fence-b',
+      viewId: 'close-fence-view-b',
+    }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-a', content: paneA }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1', paneId: 'pane-a', direction: 'horizontal',
+      newPaneId: 'pane-b', newContent: paneB, activate: false,
+    }))
+
+    const messageHandlers = new Set<(message: unknown) => void>()
+    const reconnectHandlers: Array<() => void> = []
+    wsMock.onMessage.mockImplementation((handler) => {
+      messageHandlers.add(handler)
+      return () => { messageHandlers.delete(handler) }
+    })
+    wsMock.onReconnect.mockImplementation((handler) => {
+      reconnectHandlers.push(handler)
+      return () => {}
+    })
+
+    render(<Provider store={store}><StoreBackedLayoutFreshAgentView tabId="tab-1" paneId="pane-a" /></Provider>)
+    render(<Provider store={store}><StoreBackedLayoutFreshAgentView tabId="tab-1" paneId="pane-b" /></Provider>)
+    await waitFor(() => expect(reconnectHandlers).toHaveLength(2))
+    wsMock.send.mockClear()
+
+    let closing!: Promise<unknown>
+    act(() => { closing = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-a' })) })
+    const detach = sentFreshAgentMessages('freshAgent.detach').find((message) => message.viewId === paneA.viewId)
+    expect(detach?.requestId).toBeTruthy()
+
+    await act(async () => {
+      for (const handler of [...messageHandlers]) {
+        handler({
+          type: 'freshAgent.detached',
+          requestId: detach!.requestId,
+          viewId: paneA.viewId,
+          success: true,
+        })
+      }
+    })
+    await waitFor(() => expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'pane.closed', createRequestId: paneA.createRequestId,
+    })))
+
+    // A reconnect was already registered by the mounted view. Force it in the
+    // window after detach succeeds but before durable close evidence settles.
+    await act(async () => {
+      reconnectHandlers[0]()
+      await Promise.resolve()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toEqual([])
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({ type: 'split' })
+
+    await act(async () => {
+      for (const handler of [...messageHandlers]) {
+        handler({ type: 'pane.closed.result', createRequestId: paneA.createRequestId, success: true })
+      }
+      await closing
+    })
+
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf', id: 'pane-b', content: { viewId: paneB.viewId, sessionId: native.threadId },
+    })
+    expect(sentFreshAgentMessages('freshAgent.detach')).toMatchObject([expect.objectContaining({ viewId: paneA.viewId })])
+    expect(sentFreshAgentMessages('freshAgent.detach').some((message) => message.viewId === paneB.viewId)).toBe(false)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toEqual([])
   })
 })
