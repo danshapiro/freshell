@@ -33,10 +33,14 @@
 //!      its owner pane is live. (b) `/resume <existing id>` — the fake
 //!      switches the active transcript to the EXISTING conversation and
 //!      the pane's next prompt is appended as that transcript's LATEST
-//!      user record → rebind to the existing id.
+//!      user record → rebind to the existing id; the resumed
+//!      transcript's steps CONTINUE from the planted max (a
+//!      discriminating pin: the process counter sits past it).
 //!   4. Restart resume adjacency: a restarted server (fresh in-memory
 //!      state, same antigravity home) restores the pane with the adjacent
-//!      `--conversation <bound id>` argv and identity persists.
+//!      `--conversation <bound id>` argv and identity persists; the
+//!      resumed process CONTINUES the conversation's steps from the
+//!      transcript's max (the sh fake's BOOT-arm seeding pin).
 //!
 //!      4b. Stale resume id — the PROBED missing-id contract (round 7,
 //!      Major 1): a restore create carrying an id that is NOT on disk
@@ -134,6 +138,22 @@ fn transcript_step_indexes(path: &std::path::Path) -> Vec<i64> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter_map(|value| value.get("step_index").and_then(serde_json::Value::as_i64))
         .collect()
+}
+
+/// Poll the transcript's step list until `pred` is satisfied (10 s
+/// budget — the fake appends its record asynchronously to the test's
+/// PTY write, and a same-id continuation emits NO association frame
+/// to synchronize on), returning the last observed list. Mirrors
+/// `wait_argv_rows`.
+async fn wait_transcript_steps(path: &std::path::Path, pred: impl Fn(&[i64]) -> bool) -> Vec<i64> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let steps = transcript_step_indexes(path);
+        if pred(&steps) || tokio::time::Instant::now() >= deadline {
+            return steps;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Write one fake `agy`: a contract-faithful `#!/bin/sh` reader that
@@ -1014,6 +1034,15 @@ async fn antigravity_exact_live_identity_rebind_suite() {
         "the earlier conversation own prompt",
         now_ms() - 60_000,
     );
+    // One more prompt stamped on the SWITCH conversation first, so the
+    // step-continuation pin below is DISCRIMINATING (round-2 review,
+    // Minor 1): the pane's process counter now sits at 1 (the switch
+    // conversation holds steps [0, 1]) while the planted conversation's
+    // max step is 0 — in the old flow the counter sat AT the planted
+    // max, so the pin passed even with the resume seeding removed. The
+    // extra prompt lands on the switch conversation (same-id: the
+    // locator no-ops it, no frame).
+    submit_prompt(&mut ws, &tid1, "switch conversation second prompt november").await;
     submit_prompt(&mut ws, &tid1, &format!("/resume {resume_conv}")).await;
     submit_prompt(&mut ws, &tid1, "prompt landed in the resumed conversation").await;
     let resumed = next_associated_frame(&mut ws, &tid1, "sc3-resume-rebind").await;
@@ -1033,8 +1062,10 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     // (Task 1's receipts: USER_INPUT steps 0→2→5 across three separate
     // resumed processes, no per-process reset). The pane's prompt lands
     // with a step_index strictly past every record already on disk, so
-    // in-file step_index uniqueness holds (a per-process counter reset
-    // would append a DUPLICATE of the planted step 0 instead).
+    // in-file step_index uniqueness holds. Discriminating (the extra
+    // switch-conversation prompt above): the process counter sat at 1
+    // when the /resume landed, so an un-seeded per-process counter
+    // would append step 2 here ([0, 2]), never the continuation step 1.
     let steps_3c = transcript_step_indexes(&transcript_path(home.path(), resume_conv));
     assert_eq!(
         steps_3c,
@@ -1100,6 +1131,26 @@ async fn antigravity_exact_live_identity_rebind_suite() {
             .session_ref_for(&tid4)
             .is_some_and(|r| r.provider == "antigravity" && r.session_id == resume_conv),
         "identity persists across the restart (create-time reseed from the sessionRef)"
+    );
+
+    // The sh fake's OTHER seeding arm — the boot `--conversation`
+    // resume: the restored process CONTINUES the conversation's steps
+    // from the transcript's max (the same evidenced cross-process
+    // continuation the in-CLI /resume pinned in 3c). The pane's first
+    // prompt lands strictly past every step already on disk — an
+    // un-seeded fresh-process counter would re-append the planted step
+    // 0 ([0, 1, 0]), the duplicate the pin rejects (round-2 review,
+    // Minor 1: the boot arm previously had NO step assertion at all).
+    submit_prompt(&mut ws2, &tid4, "restored pane continuing prompt oscar").await;
+    let steps_4 = wait_transcript_steps(&transcript_path(home.path(), resume_conv), |steps| {
+        steps.len() >= 3
+    })
+    .await;
+    assert_eq!(
+        steps_4,
+        vec![0, 1, 2],
+        "the boot --conversation resume continues the planted step 0 and 3c's \
+         step 1 with step 2 — never a per-process reset"
     );
 
     // ── Scenario 4b: stale resume id — the PROBED missing-id contract ──
