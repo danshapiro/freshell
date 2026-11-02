@@ -163,6 +163,27 @@ pub(crate) async fn split_pane(
         );
     }
 
+    let fresh_agent = body.get("agent").and_then(Value::as_str);
+    let needs_host_admission = if let Some(agent) = fresh_agent {
+        rest_agent_mode(agent).is_some()
+    } else {
+        !body
+            .get("hostStats")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && body.get("browser").and_then(Value::as_str).is_none()
+            && body.get("editor").and_then(Value::as_str).is_none()
+            && body.get("mode").and_then(Value::as_str).unwrap_or("shell") != "shell"
+    };
+    let _host_agent_permit = if needs_host_admission {
+        match crate::try_host_agent_admission(&state) {
+            Ok(permit) => Some(permit),
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+
     let pane_id = match resolve_pane_target(&state, &raw_pane_id) {
         PaneTarget::Pane { pane_id, .. } => pane_id,
         PaneTarget::Reject(resp) => return resp,
@@ -950,6 +971,16 @@ pub(crate) async fn respawn_pane(
             LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
         );
     }
+
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("shell");
+    let _host_agent_permit = if mode == "shell" {
+        None
+    } else {
+        match crate::try_host_agent_admission(&state) {
+            Ok(permit) => Some(permit),
+            Err(response) => return response,
+        }
+    };
 
     let tab_id = pane_tab_from_cache_or_layout(&state, &pane_id);
     // Round-1 review: an authoritative registry misses only when no connected

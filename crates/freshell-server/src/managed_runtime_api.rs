@@ -36,8 +36,13 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-use freshell_freshagent::layout_store::{LayoutStore, PaneSnapshot};
-use freshell_ownership::{OwnershipState, RuntimeOwnerKind, RuntimeOwnershipRegistry};
+use freshell_freshagent::{
+    host_agent_admission::{AdmissionError, AdmissionLease, HostAgentAdmissionGate},
+    layout_store::{LayoutStore, PaneSnapshot},
+};
+use freshell_ownership::{
+    OwnershipState, ReplayOwnerState, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+};
 use freshell_terminal::TerminalRegistry;
 
 const PROJECTION_SCHEMA_VERSION: u32 = 1;
@@ -171,6 +176,7 @@ pub struct ManagedRuntimeApiState {
     readiness_layout_store: Option<LayoutStore>,
     readiness_terminals: Option<TerminalRegistry>,
     readiness_ownership: Option<Arc<RuntimeOwnershipRegistry>>,
+    host_agent_admission: Option<HostAgentAdmissionGate>,
 }
 
 impl ManagedRuntimeApiState {
@@ -191,6 +197,7 @@ impl ManagedRuntimeApiState {
             readiness_layout_store: None,
             readiness_terminals: None,
             readiness_ownership: None,
+            host_agent_admission: None,
         };
         if let Some(client) = state.client.as_ref() {
             let snapshot = client
@@ -220,6 +227,11 @@ impl ManagedRuntimeApiState {
         self.readiness_layout_store = Some(layout_store);
         self.readiness_terminals = Some(terminals);
         self.readiness_ownership = Some(ownership);
+        self
+    }
+
+    pub fn with_host_agent_admission(mut self, gate: HostAgentAdmissionGate) -> Self {
+        self.host_agent_admission = Some(gate);
         self
     }
 
@@ -364,6 +376,20 @@ impl ManagedRuntimeApiState {
 pub fn router(state: ManagedRuntimeApiState) -> Router {
     Router::new()
         .route("/api/runtime/readiness", get(runtime_readiness))
+        .route("/api/runtime/maintenance/status", get(maintenance_status))
+        .route(
+            "/api/runtime/maintenance/quiesce",
+            post(maintenance_quiesce),
+        )
+        .route("/api/runtime/maintenance/renew", post(maintenance_renew))
+        .route(
+            "/api/runtime/maintenance/release",
+            post(maintenance_release),
+        )
+        .route(
+            "/api/runtime/maintenance/commit-stop",
+            post(maintenance_commit_stop),
+        )
         .route("/api/runtime/souls", get(list_souls))
         .route("/api/runtime/souls/{soul_id}", get(get_soul))
         .route(
@@ -409,28 +435,313 @@ async fn runtime_readiness(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    let client = match runtime_client(&state) {
-        Ok(client) => client,
+    match collect_readiness(&state).await {
+        Ok(report) => Json(report).into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+const DEFAULT_MAINTENANCE_LEASE_MS: u64 = 30_000;
+const MAX_MAINTENANCE_LEASE_MS: u64 = 300_000;
+const DEFAULT_MAINTENANCE_DRAIN_MS: u64 = 10_000;
+const MAX_MAINTENANCE_DRAIN_MS: u64 = 30_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintenanceQuiesceRequest {
+    owner_id: String,
+    #[serde(default = "default_maintenance_lease_ms")]
+    lease_duration_ms: u64,
+    #[serde(default = "default_maintenance_drain_ms")]
+    drain_timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintenanceLeaseRequest {
+    owner_id: String,
+    lease_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintenanceRenewRequest {
+    owner_id: String,
+    lease_id: String,
+    #[serde(default = "default_maintenance_lease_ms")]
+    lease_duration_ms: u64,
+}
+
+fn default_maintenance_lease_ms() -> u64 {
+    DEFAULT_MAINTENANCE_LEASE_MS
+}
+
+fn default_maintenance_drain_ms() -> u64 {
+    DEFAULT_MAINTENANCE_DRAIN_MS
+}
+
+fn admission_gate(state: &ManagedRuntimeApiState) -> Result<&HostAgentAdmissionGate, ApiRejection> {
+    state
+        .host_agent_admission
+        .as_ref()
+        .ok_or_else(|| ApiRejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Host coding-agent maintenance admission is unavailable".into(),
+        })
+}
+
+fn maintenance_error(error: AdmissionError) -> Response {
+    let status = match error {
+        AdmissionError::InvalidOwner | AdmissionError::InvalidLeaseDuration => {
+            StatusCode::BAD_REQUEST
+        }
+        AdmissionError::LeaseBusy
+        | AdmissionError::LeaseMismatch
+        | AdmissionError::LeaseExpired
+        | AdmissionError::NotDrained
+        | AdmissionError::LeaseNotClean => StatusCode::CONFLICT,
+        AdmissionError::DrainTimeout
+        | AdmissionError::Maintenance
+        | AdmissionError::ShutdownLatched => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(json!({"error": error.to_string()}))).into_response()
+}
+
+fn lease_json(lease: &AdmissionLease, gate: &HostAgentAdmissionGate) -> serde_json::Value {
+    json!({
+        "ownerId": lease.owner_id,
+        "leaseId": lease.lease_id,
+        "expiresInMs": gate.status().lease_expires_in_ms,
+    })
+}
+
+fn status_json(gate: &HostAgentAdmissionGate) -> serde_json::Value {
+    let status = gate.status();
+    json!({
+        "phase": status.phase,
+        "activePermits": status.active_permits,
+        "leaseOwner": status.lease_owner,
+        "leaseExpiresInMs": status.lease_expires_in_ms,
+    })
+}
+
+async fn maintenance_status(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    match admission_gate(&state) {
+        Ok(gate) => Json(status_json(gate)).into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+async fn maintenance_quiesce(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    Json(request): Json<MaintenanceQuiesceRequest>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    if request.lease_duration_ms == 0
+        || request.lease_duration_ms > MAX_MAINTENANCE_LEASE_MS
+        || request.drain_timeout_ms > MAX_MAINTENANCE_DRAIN_MS
+    {
+        return bad_request(
+            "leaseDurationMs and drainTimeoutMs must be within the supported bounds",
+        );
+    }
+    let gate = match admission_gate(&state) {
+        Ok(gate) => gate,
         Err(rejection) => return rejection.into_response(),
     };
-    let before = match client.health().await {
-        Ok(identity) => identity,
-        Err(error) => return client_error(error),
+    let lease = match gate.begin_quiesce(
+        &request.owner_id,
+        std::time::Duration::from_millis(request.lease_duration_ms),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => return maintenance_error(error),
     };
-    let snapshot = match client.inventory_snapshot().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return client_error(error),
+    if let Err(error) = gate
+        .drain(
+            &lease,
+            std::time::Duration::from_millis(request.drain_timeout_ms),
+        )
+        .await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": error.to_string(),
+                "drained": false,
+                "lease": lease_json(&lease, gate),
+                "admission": status_json(gate),
+            })),
+        )
+            .into_response();
+    }
+
+    let report = match collect_readiness(&state).await {
+        Ok(report) => report,
+        Err(rejection) => {
+            let mut report = PaneOwnershipReport::incomplete();
+            report.diagnostic = Some(rejection.message);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "managed runtime ownership census is unavailable",
+                    "drained": true,
+                    "readyToStop": false,
+                    "lease": lease_json(&lease, gate),
+                    "admission": status_json(gate),
+                    "paneOwnership": report,
+                })),
+            )
+                .into_response();
+        }
     };
-    let after = match client.health().await {
-        Ok(identity) => identity,
-        Err(error) => return client_error(error),
+    let pane_ownership = report["paneOwnership"].clone();
+    let ready_to_stop = pane_ownership_is_safe(&pane_ownership);
+    if ready_to_stop {
+        if let Err(error) = gate.mark_clean(&lease) {
+            return maintenance_error(error);
+        }
+    }
+    Json(json!({
+        "drained": true,
+        "readyToStop": ready_to_stop,
+        "lease": lease_json(&lease, gate),
+        "admission": status_json(gate),
+        "readiness": report,
+    }))
+    .into_response()
+}
+
+async fn maintenance_renew(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    Json(request): Json<MaintenanceRenewRequest>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    if request.lease_duration_ms == 0 || request.lease_duration_ms > MAX_MAINTENANCE_LEASE_MS {
+        return bad_request("leaseDurationMs must be within the supported bounds");
+    }
+    let gate = match admission_gate(&state) {
+        Ok(gate) => gate,
+        Err(rejection) => return rejection.into_response(),
     };
+    match gate.renew(
+        &request.owner_id,
+        &request.lease_id,
+        std::time::Duration::from_millis(request.lease_duration_ms),
+    ) {
+        Ok(lease) => Json(json!({
+            "lease": lease_json(&lease, gate),
+            "admission": status_json(gate),
+        }))
+        .into_response(),
+        Err(error) => maintenance_error(error),
+    }
+}
+
+async fn maintenance_release(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    Json(request): Json<MaintenanceLeaseRequest>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let gate = match admission_gate(&state) {
+        Ok(gate) => gate,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match gate.release_for(&request.owner_id, &request.lease_id) {
+        Ok(()) => Json(json!({"admission": status_json(gate)})).into_response(),
+        Err(error) => maintenance_error(error),
+    }
+}
+
+async fn maintenance_commit_stop(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    Json(request): Json<MaintenanceLeaseRequest>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let gate = match admission_gate(&state) {
+        Ok(gate) => gate,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let lease = AdmissionLease {
+        owner_id: request.owner_id,
+        lease_id: request.lease_id,
+    };
+    let report = match collect_readiness(&state).await {
+        Ok(report) => report,
+        Err(rejection) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": rejection.message, "readyToStop": false})),
+            )
+                .into_response();
+        }
+    };
+    let pane_ownership = report["paneOwnership"].clone();
+    if !pane_ownership_is_safe(&pane_ownership) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "host-managed, unknown, or unattached coding work prevents shutdown",
+                "readyToStop": false,
+                "readiness": report,
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = gate.mark_clean(&lease) {
+        return maintenance_error(error);
+    }
+    match gate.commit_stop(&lease) {
+        Ok(()) => Json(json!({
+            "committed": true,
+            "admission": status_json(gate),
+            "readiness": report,
+        }))
+        .into_response(),
+        Err(error) => maintenance_error(error),
+    }
+}
+
+fn pane_ownership_is_safe(value: &serde_json::Value) -> bool {
+    value.get("complete").and_then(serde_json::Value::as_bool) == Some(true)
+        && value
+            .get("readyToStop")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+async fn collect_readiness(
+    state: &ManagedRuntimeApiState,
+) -> Result<serde_json::Value, ApiRejection> {
+    let client = runtime_client(state)?;
+    let before = client.health().await.map_err(client_rejection)?;
+    let snapshot = client
+        .inventory_snapshot()
+        .await
+        .map_err(client_rejection)?;
+    let after = client.health().await.map_err(client_rejection)?;
     if before != after {
-        return ApiRejection {
+        return Err(ApiRejection {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "Managed runtime changed while readiness was being read".into(),
-        }
-        .into_response();
+        });
     }
     let pane_ownership = pane_ownership_report(
         state.readiness_layout_store.as_ref(),
@@ -439,7 +750,7 @@ async fn runtime_readiness(
         &snapshot.souls,
     );
     let (control_epoch, installation_id) = before;
-    Json(json!({
+    Ok(json!({
         "installationId": installation_id,
         "controlEpoch": control_epoch,
         "revision": snapshot.revision,
@@ -447,7 +758,15 @@ async fn runtime_readiness(
         "pendingProjectionCount": snapshot.pending_projection_count,
         "paneOwnership": pane_ownership,
     }))
-    .into_response()
+}
+
+fn client_rejection(error: ClientError) -> ApiRejection {
+    let response = client_error(error);
+    let status = response.status();
+    ApiRejection {
+        status,
+        message: "Managed runtime readiness request failed".into(),
+    }
 }
 
 async fn list_souls(
@@ -1181,9 +1500,40 @@ struct AgentPaneOwnership {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct UnattachedProcess {
+    kind: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    ownership: PaneOwnership,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PaneOwnershipReport {
     complete: bool,
     panes: Vec<AgentPaneOwnership>,
+    unattached_processes: Vec<UnattachedProcess>,
+    ready_to_stop: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
+}
+
+impl PaneOwnershipReport {
+    fn incomplete() -> Self {
+        Self {
+            complete: false,
+            panes: Vec::new(),
+            unattached_processes: Vec::new(),
+            ready_to_stop: false,
+            diagnostic: None,
+        }
+    }
 }
 
 fn pane_ownership_report(
@@ -1192,17 +1542,12 @@ fn pane_ownership_report(
     ownership: Option<&RuntimeOwnershipRegistry>,
     runtime_views: &[RuntimeView],
 ) -> PaneOwnershipReport {
-    let Some(layout_store) = layout_store else {
-        return PaneOwnershipReport {
-            complete: false,
-            panes: Vec::new(),
-        };
-    };
     let terminal_rows = terminals
         .map(TerminalRegistry::inventory)
         .unwrap_or_default();
     let mut panes: Vec<AgentPaneOwnership> = layout_store
-        .live_pane_snapshots()
+        .map(LayoutStore::live_pane_snapshots)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|entry| agent_pane_identity(entry.client_id, entry.pane))
         .map(|mut pane| {
@@ -1220,10 +1565,154 @@ fn pane_ownership_report(
             .then_with(|| left.tab_id.cmp(&right.tab_id))
             .then_with(|| left.pane_id.cmp(&right.pane_id))
     });
+    let mut unattached_processes = unattached_processes(&panes, &terminal_rows, ownership);
+    unattached_processes.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.terminal_id.cmp(&right.terminal_id))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    let complete = layout_store.is_some() && terminals.is_some() && ownership.is_some();
+    let ready_to_stop = complete
+        && panes
+            .iter()
+            .all(|pane| pane.ownership == PaneOwnership::Durable)
+        && unattached_processes.is_empty();
     PaneOwnershipReport {
-        complete: true,
+        complete,
         panes,
+        unattached_processes,
+        ready_to_stop,
+        diagnostic: None,
     }
+}
+
+fn unattached_processes(
+    panes: &[AgentPaneOwnership],
+    terminal_rows: &[InventoryTerminal],
+    ownership: Option<&RuntimeOwnershipRegistry>,
+) -> Vec<UnattachedProcess> {
+    let mut processes = Vec::new();
+    for terminal in terminal_rows.iter().filter(|terminal| {
+        terminal.mode != "shell" && terminal.status == freshell_protocol::TerminalRunStatus::Running
+    }) {
+        let matching_panes = panes
+            .iter()
+            .filter(|pane| pane.terminal_id.as_deref() == Some(terminal.terminal_id.as_str()))
+            .collect::<Vec<_>>();
+        let matching_soul_count = match (
+            terminal.soul_id.as_deref(),
+            terminal.incarnation_id.as_deref(),
+        ) {
+            (Some(soul_id), Some(incarnation_id)) => panes
+                .iter()
+                .filter(|pane| {
+                    pane.soul_id.as_deref() == Some(soul_id)
+                        && pane.incarnation_id.as_deref() == Some(incarnation_id)
+                })
+                .count(),
+            _ => 0,
+        };
+        let uniquely_durable = matching_panes.as_slice().iter().any(|pane| {
+            pane.ownership == PaneOwnership::Durable
+                && terminal.soul_id.as_deref() == pane.soul_id.as_deref()
+                && terminal.incarnation_id.as_deref() == pane.incarnation_id.as_deref()
+                && matching_panes.len() == 1
+                && matching_soul_count == 1
+        });
+        if uniquely_durable {
+            continue;
+        }
+        let ownership = match matching_panes.as_slice() {
+            [pane] if pane.ownership == PaneOwnership::HostManaged => PaneOwnership::HostManaged,
+            [] if terminal.soul_id.is_none() && terminal.incarnation_id.is_none() => {
+                PaneOwnership::HostManaged
+            }
+            _ => PaneOwnership::Unknown,
+        };
+        processes.push(UnattachedProcess {
+            kind: "terminal".into(),
+            source: "terminal-registry".into(),
+            provider: Some(terminal.mode.clone()),
+            terminal_id: Some(terminal.terminal_id.clone()),
+            session_id: terminal
+                .session_ref
+                .as_ref()
+                .map(|session_ref| session_ref.session_id.clone()),
+            ownership,
+            reason: "running terminal has no one-to-one durable pane and soul match".into(),
+        });
+    }
+
+    if let Some(ownership) = ownership {
+        let live_terminal_ids = terminal_rows
+            .iter()
+            .filter(|terminal| {
+                terminal.mode != "shell"
+                    && terminal.status == freshell_protocol::TerminalRunStatus::Running
+            })
+            .map(|terminal| terminal.terminal_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for record in ownership.snapshot_records() {
+            if record.alias_of.is_some() || record.owner_kind == "vacant" {
+                continue;
+            }
+            if record.owner_kind == "terminal"
+                && record.state == ReplayOwnerState::Live
+                && record
+                    .terminal_id
+                    .as_deref()
+                    .is_some_and(|terminal_id| live_terminal_ids.contains(terminal_id))
+            {
+                continue;
+            }
+            let (kind, source, process_ownership, reason) =
+                match (record.owner_kind.as_str(), record.state) {
+                    ("fresh-agent", ReplayOwnerState::Live) => (
+                        "fresh-agent",
+                        "runtime-ownership-registry",
+                        PaneOwnership::HostManaged,
+                        "live host Fresh Agent owner is outside a durable soul",
+                    ),
+                    ("terminal", ReplayOwnerState::Live) => (
+                        "terminal",
+                        "runtime-ownership-registry",
+                        PaneOwnership::Unknown,
+                        "live terminal owner has no running terminal registry row",
+                    ),
+                    (_, _) => (
+                        "coding-agent",
+                        "runtime-ownership-registry",
+                        PaneOwnership::Unknown,
+                        "ownership record is in a transition or has an unknown owner",
+                    ),
+                };
+            let matched_panes = panes
+                .iter()
+                .filter(|pane| {
+                    pane.provider.as_deref() == Some(record.provider.as_str())
+                        && pane.session_id.as_deref() == Some(record.session_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            let process_ownership = match matched_panes.as_slice() {
+                [pane] if pane.ownership == PaneOwnership::HostManaged => process_ownership,
+                [] => process_ownership,
+                _ => PaneOwnership::Unknown,
+            };
+            processes.push(UnattachedProcess {
+                kind: kind.into(),
+                source: source.into(),
+                provider: Some(record.provider),
+                terminal_id: record.terminal_id,
+                session_id: Some(record.session_id),
+                ownership: process_ownership,
+                reason: reason.into(),
+            });
+        }
+    }
+    processes
 }
 
 struct PaneClassification {
@@ -1512,6 +2001,75 @@ mod stop_contract_tests;
 mod tests {
     use super::*;
 
+    async fn maintenance_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+        };
+        use tower::ServiceExt;
+
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("x-auth-token", token);
+        }
+        let body = if let Some(body) = body {
+            request = request.header("content-type", "application/json");
+            Body::from(body.to_string())
+        } else {
+            Body::empty()
+        };
+        let response = app
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    async fn maintenance_router(
+        root: &std::path::Path,
+        gate: HostAgentAdmissionGate,
+        layout_store: LayoutStore,
+        ownership: Arc<RuntimeOwnershipRegistry>,
+    ) -> (Router, tokio::task::JoinHandle<()>) {
+        use freshell_runtime_client::RuntimeClient;
+        use freshell_supervisor::backend::DockerEngineBackend;
+
+        let (registry, _) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
+            root,
+            false,
+            "opencode",
+            "freshopencode",
+            "maintenance-managed-session",
+            false,
+        )
+        .await;
+        let backend = Arc::new(DockerEngineBackend::new(root.join("no-docker.sock")));
+        let (socket, control) = stop_contract_tests::start_control(root, registry, backend).await;
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(4);
+        let state = ManagedRuntimeApiState::new(
+            Arc::new("maintenance-secret".into()),
+            Some(RuntimeClient::new(&socket, "test-control-secret")),
+            None,
+            Arc::new(PaneLedger::new(None)),
+            Arc::new(broadcast_tx),
+        )
+        .await
+        .unwrap()
+        .with_readiness_ownership_sources(layout_store, TerminalRegistry::new(), ownership)
+        .with_host_agent_admission(gate);
+        (router(state), control)
+    }
+
     fn readiness_layout_sync(
         tab_id: &str,
         pane_id: &str,
@@ -1525,6 +2083,377 @@ mod tests {
             "timestamp": 1,
         }))
         .expect("readiness layout sync parses")
+    }
+
+    #[tokio::test]
+    async fn maintenance_api_is_authenticated_and_lease_owner_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let gate = HostAgentAdmissionGate::new();
+        let layout_store = LayoutStore::default();
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let (app, control) =
+            maintenance_router(root.path(), gate.clone(), layout_store, ownership).await;
+
+        let (status, _) =
+            maintenance_request(&app, "GET", "/api/runtime/maintenance/status", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/quiesce",
+            None,
+            Some(json!({"ownerId":"updater-a"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(gate.status().phase, "open");
+
+        let (status, body) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/quiesce",
+            Some("maintenance-secret"),
+            Some(json!({"ownerId":"updater-a"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let lease = body["lease"].clone();
+        assert_eq!(body["drained"], true);
+
+        let (status, renewed) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/renew",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":"updater-a", "leaseId":lease["leaseId"],
+                "leaseDurationMs":60000
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{renewed}");
+        assert_eq!(renewed["lease"]["leaseId"], lease["leaseId"]);
+
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/release",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":"updater-b", "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(gate.status().phase, "quiesced");
+
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/renew",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":"updater-a", "leaseId":"stale-lease",
+                "leaseDurationMs":30000
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/release",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":"updater-a", "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(gate.status().phase, "open");
+
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_quiesce_drains_delayed_host_create_and_reports_its_process() {
+        use freshell_ownership::{BeginOutcome, CommitOutcome, OwnerIdentity};
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let gate = HostAgentAdmissionGate::new();
+        let layout_store = LayoutStore::default();
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let (app, control) = maintenance_router(
+            root.path(),
+            gate.clone(),
+            layout_store.clone(),
+            Arc::clone(&ownership),
+        )
+        .await;
+
+        // Model a REST Fresh Agent create that acquired its permit before
+        // quiesce and publishes its process ownership and pane afterward.
+        let permit = gate.try_admit().unwrap();
+        let delayed_layout = layout_store.clone();
+        let delayed_ownership = Arc::clone(&ownership);
+        let create = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            delayed_layout.update_from_ui(
+                &readiness_layout_sync(
+                    "tab-host-race",
+                    "pane-host-race",
+                    json!({
+                        "kind":"fresh-agent", "provider":"claude",
+                        "sessionType":"freshclaude", "sessionId":"native-race-session",
+                        "createRequestId":"host-race-create", "status":"running"
+                    }),
+                ),
+                "client-host-race",
+            );
+            let BeginOutcome::Granted { generation } = delayed_ownership.begin_start(
+                "claude",
+                "native-race-session",
+                RuntimeOwnerKind::FreshAgent,
+                "host-race-create",
+                None,
+                "maintenance-race-test",
+                1,
+            ) else {
+                panic!("fake delayed host create should acquire ownership")
+            };
+            assert_eq!(
+                delayed_ownership.commit_live(
+                    "claude",
+                    "native-race-session",
+                    "host-race-create",
+                    generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some("freshclaude:native-race-session".into()),
+                        pid: Some(42),
+                        ownership_id: None,
+                    },
+                ),
+                CommitOutcome::Committed
+            );
+            drop(permit);
+        });
+
+        let (status, body) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/quiesce",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":"updater-race", "leaseDurationMs":60000,
+                "drainTimeoutMs":2000
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        create.await.unwrap();
+        assert_eq!(body["drained"], true);
+        assert_eq!(body["readyToStop"], false);
+        assert_eq!(body["readiness"]["paneOwnership"]["complete"], true);
+        assert_eq!(
+            body["readiness"]["paneOwnership"]["panes"][0]["ownership"],
+            "host-managed"
+        );
+        let unattached = body["readiness"]["paneOwnership"]["unattachedProcesses"]
+            .as_array()
+            .unwrap();
+        assert!(unattached.iter().any(|process| {
+            process["sessionId"] == "native-race-session" && process["ownership"] == "host-managed"
+        }));
+        assert_eq!(gate.status().phase, "quiesced");
+        assert!(matches!(gate.try_admit(), Err(AdmissionError::Maintenance)));
+
+        let lease = &body["lease"];
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/commit-stop",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":lease["ownerId"], "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(gate.status().phase, "quiesced");
+
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/release",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":lease["ownerId"], "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(gate.status().phase, "open");
+        assert!(gate.try_admit().is_ok());
+
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_commit_stop_requires_clean_census_and_latches_this_process() {
+        let root = tempfile::tempdir().unwrap();
+        let gate = HostAgentAdmissionGate::new();
+        let layout_store = LayoutStore::default();
+        layout_store.update_from_ui(
+            &readiness_layout_sync(
+                "tab-managed",
+                "pane-managed",
+                json!({
+                    "kind":"fresh-agent", "provider":"opencode",
+                    "sessionType":"freshopencode", "sessionId":"fresh-retained-thread",
+                    "createRequestId":"managed-create", "status":"running"
+                }),
+            ),
+            "client-managed",
+        );
+        let (app, control) = maintenance_router(
+            root.path(),
+            gate.clone(),
+            layout_store,
+            Arc::new(RuntimeOwnershipRegistry::new()),
+        )
+        .await;
+
+        let (status, quiesce) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/quiesce",
+            Some("maintenance-secret"),
+            Some(json!({"ownerId":"updater-clean"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{quiesce}");
+        assert_eq!(quiesce["readyToStop"], true);
+        let lease = &quiesce["lease"];
+
+        // A wrong owner cannot commit even if the census was clean.
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/commit-stop",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":"other-updater", "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(gate.status().phase, "quiesced");
+
+        let (status, committed) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/commit-stop",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":lease["ownerId"], "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{committed}");
+        assert_eq!(committed["committed"], true);
+        assert_eq!(gate.status().phase, "shutdown-latched");
+        assert!(matches!(
+            gate.try_admit(),
+            Err(AdmissionError::ShutdownLatched)
+        ));
+        let (status, _) = maintenance_request(
+            &app,
+            "POST",
+            "/api/runtime/maintenance/release",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":lease["ownerId"], "leaseId":lease["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // This is a new process's gate; the old process's latch is not shared
+        // globally or persisted across server starts.
+        assert!(HostAgentAdmissionGate::new().try_admit().is_ok());
+
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[test]
+    fn ownership_census_fails_closed_for_missing_sources_and_unattached_live_agent() {
+        use freshell_ownership::{BeginOutcome, CommitOutcome, OwnerIdentity};
+
+        let layout_store = LayoutStore::default();
+        let terminals = TerminalRegistry::new();
+        terminals.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "unattached-terminal".into(),
+            stream_id: "unattached-stream".into(),
+            mode: "claude".into(),
+            resume_session_id: None,
+            create_request_id: Some("unattached-terminal-create".into()),
+            created_at: None,
+        });
+        let ownership = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = ownership.begin_start(
+            "codex",
+            "unattached-session",
+            RuntimeOwnerKind::FreshAgent,
+            "server-owned-agent",
+            None,
+            "readiness-census-test",
+            1,
+        ) else {
+            panic!("fake process should acquire ownership")
+        };
+        assert_eq!(
+            ownership.commit_live(
+                "codex",
+                "unattached-session",
+                "server-owned-agent",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("freshcodex:unattached-session".into()),
+                    pid: Some(44),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        );
+
+        let report =
+            pane_ownership_report(Some(&layout_store), Some(&terminals), Some(&ownership), &[]);
+        assert!(report.complete);
+        assert!(!report.ready_to_stop);
+        assert_eq!(report.unattached_processes.len(), 2);
+        assert!(report.unattached_processes.iter().any(|process| {
+            process.ownership == PaneOwnership::HostManaged
+                && process.session_id.as_deref() == Some("unattached-session")
+        }));
+        assert!(report.unattached_processes.iter().any(|process| {
+            process.ownership == PaneOwnership::HostManaged
+                && process.terminal_id.as_deref() == Some("unattached-terminal")
+        }));
+
+        let incomplete = pane_ownership_report(Some(&layout_store), Some(&terminals), None, &[]);
+        assert!(!incomplete.complete);
+        assert!(!incomplete.ready_to_stop);
     }
 
     #[tokio::test]
@@ -1554,6 +2483,27 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for uri in [
+            "/api/runtime/maintenance/renew",
+            "/api/runtime/maintenance/release",
+            "/api/runtime/maintenance/commit-stop",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"ownerId":"updater", "leaseId":"lease"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
     }
 
@@ -1696,6 +2646,15 @@ mod tests {
             serde_json::to_value(direct_snapshot.readiness).unwrap()
         );
         assert!(body["paneOwnership"]["complete"].as_bool().unwrap());
+        assert_eq!(body["paneOwnership"]["readyToStop"], false);
+        assert!(body["paneOwnership"]["unattachedProcesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|process| {
+                process["sessionId"] == "host-native-session"
+                    && process["ownership"] == "host-managed"
+            }));
         let panes = body["paneOwnership"]["panes"].as_array().unwrap();
         assert_eq!(
             panes.len(),
@@ -1821,13 +2780,26 @@ mod tests {
             positive.incarnation_id.as_deref(),
             Some(view.incarnation_id.as_str())
         );
+        let mut durable_pane = pane.clone();
+        durable_pane.ownership = positive.ownership;
+        durable_pane.soul_id = positive.soul_id.clone();
+        durable_pane.incarnation_id = positive.incarnation_id.clone();
+        assert!(
+            unattached_processes(&[durable_pane], std::slice::from_ref(&terminal), None,)
+                .is_empty()
+        );
 
         let mut wrong_incarnation = terminal.clone();
         wrong_incarnation.incarnation_id =
             Some(freshell_runtime_protocol::IncarnationId::new().to_string());
-        let mismatch = classify_agent_pane(&pane, &[view], &[wrong_incarnation], None);
+        let mismatch = classify_agent_pane(&pane, &[view], &[wrong_incarnation.clone()], None);
         assert_eq!(mismatch.ownership, PaneOwnership::Unknown);
         assert!(mismatch.soul_id.is_none());
+        let mut unknown_pane = pane.clone();
+        unknown_pane.ownership = mismatch.ownership;
+        let unknown_processes = unattached_processes(&[unknown_pane], &[wrong_incarnation], None);
+        assert_eq!(unknown_processes.len(), 1);
+        assert_eq!(unknown_processes[0].ownership, PaneOwnership::Unknown);
 
         let host_terminal = InventoryTerminal {
             created_at: 1,

@@ -288,6 +288,15 @@ async fn create_terminal_or_content_tab_with_delivery(
             broadcast,
         );
     }
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("shell");
+    let _host_agent_permit = if mode == "shell" {
+        None
+    } else {
+        match crate::try_host_agent_admission(&state) {
+            Ok(permit) => Some(permit),
+            Err(response) => return response,
+        }
+    };
     create_terminal_tab(&state, name, &body, restore_key.as_deref(), broadcast).await
 }
 
@@ -8003,6 +8012,75 @@ if (args.includes('app-server')) {{
             "mode": "shell",
             "cwd": std::env::temp_dir().to_string_lossy(),
         })
+    }
+
+    #[tokio::test]
+    async fn maintenance_gate_refuses_rest_agent_create_split_and_respawn_but_keeps_shell_open() {
+        let state = state_with_registry();
+        let gate = state.host_agent_admission();
+        let router = app(state.clone());
+        let (status, shell) = post(router.clone(), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "{shell}");
+        let pane_id = shell["data"]["paneId"].as_str().unwrap().to_string();
+        let shell_terminal_id = shell["data"]["terminalId"].as_str().unwrap().to_string();
+        let (status, fresh_agent) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({"agent":"opencode"}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fresh_agent}");
+        let fresh_agent_pane_id = fresh_agent["data"]["paneId"].as_str().unwrap().to_string();
+        let before_split = state.layout.get_normalized_snapshot(None);
+        let lease = gate
+            .begin_quiesce("maintenance-route-test", std::time::Duration::from_secs(30))
+            .unwrap();
+        gate.drain(&lease, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let split_uri = format!("/api/panes/{pane_id}/split");
+        let respawn_uri = format!("/api/panes/{pane_id}/respawn");
+        let send_uri = format!("/api/panes/{fresh_agent_pane_id}/send-keys");
+        for (uri, body) in [
+            ("/api/tabs", json!({"agent":"claude"})),
+            (
+                "/api/tabs",
+                json!({
+                    "mode":"claude",
+                    "cwd":std::env::temp_dir().to_string_lossy()
+                }),
+            ),
+            (split_uri.as_str(), json!({"agent":"claude"})),
+            (split_uri.as_str(), json!({"mode":"claude"})),
+            (
+                respawn_uri.as_str(),
+                json!({
+                    "mode":"claude",
+                    "cwd":std::env::temp_dir().to_string_lossy()
+                }),
+            ),
+            (send_uri.as_str(), json!({"text":"start or resume"})),
+        ] {
+            let (status, response) = post(router.clone(), uri, body, true).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {response}");
+            assert_eq!(
+                response["code"],
+                json!("HOST_AGENT_MAINTENANCE"),
+                "{uri}: {response}"
+            );
+        }
+        assert_eq!(state.layout.get_normalized_snapshot(None), before_split);
+
+        // Ordinary shell creation remains available while coding-agent
+        // admission is paused.
+        let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&shell_terminal_id);
+        registry.kill(body["data"]["terminalId"].as_str().unwrap());
+        gate.release(&lease).unwrap();
     }
 
     #[tokio::test]

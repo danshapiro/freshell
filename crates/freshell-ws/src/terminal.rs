@@ -119,6 +119,40 @@ pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
     }
 }
 
+const HOST_AGENT_MAINTENANCE_MESSAGE: &str =
+    "Host coding-agent starts are temporarily paused for maintenance; retry shortly.";
+
+fn host_agent_maintenance_error(request_id: Option<String>) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
+        code: ErrorCode::RateLimited,
+        message: HOST_AGENT_MAINTENANCE_MESSAGE.to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id,
+        retry_after_ms: Some(1000),
+        terminal_exit_code: None,
+        terminal_id: None,
+        live_terminal_id: None,
+    })
+}
+
+fn fresh_agent_maintenance_error(request_id: String) -> ServerMessage {
+    ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+        code: "HOST_AGENT_MAINTENANCE".to_string(),
+        message: HOST_AGENT_MAINTENANCE_MESSAGE.to_string(),
+        request_id,
+        retryable: Some(true),
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
+    })
+}
+
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
 /// reused by the locator association seams and the identity invariant
 /// sweep -- one wall-clock source for the whole crate.
@@ -1224,6 +1258,24 @@ async fn handle_client_text(
                 }
                 crate::create_dedupe::DedupeDecision::Proceed => {}
             }
+            // Shell PTYs retain their existing behavior. Coding CLI creates
+            // must acquire maintenance admission before they queue or enter
+            // launch planning, so quiesce either drains them or refuses them.
+            let host_agent_permit = if create.mode != "shell" {
+                match state.fresh_opencode.host_agent_admission().try_admit() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        state.create_dedupe.clear_if_in_flight(&create.request_id);
+                        return crate::terminal::send(
+                            ws_tx,
+                            &host_agent_maintenance_error(Some(create.request_id.clone())),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                None
+            };
             if create.restore == Some(true) {
                 // restore:true bypasses the per-connection rate limiter —
                 // neither checked nor recorded (legacy `if (!m.restore)`) —
@@ -1231,6 +1283,7 @@ async fn handle_client_text(
                 // task (spawn-to-settled permit, cancellable).
                 crate::create_gate::spawn_gated_restore_create(
                     create,
+                    host_agent_permit,
                     state,
                     conn_sink,
                     create_cancel_rx.clone(),
@@ -1252,6 +1305,7 @@ async fn handle_client_text(
                     state,
                     conn_identity,
                     asserted_at,
+                    host_agent_permit,
                 )) {
                     Ok(()) => true,
                     Err(error) => {
@@ -1799,7 +1853,7 @@ async fn handle_client_text(
                     .await
                 {
                     if let Some(reason) = managed_input_blocked_reason(&error) {
-                        return send(
+                        return crate::terminal::send(
                             ws_tx,
                             &managed_runtime_input_blocked(&input.terminal_id, reason),
                         )
@@ -1906,6 +1960,17 @@ async fn handle_client_text(
                 let Some(create) = freshell_protocol::direct_provider_create(create) else {
                     return true;
                 };
+                let host_agent_permit =
+                    match state.fresh_opencode.host_agent_admission().try_admit() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return send(
+                                ws_tx,
+                                &fresh_agent_maintenance_error(create.request_id.clone()),
+                            )
+                            .await;
+                        }
+                    };
                 // D8 (restore-open-sessions-only): thread this connection's
                 // provenance (hello identity + the create's `tabId`) down the
                 // provider `handle_create` chain so the identity-sink binding
@@ -1922,23 +1987,32 @@ async fn handle_client_text(
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
                         tokio::spawn(
-                            async move { fresh_codex.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_codex.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(
-                            async move { fresh_claude.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_claude.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
                         tokio::spawn(
-                            async move { fresh_opencode.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_opencode.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     _ => unreachable!("direct_provider_create only accepts direct providers"),
@@ -1978,27 +2052,47 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
+            let host_agent_permit =
+                if attach.provider == freshell_protocol::AgentProvider::Amplifier {
+                    None
+                } else {
+                    match state.fresh_opencode.host_agent_admission().try_admit() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            return send(ws_tx, &host_agent_maintenance_error(None)).await;
+                        }
+                    }
+                };
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move { fresh_codex.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_codex.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
                     let reply = conn_sink.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_attach(attach, reply).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_claude.handle_attach(attach, reply).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
                     tokio::spawn(
-                        async move { fresh_opencode.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_opencode.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 _ => {}
@@ -2006,6 +2100,21 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentSend(send) => {
+            let host_agent_permit = if send.provider == freshell_protocol::AgentProvider::Amplifier
+            {
+                None
+            } else {
+                match state.fresh_opencode.host_agent_admission().try_admit() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        return crate::terminal::send(
+                            ws_tx,
+                            &host_agent_maintenance_error(send.request_id.clone()),
+                        )
+                        .await;
+                    }
+                }
+            };
             if send.checkpoint_intent.is_some() {
                 if let Some(service) = state.checkpoint_send.service.clone() {
                     let captured_send = send.clone();
@@ -2013,6 +2122,7 @@ async fn handle_client_text(
                         freshell_protocol::AgentProvider::Codex => {
                             let fresh_codex = state.fresh_codex.clone();
                             Box::pin(async move {
+                                let _host_agent_permit = host_agent_permit;
                                 fresh_codex.handle_send(send).await;
                             })
                         }
@@ -2020,12 +2130,16 @@ async fn handle_client_text(
                             let fresh_claude = state.fresh_claude.clone();
                             // The WS lane answers on the bus; the outcome is for in-process callers.
                             Box::pin(async move {
+                                let _host_agent_permit = host_agent_permit;
                                 fresh_claude.handle_send(send).await;
                             })
                         }
                         freshell_protocol::AgentProvider::Opencode => {
                             let fresh_opencode = state.fresh_opencode.clone();
-                            Box::pin(async move { fresh_opencode.handle_send(send).await })
+                            Box::pin(async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_opencode.handle_send(send).await
+                            })
                         }
                         freshell_protocol::AgentProvider::Amplifier => Box::pin(async {}),
                         // Antigravity plan Task 8: no fresh-agent runtime
@@ -2045,23 +2159,32 @@ async fn handle_client_text(
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move { fresh_codex.handle_send(send).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_codex.handle_send(send).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_send(send).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_claude.handle_send(send).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 // Batch D PR-2: materialize-or-send (the continuity fix) runs here.
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
                     tokio::spawn(
-                        async move { fresh_opencode.handle_send(send).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_opencode.handle_send(send).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 // `amplifier` exists on AgentProvider for the TERM-16
@@ -13594,6 +13717,121 @@ mod pane_reconcile_gate_tests {
         drop(interactive_create_rx);
     }
 }
+
+#[cfg(test)]
+mod host_agent_admission_tests {
+    use super::*;
+    use freshell_freshagent::host_agent_admission::HostAgentAdmissionGate;
+
+    async fn dispatch(
+        text: &str,
+        ws_tx: &mut WsSink,
+        state: &WsState,
+        interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
+        create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        let conn_sink: FrameSink = Arc::new(|_| {});
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+        let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+        handle_client_text(
+            text,
+            ws_tx,
+            state,
+            9,
+            &conn_sink,
+            false,
+            false,
+            false,
+            false,
+            interactive_create_tx,
+            create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+            &mut conn_identity,
+            &mut paced_sessions,
+            &None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn maintenance_gate_refuses_ws_terminal_restore_and_fresh_agent_revivals() {
+        use std::time::Duration;
+
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let state = super::pane_reconcile_gate_tests::state();
+        state.fresh_codex.set_enabled(true);
+        let gate: HostAgentAdmissionGate = state.fresh_opencode.host_agent_admission();
+        let lease = gate
+            .begin_quiesce("ws-maintenance-test", Duration::from_secs(30))
+            .unwrap();
+        gate.drain(&lease, Duration::from_secs(1)).await.unwrap();
+
+        let (interactive_create_tx, mut interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(8);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+
+        for (request_id, restore) in [
+            ("interactive-maintenance", false),
+            ("restore-maintenance", true),
+        ] {
+            let text = serde_json::json!({
+                "type":"terminal.create", "requestId":request_id,
+                "mode":"claude", "shell":"system", "restore":restore
+            })
+            .to_string();
+            assert!(
+                dispatch(
+                    &text,
+                    &mut ws_tx,
+                    &state,
+                    &interactive_create_tx,
+                    &create_cancel_rx,
+                )
+                .await
+            );
+            let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+            assert_eq!(refusal["type"], "error");
+            assert_eq!(refusal["code"], "RATE_LIMITED");
+            assert_eq!(refusal["requestId"], request_id);
+            assert_eq!(refusal["retryAfterMs"], 1000);
+            assert!(!state.create_dedupe.is_in_flight(request_id));
+        }
+        assert!(interactive_create_rx.try_recv().is_err());
+
+        for text in [
+            r#"{"type":"freshAgent.create","provider":"codex","sessionType":"freshcodex","requestId":"create-maintenance"}"#,
+            r#"{"type":"freshAgent.send","provider":"codex","sessionId":"codex-maintenance-session","sessionType":"freshcodex","text":"resume","requestId":"send-maintenance"}"#,
+            r#"{"type":"freshAgent.attach","provider":"codex","sessionId":"codex-maintenance-session","sessionType":"freshcodex"}"#,
+        ] {
+            assert!(
+                dispatch(
+                    text,
+                    &mut ws_tx,
+                    &state,
+                    &interactive_create_tx,
+                    &create_cancel_rx,
+                )
+                .await
+            );
+            let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+            if refusal["type"] == "freshAgent.create.failed" {
+                assert_eq!(refusal["code"], "HOST_AGENT_MAINTENANCE");
+                assert_eq!(refusal["retryable"], true);
+            } else {
+                assert_eq!(refusal["type"], "error");
+                assert_eq!(refusal["code"], "RATE_LIMITED");
+                assert_eq!(refusal["retryAfterMs"], 1000);
+            }
+        }
+
+        assert_eq!(gate.status().phase, "quiesced");
+        gate.release(&lease).unwrap();
+        assert!(gate.try_admit().is_ok());
+    }
+}
+
 #[cfg(test)]
 mod managed_output_order_tests {
     use super::*;
