@@ -1602,7 +1602,7 @@ fn unattached_processes(
             .iter()
             .filter(|pane| pane.terminal_id.as_deref() == Some(terminal.terminal_id.as_str()))
             .collect::<Vec<_>>();
-        let matching_soul_count = match (
+        let matching_soul_panes = match (
             terminal.soul_id.as_deref(),
             terminal.incarnation_id.as_deref(),
         ) {
@@ -1612,16 +1612,25 @@ fn unattached_processes(
                     pane.soul_id.as_deref() == Some(soul_id)
                         && pane.incarnation_id.as_deref() == Some(incarnation_id)
                 })
-                .count(),
-            _ => 0,
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         };
-        let uniquely_durable = matching_panes.as_slice().iter().any(|pane| {
-            pane.ownership == PaneOwnership::Durable
-                && terminal.soul_id.as_deref() == pane.soul_id.as_deref()
-                && terminal.incarnation_id.as_deref() == pane.incarnation_id.as_deref()
-                && matching_panes.len() == 1
-                && matching_soul_count == 1
-        });
+        let matching_inventory_count = terminal_rows
+            .iter()
+            .filter(|row| row.terminal_id == terminal.terminal_id)
+            .count();
+        let uniquely_durable = matching_inventory_count == 1
+            && !matching_panes.is_empty()
+            && !matching_soul_panes.is_empty()
+            && matching_panes.iter().all(|pane| {
+                pane.ownership == PaneOwnership::Durable
+                    && terminal.soul_id.as_deref() == pane.soul_id.as_deref()
+                    && terminal.incarnation_id.as_deref() == pane.incarnation_id.as_deref()
+            })
+            && matching_soul_panes.iter().all(|pane| {
+                pane.ownership == PaneOwnership::Durable
+                    && pane.terminal_id.as_deref() == Some(terminal.terminal_id.as_str())
+            });
         if uniquely_durable {
             continue;
         }
@@ -1642,7 +1651,7 @@ fn unattached_processes(
                 .as_ref()
                 .map(|session_ref| session_ref.session_id.clone()),
             ownership,
-            reason: "running terminal has no one-to-one durable pane and soul match".into(),
+            reason: "running terminal has no consistent durable pane and soul match".into(),
         });
     }
 
@@ -3105,6 +3114,26 @@ mod tests {
                 .is_empty()
         );
 
+        let mut second_view = pane.clone();
+        second_view.client_id = "second-client".into();
+        second_view.pane_id = "second-pane".into();
+        second_view.ownership = positive.ownership;
+        second_view.soul_id = positive.soul_id.clone();
+        second_view.incarnation_id = positive.incarnation_id.clone();
+        let mut first_view = pane.clone();
+        first_view.ownership = positive.ownership;
+        first_view.soul_id = positive.soul_id.clone();
+        first_view.incarnation_id = positive.incarnation_id.clone();
+        assert!(
+            unattached_processes(
+                &[first_view.clone(), second_view],
+                std::slice::from_ref(&terminal),
+                None,
+            )
+            .is_empty(),
+            "two clients viewing the same uniquely managed terminal remain protected"
+        );
+
         let mut wrong_incarnation = terminal.clone();
         wrong_incarnation.incarnation_id =
             Some(freshell_runtime_protocol::IncarnationId::new().to_string());
@@ -3113,9 +3142,23 @@ mod tests {
         assert!(mismatch.soul_id.is_none());
         let mut unknown_pane = pane.clone();
         unknown_pane.ownership = mismatch.ownership;
-        let unknown_processes = unattached_processes(&[unknown_pane], &[wrong_incarnation], None);
+        let mut conflicting_view = unknown_pane.clone();
+        conflicting_view.client_id = "conflicting-client".into();
+        conflicting_view.pane_id = "conflicting-pane".into();
+        let unknown_processes = unattached_processes(
+            &[first_view, conflicting_view],
+            std::slice::from_ref(&terminal),
+            None,
+        );
         assert_eq!(unknown_processes.len(), 1);
         assert_eq!(unknown_processes[0].ownership, PaneOwnership::Unknown);
+
+        let duplicate_inventory =
+            unattached_processes(&[unknown_pane], &[terminal, wrong_incarnation], None);
+        assert!(!duplicate_inventory.is_empty());
+        assert!(duplicate_inventory
+            .iter()
+            .all(|process| process.ownership == PaneOwnership::Unknown));
 
         let host_terminal = InventoryTerminal {
             created_at: 1,
