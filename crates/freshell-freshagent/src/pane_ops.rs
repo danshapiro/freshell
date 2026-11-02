@@ -43,7 +43,7 @@ use freshell_protocol::{ServerMessage, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL
 
 use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
-use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
+use crate::terminal_tabs::{spawn_terminal_pane_with_admission, TerminalSpawnResult};
 use crate::{
     approx_json, authorized, fail_json, ok_json, parse_required_name, rest_agent_mode,
     rest_lane_failure, FreshAgentState, PaneEntry, PaneNameResolution,
@@ -175,9 +175,9 @@ pub(crate) async fn split_pane(
             && body.get("editor").and_then(Value::as_str).is_none()
             && body.get("mode").and_then(Value::as_str).unwrap_or("shell") != "shell"
     };
-    let _host_agent_permit = if needs_host_admission {
+    let host_agent_permit = if needs_host_admission {
         match crate::try_host_agent_admission(&state) {
-            Ok(permit) => Some(permit),
+            Ok(permit) => Some(std::sync::Arc::new(permit)),
             Err(response) => return response,
         }
     } else {
@@ -337,7 +337,15 @@ pub(crate) async fn split_pane(
             .insert(new_pane_id.clone(), content.clone());
         content
     } else {
-        match spawn_terminal_pane(&state, &body, &tab_id, &new_pane_id).await {
+        match spawn_terminal_pane_with_admission(
+            &state,
+            &body,
+            &tab_id,
+            &new_pane_id,
+            host_agent_permit.clone(),
+        )
+        .await
+        {
             Ok(TerminalSpawnResult { pane_content, .. }) => pane_content,
             Err(resp) => return *resp,
         }
@@ -973,11 +981,11 @@ pub(crate) async fn respawn_pane(
     }
 
     let mode = body.get("mode").and_then(Value::as_str).unwrap_or("shell");
-    let _host_agent_permit = if mode == "shell" {
+    let host_agent_permit = if mode == "shell" {
         None
     } else {
         match crate::try_host_agent_admission(&state) {
-            Ok(permit) => Some(permit),
+            Ok(permit) => Some(std::sync::Arc::new(permit)),
             Err(response) => return response,
         }
     };
@@ -1003,7 +1011,15 @@ pub(crate) async fn respawn_pane(
         },
     };
 
-    let spawned = match spawn_terminal_pane(&state, &body, &tab_id, &pane_id).await {
+    let spawned = match spawn_terminal_pane_with_admission(
+        &state,
+        &body,
+        &tab_id,
+        &pane_id,
+        host_agent_permit.clone(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(resp) => return *resp,
     };
