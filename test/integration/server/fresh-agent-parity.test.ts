@@ -261,7 +261,11 @@ class FreshWire {
   }
 
   wait(predicate: (frame: any) => boolean): Promise<any> {
-    return waitFor('fresh-agent frame', () => this.frames.find(predicate)).catch(error => {
+    return this.waitFrom(0, predicate)
+  }
+
+  waitFrom(startCursor: number, predicate: (frame: any) => boolean): Promise<any> {
+    return waitFor('fresh-agent frame', () => this.frames.slice(startCursor).find(predicate)).catch(error => {
       throw new Error(`${String(error)}; recent frames: ${JSON.stringify(this.frames.slice(-12))}`)
     })
   }
@@ -1846,10 +1850,13 @@ tool_timeout_sec = 120
       const responsesBeforeBlockedSend = (await model!.readTraffic())
         .filter((row: any) => row.path === '/v1/responses').length
       const blockedRequestId = `send-${randomUUID()}`
+      const recoveryFrameCursor = wire.frames.length
       wire.send({ type: 'freshAgent.send', sessionType: 'freshcodex', provider: 'codex',
         sessionId: created.sessionId, requestId: blockedRequestId, text: 'AWAITED_PLAN_RECOVERY' })
-      const blockedSend = await wire.wait(frame => frame.requestId === blockedRequestId
+      const blockedSend = await wire.waitFrom(recoveryFrameCursor, frame => frame.requestId === blockedRequestId
         && ['freshAgent.send.accepted', 'error'].includes(frame.type))
+      const recoveryFrames = wire.frames.slice(recoveryFrameCursor)
+      expect(recoveryFrames).toContain(blockedSend)
       expect(blockedSend.type, JSON.stringify(blockedSend)).toBe('error')
       expect(blockedSend.message).toContain('IMPLEMENTATION_UNAVAILABLE')
       const responsesAfterBlockedSend = (await model!.readTraffic())
