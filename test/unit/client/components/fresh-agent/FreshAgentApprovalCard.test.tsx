@@ -141,20 +141,12 @@ describe('FreshAgentApprovalCard', () => {
       offered: ['accept', 'cancel', { acceptWithExecpolicyAmendment: { execpolicyAmendment: ['build'] } }],
       actions: [{ label: 'Allow', decision: 'accept' }, { label: 'Stop', decision: 'cancel' }],
     },
-    {
-      name: 'grantRoot',
-      toolName: 'Edit',
-      details: { path: '/srv/generated' },
-      offered: ['acceptForSession', 'decline'],
-      actions: [{ label: 'Allow for this session', decision: 'acceptForSession' }, { label: 'Decline', decision: 'decline' }],
-    },
   ])('renders requested $name details and preserves native action callbacks', ({ name, toolName, details, offered, actions }) => {
     const onAlwaysAllow = vi.fn()
-    const nativeDetails = name === 'grantRoot' ? { grantRoot: details.path } : details
     const { onRespond } = renderCard({
       requestId: `detail-${name}`,
       toolName,
-      native: { ...nativeDetails, availableDecisions: offered },
+      native: { ...details, availableDecisions: offered },
     }, { onAlwaysAllow })
     const card = within(screen.getByRole('alert', { name: `Permission request for ${toolName}` }))
     const preview = card.getByText((_content, element) => element?.tagName === 'PRE')
@@ -170,6 +162,29 @@ describe('FreshAgentApprovalCard', () => {
 
     expect(onRespond.mock.calls).toEqual(actions.map((action) => [{ nativeDecision: action.decision }]))
     expect(onAlwaysAllow).not.toHaveBeenCalled()
+  })
+
+  it('shows a native grant root exactly once with no empty JSON, preserving the offered decisions', () => {
+    const path = '/srv/generated'
+    const { onRespond } = renderCard({ requestId: 'root-only', toolName: 'Edit', native: { grantRoot: path, availableDecisions: ['acceptForSession', 'decline'] } })
+    const card = screen.getByRole('alert', { name: 'Permission request for Edit' })
+    expect(card.textContent?.split(path)).toHaveLength(2)
+    expect(card.querySelector('pre')).toBeNull()
+    expect(within(card).queryByText('Request details')).toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: 'Allow for this session', exact: true }))
+    fireEvent.click(within(card).getByRole('button', { name: 'Decline', exact: true }))
+    expect(onRespond.mock.calls).toEqual([[{ nativeDecision: 'acceptForSession' }], [{ nativeDecision: 'decline' }]])
+  })
+
+  it('keeps the remaining exact native scope when its separately displayed path is deduplicated', () => {
+    const path = '/srv/generated'
+    const permissions = { network: true }
+    const { onRespond } = renderCard({ requestId: 'root-scope', toolName: 'Additional permissions', native: { grantRoot: path, cwd: '/srv', permissions, availableDecisions: ['accept', 'decline'] } })
+    const card = screen.getByRole('alert', { name: 'Permission request for Additional permissions' })
+    expect(card.textContent?.split(path)).toHaveLength(2)
+    expect(JSON.parse(card.querySelector('pre')!.textContent!)).toEqual({ directory: '/srv', permissions })
+    fireEvent.click(within(card).getByRole('button', { name: 'Allow', exact: true }))
+    expect(onRespond).toHaveBeenCalledExactlyOnceWith({ nativeDecision: 'accept' })
   })
 
 })

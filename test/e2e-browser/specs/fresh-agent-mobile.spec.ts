@@ -212,8 +212,8 @@ test.describe('Fresh Agent Mobile', () => {
     await expect(meter).toHaveAttribute('aria-valuenow', '47')
 
     // Chip collapses to the SHORT label at ≤520px.
-    await expect(paneRoot.getByText('Claude Opus 5', { exact: true })).toBeVisible()
-    await expect(paneRoot.getByText('Claude Opus 5 (1M context)', { exact: true })).toBeHidden()
+    await expect(paneRoot.getByText('Claude Opus 5 high', { exact: true })).toBeVisible()
+    await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeHidden()
 
     // The word "context" drops from the strip (rendered label span is
     // display:none), and the combined 'context —' lug is excluded by seeding.
@@ -250,7 +250,7 @@ test.describe('Fresh Agent Mobile', () => {
     expect(turnHeaderFontSize!).toBeGreaterThanOrEqual(13)
 
     await page.setViewportSize({ width: 1280, height: 800 })
-    await expect(paneRoot.getByText('Claude Opus 5 (1M context)', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeVisible({ timeout: 10_000 })
     const desktopClusterBox = await meter.boundingBox()
     expect(desktopClusterBox).not.toBeNull()
     console.log(`[status-strip] mobile cluster width: ${mobileClusterBox!.width}px; desktop cluster width: ${desktopClusterBox!.width}px`)

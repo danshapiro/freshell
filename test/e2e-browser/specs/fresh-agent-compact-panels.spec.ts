@@ -179,10 +179,21 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: 
   } }
 }
 
-async function assertUsefulSpace(page: Page): Promise<void> {
+async function measureUsefulSpace(page: Page) {
   const root = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
   const geometry = await root.evaluate(node => {
     const box = (selector: string) => node.querySelector(selector)!.getBoundingClientRect()
+    const bounds = (rect: DOMRect) => ({ x: rect.x, y: rect.y, left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height })
+    const hitDetails = (control: Element) => {
+      const rect = control.getBoundingClientRect()
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+      return {
+        name: (control as HTMLElement).getAttribute('aria-label') ?? control.textContent?.trim() ?? control.tagName,
+        bounds: bounds(rect),
+        centerHit: hit === control || Boolean(hit && control.contains(hit)),
+        hitTarget: hit?.outerHTML.slice(0, 160) ?? null,
+      }
+    }
     const r = node.getBoundingClientRect(); const scroller = node.querySelector('.fresh-agent-transcript-scroll')!; const t = scroller.getBoundingClientRect(); const padding = getComputedStyle(scroller)
     const stack = box('.fresh-agent-top-stack'); const sidebar = node.querySelector('.fresh-agent-sidebar')?.getBoundingClientRect()
     const composer = box('form.fresh-agent-composer'); const prompt = Array.from(node.querySelectorAll('p')).find(p => p.textContent === 'Latest prompt must remain readable')!.getBoundingClientRect()
@@ -194,10 +205,54 @@ async function assertUsefulSpace(page: Page): Promise<void> {
     const count = countNode?.getBoundingClientRect()
     const countHit = count && document.elementFromPoint(count.x + count.width / 2, count.y + count.height / 2)
     const controls = Array.from(node.querySelectorAll('.fresh-agent-composer button')).map(el => el.getBoundingClientRect())
-    return { countVisible: !count || (count.top >= stack.top && count.bottom <= stack.bottom + 1 && count.top >= r.top && count.bottom <= r.bottom && (countHit === countNode || Boolean(countNode?.contains(countHit ?? null)))), controlsInside: controls.every(b => b.top >= r.top && b.bottom <= r.bottom + 1 && b.left >= r.left && b.right <= r.right + 1), height: r.height, transcript: visibleBottom - visibleTop, visibleTop, visibleBottom, promptTop: prompt.top, promptBottom: prompt.bottom, composerTop: composer.top, composerBottom: composer.bottom, rootTop: r.top, rootBottom: r.bottom, occupied: stack.height + (sidebar && sidebar.width >= r.width * .7 ? sidebar.height : 0), overflow: node.scrollWidth - node.clientWidth, documentOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth }
+    const composerControls = Array.from(node.querySelectorAll('.fresh-agent-composer textarea,.fresh-agent-composer input,.fresh-agent-composer button,.fresh-agent-composer [role="button"]')).map(hitDetails)
+    const requestViewportNode = node.querySelector('.fresh-agent-top-stack-scroll')
+    const requestControls = requestViewportNode
+      ? Array.from(requestViewportNode.querySelectorAll('textarea,input,button,[role="button"]')).map(hitDetails)
+      : []
+    const requestViewport = requestViewportNode?.getBoundingClientRect()
+    return {
+      countVisible: !count || (count.top >= stack.top && count.bottom <= stack.bottom + 1 && count.top >= r.top && count.bottom <= r.bottom && (countHit === countNode || Boolean(countNode?.contains(countHit ?? null)))),
+      controlsInside: controls.every(b => b.top >= r.top && b.bottom <= r.bottom + 1 && b.left >= r.left && b.right <= r.right + 1),
+      height: r.height,
+      transcript: visibleBottom - visibleTop,
+      transcriptBounds: bounds(t),
+      visibleTop,
+      visibleBottom,
+      promptTop: prompt.top,
+      promptBottom: prompt.bottom,
+      composerTop: composer.top,
+      composerBottom: composer.bottom,
+      composerBounds: bounds(composer),
+      composerControls,
+      requestViewportBounds: requestViewport ? bounds(requestViewport) : null,
+      requestControls,
+      rootTop: r.top,
+      rootBottom: r.bottom,
+      occupied: stack.height + (sidebar && sidebar.width >= r.width * .7 ? sidebar.height : 0),
+      overflow: node.scrollWidth - node.clientWidth,
+      documentOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    }
   })
+  return { root, geometry }
+}
+
+async function logUsefulSpace(page: Page) {
+  const { geometry } = await measureUsefulSpace(page)
+  console.log(JSON.stringify({ event: 'compact_panel_geometry', severity: 'INFO', ...geometry }))
+  return geometry
+}
+
+async function captureUsefulSpace(page: Page) {
+  const { root, geometry } = await measureUsefulSpace(page)
   console.log(JSON.stringify({ event: 'compact_panel_geometry', severity: 'INFO', ...geometry }))
   if (geometry.transcript < (geometry.height >= 480 ? geometry.height * .4 : 64) || geometry.promptBottom > geometry.visibleBottom + 1 || geometry.occupied > (geometry.height >= 480 ? geometry.height * .35 + 1 : Math.max(0, geometry.height - 240) + 1)) await saveScreenshot(page, `test-results/compact-geometry-failure-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
+  const colors = await root.locator('.fresh-agent-composer-action[type="submit"]').evaluate(el => { const s = getComputedStyle(el); return { foreground: s.color, background: s.backgroundColor } })
+  return { geometry, colors }
+}
+
+function assertUsefulSpaceSnapshot(snapshot: Awaited<ReturnType<typeof captureUsefulSpace>>): void {
+  const { geometry, colors } = snapshot
   expect(geometry.countVisible).toBe(true)
   expect(geometry.controlsInside).toBe(true)
   expect(geometry.transcript).toBeGreaterThanOrEqual(64)
@@ -211,7 +266,6 @@ async function assertUsefulSpace(page: Page): Promise<void> {
   expect(geometry.composerBottom).toBeLessThanOrEqual(geometry.rootBottom + 1)
   expect(geometry.overflow).toBeLessThanOrEqual(1)
   expect(geometry.documentOverflow).toBeLessThanOrEqual(1)
-  const colors = await root.locator('.fresh-agent-composer-action[type="submit"]').evaluate(el => { const s = getComputedStyle(el); return { foreground: s.color, background: s.backgroundColor } })
   expect(colors.foreground).not.toBe(colors.background)
   expect(colors.background).not.toBe('rgba(0, 0, 0, 0)')
   const luminance = (color: string) => {
@@ -222,11 +276,29 @@ async function assertUsefulSpace(page: Page): Promise<void> {
   expect((Math.max(foreground, background) + .05) / (Math.min(foreground, background) + .05)).toBeGreaterThanOrEqual(4.5)
 }
 
+async function assertUsefulSpace(page: Page): Promise<void> {
+  assertUsefulSpaceSnapshot(await captureUsefulSpace(page))
+}
+
+const emittedScreenshotPaths = new Set<string>()
+
 async function saveScreenshot(page: Page, path: string): Promise<void> {
   const bytes = await page.screenshot({ path })
-  // Cloud Run has no persistent filesystem artifact export. Retain these four
-  // review images in chunked structured stdout as well as test-results.
-  if (!['compact-freshclaude-desktop', 'compact-serif-light-split', 'compact-mono-light-narrow', 'compact-phone-dark', 'compact-tiny', 'compact-geometry-failure'].some(name => path.includes(name))) return
+  // Cloud Run has no persistent filesystem artifact export. Retain the four
+  // existing review images plus a representative image from each new geometry
+  // class; avoid streaming every failed matrix cell into the logs.
+  const reviewImages = [
+    'compact-freshclaude-desktop',
+    'compact-serif-light-split',
+    'compact-mono-light-narrow',
+    'compact-phone-dark',
+    'compact-geometry-failure-painted-freshclaude-metadata-diagnostics-and-request-decisions-share-560x320',
+    'compact-geometry-failure-painted-ambiguous-Codex-delivery-keeps-the-original-prompt-and-instruction-at-390x700',
+    'compact-geometry-failure-painted-WebFetch-compact-approval-JSON-wraps-fully-at-390px',
+    'compact-geometry-failure-composer-270px-empty-compact-pane-keeps-the-complete-composer-visible-without-scrolling',
+  ]
+  if (emittedScreenshotPaths.has(path) || !reviewImages.some(name => path.includes(name))) return
+  emittedScreenshotPaths.add(path)
   const base64 = bytes.toString('base64')
   for (let offset = 0; offset < base64.length; offset += 12000) console.log(JSON.stringify({ event: 'compact_panel_screenshot', severity: 'INFO', path, offset, data: base64.slice(offset, offset + 12000) }))
 }
@@ -276,6 +348,222 @@ async function hitAndClick(control: Locator): Promise<void> {
   if (!probe.hit) await saveScreenshot(control.page(), `test-results/compact-geometry-failure-hit-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
   expect(probe.hit, JSON.stringify(probe)).toBe(true)
   await control.click()
+}
+
+async function measurePainted(control: Locator) {
+  const result = await control.evaluate(el => {
+    const range = document.createRange()
+    range.selectNodeContents(el)
+    const rects = [...range.getClientRects()].filter(r => r.width > 0 && r.height > 0)
+    const describe = (node: Element) => {
+      const classes = typeof node.className === 'string' && node.className.trim()
+        ? `.${node.className.trim().split(/\s+/).join('.')}`
+        : ''
+      return `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ''}${classes}`
+    }
+    const clipAncestors: Array<{ ancestor: string; bounds: { left: number; top: number; right: number; bottom: number; width: number; height: number } }> = []
+    for (let parent: Element | null = el; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent)
+      if (parent.matches('.fresh-agent-pane') || /(hidden|auto|scroll|clip)/.test(style.overflowX + style.overflowY)) {
+        const bounds = parent.getBoundingClientRect()
+        clipAncestors.push({ ancestor: describe(parent), bounds: { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom, width: bounds.width, height: bounds.height } })
+      }
+    }
+    const observations = rects.map(rect => {
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+      const centerHit = hit === el || Boolean(hit && el.contains(hit))
+      return {
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        insideClips: clipAncestors.every(({ bounds }) => rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1 && rect.top >= bounds.top - 1 && rect.bottom <= bounds.bottom + 1),
+        centerHit,
+        hitTarget: hit ? describe(hit) : null,
+      }
+    })
+    const bounds = el.getBoundingClientRect()
+    return {
+      text: el.textContent?.trim() ?? '',
+      element: describe(el),
+      elementBounds: { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom, width: bounds.width, height: bounds.height },
+      count: rects.length,
+      readable: observations.length > 0 && observations.every(item => item.insideClips && item.centerHit),
+      clipAncestors,
+      observations,
+    }
+  })
+  return result
+}
+
+async function assertPainted(control: Locator, diagnosticContext?: unknown): Promise<void> {
+  const result = await measurePainted(control)
+  console.log(JSON.stringify({ event: 'compact_painted_geometry', severity: 'INFO', title: test.info().title, ...result }))
+  if (!result.readable) await saveScreenshot(control.page(), `test-results/compact-geometry-failure-painted-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
+  expect(result.count).toBeGreaterThan(0)
+  expect(result.readable, JSON.stringify(diagnosticContext === undefined ? result : { result, diagnosticContext })).toBe(true)
+}
+
+async function measureVisibleBox(control: Locator) {
+  return control.evaluate(el => {
+    const rect = el.getBoundingClientRect()
+    const clips: DOMRect[] = []
+    for (let parent: Element | null = el; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent)
+      if (parent.matches('.fresh-agent-pane') || /(hidden|auto|scroll|clip)/.test(style.overflowX + style.overflowY)) clips.push(parent.getBoundingClientRect())
+    }
+    const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+    return {
+      bounds: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height },
+      insideClips: clips.every(clip => rect.left >= clip.left - 1 && rect.right <= clip.right + 1 && rect.top >= clip.top - 1 && rect.bottom <= clip.bottom + 1),
+      centerHit: hit === el || Boolean(hit && el.contains(hit)),
+    }
+  })
+}
+
+async function measurePaintedTogether(controls: Locator[], diagnosticContext?: unknown) {
+  const results = await Promise.all(controls.map(measurePainted))
+  const diagnostics = JSON.stringify(diagnosticContext === undefined ? results : { results, diagnosticContext })
+  console.log(JSON.stringify({ event: 'compact_painted_geometry_group', severity: 'INFO', title: test.info().title, results }))
+  if (results.some(result => !result.readable)) {
+    await saveScreenshot(controls[0].page(), `test-results/compact-geometry-failure-painted-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
+  }
+  return { results, diagnostics }
+}
+
+function assertPaintedTogetherResults(measurement: Awaited<ReturnType<typeof measurePaintedTogether>>): void {
+  const { results, diagnostics } = measurement
+  for (const result of results) {
+    expect(result.count).toBeGreaterThan(0)
+    expect(result.readable, diagnostics).toBe(true)
+  }
+}
+
+async function assertPaintedTogether(controls: Locator[], diagnosticContext?: unknown): Promise<void> {
+  assertPaintedTogetherResults(await measurePaintedTogether(controls, diagnosticContext))
+}
+
+async function clearSeededDiagnostics(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!
+    h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: s.panes.activePane[tabId], updates: { createError: undefined, reconcileNotice: undefined, closeError: undefined } } })
+  })
+}
+
+async function measureComposerGeometry(page: Page) {
+  const composer = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last().locator('form.fresh-agent-composer')
+  const result = await composer.evaluate(el => {
+    const pane = el.closest('.fresh-agent-pane')!.getBoundingClientRect()
+    const bounds = el.getBoundingClientRect()
+    const isVisiblyPainted = (element: Element) => {
+      for (let parent: Element | null = element; parent; parent = parent.parentElement) {
+        const style = getComputedStyle(parent)
+        if (style.display === 'none' || style.visibility !== 'visible' || style.contentVisibility === 'hidden' || Number(style.opacity) <= 0) return false
+      }
+      return true
+    }
+    const textRects: DOMRect[] = []
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    while (walker.nextNode()) {
+      const textNode = walker.currentNode as Text
+      if (!textNode.data.trim() || !textNode.parentElement || !isVisiblyPainted(textNode.parentElement)) continue
+      const range = document.createRange()
+      range.selectNodeContents(textNode)
+      textRects.push(...[...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0))
+    }
+    const text = textRects.map(rect => {
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+      return {
+        bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        centerHit: Boolean(hit && el.contains(hit)),
+        hitTarget: hit?.outerHTML.slice(0, 160) ?? null,
+      }
+    })
+    const controls = [...el.querySelectorAll('textarea,input,button,[role="button"]')].flatMap(control => {
+      const rect = control.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0 || control.getClientRects().length === 0 || !isVisiblyPainted(control)) return []
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+      const clips: DOMRect[] = []
+      for (let parent: Element | null = control; parent; parent = parent.parentElement) {
+        const style = getComputedStyle(parent)
+        if (parent.matches('.fresh-agent-pane') || /(hidden|auto|scroll|clip)/.test(style.overflowX + style.overflowY)) clips.push(parent.getBoundingClientRect())
+      }
+      return {
+        name: (control as HTMLElement).getAttribute('aria-label') ?? control.textContent?.trim() ?? control.tagName,
+        bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        insidePane: rect.left >= pane.left - 1 && rect.right <= pane.right + 1 && rect.top >= pane.top - 1 && rect.bottom <= pane.bottom + 1 && clips.every(clip => rect.left >= clip.left - 1 && rect.right <= clip.right + 1 && rect.top >= clip.top - 1 && rect.bottom <= clip.bottom + 1),
+        hit: hit === control || Boolean(hit && control.contains(hit)),
+        hitTarget: hit?.outerHTML.slice(0, 160) ?? null,
+      }
+    })
+    const clippingRects: DOMRect[] = []
+    for (let parent: Element | null = el; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent)
+      if (parent.matches('.fresh-agent-pane') || /(hidden|auto|scroll|clip)/.test(style.overflowX + style.overflowY)) clippingRects.push(parent.getBoundingClientRect())
+    }
+    const clippingAncestors = clippingRects.map(clip => ({ left: clip.left, top: clip.top, right: clip.right, bottom: clip.bottom, width: clip.width, height: clip.height }))
+    const paintedText = text.length === textRects.length && text.every((rect, index) => {
+      const source = textRects[index]
+      return clippingRects.every(clip => source.left >= clip.left - 1 && source.right <= clip.right + 1 && source.top >= clip.top - 1 && source.bottom <= clip.bottom + 1) && rect.centerHit
+    })
+    return {
+      bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+      pane: { top: pane.top, bottom: pane.bottom },
+      text,
+      paintedText,
+      controls,
+      clippingAncestors,
+      formBoundsInsidePane: bounds.top >= pane.top - 1 && bounds.bottom <= pane.bottom + 1,
+    }
+  })
+  return { composer, result }
+}
+
+async function assertComposerPainted(page: Page, diagnosticContext?: unknown): Promise<void> {
+  const { result } = await measureComposerGeometry(page)
+  console.log(JSON.stringify({ event: 'compact_composer_geometry', severity: 'INFO', title: test.info().title, ...result }))
+  if (!result.paintedText || result.controls.length === 0 || result.controls.some(control => !control.insidePane || !control.hit)) {
+    await saveScreenshot(page, `test-results/compact-geometry-failure-composer-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
+  }
+  const details = JSON.stringify(diagnosticContext === undefined ? result : { result, diagnosticContext })
+  expect(result.paintedText, details).toBe(true)
+  expect(result.controls.length, details).toBeGreaterThan(0)
+  expect(result.controls.some(control => control.name === 'Chat message input'), details).toBe(true)
+  expect(result.controls.every(control => control.insidePane && control.hit), details).toBe(true)
+}
+
+async function scrollLayoutToComposer(page: Page, requireScroll = true): Promise<void> {
+  const layout = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last().locator('.fresh-agent-layout')
+  await layout.evaluate(el => { el.scrollTop = el.scrollHeight })
+  if (requireScroll) await expect.poll(() => layout.evaluate(el => el.scrollTop)).toBeGreaterThan(0)
+  await assertComposerPainted(page)
+}
+
+async function logComposerAfterLayoutScroll(page: Page) {
+  const layout = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last().locator('.fresh-agent-layout')
+  const previousScrollTop = await layout.evaluate(el => el.scrollTop)
+  await layout.evaluate(el => { el.scrollTop = el.scrollHeight })
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  const { result } = await measureComposerGeometry(page)
+  console.log(JSON.stringify({ event: 'compact_composer_after_scroll_geometry', severity: 'INFO', title: test.info().title, ...result }))
+  await layout.evaluate((el, scrollTop) => { el.scrollTop = scrollTop }, previousScrollTop)
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  return result
+}
+
+async function assertNoRequestStackFloor(page: Page): Promise<void> {
+  const spaceGeometry = await logUsefulSpace(page)
+  const composerAfterScroll = await logComposerAfterLayoutScroll(page)
+  const stack = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last().locator('.fresh-agent-top-stack')
+  const geometry = await stack.evaluate(el => {
+    const style = getComputedStyle(el)
+    const surfaces = [...el.querySelectorAll('.fresh-agent-notices,.fresh-agent-errors,.fresh-agent-diff-panel')]
+      .map(surface => surface.getBoundingClientRect())
+      .filter(rect => rect.width > 0 && rect.height > 0)
+    const expected = surfaces.reduce((total, rect) => total + rect.height, 0)
+      + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+      + Math.max(0, surfaces.length - 1) * parseFloat(style.rowGap)
+    return { stack: el.getBoundingClientRect().height, expected, surfaces: surfaces.map(rect => ({ top: rect.top, bottom: rect.bottom, height: rect.height })), paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, rowGap: style.rowGap }
+  })
+  console.log(JSON.stringify({ event: 'compact_no_request_stack_geometry', severity: 'INFO', ...geometry }))
+  expect(geometry.stack, JSON.stringify({ geometry, spaceGeometry, composerAfterScroll })).toBeLessThanOrEqual(geometry.expected + 1)
 }
 
 for (const [sessionType, provider] of [['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode']]) {
@@ -495,13 +783,39 @@ for (const [sessionType, provider, populated] of [['freshclaude', 'claude', fals
     h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:undefined,closeError:'Second actionable diagnostic'}}})
   })
   await expect(page.getByRole('button', { name:'Show sidebar',exact:true })).toBeVisible()
-  for (const size of [{width:1100,height:700},{width:560,height:320},{width:390,height:700}]) {
+  const sizes = [{width:1100,height:700},{width:560,height:320},{width:390,height:700}]
+  const measurements: Array<{
+    count: Locator
+    countHit: boolean
+    painted: Awaited<ReturnType<typeof measurePaintedTogether>>
+    usefulSpace: Awaited<ReturnType<typeof captureUsefulSpace>>
+  }> = []
+  for (const size of sizes) {
+    await fitRoot(page,{width:size.width})
+    await fitRoot(page,{height:size.height})
+    const spaceGeometry = await logUsefulSpace(page)
+    const errors=page.getByRole('region',{name:'Agent errors'})
+    const count=errors.getByRole('img',{name:'2 errors'})
+    const countHit=await count.evaluate(el=>{const b=el.getBoundingClientRect();const hit=document.elementFromPoint(b.x+b.width/2,b.y+b.height/2);return b.width>0&&b.height>0&&(hit===el||el.contains(hit))})
+    const painted=await measurePaintedTogether([
+      errors.locator('[data-agent-error="create"] span[role="alert"]'),
+      errors.locator('[data-agent-error="close"] span[role="alert"]'),
+    ], spaceGeometry)
+    measurements.push({count,countHit,painted,usefulSpace:await captureUsefulSpace(page)})
+  }
+  const geometryFailures: unknown[] = []
+  for (const measurement of measurements) {
+    try { await expect(measurement.count).toHaveText('2') } catch (error) { geometryFailures.push(error) }
+    try { expect(measurement.countHit).toBe(true) } catch (error) { geometryFailures.push(error) }
+    try { assertPaintedTogetherResults(measurement.painted) } catch (error) { geometryFailures.push(error) }
+    try { assertUsefulSpaceSnapshot(measurement.usefulSpace) } catch (error) { geometryFailures.push(error) }
+  }
+  if (geometryFailures.length) throw geometryFailures[0]
+
+  for (const size of sizes) {
     await fitRoot(page,{width:size.width})
     await fitRoot(page,{height:size.height})
     const errors=page.getByRole('region',{name:'Agent errors'})
-    const count=errors.getByRole('img',{name:'2 errors'})
-    await expect(count).toHaveText('2')
-    expect(await count.evaluate(el=>{const b=el.getBoundingClientRect();const hit=document.elementFromPoint(b.x+b.width/2,b.y+b.height/2);return b.width>0&&b.height>0&&(hit===el||el.contains(hit))})).toBe(true)
     await page.evaluate(text => {
       const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
       h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{reconcileNotice:text}}})
@@ -526,18 +840,24 @@ for (const [sessionType, provider, populated] of [['freshclaude', 'claude', fals
       await assertUsefulSpace(page)
     }
   }
+  const errors = page.getByRole('region', { name: 'Agent errors' })
+  const closeError = errors.locator('[data-agent-error="close"]')
+  await hitAndClick(closeError.locator('summary'))
+  await expect(closeError).toHaveAttribute('open', '')
+  await hitAndClick(closeError.getByRole('button', { name: 'Dismiss', exact: true }))
+  await expect(errors.getByRole('img', { name: '1 error' })).toHaveText('1')
+  await expect(closeError).toHaveCount(0)
+
   await page.evaluate(({sessionType,provider}) => {
     const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
-    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{createError:undefined}}})
     h.receiveWsMessage?.({type:'freshAgent.event',sessionId:`compact-${sessionType}`,sessionType,provider,event:{type:'freshAgent.notice',level:'warning',code:'mixed-severity',message:'Provider warning'}})
   },{sessionType,provider})
-  const errors=page.getByRole('region',{name:'Agent errors'})
   const mixedCount=errors.getByRole('img',{name:'1 error, 1 warning'})
   await expect(mixedCount).toHaveText('2')
   expect(await mixedCount.ariaSnapshot()).toContain('img "1 error, 1 warning"')
   await page.evaluate(() => {
     const h=window.__FRESHELL_TEST_HARNESS__!;const s=h.getState();const tabId=s.tabs.activeTabId!
-    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{closeError:undefined}}})
+    h.dispatch({type:'panes/mergePaneContent',payload:{tabId,paneId:s.panes.activePane[tabId],updates:{createError:undefined}}})
   })
   await expect(errors.getByRole('img',{name:'1 warning'})).toHaveText('1')
   await expect(mixedCount).toHaveCount(0)
@@ -571,6 +891,258 @@ test('routine feedback stays in the closed summary beside prominent reconciliati
   await expect(body).toContainText('Provider settings updated')
   await expect(body).toContainText('Session restored')
 })
+
+for (const size of [{ width: 800, height: 900 }, { width: 390, height: 700 }]) {
+  test(`one short request stays fully reachable with routine feedback at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    const state = await seedCompactPane(page, {
+      sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light',
+      snapshot: {
+        diffs: [],
+        pendingApprovals: [{ requestId: 'short-request', toolName: 'Bash', input: { command: 'echo ok' } }],
+        pendingQuestions: [],
+        pendingElicitations: [],
+      },
+    })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+    await clearSeededDiagnostics(page)
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
+      event: { type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message: 'Settings saved' },
+    }))
+    await expect(page.getByRole('status', { name: 'Agent notices' })).toContainText('Settings saved')
+    const usefulSpaceSnapshots = [await captureUsefulSpace(page)]
+    const requests = page.getByRole('region', { name: 'Pending requests' })
+    const allow = requests.getByRole('button', { name: 'Allow tool use', exact: true })
+    const initial = await allow.evaluate(el => {
+      const bounds = el.getBoundingClientRect()
+      const viewport = el.closest('[aria-label="Pending requests"]')!.getBoundingClientRect()
+      const hit = document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
+      return {
+        bounds: { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right },
+        viewport: { top: viewport.top, bottom: viewport.bottom, left: viewport.left, right: viewport.right },
+        inside: bounds.top >= viewport.top - 1 && bounds.bottom <= viewport.bottom + 1 && bounds.left >= viewport.left - 1 && bounds.right <= viewport.right + 1,
+        hit: hit === el || Boolean(hit && el.contains(hit)),
+      }
+    })
+    console.log(JSON.stringify({ event: 'compact_request_action_geometry', severity: 'INFO', title: test.info().title, action: 'Allow tool use', ...initial }))
+    const assertionFailures: unknown[] = []
+    try { expect(initial.inside, JSON.stringify(initial)).toBe(true) } catch (error) { assertionFailures.push(error) }
+    try { expect(initial.hit, JSON.stringify(initial)).toBe(true) } catch (error) { assertionFailures.push(error) }
+    await hitAndClick(allow)
+    await state.update({ pendingApprovals: [] })
+    await clearSeededDiagnostics(page)
+    await page.waitForTimeout(7000)
+    usefulSpaceSnapshots.push(await captureUsefulSpace(page))
+    try { await expect(page.getByRole('status', { name: 'Agent notices' })).toHaveCount(0) } catch (error) { assertionFailures.push(error) }
+    try { await expect(page.getByRole('region', { name: 'Pending requests' })).toHaveCount(0) } catch (error) { assertionFailures.push(error) }
+    for (const snapshot of usefulSpaceSnapshots) {
+      try { assertUsefulSpaceSnapshot(snapshot) } catch (error) { assertionFailures.push(error) }
+    }
+    if (assertionFailures.length) throw assertionFailures[0]
+  })
+}
+
+for (const [sessionType, provider] of [['freshclaude', 'claude'], ['freshcodex', 'codex']] as const) {
+  for (const size of [{ width: 560, height: 320 }, { width: 390, height: 400 }, { width: 560, height: 400 }]) {
+    test(`${sessionType} metadata, diagnostics and request decisions share ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+      void freshellPage
+      if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+      await terminal.waitForTerminal()
+      await seedCompactPane(page, { sessionType, provider, populated: true, style: 'sans', theme: 'light' })
+      await fitRoot(page, { width: size.width })
+      await fitRoot(page, { height: size.height })
+      await page.evaluate(() => {
+        const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!
+        h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: s.panes.activePane[tabId], updates: { closeError: 'Second actionable diagnostic' } } })
+      })
+      const metadata = page.locator('.fresh-agent-sidebar')
+      const metadataValue = metadata.locator('li').first()
+      const errors = page.getByRole('region', { name: 'Agent errors' })
+      const spaceGeometry = await logUsefulSpace(page)
+      await expect(metadataValue).toBeAttached()
+      await assertPaintedTogether([
+        metadataValue,
+        errors.locator('[data-agent-error="create"] span[role="alert"]'),
+        errors.locator('[data-agent-error="close"] span[role="alert"]'),
+      ], spaceGeometry)
+      await assertUsefulSpace(page)
+
+      const requests = page.getByRole('region', { name: 'Pending requests' })
+      await hitAndClick(requests.getByRole('button', { name: 'Yes', exact: true }))
+      await hitAndClick(requests.getByRole('button', { name: 'Allow tool use', exact: true }))
+      const name = requests.getByRole('textbox', { name: 'Name' })
+      await hitAndClick(name)
+      await name.fill('Dan')
+      await hitAndClick(requests.getByRole('button', { name: 'Continue', exact: true }))
+      await assertUsefulSpace(page)
+      const closeError = errors.locator('[data-agent-error="close"]')
+      await hitAndClick(closeError.locator('summary'))
+      await hitAndClick(closeError.getByRole('button', { name: 'Dismiss', exact: true }))
+      await expect(closeError).toHaveCount(0)
+    })
+  }
+}
+
+test('390x320 metadata-absent compact state keeps both diagnostics, requests and composer reachable', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await page.setViewportSize({ width: 390, height: 844 })
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, { sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light' })
+  await fitRoot(page, { width: 390 })
+  await fitRoot(page, { height: 320 })
+  await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!
+    h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: s.panes.activePane[tabId], updates: { closeError: 'Second actionable diagnostic' } } })
+  })
+  await expect(page.locator('.fresh-agent-sidebar')).toHaveCount(0)
+  const errors = page.getByRole('region', { name: 'Agent errors' })
+  const spaceGeometry = await logUsefulSpace(page)
+  await assertPaintedTogether([
+    errors.locator('[data-agent-error="create"] span[role="alert"]'),
+    errors.locator('[data-agent-error="close"] span[role="alert"]'),
+  ], spaceGeometry)
+  await assertUsefulSpace(page)
+  await hitAndClick(page.getByRole('region', { name: 'Pending requests' }).getByRole('button', { name: 'Yes', exact: true }))
+  await hitAndClick(page.getByRole('region', { name: 'Pending requests' }).getByRole('button', { name: 'Allow tool use', exact: true }))
+  const name = page.getByRole('region', { name: 'Pending requests' }).getByRole('textbox', { name: 'Name' })
+  await hitAndClick(name)
+  await name.fill('Dan')
+  await hitAndClick(page.getByRole('region', { name: 'Pending requests' }).getByRole('button', { name: 'Continue', exact: true }))
+  await assertUsefulSpace(page)
+})
+
+test('390x320 metadata-only state preserves values and a child link through sidebar scrolling', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await page.setViewportSize({ width: 390, height: 844 })
+  await terminal.waitForTerminal()
+  const childThreadId = 'compact-child-thread'
+  await seedCompactPane(page, {
+    sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light', populated: true,
+    snapshot: {
+      diffs: [], pendingApprovals: [], pendingQuestions: [], pendingElicitations: [],
+      childThreads: [{ id: 'child-row', threadId: childThreadId, origin: 'agent', title: 'Metadata child', status: 'completed', model: 'fixture' }],
+    },
+  })
+  await fitRoot(page, { width: 390 })
+  await fitRoot(page, { height: 320 })
+  await clearSeededDiagnostics(page)
+  const sidebar = page.locator('.fresh-agent-sidebar')
+  await expect(sidebar).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Pending requests' })).toHaveCount(0)
+  await expect(page.getByRole('region', { name: 'Agent errors' })).toHaveCount(0)
+  await assertUsefulSpace(page)
+  const spaceGeometry = await logUsefulSpace(page)
+
+  await sidebar.evaluate(el => { el.scrollTop = 0 })
+  const worktreeValue = sidebar.locator('li').filter({ hasText: 'feature/0' }).first()
+  await worktreeValue.scrollIntoViewIfNeeded()
+  const worktreeGeometry = await measurePainted(worktreeValue)
+  await sidebar.evaluate(el => { el.scrollTop = el.scrollHeight })
+  const childLink = sidebar.getByRole('button', { name: `Observe child ${childThreadId}` })
+  await expect(childLink).toBeVisible()
+  const childLinkGeometry = await measurePainted(childLink)
+  await sidebar.evaluate(el => { el.scrollTop = 0 })
+  await worktreeValue.scrollIntoViewIfNeeded()
+  await assertPainted(worktreeValue, { worktreeGeometry, childLinkGeometry, spaceGeometry })
+  await sidebar.evaluate(el => { el.scrollTop = el.scrollHeight })
+  await assertPainted(childLink, { worktreeGeometry, childLinkGeometry, spaceGeometry })
+})
+
+test('270px empty compact pane keeps the complete composer visible without scrolling', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await page.setViewportSize({ width: 390, height: 844 })
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, {
+    sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light',
+    snapshot: { diffs: [], pendingApprovals: [], pendingQuestions: [], pendingElicitations: [] },
+  })
+  await fitRoot(page, { width: 390 })
+  await fitRoot(page, { height: 270 })
+  await clearSeededDiagnostics(page)
+  await expect(page.locator('.fresh-agent-sidebar')).toHaveCount(0)
+  await expect(page.getByRole('region', { name: 'Pending requests' })).toHaveCount(0)
+  await expect(page.getByRole('region', { name: 'Agent errors' })).toHaveCount(0)
+  await expect(page.getByRole('status', { name: 'Agent notices' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /^Diffs:/ })).toHaveCount(0)
+  await logUsefulSpace(page)
+  await expect(page.locator('.fresh-agent-layout')).toHaveJSProperty('scrollTop', 0)
+  await assertComposerPainted(page)
+})
+
+for (const height of [200, 120]) {
+  test(`${height}px empty and answered panes keep the composer reachable without a request scroller`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    const state = await seedCompactPane(page, {
+      sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light',
+      snapshot: { diffs: [], pendingApprovals: [], pendingQuestions: [], pendingElicitations: [] },
+    })
+    await fitRoot(page, { width: 390 })
+    await fitRoot(page, { height })
+    await clearSeededDiagnostics(page)
+    await expect(page.getByRole('region', { name: 'Pending requests' })).toHaveCount(0)
+    await logUsefulSpace(page)
+    await scrollLayoutToComposer(page)
+
+    await state.update({ pendingApprovals: [{ requestId: `tiny-answer-${height}`, toolName: 'Bash', input: { command: 'echo ok' } }] })
+    const requests = page.getByRole('region', { name: 'Pending requests' })
+    await hitAndClick(requests.getByRole('button', { name: 'Allow tool use', exact: true }))
+    await state.update({ pendingApprovals: [] })
+    await expect(page.getByRole('region', { name: 'Pending requests' })).toHaveCount(0)
+    await logUsefulSpace(page)
+    await scrollLayoutToComposer(page)
+  })
+}
+
+for (const height of [200, 270]) for (const panel of ['diff', 'notice'] as const) {
+  test(`${height}px lone ${panel} content has no empty request floor and leaves composer reachable`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    const state = await seedCompactPane(page, {
+      sessionType: 'freshclaude', provider: 'claude', style: 'sans', theme: 'light',
+      snapshot: { diffs: [], pendingApprovals: [], pendingQuestions: [], pendingElicitations: [] },
+    })
+    await fitRoot(page, { width: 390 })
+    await fitRoot(page, { height })
+    await clearSeededDiagnostics(page)
+    if (panel === 'diff') {
+      await state.update({ diffs: [{ id: 'lone-change', path: '/tmp/one.ts', status: 'modified', title: 'one.ts' }] })
+      await expect(page.getByRole('button', { name: 'Diffs: 1 changed file' })).toBeVisible()
+    } else {
+      const longNotice = 'A saved provider setting changed and is ready to use. '.repeat(12)
+      await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+        type: 'freshAgent.event', sessionId: 'compact-freshclaude', sessionType: 'freshclaude', provider: 'claude',
+        event: { type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message },
+      }), longNotice)
+      const notice = page.getByRole('status', { name: 'Agent notices' })
+      const summary = notice.locator('summary')
+      const spaceGeometry = await logUsefulSpace(page)
+      const summaryGeometry = await measureVisibleBox(summary)
+      await expect(summary.locator('..')).not.toHaveAttribute('open', '')
+      const overflow = await notice.evaluate(el => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }))
+      console.log(JSON.stringify({ event: 'compact_long_notice_geometry', severity: 'INFO', title: test.info().title, overflow, summaryGeometry, spaceGeometry }))
+      expect(overflow.scrollWidth, JSON.stringify({ overflow, summaryGeometry, spaceGeometry })).toBeLessThanOrEqual(overflow.clientWidth + 1)
+      expect(summaryGeometry.bounds.width, JSON.stringify({ summaryGeometry, spaceGeometry, overflow })).toBeGreaterThan(0)
+      expect(summaryGeometry.bounds.height, JSON.stringify({ summaryGeometry, spaceGeometry, overflow })).toBeGreaterThan(0)
+      expect(summaryGeometry.insideClips, JSON.stringify({ summaryGeometry, spaceGeometry, overflow })).toBe(true)
+      expect(summaryGeometry.centerHit, JSON.stringify({ summaryGeometry, spaceGeometry, overflow })).toBe(true)
+      const summaryOverflow = await summary.evaluate(el => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth, textOverflow: getComputedStyle(el).textOverflow }))
+      expect(summaryOverflow.textOverflow).toBe('ellipsis')
+      expect(summaryOverflow.scrollWidth).toBeGreaterThan(summaryOverflow.clientWidth)
+      await hitAndClick(summary)
+      await expect(notice.locator('.fresh-agent-diagnostic-body')).toHaveText(longNotice)
+    }
+    await expect(page.getByRole('region', { name: 'Pending requests' })).toHaveCount(0)
+    await assertNoRequestStackFloor(page)
+    await scrollLayoutToComposer(page, height < 239)
+  })
+}
 
 test('requests remain clickable and native disclosures use keyboard defaults', async ({ freshellPage, page, terminal }) => {
   void freshellPage
@@ -642,6 +1214,70 @@ test('native permission scopes stay compact above reachable answers', async ({ f
   await hitAndClick(allow)
   await assertUsefulSpace(page)
 })
+
+for (const [toolName, input, requestId] of [
+  ['WebFetch', { url: `https://example.com/${'a'.repeat(120)}` }, 'wrapped-web-fetch'],
+  ['Write', { file_path: '/tmp/x', content: 'b'.repeat(120) }, 'wrapped-write'],
+  ['mcp__fixture__lookup', { key: 'c'.repeat(120) }, 'wrapped-mcp-lookup'],
+] as const) for (const width of [390, 560]) {
+  test(`${toolName} compact approval JSON wraps fully at ${width}px`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      style: 'sans',
+      theme: 'light',
+      snapshot: {
+        diffs: [],
+        pendingApprovals: [{ requestId: `${requestId}-${width}`, toolName, input }],
+        pendingQuestions: [],
+        pendingElicitations: [],
+      },
+    })
+    await fitRoot(page, { width })
+    const request = page.getByRole('alert', { name: `Permission request for ${toolName}` })
+    const preview = request.locator('pre.fresh-agent-approval-preview')
+    await expect(preview).toBeVisible()
+    const spaceGeometry = await logUsefulSpace(page)
+    const paintedGeometry = await measurePainted(preview)
+    const geometry = await preview.evaluate(el => {
+      const range = document.createRange(); range.selectNodeContents(el)
+      const rects = [...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0)
+      const bounds = el.getBoundingClientRect()
+      return {
+        lines: rects.length,
+        lineBounds: rects.map(rect => ({ left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom })),
+        bounds: { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom },
+        scrollWidth: el.scrollWidth,
+        clientWidth: el.clientWidth,
+      }
+    })
+    console.log(JSON.stringify({ event: 'compact_json_geometry', severity: 'INFO', title: test.info().title, geometry, paintedGeometry, spaceGeometry }))
+    await expect.poll(
+      () => preview.evaluate(el => el.scrollWidth - el.clientWidth),
+      { message: JSON.stringify({ geometry, paintedGeometry, spaceGeometry }) },
+    ).toBeLessThanOrEqual(1)
+    expect(geometry.lines, JSON.stringify(geometry)).toBeGreaterThan(1)
+    expect(geometry.lineBounds.every(rect => rect.left >= geometry.bounds.left - 1 && rect.right <= geometry.bounds.right + 1 && rect.top >= geometry.bounds.top - 1 && rect.bottom <= geometry.bounds.bottom + 1), JSON.stringify(geometry)).toBe(true)
+    expect(JSON.parse(await preview.textContent() ?? '')).toEqual(input)
+    await assertPainted(preview, { geometry, paintedGeometry, spaceGeometry })
+    const allow = request.getByRole('button', { name: 'Allow tool use', exact: true })
+    await hitAndClick(allow)
+    const responses = await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.().filter(frame =>
+      typeof frame === 'object' && frame !== null && 'type' in frame && frame.type === 'freshAgent.approval.respond' && 'requestId' in frame && frame.requestId === requestId,
+    ) ?? [], `${requestId}-${width}`)
+    expect(responses).toEqual([{
+      type: 'freshAgent.approval.respond',
+      sessionId: 'compact-freshclaude',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      requestId: `${requestId}-${width}`,
+      decision: { behavior: 'allow' },
+    }])
+  })
+}
 
 test('Claude plan feedback stays outside the long plan preview', async ({ freshellPage, page, terminal }) => {
   void freshellPage
@@ -832,6 +1468,8 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     }),{requestId:sent.requestId,reason})
     const summary=pane.locator('[data-agent-error="notice"] summary')
     await expect(summary).toHaveText(/^Check the conversation before sending again\. Delivery is uncertain\./)
+    const spaceGeometry = await logUsefulSpace(page)
+    await assertPainted(summary.getByRole('alert', { name: 'Agent warning' }), { spaceGeometry })
     await expect(composer).toHaveValue(prompt)
     await page.waitForTimeout(7_000)
     await expect(summary).toHaveText(/^Check the conversation before sending again\. Delivery is uncertain\./)
