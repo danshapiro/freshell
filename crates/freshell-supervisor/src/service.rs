@@ -3153,6 +3153,21 @@ impl Supervisor {
         // Metadata discovery must not queue behind lifecycle work and then
         // dispatch after the name worker's existing request budget expired.
         let Ok(_guard) = lifecycle_lock.try_lock() else {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"info",
+                    "reason":"lifecycle_busy",
+                    "soulId":request.soul_id,
+                    "nativeSessionId":request.source.native_session_id,
+                    "operation":match &request.operation {
+                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Probe => "probe",
+                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Read => "read",
+                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Write { .. } => "write",
+                    },
+                }),
+            );
             return Ok(unavailable());
         };
         let handle = self
@@ -3172,18 +3187,76 @@ impl Supervisor {
                 && view.recovery_state == freshell_runtime_protocol::RecoveryState::Live
                 && view.desired_state == freshell_runtime_protocol::DesiredState::Running
         };
-        if !matches_source(&before)
-            || !handle.fresh_agent().is_some_and(|agent| {
-                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
-            })
-            || request.codex_home.is_empty()
-        {
+        if !matches_source(&before) {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"source_mismatch",
+                    "soulId":request.soul_id,
+                    "requestedIncarnationId":request.source.incarnation_id,
+                    "currentIncarnationId":before.incarnation_id,
+                    "requestedHostBootId":request.source.host_boot_id,
+                    "currentHostBootId":before.host_boot_id,
+                    "requestedExecutionGeneration":request.source.execution_generation,
+                    "currentExecutionGeneration":before.execution_generation,
+                    "requestedIntentRevision":request.source.intent_revision,
+                    "currentIntentRevision":before.intent_revision,
+                    "requestedNativeSessionId":request.source.native_session_id,
+                    "currentNativeSessionId":before.native_session_id,
+                    "currentLaunchState":before.launch_state,
+                    "currentRecoveryState":before.recovery_state,
+                    "currentDesiredState":before.desired_state,
+                }),
+            );
+            return Ok(unavailable());
+        }
+        let is_fresh_codex = handle
+            .fresh_agent()
+            .is_some_and(|agent| agent.provider == freshell_runtime_protocol::FreshProvider::Codex);
+        if !is_fresh_codex {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"provider_mismatch",
+                    "soulId":request.soul_id,
+                    "hasFreshAgent":handle.fresh_agent().is_some(),
+                    "providerIsCodex":is_fresh_codex,
+                }),
+            );
+            return Ok(unavailable());
+        }
+        if request.codex_home.is_empty() {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"missing_codex_home",
+                    "soulId":request.soul_id,
+                    "codexHomePresent":false,
+                }),
+            );
             return Ok(unavailable());
         }
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
         if host.host_boot_id != request.source.host_boot_id {
+            append_event(
+                &self.config.lifecycle_log,
+                "freshagent.native_name_refused",
+                serde_json::json!({
+                    "severity":"warning",
+                    "reason":"host_boot_mismatch",
+                    "soulId":request.soul_id,
+                    "requestedHostBootId":request.source.host_boot_id,
+                    "currentHostBootId":host.host_boot_id,
+                }),
+            );
             return Ok(unavailable());
         }
         let reply = self
