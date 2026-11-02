@@ -164,7 +164,7 @@ export async function startInManagedContext(rig, source) {
   }
   if (!ready) {
     const stderr = await rig.ownedProviderExec(containerId, ['cat', `${directory}/stderr`])
-    assert.fail(`managed Codex loopback fixture did not start: ${stderr}`)
+    assert(ready, `managed Codex loopback fixture did not start: ${stderr}`)
   }
   assert.equal(ready.uid, 65534)
   assert.equal(ready.gid, 0)
