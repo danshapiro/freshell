@@ -7811,6 +7811,7 @@ export function query({ prompt, options }) {
         let rows: Vec<serde_json::Value> = vec![
             serde_json::json!({"uuid": "u-1", "text": "/clear", "nativeSessionId": "root-A", "pid": 4242u32}),
             serde_json::json!({"text": "Continue only the original pending native operation. Do not select another tool.", "nativeSessionId": "root-E", "pid": 4343u32}),
+            serde_json::json!({"uuid": "u-2", "text": [{"type": "text", "text": "expected original input"}], "nativeSessionId": "root-B", "pid": 4444u32}),
         ];
         let rendered = format_native_input_rows(&rows);
         assert!(
@@ -7820,6 +7821,8 @@ export function query({ prompt, options }) {
                 && rendered.contains("4242")
         );
         assert!(rendered.contains("root-E") && rendered.contains("4343"));
+        // The expected rows carry content-block arrays; their text must render too.
+        assert!(rendered.contains("expected original input") && rendered.contains("root-B"));
         // A row without a uuid must be visible as such (the cnr1 fourth-row fingerprint).
         assert!(rendered.contains("<no-uuid>") || rendered.contains("no uuid"));
     }
