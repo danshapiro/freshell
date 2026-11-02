@@ -1,5 +1,6 @@
 import type { Locator, Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import { test, expect, createFreshE2ePage } from '../helpers/fixtures.js'
+import { CLOUD_LANE_GOTO_BOUND_MS, CLOUD_LANE_HARNESS_WAIT_BOUND_MS, TestHarness, isCloudLaneWindowConfigured, selectShellFromPicker } from '../helpers/test-harness.js'
 import { FreshAgentSnapshotSchema } from '../../../shared/fresh-agent-contract.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -913,6 +914,126 @@ test('a pending Codex error stays visible until the failed turn is shown', async
   await expect(pending).toHaveCount(0)
   await expect(page.getByTestId('fresh-agent-turn-error')).toContainText(message)
   await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
+test('two browsers keep repeated answer errors scoped to their attempts', async ({ freshellPage, page, terminal, browser, serverInfo }) => {
+  test.setTimeout(180_000)
+  void freshellPage
+  await terminal.waitForTerminal()
+  // Separate contexts have independent Redux stores and machines. Both panes
+  // observe the same simulated managed session through the normal UI/WS path.
+  const peer = await createFreshE2ePage(browser, serverInfo)
+  const peerHarness = new TestHarness(peer.page)
+  try {
+    await peer.page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`, { timeout: CLOUD_LANE_GOTO_BOUND_MS })
+    await peerHarness.waitForHarness(CLOUD_LANE_HARNESS_WAIT_BOUND_MS)
+    await peerHarness.waitForConnection(undefined, { selfHealReload: isCloudLaneWindowConfigured() })
+    await selectShellFromPicker(peer.page)
+    const variant = { sessionType: 'freshcodex', provider: 'codex', style: 'sans' as const, theme: 'light' as const,
+      snapshot: { status: 'running', pendingApprovals: [], pendingElicitations: [] } }
+    const firstState = await seedCompactPane(page, variant)
+    const peerState = await seedCompactPane(peer.page, variant)
+    await firstState.update({ status: 'running' })
+    await peerState.update({ status: 'running' })
+    const pages = [page, peer.page]
+    const sessionId = 'compact-freshcodex'
+    const requestId = 'question-1'
+    const replies = async (target: Page) => target.evaluate(() =>
+      (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+        ?.filter(frame => frame.type === 'freshAgent.question.respond') ?? [])
+    const broadcast = async (event: Record<string, unknown>) => {
+      await Promise.all(pages.map(target => target.evaluate(value => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+        type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex', sessionId: 'compact-freshcodex', event: value,
+      }), event)))
+    }
+    const showOnBoth = async (message: string) => {
+      for (const target of pages) await expect(target.locator('[data-agent-error="session"] summary')).toContainText(message)
+    }
+    const absentOnBoth = async (message: string) => {
+      for (const target of pages) await expect.poll(async () =>
+        (await target.locator('[data-agent-error="session"]').allTextContents()).join(' ')).not.toContain(message)
+    }
+    for (const target of pages) {
+      await target.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+      await expect(target.getByRole('region', { name: 'Question from Codex' }).getByRole('button', { name: 'Yes', exact: true })).toBeEnabled()
+      await expect(target.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+    }
+
+    const answer = async (count: number) => {
+      await page.getByRole('region', { name: 'Question from Codex' }).getByRole('button', { name: 'Yes', exact: true }).click()
+      await expect.poll(async () => (await replies(page)).length).toBe(count)
+      expect((await replies(page)).at(-1)).toMatchObject({ sessionId, requestId, answers: { 'Continue?': 'Yes' } })
+      expect(await replies(peer.page)).toEqual([])
+    }
+    const started = (operationAttemptId: string, operationJournalSequence: number) => ({
+      type: 'freshAgent.operation.started', requestId, operationAttemptId,
+      operationJournalId: 'answer-journal', operationJournalSequence,
+    })
+    const firstRefusal = { type: 'freshAgent.error', requestId, operationAttemptId: 'answer-attempt-1', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The first answer was rejected.' }
+    await answer(1)
+    await broadcast(started('answer-attempt-1', 1))
+    await broadcast(firstRefusal)
+    await showOnBoth(firstRefusal.message)
+
+    await answer(2)
+    // Only the initiating store has seen the click until this start reaches
+    // both clients. The observer must stop associating the old provider error
+    // with the new attempt as soon as it sees the broadcast.
+    await expect(peer.page.locator('[data-agent-error="session"] summary')).toContainText(firstRefusal.message)
+    await broadcast(started('answer-attempt-2', 2))
+    await absentOnBoth(firstRefusal.message)
+    const uncertain = { type: 'freshAgent.error', requestId, operationAttemptId: 'answer-attempt-2', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+      message: 'Sending the answer could not be confirmed.' }
+    await broadcast(uncertain)
+    await showOnBoth(uncertain.message)
+    await absentOnBoth(firstRefusal.message)
+
+    // An old host receipt can arrive late or be replayed after attachment;
+    // neither may replace the current attempt's result in either store.
+    const late = { ...firstRefusal, message: 'A delayed first-attempt receipt.' }
+    await broadcast(late)
+    await broadcast({ ...late, operationReceiptReplay: true })
+    await showOnBoth(uncertain.message)
+    await absentOnBoth(late.message)
+
+    await answer(3)
+    await broadcast(started('answer-attempt-3', 3))
+    const definite = { type: 'freshAgent.error', requestId, operationAttemptId: 'answer-attempt-3', operationReceipt: true,
+      operationFallback: true, code: 'IMPLEMENTATION_UNAVAILABLE', message: 'The latest answer could not be sent.' }
+    await broadcast(definite)
+    await showOnBoth(definite.message)
+    await showOnBoth('Earlier attempt:')
+    await showOnBoth(uncertain.message)
+    await broadcast(late)
+    await showOnBoth(definite.message)
+    await showOnBoth(uncertain.message)
+    await absentOnBoth(firstRefusal.message)
+    await absentOnBoth(late.message)
+    for (const target of pages) {
+      await expect(target.getByRole('region', { name: 'Question from Codex' })).toBeVisible()
+      await expect(target.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+    }
+    expect(await replies(peer.page)).toEqual([])
+
+    // Client coverage of a replayed in-progress answer. The real managed
+    // attach and journal replay are covered by the gateway tests.
+    const pendingMessage = 'The answer is still being processed. Its outcome is not yet confirmed.'
+    await broadcast({ ...started('answer-attempt-4', 4), operationAttemptReplay: true, operationPending: true })
+    await showOnBoth(pendingMessage)
+    firstState.setSnapshot({ pendingQuestions: [] })
+    peerState.setSnapshot({ pendingQuestions: [] })
+    await broadcast({ type: 'freshAgent.question.cancelled', requestId })
+    await absentOnBoth(pendingMessage)
+    for (const target of pages) {
+      await expect(target.getByRole('region', { name: 'Question from Codex' })).toHaveCount(0)
+      await expect(target.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+    }
+  } finally {
+    await peerHarness.killAllTerminals(serverInfo)
+    await peer.context.close()
+  }
 })
 
 for (const fallbackFirst of [true, false]) test(`managed control keeps the provider cause and uncertain outcome with pending requests (fallback first: ${fallbackFirst})`, async ({ freshellPage, page, terminal }) => {
