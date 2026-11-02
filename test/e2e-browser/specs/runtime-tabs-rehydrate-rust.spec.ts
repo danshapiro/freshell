@@ -19,6 +19,8 @@ import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js
 import { derivedLayoutKey } from '../../../src/store/window-layout-keys.js'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 
+const FIXTURE_ENV = 'FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST'
+
 async function waitForValue<T>(
   description: string,
   probe: () => T | null | undefined | Promise<T | null | undefined>,
@@ -622,6 +624,282 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           const cleanup = await rig.stop()
           expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
         }
+      }
+    }
+  })
+
+  test('managed fresh-agent fork: runtime retirement reaches the sibling without client stop', async ({ browser, page }) => {
+    test.skip(process.env[FIXTURE_ENV] !== '1', `set ${FIXTURE_ENV}=1 explicitly`)
+    test.setTimeout(900_000)
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
+      FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
+    }, 'test', {
+      enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
+      providerSettings: { freshcodex: {} },
+    })
+    const desktopFrames: any[] = []
+    const mobileFrames: any[] = []
+    const captureFrames = (target: Page, sink: any[]) => {
+      const append = (direction: 'sent' | 'received', payload: unknown) => {
+        try {
+          const frame = JSON.parse(String(payload))
+          if (frame && typeof frame === 'object' && !Array.isArray(frame)) sink.push({ direction, ...frame })
+        } catch { /* non-JSON frame */ }
+      }
+      target.on('websocket', socket => {
+        socket.on('framesent', ({ payload }) => append('sent', payload))
+        socket.on('framereceived', ({ payload }) => append('received', payload))
+      })
+    }
+    let mobileContext: Awaited<ReturnType<typeof browser.newContext>> | undefined
+    let started = false
+    try {
+      const info = await rig.start()
+      started = true
+      captureFrames(page, desktopFrames)
+      const openDevice = async (target: Page, frames: any[]) => {
+        if (target !== page) captureFrames(target, frames)
+        await target.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+        await target.waitForFunction(() => Boolean(
+          document.querySelector('[data-testid="sidebar-session-list"]')
+            || (document.querySelector('section[role="dialog"]')?.textContent ?? '').includes('Choose a machine'),
+        ), undefined, { timeout: 15_000 }).catch(() => {})
+        const machineChooser = target.getByRole('dialog', { name: 'Choose a machine' })
+        if (await machineChooser.isVisible().catch(() => false)) {
+          await target.getByRole('button', { name: 'Add this machine' }).click()
+          await machineChooser.waitFor({ state: 'detached', timeout: 20_000 }).catch(() => {})
+        }
+        const harness = new TestHarness(target)
+        await harness.waitForHarness()
+        await harness.waitForConnection()
+        await target.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'connection/setAvailableClis', payload: { codex: true },
+        }))
+        return harness
+      }
+
+      const desktopHarness = await openDevice(page, desktopFrames)
+      mobileContext = await browser.newContext({
+        viewport: { width: 393, height: 851 }, screen: { width: 393, height: 851 },
+        deviceScaleFactor: 2.75, isMobile: true, hasTouch: true,
+      })
+      const mobilePage = await mobileContext.newPage()
+      const mobileHarness = await openDevice(mobilePage, mobileFrames)
+      const desktopDeviceId = await page.evaluate(() => localStorage.getItem('freshell.device-id.v2'))
+      const mobileDeviceId = await mobilePage.evaluate(() => localStorage.getItem('freshell.device-id.v2'))
+      expect(desktopDeviceId).toBeTruthy()
+      expect(mobileDeviceId).toBeTruthy()
+      expect(desktopDeviceId).not.toBe(mobileDeviceId)
+
+      const seedView = async (
+        target: Page,
+        tabId: string,
+        paneId: string,
+        sessionId?: string,
+      ) => {
+        const createRequestId = `managed-retirement-${tabId}`
+        const viewId = `managed-retirement-view-${tabId}`
+        await target.evaluate(({ currentTabId, currentPaneId, currentCreateRequestId, currentViewId, currentCwd, currentSessionId }) => {
+          const harness = window.__FRESHELL_TEST_HARNESS__
+          harness?.dispatch({ type: 'tabs/addTab', payload: { id: currentTabId, title: 'Managed fork', mode: 'shell' } })
+          harness?.dispatch({
+            type: 'panes/initLayout',
+            payload: {
+              tabId: currentTabId,
+              paneId: currentPaneId,
+              content: {
+                kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex',
+                initialCwd: currentCwd, createRequestId: currentCreateRequestId, viewId: currentViewId,
+                ...(currentSessionId ? {
+                  sessionId: currentSessionId,
+                  sessionRef: { provider: 'codex', sessionId: currentSessionId },
+                  resumeSessionId: currentSessionId,
+                } : {}),
+                status: currentSessionId ? 'idle' : 'starting', settingsDismissed: true,
+              },
+            },
+          })
+        }, { currentTabId: tabId, currentPaneId: paneId, currentCreateRequestId: createRequestId,
+          currentViewId: viewId, currentCwd: rig.repoRoot, currentSessionId: sessionId })
+        const harness = target === page ? desktopHarness : mobileHarness
+        await expect(target.locator(`[data-context="fresh-agent"][data-pane-id="${paneId}"]`)).toBeVisible({ timeout: 20_000 })
+        return { harness, tabId, paneId, createRequestId, viewId }
+      }
+
+      const desktop = await seedView(page, 'managed-retirement-desktop-tab', 'managed-retirement-desktop-pane')
+      let desktopCreated: any
+      try {
+        const result = await waitForValue('managed desktop Fresh Agent creation', async () => {
+          const failure = desktopFrames.find(frame => frame.direction === 'received'
+            && (frame.type === 'freshAgent.create.failed' || frame.type === 'freshAgent.createFailed')
+            && frame.requestId === desktop.createRequestId)
+          if (failure) return { kind: 'failure' as const, frame: failure }
+          const pane = await desktop.harness.getPaneLayout(desktop.tabId)
+          return pane?.type === 'leaf' && pane.content?.sessionId
+            ? { kind: 'created' as const, content: pane.content }
+            : null
+        }, 60_000)
+        if (result.kind === 'failure') {
+          throw new Error(`managed Fresh Agent create was rejected: ${JSON.stringify({
+            type: result.frame.type, requestId: result.frame.requestId, code: result.frame.code,
+          })}`)
+        }
+        desktopCreated = result.content
+      } catch (error) {
+        const frameSummary = desktopFrames.map(frame => ({
+          direction: frame.direction, type: frame.type, requestId: frame.requestId,
+          sessionId: frame.sessionId, sessionType: frame.sessionType,
+          code: frame.code ?? frame.event?.code, eventType: frame.event?.type,
+        }))
+        const pane = await desktop.harness.getPaneLayout(desktop.tabId)
+        const paneContent = pane?.type === 'leaf' ? pane.content : null
+        const inventory = await rig.inventory().catch(() => [])
+        const fixtureViews = inventory.filter(row => row.freshAgentSessionType === 'freshcodex').map(row => ({
+          soulId: row.soulId, launchState: row.launchState, nativeSessionId: row.nativeSessionId,
+        }))
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; pane=${JSON.stringify(paneContent)}; frames=${JSON.stringify(frameSummary)}; managedViews=${JSON.stringify(fixtureViews)}`)
+      }
+      const view = await waitForValue('owned managed Codex fixture', async () => {
+        const matches = (await rig.inventory()).filter(row => row.freshAgentSessionType === 'freshcodex'
+          && row.launchState === 'running' && row.nativeSessionId)
+        return matches.length === 1 ? matches[0] : null
+      }, 90_000)
+      const parentSessionId = view.nativeSessionId as string
+      const runtimeHandle = rig.exactRuntimeHandle(view)
+      const beforeParentTurn = await waitForValue('managed parent provider is idle before seeding', async () => {
+        const state = await rig.fixtureNativeState(runtimeHandle)
+        return state.dispatchCount === state.completionCount ? state : null
+      }, 45_000)
+      const desktopPane = page.locator(`[data-context="fresh-agent"][data-pane-id="${desktop.paneId}"]`)
+      const parentSeedPrompt = 'managed multi-device parent seed turn'
+      const composer = desktopPane.getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill(parentSeedPrompt)
+      await composer.press('Enter')
+      await waitForValue('managed parent seed turn is durably completed', async () => {
+        const state = await rig.fixtureNativeState(runtimeHandle)
+        return state.dispatchCount === beforeParentTurn.dispatchCount + 1
+          && state.completionCount === beforeParentTurn.completionCount + 1 ? state : null
+      }, 45_000)
+      const parentHistoryUserTurn = desktopPane.locator('article[data-turn-role="user"]', {
+        hasText: 'deterministic fixture request',
+      }).first()
+      await expect(parentHistoryUserTurn).toBeVisible({ timeout: 30_000 })
+      await expect(desktopPane.locator('article[data-turn-role="assistant"]').first())
+        .toContainText('deterministic fixture completion', { timeout: 30_000 })
+      await expect.poll(async () => {
+        const pane = await desktop.harness.getPaneLayout(desktop.tabId)
+        return pane?.content?.sessionRef?.sessionId ?? pane?.content?.sessionId ?? null
+      }, { timeout: 45_000, message: 'desktop binds the parent to its provider-native id' }).toBe(parentSessionId)
+
+      const mobile = await seedView(mobilePage, 'managed-retirement-mobile-tab', 'managed-retirement-mobile-pane', parentSessionId)
+      await expect.poll(async () => {
+        const pane = await mobile.harness.getPaneLayout(mobile.tabId)
+        return pane?.content?.status ?? null
+      }, { timeout: 45_000, message: 'mobile attaches its independent view to the active managed parent' }).toBe('idle')
+      await expect.poll(() => mobileFrames.some(frame => frame.direction === 'sent' && frame.type === 'freshAgent.attach'
+        && frame.sessionId === parentSessionId), { timeout: 20_000 }).toBe(true)
+      await waitForValue('sibling records the shared parent as active before retirement', async () => {
+        const state = await mobileHarness.getState()
+        const parent = Object.values(state.freshAgent.sessions as Record<string, any>)
+          .find(session => session.sessionId === parentSessionId && session.sessionType === 'freshcodex')
+        return parent && parent.status !== 'exited' ? parent : null
+      }, 45_000)
+      const mobileParentPane = mobilePage.locator(
+        '[data-context="fresh-agent"][data-pane-id="managed-retirement-mobile-pane"]',
+      )
+      await expect(mobileParentPane.locator('article[data-turn-role="user"]').first())
+        .toContainText('deterministic fixture request', { timeout: 30_000 })
+      await expect(mobileParentPane.locator('article[data-turn-role="assistant"]').first())
+        .toContainText('deterministic fixture completion', { timeout: 30_000 })
+
+      await parentHistoryUserTurn.hover()
+      const forkButton = parentHistoryUserTurn.getByRole('button', { name: 'Fork conversation from here' })
+      await expect(forkButton).toBeVisible({ timeout: 30_000 })
+      await forkButton.click()
+      const forkRequest = await waitForValue('desktop sends the managed parent fork', async () => desktopFrames.find(frame => frame.direction === 'sent'
+        && frame.type === 'freshAgent.fork' && frame.sessionId === parentSessionId) ?? null, 30_000)
+      expect(forkRequest.sessionId).toBe(parentSessionId)
+      const forkOutcome = await waitForValue('provider reports the fork result', async () => {
+        const forked = desktopFrames.find(frame => frame.direction === 'received'
+          && frame.type === 'freshAgent.forked' && frame.parentSessionId === parentSessionId)
+        if (forked) return { kind: 'forked' as const, frame: forked }
+        const failed = desktopFrames.find(frame => frame.direction === 'received' && frame.type === 'freshAgent.event'
+          && frame.sessionId === parentSessionId && frame.event?.type === 'freshAgent.error')
+        return failed ? { kind: 'failed' as const, frame: failed } : null
+      }, 60_000)
+      if (forkOutcome.kind === 'failed') {
+        const serverForkFailure = [...rig.web.capturedOutput().stdout.split('\n'), ...rig.web.capturedOutput().stderr.split('\n')]
+          .filter(line => line.includes('freshagent.gateway.managed_fork_failed')).at(-1)
+        const hostProcess = rig.runtime.topOwnedContainerExact(view.containerId, ['-eo', 'pid,args']).split('\n')
+          .find(line => line.includes('freshell-session-host') && line.includes(' serve '))
+        const hostStateDir = hostProcess?.match(/--state-dir(?:=|\s+)([^\s]+)/)?.[1]
+        const actorStatePath = hostStateDir
+          ? rig.ownedContainerExec(view.containerId, ['find', hostStateDir, '-name', 'fresh-agent-state.json', '-print'])
+            .trim().split('\n').find(Boolean)
+          : null
+        let actorState: any = null
+        if (actorStatePath) {
+          try { actorState = JSON.parse(rig.ownedContainerExec(view.containerId, ['cat', actorStatePath])) }
+          catch { /* the actor state may not be readable from the provider container */ }
+        }
+        const fixtureState = await rig.fixtureNativeState(runtimeHandle).catch(() => null)
+        const runtimeEvents = [view.containerId, rig.supervisor.containerId].flatMap(containerId =>
+          rig.runtime.containerLogs(containerId).split('\n').flatMap(line => {
+          try {
+            const row = JSON.parse(line)
+            const fields = row.fields ?? row
+            const event = fields.event ?? row.event
+            if (typeof event !== 'string' || !/(fresh.?agent|host\.native_input)/i.test(event)) return []
+            return [{ event, severity: fields.severity ?? row.severity, code: fields.code ?? row.code,
+              errorCode: fields.error_code ?? row.error_code ?? fields.errorCode ?? row.errorCode,
+              reason: fields.reason ?? row.reason, profileMatchesParent: fields.profileMatchesParent ?? row.profileMatchesParent }]
+          } catch { return [] }
+          }),
+        ).slice(-20)
+        throw new Error(`managed provider-native fork failed: ${JSON.stringify({
+          code: forkOutcome.frame.event?.code, serverForkFailure, runtimeEvents,
+          actorProfileMatchesParent: actorState?.profile?.nativeSessionId === parentSessionId,
+          fixtureStateMatchesParent: fixtureState?.nativeSessionId === parentSessionId,
+        })}`)
+      }
+      const forkReply = forkOutcome.frame
+      expect(forkReply).toMatchObject({ parentRetiredByRuntime: true, parentSessionId })
+      const childSessionId = forkReply.sessionId as string
+      expect(childSessionId).toBeTruthy()
+      expect(childSessionId).not.toBe(parentSessionId)
+      expect([desktopCreated.sessionId, desktopCreated.sessionRef?.sessionId]).toContain(parentSessionId)
+
+      await expect.poll(async () => {
+        const requesterPane = await desktop.harness.getPaneLayout(desktop.tabId)
+        return requesterPane?.content?.sessionRef?.sessionId ?? null
+      }, { timeout: 45_000, message: 'only the requesting desktop view rekeys to the child' }).toBe(childSessionId)
+      const siblingConvergence = await waitForValue('sibling keeps the parent view and sees its exited status', async () => {
+        const siblingPane = await mobile.harness.getPaneLayout(mobile.tabId)
+        const state = await mobile.harness.getState()
+        const parent = Object.values(state.freshAgent.sessions as Record<string, any>)
+          .find(session => session.sessionId === parentSessionId && session.sessionType === 'freshcodex')
+        if (parent?.status !== 'exited' || siblingPane?.content?.sessionRef?.sessionId !== parentSessionId) return null
+        return { parentStatus: parent.status, siblingSessionId: siblingPane.content.sessionRef.sessionId }
+      }, 60_000)
+      expect(siblingConvergence).toEqual({ parentStatus: 'exited', siblingSessionId: parentSessionId })
+      await expect(mobilePage.locator('[data-context="fresh-agent"][data-pane-id="managed-retirement-mobile-pane"]')
+        .getByText('This session has ended', { exact: false })).toBeVisible()
+      expect(mobileFrames.some(frame => frame.direction === 'received' && frame.type === 'freshAgent.event'
+        && frame.sessionId === parentSessionId && frame.event?.type === 'freshAgent.exit'))
+        .toBe(true)
+      const clientParentCleanup = [...desktopFrames, ...mobileFrames].filter(frame => frame.direction === 'sent'
+        && (frame.type === 'freshAgent.detach' || frame.type === 'freshAgent.kill')
+        && frame.sessionId === parentSessionId)
+      expect(clientParentCleanup, 'runtime retirement must not cause duplicate client detach or kill').toHaveLength(0)
+      const currentViews = (await rig.inventory()).filter(row => row.soulId === view.soulId
+        && row.launchState === 'running' && row.freshAgentSessionType === 'freshcodex')
+      expect(currentViews).toHaveLength(1)
+      expect(currentViews[0].nativeSessionId).toBe(childSessionId)
+    } finally {
+      await mobileContext?.close().catch(() => {})
+      if (started) {
+        const cleanup = await rig.stop()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
       }
     }
   })

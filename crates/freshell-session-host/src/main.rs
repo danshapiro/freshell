@@ -1123,7 +1123,18 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
+                    ensure_current_fresh_native_observation(state)
+                        .await
+                        .map_err(|error| {
+                            emit_environment_event(serde_json::json!({
+                                "severity":"warn",
+                                "event":"freshagent.session_host.fork_rejected",
+                                "requestId":request_id.as_str(),
+                                "reason":"native_observation_unavailable",
+                                "errorCode":error.code,
+                            }));
+                            error
+                        })?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -1131,10 +1142,31 @@ async fn dispatch_with_effects(
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
                     let prior_native = actor.profile().await.native_session_id;
-                    let transition = actor
-                        .fork(request_id, parent_session_id, input)
+                    let profile_matches_parent =
+                        prior_native.as_deref() == Some(parent_session_id.as_str());
+                    let transition = match actor
+                        .fork(request_id.clone(), parent_session_id.clone(), input)
                         .await
-                        .map_err(map_actor_error)?;
+                    {
+                        Ok(transition) => transition,
+                        Err(error) => {
+                            let reason = match &error {
+                                freshell_agent_runtime::host_actor::ActorError::NativeIdentityMismatch => "native_identity_mismatch",
+                                freshell_agent_runtime::host_actor::ActorError::AmbiguousDispatch => "ambiguous_dispatch",
+                                freshell_agent_runtime::host_actor::ActorError::Transport(_) => "transport_failure",
+                                freshell_agent_runtime::host_actor::ActorError::Persistence(_) => "persistence_failure",
+                                _ => "actor_rejected",
+                            };
+                            emit_environment_event(serde_json::json!({
+                                "severity":"warn",
+                                "event":"freshagent.session_host.fork_rejected",
+                                "requestId":request_id.as_str(),
+                                "reason":reason,
+                                "profileMatchesParent":profile_matches_parent,
+                            }));
+                            return Err(map_actor_error(error));
+                        }
+                    };
                     commit_fresh_native_transition(state, &actor, prior_native.as_deref()).await?;
                     Ok(HostResult::FreshAgentFork(
                         freshell_runtime_protocol::FreshAgentForkResult {

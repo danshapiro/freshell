@@ -3532,7 +3532,7 @@ export function FreshAgentView({
         const parentRetiredByRuntime = message.parentRetiredByRuntime === true
         if (
           !isManagedFreshAgentStopped(current)
-          && (parentRetiredByRuntime || message.requestId === current.createRequestId)
+          && message.requestId === current.createRequestId
           && message.parentSessionId === current.sessionId
           && message.sessionType === current.sessionType
           && message.provider === current.provider

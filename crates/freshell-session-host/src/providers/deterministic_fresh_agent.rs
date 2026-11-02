@@ -8,13 +8,14 @@
 use async_trait::async_trait;
 use freshell_agent_runtime::{
     host_actor::{
-        DispatchAck, DispatchFailure, FreshAgentProfile, FreshAgentTransport, TransportStart,
+        DispatchAck, DispatchFailure, ForkTransition, FreshAgentProfile, FreshAgentTransport,
+        TransportStart,
     },
     ProviderStoreProbe,
 };
 use freshell_runtime_protocol::{
-    AgentEvent, EvidenceStoreState, FreshProvider, RecoveryBlockReason, RequestId, ResumeSpec,
-    RetryHint,
+    AgentEvent, EvidenceStoreState, FreshProvider, NativeIdentityLaunch, RecoveryBlockReason,
+    RequestId, ResumeSpec, RetryHint,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -59,6 +60,7 @@ pub(crate) struct DeterministicFreshAgentTransport {
     run_as_uid: u32,
     run_as_gid: u32,
     helpers: ProviderStateHelpers,
+    native_identity_launch: Mutex<Option<NativeIdentityLaunch>>,
 }
 
 impl DeterministicFreshAgentTransport {
@@ -91,6 +93,12 @@ impl DeterministicFreshAgentTransport {
         {
             return Err("deterministic provider native identity mismatch".into());
         }
+        let native_identity_launch = match freshell_platform::managed_child_secrets::snapshot() {
+            Some(environment) => {
+                crate::providers::native_identity::launch_from_environment(environment)?
+            }
+            None => None,
+        };
         write_provider_state(&state_dir, &state, run_as_uid, run_as_gid, &helpers).await?;
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         Ok(Arc::new(Self {
@@ -103,6 +111,7 @@ impl DeterministicFreshAgentTransport {
             run_as_uid,
             run_as_gid,
             helpers,
+            native_identity_launch: Mutex::new(native_identity_launch),
         }))
     }
 
@@ -408,7 +417,130 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
         snapshot["capabilities"]["send"] = json!(state.pending_decision_id.is_none());
         snapshot["capabilities"]["interrupt"] =
             json!(state.dispatch_count > state.completion_count);
+        snapshot["capabilities"]["fork"] = json!(true);
         Ok(snapshot)
+    }
+
+    async fn fork(
+        &self,
+        _request_id: &RequestId,
+        parent_session_id: &str,
+        _input: Option<Value>,
+    ) -> Result<ForkTransition, DispatchFailure> {
+        let mut state = self.state.lock().await;
+        if state.native_session_id != parent_session_id {
+            crate::emit_environment_event(json!({
+                "severity":"warn",
+                "event":"freshagent.fixture.native_fork_failed",
+                "provider":self.provider.as_str(),
+                "requestId":_request_id.as_str(),
+                "reason":"parent_identity_mismatch",
+            }));
+            return Err(non_ambiguous(
+                "deterministic fixture fork parent is no longer current",
+            ));
+        }
+        let child_session_id = format!(
+            "fixture-native-{}-fork-{}",
+            self.provider.as_str(),
+            uuid::Uuid::new_v4()
+        );
+        let next_native_identity_launch = self
+            .native_identity_launch
+            .lock()
+            .await
+            .as_ref()
+            .map(|launch| {
+                if launch
+                    .requested_native_session_id
+                    .as_deref()
+                    .is_some_and(|requested| requested != parent_session_id)
+                {
+                    return Err(non_ambiguous(
+                        "deterministic fixture fork launch identity mismatch",
+                    ));
+                }
+                let mut next = launch.clone();
+                next.evidence_revision =
+                    next.evidence_revision.checked_add(1).ok_or_else(|| {
+                        non_ambiguous("deterministic fixture evidence revision exhausted")
+                    })?;
+                next.requested_native_session_id = Some(child_session_id.clone());
+                Ok(next)
+            })
+            .transpose()?;
+        let profile = state
+            .create_profile
+            .as_ref()
+            .ok_or_else(|| non_ambiguous("deterministic fixture create profile is unavailable"))?;
+        let child_metadata = json!({
+            "provider": self.provider.as_str(),
+            "nativeId": child_session_id.as_str(),
+            "cwd": profile.cwd.as_str(),
+            "allowCreate": true,
+        });
+        #[cfg(test)]
+        let child_history_result = write_native_history(&self.state_dir, &child_metadata, false);
+        #[cfg(not(test))]
+        let child_history_result = {
+            let input = serde_json::to_vec(&child_metadata)
+                .map_err(|error| non_ambiguous(error.to_string()))?;
+            provider_state_worker(
+                &self.state_dir,
+                self.run_as_uid,
+                self.run_as_gid,
+                &self.helpers,
+                "fork",
+                Some(&input),
+            )
+            .await
+            .map(|_| ())
+        };
+        if child_history_result.is_err() {
+            crate::emit_environment_event(json!({
+                "severity":"warn",
+                "event":"freshagent.fixture.native_fork_failed",
+                "provider":self.provider.as_str(),
+                "requestId":_request_id.as_str(),
+                "reason":"child_native_history_write",
+            }));
+            return Err(non_ambiguous(
+                "deterministic fixture child native history write failed",
+            ));
+        }
+        let mut child_state = state.clone();
+        child_state.native_session_id = child_session_id.clone();
+        child_state.dispatch_count = 0;
+        child_state.completion_count = 0;
+        child_state.pending_decision_id = None;
+        if write_provider_state(
+            &self.state_dir,
+            &child_state,
+            self.run_as_uid,
+            self.run_as_gid,
+            &self.helpers,
+        )
+        .await
+        .is_err()
+        {
+            crate::emit_environment_event(json!({
+                "severity":"warn",
+                "event":"freshagent.fixture.native_fork_failed",
+                "provider":self.provider.as_str(),
+                "requestId":_request_id.as_str(),
+                "reason":"provider_state_write",
+            }));
+            return Err(non_ambiguous(
+                "deterministic fixture provider state write failed",
+            ));
+        }
+        *state = child_state;
+        *self.native_identity_launch.lock().await = next_native_identity_launch;
+        Ok(ForkTransition {
+            parent_session_id: parent_session_id.to_string(),
+            child_session_id,
+            parent_retired_by_runtime: true,
+        })
     }
 
     async fn is_live(&self) -> bool {
@@ -417,6 +549,23 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
             Some(child) => child.try_wait().ok().flatten().is_none(),
             None => false,
         }
+    }
+
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        let native_session_id = self.state.lock().await.native_session_id.clone();
+        let launch = self.native_identity_launch.lock().await.clone()?;
+        if launch
+            .requested_native_session_id
+            .as_deref()
+            .is_some_and(|requested| requested != native_session_id)
+        {
+            return None;
+        }
+        Some(json!({
+            "nativeSessionId": native_session_id,
+            "launch": launch,
+            "fixtureTransport": "deterministic",
+        }))
     }
 
     async fn stop(self: Arc<Self>) -> Result<(), String> {
@@ -939,6 +1088,14 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
                 serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
             write_native_history(state_dir, &metadata, false)
         }
+        [operation] if operation == "fork" => {
+            let metadata: Value =
+                serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
+            if metadata["allowCreate"] != true {
+                return Err("deterministic provider fork worker requires child creation".into());
+            }
+            write_native_history(state_dir, &metadata, false)
+        }
         [operation] if operation == "snapshot" => {
             let input: Value =
                 serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
@@ -956,7 +1113,8 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
             serde_json::to_writer(std::io::stdout(), &snapshot).map_err(|error| error.to_string())
         }
         _ => Err(
-            "fixture state worker requires read, write, initialize, completion or snapshot".into(),
+            "fixture state worker requires read, write, initialize, fork, completion or snapshot"
+                .into(),
         ),
     }
 }

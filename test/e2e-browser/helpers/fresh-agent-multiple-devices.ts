@@ -445,7 +445,7 @@ function nativeFixture(input: {
       }
       return rows().filter((row) => input.mode === 'freshopencode'
         ? row.event === 'native_stop' && row.sessionId === (sessionId ?? input.sessionId)
-        : row.kind === 'native_stop' && row.sessionId === input.sessionId).length
+        : row.kind === 'native_stop' && row.sessionId === (sessionId ?? input.sessionId)).length
     },
     holdNextTurn: async (sessionId = input.sessionId) => {
       heldPromptSessionId = sessionId

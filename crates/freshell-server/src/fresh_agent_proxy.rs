@@ -477,40 +477,83 @@ impl HostedFreshAgentProxy {
                 match result {
                     Ok((soul, transition)) => {
                         let provider_name = provider_wire(&provider);
+                        let parent_session_id = transition.parent_session_id.clone();
+                        let child_session_id = transition.child_session_id.clone();
+                        let parent_retired_by_runtime = transition.parent_retired_by_runtime;
                         {
                             let mut aliases = self.aliases.lock().await;
                             aliases.retain(|(mapped_provider, _), mapped_soul| {
                                 mapped_provider != &provider_name || mapped_soul != &soul
                             });
                             aliases.insert(
-                                (provider_name.clone(), transition.child_session_id.clone()),
+                                (provider_name.clone(), child_session_id.clone()),
                                 soul.clone(),
                             );
                         }
                         self.presentation_routes.lock().await.insert(
                             soul,
-                            PresentationRoute::materialized(transition.child_session_id.clone()),
+                            PresentationRoute::materialized(child_session_id.clone()),
                         );
                         self.send(ServerMessage::FreshAgentForked(FreshAgentForked {
-                            request_id: message.request_id,
-                            parent_session_id: transition.parent_session_id,
-                            session_id: transition.child_session_id.clone(),
+                            request_id: message.request_id.clone(),
+                            parent_session_id: parent_session_id.clone(),
+                            session_id: child_session_id.clone(),
                             session_type: session_type_wire(session_type),
-                            provider: provider_wire(&provider),
-                            runtime_provider: provider_wire(&provider),
-                            parent_retired_by_runtime: Some(transition.parent_retired_by_runtime),
+                            provider: provider_name.clone(),
+                            runtime_provider: provider_name.clone(),
+                            parent_retired_by_runtime: Some(parent_retired_by_runtime),
                             session_ref: Some(SessionLocator {
-                                provider: provider_wire(&provider),
-                                session_id: transition.child_session_id,
+                                provider: provider_name.clone(),
+                                session_id: child_session_id.clone(),
                             }),
                         }));
+                        if parent_retired_by_runtime {
+                            tracing::info!(
+                                event = "freshagent.gateway.parent_retired",
+                                severity = "info",
+                                request_id = %message.request_id.as_deref().unwrap_or_default(),
+                                provider = %provider_name,
+                                parent_session_id = %parent_session_id,
+                                child_session_id = %child_session_id,
+                                "managed fork retired the parent native session"
+                            );
+                            self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                                event: serde_json::json!({ "type": "freshAgent.exit" }),
+                                provider: provider_name,
+                                session_id: parent_session_id,
+                                session_type: session_type_wire(session_type),
+                            }));
+                        }
                     }
-                    Err(_) => self.error_event(
-                        &provider,
-                        &session_id,
-                        session_type,
-                        "managed provider-native fork failed without creating another soul",
-                    ),
+                    Err(error) => {
+                        let code = match operation_error_code(&error) {
+                            "MANAGED_FRESH_AGENT_ERROR" => match create_client_error_reason(&error)
+                            {
+                                "supervisor_io" => "SUPERVISOR_IO",
+                                "supervisor_protocol" => "SUPERVISOR_PROTOCOL",
+                                "unexpected_supervisor_result" => "UNEXPECTED_SUPERVISOR_RESULT",
+                                _ => "MANAGED_FRESH_AGENT_ERROR",
+                            },
+                            code => code,
+                        };
+                        tracing::warn!(
+                            event = "freshagent.gateway.managed_fork_failed",
+                            severity = "warn",
+                            request_id = %message.request_id.as_deref().unwrap_or_default(),
+                            provider = %provider_wire(&provider),
+                            session_id = %session_id,
+                            error_code = code,
+                            reason = create_client_error_reason(&error),
+                            "managed provider-native fork failed without creating another soul"
+                        );
+                        self.error_event_code(
+                            &provider,
+                            &session_id,
+                            session_type,
+                            code,
+                            "managed provider-native fork failed without creating another soul",
+                        );
+                    }
                 }
             }
             HostedFreshAgentCommand::Undo(message) => {
@@ -2203,10 +2246,19 @@ fn decision_id(value: StringOrNumber) -> String {
 
 fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'static str {
     match error.runtime_code() {
+        Some(RuntimeErrorCode::InvalidRequest) => "INVALID_REQUEST",
         Some(RuntimeErrorCode::UnsupportedOperation) => "UNSUPPORTED_CAPABILITY",
+        Some(RuntimeErrorCode::UnsupportedWorkload) => "UNSUPPORTED_WORKLOAD",
         Some(RuntimeErrorCode::OperationImplementationUnavailable) => "IMPLEMENTATION_UNAVAILABLE",
         Some(RuntimeErrorCode::CommandAmbiguous) => "COMMAND_AMBIGUOUS",
         Some(RuntimeErrorCode::RequestIdConflict) => "REQUEST_ID_CONFLICT",
+        Some(RuntimeErrorCode::UnknownSoul) => "UNKNOWN_SOUL",
+        Some(RuntimeErrorCode::UnknownIncarnation) => "UNKNOWN_INCARNATION",
+        Some(RuntimeErrorCode::OwnershipMismatch) => "OWNERSHIP_MISMATCH",
+        Some(RuntimeErrorCode::HostUnreachable) => "HOST_UNREACHABLE",
+        Some(RuntimeErrorCode::HostAuthenticationFailed) => "HOST_AUTHENTICATION_FAILED",
+        Some(RuntimeErrorCode::RecoveryWrongIdentity) => "RECOVERY_WRONG_IDENTITY",
+        Some(RuntimeErrorCode::StaleExecutionGrant) => "STALE_EXECUTION_GRANT",
         _ => "MANAGED_FRESH_AGENT_ERROR",
     }
 }
