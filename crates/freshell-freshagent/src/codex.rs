@@ -16765,6 +16765,7 @@ pub(crate) mod tests {
                 pid: 1,
                 start_time: None,
                 tree: Vec::new(),
+                root_parent: None,
                 ownership_id: ownership_id.to_string(),
                 capture_complete: false,
             },
