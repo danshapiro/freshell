@@ -290,11 +290,12 @@ async function assertUsefulSpace(page: Page): Promise<void> {
 
 const emittedScreenshotPaths = new Set<string>()
 
-async function saveScreenshot(page: Page, path: string): Promise<void> {
+async function saveScreenshot(page: Page, path: string): Promise<boolean> {
   const bytes = await page.screenshot({ path })
   // Cloud Run has no persistent filesystem artifact export. Retain the four
-  // existing review images plus a representative image from each new geometry
-  // class; avoid streaming every failed matrix cell into the logs.
+  // existing review images, representative geometry failures, and both
+  // approved nested tiny-pane captures; avoid streaming every failed matrix
+  // cell into the logs.
   const reviewImages = [
     'compact-freshclaude-desktop',
     'compact-serif-light-split',
@@ -304,11 +305,15 @@ async function saveScreenshot(page: Page, path: string): Promise<void> {
     'compact-geometry-failure-painted-ambiguous-Codex-delivery-keeps-the-original-prompt-and-instruction-at-390x700',
     'compact-geometry-failure-painted-WebFetch-compact-approval-JSON-wraps-fully-at-390px',
     'compact-geometry-failure-composer-270px-empty-compact-pane-keeps-the-complete-composer-visible-without-scrolling',
+    'compact-tiny-200px',
+    'compact-tiny-120px',
   ]
-  if (emittedScreenshotPaths.has(path) || !reviewImages.some(name => path.includes(name))) return
+  if (emittedScreenshotPaths.has(path)) return true
+  if (!reviewImages.some(name => path.includes(name))) return false
   emittedScreenshotPaths.add(path)
   const base64 = bytes.toString('base64')
   for (let offset = 0; offset < base64.length; offset += 12000) console.log(JSON.stringify({ event: 'compact_panel_screenshot', severity: 'INFO', path, offset, data: base64.slice(offset, offset + 12000) }))
+  return true
 }
 
 async function setScale(page: Page, uiScale: number): Promise<void> {
@@ -769,7 +774,7 @@ for (const height of [200, 120]) test(`nested ${height}px panes retain requests 
   console.log(JSON.stringify({event:'tiny_compact_geometry',severity:'INFO',height,...initial}))
   expect(initial.visible).toBe(true)
   expect(initial.stackHeight).toBeGreaterThanOrEqual(64)
-  await saveScreenshot(page, `test-results/compact-tiny-${height}px.png`)
+  expect(await saveScreenshot(page, `test-results/compact-tiny-${height}px.png`)).toBe(true)
   await hitAndClick(stack.getByRole('button', { name: 'Yes', exact: true }))
   await hitAndClick(stack.getByRole('button', { name: 'Allow tool use', exact: true }))
   const name = stack.getByRole('textbox', {name:'Name'})

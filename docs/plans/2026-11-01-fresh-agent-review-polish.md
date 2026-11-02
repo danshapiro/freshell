@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Fix the optional Fresh Agent compact-panel review findings 7 through 12: clearer routine feedback and delivery instructions; correct notice expiry across disclosure and severity changes; better use of narrow/tiny-pane space and visibility of multiple diagnostic summaries; readable approval JSON without a repeated native path; stable drawer focus during pane/session updates and simpler focus-list work where justified; accessible diagnostic severity counts; quieter screenshot logs and accurate, portable historical-plan status/evidence links.
+Fix the optional Fresh Agent compact-panel review findings 7 through 12: clearer routine feedback and delivery instructions; correct notice expiry across disclosure and severity changes; better use of narrow/tiny-pane space and visibility of multiple diagnostic summaries; readable approval JSON without a repeated native path; stable drawer focus during pane/session updates and simpler focus-list work where justified; accessible diagnostic severity counts; quieter screenshot logs and accurate, portable historical-plan status/evidence links. Retain and inspect the existing 200px and 120px nested-pane screenshots from the exact Cloud browser run.
 
 ### Explicit constraints
 - Apply shared UI improvements to all Fresh Agents.
@@ -16,9 +16,10 @@ Fix the optional Fresh Agent compact-panel review findings 7 through 12: clearer
 - Work in a dedicated worktree from current origin/main; preserve unrelated work and historical verification/review outcomes.
 - Existing pane-wide Space-key behavior and unrelated baseline lint cleanup (finding 6) are outside this follow-up.
 - Do not deploy or restart production.
+- The user approved extending only the browser test's retained-screenshot allowlist for the existing 200px and 120px nested-pane PNGs; no product UI or runtime behavior changes are in scope for this evidence follow-up.
 
 ### Accepted tradeoffs and residuals
-- The previous compact-panel implementation and thinking-effort labels are already merged; this task adds the approved optional refinements.
+- The previous compact-panel implementation and thinking-effort labels are already merged; this task adds the approved optional refinements and the explicitly approved tiny-pane evidence follow-up.
 - Assess the review suggestions against current source and runtime evidence; avoid speculative caching or unrelated restructuring.
 - The user waived the recorded clean-main baseline failures and approved proceeding with the UI fixes while tracking those failures in Kata. Preserve the failed baseline result, the two Codex failures and blocked provider-parity cases, and all unreached coverage; do not silently call the full suite green.
 
@@ -617,12 +618,15 @@ git commit -m "fix: preserve changes drawer focus during fresh agent updates"
 **Files:**
 - Modify: `scripts/e2e-cloud.sh:1019`
 - Modify: `scripts/test/cloud-e2e-logging-receipt.test.sh:31`
+- Modify: `test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts` (approved review follow-up below)
 - Modify: `docs/plans/2026-11-01-fresh-agent-compact-panels.md:1`
 - Existing producer: `test/e2e-browser/specs/fresh-agent-compact-panels.spec.ts:231` (retain PNG/chunk emission).
 
 **Interfaces:**
 - Consumes unchanged `compact_panel_screenshot` JSONL `{event,severity,path,offset,data}` and retry-trace chunks. Produces human display with the same event/path/offset metadata and `data:"<retained-in-cloud-logging>"`; raw Cloud Logging data remains byte-for-byte reconstructable. No environment propagation, storage service or deployment.
 - Historical document links distinguish a published PR from retained ignored local evidence. Prior review/test verdicts stay historical facts.
+
+**Approved review follow-up (2026-11-02):** The independent review found that the passing run did not retain the existing 200px and 120px nested-pane PNGs for inspection. The user approved extending the producer's bounded screenshot allowlist to retain those two images. This changes only browser-test evidence; it does not change Freshell's UI or runtime behavior. Verify the exact two paths and inspect both images from the exact Cloud execution.
 
 - [ ] **Step 1: Write failing behavioral runner test**
 
@@ -709,7 +713,7 @@ display_log_output=$(printf '%s\n' "$log_output" | sed -E \
   '/"event"[[:space:]]*:[[:space:]]*"(e2e_playwright_retry_trace_chunk|compact_panel_screenshot)"/ s/("data"[[:space:]]*:[[:space:]]*")[^"]*/\1<retained-in-cloud-logging>/' )
 ```
 
-Update the adjacent comment to say both retry traces and review screenshots retain raw bytes in Cloud Logging and only their displayed data is redacted. Preserve runner summary/retry reconciliation, raw `log_output`, screenshot production, and raw remote records. Do not make the image emitter opt-in; that would silently discard the normal cloud artifact path.
+Update the adjacent comment to say both retry traces and review screenshots retain raw bytes in Cloud Logging and only their displayed data is redacted. Preserve runner summary/retry reconciliation, raw `log_output`, and raw remote records. For the approved review follow-up, extend only the producer's existing allowlist to include the exact `compact-tiny-200px.png` and `compact-tiny-120px.png` paths; keep the current bounded emission policy for all other screenshots. Do not make the image emitter opt-in; that would silently discard the normal cloud artifact path.
 
 Add a short dated archival note immediately below the historical plan title, separate from its immutable User Request:
 
@@ -815,7 +819,7 @@ print(json.dumps(receipts, indent=2))
 PY
 ```
 
-The existing environment used Pillow for the previous retained extractor; if missing, prepare it in the task's `.test-tmp/` Python virtual environment and record/clean that owned directory rather than changing global Python. Raw records may arrive after the runner footer; if missing, retry the exact execution query through the already documented bounded ingestion window and retain failed retrieval attempts. Inspect selected desktop, phone, serif/mono and tiny PNGs. Record execution/image/SHA and the generated receipt paths. Do not claim raw storage is smaller; only terminal display is quieter.
+The existing environment used Pillow for the previous retained extractor; if missing, prepare it in the task's `.test-tmp/` Python virtual environment and record/clean that owned directory rather than changing global Python. Raw records may arrive after the runner footer; if missing, retry the exact execution query through the already documented bounded ingestion window and retain failed retrieval attempts. Inspect selected desktop, phone, serif/mono and both approved tiny PNGs (`compact-tiny-200px.png` and `compact-tiny-120px.png`). Record execution/image/SHA and the generated receipt paths. Do not claim raw storage is smaller; only terminal display is quieter.
 
 - [ ] **Step 7: Commit task**
 
