@@ -1394,10 +1394,15 @@ tool_timeout_sec = 120
           && typeof nativeTurnId === 'string' && nativeTurnId.length > 0
           && !value.pendingApprovals.some((pending: any) => pending.requestId === control?.requestId)
           && wire.frames.slice(frameCursor).some(frame => {
-            return frame.type === 'freshAgent.event' && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
-              && frame.sessionId === adoptedStreamSessionId && frame.event?.type === 'freshAgent.transcript.patch'
-              && frame.event.sessionId === adoptedStreamSessionId
-              && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurnId && ['completed', 'interrupted', 'failed'].includes(op.status))
+              const event = frame.type === 'freshAgent.event' ? frame.event : frame
+              const routeMatches = frame.type !== 'freshAgent.event'
+                || (frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+                  && frame.sessionId === adoptedStreamSessionId)
+              return routeMatches && event?.type === 'freshAgent.transcript.patch'
+                && event.sessionId === adoptedStreamSessionId
+                && event.ops?.some((op: any) => op.op === 'settleTurn'
+                  && op.nativeTurnId === nativeTurnId
+                  && ['completed', 'interrupted', 'failed'].includes(op.status))
           })
           && (choice === 'DECLINE' || JSON.stringify(value.turns).includes('Managed '+file+' result:')) ? value : undefined
       })
