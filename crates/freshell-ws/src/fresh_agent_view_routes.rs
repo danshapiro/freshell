@@ -225,6 +225,8 @@ mod tests {
             "type":"freshAgent.detach", "provider":"codex", "sessionType":"freshcodex",
             "sessionId":"shared", "viewId":"view-a", "requestId":"detach-a"
         }));
+        assert!(!routes.views.values().any(|views| views.contains("view-a")));
+        assert!(routes.views.values().any(|views| views.contains("view-b")));
         let event = frame(json!({
             "type":"freshAgent.killed", "provider":"codex", "sessionType":"freshcodex",
             "sessionId":"shared", "success":true

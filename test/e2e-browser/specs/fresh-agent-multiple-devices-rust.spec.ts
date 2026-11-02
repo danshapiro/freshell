@@ -149,6 +149,15 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         countTranscriptRowsWithSummary(afterSnapshot.turns, 'assistant', response)
           - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'assistant', response),
       ).toBe(1)
+      if (mode === 'freshopencode') {
+        await expect.poll(async () => {
+          const layout = await desktop.harness.getPaneLayout(desktop.tabId)
+          return findFreshAgentLeaf(layout)?.content?.status ?? null
+        }, {
+          timeout: 30_000,
+          message: 'desktop converges to idle after the OpenCode prompt gate releases and rows persist',
+        }).toBe('idle')
+      }
       await expect.poll(() => native.bootCount()).toBe(1)
       await expect.poll(() => native.stopCount()).toBe(0)
 
