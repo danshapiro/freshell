@@ -627,6 +627,7 @@ describe('FreshAgentView hidden-pane create rebind (F8)', () => {
         call[0]({
           type: 'freshAgent.create.failed',
           requestId: 'req-fail-0',
+          viewId: 'req-fail-0',
           code: 'SPAWN_FAILED',
           message: 'boom',
           retryable: false,
@@ -658,7 +659,7 @@ describe('FreshAgentView hidden-pane create rebind (F8)', () => {
     // the donor FreshAgentView.test.tsx created-frame fixture).
     act(() => {
       for (const call of wsMock.onMessage.mock.calls) {
-        call[0]({ type: 'freshAgent.created', requestId: 'req-ack-0', sessionId: 'sess-ack-0' })
+        call[0]({ type: 'freshAgent.created', requestId: 'req-ack-0', viewId: 'req-ack-0', sessionId: 'sess-ack-0' })
       }
     })
     act(() => { vi.advanceTimersByTime(1_000) })

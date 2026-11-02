@@ -200,6 +200,11 @@ function leafContent(state: ReturnType<typeof store.getState>): FreshAgentPaneCo
   return layout.content
 }
 
+function activeViewId(): string {
+  const content = leafContent(store.getState())
+  return content.viewId ?? content.createRequestId
+}
+
 // markSessionLost no-ops when the session record does not exist, so seed
 // it first (setSessionStatus routes through resolveOrEnsureSession) -- the
 // exact shape fresh-agent-ws produces before dispatching markSessionLost.
@@ -274,7 +279,10 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
     renderFreshAgentPane({ sessionId: undefined, status: 'creating', createRequestId: 'req-1' })
     await flush() // initial mount consumed createSentRef
     expect(sentOfType('freshAgent.create')).toHaveLength(1)
-    receiveWs({ type: 'freshAgent.created', requestId: 'req-1', sessionId: 'live-1', sessionType: 'freshclaude', provider: 'claude', runtimeProvider: 'claude' })
+    receiveWs({
+      type: 'freshAgent.created', requestId: 'req-1', viewId: activeViewId(),
+      sessionId: 'live-1', sessionType: 'freshclaude', provider: 'claude', runtimeProvider: 'claude',
+    })
     await flush()
     act(() => {
       store.dispatch(resetFreshAgentPaneForReconcileCreate({
@@ -324,7 +332,10 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
   it('freshAgent.created clears pendingReconcile', async () => {
     renderFreshAgentPane({ status: 'creating', pendingReconcile: 'respawn', createRequestId: 'req-1' })
     await flush()
-    receiveWs({ type: 'freshAgent.created', requestId: 'req-1', sessionId: 's-1', sessionType: 'freshclaude', provider: 'claude', runtimeProvider: 'claude' })
+    receiveWs({
+      type: 'freshAgent.created', requestId: 'req-1', viewId: activeViewId(),
+      sessionId: 's-1', sessionType: 'freshclaude', provider: 'claude', runtimeProvider: 'claude',
+    })
     await flush()
     expect(leafContent(store.getState()).pendingReconcile).toBeUndefined()
   })
@@ -478,7 +489,10 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
     await flush()
     expect(sentOfType('freshAgent.create')).toHaveLength(1)
 
-    receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SESSION_RESERVED', message: 'reserved', retryable: true })
+    receiveWsBoth({
+      type: 'freshAgent.create.failed', requestId: 'req-1', viewId: activeViewId(),
+      code: 'SESSION_RESERVED', message: 'reserved', retryable: true,
+    })
     await flush()
     // Never create-failed for a transient reservation. (The snapshot-hydration
     // effect may legitimately land 'idle' for a durable ref -- the contract is
@@ -504,7 +518,10 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
 
     // hammer SESSION_RESERVED past the window
     for (let t = 0; t <= FRESH_AGENT_RESERVE_RETRY_WINDOW_MS + 2_000; t += FRESH_AGENT_RESERVE_RETRY_FLOOR_MS) {
-      receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SESSION_RESERVED', message: 'reserved', retryable: true })
+      receiveWsBoth({
+        type: 'freshAgent.create.failed', requestId: 'req-1', viewId: activeViewId(),
+        code: 'SESSION_RESERVED', message: 'reserved', retryable: true,
+      })
       await act(async () => {
         await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS)
       })
@@ -541,6 +558,7 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
       const creates = sentOfType('freshAgent.create').length
       const message = 'Codex approval_policy in /owned/codex/config.toml cannot preserve the selected source.'
       receiveWsBoth({ type: 'freshAgent.create.failed', requestId: selected.createRequestId,
+        viewId: activeViewId(),
         code: 'INVALID_REQUEST', message, retryable: false })
       await flush()
       const disclosure = document.querySelector('[data-agent-error="create"]') as HTMLElement
@@ -569,7 +587,10 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
   it('non-reserved create.failed still lands create-failed status (regression)', async () => {
     renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1' })
     await flush()
-    receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SPAWN_FAILED', message: 'x', retryable: false })
+    receiveWsBoth({
+      type: 'freshAgent.create.failed', requestId: 'req-1', viewId: activeViewId(),
+      code: 'SPAWN_FAILED', message: 'x', retryable: false,
+    })
     await flush()
     expect(leafContent(store.getState()).status).toBe('create-failed')
     expect(store.getState().freshAgent.pendingCreateFailures['req-1']).toEqual({ code: 'SPAWN_FAILED', message: 'x', retryable: false })
@@ -757,7 +778,10 @@ describe('FreshAgentView error-banner dismissal', () => {
     renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1' })
     await flush()
 
-    receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SPAWN_FAILED', message: 'spawn exploded', retryable: false })
+    receiveWsBoth({
+      type: 'freshAgent.create.failed', requestId: 'req-1', viewId: activeViewId(),
+      code: 'SPAWN_FAILED', message: 'spawn exploded', retryable: false,
+    })
     await flush()
     expect(document.querySelector('[data-agent-error="create"]')).not.toBeNull()
     expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
