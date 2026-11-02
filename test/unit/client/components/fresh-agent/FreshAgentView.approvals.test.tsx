@@ -380,7 +380,7 @@ it('keeps keyboard disclosure activation out of the composer', async () => {
 
  const composer=screen.getByRole('textbox',{name:'Chat message input'})
  fireEvent.change(composer,{target:{value:'Keep this draft'}})
- for(const label of ['Command details','Plan details','Notice details','Close failed']) {
+ for(const label of ['Command details','Plan details','Notice details','A diagnostic with recovery information — Close failed']) {
   const summary=screen.getByText(label,{exact:true}).closest('summary')!
   const details=summary.parentElement!
   summary.focus()
@@ -434,7 +434,7 @@ it('keeps question and elicitation inputs visible outside closed diagnostics', a
  store.dispatch(mergePaneContent({tabId:'tab-1',paneId:'pane-1',updates:{closeError:'Original close failure'}}))
  await mount(store)
  expect(screen.getByText('2 pending requests')).toBeVisible()
- expect(screen.getByText('Close failed',{exact:true})).toBeVisible()
+ expect(screen.getByText('Original close failure — Close failed',{exact:true})).toBeVisible()
  expect(screen.getByText('Close failed: Original close failure')).not.toBeVisible()
  const token=screen.getByLabelText('Token')
  expect(token).toBeVisible()
@@ -445,6 +445,98 @@ it('keeps question and elicitation inputs visible outside closed diagnostics', a
  fireEvent.change(token,{target:{value:'exact secret'}})
  fireEvent.click(screen.getByRole('button',{name:'Continue',exact:true}))
  expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({type:'freshAgent.elicitation.respond',requestId:'form',action:'accept',content:{token:'exact secret'}}))
+})
+
+describe('collapsed error diagnostics', () => {
+  const paneUpdate = (store: Store, updates: Record<string, unknown>) => {
+    store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates }))
+  }
+  const providerError = (store: Store, code: string, message: string) => {
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', ...CLAUDE,
+      event: { type: 'freshAgent.error', code, message },
+    })
+  }
+
+  it.each([
+    {
+      id: 'create', message: 'The provider refused to start', dismissable: true,
+      publish: (store: Store, message: string) => paneUpdate(store, { createError: { code: 'START_FAILED', message, retryable: true } }),
+    },
+    {
+      id: 'restore', message: 'The provider refused to restore this session', dismissable: true,
+      publish: (store: Store, message: string) => providerError(store, 'RESTORE_FAILED', message),
+    },
+    {
+      id: 'pane-restore', message: 'the saved session artifact is no longer available', dismissable: true,
+      publish: (store: Store) => paneUpdate(store, { restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' } }),
+    },
+    {
+      id: 'session', message: 'Selected model is at capacity. Please try a different model.', dismissable: true,
+      publish: (store: Store, message: string) => providerError(store, 'CODEX_PROVIDER_ERROR', message),
+    },
+    {
+      id: 'close', message: 'The provider could not close the session', dismissable: true,
+      publish: (store: Store, message: string) => paneUpdate(store, { closeError: message }),
+    },
+    {
+      id: 'handoff', message: 'The target provider failed to reopen', dismissable: false,
+      publish: (store: Store, message: string) => paneUpdate(store, { handoffError: { code: 'TARGET_SPAWN_FAILED', message, retryable: true, generation: 1 } }),
+    },
+  ])('shows the diagnostic for $id before expansion and retains its controls', async ({ id, message, dismissable, publish }) => {
+    serve(CLAUDE, [])
+    const store = createStore(CLAUDE)
+    await mount(store)
+    act(() => publish(store, message))
+
+    const disclosure = document.querySelector(`[data-agent-error="${id}"]`) as HTMLElement
+    expect(disclosure).toBeInTheDocument()
+    expect(disclosure).not.toHaveAttribute('open')
+    const summary = disclosure.querySelector('summary')!
+    expect(summary).toBeVisible()
+    expect(summary).toHaveTextContent(message)
+    fireEvent.click(summary)
+    const body = disclosure.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
+    expect(body).toBeVisible()
+    expect(body).toHaveTextContent(message)
+    if (id === 'create') expect(within(body).getByRole('button', { name: 'Retry' })).toBeVisible()
+    if (dismissable) {
+      fireEvent.click(within(body).getByRole('button', { name: 'Dismiss' }))
+      expect(document.querySelector(`[data-agent-error="${id}"]`)).toBeNull()
+    } else {
+      expect(within(body).getByRole('button', { name: /retry reopening/i })).toBeVisible()
+    }
+  })
+
+  it('shows a snapshot load failure before expansion', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new Error('The provider history request timed out'))
+    const store = createStore(CLAUDE)
+    await mount(store)
+    const disclosure = document.querySelector('[data-agent-error="load"]') as HTMLElement
+    expect(disclosure).toBeInTheDocument()
+    expect(disclosure).not.toHaveAttribute('open')
+    expect(disclosure.querySelector('summary')).toHaveTextContent('The provider history request timed out')
+    fireEvent.click(disclosure.querySelector('summary')!)
+    fireEvent.click(within(disclosure).getByRole('button', { name: 'Dismiss' }))
+    expect(document.querySelector('[data-agent-error="load"]')).toBeNull()
+  })
+
+  it('keeps a long session diagnostic bounded while exposing its full text on expansion', async () => {
+    serve(CLAUDE, [])
+    const store = createStore(CLAUDE)
+    await mount(store)
+    const message = 'Native provider diagnostic '.repeat(100).trim()
+    act(() => providerError(store, 'PROVIDER_FAILED', message))
+    const disclosure = document.querySelector('[data-agent-error="session"]') as HTMLElement
+    const summary = disclosure.querySelector('summary')!
+    expect(summary).toBeVisible()
+    expect(summary).toHaveTextContent('Native provider diagnostic')
+    expect(summary.textContent!.length).toBeLessThan(240)
+    fireEvent.click(summary)
+    expect(disclosure.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent(message)
+    fireEvent.click(within(disclosure.querySelector('.fresh-agent-diagnostic-body') as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+    expect(document.querySelector('[data-agent-error="session"]')).toBeNull()
+  })
 })
 
 it.each([['stuck','Agent appears stuck'],['exited','Session ended']] as const)('keeps the %s summary outside overflowing pending requests', async (status,summary) => {

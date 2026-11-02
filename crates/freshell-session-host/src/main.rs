@@ -9,6 +9,8 @@ mod provider_input_preparation;
 mod provider_secret_resolution;
 mod providers;
 mod pty;
+#[cfg(test)]
+mod retained_read_cancellation_tests;
 mod retained_store;
 #[cfg(all(test, feature = "managed-stop-contract-tests"))]
 mod stop_contract_tests;
@@ -716,7 +718,22 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
     let envelope: Envelope<HostCommand> =
         read_frame(&mut stream).await.map_err(|e| e.to_string())?;
     let request_id = envelope.request_id.clone();
-    let result = dispatch(envelope, &state).await;
+    let result = if matches!(&envelope.body, HostCommand::FreshAgentReadEvents { .. }) {
+        // A retained read is read-only and can wait on provider state after
+        // its supervisor deadline. Do not leave that work running after the
+        // supervisor drops the connection. Mutating commands must still run
+        // to their normal conclusion when their caller disconnects.
+        tokio::select! {
+            result = dispatch(envelope, &state) => result,
+            closed = wait_for_peer_disconnect(&stream) => {
+                closed.map_err(|error| format!("observe peer disconnect: {error}"))?;
+                tracing::debug!(%request_id, "freshagent.host.event_read_cancelled");
+                return Ok(());
+            }
+        }
+    } else {
+        dispatch(envelope, &state).await
+    };
     if let Err(error) = &result {
         let _ = append_event_with_secret(
             &state.state_dir,
@@ -742,6 +759,43 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+// EOF alone is insufficient: a client may shut down its write half while it
+// remains connected to read the reply. POLLHUP signals a fully closed peer.
+async fn wait_for_peer_disconnect(stream: &UnixStream) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    stream.readable().await?;
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: the borrowed stream keeps its descriptor valid; poll reads
+        // one initialized descriptor and a zero timeout cannot block.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid peer socket",
+            ));
+        }
+        if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(());
+        }
+        // Readability remains set after a write-half-close, so avoid spinning
+        // while that still-connected caller waits for its reply.
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn dispatch(

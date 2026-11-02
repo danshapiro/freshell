@@ -196,6 +196,35 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 )
             }
         };
+        // Native history cannot carry an unassigned live provider diagnostic.
+        // This is an optional enrichment: a missing or stalled retained read
+        // must not prevent the owned saved history from being displayed.
+        let retained_codex = if history_only
+            && runtime_provider == FreshProvider::Codex
+            && view.host_boot_id.is_some()
+        {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.client
+                    .fresh_agent_retained_state(view.soul_id.clone(), 1_500),
+            )
+            .await
+            {
+                Ok(Ok(retained)) => retained,
+                Ok(Err(error)) => {
+                    tracing::warn!(provider = "codex", soul_id = %view.soul_id,
+                        code = ?error.runtime_code(), "fresh_agent.hosted_retained_diagnostic_unavailable");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(provider = "codex", soul_id = %view.soul_id,
+                        "fresh_agent.hosted_retained_diagnostic_timeout");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // A reply cannot cross a native identity, owner incarnation or source change.
         let current = self
             .client
@@ -252,6 +281,19 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 serde_json::json!(true);
             snapshot["extensions"][&request.provider]["statusFromLiveState"] =
                 serde_json::json!(false);
+            if runtime_provider == FreshProvider::Codex {
+                if let Some(codex) = snapshot["extensions"]["codex"].as_object_mut() {
+                    // Saved native history has no authority over a retained
+                    // session diagnostic, including its absence.
+                    codex.remove("unattributedProviderError");
+                    codex.remove("unattributedProviderErrorAuthoritative");
+                    codex.remove("pendingProviderError");
+                    codex.remove("pendingProviderErrorAuthoritative");
+                }
+            }
+            if let Some(retained) = retained_codex.as_ref() {
+                overlay_retained_codex_diagnostic(&mut snapshot, retained, view, latest);
+            }
         }
         freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
             &mut snapshot,
@@ -491,6 +533,239 @@ impl freshell_freshagent::model_capabilities::ModelCatalogProbe for HostedCodexC
             Ok(codex_capabilities(rows))
         })
     }
+}
+
+fn overlay_retained_codex_diagnostic(
+    snapshot: &mut serde_json::Value,
+    retained: &serde_json::Value,
+    before: &freshell_runtime_protocol::RuntimeView,
+    after: &freshell_runtime_protocol::RuntimeView,
+) {
+    if !retained_batch_matches_source(Some(before), Some(after), Some(retained)) {
+        return;
+    }
+    let projection_id = retained["source"]["projectionId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty());
+    if projection_id.is_none()
+        || retained["snapshot"]["extensions"]["codex"]["projection"]["id"].as_str() != projection_id
+    {
+        return;
+    }
+    merge_retained_codex_failures(snapshot, &retained["snapshot"]);
+    let source = &retained["snapshot"]["extensions"]["codex"];
+    let message = match source.get("unattributedProviderError") {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(message)) if !message.trim().is_empty() => {
+            Some(Some(serde_json::json!(message)))
+        }
+        _ => None,
+    };
+    let pending = match source.get("pendingProviderError") {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(value) => match (value["turnId"].as_str(), value["message"].as_str()) {
+            (Some(turn_id), Some(message))
+                if !turn_id.trim().is_empty() && !message.trim().is_empty() =>
+            {
+                Some(Some(
+                    serde_json::json!({"turnId":turn_id,"message":message}),
+                ))
+            }
+            _ => None,
+        },
+    };
+    let Some(codex) = snapshot["extensions"]["codex"].as_object_mut() else {
+        return;
+    };
+    if let Some(message) = message {
+        codex.remove("unattributedProviderError");
+        if let Some(message) = message {
+            codex.insert("unattributedProviderError".into(), message);
+        }
+        codex.insert("unattributedProviderErrorAuthoritative".into(), true.into());
+    }
+    if let Some(pending) = pending {
+        codex.remove("pendingProviderError");
+        if let Some(pending) = pending {
+            codex.insert("pendingProviderError".into(), pending);
+        }
+        codex.insert("pendingProviderErrorAuthoritative".into(), true.into());
+    }
+}
+
+// A provider can exit before native history records a failed turn. Preserve
+// the saved history and add only settled, event-owned error rows from the
+// validated retained projection; retained prompts and partial output are not
+// authoritative saved history.
+fn merge_retained_codex_failures(snapshot: &mut serde_json::Value, retained: &serde_json::Value) {
+    use serde_json::Value;
+
+    let projection = &retained["extensions"]["codex"]["projection"];
+    let (Some(event_owned), Some(settled), Some(turn_rows), Some(retained_turns), Some(saved)) = (
+        projection["eventOwnedTurnIds"].as_array(),
+        projection["settledTurnIds"].as_array(),
+        projection["turnRows"].as_object(),
+        retained["turns"].as_array(),
+        snapshot["turns"].as_array_mut(),
+    ) else {
+        return;
+    };
+    let row_owners: HashMap<&str, &str> = turn_rows
+        .iter()
+        .flat_map(|(native_id, rows)| {
+            rows.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(move |row| row.as_str().map(|row_id| (row_id, native_id.as_str())))
+        })
+        .collect();
+
+    for native_id in event_owned.iter().filter_map(Value::as_str) {
+        if native_id.trim().is_empty() || !settled.iter().any(|id| id.as_str() == Some(native_id)) {
+            continue;
+        }
+        let Some(row_ids) = turn_rows.get(native_id).and_then(Value::as_array) else {
+            continue;
+        };
+        for row in retained_turns {
+            let Some(row_id) = row["turnId"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let Some(message) = row["error"]["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+            else {
+                continue;
+            };
+            if row["id"].as_str() != Some(row_id)
+                || row["role"] != "assistant"
+                || row["error"]["name"] != "CodexError"
+                || row["items"]
+                    .as_array()
+                    .is_none_or(|items| !items.is_empty())
+                || row["nativeTurnId"]
+                    .as_str()
+                    .is_some_and(|id| id != native_id)
+                || !codex_row_belongs_to_turn(row, native_id)
+                || !row_ids.iter().any(|id| id.as_str() == Some(row_id))
+            {
+                continue;
+            }
+
+            // A completed native snapshot may have synthesized an empty
+            // response before the retained failure was received. It is not
+            // provider output and would otherwise contradict the failure.
+            saved.retain(|saved_row| !is_codex_empty_response(saved_row, native_id));
+            if saved.iter().any(|saved_row| {
+                codex_row_belongs_to_turn(saved_row, native_id)
+                    && saved_row["role"] == "assistant"
+                    && saved_row["error"]["name"] == "CodexError"
+                    && saved_row["error"]["message"].as_str() == Some(message)
+            }) {
+                continue;
+            }
+
+            let occupied = |id: &str| {
+                saved.iter().any(|turn| {
+                    turn["id"].as_str() == Some(id) || turn["turnId"].as_str() == Some(id)
+                })
+            };
+            let display_id = if !occupied(row_id) {
+                row_id.to_owned()
+            } else {
+                (0usize..)
+                    .map(|index| format!("{native_id}:row-{index}"))
+                    .find(|candidate| !occupied(candidate))
+                    .expect("a free display ID exists")
+            };
+            let last_matching = saved
+                .iter()
+                .rposition(|turn| codex_row_belongs_to_turn(turn, native_id));
+            // When none of this turn was saved, its next retained native
+            // turn can still anchor it ahead of later saved history. Match by
+            // native turn rather than display-row ID: the saved and retained
+            // representations can have different numbers of rows.
+            let insert_at = last_matching.map(|index| index + 1).or_else(|| {
+                let last_retained = retained_turns.iter().rposition(|turn| {
+                    turn["turnId"]
+                        .as_str()
+                        .and_then(|id| row_owners.get(id))
+                        .copied()
+                        == Some(native_id)
+                })?;
+                retained_turns
+                    .iter()
+                    .skip(last_retained + 1)
+                    .find_map(|turn| {
+                        let next_native = turn["turnId"]
+                            .as_str()
+                            .and_then(|id| row_owners.get(id))
+                            .copied()?;
+                        if next_native == native_id {
+                            return None;
+                        }
+                        saved
+                            .iter()
+                            .position(|row| codex_row_belongs_to_turn(row, next_native))
+                    })
+            });
+            let ordinal = last_matching
+                .and_then(|index| saved[index]["ordinal"].as_u64())
+                .or_else(|| row["ordinal"].as_u64())
+                .or_else(|| {
+                    saved
+                        .iter()
+                        .filter_map(|turn| turn["ordinal"].as_u64())
+                        .max()
+                        .map(|ordinal| ordinal.saturating_add(1))
+                })
+                .unwrap_or(0);
+            let failure = serde_json::json!({
+                "id": display_id,
+                "turnId": display_id,
+                "ordinal": ordinal,
+                "source": "live",
+                "role": "assistant",
+                "summary": "",
+                "items": [],
+                "error": {"name":"CodexError", "message":message},
+                "outputState": {"provenance":"retained", "diagnostic":"unsaved", "refreshPending":false},
+            });
+            saved.insert(insert_at.unwrap_or(saved.len()), failure);
+        }
+    }
+}
+
+fn codex_row_belongs_to_turn(row: &serde_json::Value, native_id: &str) -> bool {
+    if row["nativeTurnId"].as_str() == Some(native_id) {
+        return true;
+    }
+    let Some(id) = row["turnId"].as_str() else {
+        return false;
+    };
+    id == native_id
+        || id
+            .strip_prefix(native_id)
+            .and_then(|suffix| suffix.strip_prefix(":row-"))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|digit| digit.is_ascii_digit())
+            })
+}
+
+fn is_codex_empty_response(row: &serde_json::Value, native_id: &str) -> bool {
+    if !codex_row_belongs_to_turn(row, native_id)
+        || row["role"] != "assistant"
+        || !row["error"].is_null()
+    {
+        return false;
+    }
+    let Some([item]) = row["items"].as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    let item_id = format!("{native_id}:empty-response");
+    item["id"].as_str() == Some(item_id.as_str())
+        && item["kind"] == "text"
+        && item["text"].as_str() == Some(freshell_freshagent::codex::CODEX_EMPTY_RESPONSE_TEXT)
 }
 
 pub(super) fn same_snapshot_source(

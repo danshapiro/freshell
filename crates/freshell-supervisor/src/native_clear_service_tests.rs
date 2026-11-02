@@ -22,6 +22,10 @@ struct CurrentHost {
     wrong_root_on_prepare: bool,
     stop_on_prepare: bool,
     inputs: Vec<String>,
+    events_read_count: usize,
+    events_gate: Option<Arc<tokio::sync::Notify>>,
+    events_started: Arc<tokio::sync::Notify>,
+    retained_state: Option<serde_json::Value>,
 }
 
 struct Fixture {
@@ -95,6 +99,10 @@ impl Fixture {
             wrong_root_on_prepare: false,
             stop_on_prepare: false,
             inputs: Vec::new(),
+            events_read_count: 0,
+            events_gate: None,
+            events_started: Arc::new(tokio::sync::Notify::new()),
+            retained_state: None,
         }));
         let current = host.clone();
         let database = registry.database_path().to_owned();
@@ -104,6 +112,7 @@ impl Fixture {
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let mut allow_disconnected_reply = false;
                 let result = match envelope.body {
                     HostCommand::Hello {
                         incarnation_id,
@@ -118,9 +127,19 @@ impl Fixture {
                         effective_limits: crate::checkpoints::tests::limits(),
                     }),
                     HostCommand::FreshAgentReadEvents { .. } => {
+                        let (gate, started) = {
+                            let mut state = current.lock().unwrap();
+                            state.events_read_count += 1;
+                            (state.events_gate.clone(), state.events_started.clone())
+                        };
+                        if let Some(gate) = gate {
+                            allow_disconnected_reply = true;
+                            started.notify_one();
+                            gate.notified().await;
+                        }
                         let state = current.lock().unwrap();
                         Ok(HostResult::FreshAgentEvents(AgentEventBatch {
-                            retained_state: None,
+                            retained_state: state.retained_state.clone(),
                             retained_from: 1,
                             head: 1,
                             reset_required: false,
@@ -220,15 +239,17 @@ impl Fixture {
                         "owned native-store probe is unavailable",
                     )),
                 };
-                write_frame(
+                let write_result = write_frame(
                     &mut socket,
                     &HostReply {
                         request_id: envelope.request_id,
                         result,
                     },
                 )
-                .await
-                .unwrap();
+                .await;
+                if !allow_disconnected_reply {
+                    write_result.unwrap();
+                }
             }
         });
         std::fs::write(root.path().join("host"), b"owned host fixture").unwrap();
@@ -280,6 +301,194 @@ impl Fixture {
             reply.result
         );
     }
+}
+
+// Use the real control connection so the deadline must still release owned
+// work after a web client drops its side of the request.
+async fn start_retained_snapshot_request(
+    fixture: &Fixture,
+    max_duration_ms: u64,
+) -> (tokio::task::JoinHandle<()>, tokio::io::DuplexStream) {
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let connection = tokio::spawn(super::serve_control_connection(
+        fixture.supervisor.clone(),
+        server,
+    ));
+    let request = serde_json::json!({
+        "protocolVersion":CONTROL_PROTOCOL_VERSION,
+        "requestId":RequestId::new(),
+        "role":"web",
+        "auth":CONTROL_SECRET,
+        "body":{
+            "method":"fresh_agent_read_retained_state",
+            "params":{
+                "soulId":fixture.soul.as_str(),
+                "expectedControlEpoch":fixture.supervisor.registry.control_epoch(),
+                "maxDurationMs":max_duration_ms
+            }
+        }
+    });
+    write_frame(&mut client, &request).await.unwrap();
+    (connection, client)
+}
+
+#[tokio::test]
+async fn retained_snapshot_request_deadline_cancels_waiting_lifecycle_lock_work() {
+    use std::time::Duration;
+
+    let fixture = Fixture::new().await;
+    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let held = lifecycle.lock().await;
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        let (connection, client) = start_retained_snapshot_request(&fixture, 150).await;
+        drop(client);
+        requests.push(connection);
+    }
+    let expired_while_locked = tokio::time::timeout(Duration::from_secs(2), async {
+        while requests.iter().any(|request| !request.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    drop(held);
+    for request in requests {
+        tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("released request must finish")
+            .expect("control connection must not panic");
+    }
+    let old_reads = fixture.host.lock().unwrap().events_read_count;
+    fixture.read_events().await;
+    let all_reads = fixture.host.lock().unwrap().events_read_count;
+
+    assert!(
+        expired_while_locked,
+        "the deadline must cover waiting for the lifecycle lock"
+    );
+    assert_eq!(
+        old_reads, 0,
+        "expired requests must not run after the lock is released"
+    );
+    assert_eq!(all_reads, 1, "an ordinary events read must still run");
+}
+
+#[tokio::test]
+async fn retained_snapshot_request_deadline_cancels_a_stalled_host_read() {
+    use std::time::Duration;
+
+    let fixture = Fixture::new().await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let started = {
+        let mut host = fixture.host.lock().unwrap();
+        host.events_gate = Some(gate.clone());
+        host.events_started.clone()
+    };
+    let (connection, client) = start_retained_snapshot_request(&fixture, 150).await;
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .expect("the authenticated host must receive the retained read");
+    let expired_while_stalled = tokio::time::timeout(Duration::from_secs(2), async {
+        while !connection.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let lock_released = tokio::time::timeout(Duration::from_millis(300), async {
+        let _guard = lifecycle.lock().await;
+    })
+    .await
+    .is_ok();
+    fixture.host.lock().unwrap().events_gate = None;
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), connection)
+        .await
+        .expect("released host request must finish")
+        .expect("control connection must not panic");
+    fixture.read_events().await;
+    let reads = fixture.host.lock().unwrap().events_read_count;
+
+    assert!(
+        expired_while_stalled,
+        "the deadline must cover the authenticated host read"
+    );
+    assert!(
+        lock_released,
+        "the cancelled read must release the lifecycle lock"
+    );
+    assert_eq!(
+        reads, 2,
+        "one retained and one ordinary read must reach the host"
+    );
+}
+
+#[tokio::test]
+async fn retained_snapshot_request_does_not_apply_started_journal_rows() {
+    use std::time::Duration;
+
+    let fixture = Fixture::new().await;
+    let retained = serde_json::json!({"snapshot":{"threadId":PARENT,"turns":[]}});
+    {
+        let mut host = fixture.host.lock().unwrap();
+        host.retained_state = Some(retained.clone());
+        host.observation = Some(NativeIdentityObservation {
+            native_session_id: CHILD.into(),
+            incarnation_id: fixture.handle.incarnation_id().clone(),
+            launch_nonce: fixture.launch.launch_nonce.clone(),
+            evidence_revision: fixture.launch.evidence_revision,
+            source: NativeIdentitySource::ClaudeNativeClear,
+            evidence_digest: "a".repeat(64),
+        });
+    }
+    let (connection, mut client) = start_retained_snapshot_request(&fixture, 1_500).await;
+    let reply: AdminReply = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client))
+        .await
+        .expect("retained read must finish")
+        .unwrap();
+    connection.await.unwrap();
+    let after_retained = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture.read_events().await;
+    let after_ordinary = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        after_retained.native_session_id.as_deref(),
+        Some(PARENT),
+        "a retained read must not apply journal identity changes"
+    );
+    assert!(
+        after_retained.resume_spec.is_some(),
+        "a retained read must not retire the saved recovery checkpoint"
+    );
+    assert_eq!(
+        after_ordinary.native_session_id.as_deref(),
+        Some(CHILD),
+        "ordinary journal reads must still adopt verified native clears"
+    );
+    let AdminResult::FreshAgentEvents(batch) = reply.result.unwrap() else {
+        panic!("expected retained event batch")
+    };
+    assert_eq!(
+        batch.retained_state.unwrap()["snapshot"],
+        retained["snapshot"]
+    );
+    assert!(
+        batch.events.is_empty(),
+        "retained-only reads must not expose journal rows"
+    );
 }
 
 #[tokio::test]

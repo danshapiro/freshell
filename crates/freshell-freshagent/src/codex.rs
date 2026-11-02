@@ -522,6 +522,78 @@ const DEFAULT_CODEX_QUIET_WINDOW_MS: u64 = 600_000;
 /// notification stream), and evicting the OLDEST entry can only reopen a
 /// gate for a turn so old its duplicate is long gone.
 const STATUS_RANG_TURN_IDS_CAP: usize = 8;
+const CODEX_DRAIN_RESERVATION_MESSAGE: &str =
+    "The previous session is finishing its remaining messages. Please try again.";
+
+/// Coordinates an unexpected child exit with the consumer of that exact
+/// incarnation's notification stream. The completion sender belongs only to
+/// the consumer, so its disappearance without `true` also reports a panic or
+/// cancellation rather than mistaking an incomplete stream for a drained one.
+struct CodexNotificationDrain {
+    pending: AtomicBool,
+    completed: tokio::sync::watch::Receiver<bool>,
+    finalized: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    exit_registration_gate: TokioMutex<()>,
+}
+
+struct CodexAdmissionGuard(Arc<StdMutex<projection::CodexProjection>>);
+
+impl Drop for CodexAdmissionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut projection) = self.0.lock() {
+            projection.cancel_accepted_send();
+        }
+    }
+}
+
+impl CodexNotificationDrain {
+    fn new() -> (Arc<Self>, tokio::sync::watch::Sender<bool>) {
+        let (completed_tx, completed) = tokio::sync::watch::channel(false);
+        let (finalized, _) = tokio::sync::watch::channel(false);
+        (
+            Arc::new(Self {
+                pending: AtomicBool::new(false),
+                completed,
+                finalized,
+                #[cfg(test)]
+                exit_registration_gate: TokioMutex::new(()),
+            }),
+            completed_tx,
+        )
+    }
+
+    async fn wait(&self) -> bool {
+        let mut completed = self.completed.clone();
+        loop {
+            if *completed.borrow_and_update() {
+                return true;
+            }
+            if completed.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    fn finish(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+        self.finalized.send_replace(true);
+    }
+
+    async fn wait_finalized(&self) {
+        let mut finalized = self.finalized.subscribe();
+        while !*finalized.borrow_and_update() {
+            if finalized.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+const CODEX_NOTIFICATION_DRAIN_GRACE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CODEX_NOTIFICATION_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 /// Shared ownership-bearing state for one Codex notification consumer.
 ///
@@ -532,6 +604,7 @@ struct CodexConsumerRuntime {
     turn_state: SharedCodexTurnState,
     thread_id: String,
     projection: Arc<StdMutex<projection::CodexProjection>>,
+    drain_completed: tokio::sync::watch::Sender<bool>,
     active_turn: Arc<StdMutex<Option<String>>>,
     /// The session's USER-interrupt marker: the interrupt control lane arms it,
     /// the consumer's subscription consumes it at the `interrupted` completion,
@@ -634,6 +707,11 @@ fn codex_quiet_window_ms_from_env() -> u64 {
 
 type ChildReadAttempts = HashMap<(String, String, String), u8>;
 
+struct HandoffDiagnostic {
+    message: String,
+    projection_id: Option<String>,
+}
+
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshCodexState {
@@ -645,6 +723,9 @@ pub struct FreshCodexState {
     turn_events: tokio::sync::broadcast::Sender<CodexTurnEvent>,
     /// threadId → live codex session (client + settings + owned sidecar).
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
+    /// Session-scoped unassigned diagnostics survive a handoff while the
+    /// terminal owns the runtime and until a resumed source accepts new input.
+    handoff_diagnostics: Arc<StdMutex<HashMap<String, HandoffDiagnostic>>>,
     child_reads: Arc<TokioMutex<ChildReadAttempts>>,
     retained_changed: Arc<tokio::sync::watch::Sender<u64>>,
     attention: Arc<crate::attention_ledger::AttentionLedger>,
@@ -842,6 +923,7 @@ struct CodexSession {
     native_thread_settings: Option<Value>,
     turn_state: SharedCodexTurnState,
     projection: Arc<StdMutex<projection::CodexProjection>>,
+    notification_drain: Option<Arc<CodexNotificationDrain>>,
     client: Arc<CodexAppServerClient>,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
     model: String,
@@ -911,6 +993,8 @@ struct CodexSession {
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
     /// `freshAgent.kill`); single-shot, so `None` once sent.
     kill_tx: Option<oneshot::Sender<()>>,
+    /// Requests a handoff while preserving the notification stream until EOF.
+    handoff_tx: Option<oneshot::Sender<()>>,
     /// Owns the sidecar child. An UNREQUESTED exit self-heals (adapter.ts:935-946): the
     /// watcher broadcasts the terminal `exited` status with NO chime, flips [`Self::exited`],
     /// and does NOT remove the session (stays mapped, matching the reference's "lazy restart
@@ -933,6 +1017,8 @@ struct CodexSession {
     /// teardown (the sessions-map entry is already gone by then).
     /// `None` for test fixtures without a real child.
     sidecar_pid: Option<u32>,
+    /// Exact incarnation captured by the watcher before the child can exit.
+    sidecar_identity: Option<crate::session_lease::CondemnedRuntimeIdentity>,
     /// The `/proc` ownership tag of the sidecar tree (the watcher's kill
     /// sweep tag) — see [`Self::sidecar_pid`].
     sidecar_ownership_id: String,
@@ -1000,6 +1086,12 @@ struct CodexSession {
 }
 
 impl CodexSession {
+    fn notification_drain_pending(&self) -> bool {
+        self.notification_drain
+            .as_ref()
+            .is_some_and(|drain| drain.pending.load(Ordering::SeqCst))
+    }
+
     fn effective_settings(&self) -> CodexEffectiveSettings {
         let mut settings = CodexEffectiveSettings {
             model: self.model.clone(),
@@ -1100,6 +1192,18 @@ enum EnsureAliveError {
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
     Reserved,
+    /// The previous incarnation is still delivering its remaining events.
+    Draining,
+}
+
+impl EnsureAliveError {
+    fn reservation_message(&self) -> &'static str {
+        match self {
+            Self::Draining => CODEX_DRAIN_RESERVATION_MESSAGE,
+            Self::Reserved => "Another resume for this session is in flight",
+            _ => unreachable!("only reservation errors have a reservation message"),
+        }
+    }
 }
 
 /// A codex thread this process now has a live, registered runtime for -- either it was
@@ -1132,6 +1236,18 @@ enum ResumeSessionError {
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
     Reserved,
+    /// The previous incarnation is still delivering its remaining events.
+    Draining,
+}
+
+impl ResumeSessionError {
+    fn reservation_message(&self) -> &'static str {
+        match self {
+            Self::Draining => CODEX_DRAIN_RESERVATION_MESSAGE,
+            Self::Reserved => "Another resume for this session is in flight",
+            _ => unreachable!("only reservation errors have a reservation message"),
+        }
+    }
 }
 
 impl FreshCodexState {
@@ -1151,6 +1267,7 @@ impl FreshCodexState {
             broadcast_tx,
             turn_events: tokio::sync::broadcast::channel(256).0,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            handoff_diagnostics: Arc::new(StdMutex::new(HashMap::new())),
             child_reads: Arc::new(TokioMutex::new(HashMap::new())),
             retained_changed: Arc::new(tokio::sync::watch::channel(0).0),
             attention: Arc::new(crate::attention_ledger::AttentionLedger::default()),
@@ -1381,45 +1498,134 @@ impl FreshCodexState {
         session_id: &str,
         initiator: &str,
     ) -> crate::session_handoff::StopResult {
+        let (original_owner, recorded) = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(session_id) {
+                Some(session) => (
+                    Some(session.sidecar_ownership_id.clone()),
+                    (!session.exited.load(Ordering::SeqCst))
+                        .then(|| session.sidecar_identity.clone())
+                        .flatten(),
+                ),
+                None => (None, None),
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let recorded = recorded.map(|identity| {
+            crate::session_lease::refresh_condemned_runtime_identity(
+                &identity,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+            )
+        });
+        let handoff = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(session_id) {
+                Some(session) => {
+                    if Some(&session.sidecar_ownership_id) != original_owner.as_ref() {
+                        return watcher_stop_not_confirmed();
+                    }
+                    // Register the pre-exit identity before the watcher can
+                    // publish and clean up this incarnation. A completed
+                    // watcher has already cleared its own evidence.
+                    if !session.exited.load(Ordering::SeqCst) {
+                        if let Some(recorded) = recorded {
+                            retain_codex_condemned_prior_if_current(
+                                &self.condemned_priors,
+                                session_id,
+                                recorded,
+                            );
+                        }
+                    }
+                    let handoff = if !session.exited.load(Ordering::SeqCst)
+                        && !session.notification_drain_pending()
+                    {
+                        session.handoff_tx.take().and_then(|signal| {
+                            session.notification_drain.as_ref().map(|drain| {
+                                drain.pending.store(true, Ordering::SeqCst);
+                                (signal, drain.clone())
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    handoff
+                }
+                None => None,
+            }
+        };
+        if let Some((signal, _drain)) = handoff {
+            if signal.send(()).is_err() {
+                tracing::debug!(provider = PROVIDER, session_id = %session_id,
+                    "freshagent.codex.handoff_watcher_already_exiting");
+            }
+        }
+        // A handoff continues the conversation: unlike an explicit user stop,
+        // it must let already-decoded output reach the old source first.
+        loop {
+            let drain = {
+                let sessions = self.sessions.lock().await;
+                match sessions.get(session_id) {
+                    Some(session)
+                        if Some(&session.sidecar_ownership_id) != original_owner.as_ref() =>
+                    {
+                        return watcher_stop_not_confirmed();
+                    }
+                    Some(session) if session.notification_drain_pending() => {
+                        session.notification_drain.clone()
+                    }
+                    _ => None,
+                }
+            };
+            let Some(drain) = drain else {
+                break;
+            };
+            drain.wait_finalized().await;
+        }
         tracing::info!(target: "freshell_freshagent::codex",
             session_id = %session_id, initiator,
             "freshagent.codex.handoff_stop: stopping the prior freshcodex runtime for handoff"
         );
         crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
-        // b8ke focused round-2 review R2-1 (widened round-3 R3-7): record
-        // the condemned identity — the child's pid + start time AND the
-        // already-discovered tagged tree, captured NOW (while readable) —
-        // BEFORE the first await a cancellation can land in. A cancelled
-        // or panicked teardown leaves this record as the replacement
-        // watcher's bounded kill-and-confirm probe target; the recorded
-        // tree still sweeps descendants whose tags became unreadable after
-        // the child died, and the start-time check never signals a reused
-        // pid.
-        {
-            let identity = self
-                .sessions
-                .lock()
-                .await
-                .get(session_id)
-                .and_then(|session| {
-                    session
-                        .sidecar_pid
-                        .map(|pid| (pid, session.sidecar_ownership_id.clone()))
-                });
-            if let Some((pid, tag)) = identity {
-                let recorded = crate::session_lease::record_condemned_runtime_identity(
-                    pid,
-                    CODEX_SIDECAR_OWNERSHIP_ENV,
-                    &tag,
-                );
-                self.condemned_priors
-                    .lock()
-                    .expect("condemned priors lock")
-                    .insert(session_id.to_string(), recorded);
-            }
-        }
         self.clear_controls(session_id).await;
-        let removed = self.sessions.lock().await.remove(session_id);
+        let removed = loop {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(session_id) {
+                Some(session) if Some(&session.sidecar_ownership_id) != original_owner.as_ref() => {
+                    return watcher_stop_not_confirmed();
+                }
+                Some(session) if session.notification_drain_pending() => {
+                    let drain = session.notification_drain.clone().expect("pending drain");
+                    drop(sessions);
+                    drain.wait_finalized().await;
+                }
+                _ => {
+                    let session = sessions.remove(session_id);
+                    if let Some(session) = &session {
+                        let message = session
+                            .projection
+                            .lock()
+                            .expect("codex projection lock")
+                            .unattributed_provider_error();
+                        let mut retained = self
+                            .handoff_diagnostics
+                            .lock()
+                            .expect("handoff diagnostics lock");
+                        if let Some(message) = message {
+                            retained.insert(
+                                session_id.to_owned(),
+                                HandoffDiagnostic {
+                                    message,
+                                    projection_id: None,
+                                },
+                            );
+                        } else {
+                            retained.remove(session_id);
+                        }
+                    }
+                    break session;
+                }
+            }
+        };
         let Some(session) = removed else {
             let prior_recorded = self
                 .condemned_priors
@@ -1544,6 +1750,10 @@ impl FreshCodexState {
             )),
             Err(ResumeSessionError::Reserved) => Err((
                 "codex thread reserved by another lifecycle operation".to_string(),
+                session_id.to_string(),
+            )),
+            Err(ResumeSessionError::Draining) => Err((
+                CODEX_DRAIN_RESERVATION_MESSAGE.to_string(),
                 session_id.to_string(),
             )),
             Err(ResumeSessionError::Transient(detail)) => {
@@ -2340,20 +2550,61 @@ impl FreshCodexState {
     }
 
     async fn retain_native_exit(&self, session_id: &str, ownership_id: &str) {
-        let projection = self
-            .sessions
+        let projection = {
+            // Keep identity validation and the synchronous broadcast in the
+            // same session-lock window: a replacement must not publish its
+            // own source before this source's final patch.
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions
+                .get(session_id)
+                .filter(|session| session.sidecar_ownership_id == ownership_id)
+            else {
+                return;
+            };
+            let projection = session.projection.clone();
+            let (patch, pending_before, pending_after, pending_failed) = {
+                let mut p = projection.lock().expect("codex projection lock");
+                let pending_before = p.pending_provider_error();
+                p.retire_source();
+                let pending_failed = pending_before
+                    .as_ref()
+                    .is_some_and(|(id, _)| p.turn_failed(id));
+                let pending_after = p.pending_provider_error();
+                let patch = p
+                    .take_patch()
+                    .map(|patch| (p.id.clone(), p.history_generation, patch));
+                (patch, pending_before, pending_after, pending_failed)
+            };
+            if let Some((projection_id, history_generation, patch)) = patch {
+                broadcast_codex_event(
+                    session_id,
+                    json!({"type":"freshAgent.session.init",
+                    "sessionId":session_id,"projectionId":projection_id,"historyGeneration":history_generation}),
+                    &self.broadcast_tx,
+                );
+                broadcast_codex_event(session_id, patch, &self.broadcast_tx);
+            }
+            if pending_before != pending_after {
+                broadcast_codex_pending_error_change(
+                    session_id,
+                    pending_before.as_ref(),
+                    pending_after.as_ref(),
+                    pending_failed,
+                    &self.broadcast_tx,
+                );
+                self.notify_retained();
+            }
+            projection
+        };
+        self.clear_source_controls(session_id, &projection).await;
+    }
+
+    async fn notification_drain_pending(&self, session_id: &str) -> bool {
+        self.sessions
             .lock()
             .await
             .get(session_id)
-            .filter(|session| session.sidecar_ownership_id == ownership_id)
-            .map(|session| session.projection.clone());
-        if let Some(projection) = projection {
-            projection
-                .lock()
-                .expect("codex projection lock")
-                .retire_source();
-            self.clear_source_controls(session_id, &projection).await;
-        }
+            .is_some_and(CodexSession::notification_drain_pending)
     }
 
     fn notify_retained(&self) {
@@ -3649,6 +3900,8 @@ impl FreshCodexState {
             thread_id.to_string(),
         )));
         let (created_tx, created_rx) = oneshot::channel();
+        let (notification_drain, drain_completed) = CodexNotificationDrain::new();
+        let (registered_tx, registered_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
             CodexConsumerRuntime {
@@ -3665,6 +3918,7 @@ impl FreshCodexState {
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
                 projection: projection.clone(),
+                drain_completed,
             },
             Some(created_rx),
         );
@@ -3673,11 +3927,12 @@ impl FreshCodexState {
         // down with no self-heal event; an UNREQUESTED exit self-heals (adapter.ts:935-946)
         // and flips `exited` so the next send/attach lazily respawns (PR-4).
         let (kill_tx, kill_rx) = oneshot::channel();
+        let (handoff_tx, handoff_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         // b8ke focused round-2 R2-1: the condemned-prior tag (the pid was
         // captured above for the coordinator commit).
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             thread_id.clone(),
@@ -3693,6 +3948,9 @@ impl FreshCodexState {
             self.ownership_watch(),
             Some(turn_state.clone()),
             Some(self.clone()),
+            Some(notification_drain.clone()),
+            Some(registered_rx),
+            Some(handoff_rx),
         );
 
         self.sessions.lock().await.insert(
@@ -3716,12 +3974,15 @@ impl FreshCodexState {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
                 projection,
+                notification_drain: Some(notification_drain),
                 consumer,
                 kill_tx: Some(kill_tx),
+                handoff_tx: Some(handoff_tx),
                 watcher,
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
+                sidecar_identity,
                 sidecar_ownership_id,
                 quiet_deadman,
                 turn_in_flight,
@@ -3734,6 +3995,7 @@ impl FreshCodexState {
                 provenance: provenance.clone(),
             },
         );
+        let _ = registered_tx.send(());
 
         // Round 5 (focused-ep5-r4 Finding 1), the create-resume lane's
         // post-registration dead-state re-check (the attach lane's twin is in
@@ -4101,6 +4363,13 @@ impl FreshCodexState {
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
     ) -> CodexCreateOutcome {
+        if self.notification_drain_pending(thread_id).await {
+            return self.fail_create(
+                request_id,
+                "SESSION_RESERVED",
+                CODEX_DRAIN_RESERVATION_MESSAGE,
+            );
+        }
         if let Some(p) = provenance.filter(|p| p.is_meaningful()) {
             // Re-park + snapshot the incumbent's settings in one lock scope
             // (the refresh write below asserts the parked identity together
@@ -4251,19 +4520,12 @@ impl FreshCodexState {
             Err(EnsureAliveError::RespawnFailed(err)) => {
                 return self.refuse_send(&request_id, "CODEX_RESPAWN_FAILED", &err);
             }
-            Err(EnsureAliveError::Reserved) => {
+            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
                 // Task 13 (D8): another create/attach holds this sessionRef -- the
                 // retryable non-lost error channel; the client re-drive converges.
-                let outcome = self.refuse_send(
-                    &request_id,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                );
-                self.emit_fresh_agent_error(
-                    &session_id,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                );
+                let message = error.reservation_message();
+                let outcome = self.refuse_send(&request_id, "SESSION_RESERVED", message);
+                self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
                 return outcome;
             }
         }
@@ -4303,6 +4565,7 @@ impl FreshCodexState {
                 (
                     s.client.clone(),
                     s.turn_state.clone(),
+                    s.projection.clone(),
                     s.active_turn.clone(),
                     s.turn_in_flight.clone(),
                     // FR1-1: the install-site void of the retired-turn slot.
@@ -4322,6 +4585,7 @@ impl FreshCodexState {
         let Some((
             client,
             turn_state,
+            projection,
             active_turn,
             turn_in_flight,
             retired_turn_id,
@@ -4494,6 +4758,11 @@ impl FreshCodexState {
         let contextual_answers = self.contextual_answer_targets(&session_id, &msg.text).await;
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
+        projection
+            .lock()
+            .expect("codex projection lock")
+            .begin_accepted_send();
+        let _admission = CodexAdmissionGuard(projection.clone());
         let result = if let Some(expected) = expected_turn_id.as_deref() {
             client.steer_turn(&session_id, expected, params.input).await
         } else {
@@ -4542,12 +4811,20 @@ impl FreshCodexState {
                     // Observed native admission outweighs a contradictory RPC reply.
                     (turn_id, StopDisposition::None)
                 } else if refused {
+                    projection
+                        .lock()
+                        .expect("codex projection lock")
+                        .cancel_accepted_send();
                     return self.refuse_send(
                         &request_id,
                         "CODEX_TURN_START_FAILED",
                         &err.to_string(),
                     );
                 } else {
+                    projection
+                        .lock()
+                        .expect("codex projection lock")
+                        .retain_ambiguous_send();
                     self.send_error(&request_id, "CODEX_DELIVERY_AMBIGUOUS", &err.to_string());
                     return CodexSendOutcome::Ambiguous {
                         session_id,
@@ -4559,6 +4836,67 @@ impl FreshCodexState {
                 }
             }
         };
+        // Completions and provider errors wait on the emission gate held by
+        // this send, even when they arrive before the RPC response. Associate
+        // the exact accepted turn before those notifications can be folded.
+        // The turn tracker and projection both fence stale/removed sources.
+        let (cleared_unattributed_error, pending_before, pending_after, pending_failed) = {
+            let turns = turn_state.lock().expect("codex turn state");
+            if turns.active_turn_id() == Some(submitted_turn_id.as_str())
+                && expected_turn_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == submitted_turn_id)
+            {
+                let mut p = projection.lock().expect("codex projection lock");
+                let had_error = p.unattributed_provider_error().is_some();
+                let pending_before = p.pending_provider_error();
+                if p.observe_accepted_turn(&submitted_turn_id) {
+                    let mut retained = self
+                        .handoff_diagnostics
+                        .lock()
+                        .expect("handoff diagnostics lock");
+                    if retained
+                        .get(&session_id)
+                        .and_then(|diagnostic| diagnostic.projection_id.as_deref())
+                        == Some(p.id.as_str())
+                    {
+                        retained.remove(&session_id);
+                    }
+                    let pending_after = p.pending_provider_error();
+                    let pending_failed = pending_before
+                        .as_ref()
+                        .is_some_and(|(id, _)| p.turn_failed(id));
+                    (had_error, pending_before, pending_after, pending_failed)
+                } else {
+                    (false, None, None, false)
+                }
+            } else {
+                projection
+                    .lock()
+                    .expect("codex projection lock")
+                    .cancel_accepted_send();
+                (false, None, None, false)
+            }
+        };
+        if cleared_unattributed_error || pending_before != pending_after {
+            let sessions = self.sessions.lock().await;
+            if sessions
+                .get(&session_id)
+                .is_some_and(|session| Arc::ptr_eq(&session.projection, &projection))
+            {
+                self.notify_retained();
+                if cleared_unattributed_error {
+                    broadcast_codex_provider_error_cleared(&session_id, &self.broadcast_tx);
+                }
+                broadcast_codex_pending_error_change(
+                    &session_id,
+                    pending_before.as_ref(),
+                    pending_after.as_ref(),
+                    pending_failed,
+                    &self.broadcast_tx,
+                );
+            }
+        }
         self.acknowledge_contextual_answers(&session_id, contextual_answers)
             .await;
         drop(ownership_guard);
@@ -5268,13 +5606,13 @@ impl FreshCodexState {
                 self.emit_fresh_agent_error(&session_id, "CODEX_RESPAWN_FAILED", &err);
                 return;
             }
-            Err(EnsureAliveError::Reserved) => {
+            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
                 // Task 13 (D8) discipline, mirrored from handle_send: another
                 // create/attach holds this sessionRef — retryable, never lost.
                 self.emit_fresh_agent_error(
                     &session_id,
                     "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
+                    error.reservation_message(),
                 );
                 return;
             }
@@ -5492,11 +5830,11 @@ impl FreshCodexState {
                 reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
                 return;
             }
-            Err(EnsureAliveError::Reserved) => {
+            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
                 reply_sink(rollback_error_frame(
                     &op,
                     "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
+                    error.reservation_message(),
                 ));
                 return;
             }
@@ -5881,13 +6219,13 @@ impl FreshCodexState {
                 reply_sink(fork_error_frame(&msg.session_id, &err));
                 return;
             }
-            Err(EnsureAliveError::Reserved) => {
+            Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
                 // Task 13 (D8) discipline: retryable, never lost — answered on the
                 // requesting sink like every other fork failure.
                 reply_sink(fork_error_frame_with_code(
                     &msg.session_id,
                     "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
+                    error.reservation_message(),
                 ));
                 return;
             }
@@ -7549,12 +7887,12 @@ impl FreshCodexState {
                     self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
                     return;
                 }
-                Err(EnsureAliveError::Reserved) => {
+                Err(error @ (EnsureAliveError::Reserved | EnsureAliveError::Draining)) => {
                     // Task 13 (D8): loser answer -- retryable, never lost.
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
+                        error.reservation_message(),
                     );
                     return;
                 }
@@ -7596,12 +7934,12 @@ impl FreshCodexState {
                     self.send_error(&None, "CODEX_ATTACH_RESUME_FAILED", &err);
                     return;
                 }
-                Err(ResumeSessionError::Reserved) => {
+                Err(error @ (ResumeSessionError::Reserved | ResumeSessionError::Draining)) => {
                     // Task 13 (D8): loser answer -- retryable, never lost.
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
+                        error.reservation_message(),
                     );
                     return;
                 }
@@ -7684,6 +8022,9 @@ impl FreshCodexState {
         // recreation.
         observed: Option<freshell_ownership::ObservedFence>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+        if self.notification_drain_pending(session_id).await {
+            return Err(EnsureAliveError::Draining);
+        }
         // A natural exit whose writer tree was not yet confirmed leaves a
         // condemned identity and a typed coordinator fence. Finish that
         // exact recovery before attempting any respawn; otherwise a stale
@@ -7710,6 +8051,9 @@ impl FreshCodexState {
         ) = {
             let guard = self.sessions.lock().await;
             let session = guard.get(session_id).ok_or(EnsureAliveError::NotFound)?;
+            if session.notification_drain_pending() {
+                return Err(EnsureAliveError::Draining);
+            }
             if !session.exited.load(Ordering::SeqCst) {
                 return Ok(EnsureAliveOutcome::AlreadyRunning);
             }
@@ -7775,6 +8119,9 @@ impl FreshCodexState {
         {
             let guard = self.sessions.lock().await;
             match guard.get(session_id) {
+                Some(session) if session.notification_drain_pending() => {
+                    return Err(EnsureAliveError::Draining);
+                }
                 Some(session) if !session.exited.load(Ordering::SeqCst) => {
                     return Ok(EnsureAliveOutcome::AlreadyRunning);
                 }
@@ -8190,6 +8537,8 @@ impl FreshCodexState {
         }
 
         let exited = Arc::new(AtomicBool::new(false));
+        let (notification_drain, drain_completed) = CodexNotificationDrain::new();
+        let (registered_tx, registered_rx) = oneshot::channel();
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -8206,13 +8555,15 @@ impl FreshCodexState {
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
                 projection: projection.clone(),
+                drain_completed,
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let (handoff_tx, handoff_rx) = oneshot::channel();
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             session_id.to_string(),
@@ -8228,6 +8579,9 @@ impl FreshCodexState {
             self.ownership_watch(),
             Some(turn_state.clone()),
             Some(self.clone()),
+            Some(notification_drain.clone()),
+            Some(registered_rx),
+            Some(handoff_rx),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -8263,12 +8617,15 @@ impl FreshCodexState {
                     turn_lock: Arc::new(TokioMutex::new(())),
                     event_emission_gate,
                     projection,
+                    notification_drain: Some(notification_drain),
                     consumer,
                     kill_tx: Some(kill_tx),
+                    handoff_tx: Some(handoff_tx),
                     watcher,
                     exited,
                     checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
+                    sidecar_identity,
                     sidecar_ownership_id,
                     quiet_deadman,
                     turn_in_flight,
@@ -8282,6 +8639,7 @@ impl FreshCodexState {
                 },
             );
         }
+        let _ = registered_tx.send(());
 
         // P1.13 identity event (Task 4, R2): refresh write under the SAME id --
         // snapshots the LIVE in-session values (which originate from a real
@@ -8535,6 +8893,8 @@ impl FreshCodexState {
             mint_ownership_id(),
             new_thread_id.to_string(),
         )));
+        let (notification_drain, drain_completed) = CodexNotificationDrain::new();
+        let (registered_tx, registered_rx) = oneshot::channel();
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -8551,13 +8911,15 @@ impl FreshCodexState {
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
                 projection: projection.clone(),
+                drain_completed,
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let (handoff_tx, handoff_rx) = oneshot::channel();
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             new_thread_id.clone(),
@@ -8573,6 +8935,9 @@ impl FreshCodexState {
             self.ownership_watch(),
             Some(turn_state.clone()),
             Some(self.clone()),
+            Some(notification_drain.clone()),
+            Some(registered_rx),
+            Some(handoff_rx),
         );
 
         {
@@ -8599,12 +8964,15 @@ impl FreshCodexState {
                     turn_lock: Arc::new(TokioMutex::new(())),
                     event_emission_gate,
                     projection,
+                    notification_drain: Some(notification_drain),
                     consumer,
                     kill_tx: Some(kill_tx),
+                    handoff_tx: Some(handoff_tx),
                     watcher,
                     exited,
                     checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
+                    sidecar_identity,
                     sidecar_ownership_id,
                     quiet_deadman,
                     turn_in_flight,
@@ -8616,6 +8984,7 @@ impl FreshCodexState {
                 },
             );
         }
+        let _ = registered_tx.send(());
 
         // Task 13: bind the OLD durable id to the NEW live key (the identity moved) --
         // contenders holding the old id adopt the new session via BoundLive.
@@ -8999,6 +9368,7 @@ impl FreshCodexState {
             compact_turn_id,
             event_emission_gate,
             projection,
+            drain_completed,
         } = runtime;
         let seeded = active_turn.lock().expect("active_turn mutex").clone();
         if let Some(id) = seeded.as_deref() {
@@ -9114,7 +9484,15 @@ impl FreshCodexState {
                 // turn. Every notification capable of emitting a wire frame stays
                 // behind the barrier below.
                 if matches!(&notification, CodexNotification::TurnStarted(_)) {
+                    let pending_before = projection
+                        .lock()
+                        .expect("codex projection lock")
+                        .pending_provider_error();
                     project_codex_notification(&projection, &notification);
+                    let pending_after = projection
+                        .lock()
+                        .expect("codex projection lock")
+                        .pending_provider_error();
                     let events = reduce_notification(
                         &mut subscription,
                         notification,
@@ -9131,6 +9509,31 @@ impl FreshCodexState {
                         &broadcast_tx,
                     );
                     debug_assert!(events.is_empty(), "turn/started must not emit wire frames");
+                    if pending_before != pending_after {
+                        // The lifecycle observation must fold before a send
+                        // response, but any warning change waits behind the
+                        // same publication barrier as other wire events.
+                        let _emission = event_emission_gate.lock().await;
+                        let sessions = state.sessions.lock().await;
+                        if sessions
+                            .get(&thread_id)
+                            .is_some_and(|session| Arc::ptr_eq(&session.projection, &projection))
+                        {
+                            let p = projection.lock().expect("codex projection lock");
+                            let current = p.pending_provider_error();
+                            let failed = pending_before
+                                .as_ref()
+                                .is_some_and(|(id, _)| p.turn_failed(id));
+                            broadcast_codex_pending_error_change(
+                                &thread_id,
+                                pending_before.as_ref(),
+                                current.as_ref(),
+                                failed,
+                                &broadcast_tx,
+                            );
+                            state.notify_retained();
+                        }
+                    }
                     continue;
                 }
 
@@ -9145,8 +9548,56 @@ impl FreshCodexState {
                 if !append {
                     flush_codex_projection(&projection, &thread_id, &broadcast_tx);
                 }
+                let pending_before = projection
+                    .lock()
+                    .expect("codex projection lock")
+                    .pending_provider_error();
                 let has_patch = project_codex_notification(&projection, &notification);
+                let (pending_after, pending_failed) = {
+                    let p = projection.lock().expect("codex projection lock");
+                    let failed = pending_before
+                        .as_ref()
+                        .is_some_and(|(id, _)| p.turn_failed(id));
+                    (p.pending_provider_error(), failed)
+                };
                 state.notify_retained();
+                if !has_patch {
+                    let classification = match &notification {
+                        CodexNotification::TurnCompleted(event) => projection
+                            .lock()
+                            .expect("codex projection lock")
+                            .ambiguous_completion(&Value::Object(event.params.clone())),
+                        CodexNotification::Other {
+                            method,
+                            params: Some(params),
+                        } if method == "error" => projection
+                            .lock()
+                            .expect("codex projection lock")
+                            .ambiguous_error(params),
+                        _ => None,
+                    };
+                    match classification {
+                        Some(projection::AmbiguousEventResult::Warn(message)) => {
+                            state.notify_retained();
+                            broadcast_codex_event(
+                                &thread_id,
+                                json!({"type":"freshAgent.notice",
+                                "level":"warning", "code":"CODEX_UNATTRIBUTED_PROVIDER_ERROR",
+                                "message":message}),
+                                &broadcast_tx,
+                            );
+                            // This event cannot settle or identify the send.
+                            continue;
+                        }
+                        Some(projection::AmbiguousEventResult::Refresh) => {
+                            state.notify_retained();
+                            broadcast_codex_provider_error_cleared(&thread_id, &broadcast_tx);
+                            continue;
+                        }
+                        Some(projection::AmbiguousEventResult::Ignore) => continue,
+                        None => {}
+                    }
+                }
                 if has_patch {
                     if !projection_announced {
                         let p = projection.lock().expect("codex projection lock");
@@ -9160,6 +9611,15 @@ impl FreshCodexState {
                     if !append {
                         flush_codex_projection(&projection, &thread_id, &broadcast_tx);
                     }
+                }
+                if pending_before != pending_after {
+                    broadcast_codex_pending_error_change(
+                        &thread_id,
+                        pending_before.as_ref(),
+                        pending_after.as_ref(),
+                        pending_failed,
+                        &broadcast_tx,
+                    );
                 }
                 if let CodexNotification::Other {
                     method,
@@ -9181,12 +9641,31 @@ impl FreshCodexState {
                         let message = params["error"]["message"]
                             .as_str()
                             .unwrap_or("Codex reported a provider error");
-                        let event = if params["willRetry"] == true {
-                            json!({"type":"freshAgent.retry","attempt":params["retryAttempt"].as_u64().unwrap_or(1),"error":message})
+                        let will_retry = params["willRetry"] == true;
+                        if will_retry {
+                            tracing::debug!(provider = PROVIDER, session_id = %thread_id,
+                                turn_id = params["turnId"].as_str().unwrap_or(""), %message,
+                                "freshagent.codex.provider_retry");
                         } else {
-                            json!({"type":"freshAgent.notice","level":"error","code":"CODEX_PROVIDER_ERROR","message":message})
-                        };
-                        broadcast_codex_event(&thread_id, event, &broadcast_tx);
+                            tracing::warn!(provider = PROVIDER, session_id = %thread_id,
+                                turn_id = params["turnId"].as_str().unwrap_or(""), %message,
+                                "freshagent.codex.provider_error");
+                        }
+                        let pending_matches = !will_retry
+                            && pending_after.as_ref().is_some_and(|(turn_id, pending)| {
+                                params["turnId"].as_str() == Some(turn_id.as_str())
+                                    && read_codex_turn_error(&json!({"error":params["error"]}))
+                                        .as_deref()
+                                        == Some(pending.as_str())
+                            });
+                        if !pending_matches {
+                            let event = if will_retry {
+                                json!({"type":"freshAgent.retry","attempt":params["retryAttempt"].as_u64().unwrap_or(1),"error":message})
+                            } else {
+                                json!({"type":"freshAgent.notice","level":"error","code":"CODEX_PROVIDER_ERROR","message":message})
+                            };
+                            broadcast_codex_event(&thread_id, event, &broadcast_tx);
+                        }
                     }
                 }
                 if state
@@ -9282,8 +9761,12 @@ impl FreshCodexState {
                     }
                 }
             }
-            flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+            {
+                let _emission = event_emission_gate.lock().await;
+                flush_codex_projection(&projection, &thread_id, &broadcast_tx);
+            }
             state.clear_source_controls(&thread_id, &projection).await;
+            drain_completed.send_replace(true);
         })
     }
 
@@ -9482,29 +9965,41 @@ impl FreshCodexState {
                 p.begin_history_read()
             };
             let read = if retained.is_some() || older_history_unavailable {
-                let mut metadata = client
-                    .read_thread(thread_id, false)
-                    .await
-                    .map_err(CodexSnapshotError::AppServer)?;
-                if metadata["thread"]["id"] != thread_id {
-                    return Err(CodexSnapshotError::Protocol(
-                        "live native metadata names another Codex root".into(),
-                    ));
+                // Keep transport failures on the same fenced retained-state
+                // fallback as the ordinary thread/read path below.
+                match client.read_thread(thread_id, false).await {
+                    Err(error) => Err(error),
+                    Ok(mut metadata) => {
+                        if metadata["thread"]["id"] != thread_id {
+                            return Err(CodexSnapshotError::Protocol(
+                                "live native metadata names another Codex root".into(),
+                            ));
+                        }
+                        let page = match client.read_recent_turn(thread_id).await {
+                            Ok(page) => Ok(page),
+                            Err(error) if is_codex_include_turns_unavailable(&error) => {
+                                Ok(json!({"data":[]}))
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match page {
+                            Err(error) => Err(error),
+                            Ok(page) => {
+                                let turns = page["data"].as_array().ok_or_else(|| {
+                                    CodexSnapshotError::Protocol(
+                                        "native recent-turn page has no turn array".into(),
+                                    )
+                                })?;
+                                // Native zero-turn state confirms no older conversation was omitted.
+                                if turns.is_empty() {
+                                    older_history_unavailable = false;
+                                }
+                                metadata["thread"]["turns"] = json!(turns);
+                                Ok(metadata)
+                            }
+                        }
+                    }
                 }
-                let page = match client.read_recent_turn(thread_id).await {
-                    Ok(page) => page,
-                    Err(error) if is_codex_include_turns_unavailable(&error) => json!({"data":[]}),
-                    Err(error) => return Err(CodexSnapshotError::AppServer(error)),
-                };
-                let turns = page["data"].as_array().ok_or_else(|| {
-                    CodexSnapshotError::Protocol("native recent-turn page has no turn array".into())
-                })?;
-                // Native zero-turn state confirms no older conversation was omitted.
-                if turns.is_empty() {
-                    older_history_unavailable = false;
-                }
-                metadata["thread"]["turns"] = json!(turns);
-                Ok(metadata)
             } else {
                 match client.read_thread(thread_id, true).await {
                     Ok(raw) => Ok(raw),
@@ -9982,6 +10477,9 @@ impl FreshCodexState {
         // skips both its own claim and its own commit (under-ticket mode).
         handoff: Option<(&str, u64)>,
     ) -> Result<ResumedCodexSession, ResumeSessionError> {
+        if self.notification_drain_pending(thread_id).await {
+            return Err(ResumeSessionError::Draining);
+        }
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
         }
@@ -10000,6 +10498,9 @@ impl FreshCodexState {
 
         // Re-check: a concurrent caller may have finished resuming this exact thread id
         // while we were waiting for the per-thread lock above.
+        if self.notification_drain_pending(thread_id).await {
+            return Err(ResumeSessionError::Draining);
+        }
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
         }
@@ -10616,6 +11117,8 @@ impl FreshCodexState {
             mint_ownership_id(),
             thread_id.to_string(),
         )));
+        let (notification_drain, drain_completed) = CodexNotificationDrain::new();
+        let (registered_tx, registered_rx) = oneshot::channel();
         let consumer = self.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -10632,13 +11135,15 @@ impl FreshCodexState {
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
                 projection: projection.clone(),
+                drain_completed,
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let (handoff_tx, handoff_rx) = oneshot::channel();
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.clone();
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id,
             thread_id.to_string(),
@@ -10654,8 +11159,23 @@ impl FreshCodexState {
             self.ownership_watch(),
             Some(turn_state.clone()),
             Some(self.clone()),
+            Some(notification_drain.clone()),
+            Some(registered_rx),
+            Some(handoff_rx),
         );
-        self.sessions.lock().await.insert(
+        let mut sessions = self.sessions.lock().await;
+        {
+            let mut p = projection.lock().expect("codex projection lock");
+            let mut retained = self
+                .handoff_diagnostics
+                .lock()
+                .expect("handoff diagnostics lock");
+            if let Some(diagnostic) = retained.get_mut(thread_id) {
+                p.restore_unattributed_provider_error(diagnostic.message.clone());
+                diagnostic.projection_id = Some(p.id.clone());
+            }
+        }
+        sessions.insert(
             thread_id.to_string(),
             CodexSession {
                 collaboration_mode,
@@ -10676,12 +11196,15 @@ impl FreshCodexState {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
                 projection,
+                notification_drain: Some(notification_drain),
                 consumer,
                 kill_tx: Some(kill_tx),
+                handoff_tx: Some(handoff_tx),
                 watcher,
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
+                sidecar_identity,
                 sidecar_ownership_id,
                 quiet_deadman,
                 turn_in_flight,
@@ -10690,6 +11213,8 @@ impl FreshCodexState {
                 provenance,
             },
         );
+        drop(sessions);
+        let _ = registered_tx.send(());
         active_turn
     }
 
@@ -10739,7 +11264,7 @@ impl FreshCodexState {
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             format!("codex-sidecar-test-snapshot-router-{thread_id}"),
             thread_id.to_string(),
@@ -10755,6 +11280,9 @@ impl FreshCodexState {
             self.ownership_watch(),
             Some(turn_state.clone()),
             Some(self.clone()),
+            None,
+            None,
+            None,
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -10781,12 +11309,15 @@ impl FreshCodexState {
                     mint_ownership_id(),
                     thread_id.to_string(),
                 ))),
+                notification_drain: None,
                 consumer,
                 kill_tx: Some(kill_tx),
+                handoff_tx: None,
                 watcher,
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
+                sidecar_identity,
                 sidecar_ownership_id,
                 quiet_deadman,
                 turn_in_flight,
@@ -11196,24 +11727,36 @@ fn classify_codex_item_role(item_type: &str) -> &'static str {
     }
 }
 
-/// `readCodexTurnError(rawTurn)` (`normalize.ts:509-519`).
+/// Preserve the provider's message, while ensuring a failed turn always has a
+/// nonempty explanation accepted by the shared FreshAgent error contract.
 fn read_codex_turn_error(raw_turn: &Value) -> Option<String> {
-    let error = raw_turn.get("error")?;
-    if error.is_null() {
-        return None;
-    }
-    if let Some(s) = error.as_str() {
-        return Some(s.to_string());
-    }
-    if let Some(obj) = error.as_object() {
-        if let Some(message) = obj.get("message").and_then(Value::as_str) {
-            return Some(message.to_string());
-        }
-        if let Some(message) = obj.get("error").and_then(Value::as_str) {
-            return Some(message.to_string());
-        }
-    }
-    Some(error.to_string())
+    let fallback = || "Codex failed without an error message.".to_owned();
+    let Some(error) = raw_turn.get("error").filter(|error| !error.is_null()) else {
+        return (raw_turn["status"] == "failed").then(fallback);
+    };
+    let message = if let Some(message) = error.as_str() {
+        message.to_owned()
+    } else if let Some(object) = error.as_object() {
+        object
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("error").and_then(Value::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if object.is_empty() {
+                    String::new()
+                } else {
+                    error.to_string()
+                }
+            })
+    } else {
+        error.to_string()
+    };
+    Some(if message.trim().is_empty() {
+        fallback()
+    } else {
+        message
+    })
 }
 
 /// `summarizeFreshAgentItems(items)` (`normalize.ts:168-207`): the turn's `summary` string is
@@ -11502,7 +12045,12 @@ fn build_codex_snapshot_json(
 struct CodexPendingRow {
     role: &'static str,
     items: Vec<Value>,
+    error: Option<String>,
 }
+
+/// Message generated when a completed Codex turn contains only a user prompt.
+pub const CODEX_EMPTY_RESPONSE_TEXT: &str =
+    "Codex completed this turn without recording an assistant response.";
 
 /// Split each raw native turn into maximal runs of contiguous display roles.
 /// Unknown or unsupported items are omitted before role bookkeeping; they
@@ -11574,6 +12122,7 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
             _ => rows.push(CodexPendingRow {
                 role,
                 items: mapped,
+                error: None,
             }),
         }
     }
@@ -11582,11 +12131,8 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
     if let Some(turn_error) = read_codex_turn_error(raw_turn) {
         rows.push(CodexPendingRow {
             role: "assistant",
-            items: vec![json!({
-                "id": format!("{turn_id}:turn-error"),
-                "kind": "text",
-                "text": format!("Codex turn failed: {turn_error}"),
-            })],
+            items: vec![],
+            error: Some(turn_error),
         });
     } else if raw_turn.get("status").and_then(Value::as_str) == Some("completed")
         && has_user_output
@@ -11600,8 +12146,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
             items: vec![json!({
                 "id": format!("{turn_id}:empty-response"),
                 "kind": "text",
-                "text": "Codex completed this turn without recording an assistant response.",
+                "text": CODEX_EMPTY_RESPONSE_TEXT,
             })],
+            error: None,
         });
     }
 
@@ -11631,6 +12178,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
                 "summaryKind": summary_kind,
                 "items": row.items,
             });
+            if let Some(message) = row.error {
+                turn["error"] = json!({"name":"CodexError", "message":message});
+            }
             if unique_user_row == Some(row_index) && !turn_id.is_empty() {
                 turn["nativeTurnId"] = json!(turn_id);
             }
@@ -11933,7 +12483,97 @@ pub(crate) fn spawn_exit_watcher(
         ownership,
         None,
         None,
+        None,
+        None,
+        None,
     )
+    .0
+}
+
+async fn report_codex_drain_problem(
+    state: Option<&FreshCodexState>,
+    thread_id: &str,
+    ownership_id: &str,
+) {
+    tracing::warn!(provider = PROVIDER, session_id = %thread_id, ownership_id = %ownership_id,
+        "freshagent.codex.notification_drain_pending");
+    if let Some(state) = state {
+        let sessions = state.sessions.lock().await;
+        if sessions
+            .get(thread_id)
+            .is_some_and(|session| session.sidecar_ownership_id == ownership_id)
+        {
+            broadcast_codex_event(
+                thread_id,
+                json!({"type":"freshAgent.notice", "level":"warning", "code":"CODEX_NOTIFICATION_DRAIN_PENDING",
+                    "message":"Codex exited while its response is still being processed. Try again shortly."}),
+                &state.broadcast_tx,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexDrainOutcome {
+    Drained,
+    Abandoned,
+    RequestedStop,
+}
+
+/// Wait without holding session or emission locks. A slow drain is surfaced
+/// promptly, but remains reserved and continues in the background so already
+/// queued provider diagnostics are not discarded. An explicitly requested
+/// stop can cancel this wait, including after a consumer has been aborted.
+async fn wait_for_codex_notification_drain(
+    drain: &CodexNotificationDrain,
+    kill_rx: &mut oneshot::Receiver<()>,
+    state: Option<&FreshCodexState>,
+    thread_id: &str,
+    ownership_id: &str,
+) -> CodexDrainOutcome {
+    let result = tokio::select! {
+        biased;
+        _ = &mut *kill_rx => return CodexDrainOutcome::RequestedStop,
+        result = tokio::time::timeout(CODEX_NOTIFICATION_DRAIN_GRACE, drain.wait()) => result,
+    };
+    let drained = match result {
+        Ok(drained) => drained,
+        Err(_) => {
+            report_codex_drain_problem(state, thread_id, ownership_id).await;
+            tokio::select! {
+                biased;
+                _ = &mut *kill_rx => return CodexDrainOutcome::RequestedStop,
+                drained = drain.wait() => drained,
+            }
+        }
+    };
+    if drained {
+        CodexDrainOutcome::Drained
+    } else {
+        CodexDrainOutcome::Abandoned
+    }
+}
+
+fn detach_unexpected_codex_stop(
+    result: crate::session_handoff::StopResult,
+) -> crate::session_handoff::StopResult {
+    match result {
+        crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+            crate::session_handoff::StopResult::NotConfirmed {
+                confirmation: detach_codex_confirmation(confirmation),
+            }
+        }
+        result => result,
+    }
+}
+
+async fn wait_for_codex_handoff(receiver: Option<oneshot::Receiver<()>>) {
+    if let Some(receiver) = receiver {
+        if receiver.await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11942,7 +12582,7 @@ fn spawn_exit_watcher_tracking_turns(
     ownership_id: String,
     thread_id: String,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
-    kill_rx: oneshot::Receiver<()>,
+    mut kill_rx: oneshot::Receiver<()>,
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
@@ -11970,7 +12610,13 @@ fn spawn_exit_watcher_tracking_turns(
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
     turn_state: Option<SharedCodexTurnState>,
     retained_state: Option<FreshCodexState>,
-) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
+    notification_drain: Option<Arc<CodexNotificationDrain>>,
+    registered_rx: Option<oneshot::Receiver<()>>,
+    handoff_rx: Option<oneshot::Receiver<()>>,
+) -> (
+    tokio::task::JoinHandle<crate::session_handoff::StopResult>,
+    Option<crate::session_lease::CondemnedRuntimeIdentity>,
+) {
     if let (Some(turns), Some(state)) = (&turn_state, &retained_state) {
         turns
             .lock()
@@ -12006,7 +12652,8 @@ fn spawn_exit_watcher_tracking_turns(
     let cleanup_probe = retained_state
         .as_ref()
         .and_then(|state| state.sidecar_cleanup_probe.get().cloned());
-    tokio::spawn(async move {
+    let sidecar_identity = recorded.clone();
+    let watcher = tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
         // ready in the SAME poll as `kill_rx` (the SIGTERM lands and the child exits
@@ -12016,7 +12663,7 @@ fn spawn_exit_watcher_tracking_turns(
         // Checking `kill_rx` first every time both are ready eliminates that race.
         tokio::select! {
             biased;
-            _ = kill_rx => {
+            _ = &mut kill_rx => {
                 // Torn down on request -- the quiet deadman must never fire for a
                 // session that is going away (resolves a flagged stuck state).
                 disarm_codex_quiet(&quiet_deadman, &thread_id, "kill");
@@ -12058,7 +12705,7 @@ fn spawn_exit_watcher_tracking_turns(
                     };
                     (waited, confirmed)
                 };
-                if confirmed {
+                let result = if confirmed {
                     if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
                     cleanup_confirmed_codex_teardown(
                         &leases,
@@ -12120,38 +12767,126 @@ fn spawn_exit_watcher_tracking_turns(
                             true,
                         ),
                     }
+                };
+                if let Some(drain) = &notification_drain {
+                    drain.finish();
                 }
+                result
             }
-            wait_result = child.wait() => {
+            (wait_result, handoff_requested) = async {
+                tokio::select! {
+                    biased;
+                    result = child.wait() => (result, false),
+                    _ = wait_for_codex_handoff(handoff_rx) => {
+                        let _ = child.start_kill();
+                        (child.wait().await, true)
+                    }
+                }
+            } => {
+                // The socket reader and this child watcher run independently.
+                // Only the consumer's EOF acknowledgement proves that every
+                // queued notification has been folded and broadcast.
+                if let Some(drain) = &notification_drain {
+                    #[cfg(test)]
+                    {
+                        let _registration = drain.exit_registration_gate.lock().await;
+                    }
+                    if let Some(state) = &retained_state {
+                        // Serialize this transition with handoff's final
+                        // remove-or-wait decision for the same incarnation.
+                        let _sessions = state.sessions.lock().await;
+                        drain.pending.store(true, Ordering::SeqCst);
+                    } else {
+                        drain.pending.store(true, Ordering::SeqCst);
+                    }
+                }
                 // A crashed sidecar ends any in-flight turn: disarm the deadman -- a
                 // dead process is surfaced via the `exited` self-heal below, never via
                 // the wedged-ALIVE `stuck` flag.
                 disarm_codex_quiet(&quiet_deadman, &thread_id, "exit");
-                let confirmed = if cfg!(target_os = "linux") {
-                    match recorded.as_ref() {
-                        Some(recorded) => {
-                            confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await
+                // A surviving owned descendant may itself hold the socket
+                // open. Terminate/confirm the tree concurrently with the EOF
+                // drain, while retaining the ownership fence until both end.
+                let (drain_outcome, (confirmed, escalation)) = tokio::join!(
+                    async {
+                        if let Some(drain) = &notification_drain {
+                            wait_for_codex_notification_drain(
+                                drain, &mut kill_rx, retained_state.as_ref(), &thread_id, &ownership_id,
+                            ).await
+                        } else {
+                            CodexDrainOutcome::Drained
                         }
-                        None => false,
+                    },
+                    async {
+                        let confirmed = if cfg!(target_os = "linux") {
+                            match recorded.as_ref() {
+                                Some(recorded) => confirm_codex_tree_dead(recorded, cleanup_probe.clone()).await,
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+                        // Retry an unconfirmed cleanup while EOF is still
+                        // pending: a descendant can keep the socket open
+                        // until one of those retries actually reaches it.
+                        // This task only confirms death; the ownership
+                        // release remains deferred until after the drain.
+                        let escalation = if !confirmed && cfg!(target_os = "linux") {
+                            recorded.clone().map(|recorded| tokio::spawn(codex_tree_death_escalation(
+                                recorded, ownership_id.clone(), thread_id.clone(), cleanup_probe.clone(),
+                            )))
+                        } else {
+                            None
+                        };
+                        (confirmed, escalation)
                     }
-                } else {
-                    false
-                };
+                );
+                let mut requested_during_drain = drain_outcome == CodexDrainOutcome::RequestedStop;
+                if !requested_during_drain {
+                    if let Some(registered_rx) = registered_rx {
+                        // A sidecar can exit before its creator inserts the
+                        // session. Do not mistake that registration gap for a
+                        // replacement or publish an exit ahead of registration.
+                        requested_during_drain = tokio::select! {
+                            biased;
+                            _ = &mut kill_rx => true,
+                            registered = registered_rx => registered.is_err(),
+                        };
+                    }
+                }
+                if drain_outcome == CodexDrainOutcome::Abandoned && !requested_during_drain {
+                    let source_is_current = if let Some(state) = &retained_state {
+                        state.sessions.lock().await.get(&thread_id)
+                            .is_some_and(|session| session.sidecar_ownership_id == ownership_id)
+                    } else {
+                        true
+                    };
+                    if !source_is_current {
+                        // Explicit stop aborts the consumer after removing the
+                        // session, then signals the watcher. Preserve that
+                        // requested-stop classification.
+                        let _ = (&mut kill_rx).await;
+                        requested_during_drain = true;
+                    }
+                }
                 let stop_result = if confirmed {
                     if let Some(turns) = &turn_state { turns.lock().expect("codex turn state").settle_native("", NativeSettlement::OwnedExit); }
-                    cleanup_confirmed_codex_teardown(
-                        &leases,
-                        ownership.as_ref(),
-                        &condemned_priors,
-                        &thread_id,
-                        &ownership_id,
-                        false,
-                    );
+                    if requested_during_drain {
+                        cleanup_confirmed_codex_teardown(
+                            &leases, ownership.as_ref(), &condemned_priors,
+                            &thread_id, &ownership_id, true,
+                        );
+                    }
                     tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                     crate::session_handoff::StopResult::Reaped
                 } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
+                    if requested_during_drain {
+                        if let Some(recorded) = recorded.clone() {
+                            retain_codex_condemned_prior_if_current(&condemned_priors, &thread_id, recorded);
+                        }
+                    }
                     if let Some(ownership) = ownership.as_ref() {
                         let _ = ownership.fence_unconfirmed(
                             &thread_id,
@@ -12180,17 +12915,11 @@ fn spawn_exit_watcher_tracking_turns(
                             freshell_ownership::FenceReason::WatcherFailed,
                         );
                     }
-                    let confirmation = recorded
-                        .clone()
-                        .map(|recorded| {
-                            codex_tree_death_escalation(
-                                recorded,
-                                ownership_id.clone(),
-                                thread_id.clone(),
-                                cleanup_probe.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| Box::pin(async { false }));
+                    let confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> =
+                        match escalation {
+                            Some(task) => Box::pin(async move { task.await.unwrap_or(false) }),
+                            None => Box::pin(async { false }),
+                        };
                     let confirmation = with_codex_turn_exit_confirmation(confirmation, turn_state.clone());
                     let confirmation = wrap_codex_confirmation_with_cleanup(
                         confirmation,
@@ -12199,22 +12928,55 @@ fn spawn_exit_watcher_tracking_turns(
                         Arc::clone(&leases),
                         ownership.clone(),
                         Arc::clone(&condemned_priors),
-                        false,
+                        requested_during_drain,
                     );
-                    crate::session_handoff::StopResult::NotConfirmed {
-                        confirmation: detach_codex_confirmation(confirmation),
-                    }
+                    crate::session_handoff::StopResult::NotConfirmed { confirmation }
                 };
+                if requested_during_drain {
+                    turn_in_flight.store(false, Ordering::SeqCst);
+                    *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                    if let Some(drain) = &notification_drain {
+                        drain.finish();
+                    }
+                    return stop_result;
+                }
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
                 // handled in the sibling arm above with no event here).
-                tracing::warn!(provider = PROVIDER, session_id = %thread_id, "freshagent.session.crash_detected");
+                if handoff_requested {
+                    tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.codex.handoff_drained");
+                } else {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id, "freshagent.session.crash_detected");
+                }
                 // PR-4: flip the lazy-restart flag BEFORE broadcasting, so a client that
                 // reacts to the `exited` status by immediately sending/attaching never
                 // races ahead of `ensure_session_alive` observing a stale `false`.
                 if let Some(state) = &retained_state {
                     state.retain_native_exit(&thread_id, &ownership_id).await;
                 }
+                // A requested removal or replacement may have won while the
+                // drain/cleanup awaited. Keep the identity check and the
+                // synchronous final events under the same lock.
+                let _current_session = if let Some(state) = &retained_state {
+                    let sessions = state.sessions.lock().await;
+                    if !sessions.get(&thread_id).is_some_and(|session| session.sidecar_ownership_id == ownership_id) {
+                        drop(sessions);
+                        exited.store(true, Ordering::SeqCst);
+                        if let Some(drain) = &notification_drain {
+                            drain.finish();
+                        }
+                        if confirmed {
+                            cleanup_confirmed_codex_teardown(
+                                &leases, ownership.as_ref(), &condemned_priors,
+                                &thread_id, &ownership_id, false,
+                            );
+                        }
+                        return detach_unexpected_codex_stop(stop_result);
+                    }
+                    Some(sessions)
+                } else {
+                    None
+                };
                 exited.store(true, Ordering::SeqCst);
                 let event = CodexAdapterEvent::Status {
                     session_id: thread_id.clone(),
@@ -12222,6 +12984,14 @@ fn spawn_exit_watcher_tracking_turns(
                 };
                 if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
                     let _ = broadcast_tx.send(frame);
+                }
+                if drain_outcome == CodexDrainOutcome::Abandoned {
+                    tracing::error!(provider = PROVIDER, session_id = %thread_id, ownership_id = %ownership_id,
+                        "freshagent.codex.notification_drain_aborted");
+                    if let Some(state) = &retained_state {
+                        state.emit_fresh_agent_error(&thread_id, "CODEX_NOTIFICATION_DRAIN_ABORTED",
+                            "Codex exited before its response could be fully processed. You can retry or reopen this session.");
+                    }
                 }
                 // The crash ends any in-flight turn — a turn end the
                 // notification consumer never saw (the sidecar died with it).
@@ -12242,7 +13012,7 @@ fn spawn_exit_watcher_tracking_turns(
                 // (one bell per END); a respawned incarnation never
                 // consults this set (every respawn site mints fresh
                 // Arcs).
-                if turn_was_in_flight {
+                if turn_was_in_flight && !handoff_requested {
                     mint_synthesized_attention_edge(
                         &last_turn_complete_at,
                         &thread_id,
@@ -12251,10 +13021,23 @@ fn spawn_exit_watcher_tracking_turns(
                         retained_state.as_ref(),
                     );
                 }
-                stop_result
+                if let Some(drain) = &notification_drain {
+                    drain.finish();
+                }
+                drop(_current_session);
+                if confirmed {
+                    // The coordinator cannot grant a replacement until the
+                    // old source's final events have been published.
+                    cleanup_confirmed_codex_teardown(
+                        &leases, ownership.as_ref(), &condemned_priors,
+                        &thread_id, &ownership_id, false,
+                    );
+                }
+                detach_unexpected_codex_stop(stop_result)
             }
         }
-    })
+    });
+    (watcher, sidecar_identity)
 }
 
 /// Retire the lane's in-flight-turn state at a turn end it OBSERVED (a terminal
@@ -13087,7 +13870,7 @@ fn project_codex_notification(
         CodexNotification::ThreadClosed { thread_id } => {
             let mut p = projection.lock().expect("codex projection lock");
             if p.owns_thread(thread_id) {
-                p.freeze_active("interrupted");
+                return p.lifecycle_loss();
             }
             return false;
         }
@@ -13096,7 +13879,7 @@ fn project_codex_notification(
             if p.owns_thread(thread_id)
                 && normalize_codex_thread_status(status) == CodexStatus::Exited
             {
-                p.freeze_active("interrupted");
+                return p.lifecycle_loss();
             }
             return false;
         }
@@ -13129,6 +13912,48 @@ fn broadcast_codex_event(
     });
     if let Ok(frame) = serde_json::to_string(&msg) {
         let _ = tx.send(frame);
+    }
+}
+
+fn broadcast_codex_provider_error_cleared(
+    thread_id: &str,
+    tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    broadcast_codex_event(
+        thread_id,
+        json!({"type":"freshAgent.notice", "level":"info",
+            "code":"CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED",
+            "message":"The provider warning was cleared."}),
+        tx,
+    );
+}
+
+fn broadcast_codex_pending_error_change(
+    thread_id: &str,
+    before: Option<&(String, String)>,
+    after: Option<&(String, String)>,
+    before_failed: bool,
+    tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    if before.map(|(id, _)| id) != after.map(|(id, _)| id) {
+        if let Some((turn_id, _)) = before {
+            broadcast_codex_event(
+                thread_id,
+                json!({"type":"freshAgent.notice", "level":"info",
+                "code":"CODEX_PENDING_PROVIDER_ERROR_CLEARED", "turnId":turn_id,
+                "outcome":if before_failed {"failed"} else {"other"},
+                "message":"The provider warning was cleared."}),
+                tx,
+            );
+        }
+    }
+    if let Some((turn_id, message)) = after.filter(|after| Some(*after) != before) {
+        broadcast_codex_event(
+            thread_id,
+            json!({"type":"freshAgent.notice", "level":"warning",
+            "code":"CODEX_PENDING_PROVIDER_ERROR", "turnId":turn_id, "message":message}),
+            tx,
+        );
     }
 }
 
@@ -14184,7 +15009,7 @@ pub(crate) mod tests {
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id.to_string(),
             thread_id.to_string(),
@@ -14200,6 +15025,9 @@ pub(crate) mod tests {
             None,
             Some(turn_state.clone()),
             Some(state.clone()),
+            None,
+            None,
+            None,
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -14226,12 +15054,15 @@ pub(crate) mod tests {
                     mint_ownership_id(),
                     thread_id.to_string(),
                 ))),
+                notification_drain: None,
                 consumer,
                 kill_tx: Some(kill_tx),
+                handoff_tx: None,
                 watcher,
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
+                sidecar_identity,
                 sidecar_ownership_id,
                 quiet_deadman,
                 turn_in_flight,
@@ -14267,6 +15098,30 @@ pub(crate) mod tests {
         child: tokio::process::Child,
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
+        insert_fake_session_with_real_consumer_after_gate(
+            state,
+            thread_id,
+            client,
+            active_turn,
+            notifs,
+            child,
+            ownership_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_fake_session_with_real_consumer_after_gate(
+        state: &FreshCodexState,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        active_turn: Arc<StdMutex<Option<String>>>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        child: tokio::process::Child,
+        ownership_id: &str,
+        before_insert: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) -> tokio::sync::broadcast::Receiver<String> {
         let quiet_deadman = QuietDeadman::new_shared();
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // The fixture's in-flight truth mirrors its `active_turn` seed (the
@@ -14288,6 +15143,8 @@ pub(crate) mod tests {
             mint_ownership_id(),
             thread_id.to_string(),
         )));
+        let (notification_drain, drain_completed) = CodexNotificationDrain::new();
+        let (registered_tx, registered_rx) = oneshot::channel();
         let consumer = state.spawn_consumer(
             notifs,
             CodexConsumerRuntime {
@@ -14304,13 +15161,15 @@ pub(crate) mod tests {
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
                 projection: projection.clone(),
+                drain_completed,
             },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let (handoff_tx, handoff_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
-        let watcher = spawn_exit_watcher_tracking_turns(
+        let (watcher, sidecar_identity) = spawn_exit_watcher_tracking_turns(
             child,
             ownership_id.to_string(),
             thread_id.to_string(),
@@ -14326,7 +15185,22 @@ pub(crate) mod tests {
             None,
             Some(turn_state.clone()),
             Some(state.clone()),
+            Some(notification_drain.clone()),
+            Some(registered_rx),
+            Some(handoff_rx),
         );
+        if let Some((ready, proceed)) = before_insert {
+            // Give an immediate exit enough time to finish on the old code;
+            // the fixed watcher waits here for registration instead.
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                while !watcher.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            let _ = ready.send(());
+            let _ = proceed.await;
+        }
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
@@ -14349,12 +15223,15 @@ pub(crate) mod tests {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 event_emission_gate,
                 projection,
+                notification_drain: Some(notification_drain),
                 consumer,
                 kill_tx: Some(kill_tx),
+                handoff_tx: Some(handoff_tx),
                 watcher,
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
+                sidecar_identity,
                 sidecar_ownership_id,
                 quiet_deadman,
                 turn_in_flight,
@@ -14363,6 +15240,7 @@ pub(crate) mod tests {
                 provenance: None,
             },
         );
+        let _ = registered_tx.send(());
         state.broadcast_tx.subscribe()
     }
 
@@ -14789,6 +15667,944 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
             checkpoint_intent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_turn_without_started_still_reports_its_itemless_failure() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        for scenario in 0..3 {
+            let completion_before_response = scenario != 1;
+            let native_home = small_native_home("thread-accepted-error");
+            let (state, mut events) = state_with_bus();
+            let (transport, peer) = freshell_codex::new_channel_transport();
+            let (client, notifs) = CodexAppServerClient::connect(transport);
+            insert_fake_session_with_real_consumer(
+                &state,
+                "thread-accepted-error",
+                Arc::new(client),
+                Arc::new(StdMutex::new(None)),
+                notifs,
+                spawn_sleeper(),
+                "codex-accepted-without-started",
+            )
+            .await;
+            let projection = {
+                let sessions = state.sessions.lock().await;
+                sessions["thread-accepted-error"].projection.clone()
+            };
+            {
+                let mut projection = projection.lock().unwrap();
+                let fence = projection.begin_history_read();
+                projection
+                    .accept_native_history(
+                        &json!({"thread":{"id":"thread-accepted-error","historyMode":"paginated",
+                            "status":{"type":"idle"},"turns":[{"id":"old","status":"completed",
+                            "itemsView":"full","items":[]}]}}),
+                        &fence,
+                    )
+                    .unwrap();
+            }
+            let send = {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    state
+                        .handle_send(send_msg("thread-accepted-error", "hello"))
+                        .await
+                })
+            };
+            answer_initialize_in_home(&peer, native_home.path()).await;
+            let (request_id, method, _) = peer.expect_request().await;
+            assert_eq!(method, "turn/start");
+            if scenario == 2 {
+                // The read began after dispatch but overtakes the response;
+                // its terminal row is not evidence that this is an old turn.
+                let mut projection = projection.lock().unwrap();
+                let fence = projection.begin_history_read();
+                projection
+                    .accept_native_history(
+                        &json!({"thread":{"id":"thread-accepted-error",
+                            "historyMode":"paginated","status":{"type":"idle"},"turns":[
+                            {"id":"old","status":"completed","itemsView":"full","items":[]},
+                            {"id":"accepted","status":"completed","itemsView":"full","items":[
+                                {"type":"userMessage","id":"saved-user","content":[{"type":"text","text":"saved prompt"}]},
+                                {"type":"agentMessage","id":"saved-answer","text":"saved answer"}
+                            ]}
+                        ]}}),
+                        &fence,
+                    )
+                    .unwrap();
+            }
+            let message = "Selected model is at capacity. Please try a different model.";
+            let emit_completion = || {
+                // Neither a completed old turn nor a foreign turn may claim
+                // the accepted turn's error, even when their events arrive first.
+                for id in ["old", "foreign"] {
+                    peer.emit_notification(
+                        "turn/completed",
+                        json!({"threadId":"thread-accepted-error",
+                        "turn":{"id":id,"status":"failed","error":{"message":"stale diagnostic"}}}),
+                    );
+                }
+                if completion_before_response {
+                    peer.emit_notification(
+                        "error",
+                        json!({"threadId":"thread-accepted-error",
+                        "turnId":"accepted","willRetry":false,"error":{"message":message}}),
+                    );
+                }
+                if scenario == 2 {
+                    peer.emit_notification("item/started", json!({"threadId":"thread-accepted-error",
+                        "turnId":"accepted","item":{"type":"agentMessage","id":"saved-answer","text":""}}));
+                    peer.emit_notification(
+                        "item/agentMessage/delta",
+                        json!({"threadId":"thread-accepted-error",
+                        "turnId":"accepted","itemId":"saved-answer","delta":"MUST_NOT_APPEND"}),
+                    );
+                }
+                peer.emit_notification("turn/completed", json!({"threadId":"thread-accepted-error",
+                    "turn":{"id":"accepted","status":"failed","items":[],
+                    "error":if completion_before_response { Value::Null } else { json!({"message":message}) }}}));
+            };
+            if completion_before_response {
+                emit_completion();
+            }
+            peer.respond(&request_id, json!({"turn":{"id":"accepted"}}));
+            let accepted = send.await.unwrap();
+            if !completion_before_response {
+                emit_completion();
+            }
+            let collect = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+                frame["event"]["type"] == "freshAgent.transcript.patch"
+                    && frame["event"]["ops"].to_string().contains(message)
+            })
+            .await;
+            peer.disconnect();
+            state.shutdown().await;
+            assert!(
+                matches!(accepted, CodexSendOutcome::Accepted { submitted_turn_id, .. } if submitted_turn_id == "accepted")
+            );
+            assert!(
+                collect.matched,
+                "the accepted turn must publish its provider error immediately: {:?}",
+                collect.frames
+            );
+            assert!(
+                !collect.frames.iter().any(|frame| frame["event"]["type"]
+                    == "freshAgent.transcript.patch"
+                    && frame["event"]["ops"]
+                        .to_string()
+                        .contains("stale diagnostic")),
+                "unrelated completions must stay inert"
+            );
+            if scenario == 2 {
+                let frames = json!(collect.frames).to_string();
+                assert!(
+                    frames.contains("saved prompt") && frames.contains("saved answer"),
+                    "saved context and the failure must both survive: {frames}"
+                );
+                assert!(
+                    !frames.contains("MUST_NOT_APPEND"),
+                    "saved items cannot become append baselines"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_send_preserves_unattributed_provider_failure_after_disconnect() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let native_home = small_native_home("thread-ambiguous-error");
+        let (state, mut events) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-ambiguous-error",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-ambiguous-error",
+        )
+        .await;
+        let (projection, turn_state) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions["thread-ambiguous-error"];
+            (session.projection.clone(), session.turn_state.clone())
+        };
+        {
+            let mut projection = projection.lock().unwrap();
+            let fence = projection.begin_history_read();
+            projection
+                .accept_native_history(
+                    &json!({"thread":{"id":"thread-ambiguous-error",
+                        "historyMode":"paginated","status":{"type":"idle"},"turns":[
+                        {"id":"old","status":"completed","itemsView":"full","items":[]}
+                    ]}}),
+                    &fence,
+                )
+                .unwrap();
+        }
+        let send = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .handle_send(send_msg("thread-ambiguous-error", "hello"))
+                    .await
+            })
+        };
+        answer_initialize_in_home(&peer, native_home.path()).await;
+        let (_request_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-ambiguous-error",
+            "turn":{"id":"old","status":"failed","error":{"message":"stale diagnostic"}}}),
+        );
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"foreign-thread",
+            "turn":{"id":"foreign","status":"failed","error":{"message":"foreign diagnostic"}}}),
+        );
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-ambiguous-error",
+            "turn":{"id":"unattributed","status":"failed","items":[],"error":{"message":message}}}),
+        );
+        peer.disconnect();
+        let outcome = send.await.unwrap();
+        let collect = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+            frame["event"]["type"] == "freshAgent.notice"
+                && frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR"
+                && frame["event"]["message"] == message
+        })
+        .await;
+        let unknown_delivery = turn_state.lock().unwrap().has_unknown_delivery();
+        let retained = state
+            .retained_state("thread-ambiguous-error")
+            .await
+            .unwrap();
+        state.shutdown().await;
+        assert!(
+            matches!(outcome, CodexSendOutcome::Ambiguous { .. }),
+            "a lost RPC response must remain ambiguous"
+        );
+        assert!(
+            unknown_delivery,
+            "the uncorrelated diagnostic must not settle the dispatch"
+        );
+        assert!(
+            collect.matched,
+            "the exact provider diagnostic must be shown: {:?}",
+            collect.frames
+        );
+        assert_eq!(
+            retained["snapshot"]["extensions"]["codex"]["unattributedProviderError"], message,
+            "a later attachment must recover the exact session diagnostic"
+        );
+        assert!(
+            !collect.frames.iter().any(|frame| frame["event"]
+                .to_string()
+                .contains("stale diagnostic")
+                || frame["event"].to_string().contains("foreign diagnostic")),
+            "old and foreign completions must stay fenced"
+        );
+        assert!(
+            !collect.frames.iter().any(|frame| frame["event"]["type"]
+                == "freshAgent.transcript.patch"
+                && frame["event"]["ops"].to_string().contains("unattributed")),
+            "an ambiguous response must not assign the failure to this send"
+        );
+    }
+
+    async fn check_active_provider_error_is_retained(final_status: &'static str) {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let thread_id = "thread-active-provider-error";
+        let native_home = small_native_home(thread_id);
+        let (state, mut events) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &state,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-active-provider-error",
+        )
+        .await;
+        let send = {
+            let state = state.clone();
+            tokio::spawn(async move { state.handle_send(send_msg(thread_id, "hello")).await })
+        };
+        answer_initialize_in_home(&peer, native_home.path()).await;
+        let (request_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&request_id, json!({"turn":{"id":"accepted"}}));
+        let accepted = send.await.unwrap();
+        peer.emit_notification(
+            "error",
+            json!({"threadId":thread_id,"turnId":"accepted",
+            "willRetry":true,"error":{"message":"temporary retry"}}),
+        );
+        peer.emit_notification(
+            "error",
+            json!({"threadId":"foreign-thread","turnId":"accepted",
+            "willRetry":false,"error":{"message":"foreign warning"}}),
+        );
+        peer.emit_notification(
+            "error",
+            json!({"threadId":thread_id,"turnId":"old",
+            "willRetry":false,"error":{"message":"stale warning"}}),
+        );
+        let prior = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+            frame["event"]["code"] == "CODEX_PROVIDER_ERROR"
+                && frame["event"]["message"] == "stale warning"
+        })
+        .await;
+        let before = state.retained_state(thread_id).await.unwrap();
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "error",
+            json!({"threadId":thread_id,"turnId":"accepted",
+            "willRetry":false,"error":{"message":message}}),
+        );
+        let warning = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+            frame["event"]["code"] == "CODEX_PENDING_PROVIDER_ERROR"
+        })
+        .await;
+        let retained = state.retained_state(thread_id).await.unwrap();
+        let snapshot_task = {
+            let state = state.clone();
+            tokio::spawn(async move { state.get_snapshot(thread_id, None).await })
+        };
+        let (read_id, read_method, _) = peer.expect_request().await;
+        assert_eq!(read_method, "thread/read");
+        peer.respond(
+            &read_id,
+            json!({"thread":{"id":thread_id,"historyMode":"paginated",
+            "status":{"type":"active"},"turns":[]}}),
+        );
+        let snapshot = snapshot_task.await.unwrap().unwrap();
+        if final_status == "closed" {
+            peer.emit_notification("thread/closed", json!({"threadId":thread_id}));
+        } else {
+            peer.emit_notification(
+                "turn/completed",
+                json!({"threadId":thread_id,
+                "turn":{"id":"accepted","status":final_status,"error":null}}),
+            );
+        }
+        let cleared = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+            frame["event"]["code"] == "CODEX_PENDING_PROVIDER_ERROR_CLEARED"
+        })
+        .await;
+        let after = state.retained_state(thread_id).await.unwrap();
+        peer.disconnect();
+        state.shutdown().await;
+        assert!(
+            matches!(accepted, CodexSendOutcome::Accepted { submitted_turn_id, .. } if submitted_turn_id == "accepted")
+        );
+        assert!(
+            prior.matched
+                && before["snapshot"]["extensions"]["codex"]["pendingProviderError"].is_null(),
+            "retry, foreign and old-turn errors must not become provisional failures"
+        );
+        assert!(
+            warning.matched,
+            "the active provider error needs a retained notice: {:?}",
+            warning.frames
+        );
+        assert_eq!(
+            warning.frames.last().unwrap()["event"]["turnId"],
+            "accepted"
+        );
+        assert_eq!(warning.frames.last().unwrap()["event"]["message"], message);
+        assert!(
+            !warning
+                .frames
+                .iter()
+                .any(|frame| frame["event"]["code"] == "CODEX_PROVIDER_ERROR"
+                    && frame["event"]["message"] == message),
+            "the same error must not appear twice"
+        );
+        for value in [&retained["snapshot"], &snapshot] {
+            assert_eq!(
+                value["extensions"]["codex"]["pendingProviderError"],
+                json!({"turnId":"accepted","message":message})
+            );
+            assert_eq!(
+                value["status"], "running",
+                "a provisional diagnostic is not a failed turn"
+            );
+        }
+        assert!(
+            cleared.matched,
+            "completion must clear the provisional notice: {:?}",
+            cleared.frames
+        );
+        assert_eq!(
+            cleared.frames.last().unwrap()["event"]["turnId"],
+            "accepted"
+        );
+        assert_eq!(
+            cleared.frames.last().unwrap()["event"]["outcome"],
+            if matches!(final_status, "failed" | "closed") {
+                "failed"
+            } else {
+                "other"
+            }
+        );
+        assert!(after["snapshot"]["extensions"]["codex"]["pendingProviderError"].is_null());
+        if matches!(final_status, "failed" | "closed") {
+            assert!(
+                cleared.frames.iter().any(|frame| frame["event"]["type"]
+                    == "freshAgent.transcript.patch"
+                    && frame["event"]["ops"].to_string().contains(message)),
+                "a failed completion must publish the actual error row before clearing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_provider_error_survives_without_completion_and_clears_on_success() {
+        check_active_provider_error_is_retained("completed").await;
+    }
+
+    #[tokio::test]
+    async fn active_provider_error_becomes_a_failed_turn_without_duplication() {
+        check_active_provider_error_is_retained("failed").await;
+    }
+
+    #[tokio::test]
+    async fn active_provider_error_becomes_a_failed_turn_on_thread_close() {
+        check_active_provider_error_is_retained("closed").await;
+    }
+
+    async fn check_ambiguous_send_retains_nonretry_error(error_first: bool, with_completion: bool) {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        {
+            let thread_id = "thread-ambiguous-split-error";
+            let native_home = small_native_home(thread_id);
+            let (state, mut events) = state_with_bus();
+            let (transport, peer) = freshell_codex::new_channel_transport();
+            let (client, notifs) = CodexAppServerClient::connect(transport);
+            insert_fake_session_with_real_consumer(
+                &state,
+                thread_id,
+                Arc::new(client),
+                Arc::new(StdMutex::new(None)),
+                notifs,
+                spawn_sleeper(),
+                "codex-ambiguous-split-error",
+            )
+            .await;
+            let (projection, turns) = {
+                let sessions = state.sessions.lock().await;
+                let session = &sessions[thread_id];
+                (session.projection.clone(), session.turn_state.clone())
+            };
+            {
+                let mut projection = projection.lock().unwrap();
+                let fence = projection.begin_history_read();
+                projection
+                    .accept_native_history(
+                        &json!({"thread":{"id":thread_id,
+                        "historyMode":"paginated","status":{"type":"idle"},"turns":[
+                            {"id":"old","status":"completed","itemsView":"full","items":[]},
+                            {"id":"removed","status":"completed","itemsView":"full","items":[]}
+                        ]}}),
+                        &fence,
+                    )
+                    .unwrap();
+                projection.invalidate_history(&["removed".to_owned()]);
+            }
+            let send = {
+                let state = state.clone();
+                tokio::spawn(async move { state.handle_send(send_msg(thread_id, "hello")).await })
+            };
+            answer_initialize_in_home(&peer, native_home.path()).await;
+            let (_, method, _) = peer.expect_request().await;
+            assert_eq!(method, "turn/start");
+            for (other_thread, other_turn) in [
+                (thread_id, "old"),
+                (thread_id, "removed"),
+                ("foreign-thread", "foreign"),
+            ] {
+                peer.emit_notification(
+                    "error",
+                    json!({"threadId":other_thread,
+                    "turnId":other_turn,"willRetry":false,"error":{"message":"stale diagnostic"}}),
+                );
+                peer.emit_notification(
+                    "turn/completed",
+                    json!({"threadId":other_thread,
+                    "turn":{"id":other_turn,"status":"failed","error":null}}),
+                );
+            }
+            peer.emit_notification(
+                "error",
+                json!({"threadId":thread_id,"willRetry":false,
+                    "error":{"message":"untagged diagnostic"}}),
+            );
+            peer.emit_notification(
+                "error",
+                json!({"threadId":thread_id,"turnId":"retry-only","willRetry":true,
+                    "error":{"message":"temporary retry"}}),
+            );
+            peer.emit_notification(
+                "turn/completed",
+                json!({"threadId":thread_id,"turn":{"id":"retry-only","status":"failed","error":null}}),
+            );
+            peer.emit_notification(
+                "error",
+                json!({"threadId":thread_id,"turnId":"succeeded","willRetry":false,
+                    "error":{"message":"eventually succeeded"}}),
+            );
+            peer.emit_notification(
+                "turn/completed",
+                json!({"threadId":thread_id,"turn":{"id":"succeeded","status":"completed","error":null}}),
+            );
+            peer.emit_notification(
+                "error",
+                json!({"threadId":thread_id,"turnId":"succeeded","willRetry":false,
+                    "error":{"message":"eventually succeeded"}}),
+            );
+            let message = "Selected model is at capacity. Please try a different model.";
+            let emit_error = || {
+                peer.emit_notification(
+                    "error",
+                    json!({"threadId":thread_id,
+                "turnId":"unattributed","willRetry":false,"error":{"message":message}}),
+                )
+            };
+            let emit_completion = || {
+                peer.emit_notification(
+                    "turn/completed",
+                    json!({"threadId":thread_id,
+                "turn":{"id":"unattributed","status":"failed","error":null}}),
+                )
+            };
+            if !with_completion {
+                emit_error();
+            } else if error_first {
+                emit_error();
+                emit_completion();
+            } else {
+                emit_completion();
+                emit_error();
+            }
+            peer.disconnect();
+            let outcome = send.await.unwrap();
+            let collected = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+                frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR"
+                    && frame["event"]["message"] == message
+            })
+            .await;
+            let unknown_delivery = turns.lock().unwrap().has_unknown_delivery();
+            let retained = state.retained_state(thread_id).await.unwrap();
+            state.shutdown().await;
+            assert!(matches!(outcome, CodexSendOutcome::Ambiguous { .. }) && unknown_delivery);
+            assert!(
+                collected.matched,
+                "missing warning, error_first={error_first}: {:?}",
+                collected.frames
+            );
+            assert_eq!(
+                retained["snapshot"]["extensions"]["codex"]["unattributedProviderError"],
+                message
+            );
+            assert!(!collected
+                .frames
+                .iter()
+                .any(|frame| frame["event"]["message"] == "stale diagnostic"));
+            assert!(!collected.frames.iter().any(|frame| frame["event"]["code"]
+                == "CODEX_UNATTRIBUTED_PROVIDER_ERROR"
+                && frame["event"]["message"] == "temporary retry"));
+            assert!(collected
+                .frames
+                .iter()
+                .any(|frame| frame["event"]["code"] == "CODEX_PROVIDER_ERROR"
+                    && frame["event"]["message"] == "untagged diagnostic"));
+            assert!(!collected.frames.iter().any(|frame| frame["event"]["type"]
+                == "freshAgent.transcript.patch"
+                && frame["event"]["ops"].to_string().contains("unattributed")));
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_send_retains_nonretry_error_before_blank_completion() {
+        check_ambiguous_send_retains_nonretry_error(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_send_retains_nonretry_error_after_blank_completion() {
+        check_ambiguous_send_retains_nonretry_error(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_send_retains_nonretry_error_without_completion() {
+        check_ambiguous_send_retains_nonretry_error(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_success_clears_provisional_error_without_settling_delivery() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let thread_id = "thread-ambiguous-error-success";
+        let native_home = small_native_home(thread_id);
+        let (state, mut events) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &state,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-ambiguous-error-success",
+        )
+        .await;
+        let turns = state.sessions.lock().await[thread_id].turn_state.clone();
+        let send = {
+            let state = state.clone();
+            tokio::spawn(async move { state.handle_send(send_msg(thread_id, "hello")).await })
+        };
+        answer_initialize_in_home(&peer, native_home.path()).await;
+        let (_, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.emit_notification(
+            "error",
+            json!({"threadId":thread_id,"turnId":"unknown",
+            "willRetry":false,"error":{"message":"provisional provider warning"}}),
+        );
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":thread_id,
+            "turn":{"id":"unknown","status":"completed","error":null}}),
+        );
+        peer.disconnect();
+        let outcome = send.await.unwrap();
+        let collected = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+            frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED"
+        })
+        .await;
+        let unknown_delivery = turns.lock().unwrap().has_unknown_delivery();
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(5), state.get_snapshot(thread_id, None)).await;
+        state.shutdown().await;
+        assert!(matches!(outcome, CodexSendOutcome::Ambiguous { .. }) && unknown_delivery);
+        assert!(collected.frames.iter().any(|frame| frame["event"]["code"]
+            == "CODEX_UNATTRIBUTED_PROVIDER_ERROR"
+            && frame["event"]["message"] == "provisional provider warning"));
+        assert!(
+            collected.matched,
+            "successful completion must request a refresh: {:?}",
+            collected.frames
+        );
+        assert_eq!(collected.frames.last().unwrap()["event"]["level"], "info");
+        let snapshot = snapshot
+            .expect("snapshot must not hang")
+            .expect("empty retained snapshot must remain available");
+        assert!(snapshot["extensions"]["codex"]["unattributedProviderError"].is_null());
+        assert_eq!(
+            snapshot["status"], "running",
+            "uncertain delivery must remain unsettled"
+        );
+        assert!(!collected
+            .frames
+            .iter()
+            .any(|frame| frame["event"]["type"] == "freshAgent.turn.complete"
+                || frame["event"]["type"] == "freshAgent.transcript.patch"));
+    }
+
+    #[tokio::test]
+    async fn handoff_retains_unattributed_error_until_the_next_accepted_send() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let thread_id = "thread-handoff-unattributed";
+        let native_home = small_native_home(thread_id);
+        let (state, mut events) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &state,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-handoff-unattributed",
+        )
+        .await;
+        let send = {
+            let state = state.clone();
+            tokio::spawn(async move { state.handle_send(send_msg(thread_id, "hello")).await })
+        };
+        answer_initialize_in_home(&peer, native_home.path()).await;
+        let (_, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":thread_id,
+            "turn":{"id":"unknown","status":"failed","error":{"message":message}}}),
+        );
+        peer.disconnect();
+        let outcome = send.await.unwrap();
+        let warning = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+            frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR"
+        })
+        .await;
+        let handoff = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.kill_for_handoff(thread_id, "terminal-switch-test"),
+        )
+        .await
+        .unwrap();
+        // A resume can register its sidecar, then fail an ownership or
+        // binding gate and tear that uncommitted sidecar back down. A later
+        // retry must still inherit the same session diagnostic.
+        let (temporary_transport, temporary_peer) = freshell_codex::new_channel_transport();
+        let (temporary_client, temporary_notifs) =
+            CodexAppServerClient::connect(temporary_transport);
+        state
+            .register_live_session(
+                thread_id,
+                Arc::new(temporary_client),
+                temporary_notifs,
+                "codex-handoff-uncommitted".into(),
+                spawn_sleeper(),
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                json!({}),
+                None,
+                None,
+            )
+            .await;
+        let uncommitted = state.sessions.lock().await.remove(thread_id).unwrap();
+        let cleanup = state
+            .settle_removed_session(thread_id, uncommitted, None, None)
+            .await;
+        temporary_peer.disconnect();
+        assert!(matches!(cleanup, CodexTeardownSettlement::Confirmed));
+        configure_fake_codex_cmd(
+            r#"{"overrides":{"turn/start":{"result":{"turn":{"id":"accepted-new"}}}}}"#,
+        );
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(15),
+            state.ensure_session_resumable(thread_id, None, None, None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resumed.is_ok(),
+            "a later FreshCodex handoff must resume: {:?}",
+            resumed.as_ref().err()
+        );
+        let retained = state.retained_state(thread_id).await.unwrap();
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(5), state.get_snapshot(thread_id, None))
+                .await
+                .unwrap()
+                .unwrap();
+        // A second pane subscribed to the same session must learn that the
+        // accepted send cleared the retained warning, too.
+        let mut sending_pane = state.broadcast_tx.subscribe();
+        let mut observing_pane = state.broadcast_tx.subscribe();
+        let owner_before = state.sessions.lock().await[thread_id]
+            .sidecar_ownership_id
+            .clone();
+        let accepted = state.handle_send(send_msg(thread_id, "new message")).await;
+        let sending_notice =
+            collect_frames_until(&mut sending_pane, Duration::from_secs(2), |frame| {
+                frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED"
+            })
+            .await;
+        let observing_notice =
+            collect_frames_until(&mut observing_pane, Duration::from_secs(2), |frame| {
+                frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED"
+            })
+            .await;
+        let (owner_after, active_turn) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions[thread_id];
+            let active_turn = session
+                .turn_state
+                .lock()
+                .unwrap()
+                .active_turn_id()
+                .map(str::to_owned);
+            (session.sidecar_ownership_id.clone(), active_turn)
+        };
+        let after_accepted = state.retained_state(thread_id).await.unwrap();
+        let second_handoff = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.kill_for_handoff(thread_id, "second-terminal-switch-test"),
+        )
+        .await
+        .unwrap();
+        let second_resume = tokio::time::timeout(
+            Duration::from_secs(15),
+            state.ensure_session_resumable(thread_id, None, None, None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            second_resume.is_ok(),
+            "a second handoff must resume: {:?}",
+            second_resume.as_ref().err()
+        );
+        let after_second_resume = state.retained_state(thread_id).await.unwrap();
+        let mut ordinary_events = state.broadcast_tx.subscribe();
+        let ordinary_send = state
+            .handle_send(send_msg(thread_id, "ordinary message"))
+            .await;
+        let mut ordinary_frames = Vec::new();
+        while let Ok(frame) = ordinary_events.try_recv() {
+            ordinary_frames.push(serde_json::from_str::<Value>(&frame).unwrap());
+        }
+        state.shutdown().await;
+        assert!(matches!(outcome, CodexSendOutcome::Ambiguous { .. }) && warning.matched);
+        assert!(matches!(
+            handoff,
+            crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone
+        ));
+        assert_eq!(
+            retained["snapshot"]["extensions"]["codex"]["unattributedProviderError"],
+            message
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["unattributedProviderError"],
+            message
+        );
+        assert!(
+            matches!(accepted, CodexSendOutcome::Accepted { submitted_turn_id, .. }
+            if submitted_turn_id == "accepted-new")
+        );
+        assert_eq!(
+            owner_after, owner_before,
+            "the notice must not replace the source"
+        );
+        assert_eq!(
+            active_turn.as_deref(),
+            Some("accepted-new"),
+            "accepted delivery stays active"
+        );
+        for notice in [sending_notice, observing_notice] {
+            assert!(
+                notice.matched,
+                "each pane must receive the clear notice: {:?}",
+                notice.frames
+            );
+            let frame = notice.frames.last().unwrap();
+            assert_eq!(frame["sessionId"], thread_id);
+            assert_eq!(frame["event"]["level"], "info");
+        }
+        assert!(
+            after_accepted["snapshot"]["extensions"]["codex"]["unattributedProviderError"]
+                .is_null(),
+            "a later accepted send clears the retained diagnostic"
+        );
+        assert!(matches!(
+            second_handoff,
+            crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone
+        ));
+        assert!(
+            after_second_resume["snapshot"]["extensions"]["codex"]["unattributedProviderError"]
+                .is_null(),
+            "the cleared diagnostic must not return on a later handoff"
+        );
+        assert!(matches!(ordinary_send, CodexSendOutcome::Accepted { .. }));
+        assert!(
+            !ordinary_frames
+                .iter()
+                .any(|frame| frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED"),
+            "an ordinary acceptance has no warning to clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_ambiguous_diagnostic_is_available_from_real_snapshot_route() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        for history in ["empty", "large", "unavailable"] {
+            let thread_id = format!("thread-ambiguous-{history}");
+            let home = small_native_home(&thread_id);
+            let path = home
+                .path()
+                .join("sessions")
+                .join(format!("rollout-{thread_id}.jsonl"));
+            if history == "large" {
+                let session_meta = json!({"type":"session_meta","payload":{"id":thread_id}});
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{session_meta}\n{}\n",
+                        " ".repeat(crate::native_history::RETAINED_TURN_BYTES + 1)
+                    ),
+                )
+                .unwrap();
+                assert!(read_large_native_display(home.path(), &thread_id)
+                    .unwrap()
+                    .is_some());
+            } else if history == "unavailable" {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let (state, mut events) = state_with_bus();
+            let (transport, peer) = freshell_codex::new_channel_transport();
+            let (client, notifs) = CodexAppServerClient::connect(transport);
+            insert_fake_session_with_real_consumer(
+                &state,
+                &thread_id,
+                Arc::new(client),
+                Arc::new(StdMutex::new(None)),
+                notifs,
+                spawn_sleeper(),
+                "codex-ambiguous-snapshot",
+            )
+            .await;
+            let send = {
+                let state = state.clone();
+                let thread_id = thread_id.clone();
+                tokio::spawn(async move { state.handle_send(send_msg(&thread_id, "hello")).await })
+            };
+            answer_initialize_in_home(&peer, home.path()).await;
+            let (_request_id, method, _) = peer.expect_request().await;
+            assert_eq!(method, "turn/start");
+            let message = "Selected model is at capacity. Please try a different model.";
+            peer.emit_notification(
+                "turn/completed",
+                json!({"threadId":thread_id,
+                "turn":{"id":"unattributed","status":"failed","error":{"message":message}}}),
+            );
+            peer.disconnect();
+            let outcome = send.await.unwrap();
+            let warning = collect_frames_until(&mut events, Duration::from_secs(2), |frame| {
+                frame["event"]["code"] == "CODEX_UNATTRIBUTED_PROVIDER_ERROR"
+            })
+            .await;
+            let snapshot =
+                tokio::time::timeout(Duration::from_secs(5), state.get_snapshot(&thread_id, None))
+                    .await;
+            state.shutdown().await;
+            assert!(matches!(outcome, CodexSendOutcome::Ambiguous { .. }) && warning.matched);
+            let snapshot = snapshot
+                .expect("snapshot must not hang")
+                .unwrap_or_else(|error| {
+                    panic!("history mode {history}: retained diagnostic must support a snapshot: {error:?}")
+                });
+            assert_eq!(
+                snapshot["extensions"]["codex"]["unattributedProviderError"], message,
+                "history mode {history}"
+            );
         }
     }
 
@@ -16704,6 +18520,888 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn unexpected_exit_drains_queued_provider_error_before_retirement() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, _) = state_with_bus();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let mut events = insert_fake_session_with_real_consumer(
+            &state,
+            "thread-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            notifs,
+            child,
+            "codex-queued-exit-regression",
+        )
+        .await;
+        let (gate, projection) = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions.get("thread-1").unwrap();
+            (
+                session.event_emission_gate.clone(),
+                session.projection.clone(),
+            )
+        };
+        projection
+            .lock()
+            .unwrap()
+            .apply(
+                "turn/started",
+                &json!({"threadId":"thread-1",
+            "turn":{"id":"turn-1","status":"inProgress"}}),
+            )
+            .unwrap();
+        let held = gate.lock().await;
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "error",
+            json!({"threadId":"thread-1","turnId":"turn-1",
+            "willRetry":false,"error":{"message":message}}),
+        );
+        peer.emit_notification("turn/completed", json!({"threadId":"thread-1","turn":{
+            "id":"turn-1","status":"failed","itemsView":"notLoaded","items":[],"error":{"message":message}
+        }}));
+        peer.disconnect();
+        drop(child_stdin);
+        let mut frames = Vec::new();
+        let early_exit = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                let exited = frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited";
+                frames.push(frame);
+                if exited {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        let alive_reserved = matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.ensure_session_alive("thread-1", None),
+            )
+            .await,
+            Ok(Err(EnsureAliveError::Draining))
+        );
+        let resume_reserved = matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state.ensure_session_resumable("thread-1", None, None, None),
+            )
+            .await,
+            Ok(Err(ResumeSessionError::Draining))
+        );
+        let adopt_reserved = matches!(
+            state.adopt_live_create("queued-exit-adopt", "thread-1", None).await,
+            CodexCreateOutcome::Failed { code, message, .. }
+                if code == "SESSION_RESERVED" && message == "The previous session is finishing its remaining messages. Please try again."
+        );
+        let send_reserved = matches!(
+            state.handle_send(send_msg("thread-1", "follow-up")).await,
+            CodexSendOutcome::Refused { code, message, .. }
+                if code == "SESSION_RESERVED" && message == "The previous session is finishing its remaining messages. Please try again."
+        );
+        drop(held);
+        if !early_exit {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                    let exited = frame["event"]["type"] == "freshAgent.status"
+                        && frame["event"]["status"] == "exited";
+                    frames.push(frame);
+                    if exited {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the drained source publishes its exit");
+        }
+        state.shutdown().await;
+        let patch = frames.iter().position(|frame| {
+            frame["event"]["type"] == "freshAgent.transcript.patch"
+                && frame["event"]["ops"].to_string().contains(message)
+        });
+        let exited = frames
+            .iter()
+            .position(|frame| {
+                frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited"
+            })
+            .unwrap();
+        assert!(!early_exit, "exit must wait for the queued notifications");
+        assert!(
+            alive_reserved && resume_reserved && adopt_reserved && send_reserved,
+            "recovery must remain reserved while the original stream drains"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"]["type"] == "freshAgent.notice"
+                    && frame["event"]["level"] == "warning"
+                    && frame["event"]["code"] == "CODEX_NOTIFICATION_DRAIN_PENDING"),
+            "a stalled drain must be reported"
+        );
+        assert!(
+            patch.is_some_and(|patch| patch < exited),
+            "provider error must be shown before exit: {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["event"]["type"] == "freshAgent.turn.complete")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_waits_for_queued_codex_failure_before_retiring_source() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut events) = state_with_bus();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-handoff-drain",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            notifs,
+            child,
+            "codex-handoff-drain",
+        )
+        .await;
+        let (gate, projection) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions["thread-handoff-drain"];
+            (
+                session.event_emission_gate.clone(),
+                session.projection.clone(),
+            )
+        };
+        projection
+            .lock()
+            .unwrap()
+            .apply(
+                "turn/started",
+                &json!({
+                    "threadId":"thread-handoff-drain","turn":{"id":"turn-1","status":"inProgress"}
+                }),
+            )
+            .unwrap();
+        let held = gate.lock().await;
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-handoff-drain",
+            "turn":{"id":"turn-1","status":"failed","items":[],"error":{"message":message}}}),
+        );
+        peer.disconnect();
+        drop(child_stdin);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state
+                .notification_drain_pending("thread-handoff-drain")
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exited source begins draining");
+        let mut handoff = {
+            let state = state.clone();
+            tokio::spawn(
+                async move { state.kill_for_handoff("thread-handoff-drain", "test").await },
+            )
+        };
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut handoff).await;
+        let retained_while_blocked = state
+            .sessions
+            .lock()
+            .await
+            .contains_key("thread-handoff-drain");
+        drop(held);
+        let result = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => tokio::time::timeout(Duration::from_secs(3), handoff)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let mut frames = Vec::new();
+        while let Ok(frame) = events.try_recv() {
+            frames.push(serde_json::from_str::<Value>(&frame).unwrap());
+        }
+        let no_condemned = !state
+            .condemned_priors
+            .lock()
+            .unwrap()
+            .contains_key("thread-handoff-drain");
+        configure_fake_codex_cmd("{}");
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(15),
+            state.ensure_session_resumable("thread-handoff-drain", None, None, None),
+        )
+        .await;
+        let recovered = matches!(resumed, Ok(Ok(_)))
+            && matches!(
+                state
+                    .ensure_session_alive("thread-handoff-drain", None)
+                    .await,
+                Ok(EnsureAliveOutcome::AlreadyRunning)
+            );
+        state.shutdown().await;
+        assert!(
+            retained_while_blocked,
+            "handoff must keep the source while its notification is queued"
+        );
+        assert!(matches!(
+            result,
+            crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone
+        ));
+        assert!(
+            no_condemned,
+            "a confirmed handoff must not leave a stale condemned identity"
+        );
+        assert!(
+            recovered,
+            "a subsequent FreshCodex resume must not be blocked"
+        );
+        assert!(
+            frames.iter().any(
+                |frame| frame["event"]["type"] == "freshAgent.transcript.patch"
+                    && frame["event"]["ops"].to_string().contains(message)
+            ),
+            "the provider failure must be published before handoff returns: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_preserves_queued_failure_before_exit_detection() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut events) = state_with_bus();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let pid = child.id().unwrap();
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-handoff-before-exit",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            notifs,
+            child,
+            "codex-handoff-before-exit",
+        )
+        .await;
+        let (gate, projection) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions["thread-handoff-before-exit"];
+            (
+                session.event_emission_gate.clone(),
+                session.projection.clone(),
+            )
+        };
+        projection.lock().unwrap().apply("turn/started", &json!({
+            "threadId":"thread-handoff-before-exit","turn":{"id":"turn-1","status":"inProgress"}
+        })).unwrap();
+        let held = gate.lock().await;
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-handoff-before-exit",
+            "turn":{"id":"turn-1","status":"failed","items":[],"error":{"message":message}}}),
+        );
+        peer.disconnect();
+        // Let the reader queue the notification while the child is still alive.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(child_stdin);
+        // The current-thread runtime cannot poll the watcher during this short
+        // wait, so handoff runs first even though the OS child has exited.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !crate::ownership_lane::partial_pid_confirmed_dead(pid)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let child_exited = crate::ownership_lane::partial_pid_confirmed_dead(pid);
+        let mut handoff = Box::pin(state.kill_for_handoff("thread-handoff-before-exit", "test"));
+        let polled = futures_util::poll!(&mut handoff);
+        let retained_before_watcher = state
+            .sessions
+            .lock()
+            .await
+            .contains_key("thread-handoff-before-exit");
+        drop(held);
+        let finished = match polled {
+            std::task::Poll::Ready(_) => true,
+            std::task::Poll::Pending => tokio::time::timeout(Duration::from_secs(3), handoff)
+                .await
+                .is_ok(),
+        };
+        let mut frames = Vec::new();
+        while let Ok(frame) = events.try_recv() {
+            frames.push(serde_json::from_str::<Value>(&frame).unwrap());
+        }
+        state.shutdown().await;
+        assert!(
+            child_exited,
+            "the child must have exited before handoff starts"
+        );
+        assert!(
+            retained_before_watcher,
+            "handoff must not discard the source before exit detection"
+        );
+        assert!(finished, "handoff must settle after the stream drains");
+        assert!(
+            frames.iter().any(
+                |frame| frame["event"]["type"] == "freshAgent.transcript.patch"
+                    && frame["event"]["ops"].to_string().contains(message)
+            ),
+            "the queued provider failure must survive: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_waits_when_exit_watcher_has_selected_exit_before_registering_drain() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut events) = state_with_bus();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-selected-exit",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            notifs,
+            child,
+            "codex-selected-exit",
+        )
+        .await;
+        let (gate, projection, drain) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions["thread-selected-exit"];
+            (
+                session.event_emission_gate.clone(),
+                session.projection.clone(),
+                session.notification_drain.clone().unwrap(),
+            )
+        };
+        projection
+            .lock()
+            .unwrap()
+            .apply(
+                "turn/started",
+                &json!({"threadId":"thread-selected-exit",
+            "turn":{"id":"turn-1","status":"inProgress"}}),
+            )
+            .unwrap();
+        let held_emission = gate.lock().await;
+        let held_registration = drain.exit_registration_gate.lock().await;
+        let message = "Selected model is at capacity. Please try a different model.";
+        peer.emit_notification(
+            "turn/completed",
+            json!({"threadId":"thread-selected-exit",
+            "turn":{"id":"turn-1","status":"failed","items":[],"error":{"message":message}}}),
+        );
+        peer.disconnect();
+        drop(child_stdin);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let closed = state.sessions.lock().await["thread-selected-exit"]
+                    .handoff_tx
+                    .as_ref()
+                    .is_some_and(oneshot::Sender::is_closed);
+                if closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher selects child exit before registering the drain");
+        let mut handoff = {
+            let state = state.clone();
+            tokio::spawn(
+                async move { state.kill_for_handoff("thread-selected-exit", "test").await },
+            )
+        };
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut handoff).await;
+        let retained = state
+            .sessions
+            .lock()
+            .await
+            .contains_key("thread-selected-exit");
+        drop(held_registration);
+        drop(held_emission);
+        if early.is_err() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), handoff).await;
+        }
+        let mut frames = Vec::new();
+        while let Ok(frame) = events.try_recv() {
+            frames.push(serde_json::from_str::<Value>(&frame).unwrap());
+        }
+        state.shutdown().await;
+        assert!(retained, "only the watcher may finalize the selected exit");
+        assert!(
+            frames.iter().any(
+                |frame| frame["event"]["type"] == "freshAgent.transcript.patch"
+                    && frame["event"]["ops"].to_string().contains(message)
+            ),
+            "the provider failure must survive: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_never_adopts_a_reused_process_identity() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, _) = state_with_bus();
+        let captured = Arc::new(StdMutex::new(None));
+        state.set_sidecar_capture_observer_for_tests(Arc::new({
+            let captured = captured.clone();
+            move |_, identity| *captured.lock().unwrap() = Some(identity.clone())
+        }));
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let original_pid = child.id().unwrap();
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-reused-pid",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            child,
+            "codex-reused-pid",
+        )
+        .await;
+        let drain = state.sessions.lock().await["thread-reused-pid"]
+            .notification_drain
+            .clone()
+            .unwrap();
+        let held_registration = drain.exit_registration_gate.lock().await;
+        peer.disconnect();
+        drop(child_stdin);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let closed = state.sessions.lock().await["thread-reused-pid"]
+                    .handoff_tx
+                    .as_ref()
+                    .is_some_and(oneshot::Sender::is_closed);
+                if closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher selects the original child's exit");
+        let mut unrelated = spawn_sleeper();
+        let unrelated_pid = unrelated.id().unwrap();
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut("thread-reused-pid")
+            .unwrap()
+            .sidecar_pid = Some(unrelated_pid);
+        let mut handoff = {
+            let state = state.clone();
+            tokio::spawn(async move { state.kill_for_handoff("thread-reused-pid", "test").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state
+                .condemned_priors
+                .lock()
+                .unwrap()
+                .contains_key("thread-reused-pid")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handoff records its prior identity");
+        let recorded = state.condemned_priors.lock().unwrap()["thread-reused-pid"].clone();
+        let original = captured.lock().unwrap().clone().unwrap();
+        drop(held_registration);
+        let stopped = tokio::time::timeout(Duration::from_secs(3), &mut handoff)
+            .await
+            .is_ok();
+        let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+        let _ = unrelated.start_kill();
+        let _ = unrelated.wait().await;
+        state.shutdown().await;
+        assert_eq!(original.pid, original_pid);
+        assert_eq!(
+            recorded.pid, original.pid,
+            "handoff must retain the original incarnation, not the reused PID"
+        );
+        assert_eq!(recorded.start_time, original.start_time);
+        assert!(
+            stopped && unrelated_alive,
+            "the unrelated process must remain alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_cleans_owned_descendant_before_waiting_for_stream_eof() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let peer = Arc::new(StdMutex::new(Some(peer)));
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, _) = state_with_bus();
+        let cleanup_attempts = Arc::new(AtomicU64::new(0));
+        state.set_sidecar_cleanup_probe(Arc::new({
+            let peer = peer.clone();
+            let cleanup_attempts = cleanup_attempts.clone();
+            move |_| {
+                let peer = peer.clone();
+                let cleanup_attempts = cleanup_attempts.clone();
+                Box::pin(async move {
+                    // Model an owned descendant that keeps the notification
+                    // socket open until a retry of owned-tree cleanup reaches it.
+                    if cleanup_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Ok(false);
+                    }
+                    if let Some(peer) = peer.lock().unwrap().take() {
+                        peer.disconnect();
+                    }
+                    Ok(true)
+                })
+            }
+        }));
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let mut events = insert_fake_session_with_real_consumer(
+            &state,
+            "thread-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            child,
+            "codex-descendant-held-stream",
+        )
+        .await;
+        drop(child_stdin);
+        let exited = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        if let Some(peer) = peer.lock().unwrap().take() {
+            peer.disconnect();
+        }
+        state.shutdown().await;
+        assert!(
+            cleanup_attempts.load(Ordering::SeqCst) >= 2,
+            "the owned tree cleanup must retry while its stream remains open"
+        );
+        assert!(
+            exited,
+            "owned cleanup must unblock EOF and allow exit publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_before_registration_is_published_after_registration() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, _) = state_with_bus();
+        let mut events = state.broadcast_tx.subscribe();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (proceed_tx, proceed_rx) = oneshot::channel();
+        let registering_state = state.clone();
+        let registration = tokio::spawn(async move {
+            insert_fake_session_with_real_consumer_after_gate(
+                &registering_state,
+                "thread-1",
+                Arc::new(client),
+                Arc::new(StdMutex::new(None)),
+                notifs,
+                child,
+                "codex-exit-before-registration",
+                Some((ready_tx, proceed_rx)),
+            )
+            .await
+        });
+        peer.disconnect();
+        drop(child_stdin);
+        tokio::time::timeout(Duration::from_secs(3), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+        registration.await.unwrap();
+        let exited_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        let (exited, pending) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions["thread-1"];
+            (
+                session.exited.load(Ordering::SeqCst),
+                session.notification_drain_pending(),
+            )
+        };
+        state.shutdown().await;
+        assert!(
+            exited_event,
+            "the current incarnation must publish its exit after registration"
+        );
+        assert!(
+            exited && !pending,
+            "the registered session must not remain permanently reserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_codex_drain_reports_terminal_failure_and_allows_recovery() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut events) = state_with_bus();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-abandoned",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            notifs,
+            child,
+            "codex-abandoned-recovery",
+        )
+        .await;
+        let gate = state.sessions.lock().await["thread-abandoned"]
+            .event_emission_gate
+            .clone();
+        let held = gate.lock().await;
+        peer.emit_notification(
+            "error",
+            json!({"threadId":"thread-abandoned","turnId":"turn-1",
+            "willRetry":false,"error":{"message":"queued provider diagnostic"}}),
+        );
+        peer.disconnect();
+        drop(child_stdin);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.notification_drain_pending("thread-abandoned").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exited source begins draining");
+        state.sessions.lock().await["thread-abandoned"]
+            .consumer
+            .abort();
+        let mut frames = Vec::new();
+        let error_reported = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                let error = frame["event"]["type"] == "freshAgent.error"
+                    && frame["event"]["code"] == "CODEX_NOTIFICATION_DRAIN_ABORTED";
+                frames.push(frame);
+                if error {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        let (exited, pending) = {
+            let sessions = state.sessions.lock().await;
+            let session = &sessions["thread-abandoned"];
+            (
+                session.exited.load(Ordering::SeqCst),
+                session.notification_drain_pending(),
+            )
+        };
+        drop(held);
+        state.shutdown().await;
+        let exit_index = frames.iter().position(|frame| {
+            frame["event"]["type"] == "freshAgent.status" && frame["event"]["status"] == "exited"
+        });
+        let error_index = frames.iter().position(|frame| {
+            frame["event"]["type"] == "freshAgent.error"
+                && frame["event"]["code"] == "CODEX_NOTIFICATION_DRAIN_ABORTED"
+        });
+        assert!(
+            error_reported,
+            "an aborted consumer must surface a persistent terminal error: {frames:?}"
+        );
+        assert!(
+            exit_index
+                .zip(error_index)
+                .is_some_and(|(exit, error)| exit < error),
+            "the source must be marked exited before reporting the terminal error"
+        );
+        assert!(
+            exited && !pending,
+            "the session must be eligible for normal recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_stop_cancels_pending_drain_and_allows_replacement() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (state, _) = state_with_bus();
+        let mut command = tokio::process::Command::new("cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let mut events = insert_fake_session_with_real_consumer(
+            &state,
+            "thread-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            notifs,
+            child,
+            "codex-abandoned-drain",
+        )
+        .await;
+        let gate = state.sessions.lock().await["thread-1"]
+            .event_emission_gate
+            .clone();
+        let held = gate.lock().await;
+        peer.emit_notification(
+            "error",
+            json!({"threadId":"thread-1","turnId":"turn-1",
+            "willRetry":false,"error":{"message":"queued provider error"}}),
+        );
+        peer.disconnect();
+        drop(child_stdin);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.notification_drain_pending("thread-1").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exit begins draining");
+        let reserved = matches!(
+            state.ensure_session_alive("thread-1", None).await,
+            Err(EnsureAliveError::Draining)
+        );
+
+        // A user-requested stop removes the old incarnation, then a new
+        // owner can be installed without the old watcher publishing its exit.
+        let old = state.sessions.lock().await.remove("thread-1").unwrap();
+        let old_state = state.clone();
+        let stop = tokio::spawn(async move {
+            old_state
+                .settle_removed_session("thread-1", old, None, None)
+                .await
+        });
+        let (replacement_transport, replacement_peer) = freshell_codex::new_channel_transport();
+        let (replacement_client, _replacement_notifs) =
+            CodexAppServerClient::connect(replacement_transport);
+        insert_fake_session(
+            &state,
+            "thread-1",
+            Arc::new(replacement_client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-replacement-drain",
+        )
+        .await;
+        replacement_peer.disconnect();
+        let stopped_without_gate = tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .is_ok();
+        drop(held);
+        let mut stale_exit = false;
+        while let Ok(frame) = events.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            stale_exit |= frame["event"]["type"] == "freshAgent.status"
+                && frame["event"]["status"] == "exited";
+        }
+        state.shutdown().await;
+        assert!(reserved, "an incomplete stream must remain reserved");
+        assert!(
+            stopped_without_gate,
+            "requested stop must not wait for the blocked consumer"
+        );
+        assert!(
+            !stale_exit,
+            "the old incarnation must not publish exit after replacement"
+        );
+    }
+
+    #[tokio::test]
     async fn requested_exit_watcher_reports_confirmed_reap() {
         let _process_fixture = crate::session_lease::process_fixture::lock().await;
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
@@ -17074,6 +19772,7 @@ pub(crate) mod tests {
                 turn_state: turn_state.clone(),
                 client,
                 sidecar_pid: None,
+                sidecar_identity: None,
                 sidecar_ownership_id: String::new(),
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
@@ -17091,8 +19790,10 @@ pub(crate) mod tests {
                     mint_ownership_id(),
                     "thread-stall".to_string(),
                 ))),
+                notification_drain: None,
                 consumer,
                 kill_tx: None,
+                handoff_tx: None,
                 watcher,
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
@@ -30694,12 +33395,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn build_codex_turn_json_appends_synthetic_text_item_for_turn_error() {
-        // CHANGED (was: item appended into the existing turn's `items`): the reference always
-        // gives a turn-level error its OWN synthetic display row with `role: 'assistant'`
-        // (`createSyntheticPendingRow`, `normalize.ts:521-533`) -- it is never folded into an
-        // existing row's item list. With no other items in this raw turn, that means exactly
-        // ONE output turn, whose items are just the synthetic error text.
+    fn build_codex_turn_json_exposes_native_error_as_an_agent_error() {
+        let provider_message = "Selected model is at capacity. Please try a different model.";
+        let raw_turn = json!({
+            "id": "turn-capacity",
+            "status": "failed",
+            "error": { "message": provider_message, "codexErrorInfo": "serverOverloaded" },
+            "items": [
+                { "type": "userMessage", "id": "user", "content": [{"type":"text", "text":"Continue"}] },
+                { "type": "agentMessage", "id": "partial", "text": "partial output" },
+            ],
+        });
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2]["role"], "assistant");
+        assert_eq!(turns[2]["items"], json!([]));
+        assert_eq!(
+            turns[2]["error"],
+            json!({"name":"CodexError", "message":provider_message})
+        );
+        assert_eq!(turns[1]["items"][0]["text"], "partial output");
+    }
+
+    #[test]
+    fn build_codex_turn_json_explains_failed_turns_with_missing_or_empty_error_messages() {
+        for error in [Value::Null, json!(""), json!({"message":"   "})] {
+            let raw_turn = json!({"id":"failed", "status":"failed", "items":[], "error":error});
+            let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0]["error"]["name"], "CodexError");
+            assert!(turns[0]["error"]["message"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty()));
+        }
+        let success = json!({"id":"success", "status":"completed", "items":[], "error":null});
+        assert!(build_codex_turn_json(&success, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_codex_turn_json_shows_itemless_turn_error() {
         let raw_turn = json!({
             "id": "turn-err",
             "error": { "message": "sandbox denied" },
@@ -30708,10 +33442,10 @@ pub(crate) mod tests {
         let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0]["role"], json!("assistant"));
-        assert_eq!(turns[0]["items"][0]["kind"], json!("text"));
+        assert_eq!(turns[0]["items"], json!([]));
         assert_eq!(
-            turns[0]["items"][0]["text"],
-            json!("Codex turn failed: sandbox denied")
+            turns[0]["error"],
+            json!({"name":"CodexError", "message":"sandbox denied"})
         );
     }
 

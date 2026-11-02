@@ -398,7 +398,7 @@ function successResult(method, params) {
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
       const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
-      if (behavior.liveTranscript) {
+      if (behavior.liveTranscript || behavior.turnFailure) {
         turn.status = 'inProgress'
         turn.items = [turn.items[0]]
       }
@@ -1045,6 +1045,13 @@ wss.on('connection', (socket) => {
           turn: { id: result.turn.id, status: 'inProgress' },
         })
         const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        if (behavior.turnFailure && !behavior.liveTranscript) {
+          const threadId = message.params.threadId
+          const turnId = result.turn.id
+          const item = result.turn.items[0]
+          broadcastNotification('item/started', { threadId, turnId, item })
+          broadcastNotification('item/completed', { threadId, turnId, item })
+        }
         if (behavior.liveTranscript && (!behavior.liveTranscriptPrompts || behavior.liveTranscriptPrompts.some(marker => prompt.includes(marker)))) {
           const threadId = message.params.threadId
           const turnId = result.turn.id
@@ -1098,16 +1105,26 @@ wss.on('connection', (socket) => {
           interrupted = response.cancelled === true
         }
         await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
-        behavior.threadStatuses[message.params?.threadId] = 'idle'
+        const recorded = loadRecordedTurns(message.params.threadId)
+        const finished = recorded.find((turn) => turn.id === result.turn.id)
+        if (finished && behavior.turnFailure) {
+          finished.status = interrupted ? 'interrupted' : 'failed'
+          finished.error = interrupted ? null : behavior.turnFailure
+          persistRecordedTurns(message.params.threadId, recorded)
+        }
+        const terminalStatus = interrupted ? 'interrupted' : behavior.turnFailure ? 'failed' : 'completed'
+        const lifecycleFirst = behavior.failureLifecycleFirst && terminalStatus === 'failed'
+        behavior.threadStatuses[message.params?.threadId] = lifecycleFirst ? 'systemError' : 'idle'
         broadcastNotification('thread/status/changed', {
           threadId: message.params?.threadId,
-          status: { type: 'idle' },
+          status: { type: lifecycleFirst ? 'systemError' : 'idle' },
         })
+        if (lifecycleFirst) await new Promise((resolve) => setTimeout(resolve, 100))
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
           turn: behavior.terminalItemsView
-            ? projectTurnItemsView({ ...loadRecordedTurns(message.params.threadId).find(turn => turn.id === result.turn.id), status: interrupted ? 'interrupted' : 'completed' }, behavior.terminalItemsView)
-            : { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
+            ? projectTurnItemsView({ ...finished, status: terminalStatus }, behavior.terminalItemsView)
+            : { id: result.turn.id, status: terminalStatus, ...(terminalStatus === 'failed' ? { error: behavior.turnFailure } : {}) },
         })
       }
       if (method === 'initialize') {

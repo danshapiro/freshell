@@ -121,7 +121,10 @@ function latestUserTurn() {
   return { id: 'user-1', turnId: 'user-1', role: 'user', summary: '', items: [{ id: 'message-1', kind: 'text', text: 'Latest prompt must remain readable' }] }
 }
 
-async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: (changes: Record<string, unknown>) => Promise<void> }> {
+async function seedCompactPane(page: Page, variant: Variant): Promise<{
+  update: (changes: Record<string, unknown>) => Promise<void>
+  setSnapshot: (changes: Record<string, unknown>) => void
+}> {
   await enableFreshClientsAndOpencode(page)
   await routeFileApis(page, '/tmp')
   await page.route('**/api/fresh-agent/model-capabilities/**', route => {
@@ -171,9 +174,12 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: 
     if (variant.provider === 'opencode') await expect(page.getByRole('button', { name: /^Diffs:/ })).toHaveCount(0)
     else await expect(page.getByRole('button', { name: 'Diffs: 30 changed files' })).toBeVisible()
   }
-  return { update: async changes => {
-    const previousHits = hits()
+  const setSnapshot = (changes: Record<string, unknown>) => {
     current = { ...current, ...changes, revision: Number(current.revision ?? 1) + 1 }
+  }
+  return { setSnapshot, update: async changes => {
+    const previousHits = hits()
+    setSnapshot(changes)
     await page.evaluate(v => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({ type: 'freshAgent.event', sessionId: `compact-${v.sessionType}`, sessionType: v.sessionType, provider: v.provider, event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: v.revision } }), { ...variant, revision: Number(current.revision) })
     await expect.poll(hits).toBeGreaterThan(previousHits)
   } }
@@ -276,6 +282,93 @@ async function hitAndClick(control: Locator): Promise<void> {
   if (!probe.hit) await saveScreenshot(control.page(), `test-results/compact-geometry-failure-hit-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
   expect(probe.hit, JSON.stringify(probe)).toBe(true)
   await control.click()
+}
+
+for (const size of [{ width: 390, height: 700 }, { width: 390, height: 320 }, { width: 560, height: 320 }, { width: 1100, height: 700 }]) {
+  test(`provider error cause stays readable with pending controls at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light' })
+    await page.evaluate(() => {
+      const h = window.__FRESHELL_TEST_HARNESS__!
+      const state = h.getState()
+      const tabId = state.tabs.activeTabId!
+      h.dispatch({ type: 'settings/updateSettingsLocal', payload: { sidebar: { collapsed: true } } })
+      h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: state.panes.activePane[tabId], updates: { createError: undefined } } })
+    })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+    await expect(page.locator('.fresh-agent-errors')).toHaveCount(0)
+    const unmodifiedColumns = await page.locator('.fresh-agent-top-stack').evaluate(node => ({
+      notice: node.querySelector('.fresh-agent-notices')!.getBoundingClientRect().width,
+      diff: node.querySelector('.fresh-agent-diff-panel')!.getBoundingClientRect().width,
+    }))
+    expect(unmodifiedColumns.notice).toBeCloseTo(unmodifiedColumns.diff, 0)
+    await page.evaluate(() => {
+      const h = window.__FRESHELL_TEST_HARNESS__!
+      h.receiveWsMessage?.({
+        type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+        event: { type: 'freshAgent.error', code: 'CODEX_PROVIDER_ERROR', message: 'Selected model is at capacity. Please try a different model.' },
+      })
+    })
+
+    const summary = page.locator('[data-agent-error="session"] summary')
+    await expect(summary).toBeVisible()
+    await expect(summary).toContainText('Selected model is at capacity')
+    const cause = await summary.evaluate(element => {
+      const text = element.querySelector('[role="alert"]')?.firstChild
+      const needle = 'Selected model is at capacity'
+      if (!(text instanceof Text)) return { readable: false, reason: 'missing summary text' }
+      const start = text.data.indexOf(needle)
+      if (start < 0) return { readable: false, reason: 'missing provider cause' }
+      const range = document.createRange()
+      range.setStart(text, start)
+      range.setEnd(text, start + needle.length)
+      const rects = Array.from(range.getClientRects())
+      const clips: DOMRect[] = []
+      for (let ancestor: Element | null = element; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor)
+        if (/(auto|hidden|scroll|clip)/.test(style.overflowX) || /(auto|hidden|scroll|clip)/.test(style.overflowY)) {
+          clips.push(ancestor.getBoundingClientRect())
+        }
+      }
+      const readable = rects.length > 0 && rects.every(rect => rect.width > 0 && rect.height > 0
+        && rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0 && rect.bottom <= window.innerHeight
+        && clips.every(clip => rect.left >= clip.left - 1 && rect.right <= clip.right + 1 && rect.top >= clip.top - 3 && rect.bottom <= clip.bottom + 3))
+      return { readable, rects: rects.map(({ x, y, width, height }) => ({ x, y, width, height })),
+        clips: clips.map(({ x, y, width, height }) => ({ x, y, width, height })) }
+    })
+    expect(cause.readable, JSON.stringify(cause)).toBe(true)
+    await expect(page.getByRole('status', { name: '3 pending requests' })).toBeVisible()
+    if (size.width === 390 && size.height === 320) {
+      const count = await page.locator('.fresh-agent-request-count').evaluate(element => {
+        const style = getComputedStyle(element, '::after')
+        const text = style.content.slice(1, -1)
+        const canvas = document.createElement('canvas')
+        const context = canvas.getContext('2d')!
+        context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+        return { text, needed: context.measureText(text).width, available: element.getBoundingClientRect().width }
+      })
+      expect(count.text).toBe('3 pending')
+      expect(count.needed).toBeLessThanOrEqual(count.available)
+    }
+    await expect(page.getByRole('status', { name: 'Agent notices' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Diffs: 30 changed files' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Yes', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Allow tool use' })).toBeVisible()
+    await assertUsefulSpace(page)
+    const notice = page.getByRole('status', { name: 'Agent notices' }).locator('summary')
+    await hitAndClick(notice)
+    await expect(notice.locator('..')).toHaveAttribute('open')
+    await hitAndClick(notice)
+    await hitAndClick(page.getByRole('button', { name: 'Diffs: 30 changed files' }))
+    const changes = page.getByRole('dialog', { name: 'Changes' })
+    await expect(changes).toBeVisible()
+    await changes.getByRole('button', { name: 'Close', exact: true }).click()
+    await hitAndClick(page.getByRole('button', { name: 'Yes', exact: true }))
+    await hitAndClick(page.getByRole('button', { name: 'Allow tool use' }))
+  })
 }
 
 for (const [sessionType, provider] of [['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode']]) {
@@ -648,6 +741,82 @@ test('Codex multi-turn projection keeps all session files across native patch ch
   await assertSessionRows()
 })
 
+test('retained unattributed Codex errors remain visible after a browser reload', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const message = 'Selected model is at capacity. Please try a different model.'
+  const state = await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light',
+    snapshot: { extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent', unattributedProviderError: message } } } })
+  const error = page.locator('[data-agent-error="codex-unattributed"]')
+  await expect(error.locator('summary')).toContainText(message)
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+
+  // A canonical saved session reference lets the normal pane restore path
+  // re-read the retained snapshot after the document is recreated.
+  const sessionId = '6eaf5e4c-708e-4aba-a7c0-2926e061f925'
+  await page.evaluate(id => {
+    const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!; const paneId = s.panes.activePane[tabId]
+    const content = (s.panes.layouts[tabId] as { content: Record<string, unknown> }).content
+    h.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content: { ...content, sessionId: id, sessionRef: { provider: 'codex', sessionId: id }, resumeSessionId: id } } })
+  }, sessionId)
+  await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-session-id', sessionId)
+  await expect.poll(() => page.evaluate(id => Object.keys(localStorage).some(key => key.startsWith('freshell.layout.v3.') && localStorage.getItem(key)?.includes(id)), sessionId)).toBe(true)
+  await page.addInitScript(() => {
+    ;(window as typeof window & { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = true
+  })
+  await page.reload()
+  await expect(error.locator('summary')).toContainText(message, { timeout: 30_000 })
+  await hitAndClick(error.locator('summary'))
+  await expect(error).toContainText('the associated turn could not be confirmed')
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+
+  const savedHistory = { id: 'saved-answer', turnId: 'saved-answer', role: 'assistant', summary: 'Saved history is still available',
+    items: [{ id: 'saved-answer-text', kind: 'text', text: 'Saved history is still available' }] }
+  state.setSnapshot({ turns: [latestUserTurn(), savedHistory],
+    extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true } } })
+  await page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
+    event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: 2 },
+  }), sessionId)
+  await expect(page.getByText('Saved history is still available', { exact: true })).toBeVisible()
+  await expect(error.locator('summary')).toContainText(message)
+
+  state.setSnapshot({ extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true, unattributedProviderErrorAuthoritative: true } } })
+  await page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
+    event: { type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' },
+  }), sessionId)
+  await expect(error).toHaveCount(0)
+  await expect(page.getByText('The provider warning was cleared.', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+})
+
+test('a pending Codex error stays visible until the failed turn is shown', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const message = 'Selected model is at capacity. Please try a different model.'
+  const turnId = 'pending-capacity-turn'
+  const state = await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light',
+    snapshot: { extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent', pendingProviderError: { turnId, message } } } } })
+  const pending = page.locator('[data-agent-error="codex-pending"]')
+  await expect(pending.locator('summary')).toContainText(message)
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+
+  state.setSnapshot({ turns: [latestUserTurn(), { id: turnId, turnId, role: 'assistant', summary: '', items: [],
+    error: { name: 'CodexError', message } }],
+  extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent' } } })
+  await page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+    event: { type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', turnId: id, outcome: 'failed', message: 'The provider warning was cleared.' },
+  }), turnId)
+  await expect(pending).toHaveCount(0)
+  await expect(page.getByTestId('fresh-agent-turn-error')).toContainText(message)
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
 test('routed OpenCode daemon loss exposes diagnostic and keeps the conversation recoverable', async ({ freshellPage, page, terminal }) => {
   void freshellPage
   await terminal.waitForTerminal()
@@ -659,8 +828,8 @@ test('routed OpenCode daemon loss exposes diagnostic and keeps the conversation 
     event: { type: 'freshAgent.error', code: 'OPENCODE_DAEMON_LOST', message: 'The opencode serve daemon was lost unexpectedly' },
   }))
   const error = page.locator('[data-agent-error="session"]')
-  await expect(error.getByRole('alert')).toHaveText('Agent error')
-  await expect(error.getByText('Agent error: The opencode serve daemon was lost unexpectedly', { exact: true })).toBeHidden()
+  await expect(error.locator('summary')).toContainText('The opencode serve daemon was lost unexpectedly')
+  await expect(error.locator('.fresh-agent-diagnostic-body')).toBeHidden()
   await hitAndClick(error.locator('summary'))
   await expect(error).toContainText('The opencode serve daemon was lost unexpectedly')
   await state.update({ status: 'idle' })
@@ -731,7 +900,7 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     }))
     const stack = page.getByRole('group', { name: 'Agent requests and status' })
     await stack.getByText('Notice details', {exact: true}).click()
-    await stack.getByText('Agent could not start', {exact: true}).click()
+    await stack.locator('[data-agent-error="create"] summary').click()
     const body = stack.locator('[data-agent-error="create"] .fresh-agent-diagnostic-body')
     await body.scrollIntoViewIfNeeded()
     const geometry = await body.evaluate(el => {
@@ -793,10 +962,10 @@ test('short panes keep warning summary text readable', async ({ freshellPage, pa
     const range = document.createRange(); range.selectNodeContents(el)
     const rects = [...range.getClientRects()]
     const parent = el.closest('.fresh-agent-errors')!.getBoundingClientRect()
-    return { textRects: rects.length, fullyVisible: rects.every(rect => rect.top >= parent.top && rect.bottom <= parent.bottom && rect.left >= parent.left && rect.right <= parent.right) }
+    return { textRects: rects.length, fullyVisible: rects.every(rect => rect.top >= parent.top && rect.bottom <= parent.bottom && rect.left >= parent.left && rect.right <= parent.right), rects: rects.map(({ x, y, width, height }) => ({ x, y, width, height })), parent: { x: parent.x, y: parent.y, width: parent.width, height: parent.height } }
   })
   expect(geometry.textRects).toBeGreaterThan(0)
-  expect(geometry.fullyVisible).toBe(true)
+  expect(geometry.fullyVisible, JSON.stringify(geometry)).toBe(true)
   await assertUsefulSpace(page)
 })
 

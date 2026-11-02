@@ -1329,6 +1329,33 @@ impl RuntimeClient {
         }
     }
 
+    /// Read only retained display state under the supervisor's own deadline.
+    /// A distinct command makes older supervisors reject it instead of
+    /// silently treating the deadline as an ordinary unbounded events read.
+    pub async fn fresh_agent_retained_state(
+        &self,
+        soul_id: SoulId,
+        max_duration_ms: u64,
+    ) -> Result<Option<serde_json::Value>, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentReadRetainedState(
+                    freshell_runtime_protocol::FreshAgentReadRetainedStateRequest {
+                        soul_id,
+                        max_duration_ms,
+                        expected_control_epoch: Some(epoch),
+                    },
+                ),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentEvents(events) => Ok(events.retained_state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
     pub async fn fresh_agent_history(
         &self,
         soul_id: SoulId,
@@ -1523,6 +1550,7 @@ impl RuntimeClient {
                 | AdminCommand::FreshAgentReadSnapshot(_)
                 | AdminCommand::FreshAgentReadChild(_)
                 | AdminCommand::FreshAgentReadEvents(_)
+                | AdminCommand::FreshAgentReadRetainedState(_)
         ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {

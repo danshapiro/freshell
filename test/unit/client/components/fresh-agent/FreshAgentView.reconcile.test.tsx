@@ -543,7 +543,9 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
       receiveWsBoth({ type: 'freshAgent.create.failed', requestId: selected.createRequestId,
         code: 'INVALID_REQUEST', message, retryable: false })
       await flush()
-      fireEvent.click(screen.getByText('Agent could not start', { exact: true }))
+      const summary = document.querySelector('[data-agent-error="create"] summary') as HTMLElement
+      expect(summary).toHaveTextContent(message)
+      fireEvent.click(summary)
       expect(screen.getByText(message)).toBeVisible()
       expect(leafContent(store.getState())).toEqual(expect.objectContaining({ ...selected, status: 'create-failed' }))
       expect(store.getState().freshAgent.pendingCreateFailures[selected.createRequestId]).toEqual({ code: 'INVALID_REQUEST', message, retryable: false })

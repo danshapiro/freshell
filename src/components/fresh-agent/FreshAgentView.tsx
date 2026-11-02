@@ -920,8 +920,29 @@ function getRestoreErrorMessage(reason: RestoreErrorReason): string {
   }
 }
 
+function isVerboseDiagnostic(text: string): boolean {
+  return text.length > 240 || text.split('\n').length > 3
+}
+
+function summarizeDiagnostic(text: string): string {
+  return isVerboseDiagnostic(text) ? `${text.slice(0, 160)}…` : text
+}
+
+function errorSummary(label: string, message: string | null | undefined): string {
+  return summarizeDiagnostic(message ? `${message} — ${label}` : label)
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+type CodexPendingProviderError = { turnId: string; message: string }
+const CODEX_FAILURE_WITHOUT_MESSAGE = 'Codex failed without an error message.'
+
+function readCodexPendingProviderError(value: unknown): CodexPendingProviderError | null {
+  if (!isRecord(value) || typeof value.turnId !== 'string' || !value.turnId.trim()
+    || typeof value.message !== 'string' || !value.message.trim()) return null
+  return { turnId: value.turnId, message: value.message }
 }
 
 /**
@@ -1211,6 +1232,16 @@ export function FreshAgentView({
   const mayFocusNow = usePaneFocusAdoption(paneId, isActivePane, focusEpoch)
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const snapshotRef = useRef<FreshAgentSnapshot | null>(null)
+  // Keep the latest known diagnostic across history-only responses. A null
+  // message records an authoritative clear so older history cannot revive it.
+  const [codexDiagnostic, setCodexDiagnostic] = useState<{ identity: string; message: string | null } | null>(null)
+  const codexDiagnosticVersionRef = useRef(0)
+  const codexDiagnosticAwaitingSnapshotRef = useRef<string | null>(null)
+  const [codexPendingDiagnostic, setCodexPendingDiagnostic] = useState<{ identity: string; error: CodexPendingProviderError | null } | null>(null)
+  const codexPendingDiagnosticVersionRef = useRef(0)
+  const codexPendingDiagnosticAwaitingSnapshotRef = useRef<string | null>(null)
+  const codexPendingTurnRef = useRef<{ identity: string; turnId: string; message: string } | null>(null)
+  const codexPendingFailureRef = useRef<{ identity: string; turnId: string } | null>(null)
   const commitSnapshot = useCallback((next: FreshAgentSnapshot | null) => {
     snapshotRef.current = next
     setSnapshot(next)
@@ -1887,10 +1918,14 @@ export function FreshAgentView({
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
   const snapshotHydrationIdentity = `${paneContent.createRequestId}:${paneContent.sessionType}:${paneContent.provider}:${snapshotThreadId ?? ''}`
+  const snapshotHydrationIdentityRef = useRef(snapshotHydrationIdentity)
+  snapshotHydrationIdentityRef.current = snapshotHydrationIdentity
   const previousSnapshotHydrationIdentityRef = useRef(snapshotHydrationIdentity)
   useEffect(() => {
     if (previousSnapshotHydrationIdentityRef.current === snapshotHydrationIdentity) return
     previousSnapshotHydrationIdentityRef.current = snapshotHydrationIdentity
+    setCodexDiagnostic(current => current?.identity === snapshotHydrationIdentity ? current : null)
+    setCodexPendingDiagnostic(current => current?.identity === snapshotHydrationIdentity ? current : null)
     snapshotDirtyRef.current = false
     surfaceRefreshOwedRef.current = false
     snapshotDirtyVersionRef.current += 1
@@ -3501,6 +3536,50 @@ export function FreshAgentView({
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
       const eventType = readMessageEventType(message)
       const event = message.type === 'freshAgent.event' && isRecord(message.event) ? message.event : undefined
+      const unattributedCodexDiagnosticChanged = eventType === 'freshAgent.notice'
+        && (event?.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
+          || event?.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED')
+      const pendingCodexDiagnosticChanged = eventType === 'freshAgent.notice'
+        && (event?.code === 'CODEX_PENDING_PROVIDER_ERROR'
+          || event?.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED')
+      if (messageBelongsToPane && paneContentRef.current.provider === 'codex' && unattributedCodexDiagnosticChanged) {
+        codexDiagnosticVersionRef.current += 1
+        codexDiagnosticAwaitingSnapshotRef.current = snapshotHydrationIdentityRef.current
+        if (event?.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
+          && typeof event.message === 'string' && event.message.trim()) {
+          setCodexDiagnostic({ identity: snapshotHydrationIdentityRef.current, message: event.message })
+        }
+      }
+      if (messageBelongsToPane && paneContentRef.current.provider === 'codex' && pendingCodexDiagnosticChanged) {
+        codexPendingDiagnosticVersionRef.current += 1
+        codexPendingDiagnosticAwaitingSnapshotRef.current = snapshotHydrationIdentityRef.current
+        if (event?.code === 'CODEX_PENDING_PROVIDER_ERROR') {
+          const error = readCodexPendingProviderError(event)
+          if (error) {
+            const identity = snapshotHydrationIdentityRef.current
+            codexPendingTurnRef.current = { identity, turnId: error.turnId, message: error.message }
+            codexPendingFailureRef.current = null
+            setCodexPendingDiagnostic({ identity, error })
+          }
+        } else if (event?.outcome === 'failed' && typeof event.turnId === 'string'
+          && codexPendingTurnRef.current?.identity === snapshotHydrationIdentityRef.current
+          && codexPendingTurnRef.current.turnId === event.turnId) {
+          codexPendingFailureRef.current = { identity: snapshotHydrationIdentityRef.current, turnId: event.turnId }
+        } else if (event?.outcome === 'other' && typeof event.turnId === 'string' && event.turnId.trim()) {
+          const identity = snapshotHydrationIdentityRef.current
+          const turnId = event.turnId
+          if (codexPendingTurnRef.current?.identity === identity && codexPendingTurnRef.current.turnId === turnId) {
+            codexPendingTurnRef.current = null
+            codexPendingFailureRef.current = null
+          }
+          const snapshotError = snapshotRef.current?.threadId === snapshotThreadIdRef.current
+            ? readCodexPendingProviderError(snapshotRef.current?.extensions?.codex?.pendingProviderError) : null
+          setCodexPendingDiagnostic(current => {
+            const error = current?.identity === identity ? current.error : snapshotError
+            return error?.turnId === turnId ? { identity, error: null } : current
+          })
+        }
+      }
       const eventStatus = typeof event?.status === 'string' ? event.status : undefined
       const previousStatus = agentSessionStatusRef.current ?? paneContentRef.current.status
       const busySnapshotSettled = eventType === 'freshAgent.session.snapshot'
@@ -3514,9 +3593,9 @@ export function FreshAgentView({
       }
       if (messageBelongsToPane && !hiddenRef.current && transcriptChanged && snapshotDirtyRef.current) {
         requestRevealRefresh(true)
-      } else if (messageBelongsToPane && isSnapshotInvalidatingFreshAgentEvent(message)) {
+      } else if (messageBelongsToPane && (isSnapshotInvalidatingFreshAgentEvent(message) || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged)) {
         if (!hiddenRef.current) requestSnapshotRefresh('event')
-        else if (eventClass === 'surface') surfaceRefreshOwedRef.current = true
+        else if (eventClass === 'surface' || unattributedCodexDiagnosticChanged || pendingCodexDiagnosticChanged) surfaceRefreshOwedRef.current = true
       }
       // kata 1wxv: the requesting-sink ack drives the composer refill; rollback
       // refusals render their server-pinned message verbatim. Both match on the
@@ -3673,6 +3752,9 @@ export function FreshAgentView({
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
     const requestSessionWasLost = agentSessionLostRef.current
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
+    const requestCodexDiagnosticVersion = codexDiagnosticVersionRef.current
+    const requestCodexPendingDiagnosticVersion = codexPendingDiagnosticVersionRef.current
+    const requestSnapshotIdentity = snapshotHydrationIdentityRef.current
     const trigger = snapshotRefreshTriggerRef.current
     const refreshSerial = snapshotRefreshSerialRef.current
     const snapshotAuditData = (value: FreshAgentSnapshot) => ({ historyOnly: isNativeHistoryOnlySnapshot(value),
@@ -3733,6 +3815,58 @@ export function FreshAgentView({
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
       if (snapshotAccepted && projectionMetadata) dispatch(transcriptProjectionSnapshotReceived({ ...projectionLocator, snapshot: resolved }))
+      if (provider === 'codex' && (snapshotAccepted || displaySnapshot === resolved)
+        && requestCodexDiagnosticVersion === codexDiagnosticVersionRef.current) {
+        const rawDiagnostic = resolved.extensions?.codex?.unattributedProviderError
+        const message = typeof rawDiagnostic === 'string' && rawDiagnostic.trim() ? rawDiagnostic : null
+        const diagnosticAuthoritative = (!requestReadOnly && !historyOnly)
+          || resolved.extensions?.codex?.unattributedProviderErrorAuthoritative === true
+        if (diagnosticAuthoritative || message) {
+          if (diagnosticAuthoritative && codexDiagnosticAwaitingSnapshotRef.current === requestSnapshotIdentity) {
+            codexDiagnosticAwaitingSnapshotRef.current = null
+          }
+          setCodexDiagnostic(current => {
+            if (snapshotHydrationIdentityRef.current !== requestSnapshotIdentity) return current
+            if (!diagnosticAuthoritative && current?.identity === requestSnapshotIdentity) return current
+            if (current?.identity === requestSnapshotIdentity && current.message === message) return current
+            return { identity: requestSnapshotIdentity, message }
+          })
+        }
+      }
+      if (provider === 'codex' && (snapshotAccepted || displaySnapshot === resolved)
+        && requestCodexPendingDiagnosticVersion === codexPendingDiagnosticVersionRef.current) {
+        const pending = readCodexPendingProviderError(resolved.extensions?.codex?.pendingProviderError)
+        const pendingAuthoritative = (!requestReadOnly && !historyOnly)
+          || resolved.extensions?.codex?.pendingProviderErrorAuthoritative === true
+        const failureTurn = codexPendingFailureRef.current?.identity === requestSnapshotIdentity
+          ? codexPendingFailureRef.current.turnId : undefined
+        const pendingMessage = codexPendingTurnRef.current?.identity === requestSnapshotIdentity
+          ? codexPendingTurnRef.current.message : undefined
+        const failedRowVisible = failureTurn && mergeFreshAgentTranscriptProjection(displaySnapshot, liveProjection).some((row) => (
+          row.error && (row.error.message !== CODEX_FAILURE_WITHOUT_MESSAGE || row.error.message === pendingMessage)
+            && (row.nativeTurnId === failureTurn || row.turnId === failureTurn
+            || (row.turnId.startsWith(`${failureTurn}:row-`) && /^\d+$/.test(row.turnId.slice(`${failureTurn}:row-`.length))))
+        ))
+        // A hosted history response can authoritatively say the provisional
+        // field is absent while its saved failure row is still lagging.
+        const awaitingFailedRow = Boolean(pendingAuthoritative && !pending && failureTurn && !failedRowVisible)
+        if (!awaitingFailedRow && (pendingAuthoritative || pending)) {
+          if (pendingAuthoritative && codexPendingDiagnosticAwaitingSnapshotRef.current === requestSnapshotIdentity) {
+            codexPendingDiagnosticAwaitingSnapshotRef.current = null
+          }
+          if (pendingAuthoritative) {
+            codexPendingTurnRef.current = pending ? { identity: requestSnapshotIdentity, turnId: pending.turnId, message: pending.message } : null
+            if (!pending || failureTurn !== pending.turnId) codexPendingFailureRef.current = null
+          }
+          setCodexPendingDiagnostic(current => {
+            if (snapshotHydrationIdentityRef.current !== requestSnapshotIdentity) return current
+            if (!pendingAuthoritative && current?.identity === requestSnapshotIdentity) return current
+            if (current?.identity === requestSnapshotIdentity && current.error?.turnId === pending?.turnId
+              && current.error?.message === pending?.message) return current
+            return { identity: requestSnapshotIdentity, error: pending }
+          })
+        }
+      }
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
@@ -4535,6 +4669,25 @@ export function FreshAgentView({
   const retainedSnapshot = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.retainedSnapshot : undefined)
   useEffect(() => {
     if (!retainedSnapshot) return
+    if (retainedSnapshot.provider === 'codex') {
+      const identity = snapshotHydrationIdentityRef.current
+      // Retained replay supplies an initial diagnostic, but cannot outrank a
+      // newer live notice until a fresh snapshot confirms that notice.
+      if (codexDiagnosticAwaitingSnapshotRef.current !== identity) {
+        const raw = retainedSnapshot.extensions?.codex?.unattributedProviderError
+        const message = typeof raw === 'string' && raw.trim() ? raw : null
+        setCodexDiagnostic(current => current?.identity === identity && current.message === message
+          ? current : { identity, message })
+      }
+      if (codexPendingDiagnosticAwaitingSnapshotRef.current !== identity) {
+        const error = readCodexPendingProviderError(retainedSnapshot.extensions?.codex?.pendingProviderError)
+        codexPendingTurnRef.current = error ? { identity, turnId: error.turnId, message: error.message } : null
+        codexPendingFailureRef.current = null
+        setCodexPendingDiagnostic(current => current?.identity === identity
+          && current.error?.turnId === error?.turnId && current.error?.message === error?.message
+          ? current : { identity, error })
+      }
+    }
     // A provider-retained source supersedes history requests already in flight.
     snapshotRequestAuthorityRef.current.applied = ++snapshotRequestAuthorityRef.current.next
     commitSnapshot(retainedSnapshot)
@@ -4578,8 +4731,23 @@ export function FreshAgentView({
   useEffect(() => {
     if (!liveNotice || liveNotice.seq <= shownNoticeSeqRef.current) return
     shownNoticeSeqRef.current = liveNotice.seq
+    // These notices update the retained diagnostic panel, independently of
+    // transient notices such as an uncertain delivery warning.
+    if (liveNotice.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
+      || liveNotice.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
+      || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR'
+      || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
     setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level)
   }, [liveNotice, setNotice])
+  const rawUnattributedCodexError = paneContent.provider === 'codex'
+    ? snapshot?.extensions?.codex?.unattributedProviderError : undefined
+  const unattributedCodexError = codexDiagnostic?.identity === snapshotHydrationIdentity
+    ? codexDiagnostic.message ?? undefined
+    : typeof rawUnattributedCodexError === 'string' && rawUnattributedCodexError.trim()
+      ? rawUnattributedCodexError : undefined
+  const pendingCodexError = codexPendingDiagnostic?.identity === snapshotHydrationIdentity
+    ? codexPendingDiagnostic.error
+    : paneContent.provider === 'codex' ? readCodexPendingProviderError(snapshot?.extensions?.codex?.pendingProviderError) : null
   // The session's permission mode converges onto the pane (transcript-live
   // §4.4): when the server states a new mode — the CLI left plan mode after an
   // approved ExitPlanMode, or another device changed it — the pane adopts it,
@@ -5167,13 +5335,19 @@ export function FreshAgentView({
       ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text, onToggle: setNoticeExpanded }] : []),
       ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
-    const verboseNotice = notice && (notice.text.length > 240 || notice.text.split('\n').length > 3)
+    const verboseNotice = notice && isVerboseDiagnostic(notice.text)
     const noticeSummary = verboseNotice
-      ? `${notice.text.slice(0, 160)}…${notice.text === deliveryNoticeRef.current ? ' Check the conversation before sending again.' : ''}`
+      ? `${summarizeDiagnostic(notice.text)}${notice.text === deliveryNoticeRef.current ? ' Check the conversation before sending again.' : ''}`
       : notice?.text
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
-    { id: 'create', summary: 'Agent could not start', content: (pendingCreateFailure || paneContent.createError ? (
+      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
+    { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), content: (pendingCodexError ? (
+                <FreshAgentApprovalBanner text={`Codex reported an error: ${pendingCodexError.message}`} />
+              ) : null) },
+    { id: 'codex-unattributed', level: 'warning' as const, summary: errorSummary('Codex error; turn unconfirmed', unattributedCodexError), content: (unattributedCodexError ? (
+                <FreshAgentApprovalBanner text={`Codex reported an error, but the associated turn could not be confirmed: ${unattributedCodexError}`} />
+              ) : null) },
+    { id: 'create', summary: errorSummary('Agent could not start', (pendingCreateFailure ?? paneContent.createError)?.message), content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
                     text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'}
@@ -5218,13 +5392,13 @@ export function FreshAgentView({
                   ) : null}
                 </div>
               ) : null) },
-    { id: 'restore', summary: 'Restore failed', content: (visibleRestoreFailure ? (
+    { id: 'restore', summary: errorSummary('Restore failed', visibleRestoreFailure), content: (visibleRestoreFailure ? (
                 <FreshAgentApprovalBanner
                   text={visibleRestoreFailure}
                   onDismiss={() => dispatch(clearRestoreFailure(sessionRecordLocator))}
                 />
               ) : null) },
-    { id: 'pane-restore', summary: 'Pane restore failed', content: (visiblePaneRestoreFailure ? (
+    { id: 'pane-restore', summary: errorSummary('Pane restore failed', visiblePaneRestoreFailure), content: (visiblePaneRestoreFailure ? (
                 <FreshAgentApprovalBanner
                   text={visiblePaneRestoreFailure}
                   onDismiss={() => dispatch(updatePaneContent({
@@ -5237,16 +5411,16 @@ export function FreshAgentView({
                   }))}
                 />
               ) : null) },
-    { id: 'load', summary: 'Conversation could not load', content: (visibleLoadError ? (
+    { id: 'load', summary: errorSummary('Conversation could not load', visibleLoadError), content: (visibleLoadError ? (
                 <FreshAgentApprovalBanner text={visibleLoadError} onDismiss={() => setLoadError(null)} />
               ) : null) },
-    { id: 'session', summary: 'Agent error', content: (sessionErrorMessage ? (
+    { id: 'session', summary: errorSummary('Agent error', sessionErrorMessage), content: (sessionErrorMessage ? (
                 <FreshAgentApprovalBanner
                   text={`Agent error: ${sessionErrorMessage}`}
                   onDismiss={() => dispatch(clearSessionError(sessionRecordLocator))}
                 />
               ) : null) },
-    { id: 'close', summary: 'Close failed', content: (paneContent.closeError ? (
+    { id: 'close', summary: errorSummary('Close failed', paneContent.closeError), content: (paneContent.closeError ? (
                 <FreshAgentApprovalBanner
                   text={`Close failed: ${paneContent.closeError}`}
                   onDismiss={() => dispatch(clearPaneCloseError({ tabId, paneId }))}
@@ -5278,7 +5452,7 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null) },
-    { id: 'handoff', summary: 'Reopen failed', content: (paneContent.handoffError ? (
+    { id: 'handoff', summary: errorSummary('Reopen failed', paneContent.handoffError?.message), content: (paneContent.handoffError ? (
                 <SessionHandoffErrorBanner
                   error={paneContent.handoffError}
                   appStore={appStore}
@@ -5387,7 +5561,7 @@ export function FreshAgentView({
         <div className={`${hasSidebarMetadata ? 'fresh-agent-layout--with-sidebar ' : ''}fresh-agent-layout relative z-10 min-h-0 flex-1`}>
           <div className="fresh-agent-main flex min-h-0 flex-1 flex-col">
             <div className="fresh-agent-top-stack" role="group" aria-label="Agent requests and status">
-              {requestCount > 0 ? <div className="fresh-agent-request-count" role="status">{requestCount} pending {requestCount === 1 ? 'request' : 'requests'}</div> : null}
+              {requestCount > 0 ? <div className="fresh-agent-request-count" role="status" data-request-count={requestCount} aria-label={`${requestCount} pending ${requestCount === 1 ? 'request' : 'requests'}`}>{requestCount} pending {requestCount === 1 ? 'request' : 'requests'}</div> : null}
               <div className="fresh-agent-top-stack-content">
               <FreshAgentNoticeStack notices={routineNotices} errors={visibleErrors} />
               {requestCount > 0 ? <div className="fresh-agent-top-stack-scroll" role="region" aria-label="Pending requests">
@@ -5756,6 +5930,8 @@ export function FreshAgentView({
     tabId,
     terminalFontSize,
     triggerRecovery,
+    pendingCodexError,
+    unattributedCodexError,
   ])
 
   useEffect(() => {

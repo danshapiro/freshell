@@ -1062,6 +1062,29 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentEvents(events))
             }
+            AdminCommand::FreshAgentReadRetainedState(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let budget_ms = request.max_duration_ms.min(DEFAULT_HOST_COMMAND_TIMEOUT_MS);
+                let soul_id = request.soul_id;
+                let events = match tokio::time::timeout(
+                    Duration::from_millis(budget_ms),
+                    self.fresh_agent_read_events_inner(soul_id.clone(), 0, 1, true),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::warn!(%soul_id, budget_ms, "freshagent.retained_read_timeout");
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "fresh-agent retained state read timed out",
+                        ));
+                    }
+                };
+                Ok(AdminResult::FreshAgentEvents(events))
+            }
             AdminCommand::RuntimeMetrics(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -3490,6 +3513,17 @@ impl Supervisor {
         after_sequence: u64,
         max_events: u32,
     ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
+        self.fresh_agent_read_events_inner(soul_id, after_sequence, max_events, false)
+            .await
+    }
+
+    async fn fresh_agent_read_events_inner(
+        &self,
+        soul_id: SoulId,
+        after_sequence: u64,
+        max_events: u32,
+        retained_only: bool,
+    ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _guard = lifecycle_lock.lock().await;
         let context = self
@@ -3542,6 +3576,13 @@ impl Supervisor {
                     retained["source"]["incarnationId"] =
                         serde_json::json!(handle.incarnation_id());
                     retained["source"]["hostBootId"] = serde_json::json!(host.host_boot_id);
+                }
+                if retained_only {
+                    // This bounded read is display-only. In particular, a
+                    // cancelled request must not leave a journal-driven
+                    // identity transition or recovery probe in progress.
+                    events.events.clear();
+                    return Ok(events);
                 }
                 let mut observed_current_start = false;
                 let latest_start =

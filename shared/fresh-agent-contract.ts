@@ -257,7 +257,8 @@ export const FreshAgentTurnSchema = z.object({
   // persisted error object as pretty-printed JSON). Claude projects its
   // persisted API-error lines (`ApiError`) and local-command stderr
   // (`CommandError`, e.g. a failed /compact) as item-less turns carrying only
-  // this error. Optional: codex and older servers omit it.
+  // this error. Codex projects failed turns with the provider's message as
+  // `CodexError`. Optional for successful turns and older servers.
   error: z.object({
     // OpenCode error class, e.g. 'UnknownError' / 'MessageAbortedError'.
     name: z.string().min(1),
@@ -291,7 +292,8 @@ export const FreshAgentTranscriptPatchSchema = z.object({
   historyGeneration: EventRevisionSchema,
   afterRevision: EventRevisionSchema.optional(),
   ops: z.array(z.discriminatedUnion('op', [
-    z.object({ ...TranscriptPatchBase, op: z.literal('resetTurn'), turns: z.array(FreshAgentTurnSchema), completedItemIds: z.array(z.string()).optional(), nonAppendableItemIds: z.array(z.string()).optional() }).strict(),
+    // correctSettled replaces and settles a lifecycle-frozen Codex turn.
+    z.object({ ...TranscriptPatchBase, op: z.literal('resetTurn'), turns: z.array(FreshAgentTurnSchema), completedItemIds: z.array(z.string()).optional(), nonAppendableItemIds: z.array(z.string()).optional(), correctSettled: z.literal(true).optional() }).strict(),
     z.object({ ...TranscriptPatchBase, op: z.literal('upsertItem'), row: FreshAgentTurnSchema, item: FreshAgentTranscriptItemSchema, complete: z.boolean().optional() }).strict(),
     z.object({ ...TranscriptPatchBase, op: z.literal('appendItem'), rowId: z.string().min(1), itemId: z.string().min(1), field: z.enum(['text', 'output', 'summary', 'content']), index: z.number().int().nonnegative().max(1023).nullable().optional(), text: z.string() }).strict(),
     z.object({ ...TranscriptPatchBase, op: z.literal('settleTurn'), status: z.string().optional() }).strict(),

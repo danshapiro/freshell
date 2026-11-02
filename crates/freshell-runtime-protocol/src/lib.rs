@@ -3446,6 +3446,17 @@ pub struct FreshAgentReadEventsRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+/// Read retained display state without applying journal identity changes.
+/// The deadline includes waiting for the session's lifecycle lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadRetainedStateRequest {
+    pub soul_id: SoulId,
+    pub max_duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentReadHistoryRequest {
@@ -4479,6 +4490,7 @@ pub enum AdminCommand {
     FreshAgentPrepareNative(FreshAgentInterruptRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
+    FreshAgentReadRetainedState(FreshAgentReadRetainedStateRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
     FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
     FreshAgentModelCatalog(FreshAgentModelCatalogRequest),

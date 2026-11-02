@@ -9,6 +9,8 @@ export type TranscriptProjection = {
   closedItems?: Record<string, true>
   settledTurns?: Record<string, true>
   removedTurns?: Record<string, true>
+  trimmedTurns?: Record<string, true>
+  correctedTurns?: Record<string, number>
   frozenTurns?: Record<string, FreshAgentTurn[]>
   turnRevisions?: Record<string, number>
   previewTurns?: Record<string, true>
@@ -28,24 +30,37 @@ export function applyFreshAgentTranscriptPatch(state: TranscriptProjection, inpu
   if (!parsed.success) return state
   const patch = parsed.data
   if (patch.projectionId !== state.id || patch.historyGeneration < state.historyGeneration) return state
+  const newerGeneration = patch.historyGeneration > state.historyGeneration
+  const hasCorrection = patch.ops.some((op) => op.op === 'resetTurn' && op.correctSettled)
+  const missingPrefix = Boolean(state.needsResnapshot || patch.afterRevision !== undefined && patch.afterRevision > state.eventRevision)
   // Appends can be coalesced across several revisions. The producer states
   // their consumed prefix explicitly; a jump in the final revision is legal.
   // After a gap, consumed revisions describe coverage owed to the client.
   // They cannot authorize another append until a snapshot covers that prefix.
-  if (state.needsResnapshot || patch.afterRevision !== undefined && patch.afterRevision > state.eventRevision) {
+  if (missingPrefix && !hasCorrection) {
     return { ...state, needsResnapshot: true, eventRevision: Math.max(state.eventRevision, ...patch.ops.map((op) => op.revision)) }
   }
-  const next: TranscriptProjection = patch.historyGeneration > state.historyGeneration
-    ? { id: state.id, historyGeneration: patch.historyGeneration, eventRevision: state.eventRevision, turns: [], turnRows: {}, closedItems: {}, settledTurns: {}, removedTurns: {}, turnRevisions: {}, deferredOps: [] }
-    : { ...state, turns: [...state.turns], turnRows: { ...state.turnRows }, closedItems: { ...state.closedItems }, settledTurns: { ...state.settledTurns }, removedTurns: { ...state.removedTurns }, turnRevisions: { ...state.turnRevisions }, deferredOps: [...state.deferredOps ?? []], turnOrder: [...state.turnOrder ?? []], nonAppendableItemIds: { ...state.nonAppendableItemIds } }
+  const next: TranscriptProjection = newerGeneration
+    ? { id: state.id, historyGeneration: patch.historyGeneration, eventRevision: state.eventRevision, turns: [], turnRows: {}, closedItems: {}, settledTurns: {}, removedTurns: { ...state.removedTurns }, trimmedTurns: { ...state.trimmedTurns }, correctedTurns: {}, turnRevisions: {}, deferredOps: [] }
+    : { ...state, turns: [...state.turns], turnRows: { ...state.turnRows }, closedItems: { ...state.closedItems }, settledTurns: { ...state.settledTurns }, removedTurns: { ...state.removedTurns }, trimmedTurns: { ...state.trimmedTurns }, correctedTurns: { ...state.correctedTurns }, turnRevisions: { ...state.turnRevisions }, deferredOps: [...state.deferredOps ?? []], turnOrder: [...state.turnOrder ?? []], nonAppendableItemIds: { ...state.nonAppendableItemIds } }
+  if (missingPrefix || newerGeneration && hasCorrection) next.needsResnapshot = true
   next.nonAppendableItemIds ??= {}
   next.sessionId = patch.sessionId
   for (const op of patch.ops) {
     if (op.revision <= next.eventRevision) continue
     next.eventRevision = op.revision
+    // A failure reset is a complete replacement for its turn. It can be shown
+    // across a gap while the snapshot recovers everything else. A removal is
+    // also self-contained and must take precedence over a later correction.
+    if (missingPrefix && !(op.op === 'resetTurn' && (op.correctSettled || op.turns.length === 0))) continue
     const nativeId = op.nativeTurnId
     next.turnRevisions![nativeId] = op.revision
     if (op.op === 'settleTurn') {
+      if (!next.removedTurns![nativeId] && !next.trimmedTurns![nativeId]) {
+        next.turnRows![nativeId] ??= []
+        next.turnOrder ??= []
+        if (!next.turnOrder.includes(nativeId)) next.turnOrder.push(nativeId)
+      }
       next.settledTurns![nativeId] = true
       if (op.status === 'interrupted') {
         const ids = new Set(next.turnRows![nativeId] ?? [])
@@ -59,17 +74,36 @@ export function applyFreshAgentTranscriptPatch(state: TranscriptProjection, inpu
     }
     if (next.removedTurns![nativeId]) continue
     if (op.op === 'resetTurn') {
-      if (next.settledTurns![nativeId] && op.turns.length > 0) continue
+      if (op.correctSettled) {
+        if (next.trimmedTurns![nativeId] || op.turns.length === 0 || op.turns.some((row) =>
+          (row.nativeTurnId !== undefined && row.nativeTurnId !== nativeId) || !rowBelongsToNativeTurn(row, nativeId))) continue
+        // The producer sends complete failure rows. A client may have missed
+        // the settlement, especially for an itemless turn.
+        next.settledTurns![nativeId] = true
+        next.correctedTurns![nativeId] = op.revision
+        next.deferredOps = next.deferredOps?.filter((deferred) => deferred.nativeTurnId !== nativeId)
+      } else {
+        if (next.settledTurns![nativeId] && op.turns.length > 0) continue
+        if (op.turns.length > 0) delete next.trimmedTurns![nativeId]
+      }
       next.turnOrder ??= []
       if (!next.turnOrder.includes(nativeId)) next.turnOrder.push(nativeId)
       const previousIds = new Set(next.turnRows![nativeId] ?? [])
-      const insertion = next.turns.findIndex((row) => previousIds.has(row.turnId))
+      let insertion = next.turns.findIndex((row) => previousIds.has(row.turnId))
+      if (insertion < 0) {
+        const laterIds = new Set(next.turnOrder.slice(next.turnOrder.indexOf(nativeId) + 1).flatMap((id) => next.turnRows![id] ?? []))
+        insertion = next.turns.findIndex((row) => laterIds.has(row.turnId))
+      }
       next.turns = next.turns.filter((row) => !previousIds.has(row.turnId))
       next.turns.splice(insertion < 0 ? next.turns.length : insertion, 0, ...op.turns)
       next.turnRows![nativeId] = op.turns.map((row) => row.turnId)
       next.nonAppendableItemIds[nativeId] = op.nonAppendableItemIds ?? []
-      if (op.turns.length === 0) next.removedTurns![nativeId] = true
+      if (op.turns.length === 0) {
+        next.removedTurns![nativeId] = true
+        delete next.correctedTurns![nativeId]
+      }
       for (const id of op.completedItemIds ?? []) next.closedItems![itemKey(nativeId, id)] = true
+      if (op.correctSettled) trimSettledTurns(next)
       continue
     }
     if (next.settledTurns![nativeId]) continue
@@ -133,6 +167,9 @@ function trimSettledTurns(state: TranscriptProjection): void {
     bytes -= JSON.stringify(state.turns.filter((row) => group.ids.has(row.turnId))).length
     state.turns = state.turns.filter((row) => !group.ids.has(row.turnId))
     delete state.turnRows![group.id]
+    state.trimmedTurns ??= {}
+    state.trimmedTurns[group.id] = true
+    if (state.correctedTurns) delete state.correctedTurns[group.id]
     count -= 1
   }
 }
@@ -143,6 +180,7 @@ export function freezeTranscriptProjection(state: TranscriptProjection): Transcr
     if (!state.settledTurns?.[id]) for (const row of rows) interrupted.add(row)
   }
   const next: TranscriptProjection = { ...state, closedItems: {}, deferredOps: [], deferredBytes: 0, settledTurns: { ...state.settledTurns },
+    turnRows: { ...state.turnRows }, trimmedTurns: { ...state.trimmedTurns }, correctedTurns: { ...state.correctedTurns },
     turns: state.turns.map((row) => ({ ...row, outputState: { provenance: 'retained', diagnostic: interrupted.has(row.turnId) ? 'interrupted' : row.outputState?.diagnostic ?? 'unsaved', refreshPending: false } })),
   }
   for (const id of Object.keys(state.turnRows ?? {})) next.settledTurns![id] = true
@@ -191,7 +229,9 @@ export function bindTranscriptProjection(previous: TranscriptProjection | undefi
       delete frozenTurns[oldest[0]]
     }
   }
-  return { id, historyGeneration, eventRevision: 0, turns: [], turnRows: {}, sessionId: previous?.sessionId, ...(frozenTurns ? { frozenTurns } : {}) }
+  return { id, historyGeneration, eventRevision: 0, turns: [], turnRows: {}, sessionId: previous?.sessionId,
+    ...(previous?.id === id ? { removedTurns: { ...previous.removedTurns }, trimmedTurns: { ...previous.trimmedTurns } } : {}),
+    ...(frozenTurns ? { frozenTurns } : {}) }
 }
 
 const metadataCache = new WeakMap<object, ProjectionMetadata>()
@@ -278,6 +318,9 @@ function withOutputState(rows: FreshAgentTurn[], state: ProjectionMetadata['turn
 export function mergeFreshAgentTranscriptProjection(snapshot: FreshAgentSnapshot, live?: TranscriptProjection): FreshAgentTurn[] {
   const metadata = readTranscriptProjection(snapshot)
   if (!metadata) return mergeSavedOnlyRetainedOutput(snapshot, live)
+  // Older history may contain turns removed in the new generation. Keep only
+  // the new live rows until a current snapshot establishes membership again.
+  if (live?.id === metadata.id && live.historyGeneration > metadata.historyGeneration) return live.turns
   const currentLive = live?.id === metadata.id && live.historyGeneration === metadata.historyGeneration ? live : undefined
   const liveRows = currentLive?.turnRows ?? {}
   const nativeRows = metadata.turnRows ?? {}
@@ -298,10 +341,11 @@ export function mergeFreshAgentTranscriptProjection(snapshot: FreshAgentSnapshot
     const eventRows = currentLive?.turns.filter((row) => eventIds.has(row.turnId)) ?? []
     const complete = eventRows.some((row) => row.items.some((item) => currentLive?.closedItems?.[itemKey(id, item.id)]))
     const frozenState = eventRows.find((row) => row.outputState?.provenance === 'retained' && !row.outputState.refreshPending)?.outputState
-    const eventWins = eventRows.length > 0 && !finals.has(id)
-      && (saved.length === 0 || frozenState || ((currentLive!.turnRevisions?.[id] ?? 0) > metadata.eventRevision && (!previews.has(id) || complete)))
+    const newerCorrection = (currentLive?.correctedTurns?.[id] ?? 0) > metadata.eventRevision
+    const eventWins = eventRows.length > 0 && (newerCorrection || !finals.has(id)
+      && (saved.length === 0 || frozenState || ((currentLive!.turnRevisions?.[id] ?? 0) > metadata.eventRevision && (!previews.has(id) || complete))))
     const rows = eventWins ? eventRows : saved
-    let state: ProjectionMetadata['turnOutputStates'][string] | undefined = (eventWins && frozenState ? frozenState : undefined) ?? metadata.turnOutputStates?.[id]
+    let state: ProjectionMetadata['turnOutputStates'][string] | undefined = (eventWins && frozenState ? frozenState : undefined) ?? (newerCorrection ? undefined : metadata.turnOutputStates?.[id])
       ?? (eventWins ? { provenance: 'retained' as const, refreshPending: Boolean(currentLive?.settledTurns?.[id]) } : undefined)
     // Legacy recovery message ids may be reconstructed. Keep its unmatched
     // context available without guessing which read item a live item replaces.
@@ -321,12 +365,12 @@ export function mergeFreshAgentTranscriptProjection(snapshot: FreshAgentSnapshot
   }
   const observed = currentLive?.turnOrder ?? Object.keys(liveRows)
   for (const [index, id] of observed.entries()) {
-    if (seen.has(id) || currentLive?.removedTurns?.[id] || finals.has(id)) continue
+    if (seen.has(id) || currentLive?.removedTurns?.[id] || (finals.has(id) && (currentLive?.correctedTurns?.[id] ?? 0) <= metadata.eventRevision)) continue
     const before = result.length
     appendGroup(id, [])
     const added = result.splice(before)
     const anchor = observed.slice(index + 1).find((candidate) => seen.has(candidate) && ((nativeRows[candidate]?.length ?? 0) > 0 || (liveRows[candidate]?.length ?? 0) > 0))
-    const anchorRows = new Set(anchor ? nativeRows[anchor] ?? liveRows[anchor] ?? [] : [])
+    const anchorRows = new Set(anchor ? [...nativeRows[anchor] ?? [], ...liveRows[anchor] ?? []] : [])
     const insertion = result.findIndex((row) => anchorRows.has(row.turnId))
     result.splice(insertion < 0 ? result.length : insertion, 0, ...added)
   }

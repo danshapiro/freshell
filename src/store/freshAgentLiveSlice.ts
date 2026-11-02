@@ -243,9 +243,11 @@ const freshAgentLiveSlice = createSlice({
       for (const id of Object.keys(projection.frozenTurns ?? {})) if (!accepted.has(id)) delete projection.frozenTurns![id]
       for (const id of metadata.nativeFinalTurnIds ?? []) {
         (projection.settledTurns ??= {})[id] = true
+        if ((projection.correctedTurns?.[id] ?? 0) > metadata.eventRevision) continue
         const rows = new Set(projection.turnRows?.[id] ?? [])
         projection.turns = projection.turns.filter((row) => !rows.has(row.turnId))
         if (projection.turnRows) delete projection.turnRows[id]
+        if (projection.correctedTurns) delete projection.correctedTurns[id]
         if (metadata.turnOutputStates[id]?.diagnostic !== 'interrupted' && projection.frozenTurns) delete projection.frozenTurns[id]
       }
     },

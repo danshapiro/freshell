@@ -3499,6 +3499,469 @@ async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_regi
 }
 
 #[tokio::test]
+async fn hosted_saved_history_keeps_only_the_current_retained_codex_diagnostic() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let diagnostic = "Selected model is at capacity. Please try a different model.";
+    for scenario in [
+        "failure-older-unsaved",
+        "failure-unsaved",
+        "failure-same-message-other-turn",
+        "failure-already-saved",
+        "failure-saved-partial",
+        "failure-row-id-collision",
+        "failure-synthetic-success",
+        "failure-foreign-source",
+        "failure-foreign-projection",
+        "matching",
+        "cleared",
+        "foreign-soul",
+        "foreign-incarnation",
+        "foreign-boot",
+        "foreign-native",
+        "foreign-projection",
+        "missing-projection",
+        "empty-projection",
+        "missing-boot",
+        "retained-unavailable",
+        "retained-unsupported",
+        "history-untrusted-authority",
+        "retained-stalled",
+        "changed-inventory",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("retained-history.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let server_reads = reads.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut inventories = 0;
+            let mut stalled_connections = Vec::new();
+            loop {
+                let mut stream = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => accepted.unwrap().0,
+                };
+                let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let result = match request.body {
+                    AdminCommand::Health => Ok(AdminResult::Health {
+                        control_epoch: 7,
+                        installation_id: InstallationId::new(),
+                    }),
+                    AdminCommand::Inventory => {
+                        inventories += 1;
+                        Ok(AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                            "soulId":"owned-soul",
+                            "incarnationId":if scenario == "changed-inventory" && inventories > 1 {"replacement-incarnation"} else {"owned-incarnation"},
+                            "hostBootId":if scenario == "missing-boot" {None} else {Some("owned-boot")},
+                            "launchState":"running", "cleanupState":"none",
+                            "intentRevision":1, "executionGeneration":1, "desiredState":"running",
+                            "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
+                            "evidenceRevision":0, "successfulRecoveriesInWindow":0, "provider":"codex",
+                            "nativeSessionId":"owned-native", "freshAgentSessionId":"managed-public", "freshAgentSessionType":"freshcodex"
+                        })).unwrap()]))
+                    }
+                    AdminCommand::FreshAgentReadSnapshot(read) => {
+                        assert_eq!(read.soul_id.as_str(), "owned-soul");
+                        Err(freshell_runtime_protocol::RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "provider exited",
+                        ))
+                    }
+                    AdminCommand::FreshAgentReadHistory(read) => {
+                        assert_eq!(read.soul_id.as_str(), "owned-soul");
+                        let mut codex =
+                            serde_json::json!({"ownerKind":"vacant","nativeHistoryAvailable":true});
+                        if scenario == "history-untrusted-authority" {
+                            codex["unattributedProviderErrorAuthoritative"] =
+                                serde_json::json!(true);
+                            codex["unattributedProviderError"] =
+                                serde_json::json!("stale saved warning");
+                            codex["pendingProviderErrorAuthoritative"] = serde_json::json!(true);
+                            codex["pendingProviderError"] = serde_json::json!({"turnId":"old","message":"stale pending warning"});
+                        }
+                        let mut turns = vec![
+                            serde_json::json!({"id":"saved-turn","turnId":"saved-turn","role":"assistant","summary":"Saved answer","items":[]}),
+                        ];
+                        if scenario == "failure-same-message-other-turn" {
+                            turns.push(serde_json::json!({"id":"other:row-1","turnId":"other:row-1","role":"assistant","summary":"","items":[],"error":{"name":"CodexError","message":diagnostic}}));
+                        }
+                        if scenario == "failure-older-unsaved" {
+                            turns.push(serde_json::json!({"id":"later:row-0","turnId":"later:row-0","nativeTurnId":"later","role":"user","summary":"Later question","items":[{"id":"later-question","kind":"text","text":"Later question"}]}));
+                            turns.push(serde_json::json!({"id":"later:row-1","turnId":"later:row-1","role":"assistant","summary":"Later saved answer","items":[{"id":"later-answer","kind":"text","text":"Later saved answer"}]}));
+                        }
+                        if matches!(
+                            scenario,
+                            "failure-already-saved"
+                                | "failure-saved-partial"
+                                | "failure-row-id-collision"
+                                | "failure-synthetic-success"
+                        ) {
+                            if scenario == "failure-synthetic-success" {
+                                turns.push(serde_json::json!({"id":"other:row-1","turnId":"other:row-1","role":"assistant","summary":"","items":[{"id":"other:empty-response","kind":"text","text":"Codex completed this turn without recording an assistant response."}]}));
+                            }
+                            turns.push(serde_json::json!({"id":"active:row-0","turnId":"active:row-0","nativeTurnId":"active","role":"user","summary":"Saved question","items":[{"id":"saved-prompt","kind":"text","text":"Saved question"}]}));
+                            if scenario == "failure-already-saved" {
+                                turns.push(serde_json::json!({"id":"active:row-1","turnId":"active:row-1","role":"assistant","summary":"","items":[],"error":{"name":"CodexError","message":diagnostic}}));
+                            } else if scenario == "failure-synthetic-success" {
+                                turns.push(serde_json::json!({"id":"active:row-1","turnId":"active:row-1","role":"assistant","summary":"","items":[{"id":"active:empty-response","kind":"text","text":"Codex completed this turn without recording an assistant response."}]}));
+                            } else {
+                                turns.push(serde_json::json!({"id":"active:row-1","turnId":"active:row-1","role":"assistant","summary":"Saved partial answer","items":[{"id":"saved-partial","kind":"text","text":"Saved partial answer"}]}));
+                                if scenario == "failure-row-id-collision" {
+                                    turns.push(serde_json::json!({"id":"active:row-2","turnId":"active:row-2","role":"assistant","summary":"Another saved item","items":[{"id":"saved-other","kind":"text","text":"Another saved item"}]}));
+                                }
+                            }
+                        }
+                        Ok(AdminResult::FreshAgentHistory(serde_json::json!({
+                            "threadId":"owned-native", "provider":"codex", "sessionType":"freshcodex", "status":"idle",
+                            "turns":turns,
+                            "capabilities":{"send":true,"interrupt":true,"approvals":true,"questions":true,"fork":true},
+                            "extensions":{"codex":codex}
+                        })))
+                    }
+                    AdminCommand::FreshAgentReadRetainedState(read) => {
+                        assert_eq!(read.soul_id.as_str(), "owned-soul");
+                        assert_eq!(read.max_duration_ms, 1_500);
+                        server_reads.fetch_add(1, Ordering::SeqCst);
+                        if scenario == "retained-stalled" {
+                            // Hold this request open while still serving the
+                            // final inventory check on other connections.
+                            stalled_connections.push(stream);
+                            continue;
+                        }
+                        if scenario == "retained-unsupported" {
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::InvalidRequest,
+                                "unsupported retained-state command",
+                            ))
+                        } else if scenario == "retained-unavailable"
+                            || scenario == "history-untrusted-authority"
+                        {
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::HostUnreachable,
+                                "retained state unavailable",
+                            ))
+                        } else {
+                            let mut codex = serde_json::json!({"projection":{"id":if scenario == "empty-projection" {""} else {"owned-projection"}}});
+                            let failure_scenario = scenario.starts_with("failure-");
+                            let mut retained_turns = Vec::new();
+                            if failure_scenario {
+                                codex["projection"]["historyGeneration"] = serde_json::json!(0);
+                                codex["projection"]["eventRevision"] = serde_json::json!(7);
+                                codex["projection"]["eventOwnedTurnIds"] =
+                                    serde_json::json!(["active"]);
+                                codex["projection"]["nativePreviewTurnIds"] = serde_json::json!([]);
+                                codex["projection"]["nativeFinalTurnIds"] = serde_json::json!([]);
+                                codex["projection"]["settledTurnIds"] =
+                                    serde_json::json!(["active"]);
+                                codex["projection"]["turnRows"] = serde_json::json!({"active":["active:row-0","active:row-1","active:row-2"]});
+                                codex["projection"]["turnOutputStates"] = serde_json::json!({"active":{"provenance":"retained","diagnostic":"unsaved","refreshPending":false}});
+                                retained_turns = vec![
+                                    serde_json::json!({"id":"active:row-0","turnId":"active:row-0","nativeTurnId":"active","role":"user","summary":"Retained prompt","items":[{"id":"retained-prompt","kind":"text","text":"Retained prompt must not be copied"}]}),
+                                    serde_json::json!({"id":"active:row-1","turnId":"active:row-1","role":"assistant","summary":"Retained output","items":[{"id":"retained-output","kind":"text","text":"Retained output must not be copied"}]}),
+                                    serde_json::json!({"id":"active:row-2","turnId":"active:row-2","role":"assistant","summary":"","items":[],"error":{"name":"CodexError","message":diagnostic}}),
+                                ];
+                                if scenario == "failure-older-unsaved" {
+                                    // The retained and saved displays can split
+                                    // the same native turn into different rows.
+                                    retained_turns.push(serde_json::json!({"id":"later","turnId":"later","role":"assistant","summary":"Later retained answer","items":[{"id":"later-retained","kind":"text","text":"Later retained answer"}]}));
+                                    codex["projection"]["nativeFinalTurnIds"] =
+                                        serde_json::json!(["later"]);
+                                    codex["projection"]["turnRows"]["later"] =
+                                        serde_json::json!(["later"]);
+                                }
+                            }
+                            if scenario == "missing-projection" {
+                                codex.as_object_mut().unwrap().remove("projection");
+                            }
+                            if scenario != "cleared" && !failure_scenario {
+                                codex["unattributedProviderError"] = serde_json::json!(diagnostic);
+                                codex["pendingProviderError"] = serde_json::json!({"turnId":"active","message":"pending provider warning"});
+                            }
+                            Ok(AdminResult::FreshAgentEvents(serde_json::from_value(serde_json::json!({
+                                "retainedFrom":1, "head":1, "resetRequired":false, "events":[],
+                                "retainedState":{
+                                    "source":{
+                                        "soulId":if scenario == "foreign-soul" {"other-soul"} else {"owned-soul"},
+                                        "incarnationId":if matches!(scenario, "foreign-incarnation" | "failure-foreign-source") {"other-incarnation"} else {"owned-incarnation"},
+                                        "hostBootId":if scenario == "foreign-boot" {"other-boot"} else {"owned-boot"},
+                                        "projectionId":if matches!(scenario, "foreign-projection" | "failure-foreign-projection") {"other-projection"} else if scenario == "empty-projection" {""} else {"owned-projection"},
+                                        "ownerEpoch":0, "ownerGeneration":0
+                                    },
+                                    "snapshot":{
+                                        "threadId":if scenario == "foreign-native" {"other-native"} else {"owned-native"},
+                                        "provider":"codex", "sessionType":"freshcodex", "status":"exited",
+                                        "turns":retained_turns, "extensions":{"codex":codex}
+                                    },
+                                    "attentionMarks":[], "pendingControls":[]
+                                }
+                            })).unwrap()))
+                        }
+                    }
+                    other => panic!("unexpected hosted snapshot request: {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            drop(stalled_connections);
+        });
+
+        let broadcast = Arc::new(broadcast::channel(16).0);
+        let owner =
+            freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), broadcast.clone());
+        owner
+            .set_hosted_rest_gateway(snapshot_outage_proxy(&socket))
+            .unwrap();
+        let app = freshell_freshagent::snapshot::router(freshell_freshagent::SnapshotState::new(
+            Arc::new("tok".into()),
+            freshell_freshagent::FreshCodexState::new(
+                Arc::new("tok".into()),
+                broadcast.clone(),
+                serde_json::json!({}),
+            ),
+            owner,
+            freshell_freshagent::FreshClaudeState::new(broadcast),
+        ));
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            snapshot_route_value(&app, "freshcodex", "codex", "owned-native"),
+        )
+        .await;
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (status, snapshot) =
+            result.expect("saved history must not wait indefinitely for retained state");
+        if scenario == "changed-inventory" {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{scenario}: {snapshot}"
+            );
+            continue;
+        }
+        assert_eq!(status, axum::http::StatusCode::OK, "{scenario}: {snapshot}");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            if scenario == "missing-boot" { 0 } else { 1 },
+            "{scenario}: read the retained source"
+        );
+        assert_eq!(snapshot["threadId"], "owned-native");
+        assert_eq!(
+            snapshot["turns"][0]["turnId"], "saved-turn",
+            "{scenario}: preserve saved history"
+        );
+        assert_eq!(
+            snapshot["turns"][0],
+            serde_json::json!({"id":"saved-turn","turnId":"saved-turn","role":"assistant","summary":"Saved answer","items":[]})
+        );
+        assert_eq!(snapshot["extensions"]["codex"]["ownerKind"], "vacant");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["nativeHistoryAvailable"],
+            true
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["statusFromLiveState"],
+            false
+        );
+        assert_eq!(snapshot["capabilities"]["send"], false);
+        assert_eq!(snapshot["capabilities"]["interrupt"], false);
+        let valid_failure = scenario.starts_with("failure-")
+            && !matches!(
+                scenario,
+                "failure-foreign-source" | "failure-foreign-projection"
+            );
+        if scenario.starts_with("failure-") {
+            let turns = snapshot["turns"].as_array().unwrap();
+            let failure_rows: Vec<_> = turns
+                .iter()
+                .filter(|turn| turn["error"]["message"] == diagnostic)
+                .collect();
+            assert_eq!(
+                failure_rows.len(),
+                if scenario == "failure-same-message-other-turn" {
+                    2
+                } else {
+                    usize::from(valid_failure)
+                },
+                "{scenario}: {snapshot}"
+            );
+            if valid_failure {
+                let active_failure = failure_rows
+                    .iter()
+                    .copied()
+                    .find(|row| {
+                        let id = row["turnId"].as_str().unwrap();
+                        row["nativeTurnId"] == "active"
+                            || id == "active"
+                            || id
+                                .strip_prefix("active:row-")
+                                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+                    })
+                    .expect("the retained error must stay associated with its native turn");
+                assert_eq!(active_failure["error"]["name"], "CodexError");
+                assert_eq!(active_failure["role"], "assistant");
+                let ids: Vec<_> = turns
+                    .iter()
+                    .map(|turn| turn["turnId"].as_str().unwrap())
+                    .collect();
+                let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+                assert_eq!(
+                    ids.len(),
+                    unique.len(),
+                    "{scenario}: turn IDs must remain unique"
+                );
+                let display = serde_json::to_string(turns).unwrap();
+                assert!(
+                    !display.contains("Retained prompt must not be copied"),
+                    "{scenario}: {snapshot}"
+                );
+                assert!(
+                    !display.contains("Retained output must not be copied"),
+                    "{scenario}: {snapshot}"
+                );
+                if matches!(
+                    scenario,
+                    "failure-already-saved"
+                        | "failure-saved-partial"
+                        | "failure-row-id-collision"
+                        | "failure-synthetic-success"
+                ) {
+                    let saved_user = turns
+                        .iter()
+                        .find(|turn| turn["turnId"] == "active:row-0")
+                        .expect("saved user row remains");
+                    assert_eq!(
+                        *saved_user,
+                        serde_json::json!({"id":"active:row-0","turnId":"active:row-0","nativeTurnId":"active","role":"user","summary":"Saved question","items":[{"id":"saved-prompt","kind":"text","text":"Saved question"}]})
+                    );
+                }
+                match scenario {
+                    "failure-older-unsaved" => {
+                        assert_eq!(turns.len(), 4);
+                        let failure_at = turns
+                            .iter()
+                            .position(|turn| turn["turnId"] == active_failure["turnId"])
+                            .unwrap();
+                        let later_at = turns
+                            .iter()
+                            .position(|turn| turn["turnId"] == "later:row-0")
+                            .unwrap();
+                        assert!(
+                            failure_at < later_at,
+                            "an earlier retained failure must appear before the later saved turn"
+                        );
+                        assert_eq!(
+                            turns[later_at],
+                            serde_json::json!({"id":"later:row-0","turnId":"later:row-0","nativeTurnId":"later","role":"user","summary":"Later question","items":[{"id":"later-question","kind":"text","text":"Later question"}]})
+                        );
+                        assert_eq!(
+                            turns[later_at + 1],
+                            serde_json::json!({"id":"later:row-1","turnId":"later:row-1","role":"assistant","summary":"Later saved answer","items":[{"id":"later-answer","kind":"text","text":"Later saved answer"}]})
+                        );
+                    }
+                    "failure-unsaved" => assert_eq!(turns.len(), 2),
+                    "failure-same-message-other-turn" => {
+                        assert_eq!(
+                            turns.len(),
+                            3,
+                            "an unrelated turn with the same error must remain distinct"
+                        );
+                        assert!(turns.iter().any(|turn| turn["turnId"] == "other:row-1"
+                            && turn["error"]["message"] == diagnostic));
+                    }
+                    "failure-already-saved" => {
+                        assert_eq!(turns.len(), 3, "a saved failure must not be duplicated");
+                        assert_eq!(active_failure["turnId"], "active:row-1");
+                    }
+                    "failure-saved-partial" | "failure-row-id-collision" => {
+                        assert!(
+                            display.contains("Saved partial answer"),
+                            "{scenario}: {snapshot}"
+                        );
+                        if scenario == "failure-row-id-collision" {
+                            assert!(display.contains("Another saved item"));
+                        }
+                    }
+                    "failure-synthetic-success" => {
+                        assert!(
+                            !display.contains("active:empty-response"),
+                            "the failed turn cannot retain the generated success row"
+                        );
+                        assert!(
+                            display.contains("other:empty-response"),
+                            "other turns remain untouched"
+                        );
+                        assert!(display.contains("Saved question"));
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                assert_eq!(turns.len(), 1, "a foreign retained source cannot add turns");
+            }
+            assert!(
+                snapshot["extensions"]["codex"].get("projection").is_none(),
+                "{scenario}: saved history must not claim the retained projection"
+            );
+        }
+        let codex = &snapshot["extensions"]["codex"];
+        if scenario == "matching" || scenario == "cleared" || valid_failure {
+            assert_eq!(
+                codex["unattributedProviderErrorAuthoritative"], true,
+                "{scenario}: {snapshot}"
+            );
+            if scenario == "matching" {
+                assert_eq!(codex["unattributedProviderError"], diagnostic);
+                assert_eq!(
+                    codex["pendingProviderError"],
+                    serde_json::json!({"turnId":"active","message":"pending provider warning"})
+                );
+            } else {
+                assert!(
+                    codex.get("unattributedProviderError").is_none(),
+                    "{scenario}: {snapshot}"
+                );
+                assert!(codex.get("pendingProviderError").is_none());
+            }
+            assert_eq!(
+                codex["pendingProviderErrorAuthoritative"], true,
+                "{scenario}: {snapshot}"
+            );
+        } else {
+            assert!(
+                codex
+                    .get("unattributedProviderErrorAuthoritative")
+                    .is_none(),
+                "{scenario}: {snapshot}"
+            );
+            assert!(
+                codex.get("unattributedProviderError").is_none(),
+                "{scenario}: {snapshot}"
+            );
+            assert!(
+                codex.get("pendingProviderError").is_none(),
+                "{scenario}: {snapshot}"
+            );
+            assert!(
+                codex.get("pendingProviderErrorAuthoritative").is_none(),
+                "{scenario}: {snapshot}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_wrong_local_store() {
     let mut env = crate::test_env_lock::TestEnv::lock().await;
