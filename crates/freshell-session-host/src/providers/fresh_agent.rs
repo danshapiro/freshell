@@ -1971,6 +1971,7 @@ impl FreshAgentTransport for HostedTransport {
             session_type: self.session_type(),
             input,
             request_id: Some(request_id.as_str().to_string()),
+            view_id: None,
             cwd: self
                 .profile
                 .lock()
