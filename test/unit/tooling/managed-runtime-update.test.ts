@@ -1840,7 +1840,7 @@ it('post-update scan must be complete and unblocked before success', async () =>
   expect(f.events).not.toContainEqual(expect.objectContaining({ event: 'update.completed' }))
 })
 
-it('post-update readiness accepts a complete ownership report while new host work is open', async () => {
+it('web-only completion reports post-start host and unknown ownership while leaving it running', async () => {
   const f = dependencies()
   let readCount = 0
   f.runtimeApi.respond('GET', '/api/runtime/readiness', () => {
@@ -1851,7 +1851,15 @@ it('post-update readiness accepts a complete ownership report while new host wor
         ? readinessReport()
         : readinessReport({
           paneOwnership: {
-            panes: [{ clientId: 'client-safe-post-update', tabId: 'tab-safe-post-update', paneId: 'pane-open-after-update', kind: 'fresh-agent', ownership: 'host-managed' }],
+            panes: [{
+              clientId: 'client/post-start', tabId: 'tab post-start', paneId: 'pane\npost-start', kind: 'fresh-agent',
+              provider: 'claude', terminalId: 'terminal-post-start', sessionId: 'session:post-start', ownership: 'host-managed',
+              path: '/private/provider/history', prompt: 'PRIVATE_PROMPT', message: 'PRIVATE_MESSAGE',
+            }],
+            unattachedProcesses: [{
+              kind: 'terminal', source: 'private-source', provider: 'codex', terminalId: 'unknown/terminal',
+              sessionId: 'unknown:session', ownership: 'unknown', reason: 'PRIVATE_REASON', path: '/private/runtime',
+            }],
             readyToStop: false,
           },
         }),
@@ -1861,7 +1869,83 @@ it('post-update readiness accepts a complete ownership report while new host wor
   const result = await runManagedRuntimeWorker('client', f.deps)
 
   expect(result).toBe(0)
-  expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+  const completion = f.events.find((event) => event.event === 'update.completed')
+  expect(completion).toEqual(expect.objectContaining({
+    post_start_ownership: {
+      observed_after_replacement_startup: true,
+      outside_durable_soul_ownership: true,
+      remain_running: true,
+      covered_by_prior_maintenance_lease: false,
+      panes: [{
+        client_id: 'client_post-start', tab_id: 'tab_post-start', pane_id: 'pane_post-start', kind: 'fresh-agent',
+        provider: 'claude', terminal_id: 'terminal-post-start', session_id: 'session:post-start', ownership: 'host-managed',
+      }],
+      unattached_processes: [{
+        kind: 'terminal', provider: 'codex', terminal_id: 'unknown_terminal', session_id: 'unknown:session', ownership: 'unknown',
+      }],
+    },
+  }))
+  const output = f.effects.filter((effect) => effect.startsWith('operator:')).join('\n')
+  expect(output).toContain('observed after replacement startup')
+  expect(output).toContain('outside durable-soul ownership')
+  expect(output).toContain('remain running')
+  expect(output).toContain('not covered by the prior maintenance lease')
+  expect(output).toContain('client_post-start')
+  expect(output).toContain('host-managed')
+  expect(output).toContain('unknown_terminal')
+  expect(output).not.toContain('PRIVATE_PROMPT')
+  expect(output).not.toContain('PRIVATE_MESSAGE')
+  expect(output).not.toContain('PRIVATE_REASON')
+  expect(output).not.toContain('/private/')
+  expect(output).not.toContain('test-auth-token-not-for-output')
+  expect(JSON.stringify(completion)).not.toContain('PRIVATE_')
+  expect(JSON.stringify(completion)).not.toContain('/private/')
+  expect(JSON.stringify(completion)).not.toContain('test-auth-token-not-for-output')
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+})
+
+it('reset completion reports post-start host and unknown ownership while leaving it running', async () => {
+  const f = dependencies()
+  let readCount = 0
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', () => {
+    readCount += 1
+    return {
+      status: 200,
+      body: readCount === 1
+        ? readinessReport()
+        : readinessReport({
+          paneOwnership: {
+            panes: [{
+              clientId: 'reset-client', tabId: 'reset-tab', paneId: 'reset-pane', kind: 'fresh-agent',
+              provider: 'claude', terminalId: 'reset-terminal', ownership: 'host-managed',
+            }],
+            unattachedProcesses: [{ kind: 'terminal', source: 'host-registry', provider: 'codex', terminalId: 'reset-unknown-terminal', ownership: 'unknown', reason: 'unattached' }],
+            readyToStop: false,
+          },
+        }),
+    }
+  })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(0)
+  const completion = f.events.find((event) => event.event === 'update.completed')
+  expect(completion).toEqual(expect.objectContaining({
+    post_start_ownership: expect.objectContaining({
+      observed_after_replacement_startup: true,
+      outside_durable_soul_ownership: true,
+      remain_running: true,
+      covered_by_prior_maintenance_lease: false,
+      panes: [expect.objectContaining({ pane_id: 'reset-pane', ownership: 'host-managed' })],
+      unattached_processes: [expect.objectContaining({ terminal_id: 'reset-unknown-terminal', ownership: 'unknown' })],
+    }),
+  }))
+  const output = f.effects.filter((effect) => effect.startsWith('operator:')).join('\n')
+  expect(output).toContain('reset-pane')
+  expect(output).toContain('reset-unknown-terminal')
+  expect(output).toContain('not covered by the prior maintenance lease')
+  expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
+  expect(f.deps.admin.stop).not.toHaveBeenCalledWith('reset-pane', expect.anything(), expect.anything())
 })
 
 it('default update refuses a changed supervisor identity after web restart', async () => {
