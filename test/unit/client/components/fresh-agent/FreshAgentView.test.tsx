@@ -491,6 +491,16 @@ function getFreshAgentPaneContent(store: ReturnType<typeof createStore>) {
   return layout.content
 }
 
+function expectFreshAgentPaneContentToEqual(
+  store: ReturnType<typeof createStore>,
+  expected: object,
+) {
+  expect(getFreshAgentPaneContent(store)).toEqual({
+    ...expected,
+    viewId: expect.stringMatching(/\S/),
+  })
+}
+
 function finishOutgoingTurn(store: ReturnType<typeof createStore>) {
   const content = getFreshAgentPaneContent(store)
   const locator = { sessionId: content.sessionId!, sessionType: content.sessionType, provider: content.provider }
@@ -914,11 +924,11 @@ describe('picker profile staging', () => {
       expect(wsMock.send).not.toHaveBeenCalled()
       expect(harness.getSentWsMessages?.()).toEqual([])
       expect(store.getState().freshAgent.pendingCreates).toEqual({})
-      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      expectFreshAgentPaneContentToEqual(store, content)
       // A mode mismatch must leave the hold and the picker pane untouched.
       expect(stageOwnedFreshBrowserProfile({ mode: 'wrong-mode', model, effort })).toBeNull()
       expect(harness.isAllFreshAgentNetworkEffectsSuppressed()).toBe(true)
-      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      expectFreshAgentPaneContentToEqual(store, content)
       let staged: ReturnType<typeof stageOwnedFreshBrowserProfile> = null
       act(() => { staged = stageOwnedFreshBrowserProfile({ mode, model, effort }) })
       expect(staged).toEqual({ tabId: 'tab-1', paneId: 'pane-1', createRequestId: content.createRequestId })
@@ -1019,7 +1029,7 @@ describe('stopped managed history', () => {
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
     if (stop === 'pending') expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
     else expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
-    expect(getFreshAgentPaneContent(store)).toEqual(initial)
+    expectFreshAgentPaneContentToEqual(store, initial)
     expectNoStarts()
   })
 
@@ -1029,7 +1039,7 @@ describe('stopped managed history', () => {
     const store = mount(initial)
     expectNoStarts()
     await expectRenderedText('Saved native Codex answer')
-    expect(getFreshAgentPaneContent(store)).toEqual({ ...initial, sessionRef: content.sessionRef })
+    expectFreshAgentPaneContentToEqual(store, { ...initial, sessionRef: content.sessionRef })
   })
 
   it.each([
@@ -1043,7 +1053,7 @@ describe('stopped managed history', () => {
     await act(async () => {})
     expectNoStarts()
     expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
-    expect(getFreshAgentPaneContent(store)).toEqual({ ...initial, sessionRef: sessionRef?.sessionId ? sessionRef : undefined })
+    expectFreshAgentPaneContentToEqual(store, { ...initial, sessionRef: sessionRef?.sessionId ? sessionRef : undefined })
   })
 
   it.each(['create', 'reconnect', 'attach'] as const)('checks stopped intent inside the real queued %s callback and releases its slot', async (operation) => {
@@ -1173,7 +1183,7 @@ describe('stopped managed history', () => {
       previousSessionId: native.threadId, sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
       sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } })))
     await act(async () => {})
-    expect(getFreshAgentPaneContent(store)).toEqual(initial)
+    expectFreshAgentPaneContentToEqual(store, initial)
     expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
     expectNoStarts()
   })
@@ -1216,7 +1226,7 @@ describe('stopped managed history', () => {
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
     await act(async () => {})
     expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
-    expect(getFreshAgentPaneContent(store)).toEqual(next)
+    expectFreshAgentPaneContentToEqual(store, next)
     expectNoStarts()
   })
 
@@ -14541,7 +14551,7 @@ describe('FreshAgentView', () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(3_000 + SNAPSHOT_DEBOUNCE_MS) })
       }
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
-      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      expectFreshAgentPaneContentToEqual(store, content)
       if (recoveryState === 'recovering') {
         expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
         expect(screen.getByRole('textbox', { name: 'Chat message input' }).getAttribute('placeholder')).not.toMatch(/Starting session|Session ended|Agent is working/)
@@ -14723,7 +14733,7 @@ describe('FreshAgentView', () => {
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: recovering })))
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
     await act(async () => {})
-    expect(getFreshAgentPaneContent(store)).toEqual(recovering)
+    expectFreshAgentPaneContentToEqual(store, recovering)
     expect(screen.getByText(answer)).toBeInTheDocument()
     expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
     expect(screen.queryByText(message)).not.toBeInTheDocument()
@@ -15373,8 +15383,8 @@ describe('FreshAgentView', () => {
       expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
     } else expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
     expect(document.querySelector('[data-agent-error="stuck"]')).toBeNull()
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout?.type === 'leaf' && layout.content).toEqual(content)
+    expect(screen.queryByRole('button', { name: /restart sidecar and resume session/i })).not.toBeInTheDocument()
+    expectFreshAgentPaneContentToEqual(store, content)
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
     expect(apiMock.retryManagedRuntimeSoul).not.toHaveBeenCalled()
@@ -15398,7 +15408,7 @@ describe('FreshAgentView', () => {
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
       await expectRenderedText(`Saved native ${provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, history.threadId, expect.objectContaining({ soulId: content.soulId }))
-      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      expectFreshAgentPaneContentToEqual(store, content)
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
       expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
     },
@@ -15422,7 +15432,7 @@ describe('FreshAgentView', () => {
     await expectRenderedText(/Patch saved/)
     expect(screen.getByText(/\*\*\* Begin Patch/, { selector: 'pre' })).toBeInTheDocument()
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', history.threadId, expect.objectContaining({ soulId: content.soulId }))
-    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expectFreshAgentPaneContentToEqual(store, content)
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
   })
@@ -15770,8 +15780,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => expect(document.querySelector('[data-agent-error="load"] summary')).toHaveTextContent('Saved Claude transcript could not be read'))
     expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
     expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout?.type === 'leaf' && layout.content).toEqual(content)
+    expectFreshAgentPaneContentToEqual(store, content)
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
   })
 
@@ -16051,7 +16060,7 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('note', { name: 'Retained conversation history' })).toHaveTextContent(
       'Showing retained conversation history. Older turns or large content were omitted from this view. The saved conversation has not been changed.')
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
-    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expectFreshAgentPaneContentToEqual(store, content)
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
   })
 
@@ -16072,12 +16081,12 @@ describe('FreshAgentView', () => {
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     await expectRenderedText('Conversation retained before starting new')
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'cold-lost-thread', expect.not.objectContaining({ soulId: expect.anything() }))
-    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expectFreshAgentPaneContentToEqual(store, content)
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
     expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent('Your conversation has been kept')
-    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expectFreshAgentPaneContentToEqual(store, content)
     expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
     expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
     expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
