@@ -388,7 +388,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         // A create with no locator yet cannot be detached. Retract it locally;
         // if the provider finishes later, its create acknowledgment fold
         // sends a view detach using the remembered viewId.
-        cancelCreate(content.createRequestId)
+        cancelCreate(content.createRequestId, content.viewId ?? content.createRequestId)
         ws.cancelCreate(content.createRequestId)
       }
     }

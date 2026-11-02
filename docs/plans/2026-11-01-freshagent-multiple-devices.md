@@ -265,7 +265,7 @@ git commit -m "fix(freshagent): detach closed views without terminating shared a
 - Consumes: Task 1 attachment/detach and existing canceled-create markers, parent-retired runtime signal, pane/view cleanup.
 - Produces: late-create result consumption scoped by request/view identity; no cleanup Kill for a view cancellation, new conversation or non-retiring fork/repoint.
 
-- [ ] **Step 1: Add failing tests**
+- [x] **Step 1: Add failing tests**
 
 ```text
 Change existing canceled-create regressions to execute this behavior: cancel
@@ -286,13 +286,13 @@ Browser 'stage1 switches': new/fork A, verify B continues parent, including
 provider-required parent retirement as an explicit distinct expected outcome.
 ```
 
-- [ ] **Step 2: Run and observe red**
+- [x] **Step 2: Run and observe red**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t 'other view|late create|parent view' --config config/vitest/vitest.config.ts`
 
 Expected FAIL: canceled late create/new-conversation/fork cleanup kills the shared parent or removes its session state.
 
-- [ ] **Step 3: Apply production patch**
+- [x] **Step 3: Apply production patch**
 
 ```text
 Carry viewId with pending creates/canceled markers. On late created/forked,
@@ -309,7 +309,7 @@ visibility and pane.closed acknowledgment paths, including failed detach
 compensation. Preserve explicit termination and explicit recovery-stop paths.
 ```
 
-- [ ] **Step 4: Green**
+- [x] **Step 4: Green**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t 'other view|late create|parent view' --config config/vitest/vitest.config.ts`
 
@@ -317,17 +317,17 @@ Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-brows
 
 Expected PASS with four provider modes.
 
-- [ ] **Step 5: Refactor**
+- [x] **Step 5: Refactor**
 
 Centralize request/view result matching and scoped cleanup in the attachment helper; remove only obsolete cleanup-kill branches and keep shared termination acknowledgment tests intact.
 
-- [ ] **Step 6: Impacted verification**
+- [x] **Step 6: Impacted verification**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx --config config/vitest/vitest.config.ts`
 
 Run the Step 4 browser command; expected PASS. These cover canceled routes, kill folding, tab replacement and view-switch callers.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/lib/fresh-agent-ws.ts src/lib/fresh-agent-view-attachment.ts src/components/fresh-agent/FreshAgentView.tsx src/store/tabsSlice.ts src/store/terminalDetachMiddleware.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts

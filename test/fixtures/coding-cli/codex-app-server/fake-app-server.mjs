@@ -398,7 +398,11 @@ function successResult(method, params) {
     return pages[params?.cursor ? Number(params.cursor) : 0]
   }
   if (method === 'thread/start') {
-    const threadId = behavior.threadStartThreadId
+    const configuredThreadIds = behavior.threadStartThreadIds
+    const sequencedThreadId = Array.isArray(configuredThreadIds)
+      ? configuredThreadIds[uniqueThreadStartCounter++]
+      : undefined
+    const threadId = sequencedThreadId || behavior.threadStartThreadId
       || (behavior.uniqueThreadIds === true
         ? `thread-${process.pid}-${++uniqueThreadStartCounter}`
         : 'thread-new-1')

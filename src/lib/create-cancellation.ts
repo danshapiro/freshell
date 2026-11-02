@@ -1,8 +1,11 @@
-const cancelledCreateRequestIds = new Set<string>()
+export type FreshAgentCreateRoute = { viewId?: string }
+
+const cancelledCreateRoutes = new Map<string, FreshAgentCreateRoute>()
 const createRequestRouteById = new Map<string, { viewId?: string }>()
 
-export function cancelCreate(requestId: string): void {
-  cancelledCreateRequestIds.add(requestId)
+export function cancelCreate(requestId: string, viewId?: string): void {
+  const normalizedViewId = viewId?.trim() || createRequestRouteById.get(requestId)?.viewId
+  cancelledCreateRoutes.set(requestId, normalizedViewId ? { viewId: normalizedViewId } : {})
 }
 
 export function rememberCreateRoute(requestId: string, route: { viewId?: string }): void {
@@ -16,19 +19,33 @@ export function rememberCreateRoute(requestId: string, route: { viewId?: string 
   }
 }
 
-export function consumeCreateRoute(requestId: string): { viewId?: string } | undefined {
+export function getCreateRoute(requestId: string): FreshAgentCreateRoute | undefined {
   const route = createRequestRouteById.get(requestId)
-  createRequestRouteById.delete(requestId)
-  return route
+  return route ? { ...route } : undefined
 }
 
-export function consumeCancelledCreate(requestId: string): boolean {
-  if (!cancelledCreateRequestIds.has(requestId)) return false
-  cancelledCreateRequestIds.delete(requestId)
+export function consumeCreateRoute(requestId: string, expectedViewId?: string): FreshAgentCreateRoute | undefined {
+  const route = createRequestRouteById.get(requestId)
+  if (expectedViewId && route?.viewId !== expectedViewId) return undefined
+  createRequestRouteById.delete(requestId)
+  return route ? { ...route } : undefined
+}
+
+export function consumeCancelledCreateRoute(requestId: string): FreshAgentCreateRoute | undefined {
+  const route = cancelledCreateRoutes.get(requestId)
+  if (!route) return undefined
+  cancelledCreateRoutes.delete(requestId)
+  return { ...route }
+}
+
+export function consumeCancelledCreate(requestId: string, expectedViewId?: string): boolean {
+  const route = cancelledCreateRoutes.get(requestId)
+  if (!route || (expectedViewId && route.viewId !== expectedViewId)) return false
+  cancelledCreateRoutes.delete(requestId)
   return true
 }
 
 export function _resetCancelledCreates(): void {
-  cancelledCreateRequestIds.clear()
+  cancelledCreateRoutes.clear()
   createRequestRouteById.clear()
 }

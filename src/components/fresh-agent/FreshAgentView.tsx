@@ -25,6 +25,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
+import { cancelCreate } from '@/lib/create-cancellation'
 import { adoptAuthoritativeConversationNameRef } from '@/lib/terminal-naming-rebind'
 import { isFreshAgentNetworkEffectsSuppressed, sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { convergeCodexSettings, type CodexSettingsConvergence } from '@/lib/fresh-agent-settings-convergence'
@@ -43,7 +44,6 @@ import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshReque
 import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
-import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import type { FreshAgentCodexCatalogContext } from '@shared/fresh-agent-model-capabilities'
 import { applyRefusalFence, beginOperationAttempt, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
@@ -51,6 +51,7 @@ import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { detachFreshAgentView, freshAgentViewAttachmentForPane } from '@/lib/fresh-agent-view-attachment'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
@@ -1913,6 +1914,7 @@ export function FreshAgentView({
     return buildFreshAgentSlashCommandMenu(actions, snapshot?.commands)
   }, [paneContent.sessionType, snapshot?.capabilities, snapshot?.commands])
   const paneContentRef = useRef(paneContent)
+  const pendingForkSwitchesRef = useRef(new Set<string>())
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
   const paneRootRef = useRef<HTMLDivElement | null>(null)
@@ -2529,66 +2531,43 @@ export function FreshAgentView({
   }, [paneId, providerDefaults, tabId])
 
   const startNewConversation = useCallback(async () => {
+    if (isPaneClosePending(appStore.getState().panes, tabId, paneId)) return
     const current = paneContentRef.current
     const getCurrent = () => {
       const root = appStore.getState().panes.layouts[tabId]
       const latest = root ? findPaneContent(root, paneId) : null
       return latest?.kind === 'fresh-agent' ? latest : null
     }
-    // A managed loss may already be stopped and absent from the web alias cache.
-    // Its persisted soul is the cleanup authority before replacing identity.
-    if (current.soulId || isManagedRuntimeRecoveryPending(current.recoverySummary)) {
-      const confirmed = await confirmManagedRuntimeStopped(current, {
-        getCurrent,
-        applyIntentRevision: (soulIntentRevision) => {
-          paneContentRef.current = { ...paneContentRef.current, soulIntentRevision }
-          dispatch(mergePaneContent({ tabId, paneId, updates: { soulIntentRevision } }))
-        },
-      })
-      if (!confirmed) return
-    } else {
-      // Unmanaged sessions still await their durable close acknowledgement,
-      // including a restored pane whose only identity is its sessionRef.
-      const killSessionId = current.sessionId
-        ?? (current.sessionRef?.provider === current.provider
-          ? current.sessionRef.sessionId
-          : undefined)
-      if (killSessionId) {
-        const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-        // kata b8ke (round-3 F6): the kill is a lifecycle producer — carry
-        // the observed (epoch, generation) fence so a delayed kill naming
-        // superseded ownership is typed-refused instead of killing the
-        // wrong runtime.
-        const fence = selectPaneOwnerFence(appStore.getState(), current)
-        const ack = await sendFreshAgentKillAndAwait(
-          {
-            sessionId: killSessionId,
-            sessionType: current.sessionType,
-            provider: current.provider,
-            ...(cwd ? { cwd } : {}),
-            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
-          },
-          { send: (m) => sendFreshAgentMessage(m as Record<string, unknown>) },
-        )
-        if (!ack.ok) {
-          dispatch(sessionError({
-            sessionId: killSessionId,
-            sessionType: current.sessionType,
-            provider: current.provider,
-            code: 'KILL_FAILED',
-            message: ack.timedOut ? KILL_ACK_TIMEOUT_MESSAGE : KILL_FAILED_MESSAGE,
-          }))
-          return
-        }
-      }
+    const attachment = freshAgentViewAttachmentForPane(current)
+    if (attachment) {
+      // Starting a fresh conversation releases this pane's delivery interest.
+      // Other devices remain attached to the same server-owned runtime.
+      await detachFreshAgentView(ws, attachment)
+    } else if (current.status === 'creating' || current.status === 'starting') {
+      // Retract only a client-side queued create. If it has reached the server,
+      // the server-owned startup continues and the late result releases this
+      // exact view through its saved request/view route.
+      const viewId = current.viewId ?? current.createRequestId
+      cancelCreate(current.createRequestId, viewId)
+      ws.cancelCreate(current.createRequestId)
     }
+    if (isPaneClosePending(appStore.getState().panes, tabId, paneId)) return
     const before = getCurrent()
-    if (!before) return
+    if (
+      !before
+      || before.createRequestId !== current.createRequestId
+      || (before.viewId ?? before.createRequestId) !== (current.viewId ?? current.createRequestId)
+    ) return
     dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
     const after = getCurrent()
     // A close can start while cleanup is awaited. Keep local conversation
     // state when the reducer refuses to replace that still-displayed pane.
     if (!after || after.createRequestId === before.createRequestId) return
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: { ...after, viewId: nanoid() },
+    }))
     commitSnapshot(null)
     setLoadError(null)
     setQueuedMessages([])
@@ -2596,7 +2575,7 @@ export function FreshAgentView({
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
     pendingAutoTitleBySessionIdRef.current.clear()
-  }, [appStore, commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
+  }, [appStore, commitSnapshot, dispatch, paneId, setLocalEcho, tabId, ws])
 
   const handleStartNewConversation = useCallback(() => {
     void startNewConversation().catch((error: unknown) => {
@@ -3947,50 +3926,63 @@ export function FreshAgentView({
           setNotice(shown)
         }
       }
-      if (
-        message.type === 'freshAgent.forked'
-        && !isManagedFreshAgentStopped(paneContentRef.current)
-        && (message.parentRetiredByRuntime === true || message.requestId === paneContent.createRequestId)
-        && message.parentSessionId === paneContent.sessionId
-        && message.sessionType === paneContent.sessionType
-        && message.provider === paneContent.provider
-        && typeof message.sessionId === 'string'
-      ) {
-        if (message.sessionId !== paneContent.sessionId && message.parentRetiredByRuntime !== true) {
-          const cwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
-          // kata b8ke (review I1): the post-fork cleanup kill carries the
-          // observed (epoch, generation) fence exactly like
-          // startNewConversation/restartStuckSidecar — kills are fenced,
-          // never suppressed; the server typed-refuses a stale cross-kind
-          // kill from the pair instead of the client guessing.
-          const fence = selectPaneOwnerFence(appStore.getState(), paneContent)
-          sendFreshAgentMessage({
-            type: 'freshAgent.kill',
-            sessionId: paneContent.sessionId,
-            sessionType: paneContent.sessionType,
-            provider: paneContent.provider,
-            ...(cwd ? { cwd } : {}),
-            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
-          })
+      if (message.type === 'freshAgent.forked' && typeof message.sessionId === 'string') {
+        const current = paneContentRef.current
+        const parentRetiredByRuntime = message.parentRetiredByRuntime === true
+        if (
+          !isManagedFreshAgentStopped(current)
+          && (parentRetiredByRuntime || message.requestId === current.createRequestId)
+          && message.parentSessionId === current.sessionId
+          && message.sessionType === current.sessionType
+          && message.provider === current.provider
+          && message.sessionId !== current.sessionId
+        ) {
+          const requestId = typeof message.requestId === 'string' ? message.requestId : current.createRequestId
+          const viewId = current.viewId ?? current.createRequestId
+          const switchKey = `${requestId}\0${viewId}\0${message.sessionId}`
+          if (!pendingForkSwitchesRef.current.has(switchKey)) {
+            pendingForkSwitchesRef.current.add(switchKey)
+            void (async () => {
+              try {
+                if (!parentRetiredByRuntime) {
+                  const attachment = freshAgentViewAttachmentForPane(current)
+                  if (attachment) await detachFreshAgentView(ws, attachment)
+                }
+
+                const latest = paneContentRef.current
+                if (
+                  latest.createRequestId !== current.createRequestId
+                  || (latest.viewId ?? latest.createRequestId) !== viewId
+                  || latest.sessionId !== current.sessionId
+                ) return
+
+                commitSnapshot(null)
+                dispatch(updatePaneContent({
+                  tabId,
+                  paneId,
+                  content: {
+                    ...latest,
+                    viewId: nanoid(),
+                    createRequestId: nanoid(),
+                    sessionId: message.sessionId as string,
+                    sessionRef: {
+                      provider: current.provider,
+                      sessionId: message.sessionId as string,
+                    },
+                    resumeSessionId: message.sessionId as string,
+                    status: 'connected',
+                    createError: undefined,
+                    restoreError: undefined,
+                  },
+                }))
+              } catch (error) {
+                setLoadError(error instanceof Error ? error.message : 'The parent view could not be detached, so it was kept open.')
+              } finally {
+                pendingForkSwitchesRef.current.delete(switchKey)
+              }
+            })()
+          }
         }
-        commitSnapshot(null)
-        dispatch(updatePaneContent({
-          tabId,
-          paneId,
-          content: {
-            ...paneContentRef.current,
-            createRequestId: nanoid(),
-            sessionId: message.sessionId,
-            sessionRef: {
-              provider: paneContent.provider,
-              sessionId: message.sessionId,
-            },
-            resumeSessionId: message.sessionId,
-            status: 'connected',
-            createError: undefined,
-            restoreError: undefined,
-          },
-        }))
       }
     })
     return unsubscribe

@@ -309,6 +309,25 @@ const wsMock = vi.hoisted(() => ({
   onReconnect: vi.fn(() => () => {}),
 }))
 
+const freshAgentMessageListeners = new Set<(message: Record<string, unknown>) => void>()
+
+function respondToViewDetach(success = true): void {
+  wsMock.send.mockImplementation((message: unknown) => {
+    const frame = message as Record<string, unknown>
+    if (frame.type !== 'freshAgent.detach') return
+    for (const listener of [...freshAgentMessageListeners]) {
+      listener({
+        type: 'freshAgent.detached',
+        requestId: frame.requestId as string,
+        viewId: frame.viewId as string,
+        ...(frame.sessionRef ? { sessionRef: frame.sessionRef } : {}),
+        success,
+        ...(success ? {} : { code: 'VIEW_DETACH_FAILED', message: 'The view could not be detached.' }),
+      })
+    }
+  })
+}
+
 const apiMock = vi.hoisted(() => ({
   get: vi.fn(),
   getFreshAgentThreadSnapshot: vi.fn(),
@@ -601,7 +620,11 @@ beforeEach(() => {
   wsMock.onMessage.mockReset()
   wsMock.onDisconnect.mockReset()
   wsMock.onReconnect.mockReset()
-  wsMock.onMessage.mockImplementation(() => () => {})
+  freshAgentMessageListeners.clear()
+  wsMock.onMessage.mockImplementation((listener: (message: Record<string, unknown>) => void) => {
+    freshAgentMessageListeners.add(listener)
+    return () => { freshAgentMessageListeners.delete(listener) }
+  })
   wsMock.onDisconnect.mockImplementation(() => () => {})
   wsMock.onReconnect.mockImplementation(() => () => {})
   window.sessionStorage.clear()
@@ -1264,7 +1287,7 @@ describe('stopped managed history', () => {
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
   })
 
-  it('keeps explicit Start new conversation available after Stop while withholding Resume', async () => {
+  it('starts a fresh view after Stop without stopping the shared managed agent', async () => {
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
     apiMock.stopManagedRuntimeSoul.mockResolvedValue({ outcome: 'verified_empty',
       soul: { soulId: content.soulId, intentRevision: 13 } })
@@ -1273,12 +1296,13 @@ describe('stopped managed history', () => {
     fireEvent.click(screen.getByText('Session ended', { exact: true }))
     expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
     expectNoStarts()
-    fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Start new session' })))
-    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith(content.soulId, 12))
+    respondToViewDetach()
+    fireEvent.click(screen.getByRole('button', { name: 'Start new session' }))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
     expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
     expect(getFreshAgentPaneContent(store).sessionRef).toBeUndefined()
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
   })
 
   it('withdraws an already-open model mutation dialog when stopped intent arrives', async () => {
@@ -1659,7 +1683,6 @@ describe('new conversation close acceptance', () => {
   ] as const
   const historyText = 'Retained history during the close race'
   const draftText = 'Retained unsent close-race draft'
-  const stopped = { outcome: 'verified_empty', soul: { soulId: 'close-race-soul', intentRevision: 17 } }
 
   function CurrentPane() {
     const content = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], 'pane-1'))
@@ -1676,8 +1699,6 @@ describe('new conversation close acceptance', () => {
       : mode === 'unmanaged' ? { status: 'exited' } : {}), turns: [{ id: 'close-race-turn', role: 'assistant' as const,
       items: [{ id: 'close-race-text', kind: 'text' as const, text: historyText }] }] }
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
-    const stop = createDeferred<unknown>()
-    apiMock.stopManagedRuntimeSoul.mockReturnValue(stop.promise)
     const store = createStore()
     const content: FreshAgentPaneContent = {
       kind: 'fresh-agent', sessionType, provider, createRequestId: 'close-race-create',
@@ -1702,15 +1723,24 @@ describe('new conversation close acceptance', () => {
     const handlers = new Set<(message: any) => void>()
     wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
     let closeMessage: Record<string, any> | undefined
+    let holdNextDetach = false
+    let heldDetach: Record<string, any> | undefined
+    const acknowledgeDetach = (message: Record<string, any>, success = true) => {
+      for (const handler of [...handlers]) handler({
+        type: 'freshAgent.detached',
+        requestId: message.requestId,
+        viewId: message.viewId,
+        sessionRef: message.sessionRef,
+        success,
+        ...(success ? {} : { code: 'VIEW_DETACH_FAILED', message: 'The view could not be detached.' }),
+      })
+    }
     wsMock.send.mockImplementation((message) => {
       if (message.type === 'freshAgent.detach') {
-        for (const handler of [...handlers]) handler({
-          type: 'freshAgent.detached',
-          requestId: message.requestId,
-          viewId: message.viewId,
-          sessionRef: message.sessionRef,
-          success: true,
-        })
+        if (holdNextDetach) {
+          holdNextDetach = false
+          heldDetach = message
+        } else acknowledgeDetach(message)
       }
       if (message.type === 'pane.closed' || message.type === 'panes.closed') closeMessage = message
     })
@@ -1732,7 +1762,16 @@ describe('new conversation close acceptance', () => {
       : store.getState().panes.closingPanes?.['tab-1:pane-1']
     const rendered = render(<Provider store={store}><CurrentPane /></Provider>)
     const emit = (message: unknown) => { for (const handler of [...handlers]) handler(message) }
-    return { store, content, stop, getContent, failClose, startClose, isClosing, rendered, draftKey, emit, snapshot }
+    return {
+      store, content, getContent, failClose, startClose, isClosing, rendered, draftKey, emit, snapshot,
+      holdNextDetach: () => { holdNextDetach = true },
+      acknowledgeHeldDetach: () => {
+        if (!heldDetach) throw new Error('No Fresh Agent detach is being held')
+        const message = heldDetach
+        heldDetach = undefined
+        acknowledgeDetach(message)
+      },
+    }
   }
 
   const cases = surfaces.flatMap((surface) => (['pane', 'tab'] as const).flatMap((scope) =>
@@ -1746,11 +1785,11 @@ describe('new conversation close acceptance', () => {
       const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       const startNew = () => fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
       if (timing === 'already pending') act(() => { closing = fixture.startClose() })
+      if (timing === 'starts during cleanup') fixture.holdNextDetach()
       startNew()
-      await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('close-race-soul', 17))
       if (timing === 'starts during cleanup') act(() => { closing = fixture.startClose() })
       expect(fixture.isClosing()).toBe(true)
-      await act(async () => fixture.stop.resolve(stopped))
+      if (timing === 'starts during cleanup') act(() => fixture.acknowledgeHeldDetach())
       await waitFor(() => expect(screen.getByRole('button', { name: 'Start new conversation' })).toBeEnabled())
       const assertRetained = (reattached = false) => {
         expect(screen.getByText(historyText)).toBeInTheDocument()
@@ -1771,6 +1810,7 @@ describe('new conversation close acceptance', () => {
         }
         expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
         expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
       }
       assertRetained()
       await act(async () => { fixture.failClose(); await closing })
@@ -1778,7 +1818,7 @@ describe('new conversation close acceptance', () => {
       expect(await screen.findByText(/Close failed:/)).toBeInTheDocument()
       assertRetained(true)
     } finally {
-      await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
+      await act(async () => { fixture.failClose(); await closing })
       fixture.rendered.unmount()
     }
   })
@@ -1790,7 +1830,6 @@ describe('new conversation close acceptance', () => {
       await expectRenderedText(historyText)
       act(() => { closing = fixture.startClose() })
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-      await act(async () => fixture.stop.resolve(stopped))
       expect(fixture.getContent().createRequestId).toBe(fixture.content.createRequestId)
       await act(async () => { fixture.failClose(); await closing })
       expect(screen.getByText(historyText)).toBeInTheDocument()
@@ -1807,7 +1846,7 @@ describe('new conversation close acceptance', () => {
       expect(fixture.getContent().createRequestId).toBe(newId)
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
     } finally {
-      await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
+      await act(async () => { fixture.failClose(); await closing })
       fixture.rendered.unmount()
     }
   })
@@ -1833,7 +1872,6 @@ describe('new conversation close acceptance', () => {
       const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       if (outcome === 'refused') act(() => { closing = fixture.startClose() })
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-      await act(async () => fixture.stop.resolve(stopped))
       if (outcome === 'refused') {
         expect(screen.getByText(historyText)).toBeInTheDocument()
         expect(screen.getByText('Retained submitted optimistic message')).toBeInTheDocument()
@@ -1855,24 +1893,21 @@ describe('new conversation close acceptance', () => {
         await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
       }
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
     } finally {
-      await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
+      await act(async () => { fixture.failClose(); await closing })
       fixture.rendered.unmount()
     }
   })
 
-  it.each(['refused', 'accepted'] as const)('preserves unmanaged history on a late refused close and permits ordinary %s new after awaited kill', async (outcome) => {
+  it.each(['refused', 'accepted'] as const)('preserves unmanaged history when a close is %s while starting a new view', async (outcome) => {
     const fixture = prepare(surfaces[2], 'tab', 'unmanaged')
     let closing: ReturnType<typeof fixture.startClose> | undefined
-    const acknowledgeKill = () => fixture.emit({ type: 'freshAgent.killed', sessionId: fixture.content.sessionRef!.sessionId,
-      sessionType: 'freshcodex', provider: 'codex', success: true })
     try {
       await expectRenderedText(historyText)
-      fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Start new session', exact: true })))
-      expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(1)
-      expect(fixture.getContent().createRequestId).toBe(fixture.content.createRequestId)
       if (outcome === 'refused') act(() => { closing = fixture.startClose() })
-      await act(async () => acknowledgeKill())
+      fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
+      expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
       if (outcome === 'refused') {
         expect(fixture.isClosing()).toBe(true)
         expect(screen.getByText(historyText)).toBeInTheDocument()
@@ -1888,26 +1923,26 @@ describe('new conversation close acceptance', () => {
       }
       expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
     } finally {
-      await act(async () => { acknowledgeKill(); fixture.failClose(); await closing })
+      await act(async () => { fixture.failClose(); await closing })
       fixture.rendered.unmount()
     }
   })
 
-  it('refuses a late managed cleanup after the displayed conversation source changes', async () => {
+  it('ignores a late detach result after the displayed conversation source changes', async () => {
     const fixture = prepare(surfaces[2], 'tab')
     try {
       await expectRenderedText(historyText)
+      fixture.holdNextDetach()
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
       const replacement = { ...fixture.content, createRequestId: 'replacement-close-race-create',
         soulId: 'replacement-close-race-soul', soulIntentRevision: 18 }
       await act(async () => fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
       await expectRenderedText(historyText)
-      await act(async () => fixture.stop.resolve(stopped))
+      await act(async () => fixture.acknowledgeHeldDetach())
       expect(fixture.getContent()).toMatchObject(replacement)
       expect(screen.getByText(historyText)).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     } finally {
-      await act(async () => fixture.stop.resolve(stopped))
       fixture.rendered.unmount()
     }
   })
@@ -1921,11 +1956,9 @@ describe('new conversation close acceptance', () => {
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(history.promise)
       act(() => fixture.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(reads))
-      fireEvent.click(expandDiagnosticForAction(screen.getByRole('button', { name: 'Start new session', exact: true })))
-      await act(async () => fixture.emit({ type: 'freshAgent.killed', sessionId: fixture.content.sessionId,
-        sessionType: 'freshcodex', provider: 'codex', success: true }))
+      fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
+      await waitFor(() => expect(fixture.getContent().createRequestId).not.toBe(fixture.content.createRequestId))
       const replacement = fixture.getContent().createRequestId
-      expect(replacement).not.toBe(fixture.content.createRequestId)
       expect(screen.queryByText(historyText)).toBeNull()
       await act(async () => history.resolve(fixture.snapshot))
       expect(screen.queryByText(historyText)).toBeNull()
@@ -1933,6 +1966,7 @@ describe('new conversation close acceptance', () => {
       expect(fixture.getContent().sessionRef).toBeUndefined()
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
       expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: replacement })
+      expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
     } finally {
       await act(async () => history.resolve(fixture.snapshot))
       fixture.rendered.unmount()
@@ -12668,22 +12702,19 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(wsMock.send).toHaveBeenCalledWith({
-      type: 'freshAgent.kill',
-      sessionId: 'thread-reset-alias',
-      sessionType: 'freshcodex',
-      provider: 'codex',
-    })
-    // The replacement conversation starts only once the durable close is
-    // acknowledged (correlated close waits, focused-episode-6 round 2).
+    const detach = wsMock.send.mock.calls.find(([message]) => (message as { type?: string }).type === 'freshAgent.detach')?.[0] as Record<string, unknown>
+    expect(detach).toMatchObject({ type: 'freshAgent.detach', sessionId: 'thread-reset-alias', viewId: getFreshAgentPaneContent(store).viewId })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    // The replacement view starts only once this pane's detach is acknowledged.
+    const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(before.content).toMatchObject({ sessionId: 'thread-reset-alias', status: 'idle' })
     const aliasHandlers = wsMock.onMessage.mock.calls.map(([h]) => h).filter(Boolean)
     act(() => {
       for (const handler of aliasHandlers) {
         ;(handler as (msg: unknown) => void)({
-          type: 'freshAgent.killed',
-          sessionId: 'thread-reset-alias',
-          sessionType: 'freshcodex',
-          provider: 'codex',
+          type: 'freshAgent.detached',
+          requestId: detach.requestId,
+          viewId: detach.viewId,
           success: true,
         })
       }
@@ -12747,7 +12778,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('routes FreshOpenCode new-conversation kill through the pane cwd', async () => {
+  it('routes FreshOpenCode new-conversation detach through the pane view identity', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -12771,22 +12802,25 @@ describe('FreshAgentView', () => {
 
     await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
     wsMock.send.mockClear()
+    const oldViewId = getFreshAgentPaneContent(store).viewId
+    respondToViewDetach()
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: '/new' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(wsMock.send).toHaveBeenCalledWith({
-      type: 'freshAgent.kill',
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
       sessionId: 'ses_new_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
-      cwd: '/repo/route-aware',
-    })
+      viewId: oldViewId,
+    }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
-  it('starts the new conversation only once the old session close is durably acknowledged', async () => {
+  it('starts the new conversation only once the old view detach is acknowledged', async () => {
     const handlers: Array<(msg: Record<string, unknown>) => void> = []
     wsMock.onMessage.mockReset()
     wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
@@ -12820,19 +12854,18 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(wsMock.send).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-new-ack' }),
-    )
-    // Ungated before: the pane stays on the OLD conversation until the close lands.
+    const detach = wsMock.send.mock.calls.find(([message]) => (message as { type?: string }).type === 'freshAgent.detach')?.[0] as Record<string, unknown>
+    expect(detach).toMatchObject({ type: 'freshAgent.detach', sessionId: 'thread-new-ack', viewId: getFreshAgentPaneContent(store).viewId })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    // The pane stays on the old conversation until this view's detach lands.
     const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
     expect(before.content).toMatchObject({ sessionId: 'thread-new-ack', status: 'idle' })
 
     for (const handler of handlers) {
       handler({
-        type: 'freshAgent.killed',
-        sessionId: 'thread-new-ack',
-        sessionType: 'freshcodex',
-        provider: 'codex',
+        type: 'freshAgent.detached',
+        requestId: detach.requestId,
+        viewId: detach.viewId,
         success: true,
       })
     }
@@ -12843,7 +12876,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('keeps the current conversation when the new-conversation close is not durably recorded', async () => {
+  it('keeps the current conversation when the new-conversation view detach fails', async () => {
     const handlers: Array<(msg: Record<string, unknown>) => void> = []
     wsMock.onMessage.mockReset()
     wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
@@ -12877,22 +12910,24 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
+    const detach = wsMock.send.mock.calls.find(([message]) => (message as { type?: string }).type === 'freshAgent.detach')?.[0] as Record<string, unknown>
+    expect(detach).toMatchObject({ type: 'freshAgent.detach', sessionId: 'thread-new-fail', viewId: getFreshAgentPaneContent(store).viewId })
     for (const handler of handlers) {
       handler({
-        type: 'freshAgent.killed',
-        sessionId: 'thread-new-fail',
-        sessionType: 'freshcodex',
-        provider: 'codex',
+        type: 'freshAgent.detached',
+        requestId: detach.requestId,
+        viewId: detach.viewId,
         success: false,
+        code: 'VIEW_DETACH_FAILED',
+        message: 'The view could not be detached.',
       })
     }
     await waitFor(() => {
-      // The KILL_FAILED banner state is folded (close flows never drop the
-      // conversation on an unrecorded close).
-      expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-new-fail']?.lastErrorCode).toBe('KILL_FAILED')
+      expect(screen.getByText('The view could not be detached.')).toBeInTheDocument()
     })
     const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
     expect(after.content).toMatchObject({ sessionId: 'thread-new-fail', status: 'idle' })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
   it('routes FreshOpenCode forks through the pane cwd', async () => {
@@ -14348,6 +14383,13 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(onMessage).toBeTypeOf('function')
     })
+    const parentViewId = getFreshAgentPaneContent(store).viewId
+    wsMock.send.mockImplementation((message: unknown) => {
+      const frame = message as Record<string, unknown>
+      if (frame.type === 'freshAgent.detach') onMessage?.({
+        type: 'freshAgent.detached', requestId: frame.requestId, viewId: frame.viewId, success: true,
+      })
+    })
 
     act(() => {
       onMessage?.({
@@ -14372,12 +14414,10 @@ describe('FreshAgentView', () => {
     expect(layout.content.sessionId).toBe('thread-forked')
     expect(layout.content.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-forked' })
     expect(layout.content.createRequestId).not.toBe('req-2')
-    expect(wsMock.send).toHaveBeenCalledWith({
-      type: 'freshAgent.kill',
-      sessionId: 'thread-1',
-      sessionType: 'freshcodex',
-      provider: 'codex',
-    })
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach', sessionId: 'thread-1', viewId: parentViewId,
+    }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
   // C14 (G09): a claude conversation forks (the server stamps capabilities.fork).
@@ -14441,6 +14481,7 @@ describe('FreshAgentView', () => {
     fireEvent.keyDown(menu, { key: 'Escape' })
     const forkActions = await screen.findAllByRole('button', { name: 'Fork conversation from here' })
     wsMock.send.mockClear()
+    const parentViewId = getFreshAgentPaneContent(store).viewId
     fireEvent.click(forkActions[0])
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.fork',
@@ -14453,6 +14494,12 @@ describe('FreshAgentView', () => {
     }))
 
     await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    wsMock.send.mockImplementation((message: unknown) => {
+      const frame = message as Record<string, unknown>
+      if (frame.type === 'freshAgent.detach') onMessage?.({
+        type: 'freshAgent.detached', requestId: frame.requestId, viewId: frame.viewId, success: true,
+      })
+    })
     apiMock.getFreshAgentThreadSnapshot.mockClear()
     act(() => {
       onMessage?.({
@@ -14475,11 +14522,9 @@ describe('FreshAgentView', () => {
       expect(layout.content.createRequestId).not.toBe('req-claude-fork')
     })
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
-      sessionId: parent,
-      sessionType,
-      provider: 'claude',
+      type: 'freshAgent.detach', sessionId: parent, viewId: parentViewId,
     }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.send' }))
     await waitFor(() => {
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, 'claude', child, expect.any(Object))
@@ -14510,6 +14555,9 @@ describe('FreshAgentView', () => {
       if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('expected fresh-agent pane')
       expect(layout.content.sessionId).toBe('thread-child')
     })
+    // The runtime's retirement signal is authoritative: the client adopts the
+    // child without issuing a second lifecycle operation against the parent.
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.detach' }))
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
@@ -15692,6 +15740,7 @@ describe('FreshAgentView', () => {
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', content.sessionId, expect.objectContaining({ soulId: content.soulId })))
+    respondToViewDetach()
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
     await act(async () => {
@@ -15702,6 +15751,7 @@ describe('FreshAgentView', () => {
     expect(screen.queryByText('Old native helper failure')).not.toBeInTheDocument()
     expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
     expect(getFreshAgentPaneContent(store).sessionId).toBeUndefined()
+    expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -16064,7 +16114,7 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
   })
 
-  it('reads a cold lost conversation without a soul as history without adopting live status or starting a runtime', async () => {
+  it('keeps cold lost history when the view detach cannot be confirmed', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...retainedBeforeStartNewSnapshot,
       status: 'running', capabilities: { send: true, interrupt: true, fork: true },
@@ -16084,21 +16134,21 @@ describe('FreshAgentView', () => {
     expectFreshAgentPaneContentToEqual(store, content)
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    respondToViewDetach(false)
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent('Your conversation has been kept')
+    expect(await screen.findByRole('status')).toHaveTextContent('The view could not be detached.')
     expectFreshAgentPaneContentToEqual(store, content)
     expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
     expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
     expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
-    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.detach', viewId: getFreshAgentPaneContent(store).viewId }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
   it.each([
     ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
-  ] as const)('clears a failed close only after stopping the persisted managed soul and replacing a restored %s conversation', async (sessionType, provider) => {
+  ] as const)('starts a fresh %s view after detaching its restored managed view', async (sessionType, provider) => {
     const store = createStore()
-    let resolveStop!: (result: unknown) => void
-    apiMock.stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(retainedBeforeStartNewSnapshot)
     const content = {
       kind: 'fresh-agent' as const, sessionType, provider, createRequestId: 'lost-restored-create',
@@ -16113,34 +16163,27 @@ describe('FreshAgentView', () => {
     await expectRenderedText('Conversation retained before starting new')
     expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
     wsMock.send.mockClear()
+    respondToViewDetach()
 
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('persisted-lost-soul', 17))
-    expect(getFreshAgentPaneContent(store)).toMatchObject(content)
-    expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
-    expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
-    expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
-    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
-    await act(async () => resolveStop({ outcome: 'verified_empty', soul: { soulId: 'persisted-lost-soul', intentRevision: 17 } }))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
     expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
     expect(getFreshAgentPaneContent(store).sessionRef).toBeUndefined()
     expect(getFreshAgentPaneContent(store).closeError).toBeUndefined()
     expect(screen.queryByText('Close failed: Previous close was not confirmed')).toBeNull()
+    expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
+    expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
   })
 
-  it.each(['termination_unconfirmed', 'blocked_ownership', 'backend_unavailable', 'http_failure', 'missing_revision', 'missing_soul'])(
-    'retains a lost managed Fresh Agent and reports %s cleanup inline', async (outcome) => {
+  it('retains a lost managed Fresh Agent when its own detach fails', async () => {
       const store = createStore()
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(retainedBeforeStartNewSnapshot)
-      if (outcome === 'http_failure') apiMock.stopManagedRuntimeSoul.mockRejectedValueOnce(new Error('Server is unavailable'))
-      else apiMock.stopManagedRuntimeSoul.mockResolvedValueOnce({ outcome, soul: { soulId: 'lost-soul', intentRevision: 9 } })
       const content = {
         kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
         createRequestId: 'lost-create', sessionId: 'lost-thread',
         sessionRef: { provider: 'codex' as const, sessionId: 'lost-thread' }, status: 'error' as const,
-        soulId: outcome === 'missing_soul' ? undefined : 'lost-soul',
-        soulIntentRevision: outcome === 'missing_revision' ? undefined : 9,
+        soulId: 'lost-soul',
+        soulIntentRevision: 9,
         closeError: 'Previous close was not confirmed',
         recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
@@ -16151,21 +16194,26 @@ describe('FreshAgentView', () => {
       expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       const retained = getFreshAgentPaneContent(store)
       wsMock.send.mockClear()
+      respondToViewDetach(false)
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-      expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent(outcome === 'http_failure' ? 'Server is unavailable' : 'Your conversation has been kept')
+      expect(await screen.findByRole('status')).toHaveTextContent('The view could not be detached.')
       expect(getFreshAgentPaneContent(store)).toMatchObject(retained)
       expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
-    },
-  )
+      expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
+  })
 
-  it.each(['verified_empty', 'termination_unconfirmed', 'http_failure'])('does not alter a different Fresh Agent pane after a late %s stop result', async (outcome) => {
+  it('does not alter a replacement pane after an old view detach result', async () => {
     const store = createStore()
-    let resolveStop!: (result: unknown) => void
-    let rejectStop!: (error: Error) => void
-    apiMock.stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve, reject) => { resolveStop = resolve; rejectStop = reject }))
+    const handlers: Array<(message: Record<string, unknown>) => void> = []
+    let detach: Record<string, unknown> | undefined
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => { handlers.push(handler); return () => {} })
+    wsMock.send.mockImplementation((message: unknown) => {
+      if ((message as { type?: string }).type === 'freshAgent.detach') detach = message as Record<string, unknown>
+    })
     const content = {
       kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
       createRequestId: 'old-lost-create', sessionRef: { provider: 'codex' as const, sessionId: 'old-thread' },
@@ -16176,22 +16224,18 @@ describe('FreshAgentView', () => {
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('old-soul', 11))
+    await waitFor(() => expect(detach).toBeDefined())
     const replacement = { ...content, createRequestId: 'different-create', soulId: 'different-soul',
       sessionRef: { provider: 'codex' as const, sessionId: 'different-thread' } }
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
-    await act(async () => {
-      if (outcome === 'http_failure') rejectStop(new Error('Stale request failed'))
-      else resolveStop({ outcome, soul: { soulId: 'old-soul', intentRevision: 12 } })
-    })
+    await act(async () => handlers.forEach((handler) => handler({ type: 'freshAgent.detached',
+      requestId: detach?.requestId, viewId: detach?.viewId, success: false, code: 'VIEW_DETACH_FAILED' })))
     expect(getFreshAgentPaneContent(store)).toMatchObject(replacement)
     expect(within(screen.getByTestId('managed-runtime-recovery-card')).queryByRole('status')).toBeNull()
   })
 
-  it.each(['newer_pane', 'older_result', 'wrong_soul'])('does not replace Fresh Agent authority after a %s stop response', async (scenario) => {
+  it('starts a new conversation from a running managed pane without stopping the shared runtime', async () => {
     const store = createStore()
-    let resolveStop!: (value: unknown) => void
-    apiMock.stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
     const content = {
       kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
       createRequestId: 'same-create', status: 'error' as const, soulId: 'same-soul', soulIntentRevision: 21,
@@ -16201,44 +16245,12 @@ describe('FreshAgentView', () => {
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    respondToViewDetach()
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    if (scenario === 'newer_pane') act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content, soulIntentRevision: 24 } })))
-    await act(async () => resolveStop({ outcome: 'verified_empty', soul: {
-      soulId: scenario === 'wrong_soul' ? 'different-soul' : 'same-soul', intentRevision: scenario === 'older_result' ? 20 : 22,
-    } }))
-    expect(getFreshAgentPaneContent(store)).toMatchObject({ ...content, soulIntentRevision: scenario === 'newer_pane' ? 24 : 21 })
-    const card = screen.getByTestId('managed-runtime-recovery-card')
-    if (scenario === 'newer_pane') expect(within(card).queryByRole('status')).toBeNull()
-    else expect(await within(card).findByRole('status')).toHaveTextContent('Your conversation has been kept')
-  })
-
-  it('immediately retries a running managed Fresh Agent using the committed stop revision', async () => {
-    const store = createStore()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ status: 'stuck', turns: [] })
-    let serverRevision = 17
-    let running = true
-    apiMock.stopManagedRuntimeSoul.mockImplementation((_soulId: string, revision: number) => {
-      if (revision !== serverRevision) return Promise.reject(new Error('Stale intent revision'))
-      if (running) {
-        running = false
-        serverRevision += 1
-        return Promise.resolve({ outcome: 'backend_unavailable', soul: { soulId: 'running-fresh-soul', intentRevision: serverRevision } })
-      }
-      return Promise.resolve({ outcome: 'verified_empty', soul: { soulId: 'running-fresh-soul', intentRevision: serverRevision } })
-    })
-    const content = {
-      kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
-      createRequestId: 'running-stuck-create', sessionRef: { provider: 'codex' as const, sessionId: 'retained-thread' },
-      status: 'stuck' as const, soulId: 'running-fresh-soul', soulIntentRevision: 17,
-    }
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
-    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    await waitFor(() => expect(document.querySelector('[data-agent-error="load"] summary')).toHaveTextContent('Cleanup could not be confirmed'))
-    expect(getFreshAgentPaneContent(store)).toMatchObject({ ...content, soulIntentRevision: 18 })
-    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenNthCalledWith(2, 'running-fresh-soul', 18))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
+    expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
+    expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
   })
 
   it('follows a managed same-soul fork even when another view issued the request', async () => {
@@ -20733,15 +20745,12 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
   })
 })
 
-describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement/restart', () => {
-  // The restored-pane shape: persistence strips content.sessionId, leaving
-  // ONLY the durable sessionRef — BOTH kill paths must use
-  // sessionRef.sessionId (pre-ext the `content.sessionId` gate skipped the
-  // awaited kill entirely, clearing the durable reference and starting a
-  // blank conversation while the prior runtime stayed live and
-  // unrepresented).
+describe('Fresh Agent view switches preserve a shared parent view', () => {
+  // Persistence strips content.sessionId from this restored-pane shape,
+  // leaving only the durable sessionRef. The view switch must still detach
+  // that exact old view before clearing the reference and creating a new one.
 
-  it('startNewConversation kills the sessionRef session before starting the new one', async () => {
+  it('starting a new conversation detaches this pane view before rekeying', async () => {
     const handlers: Array<(msg: Record<string, unknown>) => void> = []
     wsMock.onMessage.mockReset()
     wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
@@ -20757,6 +20766,7 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
         sessionType: 'freshcodex',
         provider: 'codex',
         createRequestId: 'req-ref-only-new',
+        viewId: 'view-ref-only-new',
         sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
         status: 'stuck',
       },
@@ -20772,6 +20782,7 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
             sessionType: 'freshcodex',
             provider: 'codex',
             createRequestId: 'req-ref-only-new',
+            viewId: 'view-ref-only-new',
             sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
             status: 'stuck',
           }}
@@ -20786,34 +20797,118 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
     // callback the /new command and the context menu drive).
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
 
-    // THE F2 CONTRACT: the awaited kill targets the durable sessionRef
-    // session — pre-ext a sessionRef-only pane sent NO kill at all and the
-    // pane swapped straight to a blank conversation over the live runtime.
-    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
+    const detach = (wsMock.send as any).mock.calls.map((call: any[]) => call[0])
+      .find((message: any) => message?.type === 'freshAgent.detach')
+    expect(detach).toMatchObject({
+      type: 'freshAgent.detach',
+      requestId: expect.any(String),
+      viewId: 'view-ref-only-new',
       sessionId: 'thread-ref-only',
+      sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
       sessionType: 'freshcodex',
       provider: 'codex',
-    }))
-    // Ungated before the ack: the pane keeps its durable reference.
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    // The pane keeps its parent view until its own detach is acknowledged.
     const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-    expect(before.content).toMatchObject({ status: 'idle' })
+    expect(before.content).toMatchObject({
+      createRequestId: 'req-ref-only-new',
+      viewId: 'view-ref-only-new',
+      sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
+    })
 
     for (const handler of handlers) {
       handler({
-        type: 'freshAgent.killed',
-        sessionId: 'thread-ref-only',
-        sessionType: 'freshcodex',
-        provider: 'codex',
+        type: 'freshAgent.detached',
+        requestId: detach.requestId,
+        viewId: detach.viewId,
+        sessionRef: detach.sessionRef,
         success: true,
       })
     }
     await waitFor(() => {
       const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       expect(after.content).toMatchObject({ status: 'creating' })
+      expect(after.content).toMatchObject({ viewId: expect.not.stringMatching('view-ref-only-new') })
       expect((after.content as { sessionId?: string }).sessionId).toBeUndefined()
       expect((after.content as { sessionRef?: { sessionId: string } }).sessionRef).toBeUndefined()
     })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
+  it('keeps the parent view and draft when its scoped detach fails', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-detach-failure',
+        viewId: 'view-detach-failure',
+        sessionRef: { provider: 'codex', sessionId: 'thread-detach-failure' },
+        status: 'stuck',
+      },
+    }))
+    const draftKey = 'fresh-agent-draft:freshcodex:req-detach-failure'
+    sessionStorage.setItem(draftKey, 'keep this parent draft')
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-detach-failure',
+            viewId: 'view-detach-failure',
+            sessionRef: { provider: 'codex', sessionId: 'thread-detach-failure' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    await waitFor(() => expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
+      viewId: 'view-detach-failure',
+      sessionId: 'thread-detach-failure',
+    })))
+    const detach = (wsMock.send as any).mock.calls.map((call: any[]) => call[0])
+      .find((message: any) => message?.type === 'freshAgent.detach')
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.detached',
+        requestId: detach.requestId,
+        viewId: detach.viewId,
+        success: false,
+        code: 'VIEW_DETACH_FAILED',
+        message: 'The shared view remains attached.',
+      })
+    }
+
+    expect(await screen.findByText('The shared view remains attached.')).toBeInTheDocument()
+    const current = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(current.content).toMatchObject({
+      createRequestId: 'req-detach-failure',
+      viewId: 'view-detach-failure',
+      sessionRef: { provider: 'codex', sessionId: 'thread-detach-failure' },
+    })
+    expect(sessionStorage.getItem(draftKey)).toBe('keep this parent draft')
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
   })
 
   it.each([['freshcodex', 'codex'], ['freshclaude', 'claude'], ['kilroy', 'claude']] as const)('restartStuckSidecar waits for the %s sessionRef process stop before resuming', async (sessionType, provider) => {

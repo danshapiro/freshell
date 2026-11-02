@@ -1,6 +1,7 @@
 import { test, expect } from '../helpers/fixtures.js'
 import {
   fetchFreshAgentSnapshot,
+  FORK_PARENT_CONTINUATION_PROMPT,
   withTwoDeviceSession,
   type FreshAgentMultipleDeviceMode,
 } from '../helpers/fresh-agent-multiple-devices.js'
@@ -29,6 +30,369 @@ function countTranscriptRowsWithSummary(
 
 test.describe('Fresh Agent shared sessions across desktop and mobile devices (Rust)', () => {
   test.setTimeout(240_000)
+
+  for (const mode of MODES) {
+    test(`stage1 cancellation ${mode}: a late create detaches only its canceled view after mobile joins`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      openView,
+    }) => {
+      const previousStops = native.stopCount()
+      const desktopTabCount = await desktop.harness.getTabCount()
+      const siblingBrowserPaneId = 'stage1-cancel-browser-sibling'
+      await desktop.page.evaluate(({ tabId, paneId, newPaneId }) => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/splitPane',
+          payload: {
+            tabId,
+            paneId,
+            direction: 'horizontal',
+            newPaneId,
+            newContent: { kind: 'browser', url: 'about:blank', devToolsOpen: false },
+          },
+        })
+      }, { tabId: desktop.tabId, paneId: desktop.paneId, newPaneId: siblingBrowserPaneId })
+      await expect.poll(async () => {
+        const layout = await desktop.harness.getPaneLayout(desktop.tabId)
+        return layout?.type === 'split' && layout.children?.some((child: any) => child.id === siblingBrowserPaneId)
+      }, { timeout: 15_000, message: 'desktop keeps a sibling pane so cancellation uses the single-pane close path' })
+        .toBe(true)
+      const composer = desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' })
+      const createMessagesBeforeNew = frames.desktop.filter((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.create').length
+      desktop.createdReplies.holdNext()
+      await composer.fill('/new')
+      await composer.press('Enter')
+      await expect.poll(() => frames.desktop.filter((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.create').length, {
+        timeout: 20_000,
+        message: 'the new-conversation action sends a create request after releasing its prior view',
+      }).toBeGreaterThan(createMessagesBeforeNew)
+      const lateCreated = await desktop.createdReplies.waitForHeld(30_000)
+      expect(lateCreated).toMatchObject({
+        type: 'freshAgent.created',
+        sessionType: mode,
+        provider: session.provider,
+        requestId: expect.any(String),
+        sessionId: expect.any(String),
+      })
+      const newSessionId = lateCreated.sessionId as string
+      expect(newSessionId).not.toBe(session.sessionId)
+      const create = frames.desktop.find((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.create'
+        && frame.requestId === lateCreated.requestId)
+      expect(create?.viewId).toEqual(expect.any(String))
+      const cancelledViewId = create?.viewId as string
+      await expect.poll(async () => {
+        const leaf = findFreshAgentLeaf(await desktop.harness.getPaneLayout(desktop.tabId))
+        return leaf?.content?.createRequestId ?? null
+      }, { timeout: 20_000, message: 'the new conversation create is pending on desktop' }).toBe(lateCreated.requestId)
+
+      const pendingPane = desktop.page.getByRole('group', { name: /^Pane:/ }).filter({
+        has: desktop.page.locator('[data-context="fresh-agent"]').last(),
+      })
+      await pendingPane.getByRole('button', { name: 'Close pane', exact: true }).click()
+      await expect.poll(() => desktop.harness.getTabCount(), {
+        timeout: 20_000,
+        message: 'closing the creating pane preserves its tab and sibling browser view',
+      }).toBe(desktopTabCount)
+      await expect.poll(async () => findFreshAgentLeaf(await desktop.harness.getPaneLayout(desktop.tabId)), {
+        timeout: 20_000,
+        message: 'closing the creating pane removes only that local Fresh Agent view',
+      }).toBeNull()
+
+      const mobileNewView = await openView('mobile', newSessionId)
+      await expect.poll(async () => findFreshAgentLeaf(await mobileNewView.harness.getPaneLayout(mobileNewView.tabId))?.content?.status ?? null, {
+        timeout: 45_000,
+        message: 'mobile attaches to the server-owned session before desktop receives its late result',
+      }).toBe('idle')
+      await expect.poll(() => frames.mobile.some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.attach'
+        && frame.sessionId === newSessionId), {
+        timeout: 20_000,
+        message: 'mobile joined the server-owned session before desktop received its late create result',
+      }).toBe(true)
+
+      desktop.createdReplies.release()
+      let detach: JsonRow | undefined
+      await expect.poll(() => {
+        detach = frames.desktop.find((frame) => frame.direction === 'sent'
+          && frame.type === 'freshAgent.detach'
+          && frame.sessionId === newSessionId
+          && frame.viewId === cancelledViewId)
+        return Boolean(detach)
+      }, {
+        timeout: 20_000,
+        message: 'the canceled create result releases only its original view',
+      }).toBe(true)
+      expect(detach).toMatchObject({ sessionId: newSessionId, viewId: cancelledViewId })
+      await expect.poll(() => frames.desktop.some((frame) => frame.direction === 'received'
+        && frame.type === 'freshAgent.detached'
+        && frame.requestId === detach?.requestId
+        && frame.viewId === cancelledViewId
+        && frame.success === true), {
+        timeout: 20_000,
+        message: 'desktop receives confirmation for the canceled view only',
+      }).toBe(true)
+      const mobileAttachesBeforeReload = frames.mobile.filter((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.attach'
+        && frame.sessionId === newSessionId).length
+      await mobileNewView.page.reload()
+      await mobileNewView.harness.waitForHarness(15_000)
+      await mobileNewView.harness.waitForConnection(45_000)
+      await expect.poll(async () => findFreshAgentLeaf(await mobileNewView.harness.getPaneLayout(mobileNewView.tabId))?.content?.status ?? null, {
+        timeout: 45_000,
+        message: 'the surviving mobile view restores to a connected or idle state after reload',
+      }).toMatch(/^(connected|idle)$/)
+      await expect.poll(() => frames.mobile.filter((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.attach'
+        && frame.sessionId === newSessionId).length, {
+        timeout: 20_000,
+        message: 'the surviving mobile view restores the shared session after reload',
+      }).toBeGreaterThan(mobileAttachesBeforeReload)
+      expect(frames.desktop.concat(frames.mobile).some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.kill'
+        && frame.sessionId === newSessionId)).toBe(false)
+      expect(native.stopCount()).toBe(previousStops)
+      const heldPrompt = 'stage1 shared held prompt'
+      const response = mode === 'freshclaude' || mode === 'kilroy'
+        ? 'Stage1 shared response'
+        : mode === 'freshcodex'
+          ? 'Native streaming fragment and final answer'
+          : `Fake OpenCode response: ${heldPrompt}`
+      const targetBeforeSend = { provider: session.provider, sessionType: mode, sessionId: newSessionId }
+      const beforeSnapshot = await fetchFreshAgentSnapshot(native.info, targetBeforeSend)
+      const desktopNewView = await openView('desktop', newSessionId)
+      await expect.poll(async () => findFreshAgentLeaf(await desktopNewView.harness.getPaneLayout(desktopNewView.tabId))?.content?.status ?? null, {
+        timeout: 45_000,
+        message: 'desktop can reattach to the server-owned new conversation after the canceled view is removed',
+      }).toBe('idle')
+      await native.holdNextTurn(newSessionId)
+      await desktopNewView.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' }).fill(heldPrompt)
+      await desktopNewView.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('button', { name: 'Send', exact: true }).click()
+      await expect.poll(() => frames.desktop.some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.send'
+        && frame.sessionId === newSessionId
+        && frame.text === heldPrompt), {
+        timeout: 20_000,
+        message: 'the reattached desktop view submits the prompt to the server-owned new conversation',
+      }).toBe(true)
+      const nativeSessionId = await native.waitForHeldTurn(heldPrompt, newSessionId)
+      const targetSession = { ...targetBeforeSend, sessionId: nativeSessionId }
+      if (mode === 'freshopencode') {
+        const materializedOnDesktop = () => frames.desktop.find((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.session.materialized'
+          && frame.previousSessionId === newSessionId
+          && frame.sessionId === nativeSessionId)
+        const materializedOnMobile = () => frames.mobile.find((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.session.materialized'
+          && frame.previousSessionId === newSessionId
+          && frame.sessionId === nativeSessionId)
+        await expect.poll(materializedOnDesktop, {
+          timeout: 20_000,
+          message: 'desktop follows OpenCode materialization to the provider session id',
+        }).toBeTruthy()
+        await expect.poll(materializedOnMobile, {
+          timeout: 20_000,
+          message: 'mobile follows OpenCode materialization while its shared view remains attached',
+        }).toBeTruthy()
+      }
+      await expect.poll(async () => findFreshAgentLeaf(await mobileNewView.harness.getPaneLayout(mobileNewView.tabId))?.content?.sessionRef?.sessionId)
+        .toBe(nativeSessionId)
+      await native.releaseTurn()
+      await expect(mobileNewView.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
+      const afterSnapshot = await fetchFreshAgentSnapshot(native.info, targetSession)
+      expect(countTranscriptRowsWithSummary(afterSnapshot.turns, 'user', heldPrompt)
+        - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'user', heldPrompt)).toBe(1)
+      expect(countTranscriptRowsWithSummary(afterSnapshot.turns, 'assistant', response)
+        - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'assistant', response)).toBe(1)
+      expect(native.stopCount()).toBe(previousStops)
+      expect(mode === 'freshopencode' ? native.bootCount() : native.bootCount(nativeSessionId)).toBe(1)
+      expect(native.stopCount(nativeSessionId)).toBe(0)
+      expect(findFreshAgentLeaf(await mobile.harness.getPaneLayout(mobileNewView.tabId))?.content?.sessionRef?.sessionId).toBe(nativeSessionId)
+    }))
+  }
+
+  for (const mode of MODES) {
+    test(`stage1 switches ${mode}: desktop starts fresh while mobile keeps a streaming parent`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+    }) => {
+      const heldPrompt = 'stage1 shared held prompt'
+      const response = mode === 'freshclaude' || mode === 'kilroy'
+        ? 'Stage1 shared response'
+        : mode === 'freshcodex'
+          ? 'Native streaming fragment and final answer'
+          : `Fake OpenCode response: ${heldPrompt}`
+      const originalBoots = native.bootCount(session.sessionId)
+      const beforeSnapshot = await fetchFreshAgentSnapshot(native.info, session)
+      await native.holdNextTurn()
+      await desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' }).fill(heldPrompt)
+      await desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('button', { name: 'Send', exact: true }).click()
+      await native.waitForHeldTurn(heldPrompt)
+
+      const composer = desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill('/new')
+      await composer.press('Enter')
+      await expect.poll(() => frames.desktop.some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.detach'
+        && frame.sessionId === session.sessionId), {
+        timeout: 20_000,
+        message: 'desktop releases only its parent view before the held turn is released',
+      }).toBe(true)
+      expect(frames.desktop.concat(frames.mobile).some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.kill'
+        && frame.sessionId === session.sessionId)).toBe(false)
+      expect(findFreshAgentLeaf(await mobile.harness.getPaneLayout(mobile.tabId))?.content?.sessionRef?.sessionId).toBe(session.sessionId)
+
+      // Release promptly after A detaches so the provider’s bounded prompt
+      // request is not held up by the new conversation’s independent startup.
+      await native.releaseTurn()
+      await expect(mobile.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
+      await expect.poll(async () => {
+        const leaf = findFreshAgentLeaf(await desktop.harness.getPaneLayout(desktop.tabId))
+        return leaf?.content?.sessionRef?.sessionId ?? null
+      }, {
+        timeout: 30_000,
+        message: 'desktop switches to a newly created conversation after its own view detaches',
+      }).not.toBe(session.sessionId)
+      expect(frames.desktop.concat(frames.mobile).some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.kill'
+        && frame.sessionId === session.sessionId)).toBe(false)
+      expect(findFreshAgentLeaf(await mobile.harness.getPaneLayout(mobile.tabId))?.content?.sessionRef?.sessionId).toBe(session.sessionId)
+      expect(native.bootCount(session.sessionId)).toBe(originalBoots)
+
+      await expect.poll(async () => {
+        const snapshot = await fetchFreshAgentSnapshot(native.info, session)
+        return {
+          user: countTranscriptRowsWithSummary(snapshot.turns, 'user', heldPrompt)
+            - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'user', heldPrompt),
+          assistant: countTranscriptRowsWithSummary(snapshot.turns, 'assistant', response)
+            - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'assistant', response),
+        }
+      }, { timeout: 45_000, message: 'the parent turn is recorded once after desktop changes its view' })
+        .toEqual({ user: 1, assistant: 1 })
+      expect(native.stopCount()).toBe(0)
+      expect(native.bootCount(session.sessionId)).toBe(originalBoots)
+    }))
+  }
+
+  for (const mode of MODES) {
+    test(`stage1 switches fork ${mode}: desktop repoints while mobile keeps the parent`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      openView,
+    }) => {
+      const heldPrompt = 'stage1 shared held prompt'
+      const response = mode === 'freshclaude' || mode === 'kilroy'
+        ? 'Stage1 shared response'
+        : mode === 'freshcodex'
+          ? 'Native streaming fragment and final answer'
+          : `Fake OpenCode response: ${heldPrompt}`
+      const parentBoots = native.bootCount(session.sessionId)
+      const beforeSnapshot = await fetchFreshAgentSnapshot(native.info, session)
+      await native.holdNextTurn()
+      await desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' }).fill(heldPrompt)
+      await desktop.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('button', { name: 'Send', exact: true }).click()
+      await native.waitForHeldTurn(heldPrompt)
+      await native.releaseTurn()
+      await expect(mobile.page.locator('[data-context="fresh-agent"]').last()).toContainText(response, { timeout: 45_000 })
+      const parentUserTurn = desktop.page.locator('[data-context="fresh-agent"] article[data-turn-role="user"]').last()
+      await expect(parentUserTurn).toBeVisible({ timeout: 20_000 })
+      await parentUserTurn.hover({ timeout: 20_000 })
+      await parentUserTurn.getByRole('button', { name: 'Fork conversation from here' }).click({ timeout: 20_000 })
+      await expect.poll(() => frames.desktop.some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.fork'
+        && frame.sessionId === session.sessionId), {
+        timeout: 20_000,
+        message: 'desktop forks the settled parent while mobile remains attached',
+      }).toBe(true)
+      let forkReply: JsonRow | undefined
+      await expect.poll(() => {
+        forkReply = frames.desktop.find((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.forked'
+          && frame.parentSessionId === session.sessionId)
+        return forkReply?.sessionId ?? null
+      }, { timeout: 45_000, message: 'desktop receives the provider fork result for its parent view' })
+        .not.toBeNull()
+      expect(forkReply?.sessionId).toEqual(expect.any(String))
+      expect(forkReply?.sessionId).not.toBe(session.sessionId)
+      // These provider fixtures fork beside the source. Managed runtimes that
+      // retire a parent are a separate authoritative outcome covered by the
+      // parentRetiredByRuntime unit case.
+      expect(forkReply?.parentRetiredByRuntime).not.toBe(true)
+      await expect.poll(async () => {
+        const leaf = findFreshAgentLeaf(await desktop.harness.getPaneLayout(desktop.tabId))
+        return leaf?.content?.sessionRef?.sessionId ?? null
+      }, { timeout: 30_000, message: 'only the desktop pane repoints to the fork child' })
+        .toBe(forkReply?.sessionId)
+      expect(frames.desktop.some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.detach'
+        && frame.sessionId === session.sessionId)).toBe(true)
+      expect(frames.desktop.concat(frames.mobile).some((frame) => frame.direction === 'sent'
+        && frame.type === 'freshAgent.kill'
+        && frame.sessionId === session.sessionId)).toBe(false)
+      expect(findFreshAgentLeaf(await mobile.harness.getPaneLayout(mobile.tabId))?.content?.sessionRef?.sessionId)
+        .toBe(session.sessionId)
+      expect(native.bootCount(session.sessionId)).toBe(parentBoots)
+
+      const beforeParentContinuation = await fetchFreshAgentSnapshot(native.info, session)
+      expect(countTranscriptRowsWithSummary(beforeParentContinuation.turns, 'user', heldPrompt)
+        - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'user', heldPrompt)).toBe(1)
+      expect(countTranscriptRowsWithSummary(beforeParentContinuation.turns, 'assistant', response)
+        - countTranscriptRowsWithSummary(beforeSnapshot.turns, 'assistant', response)).toBe(1)
+
+      const continuationPrompt = FORK_PARENT_CONTINUATION_PROMPT
+      const continuationResponse = mode === 'freshclaude' || mode === 'kilroy'
+        ? 'Stage1 shared response'
+        : mode === 'freshcodex'
+          ? 'Native streaming fragment and final answer'
+          : `Fake OpenCode response: ${continuationPrompt}`
+      const desktopParentView = await openView('desktop', session.sessionId)
+      await expect.poll(async () => findFreshAgentLeaf(await desktopParentView.harness.getPaneLayout(desktopParentView.tabId))?.content?.status ?? null, {
+        timeout: 45_000,
+        message: 'desktop can reattach to the parent conversation while mobile keeps its view',
+      }).toBe('idle')
+      await native.holdNextTurn()
+      await desktopParentView.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('textbox', { name: 'Chat message input' }).fill(continuationPrompt)
+      await desktopParentView.page.locator('[data-context="fresh-agent"]').last()
+        .getByRole('button', { name: 'Send', exact: true }).click()
+      await native.waitForHeldTurn(continuationPrompt)
+      await native.releaseTurn()
+      await expect(mobile.page.locator('[data-context="fresh-agent"]').last())
+        .toContainText(continuationResponse, { timeout: 45_000 })
+      await expect.poll(async () => {
+        const afterSnapshot = await fetchFreshAgentSnapshot(native.info, session)
+        return {
+          user: countTranscriptRowsWithSummary(afterSnapshot.turns, 'user', continuationPrompt)
+            - countTranscriptRowsWithSummary(beforeParentContinuation.turns, 'user', continuationPrompt),
+          assistant: countTranscriptRowsWithSummary(afterSnapshot.turns, 'assistant', continuationResponse)
+            - countTranscriptRowsWithSummary(beforeParentContinuation.turns, 'assistant', continuationResponse),
+        }
+      }, { timeout: 45_000, message: 'the parent continuation appears once in the shared transcript snapshot' })
+        .toEqual({ user: 1, assistant: 1 })
+      expect(native.stopCount()).toBe(0)
+      expect(native.bootCount(session.sessionId)).toBe(parentBoots)
+    }))
+  }
 
   for (const mode of MODES) {
     test(`stage1 close ${mode}: closing mobile detaches its view and desktop keeps the shared agent`, withTwoDeviceSession(mode, async ({

@@ -5,7 +5,11 @@ import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/f
 import type { SessionRef } from '@shared/session-contract'
 import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
-import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
+import {
+  consumeCreateRoute,
+  rememberCreateRoute,
+} from '@/lib/create-cancellation'
+import { consumeCancelledFreshAgentCreateRoute } from '@/lib/fresh-agent-view-attachment'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
@@ -25,6 +29,7 @@ import {
   applyRuntimeOwner,
   beginOperationAttempt,
   markControlAttemptPending,
+  clearPendingCreate,
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
@@ -192,16 +197,19 @@ export function handleFreshAgentMessage(
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
       const provider = created.provider ?? created.runtimeProvider
-      const route = consumeCreateRoute(created.requestId)
-      if (consumeCancelledCreate(created.requestId)) {
-        if (provider && route?.viewId) {
+      const cancelledAttachment = consumeCancelledFreshAgentCreateRoute(created.requestId)
+      if (cancelledAttachment) {
+        if (cancelledAttachment.matchesCurrentView) {
+          dispatch(clearPendingCreate({ requestId: created.requestId }))
+        }
+        if (provider && cancelledAttachment.viewId) {
           // A late create belongs to a pane that has already gone away. Drop
           // only that connection's view interest; the shared session remains
           // available to other panes and devices.
           ws?.send({
             type: 'freshAgent.detach',
             requestId: nanoid(),
-            viewId: route.viewId,
+            viewId: cancelledAttachment.viewId,
             sessionId: created.sessionId,
             sessionType: created.sessionType,
             provider,
@@ -210,6 +218,7 @@ export function handleFreshAgentMessage(
         }
         return true
       }
+      const route = consumeCreateRoute(created.requestId)
       if (provider) dispatch(observeFreshAgentSession({ provider, sessionId: created.sessionId }))
       dispatch(sessionCreated({
         requestId: created.requestId,

@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Browser, BrowserContext, Page } from '@playwright/test'
+import type { Browser, BrowserContext, Page, WebSocketRoute } from '@playwright/test'
 import { expect } from '@playwright/test'
 import { openPanePicker } from './pane-picker.js'
 import { installRecoveryOfferAutoDeclineOnContext } from './recovery-offer.js'
@@ -13,6 +13,7 @@ import { TestHarness } from './test-harness.js'
 import { claudeSimulatorServerEnv } from './claude-sim-lane.js'
 
 export type FreshAgentMultipleDeviceMode = 'freshclaude' | 'kilroy' | 'freshcodex' | 'freshopencode'
+export const FORK_PARENT_CONTINUATION_PROMPT = 'stage1 parent continues after desktop fork'
 type Provider = 'claude' | 'codex' | 'opencode'
 
 type JsonRow = Record<string, unknown>
@@ -22,16 +23,26 @@ type Device = {
   harness: TestHarness
   tabId: string
   paneId: string
+  frames: JsonRow[]
+  createdReplies: CreatedReplyGate
+}
+
+type DevicePage = Pick<Device, 'context' | 'page' | 'harness' | 'frames' | 'createdReplies'>
+
+type CreatedReplyGate = {
+  holdNext: () => void
+  waitForHeld: (timeoutMs?: number) => Promise<JsonRow>
+  release: () => void
 }
 
 type NativeFixture = {
   info: E2eServerInfo
   rows: () => JsonRow[]
-  bootCount: () => number
-  stopCount: () => number
-  holdNextTurn: () => Promise<void>
+  bootCount: (sessionId?: string) => number
+  stopCount: (sessionId?: string) => number
+  holdNextTurn: (sessionId?: string) => Promise<void>
   releaseTurn: () => Promise<void>
-  waitForHeldTurn: (prompt: string) => Promise<void>
+  waitForHeldTurn: (prompt: string, sessionId?: string) => Promise<string>
 }
 
 export type FreshAgentMultipleDeviceSession = {
@@ -40,6 +51,7 @@ export type FreshAgentMultipleDeviceSession = {
   native: NativeFixture
   session: { provider: Provider; sessionType: FreshAgentMultipleDeviceMode; sessionId: string }
   frames: { desktop: JsonRow[]; mobile: JsonRow[] }
+  openView: (device: 'desktop' | 'mobile', sessionId: string) => Promise<Device>
   close: () => Promise<void>
 }
 
@@ -61,7 +73,6 @@ const PANE_LABEL_BY_MODE: Record<FreshAgentMultipleDeviceMode, string> = {
 }
 
 const FRESH_AGENT_MODE = /^(freshclaude|kilroy|freshcodex|freshopencode)$/
-const CODEX_THREAD_ID = 'thread-stage1-multiple-devices'
 
 function readJsonl(filePath: string): JsonRow[] {
   if (!existsSync(filePath)) return []
@@ -174,7 +185,8 @@ async function openDevicePage(
   context: BrowserContext,
   info: E2eServerInfo,
   frames: JsonRow[],
-): Promise<{ page: Page; harness: TestHarness }> {
+  createdReplies: CreatedReplyGate,
+): Promise<DevicePage> {
   const page = await context.newPage()
   const ownedWsOrigin = info.baseUrl.replace(/^http/, 'ws')
   page.on('websocket', (socket) => {
@@ -195,7 +207,81 @@ async function openDevicePage(
   const harness = new TestHarness(page)
   await harness.waitForHarness()
   await harness.waitForConnection()
-  return { page, harness }
+  return { context, page, harness, frames, createdReplies }
+}
+
+function createCreatedReplyGate(): {
+  gate: CreatedReplyGate
+  intercept: (client: WebSocketRoute, raw: unknown) => boolean
+} {
+  let shouldHoldNext = false
+  let held: { raw: string; frame: JsonRow } | undefined
+  let resolveHeld: ((frame: JsonRow) => void) | undefined
+  let heldPromise: Promise<JsonRow> | undefined
+  let sendHeld: ((raw: string) => void) | undefined
+
+  const gate: CreatedReplyGate = {
+    holdNext: () => {
+      if (shouldHoldNext || held) throw new Error('a freshAgent.created reply is already held or armed')
+      shouldHoldNext = true
+      heldPromise = new Promise<JsonRow>((resolve) => { resolveHeld = resolve })
+    },
+    waitForHeld: (timeoutMs = 45_000) => {
+      if (held) return Promise.resolve(held.frame)
+      if (!heldPromise) throw new Error('holdNext must be called before waiting for a freshAgent.created reply')
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(
+          `Timed out after ${timeoutMs}ms waiting for a freshAgent.created reply`,
+        )), timeoutMs)
+      })
+      return Promise.race([heldPromise, timeout]).finally(() => {
+        if (timer) clearTimeout(timer)
+      })
+    },
+    release: () => {
+      if (!held || !sendHeld) throw new Error('no freshAgent.created reply is currently held')
+      const pending = held
+      held = undefined
+      sendHeld(pending.raw)
+      sendHeld = undefined
+      resolveHeld = undefined
+      heldPromise = undefined
+    },
+  }
+
+  return {
+    gate,
+    intercept: (client, raw) => {
+      if (!shouldHoldNext || typeof raw !== 'string') return false
+      let frame: unknown
+      try { frame = JSON.parse(raw) } catch { return false }
+      if (!frame || typeof frame !== 'object' || (frame as { type?: unknown }).type !== 'freshAgent.created') return false
+      held = { raw, frame: frame as JsonRow }
+      shouldHoldNext = false
+      sendHeld = (message) => client.send(message)
+      resolveHeld?.(held.frame)
+      return true
+    },
+  }
+}
+
+async function installCreatedReplyGate(
+  context: BrowserContext,
+  info: E2eServerInfo,
+  gate: ReturnType<typeof createCreatedReplyGate>,
+): Promise<void> {
+  const wsOrigin = new URL(info.baseUrl.replace(/^http/, 'ws')).origin
+  await context.routeWebSocket((url) => url.origin === wsOrigin && url.pathname === '/ws', (client) => {
+    const server = client.connectToServer()
+    client.onMessage((message) => server.send(message))
+    server.onMessage((message) => {
+      if (gate.intercept(client, message)) return
+      client.send(message)
+    })
+    client.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
+    server.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
+  })
 }
 
 async function seedHome(homeDir: string, provider: Provider): Promise<void> {
@@ -212,22 +298,22 @@ async function seedHome(homeDir: string, provider: Provider): Promise<void> {
   if (provider === 'codex') await fs.mkdir(path.join(homeDir, '.codex', 'sessions'), { recursive: true })
 }
 
-async function openMobileFreshAgentView(
-  mobile: { page: Page; harness: TestHarness },
-  frames: JsonRow[],
+async function openFreshAgentView(
+  device: DevicePage,
   sessionId: string,
   provider: Provider,
   sessionType: string,
+  cwd: string,
 ): Promise<{ tabId: string; paneId: string }> {
   // Create an independent browser-owned pane at the known durable locator.
   // The actual FreshAgentView mounts and performs the normal WS attach; this
   // avoids coupling a view-lifecycle test to session-directory discovery.
-  const before = await mobile.harness.getTabCount()
+  const before = await device.harness.getTabCount()
   const tabId = `multiple-device-tab-${sessionType}-${Date.now()}`
   const paneId = `multiple-device-pane-${sessionType}-${Date.now()}`
   const viewId = `multiple-device-view-${sessionType}-${Date.now()}`
   const createRequestId = `multiple-device-${sessionType}-${Date.now()}`
-  await mobile.page.evaluate(({ currentTabId, currentPaneId, currentProvider, currentSessionId, currentSessionType, currentCreateRequestId, currentViewId }) => {
+  await device.page.evaluate(({ currentTabId, currentPaneId, currentProvider, currentSessionId, currentSessionType, currentCreateRequestId, currentViewId, currentCwd }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__
     harness?.dispatch({ type: 'tabs/addTab', payload: { id: currentTabId, title: 'Shared Fresh Agent', mode: 'shell' } })
     harness?.dispatch({
@@ -239,6 +325,7 @@ async function openMobileFreshAgentView(
           kind: 'fresh-agent',
           provider: currentProvider,
           sessionType: currentSessionType,
+          initialCwd: currentCwd,
           createRequestId: currentCreateRequestId,
           viewId: currentViewId,
           sessionId: currentSessionId,
@@ -257,28 +344,26 @@ async function openMobileFreshAgentView(
     currentSessionType: sessionType,
     currentCreateRequestId: createRequestId,
     currentViewId: viewId,
+    currentCwd: cwd,
   })
-  await expect.poll(() => mobile.harness.getTabCount(), { timeout: 15_000 }).toBe(before + 1)
-  const activeTabId = await mobile.harness.getActiveTabId()
+  await expect.poll(() => device.harness.getTabCount(), { timeout: 15_000 }).toBe(before + 1)
+  const activeTabId = await device.harness.getActiveTabId()
   expect(activeTabId).toBe(tabId)
   await expect.poll(async () => {
-    const leaf = findFreshAgentLeaf(await mobile.harness.getPaneLayout(tabId))
+    const leaf = findFreshAgentLeaf(await device.harness.getPaneLayout(tabId))
     return leaf?.id ?? ''
   }, { timeout: 15_000, message: 'the mobile test pane contains the canonical Fresh Agent locator' }).toBe(paneId)
-  await expect(mobile.page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 15_000 })
-  await expect.poll(() => frames.some((frame) => frame.direction === 'sent'
+  await expect(device.page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 15_000 })
+  await expect.poll(() => device.frames.some((frame) => frame.direction === 'sent'
     && frame.type === 'freshAgent.attach'
     && frame.sessionId === sessionId
     && frame.viewId === viewId), {
     timeout: 15_000,
     message: 'the mobile FreshAgentView attached to the canonical locator with its own view id',
   }).toBe(true)
-  await expect.poll(() => frames.some((frame) => frame.direction === 'received'
-    && frame.type === 'freshAgent.event'
-    && frame.sessionId === sessionId), {
-    timeout: 15_000,
-    message: 'the server delivered the attached session snapshot to the mobile view',
-  }).toBe(true)
+  // The tracked, live Codex attach path intentionally has no response frame
+  // (it is a parity no-op). Callers prove the view remains usable through the
+  // later status or shared-stream assertions in their scenario.
   return { tabId, paneId }
 }
 
@@ -315,28 +400,41 @@ function nativeFixture(input: {
     ...(input.additionalAuditPaths ?? []).flatMap(readJsonl),
   ]
   const promptText = (row: JsonRow) => typeof row.prompt === 'string' ? row.prompt : undefined
-  const heldPromptCount = () => {
+  const heldPromptCount = (sessionId = input.sessionId) => {
     switch (input.mode) {
       case 'freshclaude':
       case 'kilroy':
-        return rows().filter((row) => row.kind === 'native_gate_wait' && row.sessionId === input.sessionId).length
+        return rows().filter((row) => row.kind === 'native_gate_wait' && row.sessionId === sessionId).length
       case 'freshcodex':
-        return rows().filter((row) => row.method === 'item/agentMessage/delta' && row.threadId === input.sessionId).length
+        return rows().filter((row) => row.method === 'item/agentMessage/delta' && row.threadId === sessionId).length
       case 'freshopencode':
         return rows().filter((row) => row.event === 'prompt_async'
-          && row.sessionId === input.sessionId && promptText(row)).length
+          && row.sessionId === sessionId && promptText(row)).length
     }
   }
   let heldPromptCountBefore = 0
+  let heldPromptSessionId = input.sessionId
+  let heldRowsCountBefore = 0
   return {
     info: input.info,
     rows,
-    bootCount: () => rows().filter((row) => input.mode === 'freshopencode'
-      ? row.event === 'launch'
-      : input.mode === 'freshclaude' || input.mode === 'kilroy'
-        ? row.kind === 'boot'
-        : row.event === 'native_boot').length,
-    stopCount: () => {
+    bootCount: (sessionId) => {
+      if (sessionId) {
+        if (input.mode === 'freshclaude' || input.mode === 'kilroy') {
+          return rows().filter((row) => row.kind === 'boot' && row.sessionId === sessionId).length
+        }
+        if (input.mode === 'freshcodex') {
+          return rows().filter((row) => row.method === 'thread/start' && row.threadId === sessionId).length
+        }
+        return rows().filter((row) => row.event === 'launch' && row.rootSessionId === sessionId).length
+      }
+      return rows().filter((row) => input.mode === 'freshopencode'
+        ? row.event === 'launch'
+        : input.mode === 'freshclaude' || input.mode === 'kilroy'
+          ? row.kind === 'boot'
+          : row.event === 'native_boot').length
+    },
+    stopCount: (sessionId) => {
       if (input.mode === 'freshcodex') {
         // Codex termination deliberately uses SIGKILL after the server takes
         // ownership of the process tree, so the fake app-server cannot write
@@ -346,19 +444,29 @@ function nativeFixture(input: {
           && !isProcessRunning(row.pid)).length
       }
       return rows().filter((row) => input.mode === 'freshopencode'
-        ? row.event === 'native_stop' && row.sessionId === input.sessionId
+        ? row.event === 'native_stop' && row.sessionId === (sessionId ?? input.sessionId)
         : row.kind === 'native_stop' && row.sessionId === input.sessionId).length
     },
-    holdNextTurn: async () => {
-      heldPromptCountBefore = heldPromptCount()
+    holdNextTurn: async (sessionId = input.sessionId) => {
+      heldPromptSessionId = sessionId
+      heldPromptCountBefore = heldPromptCount(sessionId)
+      heldRowsCountBefore = rows().length
       await fs.rm(input.gatePath, { force: true })
     },
     releaseTurn: async () => fs.writeFile(input.gatePath, 'released\n'),
-    waitForHeldTurn: async () => {
+    waitForHeldTurn: async (prompt, sessionId = heldPromptSessionId) => {
+      let observedSessionId = sessionId
       await expect.poll(() => {
-        if (heldPromptCount() <= heldPromptCountBefore) return false
+        if (input.mode === 'freshopencode') {
+          const promptedRows = rows().slice(heldRowsCountBefore).filter((row) => row.event === 'prompt_async'
+            && promptText(row) === prompt)
+          if (promptedRows.length === 0) return false
+          observedSessionId = String(promptedRows[promptedRows.length - 1].sessionId)
+        } else if (heldPromptCount(sessionId) <= heldPromptCountBefore) {
+          return false
+        }
         if (input.mode !== 'freshopencode') return true
-        const sessionRows = rows().filter((row) => row.sessionId === input.sessionId)
+        const sessionRows = rows().filter((row) => row.sessionId === observedSessionId)
         const busyCount = sessionRows.filter((row) => row.event === 'session_status_emitted' && row.status === 'busy').length
         const idleCount = sessionRows.filter((row) => row.event === 'session_idle_emitted').length
         return busyCount > idleCount
@@ -366,6 +474,7 @@ function nativeFixture(input: {
         timeout: 30_000,
         message: `${input.mode} native fixture reached its held prompt gate`,
       }).toBe(true)
+      return observedSessionId
     },
   }
 }
@@ -405,6 +514,7 @@ async function startTwoDeviceSession(
       program: {
         rules: [
           { on: 'msg:prompt', match: { text: 'stage1 shared held prompt' }, emit: [{ kind: 'text', data: { text: 'Stage1 shared response' } }] },
+          { on: 'msg:prompt', match: { text: FORK_PARENT_CONTINUATION_PROMPT }, emit: [{ kind: 'text', data: { text: 'Stage1 shared response' } }] },
           { on: 'msg:prompt', match: { text: 'stage1 terminate held prompt' }, emit: [{ kind: 'text', data: { text: 'Stage1 terminate response' } }] },
         ],
       },
@@ -420,7 +530,11 @@ async function startTwoDeviceSession(
     env = {
       CODEX_CMD: `${process.execPath} ${path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')}`,
       FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
-        threadStartThreadId: CODEX_THREAD_ID,
+        // Each FreshCodex session launches its own fake app-server process.
+        // IDs sequenced in config restart at index 0 per process, so use the
+        // fixture's pid-scoped IDs to keep a new conversation distinct from
+        // the shared parent thread.
+        uniqueThreadIds: true,
         appendThreadOperationLogPath: operationsPath,
         appendRequestLogPath: requestsPath,
         appendNativeNotificationLogPath: notificationsPath,
@@ -430,6 +544,7 @@ async function startTwoDeviceSession(
         liveTranscriptPrompts: [
           'stage1 warm session for multiple devices',
           'stage1 shared held prompt',
+          FORK_PARENT_CONTINUATION_PROMPT,
           'stage1 terminate held prompt',
         ],
         recordTurns: true,
@@ -457,6 +572,8 @@ async function startTwoDeviceSession(
   let desktop: Device
   let mobile: Device
   let session: FreshAgentMultipleDeviceSession['session']
+  let desktopCreatedReplyGate: ReturnType<typeof createCreatedReplyGate> | undefined
+  let mobileCreatedReplyGate: ReturnType<typeof createCreatedReplyGate> | undefined
   let closed = false
   const close = async () => {
     if (closed) return
@@ -475,8 +592,12 @@ async function startTwoDeviceSession(
     })
     info = await server.start()
     mobileContext = await newDeviceContext(browser, true)
-    desktopOpen = await openDevicePage(desktopContext, info, desktopFrames)
-    mobileOpen = await openDevicePage(mobileContext, info, mobileFrames)
+    desktopCreatedReplyGate = createCreatedReplyGate()
+    mobileCreatedReplyGate = createCreatedReplyGate()
+    await installCreatedReplyGate(desktopContext, info, desktopCreatedReplyGate)
+    await installCreatedReplyGate(mobileContext, info, mobileCreatedReplyGate)
+    desktopOpen = await openDevicePage(desktopContext, info, desktopFrames, desktopCreatedReplyGate.gate)
+    mobileOpen = await openDevicePage(mobileContext, info, mobileFrames, mobileCreatedReplyGate.gate)
 
     const desktopDeviceId = await desktopOpen.page.evaluate(() => localStorage.getItem('freshell.device-id.v2'))
     const mobileDeviceId = await mobileOpen.page.evaluate(() => localStorage.getItem('freshell.device-id.v2'))
@@ -503,10 +624,7 @@ async function startTwoDeviceSession(
     desktop.paneId = desktopLeaf.id
     session = { provider, sessionType: mode, sessionId }
 
-    if (provider === 'codex' && sessionId !== CODEX_THREAD_ID) {
-      throw new Error(`Codex fixture expected ${CODEX_THREAD_ID}, received ${sessionId}`)
-    }
-    const mobileSession = await openMobileFreshAgentView(mobileOpen, mobileFrames, sessionId, provider, mode)
+    const mobileSession = await openFreshAgentView(mobileOpen, sessionId, provider, mode, projectDir)
     mobile = { ...mobileOpen, ...mobileSession }
     await waitForPaneStatus(mobile, 'idle')
 
@@ -527,6 +645,11 @@ async function startTwoDeviceSession(
       native,
       session,
       frames: { desktop: desktopFrames, mobile: mobileFrames },
+      openView: async (deviceName, viewSessionId) => {
+        const target = deviceName === 'desktop' ? desktopOpen : mobileOpen
+        const view = await openFreshAgentView(target, viewSessionId, provider, mode, projectDir)
+        return { ...target, ...view }
+      },
       close,
     }
   } catch (error) {

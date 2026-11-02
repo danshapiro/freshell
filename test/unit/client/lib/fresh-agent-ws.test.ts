@@ -13,7 +13,7 @@ import {
   registerFreshAgentCreate,
 } from '@/lib/fresh-agent-ws'
 import { ReadyMessageSchema } from '@/lib/ready-message-schema'
-import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
+import { cancelCreate, consumeCancelledCreate, consumeCreateRoute, _resetCancelledCreates } from '@/lib/create-cancellation'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { resolvePaneNameRef } from '@/store/selectors/sessionNameSelectors'
@@ -219,16 +219,36 @@ describe('fresh-agent-ws', () => {
     })
   })
 
-  it('detaches a late freshAgent.created view when its create request was cancelled', () => {
+  it('settles a cancelled late create by view while a second view keeps the shared session', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
+
+    registerFreshAgentCreate(store.dispatch, 'req-shared-b', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'view-shared-b',
+    })
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-shared-b',
+      sessionId: 'thread-shared',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-shared',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: { type: 'freshAgent.status', status: 'running' },
+    })
 
     registerFreshAgentCreate(store.dispatch, 'req-orphan', {
       sessionType: 'freshcodex',
       provider: 'codex',
       viewId: 'view-orphan',
     })
-    cancelCreate('req-orphan')
+    cancelCreate('req-orphan', 'view-orphan')
 
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
@@ -248,19 +268,42 @@ describe('fresh-agent-ws', () => {
       provider: 'codex',
     }))
     expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-shared']?.status).toBe('running')
+    expect(store.getState().freshAgent.pendingCreates['req-shared-b']).toMatchObject({
+      sessionId: 'thread-shared',
+      provider: 'codex',
+    })
+    expect(store.getState().freshAgent.pendingCreates['req-orphan']).toBeUndefined()
+    expect(consumeCreateRoute('req-orphan')).toBeUndefined()
+    expect(consumeCancelledCreate('req-orphan')).toBe(false)
     expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-orphan']).toBeUndefined()
   })
 
-  it('routes a cancelled late FreshOpenCode create cleanup to its original view', () => {
+  it('keeps the OpenCode cwd and shared session intact while cleaning up a cancelled view', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
+
+    registerFreshAgentCreate(store.dispatch, 'req-opencode-b', {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/shared',
+      viewId: 'view-opencode-b',
+    })
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-opencode-b',
+      sessionId: 'ses_shared',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
 
     registerFreshAgentCreate(store.dispatch, 'req-opencode-orphan', {
       sessionType: 'freshopencode',
       provider: 'opencode',
+      cwd: '/repo/shared',
       viewId: 'view-opencode-orphan',
     })
-    cancelCreate('req-opencode-orphan')
+    cancelCreate('req-opencode-orphan', 'view-opencode-orphan')
 
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
@@ -279,7 +322,53 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshopencode',
       provider: 'opencode',
     }))
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      cwd: '/repo/shared',
+    }))
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_shared']).toMatchObject({
+      status: 'connected',
+      cwd: '/repo/shared',
+    })
+    expect(store.getState().freshAgent.pendingCreates['req-opencode-orphan']).toBeUndefined()
     expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_orphan']).toBeUndefined()
+  })
+
+  it('uses the canceled request view after the same pane has moved to a replacement view', () => {
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+
+    registerFreshAgentCreate(store.dispatch, 'req-old-view', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'view-old',
+    })
+    cancelCreate('req-old-view', 'view-old')
+    registerFreshAgentCreate(store.dispatch, 'req-new-view', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      viewId: 'view-new',
+    })
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-old-view',
+      sessionId: 'thread-old-view',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, ws)
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
+      viewId: 'view-old',
+      sessionId: 'thread-old-view',
+    }))
+    expect(store.getState().freshAgent.pendingCreates['req-new-view']).toMatchObject({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    expect(store.getState().freshAgent.pendingCreates['req-old-view']).toBeUndefined()
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-old-view']).toBeUndefined()
   })
 
   it('handles freshAgent.create.failed', () => {
@@ -1602,7 +1691,7 @@ describe('runtime-owner folds (kata b8ke)', () => {
     expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
-  it('a cancelled late create always routes detach through its saved view id', () => {
+  it('routes an OpenCode late detach with the canceled request view after a pane view switch', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
     registerFreshAgentCreate(store.dispatch, 'req-orphan-plain', {
@@ -1610,7 +1699,7 @@ describe('runtime-owner folds (kata b8ke)', () => {
       provider: 'codex',
       viewId: 'view-orphan-plain',
     })
-    cancelCreate('req-orphan-plain')
+    cancelCreate('req-orphan-plain', 'view-orphan-plain')
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-orphan-plain',
