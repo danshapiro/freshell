@@ -8595,6 +8595,67 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&claude_home).ok();
     }
 
+    /// Task-1 review F-1: the readiness contract includes publishes
+    /// carrying `scan_failures`. A source whose FIRST sweep fails its
+    /// root listing (the `Err` arm of `refresh_snapshot`'s
+    /// `discover_checked`) still publishes a generation — the failure
+    /// rides the same `CachedSnapshot` — so the first publish must still
+    /// flip readiness: a cold index whose first sweep failed a provider
+    /// counts as ready, with the failure carried in the payload (the
+    /// downstream "distinguish genuine unreadable-store failures from
+    /// normal warming" seam). Failure seeding mirrors the donor test
+    /// `snapshot_and_scan_failures_publish_as_one_atomic_generation`.
+    #[tokio::test]
+    async fn readiness_watch_fires_on_first_publish_carrying_scan_failures() {
+        struct FailingSource;
+        impl SessionSource for FailingSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+
+        let index = test_index(vec![Arc::new(FailingSource)]);
+        let ready = index.subscribe_ready();
+        assert!(!*ready.borrow(), "cold index must not be ready");
+
+        // First sweep: discover_checked errs, the failure is recorded, and
+        // the (empty) snapshot still publishes carrying the failure.
+        let _ = index.snapshot().await;
+
+        // Non-vacuous guard: the first publication provably carries the
+        // scan failure (same generation, one lock write) — readiness must
+        // fire on exactly this publish, not on some later healthy one.
+        let (_items, failures) = index.snapshot_with_failures().await;
+        assert_eq!(
+            failures,
+            vec!["claude".to_string()],
+            "the first publication must carry the scan failure"
+        );
+        assert!(
+            *ready.borrow(),
+            "a scan-failure first publication must still mark readiness"
+        );
+        // A late subscriber sees the current value immediately.
+        let late = index.subscribe_ready();
+        assert!(
+            *late.borrow(),
+            "late subscriber must see readiness immediately"
+        );
+        assert!(index.is_ready());
+    }
+
     #[tokio::test]
     async fn scoped_dirty_path_skips_full_discover() {
         let claude_home = unique_temp_dir("scoped-skip-discover");
