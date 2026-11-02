@@ -278,7 +278,8 @@ test.describe('Rust baseline browser actions', () => {
     expect(forwardedBodyParts?.groups?.command).toBe(shellCommand)
     expect(forwardedBodyParts?.groups?.cwd).toBe(repoDir)
     expect(forwardedBodyParts?.groups?.output).toBe(shellOutputToken)
-    const diff = pane.locator('.fresh-agent-file-diff')
+    await pane.getByRole('button', { name: /^Diffs:/ }).click()
+    const diff = page.getByRole('dialog', { name: 'Changes' }).locator('.fresh-agent-file-diff')
     await expect(diff).toContainText('README.md')
     await expect(diff).toContainText('modified')
     const diffResponse = page.waitForResponse((response) => (

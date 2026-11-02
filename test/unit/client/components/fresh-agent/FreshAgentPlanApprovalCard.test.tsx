@@ -1,3 +1,5 @@
+import userEvent from '@testing-library/user-event'
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { FreshAgentPlanApprovalCard } from '@/components/fresh-agent/FreshAgentPlanApprovalCard'
@@ -13,6 +15,8 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 // tool call: the plan renders as markdown, and each choice is its exact
 // decision (decision D4 names the four choices).
 
+afterEach(() => cleanup())
+
 const PLAN = '# Ship the parser\n\n1. Edit `parser.ts`\n2. Run the tests'
 const PLAN_FILE = '/home/me/.claude/plans/ship-the-parser.md'
 
@@ -23,7 +27,7 @@ function renderPlan(input: Record<string, unknown>, disabled = false) {
 }
 
 describe('FreshAgentPlanApprovalCard', () => {
-  afterEach(() => cleanup())
+
 
   it('renders the plan as markdown and shows where the CLI saved it', () => {
     const { card } = renderPlan({ plan: PLAN, planFilePath: PLAN_FILE })
@@ -85,7 +89,7 @@ describe('FreshAgentPlanApprovalCard', () => {
   it('a request with no plan says so and can still be answered', () => {
     const { card, onRespond } = renderPlan({})
 
-    expect(card).toHaveTextContent(/no plan text was provided/i)
+    expect(within(card).getByText(/no plan text was provided/i)).toBeVisible()
     expect(within(card).queryByRole('heading')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Keep planning' }))
     expect(onRespond).toHaveBeenCalledTimes(1)
@@ -115,4 +119,28 @@ describe('FreshAgentPlanApprovalCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Approve plan' }))
     expect(onRespond).toHaveBeenCalledWith({ behavior: 'allow' })
   })
+})
+
+it.each(['One short step', 'First step\nSecond step'])('keeps a short plan visible: %s', plan => {
+ renderPlan({plan})
+ expect(screen.getByText(plan,{normalizer:value=>value})).toBeVisible()
+ expect(screen.queryByText('Plan details')).not.toBeInTheDocument()
+})
+it('keeps feedback and all decisions available while long plan details toggle', async () => {
+ const user=userEvent.setup()
+ const plan='Long plan body '.repeat(50)
+ const {onRespond}=renderPlan({plan})
+ const body=screen.getByText(plan.trim())
+ expect(body).not.toBeVisible()
+ const note=screen.getByRole('textbox',{name:'What should change? (optional)'})
+ await user.type(note,'Please revise')
+ for(const label of ['Approve plan','Approve and auto-accept edits','Approve and stop asking for permission']) {
+  expect(screen.getByRole('button',{name:label,exact:true})).toBeVisible()
+  expect(screen.getByRole('button',{name:label,exact:true})).toBeDisabled()
+ }
+ await user.click(screen.getByText('Plan details')); expect(body).toBeVisible()
+ await user.click(screen.getByText('Plan details')); expect(body).not.toBeVisible()
+ expect(note).toHaveValue('Please revise'); expect(onRespond).not.toHaveBeenCalled()
+ await user.click(screen.getByRole('button',{name:'Keep planning'}))
+ expect(onRespond).toHaveBeenCalledExactlyOnceWith({behavior:'deny',message:'Please revise',interrupt:false})
 })

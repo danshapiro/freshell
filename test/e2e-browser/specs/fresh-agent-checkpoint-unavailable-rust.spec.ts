@@ -160,7 +160,10 @@ test.describe('fresh-agent checkpoint availability', () => {
 
       await expect.poll(() => fs.readFile(sourceFile, 'utf8'), { timeout: 20_000 })
         .toBe('before checkpoint\n')
-      await expect(reloadedPane.getByText(`Code rewound to before: "${marker}"`))
+      const notices = reloadedPane.getByRole('status', { name: 'Agent notices' })
+      await expect(notices).toBeVisible({ timeout: 10_000 })
+      await notices.locator('summary').click()
+      await expect(notices.getByText(`Code rewound to before: "${marker}"`))
         .toBeVisible({ timeout: 10_000 })
     } finally {
       await context?.close().catch(() => {})

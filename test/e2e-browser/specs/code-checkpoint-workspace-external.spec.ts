@@ -1,3 +1,4 @@
+import type { Locator } from '@playwright/test'
 import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { resolvePairedExternalFixture } from '../../../scripts/testing/e2e-external-target.js'
@@ -28,6 +29,14 @@ type CheckpointOutcome = {
   workspace?: { path: string; provenance: string }
   code?: string
   reason?: string
+}
+
+async function expectRewindNotice(pane: Locator, text: string): Promise<void> {
+  const notices = pane.getByRole('status', { name: 'Agent notices' })
+  await expect(notices).toBeVisible({ timeout: 30_000 })
+  await expect(notices).toContainText(text, { timeout: 30_000 })
+  if (!await notices.locator('details').evaluate(node => (node as HTMLDetailsElement).open)) await notices.locator('summary').click()
+  await expect(notices.getByText(text, { exact: true })).toBeVisible({ timeout: 30_000 })
 }
 
 async function currentFreshAgent(page: import('@playwright/test').Page): Promise<{
@@ -326,8 +335,7 @@ async function verifyPickerWorkspaceReopensForRewind(
   await turn.row.hover()
   const rewind = turn.row.getByRole('button', { name: 'Rewind code to here' })
   await expect(rewind).toBeEnabled()
-  const rewindNotice = expect(reopenedPane.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
-    .toContainText(`Code rewound to before: "${prompt}"`, { timeout: 30_000 })
+  const rewindNotice = expectRewindNotice(reopenedPane, `Code rewound to before: "${prompt}"`)
   const dialogAccepted = page.waitForEvent('dialog').then((dialog) => dialog.accept())
   await rewind.click()
   await Promise.all([dialogAccepted, rewindNotice])
@@ -414,8 +422,7 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
   await duplicateRows.nth(0).hover()
   const rewind = duplicateRows.nth(0).getByRole('button', { name: 'Rewind code to here' })
   await expect(rewind).toBeEnabled()
-  const rewindNotice = expect(restoredPane.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
-    .toContainText(`Code rewound to before: "${samePrompt}"`, { timeout: 30_000 })
+  const rewindNotice = expectRewindNotice(restoredPane, `Code rewound to before: "${samePrompt}"`)
   const dialogAccepted = page.waitForEvent('dialog').then(dialog => dialog.accept())
   await rewind.click()
   await Promise.all([dialogAccepted, rewindNotice])
@@ -514,8 +521,7 @@ test('opening a linked-worktree session from History preserves picker scope and 
   await turn.row.hover()
   const rewind = turn.row.getByRole('button', { name: 'Rewind code to here' })
   await expect(rewind).toBeEnabled()
-  const rewindNotice = expect(reopenedPane.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
-    .toContainText(`Code rewound to before: "${turnText}"`, { timeout: 30_000 })
+  const rewindNotice = expectRewindNotice(reopenedPane, `Code rewound to before: "${turnText}"`)
   const dialogAccepted = page.waitForEvent('dialog').then((dialog) => dialog.accept())
   await rewind.click()
   await Promise.all([dialogAccepted, rewindNotice])
@@ -547,8 +553,7 @@ test('picker-confirmed non-Git workspace captures and restores all selected file
   await targetWrite(page, `${fixture.nonGitWorkspacePath}/one.txt`, 'one changed after send\n')
   await targetWrite(page, `${fixture.nonGitWorkspacePath}/two.txt`, 'two changed after send\n')
   await turn.row.hover()
-  const rewindNotice = expect(paneRoot.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
-    .toContainText(`Code rewound to before: "${marker}"`, { timeout: 30_000 })
+  const rewindNotice = expectRewindNotice(paneRoot, `Code rewound to before: "${marker}"`)
   const dialogAccepted = page.waitForEvent('dialog').then(dialog => dialog.accept())
   await turn.row.getByRole('button', { name: 'Rewind code to here' }).click()
   await Promise.all([dialogAccepted, rewindNotice])

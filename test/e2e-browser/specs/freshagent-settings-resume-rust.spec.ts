@@ -723,7 +723,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       // broadcast frames. NO page.reload() anywhere: the banner is in-memory
       // Redux state (V1 N3).
       await expect(
-        paneRoot.getByText('This session has ended'),
+        paneRoot.locator('[data-agent-error="ended"]'),
         'the sidecar crash must surface the exited state client-side first',
       ).toBeVisible({ timeout: 30_000 })
 
@@ -738,7 +738,12 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       })
 
       // Task 6's contract: memory loss must be user-visible, not server-log-only.
-      const banner = page.getByRole('alert').filter({ hasText: 'no longer has memory' })
+      const memoryLoss = paneRoot.locator('[data-agent-error="session"]')
+      const banner = memoryLoss.getByText(/no longer has memory/)
+      await expect(banner).toHaveCount(1, { timeout: 15_000 })
+      if (!(await memoryLoss.evaluate(node => node.hasAttribute('open')))) {
+        await memoryLoss.locator('summary').click()
+      }
       await expect(banner, 'memory loss must be user-visible, not just a server warn').toBeVisible({ timeout: 15000 })
 
       // "New thread minted" = TWO thread/start entries in the op log. The fake

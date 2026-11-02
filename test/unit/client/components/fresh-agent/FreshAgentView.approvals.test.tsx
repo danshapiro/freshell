@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, createEvent, fireEvent, render, screen, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { appReducers } from '@/store/appReducers'
-import { initLayout } from '@/store/panesSlice'
-import { sessionCreated } from '@/store/freshAgentSlice'
+import { initLayout, mergePaneContent } from '@/store/panesSlice'
+import { sessionCreated, setSessionStatus } from '@/store/freshAgentSlice'
 import { setStatus } from '@/store/connectionSlice'
 import { useAppSelector } from '@/store/hooks'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
@@ -353,4 +353,165 @@ it.each([
   await advance(1000)
   expect(wsMock.send.mock.calls.filter(([frame]) => frame.type === 'freshAgent.send')).toHaveLength(1)
   expect(wsMock.send.mock.calls.filter(([frame]) => frame.type === 'freshAgent.question.respond')).toHaveLength(0)
+})
+
+it.each([CLAUDE,KILROY,CODEX])('answers a compact long request for $sessionType without expanding its arguments', async locator => {
+ serve(locator,[{requestId:'long-command',toolName:'Bash',input:{command:'echo '.repeat(500)}}])
+ const store=createStore(locator); await mount(store)
+ expect(screen.getByText('1 pending request')).toBeVisible()
+ expect(screen.getByText('echo '.repeat(500),{normalizer:value=>value})).not.toBeVisible()
+ const summary=screen.getByText('Command details')
+ expect(summary.closest('[aria-label="Pending requests"]')).not.toBeNull()
+ fireEvent.click(summary)
+ expect(responds()).toEqual([])
+ fireEvent.click(screen.getByRole('button',{name:'Allow tool use'}))
+ expect(responds()).toContainEqual(expect.objectContaining({requestId:'long-command',decision:{behavior:'allow'}}))
+})
+
+it('keeps keyboard disclosure activation out of the composer', async () => {
+ serve(CLAUDE,[
+  {requestId:'command',toolName:'Bash',input:{command:'echo '.repeat(500)}},
+  {requestId:'plan',toolName:'ExitPlanMode',input:{plan:'Review this plan. '.repeat(50)}},
+ ])
+ const store=createStore(CLAUDE)
+ store.dispatch(mergePaneContent({tabId:'tab-1',paneId:'pane-1',updates:{reconcileNotice:'Settings updated',closeError:'A diagnostic with recovery information'}}))
+ await mount(store)
+ act(() => handleFreshAgentMessage(store.dispatch, {type:'freshAgent.event',...CLAUDE,event:{type:'freshAgent.notice',level:'info',code:'SETTINGS_UPDATED',message:'Provider settings updated'}}))
+
+ const composer=screen.getByRole('textbox',{name:'Chat message input'})
+ fireEvent.change(composer,{target:{value:'Keep this draft'}})
+ for(const label of ['Command details','Plan details','Notice details','Close failed']) {
+  const summary=screen.getByText(label,{exact:true}).closest('summary')!
+  const details=summary.parentElement!
+  summary.focus()
+  const space=createEvent.keyDown(summary,{key:' ',code:'Space'})
+  fireEvent(summary,space)
+  expect(space.defaultPrevented).toBe(false)
+  // jsdom has no summary keyboard default; apply its browser click activation.
+  fireEvent.click(summary)
+  expect(details).toHaveAttribute('open')
+  expect(summary).toHaveFocus()
+  expect(composer).toHaveValue('Keep this draft')
+  const enter=createEvent.keyDown(summary,{key:'Enter',code:'Enter'})
+  fireEvent(summary,enter)
+  expect(enter.defaultPrevented).toBe(false)
+  fireEvent.click(summary)
+  expect(details).not.toHaveAttribute('open')
+  expect(summary).toHaveFocus()
+  expect(composer).toHaveValue('Keep this draft')
+ }
+ expect(responds()).toEqual([])
+})
+
+it('funnels letters from top-stack controls while leaving Space and Enter for activation', async () => {
+  serve(CLAUDE, [{ requestId: 'command', toolName: 'Bash', input: { command: 'echo '.repeat(500) } }])
+  await mount(createStore(CLAUDE))
+  const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+  fireEvent.change(composer, { target: { value: 'Draft' } })
+  for (const control of [screen.getByText('Command details'), screen.getByRole('button', { name: 'Allow tool use' })]) {
+    control.focus()
+    for (const key of [' ', 'Enter']) {
+      const event = createEvent.keyDown(control, { key })
+      fireEvent(control, event)
+      expect(event.defaultPrevented).toBe(false)
+      expect(control).toHaveFocus()
+    }
+    fireEvent.keyDown(control, { key: 'x' })
+    await advance(20) // appendText focuses on the next animation frame.
+    expect(composer).toHaveFocus()
+  }
+  expect(composer).toHaveValue('Draftxx')
+  expect(responds()).toEqual([])
+})
+
+it('keeps question and elicitation inputs visible outside closed diagnostics', async () => {
+ apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+  ...snapshot(CLAUDE,[],1),
+  pendingQuestions:[{requestId:'question',questions:[{header:'Choice',question:'Which option?',options:[{label:'Yes',description:'Proceed'}],multiSelect:false}]}],
+  pendingElicitations:[{requestId:'form',mode:'form',serverName:'contract',message:'Enter the requested token',fields:[{id:'token',title:'Token',type:'string',secret:true,required:true}]}],
+ })
+ const store=createStore(CLAUDE)
+ store.dispatch(mergePaneContent({tabId:'tab-1',paneId:'pane-1',updates:{closeError:'Original close failure'}}))
+ await mount(store)
+ expect(screen.getByText('2 pending requests')).toBeVisible()
+ expect(screen.getByText('Close failed',{exact:true})).toBeVisible()
+ expect(screen.getByText('Close failed: Original close failure')).not.toBeVisible()
+ const token=screen.getByLabelText('Token')
+ expect(token).toBeVisible()
+ expect(token.closest('details')).toBeNull()
+ expect(screen.getByText('Which option?')).toBeVisible()
+ fireEvent.click(screen.getByRole('button',{name:'Continue',exact:true}))
+ expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({type:'freshAgent.elicitation.respond'}))
+ fireEvent.change(token,{target:{value:'exact secret'}})
+ fireEvent.click(screen.getByRole('button',{name:'Continue',exact:true}))
+ expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({type:'freshAgent.elicitation.respond',requestId:'form',action:'accept',content:{token:'exact secret'}}))
+})
+
+it.each([['stuck','Agent appears stuck'],['exited','Session ended']] as const)('keeps the %s summary outside overflowing pending requests', async (status,summary) => {
+ serve(CLAUDE,Array.from({length:12},(_,index)=>({requestId:`request-${index}`,toolName:'Bash',input:{command:'echo '.repeat(100)}})))
+ const store=createStore(CLAUDE)
+ await mount(store)
+ act(()=>store.dispatch(setSessionStatus({...CLAUDE,status})))
+ expect(screen.getByText('12 pending requests')).toBeVisible()
+ const error=screen.getByText(summary,{exact:true})
+ expect(error).toBeVisible()
+ expect(error.closest('[aria-label="Pending requests"]')).toBeNull()
+ const requests=screen.getByRole('region',{name:'Pending requests'})
+ fireEvent.click(within(requests).getAllByRole('button',{name:'Allow tool use'})[0])
+ expect(responds()).toContainEqual(expect.objectContaining({requestId:'request-0',decision:{behavior:'allow'}}))
+ expect(error).toBeVisible()
+})
+
+it.each([['info', 'routine body'], ['warning', 'rate limit body'], ['error', 'compaction failure body']] as const)('preserves the provider %s notice level without inferring from text', async (level, message) => {
+ serve(CLAUDE, [])
+ const store = createStore(CLAUDE)
+ await mount(store)
+ act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...CLAUDE, event: {type: 'freshAgent.notice', level, code: 'provider-notice', message} }))
+ const text = screen.getByText(message)
+ if (level === 'info') {
+  expect(text).not.toBeVisible()
+  fireEvent.click(screen.getByText('Notice details'))
+  expect(text).toBeVisible()
+  expect(text.closest('[role="status"]')).not.toBeNull()
+ } else {
+  expect(text).toBeVisible()
+  expect(text.closest('[role="alert"]')).not.toBeNull()
+ }
+})
+
+it('keeps a long provider error concise while retaining the full diagnostic and request controls', async () => {
+ serve(CLAUDE, [{requestId:'pending',toolName:'Bash',input:{command:'echo yes'}}])
+ const store = createStore(CLAUDE)
+ await mount(store)
+ const message = 'Long provider diagnostic '.repeat(100).trim()
+ act(() => handleFreshAgentMessage(store.dispatch, {type:'freshAgent.event', ...CLAUDE, event:{type:'freshAgent.notice',level:'error',code:'diagnostic',message}}))
+ const body = screen.getByText(message)
+ expect(body).not.toBeVisible()
+ const alert = within(screen.getByRole('region',{name:'Agent errors'})).getByRole('alert').closest('summary')!
+ expect(alert).toBeVisible()
+ expect(alert.textContent!.length).toBeLessThan(240)
+ expect(screen.getByRole('button',{name:'Allow tool use'})).toBeVisible()
+ fireEvent.click(alert)
+ expect(body).toBeVisible()
+ expect(body).toHaveTextContent(message)
+})
+
+it('keeps the prevention instruction visible for persistent uncertain delivery with a long reason', async () => {
+ apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({...snapshot(CODEX,[],1),status:'idle'})
+ await mount(createStore(CODEX))
+ const composer = screen.getByRole('textbox',{name:'Chat message input'})
+ fireEvent.change(composer,{target:{value:'Keep this original'}})
+ fireEvent.click(screen.getByRole('button',{name:'Send',exact:true}))
+ await advance(0)
+ const sent = wsMock.send.mock.calls.map(([frame])=>frame).find(frame=>frame.type==='freshAgent.send')
+ const reason = 'Long uncertain delivery explanation '.repeat(30).trim()
+ act(()=>{for(const handler of wsMock.handlers) handler({type:'error',code:'INTERNAL_ERROR',requestId:sent.requestId,message:`CODEX_DELIVERY_AMBIGUOUS: ${reason}`})})
+ const warning = within(screen.getByRole('region',{name:'Agent errors'})).getByRole('alert',{name:'Agent warning'})
+ expect(warning).toBeVisible()
+ expect(warning).toHaveTextContent('Check the conversation before sending again.')
+ await advance(7000)
+ expect(warning).toBeVisible()
+ expect(composer).toHaveValue('Keep this original')
+ fireEvent.click(warning.closest('summary')!)
+ expect(screen.getByText(`Delivery uncertain (${sent.requestId}): ${reason}. Check the conversation before sending again.`)).toBeVisible()
 })
