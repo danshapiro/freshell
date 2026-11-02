@@ -16,6 +16,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use freshell_protocol::InventoryTerminal;
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
     DesiredState, IncidentId, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlanRequest,
@@ -34,6 +35,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+
+use freshell_freshagent::layout_store::{LayoutStore, PaneSnapshot};
+use freshell_ownership::{OwnershipState, RuntimeOwnerKind, RuntimeOwnershipRegistry};
+use freshell_terminal::TerminalRegistry;
 
 const PROJECTION_SCHEMA_VERSION: u32 = 1;
 const PROJECTOR_BATCH: u32 = 100;
@@ -163,6 +168,9 @@ pub struct ManagedRuntimeApiState {
     projection_store: ManagedViewProjectionStore,
     pane_ledger: Arc<PaneLedger>,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    readiness_layout_store: Option<LayoutStore>,
+    readiness_terminals: Option<TerminalRegistry>,
+    readiness_ownership: Option<Arc<RuntimeOwnershipRegistry>>,
 }
 
 impl ManagedRuntimeApiState {
@@ -180,6 +188,9 @@ impl ManagedRuntimeApiState {
             projection_store: ManagedViewProjectionStore::open(projection_path)?,
             pane_ledger,
             broadcast_tx,
+            readiness_layout_store: None,
+            readiness_terminals: None,
+            readiness_ownership: None,
         };
         if let Some(client) = state.client.as_ref() {
             let snapshot = client
@@ -197,6 +208,18 @@ impl ManagedRuntimeApiState {
         controller: Option<Arc<crate::managed_runtime::ServerManagedRuntimeController>>,
     ) -> Self {
         self.terminal_controller = controller;
+        self
+    }
+
+    pub fn with_readiness_ownership_sources(
+        mut self,
+        layout_store: LayoutStore,
+        terminals: TerminalRegistry,
+        ownership: Arc<RuntimeOwnershipRegistry>,
+    ) -> Self {
+        self.readiness_layout_store = Some(layout_store);
+        self.readiness_terminals = Some(terminals);
+        self.readiness_ownership = Some(ownership);
         self
     }
 
@@ -390,15 +413,41 @@ async fn runtime_readiness(
         Ok(client) => client,
         Err(rejection) => return rejection.into_response(),
     };
-    match client.inventory_snapshot().await {
-        Ok(snapshot) => Json(json!({
-            "revision": snapshot.revision,
-            "readiness": snapshot.readiness,
-            "pendingProjectionCount": snapshot.pending_projection_count,
-        }))
-        .into_response(),
-        Err(error) => client_error(error),
+    let before = match client.health().await {
+        Ok(identity) => identity,
+        Err(error) => return client_error(error),
+    };
+    let snapshot = match client.inventory_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return client_error(error),
+    };
+    let after = match client.health().await {
+        Ok(identity) => identity,
+        Err(error) => return client_error(error),
+    };
+    if before != after {
+        return ApiRejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Managed runtime changed while readiness was being read".into(),
+        }
+        .into_response();
     }
+    let pane_ownership = pane_ownership_report(
+        state.readiness_layout_store.as_ref(),
+        state.readiness_terminals.as_ref(),
+        state.readiness_ownership.as_deref(),
+        &snapshot.souls,
+    );
+    let (control_epoch, installation_id) = before;
+    Json(json!({
+        "installationId": installation_id,
+        "controlEpoch": control_epoch,
+        "revision": snapshot.revision,
+        "readiness": snapshot.readiness,
+        "pendingProjectionCount": snapshot.pending_projection_count,
+        "paneOwnership": pane_ownership,
+    }))
+    .into_response()
 }
 
 async fn list_souls(
@@ -1098,6 +1147,282 @@ fn runtime_client(state: &ManagedRuntimeApiState) -> Result<RuntimeClient, ApiRe
     })
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum PaneOwnership {
+    Durable,
+    HostManaged,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPaneOwnership {
+    client_id: String,
+    tab_id: String,
+    pane_id: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip)]
+    session_type: Option<String>,
+    #[serde(skip)]
+    identity_consistent: bool,
+    ownership: PaneOwnership,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    soul_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incarnation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaneOwnershipReport {
+    complete: bool,
+    panes: Vec<AgentPaneOwnership>,
+}
+
+fn pane_ownership_report(
+    layout_store: Option<&LayoutStore>,
+    terminals: Option<&TerminalRegistry>,
+    ownership: Option<&RuntimeOwnershipRegistry>,
+    runtime_views: &[RuntimeView],
+) -> PaneOwnershipReport {
+    let Some(layout_store) = layout_store else {
+        return PaneOwnershipReport {
+            complete: false,
+            panes: Vec::new(),
+        };
+    };
+    let terminal_rows = terminals
+        .map(TerminalRegistry::inventory)
+        .unwrap_or_default();
+    let mut panes: Vec<AgentPaneOwnership> = layout_store
+        .live_pane_snapshots()
+        .into_iter()
+        .filter_map(|entry| agent_pane_identity(entry.client_id, entry.pane))
+        .map(|mut pane| {
+            let classification =
+                classify_agent_pane(&pane, runtime_views, &terminal_rows, ownership);
+            pane.ownership = classification.ownership;
+            pane.soul_id = classification.soul_id;
+            pane.incarnation_id = classification.incarnation_id;
+            pane
+        })
+        .collect();
+    panes.sort_by(|left, right| {
+        left.client_id
+            .cmp(&right.client_id)
+            .then_with(|| left.tab_id.cmp(&right.tab_id))
+            .then_with(|| left.pane_id.cmp(&right.pane_id))
+    });
+    PaneOwnershipReport {
+        complete: true,
+        panes,
+    }
+}
+
+struct PaneClassification {
+    ownership: PaneOwnership,
+    soul_id: Option<String>,
+    incarnation_id: Option<String>,
+}
+
+impl PaneClassification {
+    fn unknown() -> Self {
+        Self {
+            ownership: PaneOwnership::Unknown,
+            soul_id: None,
+            incarnation_id: None,
+        }
+    }
+
+    fn durable(view: &RuntimeView) -> Self {
+        Self {
+            ownership: PaneOwnership::Durable,
+            soul_id: Some(view.soul_id.to_string()),
+            incarnation_id: Some(view.incarnation_id.to_string()),
+        }
+    }
+
+    fn host_managed() -> Self {
+        Self {
+            ownership: PaneOwnership::HostManaged,
+            soul_id: None,
+            incarnation_id: None,
+        }
+    }
+}
+
+fn classify_agent_pane(
+    pane: &AgentPaneOwnership,
+    runtime_views: &[RuntimeView],
+    terminal_rows: &[InventoryTerminal],
+    ownership: Option<&RuntimeOwnershipRegistry>,
+) -> PaneClassification {
+    if !pane.identity_consistent {
+        return PaneClassification::unknown();
+    }
+    match pane.kind.as_str() {
+        "terminal" => classify_terminal_pane(pane, runtime_views, terminal_rows),
+        "fresh-agent" => classify_fresh_agent_pane(pane, runtime_views, ownership),
+        _ => PaneClassification::unknown(),
+    }
+}
+
+fn classify_terminal_pane(
+    pane: &AgentPaneOwnership,
+    runtime_views: &[RuntimeView],
+    terminal_rows: &[InventoryTerminal],
+) -> PaneClassification {
+    let (Some(provider), Some(terminal_id)) =
+        (pane.provider.as_deref(), pane.terminal_id.as_deref())
+    else {
+        return PaneClassification::unknown();
+    };
+    let matching_terminals = terminal_rows
+        .iter()
+        .filter(|terminal| terminal.terminal_id == terminal_id)
+        .collect::<Vec<_>>();
+    let [terminal] = matching_terminals.as_slice() else {
+        return PaneClassification::unknown();
+    };
+    if terminal.mode != provider || terminal.status != freshell_protocol::TerminalRunStatus::Running
+    {
+        return PaneClassification::unknown();
+    }
+    match (
+        terminal.soul_id.as_deref(),
+        terminal.incarnation_id.as_deref(),
+    ) {
+        (Some(soul_id), Some(incarnation_id)) => {
+            let matching_views = runtime_views
+                .iter()
+                .filter(|view| {
+                    view.soul_id.as_str() == soul_id
+                        && view.incarnation_id.as_str() == incarnation_id
+                        && view.terminal_id.as_deref() == Some(terminal_id)
+                        && view.provider.as_deref() == Some(provider)
+                        && view.terminal_mode.as_deref() == Some(provider)
+                        && view.desired_state == DesiredState::Running
+                        && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+                })
+                .collect::<Vec<_>>();
+            match matching_views.as_slice() {
+                [view] => PaneClassification::durable(view),
+                _ => PaneClassification::unknown(),
+            }
+        }
+        (None, None) => PaneClassification::host_managed(),
+        _ => PaneClassification::unknown(),
+    }
+}
+
+fn classify_fresh_agent_pane(
+    pane: &AgentPaneOwnership,
+    runtime_views: &[RuntimeView],
+    ownership: Option<&RuntimeOwnershipRegistry>,
+) -> PaneClassification {
+    let (Some(provider), Some(session_id)) = (pane.provider.as_deref(), pane.session_id.as_deref())
+    else {
+        return PaneClassification::unknown();
+    };
+    let session_type = pane.session_type.as_deref();
+    let matching_views = runtime_views
+        .iter()
+        .filter(|view| view.fresh_agent_session_id.as_deref() == Some(session_id))
+        .collect::<Vec<_>>();
+    if !matching_views.is_empty() {
+        let current_matches = matching_views
+            .into_iter()
+            .filter(|view| {
+                view.provider.as_deref() == Some(provider)
+                    && view.fresh_agent_session_type.as_deref() == session_type
+                    && view.desired_state == DesiredState::Running
+                    && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+            })
+            .collect::<Vec<_>>();
+        return match current_matches.as_slice() {
+            [view] => PaneClassification::durable(view),
+            _ => PaneClassification::unknown(),
+        };
+    }
+    let Some(ownership) = ownership else {
+        return PaneClassification::unknown();
+    };
+    match ownership.observe(provider, session_id).state {
+        OwnershipState::Live { owner, .. }
+            if owner.kind == RuntimeOwnerKind::FreshAgent
+                && owner
+                    .live_session_key
+                    .as_deref()
+                    .is_some_and(|key| !key.is_empty()) =>
+        {
+            PaneClassification::host_managed()
+        }
+        _ => PaneClassification::unknown(),
+    }
+}
+
+fn agent_pane_identity(client_id: String, pane: PaneSnapshot) -> Option<AgentPaneOwnership> {
+    let content = pane.pane_content.as_ref()?;
+    let kind = content.get("kind")?.as_str()?;
+    let is_agent_pane = match kind {
+        "fresh-agent" => true,
+        "terminal" => content.get("mode").and_then(serde_json::Value::as_str) != Some("shell"),
+        _ => false,
+    };
+    if !is_agent_pane {
+        return None;
+    }
+    let provider = content
+        .get("provider")
+        .or_else(|| content.get("mode"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let pane_session_id = content
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let session_ref = content.get("sessionRef");
+    let reference_session_id = session_ref
+        .and_then(|value| value.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let reference_provider = session_ref
+        .and_then(|value| value.get("provider"))
+        .and_then(serde_json::Value::as_str);
+    let mode_provider = content.get("mode").and_then(serde_json::Value::as_str);
+    let identity_consistent = provider.as_deref().is_none_or(|provider| {
+        mode_provider.is_none_or(|mode| mode == provider)
+            && reference_provider.is_none_or(|reference_provider| reference_provider == provider)
+    }) && pane_session_id
+        .as_deref()
+        .zip(reference_session_id.as_deref())
+        .is_none_or(|(pane_id, reference_id)| pane_id == reference_id);
+    Some(AgentPaneOwnership {
+        client_id,
+        tab_id: pane.tab_id,
+        pane_id: pane.pane_id,
+        kind: kind.to_owned(),
+        provider,
+        terminal_id: pane.terminal_id,
+        session_id: pane_session_id.or(reference_session_id),
+        session_type: content
+            .get("sessionType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        identity_consistent,
+        ownership: PaneOwnership::Unknown,
+        soul_id: None,
+        incarnation_id: None,
+    })
+}
+
 fn latest_soul_views(views: &[RuntimeView]) -> HashMap<String, RuntimeView> {
     views
         .iter()
@@ -1186,6 +1511,345 @@ mod stop_contract_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn readiness_layout_sync(
+        tab_id: &str,
+        pane_id: &str,
+        content: serde_json::Value,
+    ) -> freshell_protocol::UiLayoutSync {
+        serde_json::from_value(json!({
+            "tabs": [{ "id": tab_id }],
+            "activeTabId": tab_id,
+            "layouts": { (tab_id): { "type": "leaf", "id": pane_id, "content": content } },
+            "activePane": { (tab_id): pane_id },
+            "timestamp": 1,
+        }))
+        .expect("readiness layout sync parses")
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_rejects_missing_and_wrong_authentication() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(4);
+        let state = ManagedRuntimeApiState::new(
+            Arc::new("readiness-secret".into()),
+            None,
+            None,
+            Arc::new(PaneLedger::new(None)),
+            Arc::new(broadcast_tx),
+        )
+        .await
+        .unwrap();
+        let app = router(state);
+        for token in [None, Some("wrong")] {
+            let mut request = Request::builder().uri("/api/runtime/readiness");
+            if let Some(token) = token {
+                request = request.header("x-auth-token", token);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_reports_runtime_client_identity_scan_and_current_pane_ownership() {
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+        };
+        use freshell_ownership::{BeginOutcome, CommitOutcome, OwnerIdentity};
+        use freshell_runtime_client::RuntimeClient;
+        use freshell_supervisor::backend::DockerEngineBackend;
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (registry, managed_view) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
+            root.path(),
+            false,
+            "opencode",
+            "freshopencode",
+            "managed-native-session",
+            false,
+        )
+        .await;
+        let backend = Arc::new(DockerEngineBackend::new(root.path().join("no-docker.sock")));
+        let (socket, control) =
+            stop_contract_tests::start_control(root.path(), registry, backend).await;
+        let direct_client = RuntimeClient::new(&socket, "test-control-secret");
+        let direct_health = direct_client.health().await.unwrap();
+        let direct_snapshot = direct_client.inventory_snapshot().await.unwrap();
+
+        let layout_store = LayoutStore::default();
+        layout_store.update_from_ui(
+            &readiness_layout_sync(
+                "tab-managed",
+                "pane-managed",
+                json!({
+                    "kind": "fresh-agent", "provider": "opencode", "sessionType": "freshopencode",
+                    "sessionId": managed_view.fresh_agent_session_id.clone().unwrap(),
+                    "createRequestId": "managed-create", "status": "running"
+                }),
+            ),
+            "client-managed",
+        );
+        layout_store.update_from_ui(
+            &readiness_layout_sync(
+                "tab-host",
+                "pane-host",
+                json!({
+                    "kind": "fresh-agent", "provider": "claude", "sessionType": "freshclaude",
+                    "sessionId": "host-native-session", "createRequestId": "host-create", "status": "running"
+                }),
+            ),
+            "client-host",
+        );
+        layout_store.update_from_ui(
+            &readiness_layout_sync(
+                "tab-unknown",
+                "pane-unknown",
+                json!({
+                    "kind": "fresh-agent", "provider": "codex", "sessionType": "freshcodex",
+                    "sessionId": "unknown-native-session", "createRequestId": "unknown-create", "status": "running"
+                }),
+            ),
+            "client-unknown",
+        );
+        layout_store.update_from_ui(
+            &readiness_layout_sync(
+                "tab-disconnected",
+                "pane-disconnected",
+                json!({
+                    "kind": "fresh-agent", "provider": "claude", "sessionType": "freshclaude",
+                    "sessionId": "host-native-session", "createRequestId": "stale-create", "status": "running"
+                }),
+            ),
+            "client-disconnected",
+        );
+        layout_store.remove_client("client-disconnected");
+
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            "host-native-session",
+            RuntimeOwnerKind::FreshAgent,
+            "host-owner-test",
+            None,
+            "readiness-test",
+            1,
+        ) else {
+            panic!("host-owned fixture must acquire its fake ownership record")
+        };
+        assert_eq!(
+            ownership.commit_live(
+                "claude",
+                "host-native-session",
+                "host-owner-test",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("freshclaude:host-native-session".into()),
+                    pid: Some(42),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        );
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(4);
+        let state = ManagedRuntimeApiState::new(
+            Arc::new("readiness-secret".into()),
+            Some(RuntimeClient::new(&socket, "test-control-secret")),
+            Some(root.path().join("managed-views.json")),
+            Arc::new(PaneLedger::new(Some(root.path().join("ledger")))),
+            Arc::new(broadcast_tx),
+        )
+        .await
+        .unwrap()
+        .with_readiness_ownership_sources(layout_store, TerminalRegistry::new(), ownership);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/readiness")
+                    .header("x-auth-token", "readiness-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["installationId"], direct_health.1);
+        assert_eq!(body["controlEpoch"], direct_health.0);
+        assert_eq!(
+            body["readiness"],
+            serde_json::to_value(direct_snapshot.readiness).unwrap()
+        );
+        assert!(body["paneOwnership"]["complete"].as_bool().unwrap());
+        let panes = body["paneOwnership"]["panes"].as_array().unwrap();
+        assert_eq!(
+            panes.len(),
+            3,
+            "all live layouts are reported; stale layouts are not"
+        );
+        let owner_by_pane = panes
+            .iter()
+            .map(|pane| {
+                (
+                    pane["paneId"].as_str().unwrap(),
+                    pane["ownership"].as_str().unwrap(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(owner_by_pane.get("pane-managed"), Some(&"durable"));
+        assert_eq!(owner_by_pane.get("pane-host"), Some(&"host-managed"));
+        assert_eq!(owner_by_pane.get("pane-unknown"), Some(&"unknown"));
+        assert!(!owner_by_pane.contains_key("pane-disconnected"));
+
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_fresh_agent_identity_is_not_reported_as_durable() {
+        use freshell_runtime_protocol::{IncarnationId, SoulId};
+        let root = tempfile::tempdir().unwrap();
+        let (_registry, view) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
+            root.path(),
+            false,
+            "opencode",
+            "freshopencode",
+            "managed-native-session",
+            false,
+        )
+        .await;
+        let mut second = view.clone();
+        second.soul_id = SoulId::new();
+        second.incarnation_id = IncarnationId::new();
+        let pane = AgentPaneOwnership {
+            client_id: "client".into(),
+            tab_id: "tab".into(),
+            pane_id: "pane".into(),
+            kind: "fresh-agent".into(),
+            provider: Some("opencode".into()),
+            terminal_id: None,
+            session_id: view.fresh_agent_session_id.clone(),
+            session_type: Some("freshopencode".into()),
+            identity_consistent: true,
+            ownership: PaneOwnership::Unknown,
+            soul_id: None,
+            incarnation_id: None,
+        };
+        let classification = classify_agent_pane(&pane, &[view, second], &[], None);
+        assert_eq!(classification.ownership, PaneOwnership::Unknown);
+        assert!(classification.soul_id.is_none());
+        assert!(classification.incarnation_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_pane_requires_matching_terminal_and_current_supervisor_identity() {
+        use freshell_protocol::{InventoryTerminal, TerminalRunStatus};
+        use freshell_runtime_protocol::DesiredState;
+
+        let root = tempfile::tempdir().unwrap();
+        let (_registry, mut view) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
+            root.path(),
+            false,
+            "codex",
+            "freshcodex",
+            "terminal-native-session",
+            false,
+        )
+        .await;
+        view.terminal_id = Some("managed-terminal".into());
+        view.terminal_mode = Some("codex".into());
+        view.provider = Some("codex".into());
+        view.desired_state = DesiredState::Running;
+        let pane = AgentPaneOwnership {
+            client_id: "client".into(),
+            tab_id: "tab".into(),
+            pane_id: "pane".into(),
+            kind: "terminal".into(),
+            provider: Some("codex".into()),
+            terminal_id: Some("managed-terminal".into()),
+            session_id: None,
+            session_type: None,
+            identity_consistent: true,
+            ownership: PaneOwnership::Unknown,
+            soul_id: None,
+            incarnation_id: None,
+        };
+        let terminal = InventoryTerminal {
+            created_at: 1,
+            last_activity_at: 1,
+            mode: "codex".into(),
+            status: TerminalRunStatus::Running,
+            terminal_id: "managed-terminal".into(),
+            title: "Codex".into(),
+            codex_durability: None,
+            cwd: None,
+            description: None,
+            runtime_status: None,
+            soul_id: Some(view.soul_id.to_string()),
+            incarnation_id: Some(view.incarnation_id.to_string()),
+            recovery_summary: None,
+            session_ref: None,
+            session_name: None,
+            name_ref: None,
+        };
+        let positive = classify_agent_pane(
+            &pane,
+            std::slice::from_ref(&view),
+            &[terminal.clone()],
+            None,
+        );
+        assert_eq!(positive.ownership, PaneOwnership::Durable);
+        assert_eq!(positive.soul_id.as_deref(), Some(view.soul_id.as_str()));
+        assert_eq!(
+            positive.incarnation_id.as_deref(),
+            Some(view.incarnation_id.as_str())
+        );
+
+        let mut wrong_incarnation = terminal.clone();
+        wrong_incarnation.incarnation_id =
+            Some(freshell_runtime_protocol::IncarnationId::new().to_string());
+        let mismatch = classify_agent_pane(&pane, &[view], &[wrong_incarnation], None);
+        assert_eq!(mismatch.ownership, PaneOwnership::Unknown);
+        assert!(mismatch.soul_id.is_none());
+
+        let host_terminal = InventoryTerminal {
+            created_at: 1,
+            last_activity_at: 1,
+            mode: "codex".into(),
+            status: TerminalRunStatus::Running,
+            terminal_id: "managed-terminal".into(),
+            title: "Codex".into(),
+            codex_durability: None,
+            cwd: None,
+            description: None,
+            runtime_status: None,
+            soul_id: None,
+            incarnation_id: None,
+            recovery_summary: None,
+            session_ref: None,
+            session_name: None,
+            name_ref: None,
+        };
+        let host = classify_agent_pane(&pane, &[], &[host_terminal], None);
+        assert_eq!(host.ownership, PaneOwnership::HostManaged);
+    }
 
     #[cfg(unix)]
     #[tokio::test]

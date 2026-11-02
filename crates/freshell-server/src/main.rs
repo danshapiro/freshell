@@ -131,6 +131,18 @@ fn load_dotenv_from(dir: &Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
 }
 
+fn server_build_info() -> serde_json::Value {
+    serde_json::json!({
+        "managedRuntimeV1": cfg!(feature = "managed-runtime-v1"),
+    })
+}
+
+fn managed_runtime_feature_error(requested: Option<&str>, compiled: bool) -> Option<String> {
+    (requested == Some("1") && !compiled).then(|| {
+        "FRESHELL_MANAGED_RUNTIME_V1=1 requires freshell-server to be built with the managed-runtime-v1 feature; rebuild with `cargo build -p freshell-server --release --features managed-runtime-v1`".to_string()
+    })
+}
+
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the close-evidence
 /// retention gate input — every pane identity the retained snapshot
 /// generations reference, scanned from the SAME `tabs-snapshots` store the
@@ -803,12 +815,28 @@ fn runtime_ownership_for_ledger(
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("--build-info"))
+    {
+        println!("{}", server_build_info());
+        return ExitCode::SUCCESS;
+    }
+
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
     // `.env` from cwd before the module reads ANY process env — including the
     // AUTH_TOKEN check immediately below. A cwd we can't resolve, or a cwd with
     // no `.env`, is a silent no-op either way.
     if let Ok(cwd) = std::env::current_dir() {
         load_dotenv_from(&cwd);
+    }
+
+    if let Some(error) = managed_runtime_feature_error(
+        std::env::var("FRESHELL_MANAGED_RUNTIME_V1").ok().as_deref(),
+        cfg!(feature = "managed-runtime-v1"),
+    ) {
+        eprintln!("freshell-server: {error}");
+        return ExitCode::FAILURE;
     }
 
     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
@@ -3189,7 +3217,12 @@ async fn main() -> ExitCode {
             eprintln!("managed runtime API initialization failed: {error}");
             std::process::exit(1);
         })
-        .with_terminal_controller(managed_runtime_controller.clone());
+        .with_terminal_controller(managed_runtime_controller.clone())
+        .with_readiness_ownership_sources(
+            layout_store.clone(),
+            registry.clone(),
+            Arc::clone(&ownership),
+        );
         state.spawn_projector();
         managed_runtime_api::router(state)
     };
@@ -4878,6 +4911,27 @@ mod sessions_sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_info_reports_the_compiled_managed_runtime_feature() {
+        assert_eq!(
+            server_build_info(),
+            serde_json::json!({
+                "managedRuntimeV1": cfg!(feature = "managed-runtime-v1"),
+            })
+        );
+    }
+
+    #[test]
+    fn requested_managed_runtime_without_its_feature_has_an_actionable_error() {
+        let error = managed_runtime_feature_error(Some("1"), false)
+            .expect("a featureless binary must reject requested managed runtime");
+        assert!(error.contains("FRESHELL_MANAGED_RUNTIME_V1=1"));
+        assert!(error.contains("managed-runtime-v1"));
+        assert!(error.contains("--features managed-runtime-v1"));
+        assert!(managed_runtime_feature_error(Some("1"), true).is_none());
+        assert!(managed_runtime_feature_error(Some("true"), false).is_none());
+    }
 
     #[test]
     fn boot_epoch_is_reserved_before_constructing_runtime_ownership() {
