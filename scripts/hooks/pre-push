@@ -153,7 +153,7 @@ if [ "$run_rust" = 1 ]; then
         fail "rust test plan could not be computed (scripts/hooks/rust-test-targets.ts)"
         ;;
       workspace)
-        test_command="cargo test --workspace --exclude freshell-tauri --locked"
+        test_command="CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --workspace --exclude freshell-tauri --locked"
         echo "pre-push: rust gate — sandboxed $test_command (the long one)" >&2
         "$HOOK_DIR/../sandbox-test.sh" "$test_command" \
           || fail "$test_command (sandboxed)"
@@ -161,7 +161,7 @@ if [ "$run_rust" = 1 ]; then
       packages)
         pkgs_args=""
         for p in $test_pkgs; do pkgs_args="$pkgs_args -p $p"; done
-        test_command="cargo test --locked${pkgs_args}"
+        test_command="CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked${pkgs_args}"
         echo "pre-push: rust gate — sandboxed targeted cargo test:$pkgs_args" >&2
         "$HOOK_DIR/../sandbox-test.sh" "$test_command" \
           || fail "$test_command (sandboxed)"

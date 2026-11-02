@@ -597,10 +597,16 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       'clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings',
     )
     expect(out.sandboxEvents).toMatchObject([
-      { args: ['cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'], cwd: fixtureRoot },
+      {
+        args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
+        cwd: fixtureRoot,
+      },
     ])
     expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
-      { args: ['test', '--locked', '-p', 'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'], sandboxActive: '1' },
+      {
+        args: ['test', '--locked', '-p', 'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'],
+        buildJobs: '3', testThreads: '4', tokioThreads: '2', sandboxActive: '1',
+      },
     ])
   })
 
@@ -608,10 +614,16 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     const out = runInstrumentedHook(fixtureSha, tauriSha)
     expect(out.status, out.stderr).toBe(0)
     expect(out.sandboxEvents).toMatchObject([
-      { args: ['cargo test --workspace --exclude freshell-tauri --locked'], cwd: fixtureRoot },
+      {
+        args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --workspace --exclude freshell-tauri --locked'],
+        cwd: fixtureRoot,
+      },
     ])
     expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
-      { args: ['test', '--workspace', '--exclude', 'freshell-tauri', '--locked'], sandboxActive: '1' },
+      {
+        args: ['test', '--workspace', '--exclude', 'freshell-tauri', '--locked'],
+        buildJobs: '3', testThreads: '4', tokioThreads: '2', sandboxActive: '1',
+      },
     ])
   })
 
@@ -666,7 +678,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       expect(res.stderr).toContain('sandboxed targeted cargo test: -p freshell-freshagent -p freshell-server -p freshell-ws')
       expect(sandboxEvents).toHaveLength(1)
       expect(sandboxEvents[0]).toMatchObject({
-        args: ['cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
+        args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
         cwd: fixtureRoot,
       })
       expect(cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([{
@@ -724,7 +736,10 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     })
     expect(out.status, out.stderr).toBe(0)
     expect(out.sandboxEvents).toMatchObject([
-      { args: ['cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'], cwd: fixtureRoot },
+      {
+        args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws'],
+        cwd: fixtureRoot,
+      },
     ])
     expect(
       out.cargoEvents
@@ -734,9 +749,9 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
       {
         args: ['test', '--locked', '-p', 'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'],
-        buildJobs: null,
-        testThreads: null,
-        tokioThreads: null,
+        buildJobs: '3',
+        testThreads: '4',
+        tokioThreads: '2',
         sandboxActive: '1',
         sandboxMode: null,
         sandboxOptIn: null,
@@ -774,14 +789,17 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     const out = runInstrumentedHook(fixtureSha, tauriSha)
     expect(out.status, out.stderr).toBe(0)
     expect(out.sandboxEvents).toMatchObject([
-      { args: ['cargo test --workspace --exclude freshell-tauri --locked'], cwd: fixtureRoot },
+      {
+        args: ['CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --workspace --exclude freshell-tauri --locked'],
+        cwd: fixtureRoot,
+      },
     ])
     expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
       {
         args: ['test', '--workspace', '--exclude', 'freshell-tauri', '--locked'],
-        buildJobs: null,
-        testThreads: null,
-        tokioThreads: null,
+        buildJobs: '3',
+        testThreads: '4',
+        tokioThreads: '2',
         sandboxActive: '1',
       },
     ])
