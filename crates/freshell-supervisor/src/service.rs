@@ -180,6 +180,16 @@ struct McpCapabilityRequest<'a> {
     provider_path_inputs: Option<&'a freshell_runtime_protocol::ProviderPathInputs>,
 }
 
+struct ReplacementMcpCapabilityRequest<'a> {
+    start: &'a crate::registry::RecoveryStart,
+    provider: &'a str,
+    context: &'a freshell_runtime_protocol::ProviderLaunchContext,
+    references: &'a [freshell_runtime_protocol::ProviderSecretReference],
+    cwd: &'a str,
+    workspace: &'a str,
+    reopen_prepared: bool,
+}
+
 #[derive(Clone)]
 struct AuthLookupAuthority {
     start: crate::registry::RecoveryStart,
@@ -1710,7 +1720,7 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "commit_backend_identity", error)
                 })?;
             state = LaunchState::Created;
-            if let Some(evidence) = create_evidence.as_deref_mut() {
+            if let Some(evidence) = create_evidence {
                 *evidence = ReopenCreateEvidence::IdentityCommitted;
             }
             crash_if("after_created_commit");
@@ -4322,9 +4332,15 @@ impl Supervisor {
         cwd: &str,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
-        self.issue_replacement_mcp_capability_inner(
-            start, provider, context, references, cwd, workspace, false,
-        )
+        self.issue_replacement_mcp_capability_inner(ReplacementMcpCapabilityRequest {
+            start,
+            provider,
+            context,
+            references,
+            cwd,
+            workspace,
+            reopen_prepared: false,
+        })
         .await
     }
 
@@ -4337,22 +4353,31 @@ impl Supervisor {
         cwd: &str,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
-        self.issue_replacement_mcp_capability_inner(
-            start, provider, context, references, cwd, workspace, true,
-        )
+        self.issue_replacement_mcp_capability_inner(ReplacementMcpCapabilityRequest {
+            start,
+            provider,
+            context,
+            references,
+            cwd,
+            workspace,
+            reopen_prepared: true,
+        })
         .await
     }
 
     async fn issue_replacement_mcp_capability_inner(
         &self,
-        start: &crate::registry::RecoveryStart,
-        provider: &str,
-        context: &freshell_runtime_protocol::ProviderLaunchContext,
-        references: &[freshell_runtime_protocol::ProviderSecretReference],
-        cwd: &str,
-        workspace: &str,
-        reopen_prepared: bool,
+        request: ReplacementMcpCapabilityRequest<'_>,
     ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        let ReplacementMcpCapabilityRequest {
+            start,
+            provider,
+            context,
+            references,
+            cwd,
+            workspace,
+            reopen_prepared,
+        } = request;
         let codex_source_runtime = if provider == "codex" {
             use freshell_platform::codex_inputs::NativeSourceRuntime;
             let incompatible =
@@ -6996,13 +7021,14 @@ mod tests {
                     (0, 0, 0),
                     "{failure}: failed replacement must release only verified-empty authority"
                 );
-                let mut probe = backend.probe.lock().unwrap();
-                if matches!(failure, "after-grant" | "commit") {
-                    assert_eq!(probe.stop_count, 1);
+                {
+                    let mut probe = backend.probe.lock().unwrap();
+                    if matches!(failure, "after-grant" | "commit") {
+                        assert_eq!(probe.stop_count, 1);
+                    }
+                    probe.fail_create = false;
+                    probe.fail_after_grant = false;
                 }
-                probe.fail_create = false;
-                probe.fail_after_grant = false;
-                drop(probe);
                 let retry_peer = with_callback.then(|| {
                     tokio::spawn(frozen_callback_peer(
                         UnixListener::bind(&callback_socket).unwrap(),
@@ -7481,6 +7507,20 @@ mod tests {
 
     #[tokio::test]
     async fn reopen_uncertain_create_retains_authority_until_verified() {
+        #[derive(Debug)]
+        struct LatestRecoverySnapshot {
+            incarnation_id: String,
+            launch_state: String,
+            cleanup_state: String,
+            command_state: String,
+            stop_outcome: Option<String>,
+            stop_settled: bool,
+            writer_claim_count: u64,
+            reservation_count: u64,
+            recovery_attempt_id: Option<String>,
+            identity_is_empty: bool,
+        }
+
         let mut failures = Vec::new();
         for (label, create_then_fail, fail_identity_commit) in [
             ("uncertain create", true, false),
@@ -7513,22 +7553,35 @@ mod tests {
             }
 
             let database = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
-            let latest: (String, String, String, String, Option<String>, bool, u64, u64, Option<String>, bool) = database
+            let latest = database
                 .query_row(
                     "SELECT i.incarnation_id,i.launch_state,i.cleanup_state,c.state,p.outcome,p.settled,(SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=i.incarnation_id),(SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=i.incarnation_id),s.recovery_attempt_id,(i.docker_daemon_id IS NULL AND i.container_id IS NULL AND i.grant_id IS NULL) FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id JOIN souls s ON s.soul_id=i.soul_id LEFT JOIN ordinary_stops p ON p.incarnation_id=i.incarnation_id WHERE i.soul_id=?1 ORDER BY i.created_at DESC,i.rowid DESC LIMIT 1",
                     [soul.as_str()],
-                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+                    |row| {
+                        Ok(LatestRecoverySnapshot {
+                            incarnation_id: row.get(0)?,
+                            launch_state: row.get(1)?,
+                            cleanup_state: row.get(2)?,
+                            command_state: row.get(3)?,
+                            stop_outcome: row.get(4)?,
+                            stop_settled: row.get(5)?,
+                            writer_claim_count: row.get(6)?,
+                            reservation_count: row.get(7)?,
+                            recovery_attempt_id: row.get(8)?,
+                            identity_is_empty: row.get(9)?,
+                        })
+                    },
                 )
                 .unwrap();
-            if latest.1 != "stopping"
-                || latest.2 != "blocked_ownership"
-                || latest.3 != "reopen_cleanup_pending"
-                || latest.4.as_deref() != Some("blocked_ownership")
-                || latest.5
-                || latest.6 != 1
-                || latest.7 != 1
-                || latest.8.is_none()
-                || !latest.9
+            if latest.launch_state != "stopping"
+                || latest.cleanup_state != "blocked_ownership"
+                || latest.command_state != "reopen_cleanup_pending"
+                || latest.stop_outcome.as_deref() != Some("blocked_ownership")
+                || latest.stop_settled
+                || latest.writer_claim_count != 1
+                || latest.reservation_count != 1
+                || latest.recovery_attempt_id.is_none()
+                || !latest.identity_is_empty
             {
                 failures.push(format!(
                     "{label}: uncertain ownership must remain blocked with claims and reservations; got {latest:?}"
@@ -7544,7 +7597,7 @@ mod tests {
             let verified_empty_count: u64 = database
                 .query_row(
                     "SELECT COUNT(*) FROM ordinary_stops WHERE incarnation_id=?1 AND outcome='verified_empty'",
-                    [&latest.0],
+                    [&latest.incarnation_id],
                     |row| row.get(0),
                 )
                 .unwrap();
