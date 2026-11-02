@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Implement the three managed-runtime update modes: default updates the web/client without restarting the durable supervisor or resetting managed coding sessions; `--all` updates the web/client and durable runtime; `--durable-only` updates durable components while leaving the web/client unchanged. Also fix the pre-existing managed-provider qualification compile failure in a dedicated worktree so tests can run, then continue the update-mode implementation.
+Implement the three managed-runtime update modes: default updates the web/client without restarting the durable supervisor or resetting managed coding sessions; `--all` updates the web/client and durable runtime; `--durable-only` updates durable components while leaving the web/client unchanged. Fix the pre-existing managed-provider qualification compile failure so tests can run. Add deployment verification so the server refuses to start with managed runtime enabled when its binary lacks `managed-runtime-v1`, supported deployment paths cannot install such a binary, and an updater verifies authenticated runtime readiness connected to the intended supervisor before reporting success. Prove through ordinary UI creation paths that supported terminal and Fresh Agent agents receive managed runtime identities and remain attached to the same managed sessions across a web-only update. Detect and report open panes whose agents still run outside durable souls, preserving their work.
 
 ### Explicit constraints
 - Require the user to say “APPROVED” verbatim before either reset-capable mode, based on the mode/action category and without compatibility analysis.
@@ -15,11 +15,24 @@ Implement the three managed-runtime update modes: default updates the web/client
 - Default mode reminds the operator that the supervisor and managed sessions were not restarted and that reset-capable updates require verbatim approval.
 - Remove the existing broad approval restriction for ordinary web/client restarts; do not replace it with another web/client approval rule.
 - Ensure ordinary web/client maintenance cannot indirectly restart the durable supervisor.
-- Use the-usual workflow.
-- Fix the baseline compile failure in the dedicated worktree under the user's explicit exception, then continue the requested update-mode implementation.
+- If `FRESHELL_MANAGED_RUNTIME_V1=1` is requested but the server binary lacks the compile-time `managed-runtime-v1` feature, fail startup with a useful error. Supported deployment paths must detect and refuse binaries that would disable requested managed-runtime support.
+- Before an updater reports success, verify the authenticated runtime API is ready and connected to the intended supervisor. Generic HTTP health and a successful socket connection alone are insufficient evidence.
+- Integration/browser tests must create agents through ordinary UI paths for supported terminal and Fresh Agent modes, verify managed runtime identities, and confirm the same managed sessions remain attached across a web-only update.
+- Detect and report open panes whose agents are still host-managed outside durable souls. Preserve their running work; any migration that can interrupt them must be a separate deliberate operation.
+- Use the-usual workflow. Fix the pre-existing baseline compile failure in the dedicated worktree before continuing implementation.
+- Do not deploy or restart live production services as part of this code change.
 
 ### Accepted tradeoffs and residuals
 - An approved update may interrupt active coding sessions; saved history remains and reopening is attempted, but recovery is not guaranteed. Manually reopening or porting sessions afterward is acceptable if needed.
+- Existing host-managed agents may remain outside durable-soul protection until a separate deliberate migration is authorized; preserve their running work during this task.
+
+## Deployment and host-pane safety decisions
+
+- A web restart can terminate host-owned PTYs and legacy Fresh Agent processes. The updater must therefore preflight current open agent panes before any service or artifact mutation. It may proceed only when every open agent pane is positively matched to the intended supervisor's current soul/incarnation, or when the current authoritative pane inventory is complete and contains no agents. Host-managed, unknown, stale-ambiguous, and unavailable inventory outcomes all refuse with pane details or a clear evidence-gap explanation. No update mode is an implicit host-agent migration.
+- A currently running featureless/legacy server cannot prove a complete Fresh Agent and multi-client pane inventory, and lacks an admission/quiesce gate. A 404 from `/api/runtime/*` is therefore unknown, not empty. The updater and live-server launcher must refuse before building/installing/restarting when the current server cannot provide complete authoritative ownership evidence; they must not treat the staged candidate's capabilities as proof about the old server. This intentionally requires a separate deliberate first-upgrade/migration decision if host work may be running.
+- The managed-runtime readiness response carries the identity returned by its own authenticated control client: persistent `installationId` plus per-start `controlEpoch`. The updater brackets the authenticated HTTP readiness request with direct health calls over the verified supervisor socket and accepts readiness only when all three identity pairs match the intended owner. Default mode additionally requires the pair to match the pre-web-restart supervisor; reset modes use the updated supervisor's pair.
+- The runtime readiness response must report a completed initial scan and no blocked subsystems. Generic `/api/health`, socket-file existence, callback-socket connection, or a direct supervisor check alone never means the update succeeded.
+- A side-effect-free server build-info command exposes whether `managed-runtime-v1` was compiled in. The server itself rejects `FRESHELL_MANAGED_RUNTIME_V1=1` in a featureless build before binding. Updater and supported launcher paths probe the exact candidate before replacing/starting it; if requested protection is absent, they refuse before deployment effects.
 
 ## Goal
 
@@ -31,7 +44,7 @@ Add `pnpm run update:managed-runtime` with default web/client maintenance and ex
 
 Resolve the supported systemd user-unit owner and artifact/resource manifest before staging. Before any web stop, start, or restart, inspect effective loaded properties and transitive relationships from both selected units, including forward activation and reverse stop/restart propagation. Account for `Requires=`, `Wants=`, `Requisite=`, `PartOf=`, `BindsTo=`, `Upholds=`, `PropagatesStopTo=`, and effective inverse relationships such as `ConsistsOf=`, `BoundBy=`, and `UpheldBy=`. Refuse before web actions if any effective relationship could start, restart, or stop the durable supervisor as a consequence of a web action. The installed web drop-in uses ordering-only `After=`; the updater explicitly starts services when a reset mode needs them.
 
-Default mode builds and stages a `managed-runtime-v1` web server plus the served client, installs them, restarts only `freshell-rust.service`, and waits for readiness. It does not access supervisor control or call supervisor service actions. It prints before handoff that supervisor and managed sessions were not restarted and that reset-capable modes require exact `APPROVED`. The durable completion JSONL event carries the same reminder so it survives caller loss.
+Default mode first verifies the current open-pane inventory and refuses if host-managed or unknown agents exist, then builds and stages a `managed-runtime-v1` web server plus the served client, installs them, restarts only `freshell-rust.service`, and waits for authenticated readiness on the same supervisor instance. It does not perform supervisor service actions. It prints before handoff that supervisor and managed sessions were not restarted and that reset-capable modes require exact `APPROVED`. The durable completion JSONL event carries the same reminder so it survives caller loss.
 
 Both reset modes build and stage selected artifacts and compare the candidate's compiled schema version with the installed read-only `installation.schema_version` before stopping any service. The side-effect-free candidate command prints compiled `SCHEMA_VERSION` without opening a registry. Schema mismatch refuses before stopping the web/API unit and points to the existing verified-backup/upgrade procedure. Reopen remains migration-free and reuses schema 19's `commands` journal for successful incarnation idempotency: the request ID/digest, incarnation association, automatic-primary-view restoration, and stopped-to-running CAS commit atomically. Exact replay is checked before the advanced revision. Pending revocation commits no new command, incarnation, view restoration, or revision; retry uses a fresh ID. The journal does not promise exact durable replay for every failure or unavailable result.
 
@@ -99,8 +112,10 @@ The Stage 2 ledger and evidence are in /home/dan/code/freshell/.worktrees/.the-u
 
 - Task 1 owns only `crates/freshell-server/src/managed_provider_bootstrap.rs`.
 - Task 2 owns the supervisor control protocol and Reopen implementation: `crates/freshell-runtime-protocol/src/lib.rs`, `crates/freshell-supervisor/src/main.rs`, `registry.rs`, `service.rs`, and the supervisor's unit tests. It also owns the runtime-client control operations and admin CLI: `crates/freshell-runtime-client/src/lib.rs`, `src/bin/freshell-supervisor-admin.rs`, and `tests/supervisor_admin_legacy_peer.rs`.
-- Task 3 owns updater orchestration: `scripts/update-managed-runtime.ts`, the `package.json` script entry, and `test/unit/tooling/managed-runtime-update.test.ts`.
-- Task 4 owns fixture, systemd, operator guidance, and policy surfaces: `scripts/testing/runtime-sandbox.ts`, `test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts`, `installers/systemd/freshell-rust.service.d/managed-runtime.conf`, `AGENTS.md`, `scripts/launch-rust.sh`, `scripts/prebuild-guard.ts`, `test/unit/tooling/prebuild-guard.test.ts`, both extension-installer skill copies, and the two managed-runtime operator runbooks.
+- Task 3 initially owns updater orchestration: `scripts/update-managed-runtime.ts`, the `package.json` script entry, and `test/unit/tooling/managed-runtime-update.test.ts`; the later, sequential Task 5 adds the newly requested deployment/readiness checks to the same updater files.
+- Task 4 owns server build protection, authenticated readiness, and live-pane ownership reporting: `crates/freshell-server/src/main.rs`, `crates/freshell-server/src/managed_runtime_api.rs`, the narrow pane-layout seam in `crates/freshell-freshagent/src/layout_store.rs` if required, and the corresponding server/layout behavior tests.
+- Task 5 owns updater verification and supported deployment preflight: `scripts/update-managed-runtime.ts`, `test/unit/tooling/managed-runtime-update.test.ts`, `scripts/launch-rust.sh`, and its deployment behavior tests.
+- Task 6 owns fixture, systemd, operator guidance, and UI routing coverage: `scripts/testing/runtime-sandbox.ts`, `test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts`, `installers/systemd/freshell-rust.service.d/managed-runtime.conf`, `AGENTS.md`, `scripts/prebuild-guard.ts`, `test/unit/tooling/prebuild-guard.test.ts`, both extension-installer skill copies, and the two managed-runtime operator runbooks.
 
 Each task is implemented and reviewed before the next starts. The review scope is its owned files and the exact behavioral selectors listed in that task. Keep commits limited to that task's owned files; the compile repair is a prerequisite commit.
 
@@ -298,7 +313,7 @@ Use injected adapters that record ordered effects and never touch the host. Cove
 - Saved references come only from final supervisor Inventory RuntimeView rows joined to targets by `soul_id`, using the same active-or-latest row as Stop. Use provider/native identity and provider-specific conversation identity; do not use browser storage, directory scans, or fresh-agent history for terminal souls. Report no-reference and ineligible counts. Missing required native identity on a resumable target is `unavailable`; no Reopen is dispatched. Reopen candidates intersect only with the successfully stopped target set.
 - A client directory swap uses two same-filesystem renames through a unique sibling. On second-rename failure, preserve/report the old sibling and do not restart web. Post-stop failure reports phase/partial state, preserves persistent data, does not restore old binaries/image settings, and points to forward recovery. Reopen pending/failure does not stop later candidates from being attempted.
 
-Add a no-effect updater scaffold if needed so tests load and fail on the expected action assertion. Ensure test titles are unique and use exact Vitest `-t` selectors for red and green runs. The implementation module is also typechecked through the Task 4 fixture import.
+Add a no-effect updater scaffold if needed so tests load and fail on the expected action assertion. Ensure test titles are unique and use exact Vitest `-t` selectors for red and green runs. The implementation module is also typechecked through the Task 6 fixture import.
 
 - [ ] **Step 2: Run the focused red behavior selectors**
 
@@ -334,7 +349,7 @@ Add `"update:managed-runtime": "tsx scripts/update-managed-runtime.ts"` to `pack
 
 - [ ] **Step 4: Run exact green selectors and refactor**
 
-Run the five named Vitest commands from Step 2 and all remaining named new updater tests with exact `-t` selectors. Also run the full new unit file and `pnpm run typecheck:managed-tests` after Task 4 imports the updater. Expected: every targeted case executes and passes, with no prose/config snapshot tests.
+Run the five named Vitest commands from Step 2 and all remaining named new updater tests with exact `-t` selectors. Also run the full new unit file and `pnpm run typecheck:managed-tests` after Task 6 imports the updater. Expected: every targeted case executes and passes, with no prose/config snapshot tests.
 
 Refactor parsing, approval, transient dispatch, lock ownership, owner/graph verification, manifest resolution, staging, each mode's actions, admin CLI calls, and output/logging into separate named functions. Keep failures recoverable and ensure web restoration runs on every applicable pre-supervisor-stop abort. Review only Task 3 files and tests.
 
@@ -345,40 +360,100 @@ git add scripts/update-managed-runtime.ts package.json test/unit/tooling/managed
 git commit -m "feat: add managed runtime update modes"
 ~~~
 
-### Task 4: Integrate Fixtures, Systemd, Operator Guidance, and Safety Rules
+### Task 4: Add Server Feature Protection and Runtime Ownership Evidence
+
+**Files:**
+- Modify: `crates/freshell-server/src/main.rs` and `crates/freshell-server/src/managed_runtime_api.rs`.
+- Modify `crates/freshell-freshagent/src/layout_store.rs` only if needed to read all current live client layouts without exposing retained disconnected snapshots.
+- Add focused server/layout behavior tests in their existing crate test modules or narrow new test modules.
+
+**Interfaces:**
+- The server exposes a side-effect-free build-info command that reports whether `managed-runtime-v1` was compiled in.
+- A featureless server exits before binding when `FRESHELL_MANAGED_RUNTIME_V1=1`, with an error naming the required feature/build flag.
+- Authenticated `/api/runtime/readiness` includes the identity of the supervisor used by its own runtime client (`installationId`, `controlEpoch`), existing scan/blocked-subsystem readiness, and a read-only current agent-pane ownership report.
+- The pane report covers all live connected UI layout snapshots, excludes disconnected/stale snapshots, and classifies each agent pane as `durable`, `host-managed`, or `unknown`. `durable` requires a positive match between pane/terminal/Fresh Agent identity and the intended supervisor's current soul/incarnation. Missing evidence remains `unknown`; the environment flag is never evidence of protection.
+
+- [ ] **Step 1: Add failing server behavior tests**
+
+Cover: a real featureless server process requested with the enable flag exits nonzero before binding and prints the feature-specific error; the build-info command reports the compiled feature value without loading deployment state or binding; authenticated readiness rejects missing/wrong auth; successful readiness returns a matching runtime-client health identity and the existing scan state; current live pane enumeration includes multiple connected layouts, excludes retained stale layouts, identifies a host-owned coding pane, identifies a verified managed pane, and leaves ambiguous identities unknown. Tests use fake supervisor/control state and disposable layouts only.
+
+- [ ] **Step 2: Implement the build and read-only readiness interfaces**
+
+Dispatch the build-info command before runtime startup side effects. Add the no-feature enable guard immediately after environment loading and before listeners/services initialize. Extend authenticated readiness by obtaining supervisor health and Inventory from the same configured `RuntimeClient`; derive ownership from live layout snapshots plus authoritative terminal/Fresh Agent and supervisor identities. Keep reads bounded and side-effect free. Do not add an unauthenticated identity endpoint or alter frozen control protocol messages.
+
+- [ ] **Step 3: Run exact green tests and refactor**
+
+Run every new behavior selector and relevant server/layout test, plus `cargo fmt --all --check`. Add or adjust a featureless-binary subprocess command in the task report so startup is exercised in an actual no-feature build. Review auth, stale-client exclusion, pane-to-runtime joins, and the rule that only a positive identity match can be called durable.
+
+- [ ] **Step 4: Commit the task**
+
+Commit only the server/readiness and layout files assigned above.
+
+### Task 5: Verify Deployment Candidates and Runtime Readiness
+
+**Files:**
+- Modify: `scripts/update-managed-runtime.ts` and `test/unit/tooling/managed-runtime-update.test.ts`.
+- Modify: `scripts/launch-rust.sh`.
+- Create: `test/unit/tooling/launch-rust-managed-runtime.test.ts`.
+
+**Interfaces:**
+- The updater consumes Task 4 build-info/readiness/pane-ownership interfaces.
+- The updater checks a complete pane report before any build, stop, install, or service action. A host-managed or unknown open agent pane blocks the operation and is reported. If the current featureless/legacy server cannot provide complete pane evidence or a runtime-readiness 404 prevents that proof, fail closed with the evidence gap and make no service/session/artifact change; do not use the candidate binary to claim the currently running work is safe.
+- Before installing/starting the server, updater and launcher inspect the exact candidate's build-info and refuse it if managed runtime was requested but not compiled in. `scripts/launch-rust.sh` builds with the feature when the request environment is enabled and validates existing binaries on `--skip-build` before stopping/starting anything.
+- After the web service starts, the updater authenticates to `/api/runtime/readiness`, requires a complete initial scan and no blocked subsystems, and brackets the request with direct supervisor health calls over the selected socket. All three `(installationId, controlEpoch)` pairs must match. Default mode also requires this pair to remain unchanged from before the web-only update; reset modes capture the updated supervisor pair. The auth token is held in memory and never appears in arguments, environment overrides, logs, or output.
+
+- [ ] **Step 1: Add failing updater/launcher behavior tests**
+
+Add named cases for: a complete empty report permits proceeding; host-managed and unknown panes are listed and refuse before any build/staging/service/session effects; a featureless legacy server or missing/incomplete pane report refuses before effects; candidate build-info without the feature refuses before install/start; `/api/health` plus callback socket alone cannot complete an update; readiness must be authenticated, scan-complete, and unblocked; wrong installation ID, stale epoch, or identity change during the bracket fails; a default update rejects an indirectly restarted supervisor; reset modes accept only the identity from the updated intended supervisor; token values never enter command arguments or logs; launch-rust with the feature requested builds/validates a feature-enabled artifact, and `--skip-build` refuses a featureless artifact before stopping anything. Use unique full titles, including at minimum `host-managed panes refuse before mutation and are reported`, `unknown pane ownership refuses before mutation`, `legacy featureless server refuses before mutation`, `authenticated readiness identity brackets intended supervisor`, `candidate without managed runtime is refused before install`, and `launcher skip-build refuses a featureless binary`. Run each exact title independently in red and green.
+
+- [ ] **Step 2: Implement updater and launcher verification**
+
+Run the pane/readiness preflight before any build, artifact staging, service action, or session action. Obtain the current auth token from the selected live process environment or its verified environment file, keep it only in process memory, and make an authenticated readiness request. Refuse a featureless/legacy live server when it cannot prove current pane ownership; a 404 or missing report is not empty. Probe the staged/existing server's build-info directly before replace/start. Preserve existing mode action order and reset approval semantics. Do not add an override that permits interrupting host-managed work.
+
+- [ ] **Step 3: Run exact green selectors and refactor**
+
+Run every exact behavior selector, the full updater unit file, launcher behavior tests, strict TypeScript for tooling tests, and `git diff --check`. Confirm each red command fails on the intended assertion and each green selector actually executes. Review that failed preflights happen before persistent or service effects and that successful runtime verification proves the API and direct socket identify the same supervisor instance.
+
+- [ ] **Step 4: Commit the task**
+
+Commit only the updater, updater tests, launcher, and launcher behavior tests.
+
+### Task 6: Integrate UI Fixtures, Systemd, Operator Guidance, and Safety Rules
 
 **Files:**
 - Modify: `scripts/testing/runtime-sandbox.ts`.
 - Modify: `test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts`.
 - Modify: `installers/systemd/freshell-rust.service.d/managed-runtime.conf`.
-- Modify: `AGENTS.md` and `scripts/launch-rust.sh`.
+- Modify: `AGENTS.md`.
 - Modify: `scripts/prebuild-guard.ts` and its behavior test `test/unit/tooling/prebuild-guard.test.ts`.
 - Modify both `.claude/skills/extension-installer/SKILL.md` and `.codex/skills/extension-installer/SKILL.md`.
 - Modify: `docs/development/self-hosted-launch-runbook.md` and `docs/development/managed-runtime-rollout.md`.
 
 **Interfaces:**
-- Consumes the Task 3 updater and Task 2 control operations, plus disposable fixture adapters and the selected systemd unit pair.
-- Produces provider-free evidence for all modes, an ordering-only web/supervisor relation, consistent operator guidance, and removal of ordinary web/client restart approval gates from repo-owned policy surfaces.
+- Consumes the Task 4 server ownership/readiness API, Task 5 updater verification, Task 2 control operations, and disposable fixture adapters.
+- Produces provider-free evidence for all modes, ordinary UI routing and managed-session continuity, host-agent preservation/refusal, an ordering-only web/supervisor relation, consistent operator guidance, and removal of ordinary web/client restart approval gates from repo-owned policy surfaces.
 
 - [ ] **Step 1: Add failing fixture and guard behavior cases**
 
-Add three named provider-free fixture cases and a fixture-owned second workload image/reference option:
+Add real provider-free UI fixture coverage for the three update modes. Create at least one supported terminal coding-agent pane through the ordinary pane picker/TerminalView path and one supported Fresh Agent pane through its ordinary pane picker path; do not create these subjects through REST or test-only creation shortcuts. Verify their exact managed soul/incarnation/terminal-or-session identities in the supervisor and UI before and after default web-only update, and prove follow-up remains attached to those same sessions.
+
+Also add fixture checks for:
 
 1. `managed update modes - default preserves running souls and reports reminder`: updater replaces managed-runtime-v1 web/client and restarts only fixture web. Assert bridge remains enabled; supervisor, soul, incarnation, container, native-session, and history identities remain unchanged; follow-up succeeds; reminder is printed before handoff and present in completion JSONL.
 2. `managed update modes - all reopens on updated runtime and restores primary view`: exact approval, fixture-owned transient worker and services, changed runtime marker, new incarnation on the same soul/provider store/native identity, retained history, visible automatic primary view immediately after atomic Reopen, and successful follow-up. Observe the direct Reopen command/request ID.
 3. `managed update modes - durable-only preserves old web and client`: old web executable/version and old callback shape remain selected; only fixture supervisor/workload changes; web restarts only to restore callback readiness; client directory and digest remain unchanged; Reopen reaches the changed runtime through the old web peer.
 
-These fixture cases must fail through executed assertions before the fixture option/behavior is implemented. Run these exact red selectors and confirm the named new test executes and fails behaviorally:
+The default case runs the Task 5 updater fixture, restarts only fixture web, and asserts the bridge plus existing managed sessions survive with unchanged identity and retained history. Add a host-owned agent fixture pane and prove the updater names it, refuses before build/service/session effects, and leaves its process running. The --all and --durable-only reset behavior remains as defined in Task 3. The cases must fail through executed assertions before fixture behavior is implemented. Use direct Playwright CLI arguments with the fixture env; the package wrapper puts its selector in the wrong position, and Playwright prefixes titles with the selected project. For a named case, use the direct form below (a unique suffix selector executes the case despite the project prefix); also run each exact case selector independently in red and green, and never accept a skipped or zero-test result.
 
 ~~~bash
-pnpm run test:runtime:fresh-agent-fixtures --grep '^managed update modes - default preserves running souls and reports reminder$'
-pnpm run test:runtime:fresh-agent-fixtures --grep '^managed update modes - all reopens on updated runtime and restores primary view$'
-pnpm run test:runtime:fresh-agent-fixtures --grep '^managed update modes - durable-only preserves old web and client$'
+FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local pnpm exec playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --grep 'managed update modes - default preserves running souls and reports reminder$' test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
+FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local pnpm exec playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --grep 'managed update modes - all reopens on updated runtime and restores primary view$' test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
+FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local pnpm exec playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --grep 'managed update modes - durable-only preserves old web and client$' test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
 ~~~
 
 The fixture cannot test installed systemd wiring; the updater's Task 3 stubbed graph cases own that behavior.
 
-Add a `prebuild-guard` behavior test that runs the guard's real production-health probe against a disposable fake Freshell server. It must prove the guard still blocks an in-place build that would overwrite a live `dist/`, while its actionable path no longer says an ordinary web/client restart needs approval and points to the default managed updater. Do not add a prose snapshot or compare a full help-text blob; assert the guard's exit/block behavior and the relevant actionable outcome. Run this exact red selector before changing the guard message and confirm it fails on the old action path:
+Add a `prebuild-guard` behavior test that runs the guard's real production-health probe against a disposable fake Freshell server. It must prove the guard still blocks an in-place build that would overwrite a live `dist/`, while its actionable path points to the default managed updater without implying ordinary web/client restarts need approval. Do not add a prose snapshot or compare a full help-text blob; assert the guard's exit/block behavior and relevant actionable outcome. Run the existing red selector before changing the guard message and confirm it fails on the old action path:
 
 ~~~bash
 pnpm run test:vitest run test/unit/tooling/prebuild-guard.test.ts --config config/vitest/vitest.config.ts -t '^live production build guard recommends updater without approval gate$'
@@ -386,20 +461,20 @@ pnpm run test:vitest run test/unit/tooling/prebuild-guard.test.ts --config confi
 
 - [ ] **Step 2: Implement compatibility, systemd, and policy corrections**
 
-Change the installed drop-in to ordering-only `After=freshell-supervisor.service`; no `Requires=`, `Wants=`, or `Requisite=`. Preserve direct supervisor start/stop sequencing in the updater. Update `AGENTS.md`, `scripts/launch-rust.sh`, both extension-installer skills, and runbooks to remove blanket APPROVED restrictions for ordinary web/client restarts. Keep exact APPROVED only for `--all` and `--durable-only`, based on mode/action category and without compatibility analysis. In both skill copies, update every repeated reference about extension activation/restart, not just the first paragraph. Ordinary extension activation can occur with a normal web/client restart under the no-indirect-supervisor-restart rule.
+Change the installed drop-in to ordering-only `After=freshell-supervisor.service`; no `Requires=`, `Wants=`, or `Requisite=`. Preserve direct supervisor start/stop sequencing in the updater. Update `AGENTS.md`, both extension-installer skills, and runbooks to remove blanket APPROVED restrictions for ordinary web/client restarts. Keep exact APPROVED only for `--all` and `--durable-only`, based on mode/action category and without compatibility analysis. In both skill copies, update every repeated reference about extension activation/restart, not just the first paragraph. Ordinary extension activation can occur with a normal web/client restart under the no-indirect-supervisor-restart rule.
 
 Update `scripts/prebuild-guard.ts` guidance so it still blocks building over a live production `dist/` but directs operators to the default updater for ordinary web/client maintenance without an approval gate. Keep launcher PID ownership and systemd/unknown-owner safety checks. The effective-graph behavior is implemented/tested through Task 3 adapters, not guessed from the checked-in unit alone.
 
-Both operator runbooks must say to invoke the updater from a host shell, not a Freshell-managed container pane: managed panes run inside soul containers and lack the host user systemd manager and matching deployment checkout. Explain that reset preflight reads no-runtime state from the staged candidate supervisor's read-only registry command, so first-upgrade support does not depend on a new method in the currently running supervisor. Document the three modes, exact reset approval, reminder/completion record, unit/status/journal/JSONL recovery, schema preflight, old-web/new-supervisor `--durable-only` behavior, failure/partial-state reporting, graph refusal and deployment/reload guidance, callback readiness, history retention, manual recovery, and forward-recovery runbook. Preserve the existing schema migration/verified backup procedure. Do not promise automatic artifact rollback. Do not change README.md.
+Both operator runbooks must say to invoke the updater from a host shell, not a Freshell-managed container pane: managed panes run inside soul containers and lack the host user systemd manager and matching deployment checkout. Explain feature build/startup checks; authenticated readiness and supervisor identity verification; how open host-managed/unknown panes are reported and block updates; why their work remains running and why migration is separate; reset preflight's candidate read-only registry command; all three modes; exact reset approval; reminder/completion record; unit/status/journal/JSONL recovery; schema preflight; old-web/new-supervisor `--durable-only` behavior; failure/partial-state reporting; graph refusal and systemd reload guidance; callback readiness; history retention; manual recovery; and the forward-recovery runbook. Preserve the existing schema migration/verified backup procedure. Do not promise automatic artifact rollback. Do not change README.md.
 
 - [ ] **Step 3: Run exact green fixture and guard tests**
 
-Run each newly added fixture case by its complete title so the selector cannot pass without executing it, then run the real guard behavior test:
+Run each newly added fixture case with the direct Playwright command form from Step 1, then run the real guard behavior test:
 
 ~~~bash
-pnpm run test:runtime:fresh-agent-fixtures --grep '^managed update modes - default preserves running souls and reports reminder$'
-pnpm run test:runtime:fresh-agent-fixtures --grep '^managed update modes - all reopens on updated runtime and restores primary view$'
-pnpm run test:runtime:fresh-agent-fixtures --grep '^managed update modes - durable-only preserves old web and client$'
+FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local pnpm exec playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --grep 'managed update modes - default preserves running souls and reports reminder$' test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
+FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local pnpm exec playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --grep 'managed update modes - all reopens on updated runtime and restores primary view$' test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
+FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local pnpm exec playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --grep 'managed update modes - durable-only preserves old web and client$' test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts
 pnpm run test:vitest run test/unit/tooling/prebuild-guard.test.ts --config config/vitest/vitest.config.ts -t '^live production build guard recommends updater without approval gate$'
 ~~~
 
@@ -412,18 +487,19 @@ Run: `cargo fmt --all --check`, `pnpm run typecheck:managed-tests`, the full `pn
 - [ ] **Step 5: Commit the task**
 
 ~~~bash
-git add scripts/testing/runtime-sandbox.ts test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts installers/systemd/freshell-rust.service.d/managed-runtime.conf AGENTS.md scripts/launch-rust.sh scripts/prebuild-guard.ts test/unit/tooling/prebuild-guard.test.ts .claude/skills/extension-installer/SKILL.md .codex/skills/extension-installer/SKILL.md docs/development/self-hosted-launch-runbook.md docs/development/managed-runtime-rollout.md
+git add scripts/testing/runtime-sandbox.ts test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts installers/systemd/freshell-rust.service.d/managed-runtime.conf AGENTS.md scripts/prebuild-guard.ts test/unit/tooling/prebuild-guard.test.ts .claude/skills/extension-installer/SKILL.md .codex/skills/extension-installer/SKILL.md docs/development/self-hosted-launch-runbook.md docs/development/managed-runtime-rollout.md
 git commit -m "feat: complete managed runtime update integration"
 ~~~
 
 ## Plan self-review
 
-- The complete User Request block remains byte-for-byte identical to the block at original plan commit `76701e039`, appears exactly once, and retains hash `e692116fad48424da56cfb1c577231258ad9b4f16aded3cabc1652328c94aecf`.
-- The implementation is split into sequential reviewable tasks: compile repair; supervisor protocol/Reopen/schema/admin CLI; updater orchestration; fixture, systemd, operator guidance, and safety surfaces. Each task owns a disjoint file set, has an explicit interface and review boundary, lists focused commands, and commits only its files.
+- The current sanitized User Request appears exactly once and includes the additive deployment-verification direction; its section hash (from `## User Request` up to the next plan-owned heading) is `a4c903a197d07e2376b00cfa4877a5772be8866a8026cc8cfd072564f7cb9e82`. The three-round Stage 3 plan review was already exhausted before this user addition; the Stage 4 plan amendment records the new scope and Stage 5 whole-delta review remains the final code-readiness gate.
+- The implementation is split into six sequential reviewable tasks: compile repair; supervisor protocol/Reopen/schema/admin CLI; initial updater orchestration; server feature/readiness/pane evidence; updater deployment/readiness checks; UI fixture, systemd, and operator guidance. Task 5 intentionally amends the updater files first implemented in Task 3, but tasks remain sequential and no two implementers own that work at once. Every task has an explicit interface and review boundary, focused behavior checks, and a scoped commit.
 - Task 1 also repairs one pre-existing feature-gated test-fixture compile error (`native_identity` omitted) that the focused server test exposed after the two planned production errors; its only change is a `None` fixture value.
 - All 14 final-review findings are concrete plan requirements: ordinary restart wording is removed from both extension skills and prebuild guidance with a runtime behavior test; reset-mode aborts restore healthy web service; Reopen atomically restores automatic primary view; Stops halt at the first non-VerifiedEmpty outcome; durable-only checks running/on-disk executable identity; callback peer covers issue/activate/commit/abort/revoke; desired-stopped emptiness checks the addressed incarnation; Inventory is the authoritative saved-reference source joined by soul ID; schema/Reopen/CLI/callback red and green commands target exact named tests; implementation tasks are split; operator guidance specifies host shell and why; graph checks include forward and reverse activation/propagation relations; the default completion event includes the reminder; and worker invokes the resolved tsx JavaScript entrypoint with pinned Node.
 - Reset targets remain separate from saved-reference candidates. The fixed Inventory is taken after web ingress closes; Stop uses the supervisor's active-first/otherwise-latest incarnation selection; targets are coding-provider souls with desired-running state; missing required identity yields unavailable without Reopen; Reopen candidates intersect only the successfully stopped set.
 - Reopen remains migration-free. The candidate schema command avoids registry open; current schema is read-only. Successful command/digest/incarnation association, stopped-to-running CAS, and automatic-primary-view restoration commit atomically; exact replay precedes revision validation; pending revocation creates no command/incarnation/view/revision and retries with a fresh ID.
+- The new deployment constraints are backed by source evidence: featureless startup must reject the enabled flag; staged/existing binaries expose a side-effect-free feature bit; readiness reports the identity of its own supervisor client; updater compares that identity with stable direct health samples; and current host-owned/unknown agent panes block any web restart before work is changed. A missing or incomplete current-pane report fails closed. The UI fixture will verify ordinary terminal and Fresh Agent creation paths and exact identity continuity across default update.
 - The plan preserves the After-only service relation, owner-derived artifact manifest, explicit Docker socket, destination-filesystem staging, two-rename client swap, transient worker/lock/log design, exact reset-only approval, caller-loss completion, forward-recovery-only failure handling, and the accepted interruption/history tradeoff. The staged candidate's local read-only registry inventory resolves the first-upgrade no-runtime gap without changing v2 socket frames or requiring a separate bootstrap deployment; its tests distinguish proven empty from unresolved and ensure no database writes. No test claims to certify installed systemd wiring and no README change is planned.
 - Task 2's implementation review found six Important gaps in real provider startup/resume, preparation commit, failure cleanup, successful replay after later lifecycle changes, and startup-path schema coverage. Task 2 now requires provider-stub regressions for each finding before it can pass task review; these findings remain open until a fixer commit and independent re-review clear them.
 - Task 2 ownership includes `recovery.rs` because independent review proved stopped-intent cancellation occurs in the native-readiness path there; the fix must allow only the exact prepared Reopen attempt through that existing gate.
