@@ -19,10 +19,16 @@ struct PendingCreate {
     view_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingFork {
+    parent: Locator,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FreshAgentViewRoutes {
     uses_view_ids: bool,
     pending_creates: HashMap<(String, String), PendingCreate>,
+    pending_forks: HashMap<(String, String), PendingFork>,
     views: HashMap<Locator, HashSet<String>>,
 }
 
@@ -59,6 +65,25 @@ impl FreshAgentViewRoutes {
                     .or_default()
                     .insert(view_id.to_string());
             }
+            "freshAgent.fork" => {
+                self.uses_view_ids = true;
+                let Some(request_id) = value.get("requestId").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(parent) = locator_from(value, "sessionId") else {
+                    return;
+                };
+                if self
+                    .views
+                    .get(&parent)
+                    .is_some_and(|views| views.contains(view_id))
+                {
+                    self.pending_forks.insert(
+                        (request_id.to_string(), view_id.to_string()),
+                        PendingFork { parent },
+                    );
+                }
+            }
             "freshAgent.detach" => {
                 self.uses_view_ids = true;
                 self.detach_view(view_id);
@@ -72,6 +97,8 @@ impl FreshAgentViewRoutes {
     pub(crate) fn detach_view(&mut self, view_id: &str) {
         self.pending_creates
             .retain(|_, pending| pending.view_id != view_id);
+        self.pending_forks
+            .retain(|(_, pending_view_id), _| pending_view_id != view_id);
         self.views.retain(|_, views| {
             views.remove(view_id);
             !views.is_empty()
@@ -154,15 +181,35 @@ impl FreshAgentViewRoutes {
                 true
             }
             "freshAgent.forked" => {
+                let Some(request_id) = value.get("requestId").and_then(Value::as_str) else {
+                    return !self.uses_view_ids;
+                };
+                let Some(view_id) = value.get("viewId").and_then(Value::as_str) else {
+                    return !self.uses_view_ids;
+                };
+                let key = (request_id.to_string(), view_id.to_string());
+                let Some(pending) = self.pending_forks.get(&key) else {
+                    return !self.uses_view_ids;
+                };
                 let Some(parent) = locator_from(&value, "parentSessionId") else {
-                    return !self.uses_view_ids;
+                    return false;
                 };
-                let Some(views) = self.views.get(&parent).cloned() else {
-                    return !self.uses_view_ids;
-                };
-                if let Some(next) = locator_from(&value, "sessionId") {
-                    self.views.entry(next).or_default().extend(views);
+                if pending.parent != parent
+                    || !self
+                        .views
+                        .get(&parent)
+                        .is_some_and(|views| views.contains(view_id))
+                {
+                    return false;
                 }
+                let Some(child) = locator_from(&value, "sessionId") else {
+                    return false;
+                };
+                self.pending_forks.remove(&key);
+                self.views
+                    .entry(child)
+                    .or_default()
+                    .insert(view_id.to_string());
                 true
             }
             _ => {
@@ -347,6 +394,121 @@ mod tests {
             "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
             "sessionId":"late-session", "event":{"type":"freshAgent.stream"}
         }))));
+    }
+
+    #[test]
+    fn hosted_fork_routes_child_events_only_to_the_exact_requesting_view() {
+        let parent = json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"parent"
+        });
+        let mut requester = FreshAgentViewRoutes::default();
+        let mut sibling = FreshAgentViewRoutes::default();
+        let mut replacement = FreshAgentViewRoutes::default();
+
+        for (routes, view_id) in [
+            (&mut requester, "requester-view"),
+            (&mut sibling, "sibling-view"),
+            (&mut replacement, "replacement-view"),
+        ] {
+            let mut attach = parent.clone();
+            attach["type"] = "freshAgent.attach".into();
+            attach["viewId"] = view_id.into();
+            routes.observe_client_value(&attach);
+        }
+
+        requester.observe_client_value(&json!({
+            "type":"freshAgent.fork", "requestId":"reused-fork-id",
+            "viewId":"requester-view", "provider":"codex",
+            "sessionType":"freshcodex", "sessionId":"parent"
+        }));
+
+        // A replacement can reuse the request ID, but its different view must
+        // not inherit a child route from the requester's result.
+        let replacement_result = frame(json!({
+            "type":"freshAgent.forked", "requestId":"reused-fork-id",
+            "viewId":"replacement-view", "parentSessionId":"parent",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"stale-child"
+        }));
+        assert!(!requester.should_deliver(&replacement_result));
+        assert!(!replacement.should_deliver(&replacement_result));
+        assert!(!sibling.should_deliver(&replacement_result));
+        let stale_child_event = frame(json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"stale-child", "event":{"type":"freshAgent.stream"}
+        }));
+        assert!(!requester.should_deliver(&stale_child_event));
+        assert!(!replacement.should_deliver(&stale_child_event));
+        assert!(!sibling.should_deliver(&stale_child_event));
+
+        // Even the exact pair cannot route a reply for a different parent.
+        assert!(!requester.should_deliver(&frame(json!({
+            "type":"freshAgent.forked", "requestId":"reused-fork-id",
+            "viewId":"requester-view", "parentSessionId":"other-parent",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"wrong-parent-child"
+        }))));
+        assert!(!requester.should_deliver(&frame(json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"wrong-parent-child", "event":{"type":"freshAgent.stream"}
+        }))));
+
+        let requester_result = frame(json!({
+            "type":"freshAgent.forked", "requestId":"reused-fork-id",
+            "viewId":"requester-view", "parentSessionId":"parent",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"requester-child"
+        }));
+        assert!(requester.should_deliver(&requester_result));
+        assert!(!sibling.should_deliver(&requester_result));
+        assert!(!replacement.should_deliver(&requester_result));
+
+        let requester_child_event = frame(json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"requester-child", "event":{"type":"freshAgent.stream"}
+        }));
+        assert!(requester.should_deliver(&requester_child_event));
+        assert!(!sibling.should_deliver(&requester_child_event));
+        assert!(!replacement.should_deliver(&requester_child_event));
+
+        // A second view may legitimately reuse the same request ID. The exact
+        // pair still routes its own child without changing the sibling route.
+        replacement.observe_client_value(&json!({
+            "type":"freshAgent.fork", "requestId":"reused-fork-id",
+            "viewId":"replacement-view", "provider":"codex",
+            "sessionType":"freshcodex", "sessionId":"parent"
+        }));
+        let replacement_fork_result = frame(json!({
+            "type":"freshAgent.forked", "requestId":"reused-fork-id",
+            "viewId":"replacement-view", "parentSessionId":"parent",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"replacement-child"
+        }));
+        assert!(!requester.should_deliver(&replacement_fork_result));
+        assert!(!sibling.should_deliver(&replacement_fork_result));
+        assert!(replacement.should_deliver(&replacement_fork_result));
+        let replacement_child_event = frame(json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"replacement-child", "event":{"type":"freshAgent.stream"}
+        }));
+        assert!(!requester.should_deliver(&replacement_child_event));
+        assert!(!sibling.should_deliver(&replacement_child_event));
+        assert!(replacement.should_deliver(&replacement_child_event));
+
+        // Forking does not consume the parent's route, so the sibling still
+        // receives authoritative parent retirement after the fork response.
+        let parent_exit = frame(json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"parent", "event":{"type":"freshAgent.exit"}
+        }));
+        assert!(sibling.should_deliver(&parent_exit));
+    }
+
+    #[test]
+    fn legacy_fork_without_view_id_keeps_global_fanout_without_route_mutation() {
+        let mut routes = FreshAgentViewRoutes::default();
+
+        assert!(routes.should_deliver(&frame(json!({
+            "type":"freshAgent.forked", "parentSessionId":"parent",
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"child"
+        }))));
+        assert!(routes.views.is_empty());
     }
 
     #[test]
