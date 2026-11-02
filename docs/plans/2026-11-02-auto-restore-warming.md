@@ -148,15 +148,21 @@ pub fn is_ready(&self) -> bool {
     *self.ready_rx.borrow()
 }
 
-// in perform_refresh_once, immediately after the snapshot publish (the
-// store into self.snapshot, before the `if changed > 0` generation bump),
-// still under refresh_lock:
+// NOTE (plan-review round-2 finding 6): `perform_refresh_once` is an
+// ASSOCIATED function — `Self::perform_refresh_once(sources, file_cache,
+// direct_cache, snapshot, persist_path, persist_state, dirty_paths,
+// dirty_providers, last_full_at, ttl, ...)` (directory_index.rs:1885-1910) —
+// there is no `self` inside it. Follow the house pattern: thread the sender
+// through `perform_refresh`'s existing Arc-clone parameter list as
+// `ready_tx: Arc<tokio::sync::watch::Sender<bool>>` and flip it inside
+// perform_refresh_once immediately after the snapshot publish (before the
+// conditional generation bump), under the same refresh_lock:
 // First sweep completed: publish readiness regardless of content delta.
 // send_if_modified (NOT send_modify — tokio notifies unconditionally on
 // send_modify, verified at the pinned 1.52.3): only the false->true
 // transition notifies, so later publishes never re-wake readiness
 // watchers. (Load-bearing ledger C1d.)
-self.ready_tx.send_if_modified(|r| if *r { false } else { *r = true; true });
+ready_tx.send_if_modified(|r| if *r { false } else { *r = true; true });
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -538,12 +544,13 @@ git commit -m "feat(server): broadcast session index readiness once per boot + d
 - Modify: `crates/freshell-ws/src/reconcile.rs` (existence arm :492-510; ladder unit tests :956-980)
 - Modify: `crates/freshell-ws/src/reconcile_freshagent.rs` (plan-review round-1 finding 4: `FreshAgentPresence` gains an unreadable variant; the exhaustive `SessionExistence` match (:109-124, "no catch-all" doctrine) maps `Unreadable` to it; the fresh-agent verdict ladder emits `error{session_store_unreadable}` for it — NEVER a respawn-driving presence (which would burn the respawn counter on an unreadable store), identity retained, no counter burn)
 - Modify: `crates/freshell-ws/src/resume_validation.rs` (map Unreadable beside Unknown :66-74, :113-127; inline tests :160-389)
-- Modify: `crates/freshell-server/src/existence.rs` (warm arms :322-464; cold arms :265-321; AD-4 comment :276-282; scan-failure honesty below; inline tests :523+; `unreadable_opencode_db_answers_unknown_never_absent` pin at :1355 area)
+- Modify: `crates/freshell-server/src/existence.rs` (warm arms :322-464; cold arms :265-321; AD-4 comment :276-282; scan-failure honesty via the new `SessionIndex::peek_with_failures()` below; inline tests :523+; `unreadable_opencode_db_answers_unknown_never_absent` pin at :1355 area)
+- Modify: `crates/freshell-sessions/src/directory_index.rs` (add the sync single-generation `peek_with_failures()` accessor beside `peek()` :1654 — one snapshot-mutex read returning items + scan_failures atomically; inline test for the same-generation guarantee)
 - Test: the inline test modules above + `crates/freshell-protocol/tests/pane_reconcile.rs` (reason serialization :234-239 area) + `crates/freshell-ws/tests/pane_reconcile.rs` (a scripted-probe test) + `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` (unreadable-presence test)
 
 **Interfaces:**
 - Consumes: nothing from Tasks 1-3.
-- Produces: `SessionExistence::Unreadable` (new variant — "known provider, index PUBLISHED, but this identity's store could not be read"); wire verdict reason string `"session_store_unreadable"`; cold-path by-id resolution for opencode and antigravity (Present/Absent/Unreadable→Unknown-while-cold); a fresh-agent presence variant that emits the same honest error for fresh-agent panes; and **scan-failure honesty** (round-1 finding 3): a warm-miss for a provider whose scan FAILED (the published snapshot's `scan_failures` names it — `SessionIndex::scan_failures()`, directory_index.rs:1352) answers `Unreadable`, never `Absent` — a failed codex root scan publishing an empty snapshot must not let a recoverable identity fold `dead_session`/`fresh`. Codex stays `Unknown` while cold (AD-4 stands; comment updated to name readiness-driven recovery as the codex path).
+- Produces: `SessionExistence::Unreadable` (new variant — "known provider, index PUBLISHED, but this identity's store could not be read"); wire verdict reason string `"session_store_unreadable"`; cold-path by-id resolution for opencode and antigravity (Present/Absent/Unreadable→Unknown-while-cold); a fresh-agent presence variant that emits the same honest error for fresh-agent panes; and **scan-failure honesty** (round-1 finding 3 + round-2 finding 4): a new sync single-generation accessor `SessionIndex::peek_with_failures() -> Option<(Arc<Vec<IndexedSession>>, Vec<String>)>` (freshell-sessions touch, added in this task) that the existence probe uses for its warm path — a session miss for a provider named in the SAME generation's `scan_failures` answers `Unreadable`, never `Absent` (a failed codex root scan publishing an empty snapshot must not let a recoverable identity fold `dead_session`/`fresh`). Codex stays `Unknown` while cold (AD-4 stands; comment updated to name readiness-driven recovery as the codex path).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -590,15 +597,18 @@ fn codex_stays_unknown_when_cold_ad4_stands() { /* unchanged expectation, now do
 
 #[test]
 fn warm_codex_miss_with_a_failed_codex_scan_answers_unreadable_never_absent() {
-    // Round-1 finding 3: the sweep publishes with scan_failures naming codex
-    // (e.g. root EACCES) and no codex rows; a codex session warm-miss must
-    // answer Unreadable (-> error{session_store_unreadable}), NEVER the
-    // snapshot-only Absent that would fold dead_session/fresh for a
-    // recoverable identity. Consult SessionIndex::scan_failures() on the
-    // warm miss for the provider before the final Absent (codex has no
-    // by-id fallback; providers WITH fallbacks keep their positive
-    // disk-truth answers — a fallback hit/miss is authoritative even when
-    // the scan failed).
+    // Round-1 finding 3 + round-2 finding 4: the sweep publishes with
+    // scan_failures naming codex (e.g. root EACCES) and no codex rows; a
+    // codex session warm-miss must answer Unreadable (-> error{session_store_unreadable}),
+    // NEVER the snapshot-only Absent that would fold dead_session/fresh for
+    // a recoverable identity. The rows AND the failures must come from ONE
+    // peek_with_failures() read (same generation) — a separate later
+    // scan_failures() read races a refresh publish.
+}
+#[test]
+fn peek_with_failures_returns_items_and_failures_from_one_generation() {
+    // The sync accessor takes the snapshot mutex once: items and failures
+    // cannot straddle generations.
 }
 
 #[test]
@@ -695,16 +705,21 @@ SessionExistence::Unreadable => PaneVerdict {
 // the readiness-driven recovery (kata vnpc) codex panes park briefly and
 // resume automatically when the first sweep publishes.
 
-// SCAN-FAILURE HONESTY (round-1 finding 3) — in the warm path, before the
-// final Absent for a provider, consult the published snapshot's scan
-// failures: if SessionIndex::scan_failures() names the provider, the
-// snapshot's missing rows are NOT evidence — answer Unreadable.
-// (Codex is the load-bearing case: no by-id fallback, snapshot-only Absent.
-// Providers with by-id fallbacks keep the fallback's disk-truth answer —
-// a fallback hit/miss stays authoritative when the scan failed.)
-if provider_scan_failed(&self.index, provider) {
-    return SessionExistence::Unreadable;
-}
+// SCAN-FAILURE HONESTY (round-1 finding 3 + round-2 finding 4) — the probe
+// must read the rows AND the scan failures from ONE generation: pairing
+// `peek()` rows with a LATER `scan_failures()` read lets a refresh publish
+// between the two reads (directory_index.rs's own same-generation contract,
+// :1340-1352 — the reason `snapshot_with_failures()` exists). Add a sync
+// single-read accessor `SessionIndex::peek_with_failures() ->
+// Option<(Arc<Vec<IndexedSession>>, Vec<String>)>` that takes the snapshot
+// mutex ONCE and returns items + scan_failures atomically (the sync twin of
+// `snapshot_with_failures()`, :1548). The existence probe then uses
+// peek_with_failures() for its warm path: a session miss for a provider
+// named in that same generation's scan_failures answers Unreadable, never
+// Absent. (Codex is the load-bearing case: no by-id fallback, snapshot-only
+// Absent. Providers with by-id fallbacks keep the fallback's disk-truth
+// answer — a fallback hit/miss stays authoritative even when the scan
+// failed.)
 
 // crates/freshell-ws/src/reconcile_freshagent.rs (round-1 finding 4):
 // FreshAgentPresence gains a StoreUnreadable variant; the exhaustive
@@ -916,7 +931,8 @@ git commit -m "feat(client): parse session-index readiness wire state; fold unre
 - Create: `src/components/ReconcileWarmingRecoveryDriver.tsx`
 - Modify: `src/App.tsx` (mount beside `<ReconcileWarmingBanner />` :2604)
 - Modify: `src/components/ReconcileWarmingBanner.tsx` (module doc :9-14 — manual Retry is no longer THE designed recovery path, it stays as the non-routine escape hatch)
-- Modify: `src/lib/pane-reconcile.ts` + `src/store/panesSlice.ts` (identity guards for the attach/respawn/fresh reconcile folds — plan-review round-1 finding 2: `foldVerdicts` passes each request pane's `createRequestId` into the `applyReconcileAttach`/`resetPaneForReconcileCreate`/fresh-agent twin reducer payloads as `expectedCreateRequestId`; the reducers no-op with a `log.warn('ignoring a stale-verdict ... for replaced pane content')` when the pane's CURRENT `createRequestId` differs — mirroring the existing `setPaneRestoreError` guard. This tightens ALL reconcile callers (App boot, banner Retry, exhaustion, .lost, driver) — the stale-response hazard the kata names ("stale responses cannot restore a closed or rebound pane") is closed system-wide, not per-caller.)
+- Modify: `src/lib/pane-reconcile.ts` + `src/store/panesSlice.ts` (identity guards for EVERY reconcile fold arm — plan-review round-1 finding 2 + round-2 finding 2: `foldVerdicts` passes each request pane's `createRequestId` into the reducer payloads as `expectedCreateRequestId` for the attach/respawn/fresh reducers AND for the error arms' `setPaneRestoreError` dispatches (round-2 finding 2: a delayed error verdict latching onto rebound content would block its restoration with a wrong error — the existing error arm never supplied the guard, so it must now); the reducers no-op with a `log.warn('ignoring a stale-verdict ... for replaced pane content')` when the pane's CURRENT `createRequestId` differs — mirroring the existing `setPaneRestoreError` guard mechanism. This tightens ALL reconcile callers (App boot, banner Retry, exhaustion, .lost, driver) — the stale-response hazard the kata names ("stale responses cannot restore a closed or rebound pane") is closed system-wide, not per-caller.)
+- Modify: `src/store/paneTypes.ts` (plan-review round-2 finding 3: `ReconcileWarmingState.paneRefs` entries gain the PARKED pane's `createRequestId` — `{ tabId, paneId, createRequestId }` — minted by `foldVerdicts`'s batched `setReconcileWarming` from the request pane claims; ephemeral, never persisted (already stripped by persistMiddleware). Identity-BINDS the waiting state: the driver drives only refs whose CURRENT content carries the parked createRequestId, so a pane replaced while waiting (same paneId, new content) drops out — its pending recovery is canceled exactly as a closed pane's is. The banner and App clear paths are unaffected mechanically (they use count/clear).)
 - Test: `test/unit/client/components/ReconcileWarmingRecoveryDriver.test.tsx` (new; harness modeled on ReconcileWarmingBanner.test.tsx); extend `test/unit/client/lib/pane-reconcile.test.ts` + `test/unit/client/store/panesSlice.reconcile.test.ts` for the identity guards (RED: an attach verdict for an OLD createRequestId must NOT fold onto rebound content carrying a NEW createRequestId; same for respawn/fresh).
 
 **Interfaces:**
@@ -924,14 +940,14 @@ git commit -m "feat(client): parse session-index readiness wire state; fold unre
 - Produces: `<ReconcileWarmingRecoveryDriver />` (renders null) — the automatic recovery. Constants: `RECOVERY_RETRY_BACKOFF_MS = 2_000`, `RECOVERY_RETRY_LIMIT = 2` (automatic re-drives per readiness observation), `RECOVERY_RESULT_WAIT_MS = 10_000` (in-flight watchdog, mirrors `RECONCILE_RESULT_WAIT_MS`).
 
 **Behavioral contract (test-first):**
-1. Effect: derive `reconcilablePaneRefs` = warming paneRefs that still exist in the live layouts (a cheap selector over `panes.layouts`). If warming is non-null but `reconcilablePaneRefs` is empty → `clearReconcileWarming()` (every parked pane closed or replaced — "closing a pane cancels its pending recovery", pre- OR post-readiness) + debug log. When `reconcilablePaneRefs` is non-empty AND `sessionIndexReady === true` and no drive is in flight → drive once: `buildReconcileRequestForPanes(store.getState(), reconcilablePaneRefs)` (null ⇒ clear + debug log); else own-reconcileId `ws.onMessage` subscription (fold-ownership: skip foreign `pane.reconcile.result`), `ws.send(request)`, info drive log. Effect deps include the reconcilable-refs-derived value, `sessionIndexReady`, AND `connection.lastReadyAt` (round-1 finding 5: a reconnect's fresh ready re-drives with a reset budget even when `sessionIndexReady` stays true).
+1. Effect: derive `identityMatchingPaneRefs` = warming paneRefs whose pane exists in the live layouts AND whose CURRENT content `createRequestId` equals the ref's PARKED `createRequestId` (round-2 finding 3 — replaced panes drop out; their pending recovery is canceled, never transferred to the replacement). If warming is non-null but `identityMatchingPaneRefs` is empty → `clearReconcileWarming()` (every parked pane closed or replaced — "closing a pane cancels its pending recovery", pre- OR post-readiness) + debug log; else if `sessionIndexReady === true` and no drive is in flight → drive once: `buildReconcileRequestForPanes(store.getState(), identityMatchingPaneRefs)` (null ⇒ clear + debug log); else own-reconcileId `ws.onMessage` subscription (fold-ownership: skip foreign `pane.reconcile.result`), `ws.send(request)`, info drive log. Effect deps include the identity-matching-refs-derived value, `sessionIndexReady`, AND `connection.lastReadyAt` (round-1 finding 5: a reconnect's fresh ready re-drives with a reset budget even when `sessionIndexReady` stays true).
 2. Result folded: check `outcome.cardinalityViolation` FIRST (round-1 finding 6 — mirror the banner handler): keep the banner + `console.error/log.warn` and DO NOT clear. Otherwise `outcome.warming === 0` ⇒ `clearReconcileWarming()` + info settle log; still warming ⇒ bounded backoff: bump the recovery tick after 2s while `attempts < RECOVERY_RETRY_LIMIT` (debug log), else warn gave-up and stop (banner + manual Retry remain — no busy polling).
 3. Watchdog: an in-flight drive whose result never arrives (lost result on a live connection, or a dead socket) is dropped after 10s — unsubscribe, clear pending, warn (cause: result wait expired, with reconcileId + elapsed), and BUMP THE RECOVERY TICK so the effect re-arms and re-drives while the attempt budget allows (round-1 finding 5). `attempts` resets whenever `connection.lastReadyAt` changes (a new handshake = a new readiness observation).
 4. Correlated server error: an `error` frame with `requestId === request.reconcileId` (RECONCILE_TOO_LARGE/RECONCILE_UNAVAILABLE class) drops the drive with a warn (cause in the log) and bumps the tick — never waiting for the watchdog (round-1 finding 5).
 5. Single-flight: a second effect firing while a drive is in flight does not send a second request (dedup).
 6. Disconnect: `ws.send` never throws (optional-chained no-op on a dead socket — ledger F2), so there is no send-failure arm; the watchdog is the disconnect safety net, and the next ready re-evaluates and re-drives. (A `try/catch` around the send is dead code — do not add it; the banner's own Retry does not guard it either.)
 7. No drive when `sessionIndexReady === false` (pre-readiness) or when `reconcileWarming` is null.
-8. Logs carry the kata's diagnosis fields (round-1 finding 7): every drive/settle/gave-up/watchdog log includes the reconcileId, the paneKeys (tab:pane list), the pane count; settle and gave-up include elapsed durationMs; gave-up and watchdog include the failure cause; all transition-gated (nothing per poll/interval; no timers while idle).
+8. Logs carry the kata's diagnosis fields (round-1 finding 7 + round-2 finding 5): every drive/settle/gave-up/watchdog log includes the reconcileId, the paneKeys (tab:pane list), the pane count, AND the affected providers/sessionIds (read from the request panes' `sessionRef` claims — the pane's durable identity is exactly what recovery diagnosis needs); settle and gave-up include elapsed durationMs; gave-up, watchdog, refused, and cardinality logs include the failure cause. Severity design (client-logger evidence: production default level is `warn`, `info` is development/debug-logging only — client-logger.ts:11-13): failure transitions (gave-up, watchdog expiry, correlated refusal, cardinality violation) log at `warn` and ARE recorded in production; the happy-path drive/settle transitions log at `info` (visible in development and under the Debug-logging toggle, consistent with the house treatment of client-side happy-path transitions — the server-side readiness events `session_index_warm`/`session_index_ready_broadcast` are INFO and recorded by the default RUST_LOG). All transition-gated (nothing per poll/interval; no timers while idle).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -951,6 +967,7 @@ it('drops an unanswered drive after the result watchdog, then re-drives via the 
 it('resets the retry budget and re-drives on a new handshake even when sessionIndexReady stays true (lastReadyAt dep)')
 it('folds only its own reconcileId, skipping foreign results')
 it('leaves restoreError panes out of the warming state (unreadable-store verdicts are not re-parked)')
+it('excludes a pane replaced while parked (new createRequestId under the same paneId) — its pending recovery is canceled, the replacement is never reconciled by the drive')
 ```
 
 Identity-guard RED tests (extend `pane-reconcile.test.ts` + `panesSlice.reconcile.test.ts`):
@@ -958,6 +975,8 @@ Identity-guard RED tests (extend `pane-reconcile.test.ts` + `panesSlice.reconcil
 ```ts
 it('a stale attach verdict for a replaced pane (new createRequestId) folds NOTHING onto the rebound content')
 it('a stale respawn/fresh verdict for a replaced pane folds NOTHING (expectedCreateRequestId guard)')
+it('a stale error verdict (session_store_unreadable / provider_runtime_failed) for a replaced pane folds NOTHING — it cannot latch a wrong error onto the rebound content and block its restoration')
+it('the warming paneRefs carry the parked createRequestId and foldVerdicts mints them from the request pane claims')
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -1121,7 +1140,7 @@ git commit -m "feat(client): auto-restore parked panes on session-index readines
 **Interfaces:**
 - Consumes: Task 3's `FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS` via `RustServer({env})` (helpers/rust-server.ts forwards arbitrary env, :304-312); the donor `bootAdoption` pattern from reconcile-client-adoption-rust.spec.ts:322 (the spec constructs its OWN `RustServer({env, setupHome})`, boots the base `page` fixture via `page.goto(baseUrl/?token&e2e=1)` + `TestHarness.waitForHarness/waitForConnection` — NOT `freshellPage`/`serverInfo`, which bind to the worker-scoped fixture server that never sees the hold env); `installDualRoleCodexCli` (fixtures/codex-dual-role.ts) + seeded codex session transcripts under the isolated home's `~/.codex/sessions` (codex is THE deterministic park class: AD-4 keeps codex `Unknown` while the index is cold — no cold by-id locator, plan Task 4; claude/amplifier resolve cold via their existing by-id locators and opencode/antigravity via Task 4's, so they never park deterministically); `writeClaudeTranscript`/`seedClaudeHome` donors for the shell-pane contrast and provider-root presence; harness `getState`/`getPaneLayout`/`getTerminalBuffer`/`getSentWsMessages`; `/api/terminals` REST with `x-auth-token`; the stable-count settle donor from restore-contract-wall.
 - Produces: the kata's acceptance e2e — actually executed on the configured (local) backend.
-- Sandbox classification (explicit, so implementers do not re-derive it): fixture-owned server restarts in the Playwright lane are the repo's documented "may skip" class — `RustServer.restart()`/`restartAbrupt()` kill only the fixture-spawned process group (ownership-safe by construction), exactly like every existing reconcile/restore e2e (reconcile-client-adoption, restore-contract-wall, compound-restart, ...). The sandbox requirement applies to suites that kill HOST processes or decoy freshell-servers (cargo process-kill/restart-storm classes), which this plan routes through `scripts/sandbox-test.sh` unchanged (see docs/development/test-sandbox.md "When you MUST use it" / "May skip").
+- Sandbox classification (explicit — plan-review rounds 1 and 2 both flagged this; the reasoning is recorded here so implementers do not re-derive it): docs/development/test-sandbox.md's must-use clause reads, at the letter, "process-kill suites (anything that sends signals to a real or decoy freshell-server)". The repo's OPERATIVE classification is narrower and is what this plan follows: AGENTS.md's own wording scopes the sandbox to "process-kill, config-corruption, and restart-STORM suites" (repeatedly starts/stops), and the merged e2e suite signals only test-owned fixture process groups in the ordinary local lane — reconcile-client-adoption-rust, restore-contract-wall-rust, compound-restart-rust, double-restart-terminal-restore-rust, create-protection-restore-storm-rust, reconnect-revive-rust, paced-restore-convergence-rust and ~20 more merged specs all restart their own `RustServer` fixtures locally. This plan's delta therefore: (a) limits the NEW spec to exactly ONE graceful `server.restart()` per test (no `restartAbrupt()`, no kill storms, no host/decoy processes — the same process-group ownership as the merged donors), (b) routes every cargo-lane destructive test through `scripts/sandbox-test.sh` unchanged, and (c) records that IF the team later decides the Playwright lane belongs inside the Docker sandbox, that migration is repo-wide (all merged restart specs + a browser-equipped sandbox image), not a delta this feature can carry alone.
 
 **Spec sketch (four tests; `test.setTimeout(240_000)` matching the donor; all waits generous + explicit):**
 
