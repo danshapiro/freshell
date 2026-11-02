@@ -28,7 +28,7 @@ Root-cause and fix four open Kata issues in the Freshell repository, each with i
 
 **Goal:** Make managed Codex recovery survive a native crash with archived history per the documented recover-on-send contract (with typed redacted diagnostics), and make the three flaky/failing Claude session-host tests deterministic and evidence-retaining, so the full suite is green at this branch's HEAD for exactly the four tracked Kata failures it fixes.
 
-**Architecture:** Two work streams. (A) Test-reliability stream (Tasks 1–4): all three Claude test failures are test/fixture-layer readiness or isolation defects — the production announce-vs-evidence transport contract is deliberate and stays intact; fixes mirror existing in-repo waiting patterns and add fixture isolation plus failure-evidence retention. (B) Production-recovery stream (Tasks 5–8): gc1p is a real managed-Codex recovery bug with two layers — a stale stored resume spec clobbering the incarnation's folded settings at grant execution (Fix A), and whole-host replacement preempting the proven send-driven recover-on-send path for a native-provider exit in a live host (Fix B), plus an opaque error surface that must become typed redacted diagnostics (Fix C). The installed parity integration case in the disposable sandbox is the acceptance proof.
+**Architecture:** Two work streams. (A) Test-reliability stream (Tasks 1–4): all three Claude test failures are test/fixture-layer readiness or isolation defects — the production announce-vs-evidence transport contract is deliberate and stays intact; fixes mirror existing in-repo waiting patterns and add fixture isolation plus failure-evidence retention. (B) Production-recovery stream (Tasks 5–8): gc1p is a real managed-Codex recovery bug with two layers — a stale stored resume spec clobbering the incarnation's folded settings at grant execution (Fix A), and THREE blockers preempting the proven send-driven recover-on-send path for a native-provider exit in a live host (Fix B): the supervisor's whole-host replacement observer, the admission gate's blanket `status.exited` refusal, and the session-host send-time current-native-observation guard whose only rescue arm is Claude-only (load-bearing validation falsified the two-blocker design; see `reports/load-bearing-validator-lb1.md`). Plus an opaque error surface that must become typed redacted diagnostics (Fix C). The installed parity integration case in the disposable sandbox is the acceptance proof.
 
 **Tech Stack:** Rust (freshell-supervisor, freshell-session-host, freshell-agent-runtime, freshell-runtime-protocol, freshell-server crates; cargo `--locked`), Node sidecar fixture (`test/unit/claude-sidecar/fixtures/native-startup-query.mjs`, `crates/freshell-claude-sidecar`), Vitest for client/tooling tests, Docker sandbox via `scripts/sandbox-test.sh`, KataTracker (`kata`) for issue tracking.
 
@@ -431,16 +431,18 @@ git commit -m "fix: folded recovery settings win over stale stored resume spec a
 **Files:**
 - Modify: `crates/freshell-supervisor/src/inventory.rs` (provider-exit observer classification, base_ref :316-340)
 - Modify: `crates/freshell-supervisor/src/service.rs` (admission gate `authenticate_current_fresh_host` :2582-2694 — typed recoverable state instead of the blanket `status.exited` refusal at :2674-2693; codex readiness arm analogous to `can_prepare` :2601-2603)
+- Modify: `crates/freshell-session-host/src/main.rs` (send-time guard: `HostCommand::FreshAgentSend` handler runs `ensure_current_fresh_native_observation` before `actor.dispatch`, base_ref :1078 and :1086-1094; `FreshAgentPrepareNative` gate :1021 — third blocker found by load-bearing validation)
+- Modify: `crates/freshell-session-host/src/providers/fresh_agent.rs` (`prepare_native_readiness` codex arm, base_ref :790-793 — currently a no-op for codex; `observed_native_session_id` returns `None` when `!is_live` per host_actor.rs:1006-1009 → codex `has_live_session` codex.rs:7292-7297)
 - Modify (as needed): `crates/freshell-supervisor/src/recovery.rs` (suppress whole-host replacement for the new live-host class; keep replacement + RETRY_BUDGET for host-process death/OOM)
-- Test: supervisor unit tests (new classification + admission tests), and the existing neighbors stay green.
+- Test: supervisor unit tests (new classification + admission tests), session-host unit tests (new send-guard recoverable-state test), and the existing neighbors stay green.
 
 **Interfaces:**
-- Consumes: Task 5's typed diagnostics (failure visibility), Task 6's settings consistency (replacement launches, other failure classes, stay correct), the direct adapter's proven send path (`ensure_session_alive` mint-new on `threadNotFound`, codex.rs:7636-7667) and its typed `NativeDispatchIdentity` commit (providers/fresh_agent.rs:1189-1226 → service.rs:2511-2537), the `is_codex_thread_not_found` classifier.
-- Produces: a supervisor classification distinguishing (i) host-process death (or other whole-host classes) — existing whole-host replacement + RETRY_BUDGET semantics unchanged — from (ii) a codex native-provider exit while the host process and durable actor are intact — the soul remains send-admitted, no whole-host replacement, and the next send drives the existing recover-on-send path whose typed identity commit moves the native root durably. Scoped to codex managed sessions; claude/kilroy/opencode crash policies unchanged.
+- Consumes: Task 5's typed diagnostics (failure visibility), Task 6's settings consistency (replacement launches, other failure classes, stay correct), the direct adapter's proven send path (`ensure_session_alive` mint-new on `threadNotFound`, codex.rs:7636-7667) and its typed `NativeDispatchIdentity` commit (providers/fresh_agent.rs:1189-1226 → service.rs:2511-2537), the `is_codex_thread_not_found` classifier, the owned-tree proof discipline (`task010_failed_resume_confirms_its_owned_tree_before_minting_again`, providers/fresh_agent.rs:3422).
+- Produces: a supervisor classification distinguishing (i) host-process death (or other whole-host classes) — existing whole-host replacement + RETRY_BUDGET semantics unchanged — from (ii) a codex native-provider exit while the host process and durable actor are intact: the soul remains send-admitted, no whole-host replacement, and the next send drives the existing recover-on-send path whose typed identity commit moves the native root durably. The SAME typed recoverable state must be recognized at BOTH gates on the send path: the supervisor admission gate AND the session-host send-time current-native-observation guard, which must route the send to the actor's recover-on-send (owned-tree proof → mint-new → typed commit) instead of refusing with `NATIVE_IDENTITY_UNOBSERVED` (`RecoveryWrongIdentity`). Scoped to codex managed sessions; claude/kilroy/opencode crash policies and the guard's Claude rescue arm are unchanged.
 
 - [ ] **Step 1: Write the failing behavioral test (observer classification)**
 
-Supervisor unit test: a provider-exit observation for a codex managed session whose HOST process is alive (and durable actor intact) must classify as send-recoverable (NOT whole-host-replaceable); a host-process death observation must still classify as whole-host-replaceable. RED: today provider-exit in a live host triggers whole-host replacement.
+Supervisor unit test: a provider-exit observation for a codex managed session whose HOST process is alive (and durable actor intact) must classify as send-recoverable (NOT whole-host-replaceable) and must not flip the soul out of its live/recovery-neutral state; a host-process death observation must still classify as whole-host-replaceable. RED: today provider-exit in a live host triggers whole-host replacement.
 
 Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-supervisor -- --nocapture"` (narrowed to the new test name)
 
@@ -448,7 +450,7 @@ Expected: FAIL (no such class exists).
 
 - [ ] **Step 2: Implement the classification**
 
-Split the observer classification in inventory.rs (:316-340) per the interface contract; record the class in the supervisor's soul/session status as a typed, honest state (e.g. exited-send-recoverable), and suppress the whole-host replacement for class (ii) in recovery.rs. Budget semantics (3 attempts, RETRY_BUDGET persisted verdict, manual rearm) stay byte-identical for class (i).
+Split the observer classification in inventory.rs (:316-340) per the interface contract; record the class in the supervisor's soul/session status as a typed, honest state (e.g. exited-send-recoverable), and suppress the whole-host replacement for class (ii) in recovery.rs. Budget semantics (3 attempts, RETRY_BUDGET persisted verdict, manual rearm) stay byte-identical for class (i). Add a focused registry test asserting the original writer claim on the old root still exists when the commit's writer-claim clause runs (validator new-assumption 1).
 
 - [ ] **Step 3: Write the failing behavioral test (admission gate)**
 
@@ -460,26 +462,39 @@ Expected: FAIL (blanket refusal).
 
 - [ ] **Step 4: Implement the admission gate**
 
-In `authenticate_current_fresh_host` (:2582-2694), replace the blanket `status.exited` refusal with a typed recoverable-state branch for the codex live-host class: admit the send to the actor lane (which drives `ensure_session_alive` → `thread/resume` → proved `threadNotFound` → mint-new thread → typed `NativeDispatchIdentity` commit moving the native root). The codex readiness arm mirrors `can_prepare` (:2601-2603). Non-codex providers and genuinely-dead hosts keep today's behavior. Ownership invariants preserved: public alias and original reference survive; the native root moves ONLY through the typed commit; archived original bytes are never written.
+In `authenticate_current_fresh_host` (:2582-2694), replace the blanket `status.exited` refusal with a typed recoverable-state branch for the codex live-host class: admit the send to the actor lane. The codex readiness arm mirrors `can_prepare` (:2601-2603). Non-codex providers and genuinely-dead hosts keep today's behavior.
 
-- [ ] **Step 5: Run the focused tests**
+- [ ] **Step 5: Write the failing behavioral test (session-host send-time guard — the third blocker)**
 
-Rerun Steps 1/3 selectors: PASS.
+Session-host unit test: with a codex session whose host process and durable actor are alive but whose native process is dead (native root's history archived/absent), a `FreshAgentSend` that carries the typed recoverable state must reach the actor's recover-on-send (eventually minting a new native conversation and committing the typed identity) instead of being refused at `ensure_current_fresh_native_observation` with `NATIVE_IDENTITY_UNOBSERVED`; the same send WITHOUT the recoverable state (an unclassified dead-native session) must still refuse exactly as today (the identity fence stays intact for everyone else). RED: today the guard refuses unconditionally because `observed_native_session_id` is `None` when `!is_live` and the only rescue arm (`prepare_native_readiness`) is a no-op for codex.
 
-- [ ] **Step 6: Refactor while green**
+Run: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host <new test name> -- --exact --nocapture"`
+
+Expected: FAIL (send-time refusal).
+
+- [ ] **Step 6: Implement the send-guard routing**
+
+Make the send-time guard recoverable-state-aware for the codex live-host class, mirroring the production Claude rescue shape: either the guard's `prepare_native_readiness` path gains a codex arm (no longer a no-op for a live-host/dead-native codex session, routing into the actor's recover-on-send) or the `FreshAgentSend`/`FreshAgentPrepareNative` handlers (main.rs:1078/:1021) accept the supervisor's typed recoverable marker and dispatch to the actor lane that runs `ensure_session_alive` (owned-tree proof → proved `threadNotFound` → mint-new → typed `NativeDispatchIdentity` commit). Choose the arm that keeps the guard's intent — never write into an identity you cannot prove you own; the mint path itself proves ownership through the durable actor/journal (`task010` discipline). Ownership invariants preserved: public alias and original reference survive; the native root moves ONLY through the typed commit; archived original bytes are never written. Watch the naming-handle interaction the validator flagged (new-assumption 2): a freshly minted thread's `pending_naming_handle` is expected `None` and the parity test's old/new name-policy assertions must still hold — cover it in this task's focused tests.
+
+- [ ] **Step 7: Run the focused tests**
+
+Rerun Steps 1/3/5 selectors: PASS.
+
+- [ ] **Step 8: Refactor while green**
 
 Keep the classification a pure function over the observation + host liveness facts; no new policy knobs or config.
 
-- [ ] **Step 7: Run impacted-test verification**
+- [ ] **Step 9: Run impacted-test verification**
 
-1. Supervisor lanes: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-supervisor -- --nocapture"` — PASS (all recovery.rs retry tests, registry budget/spec tests).
-2. Client-side budget semantics: `pnpm run test:vitest run test/runtime/gates/phase-3.test.ts --config config/vitest/vitest.config.ts` — PASS (RETRY_BUDGET persistence + manual-retry semantics unchanged).
-3. Managed terminal-provider crash lanes (different provider class — must be undisturbed): `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:vitest run test/integration/server/managed-provider-parity.test.ts --config config/vitest/vitest.config.ts` — PASS.
+1. Supervisor lanes: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-supervisor -- --nocapture"` — PASS (all recovery.rs retry tests, registry budget/spec tests, plus the new writer-claim test).
+2. Session-host lanes: `bash scripts/sandbox-test.sh "cargo test --locked -p freshell-session-host --bin freshell-session-host -- --nocapture"` — PASS (task008 settings tests, task010 owned-tree mint-new test, resume-ordering tests around :4006/:4310, the map_fresh_agent_open_error tests from Task 5).
+3. Client-side budget semantics: `pnpm run test:vitest run test/runtime/gates/phase-3.test.ts --config config/vitest/vitest.config.ts` — PASS (RETRY_BUDGET persistence + manual-retry semantics unchanged).
+4. Managed terminal-provider crash lanes (different provider class — must be undisturbed): `FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:vitest run test/integration/server/managed-provider-parity.test.ts --config config/vitest/vitest.config.ts` — PASS.
 
-- [ ] **Step 8: Commit the task**
+- [ ] **Step 10: Commit the task**
 
 ```bash
-git add crates/freshell-supervisor/src/inventory.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs
+git add crates/freshell-supervisor/src/inventory.rs crates/freshell-supervisor/src/service.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-session-host/src/main.rs crates/freshell-session-host/src/providers/fresh_agent.rs
 git commit -m "feat: send-driven managed codex recovery for native exit in a live host"
 ```
 
@@ -497,7 +512,7 @@ git commit -m "feat: send-driven managed codex recovery for native exit in a liv
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='gc1p installed parity acceptance' pnpm run test:vitest run test/integration/server/fresh-agent-parity.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: PASS — the whole case, including every post-crash assertion that previously failed at the first recovery send (base_ref :1041). If any assertion fails, capture the Task-5 diagnostics from the retained JSONL logs, fix the substantiated gap in the owning task's files with its own focused test, and rerun. Do not relax any assertion.
+Expected: PASS — the whole case, including every post-crash assertion that previously failed at the first recovery send (base_ref :1041). If any assertion fails, capture the Task-5 diagnostics from the retained JSONL logs, fix the substantiated gap in the owning task's files with its own focused test, and rerun. Do not relax any assertion. This run also settles the validator's gateway-ownership-fence assumption (the case drives the recovery send through the original public reference with the gateway's ownership fence active — retained evidence proves the fence held pre-crash, and this run proves it holds across the identity commit).
 
 - [ ] **Step 2: Run the managed-recovery neighbor lanes**
 
