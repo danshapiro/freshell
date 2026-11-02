@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Implement the manually tested approach for useful, efficient Freshell screenshots of background panes with large transcripts.
+Implement the manually tested approach for useful, efficient Freshell screenshots of background panes with large transcripts, show a toast throughout capture, provide useful screenshot diagnostics, and land the completed change on main through a PR.
 
 ### Explicit constraints
 - A pane with 30,000 elements is typical and must produce a useful screenshot efficiently.
@@ -17,7 +17,10 @@ Implement the manually tested approach for useful, efficient Freshell screenshot
 - Keep the feature simple and proportionate to its low importance.
 - Use the-usual workflow, work in a dedicated git worktree, and preserve unrelated work.
 - Proceed despite the unrelated existing base-test failure, recording that failure separately.
-- Do not deploy or restart the production server, or create a PR without explicit approval.
+- Show a toast while a screenshot is happening and remove it when capture finishes, including failure paths.
+- Provide good screenshot observability using the existing logging infrastructure.
+- When implementation and verification are complete, create a PR and land it on main; the user has explicitly authorized this operation.
+- Do not deploy or restart the production server.
 
 ### Accepted tradeoffs and residuals
 - A brief capture-related hesitation remains acceptable; the tested approach does not promise imperceptible capture.
@@ -46,7 +49,7 @@ Work only in `/home/dan/code/freshell/.worktrees/viewport-screenshots`, branch `
 
 Follow [AGENTS.md](../../AGENTS.md) for pnpm 10.34.5, coordinated testing, cloud failure policy, worktree test storage, process cleanup, and final push/PR approval. Both configured test backends are already `cloud`. Fast focused Vitest commands with explicit config below are the documented local iteration path; they do not substitute for cloud receipts. Use the prepared dependencies and runtime files. No production access is needed. Do not copy private transcript artifacts into fixtures or tracked text.
 
-This is an internal screenshot implementation change; there is no new end-user feature, setting, or significant UI change needing README or `docs/index.html` edits. There are no migrations or deploy steps. Recovery is reverting the focused feature commits through the usual reviewed branch process, with no stored data to migrate. Existing capture errors remain normal `ScreenshotResult` failures and retain caller-level diagnostics; do not introduce a telemetry system or log transcript contents.
+This is a screenshot implementation change with a small progress toast; there is no new setting or significant UI change needing README or `docs/index.html` edits. There are no migrations or deploy steps. Recovery is reverting the focused feature commits through the usual reviewed branch process, with no stored data to migrate. Existing capture errors remain normal `ScreenshotResult` failures. The requested diagnostics use existing logging infrastructure; do not introduce a telemetry system or log transcript contents.
 
 ---
 
@@ -1189,3 +1192,15 @@ git commit -m "fix: capture visible lines of large screenshot code blocks"
 ## Planner self-review
 
 The complete supplied User Request block is retained once. Both tasks deliver independently reviewable production behavior and fold their browser proof into the same deliverable; no separate test-only phase is required. Source changes are limited to the preparation helper and main capture/iframe composition, with typed synthetic fixtures and existing API/harness entrypoints. The 30k oracle uses actual source geometry and minimap rather than different fixtures; code-line selection/alignment uses independent live Range glyph positions rather than the adapter formula. Wrapped output opens its real activity disclosure and remains plain wrapped text. Exact ordinary/reference comparisons, the real 10-second deadline, two-frame settling, fresh geometry after awaits, retained iframe count/src/pane guards, and renderer failure/overlap behavior remain covered. Every edited literal, interface, reference, and count has been reconciled with these tasks and the current source. No private proof data, production step, dependency change, source test hook, exceptional iframe lifecycle framework, or unauthorized PR action is introduced.
+
+### Task 3: Show capture progress and retain useful diagnostics
+
+The user's follow-up adds a passive progress toast and screenshot observability, and explicitly authorizes landing through a PR. Reuse the completed viewport implementation and its evidence. Main has been merged so the earlier qualification-build fixes are present; the old failure receipts remain historical evidence rather than an assumed current exception.
+
+- [ ] Add behavioral failing tests for progress through pending capture and renderer cleanup, success/failure removal, overlapping captures, and correlated lifecycle diagnostics with debug logging off.
+- [ ] Add a small screenshot-specific progress state and accessible React toast in App. Begin progress before target resolution, allow the toast to paint before synchronous clone work with a bounded fallback for hidden documents, and finish in the outer cleanup. Exclude the toast from html2canvas using its supported ignore attribute. Do not move focus or change selections, tabs, or scroll.
+- [ ] Log structured start/success/failure events through the existing console-to-server path, using the broker request ID when available. Include scope/target IDs, elapsed and phase timings, dimensions on success, failure stage/error, and iframe fallback counts. Healthy events must remain available with debug logging off. Never log screenshot bytes, transcript content, or iframe URLs.
+- [ ] Refactor to the smallest screenshot-specific implementation, rerun focused units and typechecks, and run affected browser cases on the configured cloud backend. Browser coverage observes the real toast during a held capture, its cleanup on success/failure, screenshot exclusion, and continued live interaction. Preserve the existing pixel and large-pane assertions.
+- [ ] Commit the feature and report exact test receipts and cleanup to the coordinator. The coordinator owns the final full-suite gate, independent review, push, PR, merge, and worktree cleanup. Production deployment remains unauthorized.
+
+Task 3 self-review: the toast is app-wide but contains no interaction or modal behavior. A reference count covers overlapping requests without a queue or cancellation framework. A two-frame paint opportunity with bounded timeout avoids waiting forever in a hidden browser. Lifecycle diagnostics share the existing collection path and do not traverse transcript history or add a backend. Existing screenshot request/result contracts remain unchanged; an optional internal request-ID argument provides correlation.
