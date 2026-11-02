@@ -36,6 +36,26 @@ export type Phase2RunResult = {
   blocked: Phase2BlockedCase[]
 }
 
+type ManagedRuntimeIdentity = {
+  soulId: string
+  incarnationId: string
+  containerId: string
+  hostBootId: string
+}
+
+type OomProofBaseline = {
+  identity: ManagedRuntimeIdentity
+  memoryBounds: { memoryMax: string; swapMax: string }
+  memoryEvents: Record<string, number>
+  metrics: any
+  restartPolicy: { name: string; maximumRetryCount: number }
+  restartCount: number
+  hostState: { hostBootId: string; workerLaunchCount: number }
+  registryView: any
+  lifecyclePath: string
+  lifecycleOffset: number
+}
+
 /**
  * Gate 2 deliberately runs every deterministic infrastructure case before the
  * environment-dependent browser/provider receipts. A blocked browser or
@@ -347,21 +367,43 @@ async function gate06MemoryOomChildOnly(h: RuntimeHarness): Promise<void> {
   const sentinel = h.startWebLifetimeSentinel('p2-g06-oom-sentinel')
   const epoch = await controlEpoch(h, supervisor)
   const shell = await launchShell(h, supervisor, { caseId, epoch, projectKey: 'p2-oom' })
-  const memoryMax = h.execOwnedContainerExact(shell.containerId, ['cat', '/sys/fs/cgroup/memory.max']).trim()
-  const swapMax = h.execOwnedContainerExact(shell.containerId, ['cat', '/sys/fs/cgroup/memory.swap.max']).trim()
-  h.assert(caseId, Number(memoryMax) === PHASE2_TEST_LIMITS.memoryBytes && Number(swapMax) === 0, 'effective memory and swap bounds match the fixture profile', { memoryMax, swapMax })
-  const before = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(shell.soulId, epoch)), 'runtime_metrics')
+  const witness = await launchShell(h, supervisor, { caseId, epoch, projectKey: 'p2-oom-witness' })
+  const witnessInitialInspect = h.inspectContainer(witness.containerId)
+  const witnessRestartCount = witnessInitialInspect.State.RestartCount
+  h.assert(caseId,
+    witnessInitialInspect.Id === witness.containerId && witnessInitialInspect.State.Running === true
+      && Number.isSafeInteger(witnessRestartCount) && witnessRestartCount >= 0,
+    'independent managed-session witness is running before the OOM workloads',
+    { soulId: witness.soulId, incarnationId: witness.incarnationId, containerId: witness.containerId,
+      restartCount: witnessRestartCount, state: witnessInitialInspect.State })
+
+  const childBaseline = await captureOomProofBaseline(h, supervisor, epoch, shell, 'child')
   const command = `node --max-old-space-size=1024 -e "const a=[]; setInterval(()=>a.push(Buffer.alloc(16*1024*1024,1)),5)"; printf 'OOM_CHILD_EXIT=%s\\n' $?\n`
   await h.adminOk(supervisor, h.terminalInputBody(shell.soulId, command, epoch), { requestId: newRequest() })
-  let after: any = before
+  let after: any = childBaseline.metrics
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     await sleep(250)
     after = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(shell.soulId, epoch)), 'runtime_metrics')
-    if (after.memoryOomKill > before.memoryOomKill) break
+    if (after.memoryOomKill > childBaseline.metrics.memoryOomKill) break
   }
-  h.assert(caseId, after.memoryOomKill > before.memoryOomKill, 'cgroup records a real OOM kill beyond the 256 MiB cap', { before, after })
-  h.assert(caseId, h.isContainerRunning(shell.containerId), 'child-only OOM does not kill the session host/container')
+  const childMemoryEvents = readCgroupMemoryEvents(h, shell.containerId)
+  h.assert(caseId,
+    after.memoryOom > childBaseline.metrics.memoryOom
+      && after.memoryOomKill > childBaseline.metrics.memoryOomKill
+      && childMemoryEvents.oom > childBaseline.memoryEvents.oom
+      && childMemoryEvents.oom_kill > childBaseline.memoryEvents.oom_kill,
+    'child workload produces advancing cgroup and supervisor OOM counters under the 256 MiB cap',
+    { identity: childBaseline.identity, memoryBounds: childBaseline.memoryBounds,
+      memoryEventsBefore: childBaseline.memoryEvents, memoryEventsAfter: childMemoryEvents,
+      metricsBefore: childBaseline.metrics, metricsAfter: after })
+  h.recordLifecycle('p2.g06.oom.observed', { workload: 'child', identity: childBaseline.identity,
+    memoryBounds: childBaseline.memoryBounds, memoryEventsBefore: childBaseline.memoryEvents,
+    memoryEventsAfter: childMemoryEvents, metricsBefore: childBaseline.metrics, metricsAfter: after })
+  const childInspect = h.inspectContainer(shell.containerId)
+  h.assert(caseId, childInspect.Id === shell.containerId && childInspect.State.Running === true,
+    'child-only OOM leaves the exact session host/container running',
+    { identity: childBaseline.identity, state: childInspect.State })
   h.execOwnedContainerExact(sentinel, ['true'])
   h.assert(caseId, h.isContainerRunning(sentinel), 'unrelated sentinel survives the OOM')
   await h.adminOk(supervisor, h.terminalInputBody(shell.soulId, "echo AFTER_OOM_HOST_ALIVE\n", epoch), { requestId: newRequest() })
@@ -377,21 +419,20 @@ async function gate06MemoryOomChildOnly(h: RuntimeHarness): Promise<void> {
     expectedControlEpoch: epoch,
   }), { requestId: shell.launchRequestId }), 'launch')
   h.assert(caseId, replay.view.launchState === 'running' && replay.view.containerId === shell.containerId, 'child OOM is not misclassified as a lost/replaced soul', replay)
-  const stop = dataOf(await h.adminOk(supervisor, h.stopBody(shell.soulId, epoch)), 'stop')
-  h.assert(caseId, stop.outcome === 'verified_empty', 'OOM-tested runtime still cleans up by exact enclosure')
+  await assertOomSoulRemainsRunning(h, supervisor, shell, childBaseline, 'child')
+  await assertManagedWitnessAfterOom(h, supervisor, epoch, witness, witnessRestartCount, 'child')
+  await observeOomQuietInterval(h, supervisor, epoch, shell, childBaseline, 'child')
+  await stopManagedRuntimeWithEvidence(h, supervisor, epoch, shell, childBaseline.registryView.intentRevision, 'child')
 
   // Provider-root OOM: the PTY child itself dies while the trusted session
   // host remains alive. This is the green-zombie shape Phase 2 must surface.
   const rootSoul = newSoul()
+  const rootProgram = 'process.stdout.write("P2_ROOT_OOM_READY\\n"); process.stdin.once("data", () => { const a=[]; setInterval(() => a.push(Buffer.alloc(16*1024*1024,1)),5) })'
   const rootTerminal = terminalSpec(h, {
     caseId,
     projectKey: 'p2-root-oom',
     program: '/usr/local/bin/node',
-    args: [
-      '--max-old-space-size=1024',
-      '-e',
-      'const a=[]; setInterval(()=>a.push(Buffer.alloc(16*1024*1024,1)),5)',
-    ],
+    args: ['--max-old-space-size=1024', '-e', rootProgram],
   })
   const rootLaunch = dataOf(await h.adminOk(supervisor, h.launchBody({
     soulId: rootSoul,
@@ -402,22 +443,378 @@ async function gate06MemoryOomChildOnly(h: RuntimeHarness): Promise<void> {
     terminal: rootTerminal,
     expectedControlEpoch: epoch,
   }), { requestId: newRequest() }), 'launch')
-  const rootBefore = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(rootSoul, epoch)), 'runtime_metrics')
-  let rootMetrics: any = rootBefore
+  const rootRuntime: ManagedRuntimeIdentity = {
+    soulId: rootSoul,
+    incarnationId: rootLaunch.view.incarnationId,
+    containerId: rootLaunch.view.containerId,
+    hostBootId: rootLaunch.hostBootId,
+  }
+  await waitForOutput(h, supervisor, rootSoul, epoch, /P2_ROOT_OOM_READY/, 20_000)
+  const rootBaseline = await captureOomProofBaseline(h, supervisor, epoch, rootRuntime, 'provider-root')
+  await h.adminOk(supervisor, h.terminalInputBody(rootSoul, 'START_ROOT_OOM\n', epoch), { requestId: newRequest() })
+  let rootMetrics: any = rootBaseline.metrics
   let rootOutput: any = null
   const rootDeadline = Date.now() + 30_000
   while (Date.now() < rootDeadline) {
     await sleep(250)
     rootMetrics = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(rootSoul, epoch)), 'runtime_metrics')
     rootOutput = dataOf(await h.adminOk(supervisor, h.terminalReadOutputBody(rootSoul, 0, 64 * 1024, epoch)), 'terminal_output')
-    if (rootMetrics.memoryOomKill > rootBefore.memoryOomKill && rootOutput.exited) break
+    if (rootMetrics.memoryOomKill > rootBaseline.metrics.memoryOomKill && rootOutput.exited) break
   }
-  h.assert(caseId, rootMetrics.memoryOomKill > rootBefore.memoryOomKill, 'provider-root allocation is OOM-killed by the same 256 MiB cgroup', { rootBefore, rootMetrics })
-  h.assert(caseId, rootOutput?.exited === true && typeof rootOutput?.exitCode === 'number' && rootOutput.exitCode !== 0, 'host reports PTY-root exit and nonzero exit code through terminal output status', rootOutput)
-  h.assert(caseId, h.isContainerRunning(rootLaunch.view.containerId), 'session host/container survives provider-root OOM long enough to report it')
-  const rootStop = dataOf(await h.adminOk(supervisor, h.stopBody(rootSoul, epoch)), 'stop')
-  h.assert(caseId, rootStop.outcome === 'verified_empty', 'dead provider enclosure is still authoritatively stopped and released')
+  const rootMemoryEvents = readCgroupMemoryEvents(h, rootRuntime.containerId)
+  h.assert(caseId,
+    rootMetrics.memoryOom > rootBaseline.metrics.memoryOom
+      && rootMetrics.memoryOomKill > rootBaseline.metrics.memoryOomKill
+      && rootMemoryEvents.oom > rootBaseline.memoryEvents.oom
+      && rootMemoryEvents.oom_kill > rootBaseline.memoryEvents.oom_kill,
+    'provider-root workload advances cgroup and supervisor OOM counters under the same 256 MiB cap',
+    { identity: rootBaseline.identity, memoryBounds: rootBaseline.memoryBounds,
+      memoryEventsBefore: rootBaseline.memoryEvents, memoryEventsAfter: rootMemoryEvents,
+      metricsBefore: rootBaseline.metrics, metricsAfter: rootMetrics })
+  h.assert(caseId,
+    rootOutput?.exited === true && typeof rootOutput?.exitCode === 'number' && rootOutput.exitCode !== 0,
+    'host reports provider-root exit and nonzero exit code through terminal output status',
+    { identity: rootBaseline.identity, rootOutput })
+  h.recordLifecycle('p2.g06.oom.observed', { workload: 'provider-root', identity: rootBaseline.identity,
+    memoryBounds: rootBaseline.memoryBounds, memoryEventsBefore: rootBaseline.memoryEvents,
+    memoryEventsAfter: rootMemoryEvents, metricsBefore: rootBaseline.metrics, metricsAfter: rootMetrics,
+    terminalExit: { exited: rootOutput?.exited, exitCode: rootOutput?.exitCode } })
+  const rootInspect = h.inspectContainer(rootRuntime.containerId)
+  h.assert(caseId, rootInspect.Id === rootRuntime.containerId && rootInspect.State.Running === true,
+    'session host/container survives provider-root OOM long enough to report it',
+    { identity: rootBaseline.identity, state: rootInspect.State })
+  await assertOomSoulRemainsRunning(h, supervisor, rootRuntime, rootBaseline, 'provider-root')
+  await assertManagedWitnessAfterOom(h, supervisor, epoch, witness, witnessRestartCount, 'provider-root')
+  await observeOomQuietInterval(h, supervisor, epoch, rootRuntime, rootBaseline, 'provider-root')
+  await stopManagedRuntimeWithEvidence(h, supervisor, epoch, rootRuntime, rootBaseline.registryView.intentRevision, 'provider-root')
+
+  const witnessInventory = await readInventorySoul(h, supervisor, witness.soulId)
+  await stopManagedRuntimeWithEvidence(h, supervisor, epoch, witness, witnessInventory.view?.intentRevision, 'witness')
 }
+
+async function captureOomProofBaseline(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  epoch: number,
+  runtime: ManagedRuntimeIdentity,
+  workload: string,
+): Promise<OomProofBaseline> {
+  const identity = { ...runtime }
+  const memoryBounds = {
+    memoryMax: h.execOwnedContainerExact(identity.containerId, ['cat', '/sys/fs/cgroup/memory.max']).trim(),
+    swapMax: h.execOwnedContainerExact(identity.containerId, ['cat', '/sys/fs/cgroup/memory.swap.max']).trim(),
+  }
+  const memoryEvents = readCgroupMemoryEvents(h, identity.containerId)
+  const metrics = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(identity.soulId, epoch)), 'runtime_metrics')
+  const inspected = h.inspectContainer(identity.containerId)
+  const restartPolicy = {
+    name: inspected.HostConfig?.RestartPolicy?.Name,
+    maximumRetryCount: inspected.HostConfig?.RestartPolicy?.MaximumRetryCount,
+  }
+  const restartCount = inspected.State?.RestartCount
+  const hostStateFile = path.join(h.runtimeDir(supervisor, identity.incarnationId), 'host-state.json')
+  const rawHostState = JSON.parse(fs.readFileSync(hostStateFile, 'utf8'))
+  const hostState = { hostBootId: rawHostState.hostBootId, workerLaunchCount: rawHostState.workerLaunchCount }
+  const inventory = await readInventorySoul(h, supervisor, identity.soulId)
+  const lifecyclePath = path.join(path.dirname(supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
+  const lifecycleOffset = fs.statSync(lifecyclePath).size
+  const baseline: OomProofBaseline = {
+    identity,
+    memoryBounds,
+    memoryEvents,
+    metrics,
+    restartPolicy,
+    restartCount,
+    hostState,
+    registryView: inventory.view,
+    lifecyclePath,
+    lifecycleOffset,
+  }
+  const evidence = { workload, ...baseline, registryRows: inventory.rows.length }
+  h.assert('P2-G06',
+    Number(memoryBounds.memoryMax) === PHASE2_TEST_LIMITS.memoryBytes && Number(memoryBounds.swapMax) === 0,
+    `${workload} OOM workload has the exact effective memory and swap bounds`, evidence)
+  h.assert('P2-G06',
+    memoryEvents.oom === 0 && memoryEvents.oom_kill === 0
+      && metrics.memoryOom === memoryEvents.oom && metrics.memoryOomKill === memoryEvents.oom_kill,
+    `${workload} OOM counters are readable and start at the same zero baseline`, evidence)
+  h.assert('P2-G06',
+    inspected.Id === identity.containerId && inspected.State?.Running === true
+      && Number.isSafeInteger(restartCount) && restartCount >= 0
+      && typeof restartPolicy.name === 'string'
+      && Number.isSafeInteger(restartPolicy.maximumRetryCount),
+    `${workload} actual container identity, restart policy, and restart count are captured before OOM`, evidence)
+  h.assert('P2-G06',
+    hostState.hostBootId === identity.hostBootId && Number.isSafeInteger(hostState.workerLaunchCount)
+      && hostState.workerLaunchCount >= 1,
+    `${workload} baseline records the exact host boot and worker-launch count`, evidence)
+  h.assert('P2-G06',
+    inventory.rows.length === 1 && inventory.view?.desiredState === 'running'
+      && inventory.view?.recoveryState === 'live' && inventory.view?.launchState === 'running'
+      && inventory.view?.incarnationId === identity.incarnationId
+      && inventory.view?.containerId === identity.containerId,
+    `${workload} baseline registry row names the exact running incarnation`, evidence)
+  h.recordLifecycle('p2.g06.oom.baseline_captured', evidence)
+  return baseline
+}
+
+async function assertOomSoulRemainsRunning(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  runtime: ManagedRuntimeIdentity,
+  baseline: OomProofBaseline,
+  workload: string,
+): Promise<void> {
+  const inventory = await readInventorySoul(h, supervisor, runtime.soulId)
+  h.assert('P2-G06',
+    inventory.rows.length === 1 && inventory.view?.desiredState === 'running'
+      && inventory.view?.recoveryState === 'live' && inventory.view?.launchState === 'running'
+      && inventory.view?.intentRevision === baseline.registryView.intentRevision
+      && inventory.view?.incarnationId === runtime.incarnationId
+      && inventory.view?.containerId === runtime.containerId,
+    `durable registry retains the exact running incarnation after ${workload} OOM`,
+    { workload, identity: runtime, baselineView: baseline.registryView, rows: inventory.rows,
+      inventoryRevision: inventory.snapshot.revision })
+}
+
+async function assertManagedWitnessAfterOom(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  epoch: number,
+  witness: ManagedRuntimeIdentity,
+  expectedRestartCount: number,
+  workload: string,
+): Promise<void> {
+  const marker = `P2_WITNESS_AFTER_${workload.toUpperCase()}_OOM`
+  const before = h.inspectContainer(witness.containerId)
+  const beforeInventory = await readInventorySoul(h, supervisor, witness.soulId)
+  h.assert('P2-G06', before.Id === witness.containerId && before.State?.Running === true
+    && before.State?.RestartCount === expectedRestartCount,
+  `independent managed witness remains running before ${workload} OOM readback`,
+  { identity: witness, state: before.State, registryRows: beforeInventory.rows })
+  await h.adminOk(supervisor, h.terminalInputBody(witness.soulId, `echo ${marker}\n`, epoch), { requestId: newRequest() })
+  const output = await waitForOutput(h, supervisor, witness.soulId, epoch, new RegExp(marker), 20_000)
+  const after = h.inspectContainer(witness.containerId)
+  const afterInventory = await readInventorySoul(h, supervisor, witness.soulId)
+  const receipts = h.broker.receipts().filter((receipt) => receipt.soulId === witness.soulId)
+  h.assert('P2-G06', after.Id === witness.containerId && after.State?.Running === true
+    && after.State?.RestartCount === expectedRestartCount
+    && afterInventory.rows.length === 1 && afterInventory.view?.desiredState === 'running'
+    && afterInventory.view?.recoveryState === 'live' && afterInventory.view?.launchState === 'running'
+    && afterInventory.view?.incarnationId === witness.incarnationId
+    && afterInventory.view?.containerId === witness.containerId
+    && receipts.length === 1 && receipts[0].incarnationId === witness.incarnationId
+    && receipts[0].containerId === witness.containerId,
+  `independent managed witness remains exact and executes a command after ${workload} OOM`,
+  { workload, identity: witness, restartCount: after.State?.RestartCount,
+    output: output.slice(-4000), state: after.State, registryRows: afterInventory.rows, receipts })
+  h.recordLifecycle('p2.g06.oom.witness_command_completed', { workload, identity: witness,
+    marker, outputTail: output.slice(-2000), restartCount: after.State?.RestartCount })
+}
+
+async function observeOomQuietInterval(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  epoch: number,
+  runtime: ManagedRuntimeIdentity,
+  baseline: OomProofBaseline,
+  workload: string,
+): Promise<void> {
+  const startedAt = Date.now()
+  const deadline = startedAt + 30_000
+  const samples: any[] = []
+  while (Date.now() < deadline) {
+    const inspected = h.inspectContainer(runtime.containerId)
+    const hostPath = path.join(h.runtimeDir(supervisor, runtime.incarnationId), 'host-state.json')
+    const rawHost = JSON.parse(fs.readFileSync(hostPath, 'utf8'))
+    const inventory = await readInventorySoul(h, supervisor, runtime.soulId)
+    const receipts = h.broker.receipts().filter((receipt) => receipt.soulId === runtime.soulId)
+    const lifecycleEvents = readSupervisorLifecycleAfter(baseline.lifecyclePath, baseline.lifecycleOffset)
+    const sameSoulEvents = lifecycleEvents.filter((row: any) => row?.data?.soulId === runtime.soulId)
+    const restartEvents = sameSoulEvents.filter((row: any) =>
+      row.event === 'supervisor.launch_running' || row.event === 'supervisor.runtime_observer.recovery_scheduled')
+    const restartPolicy = {
+      name: inspected.HostConfig?.RestartPolicy?.Name,
+      maximumRetryCount: inspected.HostConfig?.RestartPolicy?.MaximumRetryCount,
+    }
+    const sample = {
+      at: new Date().toISOString(),
+      docker: { id: inspected.Id, running: inspected.State?.Running,
+        restartCount: inspected.State?.RestartCount, restartPolicy },
+      host: { hostBootId: rawHost.hostBootId, workerLaunchCount: rawHost.workerLaunchCount },
+      registryRows: inventory.rows,
+      receipts: receipts.map((receipt) => ({ soulId: receipt.soulId,
+        incarnationId: receipt.incarnationId, containerId: receipt.containerId })),
+      sameSoulLifecycleEvents: sameSoulEvents,
+      restartEvents,
+    }
+    const stable = inspected.Id === runtime.containerId && inspected.State?.Running === true
+      && inspected.State?.RestartCount === baseline.restartCount
+      && restartPolicy.name === baseline.restartPolicy.name
+      && restartPolicy.maximumRetryCount === baseline.restartPolicy.maximumRetryCount
+      && rawHost.hostBootId === runtime.hostBootId
+      && rawHost.workerLaunchCount === baseline.hostState.workerLaunchCount
+      && inventory.rows.length === 1 && inventory.view?.desiredState === 'running'
+      && inventory.view?.recoveryState === 'live' && inventory.view?.launchState === 'running'
+      && inventory.view?.intentRevision === baseline.registryView.intentRevision
+      && inventory.view?.incarnationId === runtime.incarnationId
+      && inventory.view?.containerId === runtime.containerId
+      && receipts.length === 1 && receipts[0].incarnationId === runtime.incarnationId
+      && receipts[0].containerId === runtime.containerId && restartEvents.length === 0
+    samples.push({ ...sample, stable })
+    if (!stable) {
+      h.assert('P2-G06', false, `${workload} OOM runtime changed during the 30-second quiet interval`,
+        { workload, identity: runtime, baseline, sample })
+    }
+    const remaining = deadline - Date.now()
+    if (remaining > 0) await sleep(Math.min(1_000, remaining))
+  }
+  const durationMs = Date.now() - startedAt
+  const lifecycleEvents = readSupervisorLifecycleAfter(baseline.lifecyclePath, baseline.lifecycleOffset)
+  const sameSoulEvents = lifecycleEvents.filter((row: any) => row?.data?.soulId === runtime.soulId)
+  const restartEvents = sameSoulEvents.filter((row: any) =>
+    row.event === 'supervisor.launch_running' || row.event === 'supervisor.runtime_observer.recovery_scheduled')
+  const evidence = { workload, identity: runtime, durationMs, expectedDurationMs: 30_000,
+    sampleCount: samples.length, restartPolicy: baseline.restartPolicy,
+    restartCount: baseline.restartCount, workerLaunchCount: baseline.hostState.workerLaunchCount,
+    sameSoulLifecycleEvents: sameSoulEvents, restartEvents, samples }
+  h.assert('P2-G06', durationMs >= 30_000 && samples.length > 0
+    && samples.every((sample) => sample.stable) && restartEvents.length === 0,
+  `${workload} OOM has a stable 30-second identity and lifecycle quiet interval`, evidence)
+  h.recordLifecycle('p2.g06.oom.quiet_interval_passed', evidence)
+}
+
+async function stopManagedRuntimeWithEvidence(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  epoch: number,
+  runtime: ManagedRuntimeIdentity,
+  expectedIntentRevision: number | undefined,
+  label: string,
+): Promise<void> {
+  const expectedRevision = expectedIntentRevision ?? Number.NaN
+  h.assert('P2-G06', Number.isSafeInteger(expectedRevision) && expectedRevision >= 0,
+    `${label} exact runtime has a current intent revision before Stop`,
+    { identity: runtime, expectedIntentRevision })
+  const before = await readInventorySoul(h, supervisor, runtime.soulId)
+  h.assert('P2-G06', before.rows.length === 1 && before.view?.desiredState === 'running'
+    && before.view?.incarnationId === runtime.incarnationId
+    && before.view?.containerId === runtime.containerId
+    && before.view?.intentRevision === expectedIntentRevision,
+  `${label} Stop starts from the exact registered running incarnation`,
+  { identity: runtime, expectedIntentRevision, rows: before.rows })
+  const stop = dataOf(await h.adminOk(supervisor,
+    h.stopBody(runtime.soulId, epoch, expectedIntentRevision), { requestId: newRequest() }), 'stop')
+  const stoppedRevision = stop.view?.intentRevision
+  h.assert('P2-G06', stop.outcome === 'verified_empty'
+    && stop.view?.soulId === runtime.soulId && stop.view?.desiredState === 'stopped'
+    && stop.view?.intentRevision === expectedRevision + 1
+    && stop.view?.incarnationId === runtime.incarnationId,
+  `${label} exact managed-runtime Stop commits stopped intent and settles`,
+  { identity: runtime, expectedIntentRevision, stop })
+
+  const durable = JSON.parse(h.execOwnedContainerExact(supervisor.containerId, [
+    'python3', '-c', PHASE2_G06_STOP_FACTS_PY, runtime.soulId,
+  ]))
+  h.assert('P2-G06', durable.soul?.soul_id === runtime.soulId
+    && durable.soul?.desired_state === 'stopped'
+    && durable.soul?.intent_revision === stoppedRevision
+    && durable.incarnations?.length === 1
+    && durable.incarnations[0]?.incarnation_id === runtime.incarnationId
+    && durable.incarnations[0]?.container_id === runtime.containerId
+    && durable.stops?.length === 1
+    && durable.stops[0]?.incarnation_id === runtime.incarnationId
+    && durable.stops[0]?.intent_revision === stoppedRevision
+    && durable.stops[0]?.outcome === 'verified_empty'
+    && durable.stops[0]?.revoke_pending === 0 && durable.stops[0]?.settled === 1
+    && durable.writers === 0,
+  `${label} durable Stop record is settled with zero writers and no replacement incarnation`,
+  { identity: runtime, expectedIntentRevision, durable })
+
+  const runtimeAbsence = assertExactRuntimeAbsentAfterStop(h, 'P2-G06', runtime.containerId, label)
+  const after = await readInventorySoul(h, supervisor, runtime.soulId)
+  h.assert('P2-G06', after.rows.length === 1 && after.view?.desiredState === 'stopped'
+    && after.view?.intentRevision === stoppedRevision
+    && after.view?.incarnationId === runtime.incarnationId
+    && after.view?.containerId === runtime.containerId,
+  `${label} post-Stop registry retains only the exact stopped incarnation`,
+  { identity: runtime, stoppedRevision, rows: after.rows, runtimeAbsence })
+  h.recordLifecycle('p2.g06.oom.stop_verified', { label, identity: runtime, expectedIntentRevision,
+    stoppedRevision, stopOutcome: stop.outcome, durable, runtimeAbsence })
+}
+
+function assertExactRuntimeAbsentAfterStop(
+  h: RuntimeHarness,
+  caseId: string,
+  containerId: string,
+  label: string,
+): Record<string, unknown> {
+  try {
+    const inspected = h.inspectContainer(containerId)
+    const state = { containerId: inspected.Id, status: inspected.State?.Status,
+      running: inspected.State?.Running, pid: inspected.State?.Pid }
+    const stopped = inspected.Id === containerId && inspected.State?.Running === false
+      && inspected.State?.Pid === 0 && ['created', 'exited', 'dead'].includes(inspected.State?.Status)
+    h.assert(caseId, stopped, `${label} exact runtime is stopped and empty after Stop`, state)
+    return state
+  } catch (error) {
+    const value = error as { message?: string; stderr?: Buffer; stdout?: Buffer }
+    const details = [value.message, value.stderr?.toString('utf8'), value.stdout?.toString('utf8')]
+      .filter(Boolean).join('\n')
+    const escapedId = escapeRegExp(containerId)
+    const exactNotFound = new RegExp(`(?:No such container|No such object):\\s*${escapedId}(?:\\s|$)`, 'i').test(details)
+    if (!exactNotFound) throw error
+    const evidence = { containerId, status: 'absent', dockerError: details }
+    h.assert(caseId, exactNotFound, `${label} exact runtime is absent after Stop`, evidence)
+    return evidence
+  }
+}
+
+async function readInventorySoul(h: RuntimeHarness, supervisor: SupervisorInstance, soulId: string): Promise<{
+  snapshot: any
+  rows: any[]
+  view: any
+}> {
+  const snapshot = dataOf(await h.adminOk(supervisor, h.inventorySnapshotBody()), 'inventory_snapshot')
+  const rows = snapshot.souls.filter((row: any) => row.soulId === soulId)
+  return { snapshot, rows, view: rows.at(-1) }
+}
+
+function readCgroupMemoryEvents(h: RuntimeHarness, containerId: string): Record<string, number> {
+  const output = h.execOwnedContainerExact(containerId, ['cat', '/sys/fs/cgroup/memory.events'])
+  const events: Record<string, number> = {}
+  for (const line of output.trim().split(/\r?\n/)) {
+    const match = /^([a-z_]+)\s+(\d+)$/.exec(line.trim())
+    if (!match) throw new Error(`malformed cgroup memory.events row: ${line}`)
+    const value = Number(match[2])
+    if (!Number.isSafeInteger(value)) throw new Error(`invalid cgroup memory.events counter: ${line}`)
+    events[match[1]] = value
+  }
+  if (!Number.isSafeInteger(events.oom) || !Number.isSafeInteger(events.oom_kill)) {
+    throw new Error(`cgroup memory.events lacks OOM counters: ${output}`)
+  }
+  return events
+}
+
+function readSupervisorLifecycleAfter(file: string, byteOffset: number): any[] {
+  const content = fs.readFileSync(file)
+  if (content.byteLength < byteOffset) throw new Error(`supervisor lifecycle log shrank during OOM proof: ${file}`)
+  const suffix = content.subarray(byteOffset).toString('utf8')
+  if (!suffix.trim()) return []
+  return suffix.trimEnd().split(/\r?\n/).map((line) => JSON.parse(line))
+}
+
+const PHASE2_G06_STOP_FACTS_PY = String.raw`
+import json,sqlite3,sys
+c=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True)
+c.row_factory=sqlite3.Row
+soul=c.execute('SELECT soul_id,intent_revision,desired_state FROM souls WHERE soul_id=?',(sys.argv[1],)).fetchone()
+incarnations=[dict(r) for r in c.execute('SELECT incarnation_id,container_id,launch_state,cleanup_state FROM incarnations WHERE soul_id=? ORDER BY created_at,rowid',(sys.argv[1],))]
+stops=[dict(r) for r in c.execute('SELECT incarnation_id,intent_revision,outcome,revoke_pending,settled FROM ordinary_stops WHERE soul_id=? ORDER BY intent_revision',(sys.argv[1],))]
+writers=c.execute('SELECT count(*) FROM writer_claims WHERE soul_id=?',(sys.argv[1],)).fetchone()[0]
+print(json.dumps({'soul':dict(soul) if soul else None,'incarnations':incarnations,'stops':stops,'writers':writers}))
+c.close()
+`
 
 export async function gate07PidCeilingAndSetsid(h: RuntimeHarness): Promise<void> {
   const caseId = 'P2-G07'
