@@ -31,7 +31,7 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 1. Keep immutable approved base cbae31df487bc150c1d57ba93b63f18910ce5098 and worktree /home/dan/code/freshell/.worktrees/mdmw-sandbox-budget on branch the-usual/mdmw-sandbox-budget. Main advanced with unrelated UI changes; do not rebase this approved run or alter the older broad crash-resilience work.
 2. Follow repository AGENTS.md, pnpm 10.34.5, frozen installs, configured cloud backends and coordinated broad gates. Tests run in this task worktree. Tiny generated projects are required fixtures; the exact archive inside the explicitly required isolated guest is acceptance input, not an additional host test checkout.
 3. Preserve --rm, --init, exact name/CID ownership, owner-guard and signals, cache identity/mounts/labels, early specialized dispatches, both runtime preparation/execution phases, runtime restrictions, and cleanup failure returning 1. No second lifecycle owner, retained-container framework, generic redactor, supervisor, or audit trail.
-4. Apply --cpus 2, --memory 8g, --memory-swap 16g, and --pids-limit 512 in the shared launch arguments. Total RAM-plus-swap is explicit; do not introduce a no-swap product policy. Deliberate overrides may select other Cargo job counts while the aggregate CPU quota remains two.
+4. Apply --cpus 2, --memory 8g, --memory-swap 16g, and --pids-limit 512 in the shared launch arguments. Total RAM-plus-swap is explicit; do not introduce a no-swap product policy. The fixed aggregate CPU quota applies to every sandbox workload, including explicit higher Cargo job counts; this change adds no CPU-limit override. Document that throughput tradeoff. The required full-suite gate must treat any resulting timeout as a failure to investigate, not a presumed baseline failure.
 5. The normal default leaves CARGO_BUILD_JOBS absent. Cargo 1.96's native selector reads cgroup quotas; do not inject an environment fallback that masks project build.jobs. Preserve project configuration, nonempty exported environment strings, inline assignments, and CLI overrides. Never parse arbitrary project TOML, rewrite the caller command, or add a fallback config unless actual scheduling disproves the selected native path.
 6. Historical two-job evidence is a reliable candidate only. Final-source ordinary/runtime scheduling and cold current-source resource/containment evidence remain mandatory. Attribute the canonical image's floating Cargo version separately from the explicitly pinned Rust/Clippy 1.96.0 payload.
 7. New metadata contains fixed events, JSON encoding, command SHA256, published full CID, allowlisted numeric/null settings, own cgroup controls, and true statuses. Never add command text, arbitrary environment, Config.Env/Config.Cmd, raw inspect output, or raw daemon errors to metadata. Keep original workload stdout/stderr separate. Unavailable OOM state stays null; exit 137 is not proof of OOM.
@@ -46,13 +46,13 @@ Fix freshell#mdmw: give the 8 GiB test sandbox a measured safe default build con
 ## File responsibilities and dependency map
 
 1. Modify scripts/sandbox-test.sh: shared limits, conditional forwarding of an explicit jobs value, unchanged command argument, pre-caller observation, and compact receipts within existing settlement.
-2. Create scripts/testing/sandbox-diagnostics.mjs: dependency-free JSONL/digest formatting and four read-only own-cgroup observations. No Docker or process management.
+2. Create scripts/testing/sandbox-diagnostics.mjs: dependency-free JSONL/digest formatting and four read-only own-cgroup observations. No Docker or process management. Keep mode 0644 and invoke via Node.
 3. Modify test/unit/tooling/sandbox-test.sandbox.ts: extend existing recording-Docker fixture and execute the actual copied launcher. The whole file retains its strict sandbox configuration.
-4. Create scripts/testing/sandbox-budget-smoke.mjs: restore/adapt the existing six-member offline Cargo smoke from commit 73c28b98038cd0d8c8bedd2042eaef6866106e4f; prove actual jobs/overlap, native defaults, and overrides.
+4. Create scripts/testing/sandbox-budget-smoke.mjs: restore/adapt the existing six-member offline Cargo smoke from commit 73c28b98038cd0d8c8bedd2042eaef6866106e4f; prove actual jobs/overlap, native defaults, and overrides. Keep mode 0644 and invoke via Node; neither new .mjs file is a new executable launch owner.
 5. Modify scripts/sandbox-selftest.sh: add actual default/project/exported/inline/CLI smoke cases while retaining every isolation proof. Apply the already identified narrow lock-generator readability/umask correction only if needed.
 6. Modify scripts/sandbox-cache-selftest.sh, scripts/test/sandbox-runtime-startup.test.sh, and test/unit/tooling/testing/codex-sandbox-cache.test.ts: copy the newly required helper wherever the real copied launcher executes.
 7. Modify docs/development/test-sandbox.md: explain quota-derived defaults versus overrides, requested/observed limits, compact receipts, and missing post-removal state. This existing usage document is already linked from AGENTS.md. The new plan receives its own single reference there during Stage 2; no instructions change. No end-user UI, dependency, lockfile, README or docs/index.html change is needed.
-8. Acceptance-only driver/evidence belongs under /home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/acceptance/. Disposable guest disks/keys/seed/source inputs belong under the task worktree .test-tmp/ and are recorded for exact cleanup. Review results belong under test-results/mdmw-sandbox-budget/. Do not commit tooling frameworks, guest disks, archives, dependencies, or logs.
+8. Acceptance-only driver/evidence belongs under /home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/acceptance/. Disposable guest disks/keys/seed/source inputs belong under the task worktree .test-tmp/ and are recorded for exact cleanup. Review results belong under test-results/mdmw-sandbox-budget/. Before any rootful bind, create task-owned directories as the current user and verify ownership; do not let Docker create them. Verify ignores with `git check-ignore -v .test-tmp/check test-results/check`: the existing common Git exclude covers .test-tmp/ and .gitignore covers test-results/. Do not commit tooling frameworks, guest disks, archives, dependencies, or logs.
 
 Task 1 produces the clean implementation commit. Task 2 accepts exactly that commit; later scoped source corrections require a new commit and affected revalidation. No parallel worktree mutators are needed.
 
@@ -64,7 +64,7 @@ Task 1 produces the clean implementation commit. Task 2 accepts exactly that com
 
 - Preserve the one-argument caller-command CLI and existing runtime flags.
 - Extend existing fixture.run(guard?, runtimeSuite?, twoPhase?, options?) with optional command and cargoJobs inputs. The default test input explicitly removes ambient CARGO_BUILD_JOBS; an explicit input is forwarded unchanged.
-- Helper modes: digest; configured/effective CONTAINER PHASE SHA256 JOBS_ENV; workload CONTAINER PHASE SHA256 CID DOCKER_STATUS; final CONTAINER PHASE SHA256 DOCKER_STATUS FINAL_STATUS SETTLED. An empty jobs argument means absent, not an invented default. Digest alone writes hex on stdout; other modes emit JSONL on stderr.
+- Helper modes: digest; configured/effective CONTAINER PHASE SHA256 JOBS_ENV; workload CONTAINER PHASE SHA256 CID DOCKER_STATUS; final CONTAINER PHASE SHA256 DOCKER_STATUS FINAL_STATUS SETTLED. An empty jobs argument means absent, not an invented default. An empty digest argument means unavailable and encodes null; other nonempty digests must be validated hex. Digest alone writes hex on stdout; other modes emit JSONL on stderr.
 - Smoke CLI: node scripts/testing/sandbox-budget-smoke.mjs EXPECTED_JOBS, optionally followed by exactly --cli-jobs EXPECTED_JOBS or --project-jobs EXPECTED_JOBS. Expected jobs is 1 or 2; other argument forms fail. Each mode observes actual build-script NUM_JOBS.
 - Stage 2 corrected decisions below intentionally replace invalid unexecuted draft implementation snippets. No newly authored unexecuted product code is prescribed as validated code.
 
@@ -80,6 +80,8 @@ Add behavioral cases that:
 4. Preserve attached statuses 0, 37, 137, 125; associate the full published CID after object auto-removal, use null for unpublished identity, and keep OOM null/state not retained.
 5. Preserve the existing remove-failed case's original Docker status 42 separately from final cleanup status 1 and settled=false, retaining its control directory. Successful cleanup leaves no owned control directory.
 6. Preserve all existing guard/signal/ownership cases; interrupted wait must not report false attached status 0.
+7. Omit the copied diagnostic helper, and separately replace it with a fixture-only helper that exits nonzero for each of digest, configured, workload and final modes. Execute the real launcher for successful and exit-37 workloads plus remove-failed cleanup: the caller still runs, original attached status remains 0, 37 or 42, cleanup failure still returns 1 and retains its control directory, and each unavailable diagnostic emits a fixed secret-safe event rather than a fabricated successful observation. Missing digest becomes null. Use finite subprocess deadlines and no new production fault-injection interface.
+8. Exercise effective-observation failure by running the actual new Bash prelude tail argv in a bounded subprocess against the fixture's copied missing/failing helper and a caller that writes a marker then exits 37. Map only the container helper pathname to the fixture pathname; keep the final caller argument unchanged. Assert exact marker/output, exit 37 and the unavailable event. The fake must execute the prelude for this case, not fabricate its receipt.
 
 Keep the original fixture working against unchanged source for RED. Add copies of the new helper only in Step 3 when that file is created; do not turn RED into a missing-helper setup failure. Existing budget/default assertions must fail because the real launcher lacks the new CPU/receipt/forwarding behavior.
 
@@ -106,7 +108,7 @@ The helper JSON-encodes fixed severity/event fields. Validate owned names and fu
 3. sandbox_workload_exit with the exact owned CID when published/discovered, true attached Docker status or null, state not_retained, OOM null. Emit before existing cleanup removes the control directory, using its existing CID/name resolution.
 4. sandbox_result with attached status separately from final status and settled outcome, after existing container/guard cleanup.
 
-Use the existing positional-argument shell-prelude design: helper runs before final exec of the caller, whose text remains one unchanged argv element. A helper observation failure emits a fixed secret-safe unavailable event and does not replace the workload/cleanup result. Preserve existing workload-started/finished/failed semantics, ownership checks, removal, guard joining and signal handling.
+Add a positional-argument shell prelude: helper runs before final exec of the caller, whose text remains one unchanged argv element and the final Docker argument, preserving existing args.at(-1) callers. Guard every auxiliary digest, observation and receipt invocation against set -e termination; suppress raw helper failures and emit a fixed secret-safe unavailable event. A failed digest becomes null, and failed observation never claims effective limits were observed. Auxiliary failure must not skip the caller, overwrite an original attached/cleanup status, or bypass settlement; missing required diagnostic evidence still fails acceptance even when the workload itself exits 0. Preserve existing workload-started/finished/failed semantics, ownership checks, removal, guard joining and signal handling.
 
 Create the helper and then add dependency copies to the four existing real copied-wrapper fixtures. Search for other actual launcher copies and add only necessary copies. Do not change stub-only fixtures or weaken their assertions.
 
@@ -115,11 +117,11 @@ Restore the historical six-member smoke and adapt its intent:
 1. Six independent offline members each retain 8 MiB for 300 ms and write one complete completion record with name, NUM_JOBS and start/end timestamps. Require exactly six distinct completions, expected NUM_JOBS for all, and overlap between one and the expected job cap.
 2. Native default mode requires no jobs environment/config/CLI override or inherited external jobserver. Project mode creates fixture-local .cargo/config.toml build.jobs and runs Cargo from that project directory. CLI mode passes the real --jobs argument. Environment modes receive their setting through actual wrapper invocation.
 3. Use unique fixture source/target directories, a 120-second Cargo deadline and finally cleanup. Runtime uses the existing executable-artifact root FRESHELL_TEST_EXECUTABLE_TMP_DIR for its owned fixture/target; preserve runtime restrictions instead of changing temp mount policy.
-4. Assert actual own-cgroup CPU ratio 2, memory 8589934592, swap allowance 8589934592 and PIDs 512, low-pressure smoke peak below 2 GiB and PSI some avg10 below 5. Emit sandbox_budget_smoke_passed with observed jobs/overlap/kernel readings. A tiny smoke never replaces the final cold graph.
+4. Assert actual own-cgroup CPU ratio 2, memory 8589934592, swap allowance 8589934592 and PIDs 512, low-pressure smoke lifetime memory.peak below 2 GiB and MEMORY PSI some avg10 from memory.pressure below 5. Warm fingerprinted Node dependencies in a separate completed setup container before the measured smoke containers; verify their entrypoints reuse that fingerprint without installation. Do not reset memory.peak or include bootstrap in the tiny-build measurement; do not precompile the cold Cargo graph. Emit sandbox_budget_smoke_passed with observed jobs/overlap/kernel readings. A tiny smoke never replaces the final cold graph.
 
-Add selftest default, project 1, exported 1, inline 1 and CLI 1 cases through the actual wrapper. Default explicitly removes CARGO_BUILD_JOBS and never assigns 2. Keep all original isolation proofs. If known Proof 6 lock-generation permissions block acceptance, apply only the already identified input readability plus generator umask 022 correction; preserve its assertions and record necessity.
+Add selftest default, project 1, exported 1, inline 1 and CLI 1 cases through the actual wrapper. Before these measured cases, warm fingerprinted Node dependencies through a separate completed wrapper setup container running only `:`. Default explicitly removes CARGO_BUILD_JOBS and never assigns 2. Keep all original isolation proofs, including their intentional dependency-install cases. If known Proof 6 lock-generation permissions block acceptance, apply only the already identified input readability plus generator umask 022 correction; preserve its assertions and record necessity.
 
-Document behavior and limitations in the existing agent test-sandbox documentation.
+Document the fixed CPU budget for all workloads, higher-job override throughput limits, requested versus observed controls, and compact diagnostics in the existing agent test-sandbox documentation. State plainly that unavailable OOM state remains null and exit 137 is never classified as OOM by this launcher.
 
 - [ ] **Step 4: Run focused GREEN**
 
@@ -136,7 +138,10 @@ From the task worktree, preserve the strict enclosure for process-signal fixture
 ~~~bash
 scripts/sandbox-test.sh --runtime-suite 'pnpm run test:vitest run --config test/unit/tooling/sandbox-test.config.ts'
 scripts/sandbox-test.sh --runtime-suite 'pnpm run test:vitest run test/unit/tooling/testing/codex-sandbox-cache.test.ts test/unit/tooling/testing/runtime-sandbox.test.ts test/unit/tooling/native-session-names.test.ts test/unit/tooling/sandbox-owner-guard.test.ts --config config/vitest/vitest.config.ts'
-bash -n scripts/sandbox-test.sh scripts/sandbox-selftest.sh scripts/sandbox-cache-selftest.sh scripts/test/sandbox-runtime-startup.test.sh
+bash -n scripts/sandbox-test.sh
+bash -n scripts/sandbox-selftest.sh
+bash -n scripts/sandbox-cache-selftest.sh
+bash -n scripts/test/sandbox-runtime-startup.test.sh
 node --check scripts/testing/sandbox-diagnostics.mjs
 node --check scripts/testing/sandbox-budget-smoke.mjs
 git diff --check
@@ -144,24 +149,18 @@ git diff --check
 
 Expected: all commands exit 0 and selected tests actually run, covering resource/ownership/guard cases, Cargo callers, per-worktree caches, native-contract dispatch and runtime preparation/startup. Tests invoking real substantial compilation must use Task 2's qualified guest; finite fixture cases may stay in the task's strict enclosure.
 
-The parent separately runs the configured coordinated branch full suite from the feature worktree, waiting for any foreign holder:
-
-~~~bash
-env GCLOUD_ROBOT_REQUIRE=1 CARGO_BUILD_JOBS=2 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='freshell mdmw sandbox build budget branch verification' pnpm run test
-~~~
-
-Expected: every configured phase, cloud local companion and local Electron lane completes and passes, or an exact failure receives its own permitted disposition with base reproduction where claimed pre-existing. Do not disable phases, change backend, assume baseline cause, or repair unrelated behavior. Any optional external-provider process-local environment sanitation must be corroborated/recorded; it is not a source repair or a baseline exemption.
-
 - [ ] **Step 7: Commit the coherent implementation**
 
 ~~~bash
 git add scripts/sandbox-test.sh scripts/testing/sandbox-diagnostics.mjs scripts/testing/sandbox-budget-smoke.mjs test/unit/tooling/sandbox-test.sandbox.ts test/unit/tooling/testing/codex-sandbox-cache.test.ts scripts/sandbox-selftest.sh scripts/sandbox-cache-selftest.sh scripts/test/sandbox-runtime-startup.test.sh docs/development/test-sandbox.md
+git diff --cached --check
+git diff --cached --summary
 git commit -m "fix: bound sandbox build concurrency and record effective limits"
 git status --short
 git rev-parse HEAD
 ~~~
 
-Expected: focused source/tests/docs commit and clean worktree. Record its commit/tree before final-source acceptance. Any later scoped correction requires affected tests, a new commit, and cold acceptance on that final source.
+Expected: staged whitespace check exits 0 and the summary shows both new .mjs files as mode 100644, followed by a focused source/tests/docs commit and clean worktree. Record its commit/tree before final-source acceptance. Any later scoped correction requires affected tests, a new commit, and cold acceptance on that final source; the final full-suite gate below also covers that final committed HEAD.
 
 ## Task 2: Prove actual launcher behavior and cold Clippy in one disposable normal-rootless/systemd guest
 
@@ -175,11 +174,13 @@ Expected: focused source/tests/docs commit and clean worktree. Record its commit
 
 - [ ] **Step 1: Prepare and qualify one fresh bounded guest before real acceptance compilation**
 
-The read-only cloud route is unavailable with current Compute API/robot authority. Use the available rootful Docker/KVM tool image, not missing old disks/harnesses. Recheck capacity, then create one exact-owned outer container explicitly in host system.slice: RAM 20 GiB, total RAM-plus-swap 20 GiB, CPUs 4, host PIDs 512, only /dev/kvm passthrough. Give the Ubuntu 24.04 guest RAM 16 GiB/four vCPUs and one new 100 GiB virtual disk. Keep outer/guest allocations finite; never pair the larger guest with the old 12 GiB outer cap. No garageserver package/service/policy change.
+The read-only cloud route is unavailable with current Compute API/robot authority. Use the available rootful Docker/KVM tool image, not missing old disks/harnesses. Immediately before allocation, perform one read-only capacity admission: require host MemAvailable at least 28 GiB (20 GiB outer cap plus 8 GiB reserve), at least 120 GiB free on each backing filesystem used for the 100 GiB guest disk and Docker storage, and at least 28 GiB remaining under every finite host ancestor memory.max. Missing readings or lower capacity stop setup without allocation; do not add a host-pressure monitor or change host policy. Pre-create every task bind directory as the current user, verify its ownership and the documented Git ignores, then create one exact-owned outer container explicitly in host system.slice: RAM 20 GiB, total RAM-plus-swap 20 GiB, CPUs 4, host PIDs 512, only /dev/kvm passthrough. Give the Ubuntu 24.04 guest RAM 16 GiB/four vCPUs and one new 100 GiB virtual disk. Keep outer/guest allocations finite; never pair the larger guest with the old 12 GiB outer cap. No garageserver package/service/policy change.
 
 Record vendor image/checksum, toolimage identity, guest kernel/systemd/Docker, owned PID/CID/cgroups and paths. Require KVM rather than silently switching acceleration. Use task-only SSH key/cloud-init/forwarding and finite setup/workload/export/cleanup deadlines with time reserved for export/cleanup. Keep the small guest setup specific to this run.
 
 Inside the guest use ordinary UID 1000, a real systemd user manager, normal rootless Docker/systemd cgroup v2 delegation, supported overlayfs, private Docker bridge and normal proc/sysfs. Prove rootless daemon/workload ancestry beneath the guest user manager and real UID maps. Guest-local ordinary package/delegation setup is allowed; no privileged/unconfined/host-network workaround and no host-policy change.
+
+Provide at least 8 GiB physical guest swap for the advertised container swap allowance; record guest swap availability/use separately from cgroup allowance. Record read-only host and guest systemd-oomd enabled/active state and relevant user-slice ManagedOOM policy. Before interpreting a swap-using or oomd-related failure as evidence for host manager preservation, qualify the relevant behavior in the disposable guest; otherwise report the observed guest-only outcome and the missing equivalence. A no-swap or oomd-disabled guest cannot prove manager-preservation failure paths it did not exercise. Do not recreate a manager-kill scenario or alter the host to obtain equivalence.
 
 Before releasing a compiler, prove actual outer placement/bounds, guest memory/CPU headroom, CPU/memory/PID delegation, a finite harmless container's live controls, two ordinary private-bridge containers communicating, an owned unrelated-service sentinel, an evidence export round trip and exact resource ownership/cleanup path. Recheck relevant ancestor controls so the container's own 8 GiB allowance is not silently narrower. No pressure reproducer or user-manager failure is needed.
 
@@ -189,9 +190,10 @@ Keep evidence sampling finite and focused on the guest workload. Hard outer cont
 
 Transfer the exact clean Task 1 archive; record commit/tree/archive and file manifest. Install pinned dependencies frozen in this isolated source. Attribute canonical image identity and actual Rust/Cargo version. Guest source is the required isolated acceptance input; no extra host checkout is created.
 
-Repeat the strict/impacted commands where their real route needs the guest. Run actual ordinary default and project/exported/inline/CLI override smokes, then runtime default and at least a discriminating native project override:
+Repeat the strict/impacted commands where their real route needs the guest. First finish a separate ordinary wrapper setup container that warms only fingerprinted Node dependencies. Verify subsequent measured entrypoints reuse them; a dependency reinstall invalidates that tiny smoke measurement and requires completing setup before a fresh measured container. This warmup does not compile Cargo. Run actual ordinary default and project/exported/inline/CLI override smokes, then runtime default and at least a discriminating native project override:
 
 ~~~bash
+env -u CARGO_BUILD_JOBS scripts/sandbox-test.sh ':'
 env -u CARGO_BUILD_JOBS scripts/sandbox-test.sh 'node scripts/testing/sandbox-budget-smoke.mjs 2'
 env -u CARGO_BUILD_JOBS scripts/sandbox-test.sh 'node scripts/testing/sandbox-budget-smoke.mjs 1 --project-jobs 1'
 env CARGO_BUILD_JOBS=1 scripts/sandbox-test.sh 'node scripts/testing/sandbox-budget-smoke.mjs 1'
@@ -211,6 +213,8 @@ Run the actual wrapper with exit 37 and literal exit 137; preserve their exact s
 Retain --rm and corroborate published full CID after ordinary auto-removal before wrapper control cleanup. Record actual guest Docker version; source-matched installed-host CLI evidence is not a substitute for its real route. Remove fixture projects after each run.
 
 - [ ] **Step 3: Run exact final-source cold supported-toolchain Clippy**
+
+Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it; never accept Clippy evidence for source older than the last correction.
 
 Use fresh exact-owned target, registry and Git caches. Prove the effective target empty before compiler release and rule out inherited target/compiler-cache redirection. Network/toolchain preparation may not precompile the graph. Record image ABI/UID/tools, source and actual supported toolchain.
 
@@ -244,13 +248,23 @@ Export commands/statuses, source/image/toolchain manifests, actual jobs, receipt
 
 Verify recorded containers/volumes are absent and unreferenced; QEMU/outer/sampler/sentinel processes ended; owned keys/disks/seed/temp inputs removed. Verify PID birth identity/cwd/argv before stopping an exact task process. Never broad-kill, delete another task's resource/shared cache, or treat inspection failure as absence. Keep the feature branch/worktree for review.
 
-Request the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding.
+Obtain this task's the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding. Any further source correction is committed and receives affected verification and final-source cold acceptance before task completion.
 
 - [ ] **Step 5: Complete the scoped handoff**
 
-Record actual commands, final commit, measured result or qualifying contained failure and limitations, independent verdicts, branch full-suite disposition and evidence paths in the run record. Unresolved required proof is FAILED/non-converged, never silent success. Launcher/Docker/Cargo integration and smokes provide relevant end-to-end coverage; browser tests add no evidence for this unchanged UI.
+Record actual commands, final commit, measured result or qualifying contained failure and limitations, task-review verdicts and evidence paths in the run record. The parent appends the final-HEAD full-suite disposition after both task reviews and before whole-branch review. Unresolved required proof is FAILED/non-converged, never silent success. Launcher/Docker/Cargo integration and smokes provide relevant end-to-end coverage; browser tests add no evidence for this unchanged UI.
 
 No PR or deployment is authorized. Prepare the clean committed result and ask for explicit landing authorization only at the parent workflow's final handoff.
+
+## Final committed-source gate
+
+After both planned tasks, their corrections and task reviews are complete, the parent runs the configured coordinated full-suite gate on the final committed HEAD from this feature worktree, before whole-branch review. Follow usual-executing-plans for periodic gates, adopting exact-HEAD results, recording failures and rerunning after committed fixes; Task 1's precommit checks and an older commit's full-suite result do not substitute for this gate. Wait for any foreign coordinator holder.
+
+~~~bash
+env GCLOUD_ROBOT_REQUIRE=1 CARGO_BUILD_JOBS=2 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='freshell mdmw sandbox build budget branch verification' pnpm run test
+~~~
+
+Expected: every configured phase, cloud local companion and local Electron lane completes and passes, excluding only ledger-recorded failures reproduced on the immutable base. Record exact HEAD, command and all phase results. The unidentified base exit 1 grants no exemption. Do not disable phases, change backend, assume baseline cause, or repair unrelated behavior; unresolved failures receive an explicit blocked/non-converged disposition. Any optional external-provider process-local environment sanitation must be corroborated/recorded; it is not a source repair or a baseline exemption. Any subsequent source fix requires committed affected verification and an exact-final-HEAD gate before whole-branch review.
 
 ## Requirement coverage and planning self-review
 
