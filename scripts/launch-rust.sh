@@ -111,6 +111,46 @@ if [[ "$STOP_ONLY" == 1 ]]; then
   exit $?
 fi
 
+trim_env_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+read_dotenv_value() {
+  local wanted="$1" line key value
+  [[ -f "$REPO_ROOT/.env" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim_env_value "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="$(trim_env_value "${line#export}")"
+    fi
+    [[ "$line" == *=* ]] || continue
+    key="$(trim_env_value "${line%%=*}")"
+    [[ "$key" == "$wanted" ]] || continue
+    value="$(trim_env_value "${line#*=}")"
+    if [[ "$value" == \"* || "$value" == \'* ]]; then
+      local quote="${value:0:1}"
+      value="${value:1}"
+      value="${value%%"$quote"*}"
+    else
+      value="${value%%#*}"
+      value="$(trim_env_value "$value")"
+    fi
+    printf '%s' "$value"
+    return 0
+  done < "$REPO_ROOT/.env"
+  return 1
+}
+
+if [[ "${FRESHELL_MANAGED_RUNTIME_V1+x}" == x ]]; then
+  MANAGED_RUNTIME_REQUESTED="$FRESHELL_MANAGED_RUNTIME_V1"
+else
+  MANAGED_RUNTIME_REQUESTED="$(read_dotenv_value FRESHELL_MANAGED_RUNTIME_V1 || true)"
+fi
+
 # --- build -------------------------------------------------------------------
 
 if [[ "$SKIP_BUILD" != 1 ]]; then
@@ -125,7 +165,7 @@ if [[ "$SKIP_BUILD" != 1 ]]; then
   fi
   echo "Building Rust server (cargo build --release -p freshell-server)..."
   cargo_args=(build --release -p freshell-server --locked)
-  if [[ "${FRESHELL_MANAGED_RUNTIME_V1:-}" == "1" ]]; then
+  if [[ "$MANAGED_RUNTIME_REQUESTED" == "1" ]]; then
     cargo_args+=(--features managed-runtime-v1)
   fi
   cargo "${cargo_args[@]}"
@@ -149,7 +189,7 @@ pnpm run --silent prepare:rust-runtime
 # A requested managed-runtime launch must use a binary that proves the feature
 # was compiled in. This read-only command runs before any existing instance can
 # be stopped or any replacement server can be started, including --skip-build.
-if [[ "${FRESHELL_MANAGED_RUNTIME_V1:-}" == "1" ]]; then
+if [[ "$MANAGED_RUNTIME_REQUESTED" == "1" ]]; then
   if ! "$BINARY" --build-info | node -e '
     let output = "";
     process.stdin.setEncoding("utf8");
