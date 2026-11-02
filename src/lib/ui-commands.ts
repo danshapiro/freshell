@@ -161,7 +161,7 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
   try {
     // Renders through an off-DOM clone: the user's selection, focus, and
     // screen never move, background tabs included.
-    const capture = await captureUiScreenshot({ scope, paneId, tabId })
+    const capture = await captureUiScreenshot({ scope, paneId, tabId }, requestId)
     runtime.send({
       type: 'ui.screenshot.result',
       requestId,
