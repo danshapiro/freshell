@@ -188,25 +188,28 @@ impl DeterministicFreshAgentTransport {
         .await
         .map_err(non_ambiguous)?;
         // The same completed turn is now saved under this native identity.
-        // The existing proxy binds previousSessionId to its presentation ID.
         let (wire_provider, session_type) = match self.provider {
             FreshProvider::Claude => ("claude", "freshclaude"),
             FreshProvider::Kilroy => ("claude", "kilroy"),
             FreshProvider::Codex => ("codex", "freshcodex"),
             FreshProvider::Opencode => ("opencode", "freshopencode"),
         };
-        self.event_tx
-            .send(AgentEvent::Provider {
-                payload: json!({
-                    "type":"freshAgent.session.materialized",
-                    "provider":wire_provider,
-                    "sessionType":session_type,
-                    "previousSessionId":native_session_id,
-                    "sessionId":native_session_id,
-                }),
-            })
-            .await
-            .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
+        if self.provider != FreshProvider::Codex {
+            // These fixtures materialize when a native turn is saved; Codex
+            // already returned its native thread on create.
+            self.event_tx
+                .send(AgentEvent::Provider {
+                    payload: json!({
+                        "type":"freshAgent.session.materialized",
+                        "provider":wire_provider,
+                        "sessionType":session_type,
+                        "previousSessionId":native_session_id,
+                        "sessionId":native_session_id,
+                    }),
+                })
+                .await
+                .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
+        }
         self.event_tx
             .send(AgentEvent::Provider {
                 payload: json!({
@@ -224,17 +227,33 @@ impl DeterministicFreshAgentTransport {
             })
             .await
             .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
+        let completion_event = if self.provider == FreshProvider::Codex {
+            json!({
+                "type":"freshAgent.event",
+                "provider":wire_provider,
+                "sessionType":session_type,
+                "sessionId":native_session_id,
+                "event":{
+                    "type":"freshAgent.turn.complete",
+                    "sessionId":native_session_id,
+                    "at":unix_millis(),
+                    "outcome":"completed"
+                }
+            })
+        } else {
+            json!({
+                "type":"freshAgent.turn.complete",
+                "provider":self.provider.as_str(),
+                "sessionId":native_session_id,
+                "turnId":turn_id,
+                "assistantMessageId":message_id,
+                "completionKind":"provider_native_completed",
+                "at":unix_millis()
+            })
+        };
         self.event_tx
             .send(AgentEvent::Provider {
-                payload: json!({
-                    "type":"freshAgent.turn.complete",
-                    "provider":self.provider.as_str(),
-                    "sessionId":native_session_id,
-                    "turnId":turn_id,
-                    "assistantMessageId":message_id,
-                    "completionKind":"provider_native_completed",
-                    "at":unix_millis()
-                }),
+                payload: completion_event,
             })
             .await
             .map_err(|_| non_ambiguous("deterministic event receiver closed"))
@@ -1104,6 +1123,8 @@ mod tests {
 
     fn initial_profile(provider: FreshProvider) -> FreshAgentProfile {
         FreshAgentProfile {
+            naming_handle: None,
+            collaboration_mode: None,
             runtime_variant: match provider {
                 FreshProvider::Claude | FreshProvider::Kilroy => "claude-sdk",
                 FreshProvider::Codex => "codex-app-server",
@@ -1483,6 +1504,152 @@ mod tests {
             format!("{HANG_AFTER_ACCEPT_CONTROL} suffix"),
             HANG_AFTER_ACCEPT_CONTROL
         );
+    }
+
+    #[tokio::test]
+    async fn codex_fixture_completion_emits_native_wire_shape_without_replacing_the_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = initial_profile(FreshProvider::Codex);
+        let transport = DeterministicFreshAgentTransport::open(
+            home.path().join("fixture"),
+            &profile,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .await
+        .unwrap();
+        let native = transport.state.lock().await.native_session_id.clone();
+        let mut events = transport.take_event_stream().unwrap();
+        let request = RequestId::parse("fixture-wire-shape").unwrap();
+
+        // Exercise the same completion path used by dispatch, without starting
+        // its owned provider child. Codex's fixture history writer is in-process.
+        transport.emit_completion(&request).await.unwrap();
+        let events: Vec<Value> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| match event {
+                AgentEvent::Provider { payload } => payload,
+                other => panic!("unexpected fixture event: {other:?}"),
+            })
+            .collect();
+        assert!(
+            events
+                .iter()
+                .all(|event| event["type"] != "freshAgent.session.materialized"),
+            "an ordinary completion must not replace the existing native thread"
+        );
+        let assistant = events
+            .iter()
+            .position(|event| event["event"]["type"] == "fixture.provider_native.assistant_message")
+            .expect("fixture assistant marker");
+        let completions: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event["type"] == "freshAgent.event"
+                    && event["event"]["type"] == "freshAgent.turn.complete"
+            })
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "one wrapped completion must follow the saved turn"
+        );
+        let (completed, completion) = completions[0];
+        assert!(assistant < completed);
+        assert_eq!(completion["provider"], "codex");
+        assert_eq!(completion["sessionType"], "freshcodex");
+        assert_eq!(completion["sessionId"], native);
+        assert_eq!(completion["event"]["sessionId"], native);
+        assert!(completion["event"]["at"].as_i64().is_some());
+        assert_eq!(completion["event"]["outcome"], "completed");
+        let saved =
+            freshell_freshagent::native_history::read("codex", home.path(), &native).unwrap();
+        assert_eq!(saved["threadId"], native);
+        assert!(saved["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|turn| turn["summary"] == "deterministic fixture completion"));
+        let turn = format!("turn-{}-1", short_hash(request.as_str()));
+        let message = format!("assistant-{}-1", short_hash(&turn));
+        assert_eq!(events[assistant]["event"]["turnId"], turn);
+        assert_eq!(events[assistant]["event"]["assistantMessageId"], message);
+        let history = fs::read_to_string(
+            home.path()
+                .join(".codex/sessions")
+                .join(format!("rollout-fixture-{native}.jsonl")),
+        )
+        .unwrap();
+        let records: Vec<Value> = history
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["type"] == "turn_context"
+                    && record["payload"]["turn_id"] == turn)
+        );
+        assert!(records
+            .iter()
+            .any(|record| record["type"] == "response_item" && record["payload"]["id"] == message));
+        assert_eq!(transport.state.lock().await.completion_count, 1);
+    }
+
+    #[tokio::test]
+    async fn claude_fixture_completions_keep_the_existing_materialization_and_completion() {
+        for (provider, session_type) in [
+            (FreshProvider::Claude, "freshclaude"),
+            (FreshProvider::Kilroy, "kilroy"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let profile = initial_profile(provider.clone());
+            let transport = DeterministicFreshAgentTransport::open(
+                home.path().join("fixture"),
+                &profile,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .await
+            .unwrap();
+            let native = transport.state.lock().await.native_session_id.clone();
+            let mut receiver = transport.take_event_stream().unwrap();
+            let request = RequestId::parse("fixture-claude-wire-shape").unwrap();
+            transport.emit_completion(&request).await.unwrap();
+            let events: Vec<Value> = std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(|event| match event {
+                    AgentEvent::Provider { payload } => payload,
+                    other => panic!("unexpected fixture event: {other:?}"),
+                })
+                .collect();
+
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0]["type"], "freshAgent.session.materialized");
+            assert_eq!(events[0]["provider"], "claude");
+            assert_eq!(events[0]["sessionType"], session_type);
+            assert_eq!(events[0]["previousSessionId"], native);
+            assert_eq!(events[0]["sessionId"], native);
+            assert_eq!(
+                events[1]["event"]["type"],
+                "fixture.provider_native.assistant_message"
+            );
+            assert_eq!(events[2]["type"], "freshAgent.turn.complete");
+            assert_eq!(events[2]["sessionId"], native);
+            assert_eq!(events[2]["completionKind"], "provider_native_completed");
+            assert_eq!(
+                events[1]["event"]["assistantMessageId"],
+                events[2]["assistantMessageId"]
+            );
+            let saved =
+                freshell_freshagent::native_history::read(provider.as_str(), home.path(), &native)
+                    .unwrap();
+            assert_eq!(saved["threadId"], native);
+            assert!(saved["turns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|turn| turn["summary"] == "deterministic fixture completion"));
+        }
     }
 
     #[tokio::test]
