@@ -8,8 +8,12 @@ use crate::backend::{
 use crate::registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry};
 use freshell_runtime_protocol::*;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::{
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 use tokio::net::UnixListener;
+use tokio::time::sleep;
 
 const SECRET: &str = "synthetic-control-secret";
 
@@ -2371,6 +2375,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         "write",
         "probe",
         "busy",
+        "busy-released",
         "stale-native",
         "stale-boot",
         "stale-incarnation",
@@ -2426,6 +2431,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
             "stale-intent" => source.intent_revision += 1,
             _ => {}
         }
+        let expected_source = source.clone();
         let epoch = fixture.supervisor.registry.control_epoch();
         let mut request = Envelope::new(
             RequestId::new(),
@@ -2451,12 +2457,24 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         );
         request.auth = Some(SECRET.into());
         let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
-        let _busy_guard = if scenario == "busy" {
-            Some(lifecycle.lock().await)
+        let mut busy_guard = if matches!(scenario, "busy" | "busy-released") {
+            Some(lifecycle.clone().lock_owned().await)
+        } else {
+            None
+        };
+        let release_busy = if scenario == "busy-released" {
+            let guard = busy_guard.take().unwrap();
+            Some(tokio::spawn(async move {
+                sleep(Duration::from_millis(25)).await;
+                drop(guard);
+            }))
         } else {
             None
         };
         let reply = fixture.supervisor.dispatch(request).await;
+        if let Some(release_busy) = release_busy {
+            release_busy.await.unwrap();
+        }
         host.abort();
         let _ = host.await;
         if scenario == "stale-epoch" {
@@ -2479,6 +2497,10 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                     reply,
                     FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
                 ),
+                "busy-released" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Title(Some("Native title".into()))
+                ),
                 "boot-changes" => assert_eq!(
                     reply,
                     FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
@@ -2493,8 +2515,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         }
         {
             let calls = received.lock().unwrap();
-            if scenario.starts_with("stale-") || scenario == "wrong-provider" || scenario == "busy"
-            {
+            if scenario.starts_with("stale-") || scenario == "wrong-provider" || scenario == "busy" {
                 assert!(
                     calls.is_empty(),
                     "{scenario}: no host/native work for stale authority"
@@ -2545,6 +2566,30 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                 refusal_events.is_empty(),
                 "{scenario}: successful or pre-route requests do not record a refusal"
             );
+        }
+        if scenario == "busy" {
+            let refusal = &refusal_events[0]["data"];
+            assert_eq!(
+                refusal["requestedSource"]["incarnationId"],
+                expected_source.incarnation_id.to_string()
+            );
+            assert_eq!(
+                refusal["requestedSource"]["hostBootId"],
+                expected_source.host_boot_id.to_string()
+            );
+            assert_eq!(
+                refusal["requestedSource"]["executionGeneration"],
+                expected_source.execution_generation
+            );
+            assert_eq!(
+                refusal["requestedSource"]["intentRevision"],
+                expected_source.intent_revision
+            );
+            assert_eq!(
+                refusal["requestedSource"]["nativeSessionId"],
+                expected_source.native_session_id
+            );
+            assert!(refusal["lifecycleLockWaitMs"].as_u64().unwrap() > 0);
         }
         assert_eq!(
             fixture

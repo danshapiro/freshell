@@ -111,6 +111,10 @@ pub struct SupervisorConfig {
     pub admission: AdmissionPolicy,
 }
 
+/// Native-name metadata work may wait briefly for a normal lifecycle probe,
+/// but it must not queue behind long lifecycle operations before dispatch.
+const NATIVE_NAME_LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 pub(crate) struct LaunchWorkload {
     pub(crate) soul_id: SoulId,
@@ -3764,27 +3768,60 @@ impl Supervisor {
                 })
             };
             let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
-            // Metadata discovery must not queue behind lifecycle work and then
-            // dispatch after the name worker's existing request budget expired.
-            let Ok(_guard) = lifecycle_lock.try_lock() else {
-                append_event(
-                    &self.config.lifecycle_log,
-                    "freshagent.native_name_refused",
-                    serde_json::json!({
-                        "severity":"info",
-                        "reason":"lifecycle_busy",
-                        "soulId":request.soul_id,
-                        "nativeSessionId":request.source.native_session_id,
-                        "operation":match &request.operation {
-                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Probe => "probe",
-                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Read => "read",
-                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Write { .. } => "write",
-                        },
-                    }),
-                );
-                return Ok(FreshAgentNativeNameReply::Failed(
-                    FreshAgentNativeNameError::LifecycleBusy,
-                ));
+            // Brief contention from a normal recovery probe should not consume a
+            // native-name retry cycle. Still honor the request deadline and cap
+            // the wait so metadata discovery cannot queue behind long lifecycle
+            // work and dispatch after its budget expires.
+            let _guard = match lifecycle_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let started_waiting = Instant::now();
+                    let wait_deadline =
+                        (started_waiting + NATIVE_NAME_LIFECYCLE_LOCK_WAIT).min(deadline);
+                    match tokio::time::timeout_at(wait_deadline, lifecycle_lock.lock()).await {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            let lifecycle_lock_wait_ms = started_waiting
+                                .elapsed()
+                                .as_millis()
+                                .min(u128::from(u64::MAX))
+                                as u64;
+                            append_event(
+                                &self.config.lifecycle_log,
+                                "freshagent.native_name_refused",
+                                serde_json::json!({
+                                    "severity":"info",
+                                    "reason":"lifecycle_busy",
+                                    "soulId":request.soul_id,
+                                    "nativeSessionId":request.source.native_session_id,
+                                    "requestedSource":{
+                                        "incarnationId":request.source.incarnation_id.to_string(),
+                                        "hostBootId":request.source.host_boot_id.to_string(),
+                                        "executionGeneration":request.source.execution_generation,
+                                        "intentRevision":request.source.intent_revision,
+                                        "nativeSessionId":request.source.native_session_id,
+                                    },
+                                    "lifecycleLockWaitMs":lifecycle_lock_wait_ms,
+                                    "operation":match &request.operation {
+                                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Probe => "probe",
+                                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Read => "read",
+                                        freshell_runtime_protocol::FreshAgentNativeNameOperation::Write { .. } => "write",
+                                    },
+                                }),
+                            );
+                            if Instant::now() >= deadline {
+                                return Ok(FreshAgentNativeNameReply::Failed(
+                                    FreshAgentNativeNameError::Timeout {
+                                        timeout_ms: BUDGET_MS,
+                                    },
+                                ));
+                            }
+                            return Ok(FreshAgentNativeNameReply::Failed(
+                                FreshAgentNativeNameError::LifecycleBusy,
+                            ));
+                        }
+                    }
+                }
             };
             self.registry
                 .assert_epoch(request.expected_control_epoch)
