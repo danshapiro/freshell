@@ -150,6 +150,7 @@ import { randomBytes } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { nativeProfileDigest, nativeResourceDigest } from './native-profile-digest.mjs'
 import { createNativeSessionChannel, inspectNativeForkSource, nativeInputDigest } from './native-session-channel.mjs'
+import { ordinaryPermissionAllowedDuringNativeInspection } from './native-checkpoint-release.mjs'
 import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
 import { spawnObservedNative } from './native-process.mjs'
 import { configureSession, userMessageContent } from './session-settings.mjs'
@@ -474,7 +475,9 @@ function exitWithoutSession(sdkQuery, code) {
 }
 
 async function waitForNativeCheckpointRelease(state, input, generation, hookSignal) {
-  if (state.nativePendingOperation) return false
+  if (state.nativePendingOperation) {
+    return await ordinaryPermissionAllowedDuringNativeInspection(state, generation, hookSignal) ? null : false
+  }
   let release
   const released = new Promise((resolve) => { release = resolve })
   const pending = { generation, toolUseID: input.tool_use_id,
