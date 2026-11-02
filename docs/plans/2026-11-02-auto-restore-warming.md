@@ -27,6 +27,7 @@ After a Freshell server restart or browser reconnect, panes that were parked wai
 - Destructive restart/process-kill testing happens only inside the disposable sandbox; slower but safe.
 - Out-of-scope residuals (separate work): OOM investigation/mitigation, resource limits/process isolation, in-flight agent turn recovery/replay (kata freshell#7fen).
 - Cloud test backends stay unset (local backend) unless the user directs otherwise.
+- User direction (2026-11-02, mid-run): the recorded baseline failures — the seven enumerated environment-class test files at base_ref 520626c46 (missing external Codex artifact, runtime-build manifest collisions, the Windows-labeled harness test, Docker/hosted parity flakes; see the run's baseline ledger) — are pre-approved to continue past and waived by the user. The run's full-suite gate passes when green excluding those waived failures; failures introduced by this change itself remain fix-and-required.
 
 **Goal:** Parked panes waiting for the session index restore themselves automatically when the index finishes its first sweep — no click, no reload, no tab visit — while genuine unreadable-store failures surface honest per-pane errors instead of a lying "waiting" banner.
 
