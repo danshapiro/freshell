@@ -1160,6 +1160,35 @@ test.describe('Google CLI identity + activity + attention + naming (Rust)', () =
           'association #3 (the /resume: rebind to the existing conversation)',
         )
         expect(associated3.previousSessionId, 'the resume rebind names the superseded identity').toBe(convTwo)
+
+        // The resumed conversation's records CONTINUE the steps — the
+        // real binary's evidenced cross-process continuation (Task 1's
+        // receipts: USER_INPUT steps 0→2→5 across three separate resumed
+        // processes, no per-process reset). The pane's turn lands with
+        // step_index values strictly past every record already on disk,
+        // so in-file step_index uniqueness holds (a per-process counter
+        // reset would append a DUPLICATE of the planted step 0 instead).
+        const resumedTranscriptPath = path.join(
+          brainRootOf(info), convExisting, '.system_generated', 'logs', 'transcript.jsonl',
+        )
+        const readResumedStepIndexes = async (): Promise<number[]> => {
+          const raw = await fs.readFile(resumedTranscriptPath, 'utf8').catch(() => '')
+          const steps: number[] = []
+          for (const line of raw.split('\n')) {
+            if (!line.trim()) continue
+            try {
+              const record = JSON.parse(line) as { step_index?: unknown }
+              if (typeof record.step_index === 'number') steps.push(record.step_index)
+            } catch {
+              // malformed tail — skip
+            }
+          }
+          return steps
+        }
+        await expect.poll(async () => readResumedStepIndexes(), {
+          timeout: 15_000,
+          message: 'the resumed conversation continues the planted step 0 (steps 0,1,2,3 — never a per-process reset)',
+        }).toEqual([0, 1, 2, 3])
       } finally {
         capture.close()
         await server.stop().catch(() => {})

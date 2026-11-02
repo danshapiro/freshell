@@ -802,6 +802,35 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         await submitLine(page, paneIdBound, 'second turn after restart')
         await pollLeafBuffer(harness, tabId!, paneIdBound, `agy: remembered: ${nonce}`, 30_000)
 
+        // STEP continuation across the restart — the real binary's
+        // evidenced cross-process continuation (Task 1's receipts:
+        // USER_INPUT steps 0→2→5 across three separate resumed
+        // processes, no per-process reset): the second turn's records
+        // land with step_index values strictly past every record the
+        // first process wrote, so in-file step_index uniqueness holds
+        // (a per-process counter reset would duplicate 0,1,2 instead).
+        const boundTranscriptPath = path.join(
+          brainRootOf(info), boundId, '.system_generated', 'logs', 'transcript.jsonl',
+        )
+        const readBoundStepIndexes = async (): Promise<number[]> => {
+          const raw = await fs.readFile(boundTranscriptPath, 'utf8').catch(() => '')
+          const steps: number[] = []
+          for (const line of raw.split('\n')) {
+            if (!line.trim()) continue
+            try {
+              const record = JSON.parse(line) as { step_index?: unknown }
+              if (typeof record.step_index === 'number') steps.push(record.step_index)
+            } catch {
+              // malformed tail — skip
+            }
+          }
+          return steps
+        }
+        await expect.poll(async () => readBoundStepIndexes(), {
+          timeout: 15_000,
+          message: 'the restarted process continues the conversation\'s steps (0,1,2 then 3,4,5 — never a per-process reset)',
+        }).toEqual([0, 1, 2, 3, 4, 5])
+
         // ── Scenario 7: the zero-turn pane restores FRESH ─────────────────
         // No sessionRef, no resume argv — its restore create carries no
         // identity, so the CLI launches fresh (`agy> `) and NO conversation

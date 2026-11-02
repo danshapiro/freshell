@@ -122,6 +122,20 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
         .join("transcript.jsonl")
 }
 
+/// Every `step_index` in a transcript, in file order (the fake's records
+/// are single-line JSON; records without a step_index — the ownership
+/// anchor — are skipped). Absent transcript ⇒ empty. The resume-path
+/// step-continuation pins assert on this: a resumed conversation's
+/// records CONTINUE past every step already on disk — the real binary's
+/// evidenced cross-process continuation — with in-file uniqueness.
+fn transcript_step_indexes(path: &std::path::Path) -> Vec<i64> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value.get("step_index").and_then(serde_json::Value::as_i64))
+        .collect()
+}
+
 /// Write one fake `agy`: a contract-faithful `#!/bin/sh` reader that
 /// models the transcript behavior the locator consumes.
 ///
@@ -144,9 +158,14 @@ fn transcript_path(home: &std::path::Path, conv: &str) -> std::path::PathBuf {
 ///   vocabulary: `source`/`status`/`step_index` + a `created_at`
 ///   ms-precision ISO stamp — the shared coercion's documented shape)
 ///   carrying the line text in `content`. A per-conversation STEP
-///   counter (reset at each conversation mint, incremented per appended
-///   record) gives every record a unique step_index — the real binary's
-///   per-record identity the tracker's dedupe keys on.
+///   counter gives every record a unique step_index — the real binary's
+///   per-record identity the tracker's dedupe keys on: a MINT resets it
+///   (a fresh conversation starts at step 0) while a RESUME (the
+///   `--conversation` argv pair and the `/resume <id>` verb) seeds it
+///   from the transcript's max existing step_index, modeling the
+///   evidenced cross-process continuation (real-binary receipts:
+///   USER_INPUT steps 0→2→5 across three separate processes — no
+///   per-process reset).
 /// - `/switch:<id>` (the documented new-conversation switch) mints a NEW
 ///   conversation: initializes its ownership record and makes it active —
 ///   the NEXT stdin line lands as that conversation's first user record.
@@ -195,13 +214,30 @@ fn write_fake_agy() -> std::path::PathBuf {
 AGY_BRAIN="$AGY_HOME/brain"
 CONV="conv-$FRESHELL_TERMINAL_ID"
 AGY_CWD="$(pwd)"
-# Per-conversation record counter: the real binary's step_index identity
-# (unique per record, reset per conversation mint — synthetic precision
-# for the recency tests; the real binary writes second-granularity
-# created_at stamps, which the shared coercion also accepts).
+# Per-conversation record counter modeling the real binary's step_index
+# identity: unique per record, strictly increasing across turns AND across
+# processes (binary evidence: USER_INPUT steps 0→2→5 across three separate
+# resumed processes — no per-process reset). A MINT resets it (fresh
+# conversation; first record step 0) and a RESUME seeds it from the
+# transcript's max existing step_index via seed_step — the evidenced
+# cross-process continuation. Synthetic ms-precision created_at stamps for
+# the recency tests; the real binary writes second-granularity stamps,
+# which the shared coercion also accepts.
 STEP=-1
 now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 next_step() { STEP=$((STEP + 1)); }
+# Seed the step counter from the transcript's max existing step_index —
+# the evidenced cross-process continuation (see the STEP comment above):
+# a resumed process CONTINUES the conversation's steps; only a mint
+# (mint_conversation resets STEP) starts fresh. The pipeline takes the
+# numeric max across every step-bearing record line.
+seed_step() {
+  STEP=-1
+  if [ -f "$TRANSCRIPT" ]; then
+    m=$(grep -o '"step_index":[0-9]*' "$TRANSCRIPT" | grep -o '[0-9][0-9]*' | sort -n | tail -1)
+    if [ -n "$m" ]; then STEP=$m; fi
+  fi
+}
 if [ -n "$AGY_ARGV_CAPTURE" ]; then
   printf '%s\n' "$*" >> "$AGY_ARGV_CAPTURE"
 fi
@@ -275,6 +311,10 @@ if [ ! -f "$TRANSCRIPT" ]; then
   fi
   mint_conversation
 else
+  # A resumed process CONTINUES the conversation's steps (binary
+  # evidence: USER_INPUT steps 0→2→5 across three separate resumed
+  # processes) — seed the counter from the records already on disk.
+  seed_step
   printf 'agy-resumed:%s\n' "$CONV"
 fi
 while IFS= read -r line; do
@@ -287,6 +327,9 @@ while IFS= read -r line; do
     "/resume "*)
       CONV="${line#/resume }"
       TRANSCRIPT="$(transcript_of)"
+      # The in-CLI resume CONTINUES the conversation's steps too (the
+      # same evidenced cross-process continuation as the argv arm).
+      seed_step
       ;;
     "settle:"*)
       # The user record's text is the FULL input line (the locator
@@ -984,6 +1027,21 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     );
     // The rebind's transcript path really is the resumed conversation's.
     let _ = rebound_log;
+
+    // The resumed conversation's records CONTINUE the conversation's
+    // steps — the real binary's evidenced cross-process continuation
+    // (Task 1's receipts: USER_INPUT steps 0→2→5 across three separate
+    // resumed processes, no per-process reset). The pane's prompt lands
+    // with a step_index strictly past every record already on disk, so
+    // in-file step_index uniqueness holds (a per-process counter reset
+    // would append a DUPLICATE of the planted step 0 instead).
+    let steps_3c = transcript_step_indexes(&transcript_path(home.path(), resume_conv));
+    assert_eq!(
+        steps_3c,
+        vec![0, 1],
+        "the resumed conversation continues the planted step 0 with step 1 — \
+         never a per-process reset"
+    );
 
     // ── Scenario 4: restart resume adjacency ────────────────────────────
     // Kill the pane, then "restart the server" the way a restart actually

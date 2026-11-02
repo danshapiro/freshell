@@ -294,15 +294,46 @@ function loadRememberedNonces(conversationId) {
   return nonces
 }
 
+// ── step-counter seeding (the cross-process continuation) ────────────────────
+// The real binary CONTINUES a conversation's step_index across processes
+// (binary evidence: USER_INPUT steps 0→2→5 across three separate resumed
+// processes — no per-process reset), so a resumed conversation's new
+// records must continue past every record already on disk.
+
+function maxStepIndex(conversationId) {
+  let raw
+  try {
+    raw = fs.readFileSync(transcriptPath(conversationId), 'utf8')
+  } catch {
+    return -1
+  }
+  let max = -1
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) continue
+    let obj
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      continue // malformed tail — skip
+    }
+    if (typeof obj?.step_index === 'number' && obj.step_index > max) max = obj.step_index
+  }
+  return max
+}
+
 // ── interactive conversation state ───────────────────────────────────────────
 
 const state = {
   conversationId: null,
   remembered: [],
-  // Per-conversation record counter: the real binary's step_index identity
-  // (unique per record, strictly increasing across turns — binary evidence;
-  // reset per conversation mint). The tracker's settle dedupe keys on
-  // (created_at, step_index).
+  // Per-conversation record counter modeling the real binary's step_index
+  // identity: unique per record, strictly increasing across turns AND
+  // across processes (binary evidence: USER_INPUT steps 0→2→5 across
+  // three separate resumed processes — no per-process reset). Every
+  // activation seeds it from the transcript's max existing step_index,
+  // so a RESUME continues the steps and a MINT (whose fresh transcript
+  // carries no step records yet) starts fresh. The tracker's settle
+  // dedupe keys on (created_at, step_index).
   step: -1,
 }
 
@@ -314,17 +345,22 @@ function nextStepIndex() {
 function activateConversation(conversationId) {
   state.conversationId = conversationId
   state.remembered = loadRememberedNonces(conversationId)
+  // Seed the step counter from the transcript — the evidenced
+  // cross-process continuation. A mint's just-written transcript
+  // carries no step records yet, so a mint still starts at step 0.
+  state.step = maxStepIndex(conversationId)
   updateLastConversationsCache(conversationId)
 }
 
 // The mint (b): fresh transcript (ownership record as the FIRST line) + the
-// cache sidecar. Silent — the caller owns the stdout marker.
+// cache sidecar. Silent — the caller owns the stdout marker. The step
+// counter re-seeds inside activateConversation from the fresh, step-less
+// transcript — a mint starts at step 0.
 function mintConversation() {
   const conversationId = crypto.randomUUID()
   const file = transcriptPath(conversationId)
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, `${JSON.stringify(sessionStartRecord(conversationId))}\n`)
-  state.step = -1
   activateConversation(conversationId)
   return conversationId
 }

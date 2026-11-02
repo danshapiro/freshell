@@ -923,8 +923,10 @@ impl AntigravityActivityTracker {
         effects
     }
 
-    /// Consume one classified transcript record (the Stage-1 candidate
-    /// contract — see the module doc for the full classification table).
+    /// Consume one classified transcript record (the real-binary record
+    /// contract, corrected 2026-11-02 against real agy 1.2.11 + 1.4.12
+    /// transcripts — see the module doc for the full classification
+    /// table).
     pub fn note_record(
         &mut self,
         terminal_id: &str,
