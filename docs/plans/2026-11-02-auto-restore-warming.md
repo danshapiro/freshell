@@ -343,6 +343,23 @@ Ok(json) => {
 // include session_index_ready: session_index_ready_v1.then(|| {
 //     state.session_index_ready.as_ref().map(|rx| *rx.borrow()).unwrap_or(false)
 // }),
+//
+// Deferral transition log (round-3 finding 6 — production-visible recovery
+// transitions live SERVER-SIDE, where the default RUST_LOG records INFO):
+// in handle_pane_reconcile, when the warming deferral fires (and again only
+// if the post-deferral re-derivation STILL answers warming), emit
+//     tracing::info!(
+//         event = "pane_reconcile.index_warming",
+//         connection_id = conn_id,
+//         reconcile_id = %request.reconcile_id,
+//         pane_count = warming_count,
+//         budget_ms = state.reconcile_deferral_budget_ms,
+//         "pane reconcile deferred: session index warming"
+//     );
+// — once per request by construction (never per poll). Extend the
+// freshell-ws warming tests to assert the event fires exactly once per
+// deferred request (thread-local tracing capture convention:
+// crates/freshell-ws/tests/safe08_restore_diagnostics.rs:29-80).
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -620,6 +637,30 @@ fn fresh_agent_unreadable_presence_yields_the_honest_error_never_a_respawn() {
     // error. Unknown keeps today's respawn-with-cap doctrine untouched.
 }
 
+#[test]
+fn fresh_agent_cold_unknown_parks_as_warming_and_burns_no_respawn_counter() {
+    // Round-3 finding 2: probe Unknown + NO ledger ever_bound evidence ⇒
+    // error{index_warming} (park until readiness), respawn counter
+    // UNTOUCHED across repeated cold reconciles (assert the counter after
+    // N cold requests == 0). Unknown WITH ledger ever_bound evidence keeps
+    // OnDisk ⇒ respawn (positive disk truth).
+}
+
+#[test]
+fn fresh_agent_provider_unavailable_yields_the_honest_error_never_a_respawn() {
+    // Round-3 finding 2: a fresh-agent pane for a provider whose home is
+    // missing derives error{provider_unavailable} — never a respawn (the
+    // July §3 doctrine, previously fail-open respawn-with-cap).
+}
+
+#[test]
+fn warm_index_with_a_missing_provider_root_answers_provider_unavailable_never_absent() {
+    // Round-3 finding 5: the root-presence check hoisted to the top of
+    // exists() holds on the WARM path — a published snapshot with no rows
+    // for a provider whose root is gone answers ProviderUnavailable, never
+    // the Absent that would fold dead_session/fresh.
+}
+
 // update the existing pin `unreadable_opencode_db_answers_unknown_never_absent`
 // (existence.rs :1351 area): it becomes
 // `unreadable_opencode_db_answers_unreadable_never_absent` — the WARM-path
@@ -721,12 +762,32 @@ SessionExistence::Unreadable => PaneVerdict {
 // answer — a fallback hit/miss stays authoritative even when the scan
 // failed.)
 
-// crates/freshell-ws/src/reconcile_freshagent.rs (round-1 finding 4):
-// FreshAgentPresence gains a StoreUnreadable variant; the exhaustive
-// SessionExistence match maps Unreadable => StoreUnreadable; the fresh-agent
-// verdict ladder emits error{reason: "session_store_unreadable"} for it —
-// never respawn (no counter burn), identity retained. Unknown keeps its
+// crates/freshell-ws/src/reconcile_freshagent.rs (round-1 finding 4 +
+// round-3 finding 2): FreshAgentPresence gains a StoreUnreadable variant;
+// the exhaustive SessionExistence match maps Unreadable => StoreUnreadable;
+// the fresh-agent verdict ladder emits error{reason: "session_store_unreadable"}
+// for it — never respawn (no counter burn), identity retained. Unknown keeps its
 // respawn-with-cap doctrine unchanged (the B1 comment :116-118 pattern).
+// AND (round-3 finding 2 — the deeper doctrine change, enabled by readiness
+// recovery): `E::Unknown` with NO ledger evidence no longer maps to a
+// respawn-driving presence — it parks as error{index_warming} like the
+// terminal lane, so cold-index fresh-agent reconciles burn ZERO respawn
+// counter (three reconnects during a slow scan must not manufacture a false
+// dead_session{respawn_exhausted} for a session the index never
+// adjudicated; pre-change, presence Unknown ⇒ respawn ⇒ per-request cap
+// burn, reconcile_freshagent.rs:240-246, :273, :365). `E::Unknown` WITH
+// ledger `ever_bound` evidence keeps OnDisk (positive disk-truth — respawn
+// is honest there). `E::ProviderUnavailable` maps to the honest
+// error{provider_unavailable} for fresh-agent panes (July §3 doctrine: a
+// missing provider home is never warming, and respawn-for-an-uninstalled-
+// provider was the same fail-open workaround Unknown had).
+// Hoist (round-3 finding 5): the provider-root presence check
+// (existence.rs cold arm :269-275 — "provider root registered AND missing
+// on this machine ⇒ ProviderUnavailable") moves to the TOP of exists(),
+// before the peek() branch, so it holds for the WARM path too — a published
+// empty snapshot for a provider whose root is gone must answer
+// ProviderUnavailable, never Absent (a warm miss today would fold
+// dead_session/fresh for an uninstalled provider's recoverable identity).
 
 // every exhaustive `match` on SessionExistence across the workspace gains the
 // new arm — grep `SessionExistence::` and handle each (probe impls, gates,
@@ -755,7 +816,7 @@ Expected: PASS — including the untouched warming/deferral pins and `row5_unkno
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-ws/src crates/freshell-server/src crates/freshell-protocol/tests
+git add crates/freshell-ws/src crates/freshell-server/src crates/freshell-sessions/src/directory_index.rs crates/freshell-protocol/tests crates/freshell-ws/tests
 git commit -m "feat(existence): distinguish unreadable stores from warming post-readiness; resolve cold opencode/antigravity identities by id"
 ```
 
@@ -919,7 +980,7 @@ Expected: PASS (existing behavior unchanged: `error{index_warming}` still folds 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add shared/ws-protocol.ts shared/session-contract.ts shared/fresh-agent.ts src/lib/ready-message-schema.ts src/lib/pane-reconcile.ts src/store/connectionSlice.ts src/lib/ws-client.ts src/components/fresh-agent/FreshAgentView.tsx src/App.tsx crates/freshell-ws/src/tabs_store_model.rs crates/freshell-ws/src/tabs_persist_validation.rs crates/freshell-freshagent/src/layout_store_content.rs
+git add shared/ws-protocol.ts shared/session-contract.ts shared/fresh-agent.ts src/lib/ready-message-schema.ts src/lib/pane-reconcile.ts src/store/connectionSlice.ts src/lib/ws-client.ts src/components/fresh-agent/FreshAgentView.tsx src/App.tsx crates/freshell-ws/src/tabs_store_model.rs crates/freshell-ws/src/tabs_persist_validation.rs crates/freshell-freshagent/src/layout_store_content.rs test/unit/shared/ws-protocol.reconcile.test.ts test/unit/client/lib/pane-reconcile.test.ts test/unit/client/lib/pane-reconcile.fresh-agent.test.ts test/unit/client/components/App.reconcile-adoption.test.tsx
 git commit -m "feat(client): parse session-index readiness wire state; fold unreadable-store verdicts into honest restore errors"
 ```
 
@@ -1054,7 +1115,7 @@ export function ReconcileWarmingRecoveryDriver(): null {
       // the cause — never wait out the watchdog (round-1 finding 5).
       if (msg.type === 'error' && (msg as { requestId?: unknown }).requestId === request.reconcileId) {
         onDriveFinished()
-        log.warn(`[reconcile-warming-recovery] drive refused (reconcileId=${request.reconcileId}, cause=${String((msg as { code?: unknown }).code)}) after ${Date.now() - startedAt}ms`)
+        log.warn(`[reconcile-warming-recovery] drive refused (reconcileId=${request.reconcileId}, paneCount=${request.panes.length}, paneKeys=${paneKeyList(request.panes)}, sessions=${sessionRefList(request)}, cause=${String((msg as { code?: unknown }).code)}) after ${Date.now() - startedAt}ms`)
         return
       }
       if (msg.type !== 'pane.reconcile.result') return
@@ -1074,11 +1135,11 @@ export function ReconcileWarmingRecoveryDriver(): null {
         log.debug(`[reconcile-warming-recovery] still warming after drive — bounded backoff ${RECOVERY_RETRY_BACKOFF_MS}ms (attempt ${attemptsRef.current}/${RECOVERY_RETRY_LIMIT}, paneKeys=${request.panes.map((p) => p.paneKey).join(',')})`)
         window.setTimeout(onDriveFinished, RECOVERY_RETRY_BACKOFF_MS)
       } else {
-        log.warn(`[reconcile-warming-recovery] gave up after ${attemptsRef.current} drives over ${Date.now() - startedAt}ms (cause=still-warming, reconcileId=${request.reconcileId}, paneKeys=${request.panes.map((p) => p.paneKey).join(',')}) — banner and manual Retry remain`)
+        log.warn(`[reconcile-warming-recovery] gave up after ${attemptsRef.current} drives over ${Date.now() - startedAt}ms (cause=still-warming, reconcileId=${request.reconcileId}, paneCount=${request.panes.length}, paneKeys=${paneKeyList(request.panes)}, sessions=${sessionRefList(request)}) — banner and manual Retry remain`)
       }
     })
     const watchdog = window.setTimeout(() => {
-      log.warn(`[reconcile-warming-recovery] result wait expired — dropping drive (reconcileId=${request.reconcileId}, cause=result-lost, elapsed=${Date.now() - startedAt}ms)`)
+      log.warn(`[reconcile-warming-recovery] result wait expired — dropping drive (reconcileId=${request.reconcileId}, paneCount=${request.panes.length}, paneKeys=${paneKeyList(request.panes)}, cause=result-lost, elapsed=${Date.now() - startedAt}ms)`)
       onDriveFinished()
     }, RECOVERY_RESULT_WAIT_MS)
     pendingRef.current = { request, unsubscribe, watchdog, startedAt }
@@ -1092,7 +1153,7 @@ export function ReconcileWarmingRecoveryDriver(): null {
 }
 ```
 
-(Notes for the implementer: `paneExistsInLayouts`/`paneKeyList` are thin local helpers — a leaf-walk over `store.getState().panes.layouts` (or a tiny exported selector in pane-reconcile.ts where `forEachReconcilablePane` already walks layouts); `reconcilableRefsTick` is a lightweight derived signal that changes identity when any warming paneKey appears in / disappears from the layouts (derive it in the component from `useAppSelector` over `panes.layouts` — e.g. a joined string of the surviving warming paneKeys — so the effect re-runs on closure/rebinding without deep layout comparison). The backoff/watchdog/error re-arm all funnel through `onDriveFinished`'s recovery-tick bump; keep the retry path event-driven, no interval. The identity guards (Files: pane-reconcile.ts + panesSlice.ts) land FIRST in this task's RED→GREEN sequence, with their own focused tests, before the driver component tests.)
+(Notes for the implementer: `paneExistsInLayouts`/`paneKeyList`/`sessionRefList` are thin local helpers — a leaf-walk over `store.getState().panes.layouts` (or a tiny exported selector in pane-reconcile.ts where `forEachReconcilePane` already walks layouts), a paneKey joiner, and a `provider:sessionId` joiner over the request panes' `sessionRef` claims (round-3 finding 6: the failure logs carry pane count, paneKeys, AND session identities); `reconcilableRefsTick` is a lightweight derived signal that changes identity when a warming pane's PRESENCE or IDENTITY changes — derive it as the joined string of `${paneKey}:${currentContentCreateRequestId}` for each warming ref (round-3 finding 3: keying on paneKey ALONE stays unchanged when a parked pane is rebound via replacePane — the same paneId with NEW content — so the effect would never re-run its identity check; including the CURRENT content's createRequestId makes any rebind change the derived value and re-run the filter, canceling the old pane's pending recovery immediately). The backoff/watchdog/error re-arm all funnel through `onDriveFinished`'s recovery-tick bump; keep the retry path event-driven, no interval. The identity guards (Files: pane-reconcile.ts + panesSlice.ts) land FIRST in this task's RED→GREEN sequence, with their own focused tests, before the driver component tests.)
 
 Mount in `src/App.tsx` beside the banner (:2604):
 
@@ -1124,7 +1185,7 @@ Expected: PASS. Also `pnpm run lint` (a11y/plugin rules — the driver renders n
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/ReconcileWarmingRecoveryDriver.tsx src/App.tsx src/components/ReconcileWarmingBanner.tsx src/lib/pane-reconcile.ts src/store/panesSlice.ts test/unit/client/components/ReconcileWarmingRecoveryDriver.test.tsx test/unit/client/lib/pane-reconcile.test.ts test/unit/client/store/panesSlice.reconcile.test.ts
+git add src/components/ReconcileWarmingRecoveryDriver.tsx src/App.tsx src/components/ReconcileWarmingBanner.tsx src/lib/pane-reconcile.ts src/store/panesSlice.ts src/store/paneTypes.ts test/unit/client/components/ReconcileWarmingRecoveryDriver.test.tsx test/unit/client/lib/pane-reconcile.test.ts test/unit/client/store/panesSlice.reconcile.test.ts
 git commit -m "feat(client): auto-restore parked panes on session-index readiness with identity-guarded bounded retries"
 ```
 
@@ -1237,7 +1298,7 @@ The RED is a deterministic scratch-toggle against the implemented feature: tempo
 
 Run: `pnpm run test:e2e:chromium test/e2e-browser/specs/reconcile-auto-restore-warming-rust.spec.ts`
 
-Expected: FAIL deterministically in tests 1 and 4 — with the driver unmounted, no click ever happens, so the banner never clears and the parked codex pane never restores (the banner-visibility and restoration assertions time out). Tests 2 and 3 fail on their post-hold assertions the same way. Record the observed failure output in the task report, then RESTORE the mount line (the scratch edit must leave the tree clean; `git diff` empty before continuing).
+Expected: FAIL deterministically in tests 1 and 4 — with the driver unmounted, no click ever happens, so the banner never clears and the parked codex pane never restores (the banner-visibility and restoration assertions time out). Tests 2 and 3 fail on their post-hold assertions the same way. Record the observed failure output in the task report, then revert the SCRATCH edit only (`git checkout -- src/App.tsx` — the intended tracked changes from Step 1, the new spec and the adoption-spec conversion, REMAIN in the tree and are part of this task's Step 7 commit; only the driver-mount toggle is temporary).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
