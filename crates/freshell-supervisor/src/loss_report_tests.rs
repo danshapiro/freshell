@@ -3113,7 +3113,8 @@ fn test_repair_scope(
 #[tokio::test]
 async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() {
     use freshell_runtime_protocol::{
-        LostSoulRepairTarget, RequestId, RestoreLostSoulsRequest, RuntimeErrorCode,
+        AdminCommand, ControlRole, Envelope, LostSoulRepairTarget, RequestId,
+        RestoreLostSoulsRequest, RuntimeErrorCode,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -3140,21 +3141,32 @@ async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() 
     let scope = test_repair_scope(&registry, &targets);
     targets[4].expected_intent_revision += 1;
     let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: scope.source_selection(),
+        targets,
+        canonical_owners: Vec::new(),
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
     let result = supervisor
-        .restore_lost_souls(
-            RequestId::new(),
-            RestoreLostSoulsRequest {
-                scope_id: scope.scope_id.clone(),
-                source: scope.source_selection(),
-                targets,
-                canonical_owners: Vec::new(),
-                expected_control_epoch: Some(registry.control_epoch()),
-            },
-        )
+        .restore_lost_souls(RequestId::new(), request.clone())
         .await;
-
     assert_eq!(
         result.unwrap_err().code,
+        RuntimeErrorCode::StaleIntentRevision
+    );
+
+    // The authenticated control path must preserve the same stale-revision
+    // refusal while polling this large recovery operation on the normal stack.
+    let mut envelope = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::RestoreLostSouls(request),
+    );
+    envelope.auth = Some("synthetic-secret".into());
+    let dispatched = supervisor.dispatch(envelope).await;
+    assert_eq!(
+        dispatched.result.unwrap_err().code,
         RuntimeErrorCode::StaleIntentRevision
     );
 }

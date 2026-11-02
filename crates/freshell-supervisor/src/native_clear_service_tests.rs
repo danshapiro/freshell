@@ -23,6 +23,12 @@ struct CurrentHost {
     stop_on_prepare: bool,
     inputs: Vec<String>,
     interrupt_ids: Vec<Option<String>>,
+    rollback_requests: Vec<(
+        String,
+        FreshAgentRollbackDirection,
+        FreshAgentRollbackMode,
+        Option<String>,
+    )>,
     events_read_count: usize,
     events_gate: Option<Arc<tokio::sync::Notify>>,
     events_started: Arc<tokio::sync::Notify>,
@@ -101,6 +107,7 @@ impl Fixture {
             stop_on_prepare: false,
             inputs: Vec::new(),
             interrupt_ids: Vec::new(),
+            rollback_requests: Vec::new(),
             events_read_count: 0,
             events_gate: None,
             events_started: Arc::new(tokio::sync::Notify::new()),
@@ -229,6 +236,26 @@ impl Fixture {
                             .push(wire["params"]["request_id"].as_str().map(str::to_owned));
                         Ok(HostResult::FreshAgentInterrupted)
                     }
+                    HostCommand::FreshAgentRollback {
+                        request_id,
+                        direction,
+                        mode,
+                        turn_id,
+                        ..
+                    } => {
+                        current.lock().unwrap().rollback_requests.push((
+                            request_id.as_str().to_owned(),
+                            direction,
+                            mode,
+                            turn_id,
+                        ));
+                        Ok(HostResult::FreshAgentCommand {
+                            native_identity: None,
+                            state: CommandState::ProviderAcked,
+                            native_session_id: None,
+                            claude_fork: None,
+                        })
+                    }
                     HostCommand::Status { .. } => {
                         let state = current.lock().unwrap();
                         Ok(HostResult::Status {
@@ -312,6 +339,45 @@ impl Fixture {
             reply.result
         );
     }
+}
+
+#[tokio::test]
+async fn rollback_dispatch_preserves_the_owned_request_on_the_normal_stack() {
+    let fixture = Fixture::new().await;
+    let request_id = RequestId::parse("owned-rollback-request").unwrap();
+    let mut envelope = Envelope::new(
+        request_id,
+        ControlRole::Web,
+        AdminCommand::FreshAgentRollback(FreshAgentRollbackRequest {
+            soul_id: fixture.soul.clone(),
+            direction: FreshAgentRollbackDirection::Undo,
+            mode: FreshAgentRollbackMode::ToTurn,
+            turn_id: Some("owned-turn".into()),
+            cwd: None,
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        }),
+    );
+    envelope.auth = Some(CONTROL_SECRET.into());
+    let reply = fixture.supervisor.dispatch(envelope).await;
+    assert!(
+        matches!(
+            reply.result,
+            Ok(AdminResult::FreshAgentCommand {
+                state: CommandState::ProviderAcked,
+            })
+        ),
+        "{:?}",
+        reply.result
+    );
+    assert_eq!(
+        fixture.host.lock().unwrap().rollback_requests,
+        vec![(
+            "owned-rollback-request".to_owned(),
+            FreshAgentRollbackDirection::Undo,
+            FreshAgentRollbackMode::ToTurn,
+            Some("owned-turn".to_owned()),
+        )]
+    );
 }
 
 #[tokio::test]
