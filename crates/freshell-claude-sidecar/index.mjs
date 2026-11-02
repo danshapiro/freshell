@@ -150,7 +150,7 @@ import { randomBytes } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { nativeProfileDigest, nativeResourceDigest } from './native-profile-digest.mjs'
 import { createNativeSessionChannel, inspectNativeForkSource, nativeInputDigest } from './native-session-channel.mjs'
-import { ordinaryPermissionAllowedDuringNativeInspection } from './native-checkpoint-release.mjs'
+import { concurrentNativeHookDecision } from './native-checkpoint-release.mjs'
 import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
 import { spawnObservedNative } from './native-process.mjs'
 import { configureSession, userMessageContent } from './session-settings.mjs'
@@ -474,9 +474,14 @@ function exitWithoutSession(sdkQuery, code) {
   setTimeout(() => process.exit(code), EXIT_FLUSH_BUDGET_MS)
 }
 
-async function waitForNativeCheckpointRelease(state, input, generation, hookSignal) {
+async function waitForNativeCheckpointRelease(state, input, generation, hookSignal, sessionId) {
   if (state.nativePendingOperation) {
-    return await ordinaryPermissionAllowedDuringNativeInspection(state, generation, hookSignal) ? null : false
+    const decision = await concurrentNativeHookDecision(state, generation, hookSignal)
+    if (!decision.allowOrdinary) {
+      log(decision.reason === 'store_check_failed' ? 'warn' : 'info', 'native.concurrent_hook_denied', { sessionId, queryGeneration: generation,
+        reason: decision.reason, ...(decision.inputState ? { inputState: decision.inputState } : {}) })
+    }
+    return decision.allowOrdinary ? null : false
   }
   let release
   const released = new Promise((resolve) => { release = resolve })
@@ -511,7 +516,7 @@ async function routeNativePermission({ session, sessionId, req, launch, generati
   let currentOptions = options
   if (session.nativeStore && req.resumeSessionId && !session.nativeContinuation) {
     const resumed = await waitForNativeCheckpointRelease(session,
-      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal)
+      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, sessionId)
     if (resumed === false) return { behavior: 'deny', message: 'Original native checkpoint has no current fenced release' }
   }
   const record = session.nativeContinuation
