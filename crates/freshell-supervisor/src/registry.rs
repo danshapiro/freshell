@@ -168,6 +168,116 @@ pub enum RegistryError {
     Join(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceInventoryStatus {
+    VerifiedEmpty,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoRuntimeInventoryRecord {
+    pub soul_id: String,
+    pub desired_state: String,
+    pub intent_revision: i64,
+    pub status: MaintenanceInventoryStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceInventorySnapshot {
+    pub no_runtime: Vec<NoRuntimeInventoryRecord>,
+}
+
+/// Reads registry-only evidence for souls that have never acquired an
+/// addressable incarnation. This command deliberately does not initialize a
+/// Registry, apply migrations, or inspect the runtime backend.
+pub fn read_maintenance_inventory(
+    database_path: &Path,
+) -> Result<MaintenanceInventorySnapshot, RegistryError> {
+    if !database_path.is_absolute() {
+        return Err(RegistryError::InvalidState(
+            "maintenance inventory requires an absolute database path".into(),
+        ));
+    }
+    let metadata = std::fs::metadata(database_path)?;
+    if !metadata.is_file() {
+        return Err(RegistryError::InvalidState(
+            "maintenance inventory path is not a regular database file".into(),
+        ));
+    }
+
+    let mut conn = Connection::open_with_flags(
+        database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
+    // A registry-level dangling reservation has no soul identity to attach to
+    // a particular row. Conservatively make every no-runtime conclusion
+    // unresolved while such unexplained authority exists.
+    let orphaned_admission_reservation: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM admission_reservations a LEFT JOIN incarnations i ON i.incarnation_id=a.incarnation_id WHERE i.incarnation_id IS NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut statement = tx.prepare(
+        r#"SELECT s.soul_id,s.desired_state,s.intent_revision,
+              CASE WHEN s.intent_revision > 0
+                     AND s.desired_state='stopped'
+                     AND s.recovery_state='stopped'
+                     AND s.recovery_attempt_id IS NULL
+                     AND ?1=0
+                     AND NOT EXISTS(SELECT 1 FROM recovery_attempts r WHERE r.soul_id=s.soul_id AND r.finished_at IS NULL)
+                     AND NOT EXISTS(SELECT 1 FROM provider_input_preparations p WHERE p.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM writer_claims w WHERE w.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM ordinary_stops p WHERE p.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id)
+                     AND NOT EXISTS(SELECT 1 FROM native_origin_owners o
+                                    WHERE o.ownership_state!='owned'
+                                      AND (o.owner_soul_id=s.soul_id OR o.owner_soul_id IS NULL))
+                     AND NOT EXISTS(SELECT 1 FROM view_intents v
+                                    WHERE v.soul_id=s.soul_id AND v.kind='automatic_primary'
+                                      AND v.visibility!='hidden')
+                   THEN 'verified_empty' ELSE 'unresolved' END
+         FROM souls s
+         WHERE NOT EXISTS(SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id)
+         ORDER BY s.created_at,s.soul_id"#,
+    )?;
+    let rows = statement.query_map([orphaned_admission_reservation], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut no_runtime = Vec::new();
+    for row in rows {
+        let (soul_id, desired_state, intent_revision, status) = row?;
+        no_runtime.push(NoRuntimeInventoryRecord {
+            soul_id,
+            desired_state,
+            intent_revision,
+            status: match status.as_str() {
+                "verified_empty" => MaintenanceInventoryStatus::VerifiedEmpty,
+                "unresolved" => MaintenanceInventoryStatus::Unresolved,
+                _ => {
+                    return Err(RegistryError::Integrity(
+                        "unknown maintenance inventory status".into(),
+                    ));
+                }
+            },
+        });
+    }
+    drop(statement);
+    tx.commit()?;
+    Ok(MaintenanceInventorySnapshot { no_runtime })
+}
+
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<RegistryInner>,
@@ -7721,6 +7831,113 @@ pub(crate) fn stopped_repair_owner_candidates_in_connection(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn maintenance_inventory_proves_only_safe_no_runtime_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let database_path = dir.path().join("runtime.sqlite3");
+        let safe_stopped = SoulId::new().to_string();
+        let desired_running = SoulId::new().to_string();
+        let blocked = SoulId::new().to_string();
+        let claimed = SoulId::new().to_string();
+        let reserved = SoulId::new().to_string();
+        let ambiguous_owner = SoulId::new().to_string();
+        let addressable = SoulId::new().to_string();
+        drop(registry);
+
+        let conn = Connection::open(&database_path).unwrap();
+        let insert_soul = |conn: &Connection, soul: &str, desired: &str, recovery: &str| {
+            conn.execute(
+                "INSERT INTO souls (soul_id,provider,provider_store_id,creation_seed_ref,desired_state,intent_revision,recovery_state,durability_state,allocation_state,checkpoint_revision,evidence_revision,successful_recoveries_in_window,project_key,resource_profile,provider_volume_name,created_at,updated_at) VALUES (?1,'codex','store','seed',?2,1,?3,'durable','allocated',0,0,0,'default','custom','volume',0,0)",
+                params![soul, desired, recovery],
+            )
+            .unwrap();
+        };
+        insert_soul(&conn, &safe_stopped, "stopped", "stopped");
+        insert_soul(&conn, &desired_running, "running", "live");
+        insert_soul(&conn, &blocked, "stopped", "blocked");
+        insert_soul(&conn, &claimed, "stopped", "stopped");
+        insert_soul(&conn, &reserved, "stopped", "stopped");
+        insert_soul(&conn, &ambiguous_owner, "stopped", "stopped");
+        insert_soul(&conn, &addressable, "stopped", "stopped");
+
+        // A dangling claim is inconsistent registry evidence and must not be
+        // mistaken for a safe no-runtime result.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES ('codex','store','native',?1,'missing-incarnation',1)",
+            [&claimed],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_input_preparations (soul_id,reservation_id,creation_seed_ref,image_ref,host_binary_path,host_binary_sha256,intent_revision,provider,consumed) VALUES (?1,'pending-reservation','seed','image','/host','digest',1,'opencode',0)",
+            [&reserved],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_origin_owners (provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES ('codex','store','root',?1,NULL,'ambiguous',0)",
+            [&ambiguous_owner],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,launch_state,execution_generation,requested_limits,cleanup_state,created_at,updated_at) VALUES ('addressable-incarnation',?1,'addressable-nonce','stopped',0,'{}','verified_empty',0,0)",
+            [&addressable],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let outcomes = snapshot
+            .no_runtime
+            .into_iter()
+            .map(|record| {
+                (
+                    record.soul_id,
+                    (record.desired_state, record.intent_revision, record.status),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(outcomes.len(), 6, "every no-incarnation soul is reported");
+        assert_eq!(
+            outcomes.get(&safe_stopped),
+            Some(&(
+                "stopped".to_string(),
+                1,
+                MaintenanceInventoryStatus::VerifiedEmpty
+            ))
+        );
+        for soul in [
+            &desired_running,
+            &blocked,
+            &claimed,
+            &reserved,
+            &ambiguous_owner,
+        ] {
+            let (_, revision, status) = outcomes.get(soul).expect("no-runtime soul is reported");
+            assert_eq!(*revision, 1);
+            assert_eq!(*status, MaintenanceInventoryStatus::Unresolved);
+        }
+        assert!(!outcomes.contains_key(&addressable));
+
+        // A dangling admission reservation cannot be tied to one soul, so it
+        // prevents all no-runtime rows from claiming the registry is empty.
+        let conn = Connection::open(&database_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES ('missing-incarnation','default',1,1,1,0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let snapshot = read_maintenance_inventory(&database_path).unwrap();
+        let safe_record = snapshot
+            .no_runtime
+            .iter()
+            .find(|record| record.soul_id == safe_stopped)
+            .expect("safe soul remains represented");
+        assert_eq!(safe_record.status, MaintenanceInventoryStatus::Unresolved);
+    }
+
     #[tokio::test]
     async fn recovery_initialization_grant_before_identity_is_not_pristine() {
         let dir = tempfile::tempdir().unwrap();
