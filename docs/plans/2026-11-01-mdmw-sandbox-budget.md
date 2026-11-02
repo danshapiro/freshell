@@ -161,7 +161,7 @@ git status --short
 git rev-parse HEAD
 ~~~
 
-Expected: staged whitespace check exits 0 and the summary shows both new .mjs files as mode 100644, followed by a focused source/tests/docs commit and clean worktree. Record its commit/tree before final-source acceptance. Any later scoped correction requires affected tests, a new commit, and cold acceptance on that final source; the final full-suite gate below also covers that final committed HEAD.
+Expected: staged whitespace check exits 0 and the summary shows both new .mjs files as mode 100644, followed by a focused source/tests/docs commit and clean worktree. Record its commit/tree before final-source acceptance. Any later scoped correction requires affected tests and a new commit. Reuse the recorded cold result only when the actual workload and its complete compiled input closure are demonstrated unchanged; otherwise repeat cold acceptance on the corrected source. Attribute the measured source honestly, and run the final full-suite gate on the final committed HEAD.
 
 ## Task 2: Prove actual launcher behavior and cold Clippy in one disposable normal-rootless/systemd guest
 
@@ -215,7 +215,7 @@ Retain --rm and corroborate published full CID after ordinary auto-removal befor
 
 - [x] **Step 3: Run exact final-source cold supported-toolchain Clippy**
 
-Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it; never accept Clippy evidence for source older than the last correction.
+Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it. A later follow-up may reuse the recorded result only after proving that the workload and complete compiled input closure are unchanged; if that proof fails, repeat the cold payload on the corrected source, preserving exact source attribution.
 
 Use fresh exact-owned target, registry and Git caches. Prove the effective target empty before compiler release and rule out inherited target/compiler-cache redirection. Network/toolchain preparation may not precompile the graph. Record image ABI/UID/tools, source and actual supported toolchain.
 
@@ -249,13 +249,42 @@ Export commands/statuses, source/image/toolchain manifests, actual jobs, receipt
 
 Verify recorded containers/volumes are absent and unreferenced; QEMU/outer/sampler/sentinel processes ended; owned keys/disks/seed/temp inputs removed. Verify PID birth identity/cwd/argv before stopping an exact task process. Never broad-kill, delete another task's resource/shared cache, or treat inspection failure as absence. Keep the feature branch/worktree for review.
 
-Obtain this task's the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding. Any further source correction is committed and receives affected verification and final-source cold acceptance before task completion.
+Obtain this task's the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding. Any further source correction is committed and receives affected verification; reuse cold evidence only after proving its workload and complete compiled input closure unchanged, or repeat acceptance on the corrected source.
 
 - [x] **Step 5: Complete the scoped handoff**
 
 Record actual commands, final commit, measured result or qualifying contained failure and limitations, task-review verdicts and evidence paths in the run record. The parent appends the final-HEAD full-suite disposition after both task reviews and before whole-branch review. Unresolved required proof is FAILED/non-converged, never silent success. Launcher/Docker/Cargo integration and smokes provide relevant end-to-end coverage; browser tests add no evidence for this unchanged UI.
 
 No PR or deployment is authorized. Prepare the clean committed result and ask for explicit landing authorization only at the parent workflow's final handoff.
+
+## Approved follow-up: sandbox review findings and Codex blockers
+
+The user approved repairing the three required findings after the passed delta review and expanding this work to the Codex failures blocking the full suite. The earlier pass and its unresolved findings remain recorded; fresh task reviews, a review of the cumulative repairs and an independent review of the resulting complete delta are required. The exact failed gate, its skipped cases and unrun phases remain historical evidence, not a pass.
+
+Before allocating a test environment, use the ongoing read-only storage audit to choose evidence-based disk and memory admission, bounded resource use, monitoring and exact cleanup appropriate to that command. The earlier 120 GiB stop applied to a large guest and is not automatically a suitable bound for a tiny test; never silently ignore it or consume another task's reserve. A guest must not outlive its only resource guard when an agent or tool session ends. No host-policy changes, shared-cache deletion, extra worktree or workspace copy, production restart, or broad process kill is permitted. The process-signal and container-restart paths require a qualified disposable isolation boundary with its own daemon; ordinary finite behavioral tests use the repository-supported strict sandbox when applicable.
+
+### Task 3: Close the sandbox test and diagnostic findings
+
+- [ ] Add a committed behavioral regression that actually runs the in-container prelude with the real effective-limit helper and observes the resulting correct receipt. A missing/failing helper case alone is not the positive path. Exercise the real wrapper in its strict test enclosure; when the behavior already works, demonstrate the new test fails under a controlled relevant fault rather than inventing a product failure, then restore and refactor.
+- [ ] Make the two-job smoke detect a serial run, while preserving the one-job, environment, project and CLI override cases. Verify overlap with deterministic behavioral evidence rather than relying on a short timing window that can flake; prove a serial two-job simulation fails and a real overlapping case succeeds.
+- [ ] Preserve useful, structured, secret-safe smoke failure details for incorrect job observations, overlap and resource checks after temporary observations are cleaned. Test that distinct failures remain diagnosable without leaking raw commands, environment values or other secret inputs.
+- [ ] Run focused and neighboring affected tests, actual sandbox selftest/smoke when safe, perform refactor and self-review, commit the scoped change, then obtain a fresh requirements-and-quality review. Record evidence clearing D1.1, D1.2 and D1.3; do not change the three optional findings merely because they were mentioned.
+
+### Task 4: Repair the installed-Codex test-support async contract
+
+- [ ] Trace the managed helper and all callers in `test/integration/providers/codex-local-provider.mjs` and `test/integration/server/fresh-agent-parity.test.ts`. Add a focused behavioral test using genuinely asynchronous owned execution: cover ordered launch/readiness, repeated not-ready results, parsed traffic, signal/closed settlement, and surfaced failures without orphaned work. Verify the test fails for the observed Promise/JSON bug before changing the helper.
+- [ ] Await the complete managed lifecycle and update its actual callers coherently, preserving cleanup, traffic, resume, restart and crash coverage. Do not repair only the first `JSON.parse` while leaving later async operations unhandled; do not weaken assertions.
+- [ ] Run RED/GREEN/refactor and focused neighboring tests; execute the exact installed-Codex integration path under an appropriately qualified isolated daemon when resources permit. Commit and obtain a fresh task review.
+
+### Task 5: Resolve Codex identity and parity coverage
+
+- [ ] Establish the actual initial-create, real replacement, materialization, managed-alias, native-resume and client-routing contracts from source, existing tests and prior evidence. Distinguish the deterministic fixture's first-turn behavior from genuine replacement delivery. The earlier timeout reproduced on the immutable base, but that alone does not choose a product or fixture fix.
+- [ ] Add meaningful tests that reproduce whichever fixture or product defect is proven. Preserve exact native resume, missing-grant, stale/replay and real replacement coverage; never accept the old managed-ID completion merely by relaxing the assertion. Change the smallest correct fixture, test or production route supported by that evidence, then GREEN and refactor.
+- [ ] Run all hosted provider rows, the complete provider-parity contract and the exact installed-Codex case with positive test counts when their isolation and resource requirements are met. Include the relevant Rust and client behavior tests if those layers change. Commit and obtain a fresh task review.
+
+### Follow-up integration and gate
+
+After Tasks 3–5, verify all affected smoke/integration behavior and revalidate or repeat the cold evidence as described above. Run the exact configured coordinated full-suite command on the final committed HEAD, preserving its cloud companion and every phase; inventory and fix in-scope failures and record any separately reproduced base failure. Obtain the required fresh whole-branch review, then the parent performs an independent complete-delta review of the approved repairs. The user authorized a new repair/review cycle despite the earlier passing marker; that earlier verdict does not cover new commits. No PR or deployment is authorized.
 
 ## Final committed-source gate
 
@@ -305,13 +334,13 @@ earlier unidentified base failure grants no exemption.
 
 ### Pending final gate
 
-After both planned tasks, their corrections and task reviews are complete, the parent runs the configured coordinated full-suite gate on the final committed HEAD from this feature worktree, before whole-branch review. Follow usual-executing-plans for periodic gates, adopting exact-HEAD results, recording failures and rerunning after committed fixes; Task 1's precommit checks and an older commit's full-suite result do not substitute for this gate. Wait for any foreign coordinator holder.
+After all planned tasks, their corrections and task reviews are complete, the coordinator runs the configured coordinated full-suite gate on the final committed HEAD from this feature worktree, before whole-branch review. Follow usual-executing-plans for periodic gates, adopting exact-HEAD results, recording failures and rerunning after committed fixes; Task 1's precommit checks and an older commit's full-suite result do not substitute for this gate. Wait for any foreign coordinator holder.
 
 ~~~bash
 env GCLOUD_ROBOT_REQUIRE=1 CARGO_BUILD_JOBS=2 FRESHELL_RUST_TEST_SANDBOX=1 FRESHELL_TEST_SUMMARY='freshell mdmw sandbox build budget branch verification' pnpm run test
 ~~~
 
-Expected: every configured phase, cloud local companion and local Electron lane completes and passes, excluding only ledger-recorded failures reproduced on the immutable base. Record exact HEAD, command and all phase results. The unidentified base exit 1 grants no exemption. Do not disable phases, change backend, assume baseline cause, or repair unrelated behavior; unresolved failures receive an explicit blocked/non-converged disposition. Any optional external-provider process-local environment sanitation must be corroborated/recorded; it is not a source repair or a baseline exemption. Any subsequent source fix requires committed affected verification and an exact-final-HEAD gate before whole-branch review.
+Expected: every configured phase, cloud local companion and local Electron lane completes and passes, excluding only ledger-recorded failures reproduced on the immutable base. Record exact HEAD, command and all phase results. The unidentified base exit 1 grants no exemption. Do not disable phases, change backend, assume baseline cause, or repair behavior beyond the approved Codex blockers; unresolved failures receive an explicit blocked/non-converged disposition. Any optional external-provider process-local environment sanitation must be corroborated/recorded; it is not a source repair or a baseline exemption. Any subsequent source fix requires committed affected verification and an exact-final-HEAD gate before whole-branch review.
 
 ## Requirement coverage and planning self-review
 
@@ -319,9 +348,9 @@ Expected: every configured phase, cloud local companion and local Electron lane 
 2. Overrides: conditional exported forwarding plus real project/inline/CLI cases; no project parser or precedence-masking environment fallback.
 3. Limits and failures: requested versus own-kernel observations, non-root distinct-budget probe, digest/CID/true attached and final statuses, null unavailable state, no 137 OOM inference.
 4. Meaningful coverage: real-wrapper RED/GREEN/refactor, preserved strict ownership/guard/cache tests, actual modes/selftest/negative cases and isolated exact-toolchain cold graph.
-5. Safety/scope: approved immutable failing base, task worktree, finite strict fixture route, qualified bounded disposable guest for cold evidence, exact cleanup, no unrelated repair/production/PR.
+5. Safety/scope: approved immutable failing base, task worktree, finite strict fixture route, qualified bounded disposable guest for cold evidence, exact cleanup, only the approved Codex blocker repair beyond sandbox scope, no production/PR.
 6. Review/commit: focused implementation checkpoint and actual evidence with fresh independent gates. Unknown baseline failure grants no exemption.
 
 Stage 2 decision evidence stays in the external run reports: load-bearing-finder.md, load-bearing-strategist.md and load-bearing-validator-{env-cgroup,cid,override,budget-clippy}.md under /home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/reports/. Static proof selected the architecture; the execution checkpoint above records the subsequent actual guest, observer/defaults and cold outcomes without treating that earlier static proof as empirical evidence.
 
-Self-review: the canonical User Request remains unchanged exactly once; every obligation maps above. Removed invalid env-default implementation drafts and VM-before-finite-fake-test dependency; retained intended behavior and exact interfaces rather than substituting new unexecuted product snippets. No deferred product behavior, stub-as-acceptance, unrelated source task, host-monitoring framework or blanket failure exemption is introduced.
+Self-review: the canonical User Request remains unchanged exactly once; every obligation maps above. Removed invalid env-default implementation drafts and VM-before-finite-fake-test dependency; retained intended behavior and exact interfaces rather than substituting new unexecuted product snippets. The user-approved follow-up targets only required sandbox review findings and the Codex blockers; no stub-as-acceptance, permanent host-monitoring framework or blanket failure exemption is introduced.
