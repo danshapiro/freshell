@@ -2287,6 +2287,229 @@ fn presentation_rewrite_keeps_materialized_native_identity() {
 }
 
 #[tokio::test]
+async fn hosted_codex_materialization_rekeys_following_native_turn_events() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-codex-materialization-route").unwrap();
+    let managed_id = "managed-codex-public";
+    let native_id = "thread-codex-native";
+    let native_turn_id = "turn-codex-native";
+    let attention_since = 10_000;
+    let proxy = HostedFreshAgentProxy {
+        checkpoint_barrier: std::sync::OnceLock::new(),
+        ownership: std::sync::OnceLock::new(),
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::initial(managed_id),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+    let events = [
+        serde_json::json!({
+            "type":"freshAgent.session.materialized",
+            "provider":"codex",
+            "sessionType":"freshcodex",
+            "previousSessionId":managed_id,
+            "sessionId":native_id
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"codex",
+            "sessionType":"freshcodex",
+            "sessionId":native_id,
+            "event":{
+                "type":"freshAgent.transcript.patch",
+                "sessionId":native_id,
+                "ops":[{"op":"settleTurn","nativeTurnId":native_turn_id,"status":"completed"}]
+            }
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"codex",
+            "sessionType":"freshcodex",
+            "sessionId":native_id,
+            "event":{"type":"freshAgent.turn.complete","sessionId":native_id,"at":attention_since + 1}
+        }),
+    ];
+
+    for event in events {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "codex",
+                managed_id,
+                "freshcodex",
+                Some(attention_since),
+            )
+            .await;
+    }
+
+    let frames: Vec<serde_json::Value> = (0..3)
+        .map(|_| serde_json::from_str(&receiver.try_recv().unwrap()).unwrap())
+        .collect();
+    assert_eq!(frames[0]["previousSessionId"], managed_id);
+    assert_eq!(frames[0]["sessionId"], native_id);
+    assert_eq!(frames[1]["event"]["type"], "freshAgent.transcript.patch");
+    assert_eq!(frames[1]["event"]["ops"][0]["nativeTurnId"], native_turn_id);
+    assert_eq!(frames[1]["event"]["ops"][0]["status"], "completed");
+    assert_eq!(frames[1]["sessionId"], native_id);
+    assert_eq!(frames[1]["event"]["sessionId"], native_id);
+    assert_eq!(frames[2]["event"]["type"], "freshAgent.turn.complete");
+    assert_eq!(frames[2]["event"]["at"], attention_since + 1);
+    assert_eq!(frames[2]["sessionId"], native_id);
+    assert_eq!(frames[2]["event"]["sessionId"], native_id);
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| (route.session_id.as_str(), route.materialized)),
+        Some((native_id, true)),
+    );
+}
+
+#[tokio::test]
+async fn replayed_codex_materialization_does_not_rekey_a_forked_pane_to_its_parent() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-codex-materialization-fork-route").unwrap();
+    let proxy = HostedFreshAgentProxy {
+        checkpoint_barrier: std::sync::OnceLock::new(),
+        ownership: std::sync::OnceLock::new(),
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::materialized("thread-codex-child"),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+
+    proxy
+        .forward_polled_event(
+            &soul,
+            AgentEvent::Provider {
+                payload: serde_json::json!({
+                    "type":"freshAgent.session.materialized",
+                    "provider":"codex",
+                    "sessionType":"freshcodex",
+                    "previousSessionId":"managed-codex-public",
+                    "sessionId":"thread-codex-parent"
+                }),
+            },
+            "codex",
+            "managed-codex-public",
+            "freshcodex",
+            Some(10_000),
+        )
+        .await;
+
+    assert!(
+        receiver.try_recv().is_err(),
+        "a replayed parent materialization must not be forwarded to the current child"
+    );
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| (route.session_id.as_str(), route.materialized)),
+        Some(("thread-codex-child", true)),
+    );
+}
+
+#[tokio::test]
+async fn codex_recovery_materialization_advances_current_native_route() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-codex-recovery-materialization-route").unwrap();
+    let previous_native_id = "thread-codex-before-recovery";
+    let recovered_native_id = "thread-codex-after-recovery";
+    let recovered_turn_id = "turn-codex-after-recovery";
+    let proxy = HostedFreshAgentProxy {
+        checkpoint_barrier: std::sync::OnceLock::new(),
+        ownership: std::sync::OnceLock::new(),
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::materialized(previous_native_id),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+
+    for event in [
+        serde_json::json!({
+            "type":"freshAgent.session.materialized",
+            "provider":"codex",
+            "sessionType":"freshcodex",
+            "previousSessionId":previous_native_id,
+            "sessionId":recovered_native_id
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"codex",
+            "sessionType":"freshcodex",
+            "sessionId":recovered_native_id,
+            "event":{
+                "type":"freshAgent.transcript.patch",
+                "sessionId":recovered_native_id,
+                "ops":[{"op":"settleTurn","nativeTurnId":recovered_turn_id,"status":"completed"}]
+            }
+        }),
+    ] {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "codex",
+                previous_native_id,
+                "freshcodex",
+                Some(10_000),
+            )
+            .await;
+    }
+
+    let materialized: serde_json::Value =
+        serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(materialized["type"], "freshAgent.session.materialized");
+    assert_eq!(materialized["previousSessionId"], previous_native_id);
+    assert_eq!(materialized["sessionId"], recovered_native_id);
+
+    let recovered_event: serde_json::Value =
+        serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(recovered_event["type"], "freshAgent.event");
+    assert_eq!(recovered_event["sessionId"], recovered_native_id);
+    assert_eq!(recovered_event["event"]["sessionId"], recovered_native_id);
+    assert_eq!(
+        recovered_event["event"]["ops"][0]["nativeTurnId"],
+        recovered_turn_id
+    );
+    assert_eq!(recovered_event["event"]["ops"][0]["status"], "completed");
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| (route.session_id.as_str(), route.materialized)),
+        Some((recovered_native_id, true)),
+    );
+}
+
+#[tokio::test]
 async fn materialization_keeps_following_transcript_invalidations_on_the_native_route() {
     let (broadcast, mut receiver) = broadcast::channel(8);
     let soul = SoulId::parse("soul-materialization-route").unwrap();

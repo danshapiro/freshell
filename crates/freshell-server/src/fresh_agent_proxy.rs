@@ -1521,9 +1521,7 @@ impl HostedFreshAgentProxy {
         session_type: &str,
         attention_since: Option<i64>,
     ) {
-        let materialized_session_id = (provider != "codex")
-            .then(|| materialized_session_id(&event))
-            .flatten();
+        let materialized_session = materialized_session(&event);
         let confirmed_clear = self
             .confirmed_claude_clear(soul, &event, provider, session_type)
             .await;
@@ -1570,13 +1568,20 @@ impl HostedFreshAgentProxy {
                 route.session_id = session_id;
             }
         }
-        if materialized_session_id
+        if materialized_session
             .as_ref()
-            .is_some_and(|session_id| route.materialized && session_id != &route.session_id)
+            .is_some_and(|(previous_session_id, session_id)| {
+                route.materialized
+                    && session_id != &route.session_id
+                    && !(provider == "codex"
+                        && previous_session_id.as_deref() == Some(route.session_id.as_str()))
+            })
         {
             // The journal replays from cursor zero. After a fork, an older
             // parent materialization must not move this soul back off its
-            // current native session.
+            // current native session. Codex crash recovery can legitimately
+            // mint a new root, but only when the materialization names the
+            // current route as its previous session.
             return;
         }
 
@@ -1611,7 +1616,7 @@ impl HostedFreshAgentProxy {
         }
 
         let presentation_id = route.session_id.clone();
-        if let Some(session_id) = materialized_session_id {
+        if let Some((_, session_id)) = materialized_session {
             route.session_id = session_id;
             route.materialized = true;
         }
@@ -2332,25 +2337,31 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
     }
 }
 
-fn materialized_session_id(event: &AgentEvent) -> Option<String> {
+fn materialized_session(event: &AgentEvent) -> Option<(Option<String>, String)> {
     let AgentEvent::Provider { payload } = event else {
         return None;
     };
-    find_materialized_session_id(payload)
+    find_materialized_session(payload)
 }
 
-fn find_materialized_session_id(payload: &serde_json::Value) -> Option<String> {
+fn find_materialized_session(payload: &serde_json::Value) -> Option<(Option<String>, String)> {
     let object = payload.as_object()?;
     if object.get("type").and_then(serde_json::Value::as_str)
         == Some("freshAgent.session.materialized")
     {
-        return object
+        let session_id = object
             .get("sessionId")
             .and_then(serde_json::Value::as_str)
             .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned)?;
+        let previous_session_id = object
+            .get("previousSessionId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.is_empty())
             .map(str::to_owned);
+        return Some((previous_session_id, session_id));
     }
-    object.values().find_map(find_materialized_session_id)
+    object.values().find_map(find_materialized_session)
 }
 
 fn stable_hex(value: &str) -> String {
