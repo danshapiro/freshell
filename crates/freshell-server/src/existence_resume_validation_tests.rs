@@ -114,18 +114,19 @@ async fn amplifier_definitively_absent_stays_absent() {
     let _ = std::fs::remove_dir_all(&amp_home);
 }
 
-/// Locator returns Unreadable (e.g. permissions) => honest Unknown, never
-/// a false Absent.
+/// Locator returns Unreadable (e.g. permissions) => the honest
+/// post-readiness `Unreadable` (kata vnpc Task 4: reconcile surfaces
+/// error{session_store_unreadable}), never a false Absent.
 #[tokio::test]
-async fn amplifier_unreadable_store_answers_unknown() {
+async fn amplifier_unreadable_store_answers_unreadable() {
     let home = temp_claude_home("amp-unreadable");
     let (probe, index) = probe_over(&home);
     let probe = probe.with_amplifier_session_locator(Arc::new(|_sid: &str| ByIdAnswer::Unreadable));
     index.warm().await;
     assert_eq!(
         probe.exists("amplifier", "amp-x"),
-        SessionExistence::Unknown,
-        "read failure is honest ignorance — fail open, never Absent"
+        SessionExistence::Unreadable,
+        "read failure is the honest unreadable-store error — never Absent"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -408,12 +409,14 @@ fn cold_index_claude_uses_transcript_locator() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Cold index + locators chained: codex/opencode must NOT run their by-id
-/// lookups when cold (AD-4 — the codex walk is ~1 s on a real store).
+/// Cold index + locators chained: codex must NOT run its by-id lookup when
+/// cold (AD-4 — the walk is ~1 s on a real store; no cold codex locator was
+/// added). opencode RESOLVES by id when cold (kata vnpc Task 4: the cheap
+/// SQLite locator is the warm-miss arm's own check, safe pre-readiness).
 /// The root-missing => ProviderUnavailable pre-check stays byte-for-byte
 /// today's behavior.
 #[test]
-fn cold_index_codex_and_opencode_answer_unknown() {
+fn cold_index_codex_stays_unknown_opencode_resolves_by_id() {
     let index_home = temp_claude_home("cold-codex-opencode");
     let codex_root = rv_temp_dir("cold-codex-root");
     let opencode_root = rv_temp_dir("cold-opencode-root");
@@ -435,8 +438,8 @@ fn cold_index_codex_and_opencode_answer_unknown() {
     );
     assert_eq!(
         probe.exists("opencode", "ses_cold00000000000000000000000"),
-        SessionExistence::Unknown,
-        "cold opencode stays Unknown (AD-4)"
+        SessionExistence::Present,
+        "cold opencode resolves by id without waiting for the scan (kata vnpc Task 4)"
     );
 
     // Root-missing pre-check untouched: even with a locator chained, a
@@ -531,10 +534,11 @@ async fn antigravity_definitively_absent_stays_absent() {
 }
 
 /// An unreadable transcript (the corruption/permission class) answers
-/// honest Unknown — never a finalized Absent that could adjudicate a live
-/// conversation dead.
+/// the honest post-readiness `Unreadable` (kata vnpc Task 4: reconcile
+/// surfaces error{session_store_unreadable}) — never a finalized Absent
+/// that could adjudicate a live conversation dead.
 #[tokio::test]
-async fn antigravity_unreadable_store_answers_unknown() {
+async fn antigravity_unreadable_store_answers_unreadable() {
     let home = temp_claude_home("agy-unreadable");
     let (probe, index) = probe_over(&home);
     let probe = probe.with_antigravity_transcript_locator(Arc::new(|_sid: &str| {
@@ -543,8 +547,8 @@ async fn antigravity_unreadable_store_answers_unknown() {
     index.warm().await;
     assert_eq!(
         probe.exists("antigravity", "agy-x"),
-        SessionExistence::Unknown,
-        "read failure is honest ignorance — fail open, never Absent"
+        SessionExistence::Unreadable,
+        "read failure is the honest unreadable-store error — never Absent"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

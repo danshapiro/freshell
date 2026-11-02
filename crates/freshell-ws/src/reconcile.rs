@@ -507,6 +507,15 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
             reason: Some("provider_unavailable".to_string()),
             ..base(pane, ReconcileVerdict::Error)
         },
+        // Kata vnpc Task 4: a PUBLISHED index that could not read this
+        // identity's store is NOT warming (that label would lie
+        // post-readiness) and NOT dead_session/fresh (the store may hold the
+        // session). The honest error carries the reason; the client keeps its
+        // claimed identity and the pane retries later.
+        SessionExistence::Unreadable => PaneVerdict {
+            reason: Some("session_store_unreadable".to_string()),
+            ..base(pane, ReconcileVerdict::Error)
+        },
     }
 }
 
@@ -965,6 +974,25 @@ mod tests {
         let v = f.one(p);
         assert_eq!(v.verdict, ReconcileVerdict::Error);
         assert_eq!(v.reason.as_deref(), Some("index_warming"));
+    }
+
+    /// Kata vnpc Task 4: a probe that CAN see the published index but cannot
+    /// read THIS identity's store answers `Unreadable` — the honest
+    /// error{session_store_unreadable}, never index_warming (post-readiness
+    /// warming would be a lying label) and never dead_session/fresh (an
+    /// unreadable store may hold the session; the pane keeps its identity
+    /// for a later retry).
+    #[test]
+    fn unreadable_existence_yields_session_store_unreadable_error() {
+        let f = Fixture::new();
+        f.probe
+            .set("claude", "s-locked", SessionExistence::Unreadable);
+        let mut p = pane("cr-unreadable");
+        p.session_ref = Some(sref("claude", "s-locked"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("session_store_unreadable"));
+        assert_ne!(v.reason.as_deref(), Some("index_warming"));
     }
 
     /// A known provider whose session root does not exist on this machine →

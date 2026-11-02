@@ -2254,9 +2254,12 @@ async fn main() -> ExitCode {
                 let existence = match probe.exists_for_gate(provider, session_id) {
                     SessionExistence::Present => ResumeExistence::Present,
                     SessionExistence::Absent => ResumeExistence::Absent,
-                    SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
-                        ResumeExistence::Unknown
-                    }
+                    // Kata vnpc Task 4: `Unreadable` maps beside `Unknown` —
+                    // the resume gate fails open for user creates and blocks
+                    // managed recovery (both require positive evidence).
+                    SessionExistence::Unknown
+                    | SessionExistence::ProviderUnavailable
+                    | SessionExistence::Unreadable => ResumeExistence::Unknown,
                 };
                 ResumeProbeAnswer {
                     existence,

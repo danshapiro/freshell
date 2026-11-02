@@ -44,6 +44,15 @@
 //!   locate_transcript), so RECONCILE verdicts no longer depend on the
 //!   single-root index walk for file existence. The History index walk
 //!   itself still reads one root; that residual listing exposure remains.
+//! - Parking doctrine (kata vnpc Task 4, round-3 finding 2): a cold index
+//!   with NO ledger `ever_bound` evidence parks the pane as
+//!   error{index_warming} (readiness-driven recovery re-derives when the
+//!   first sweep publishes) instead of fail-open respawning — repeated cold
+//!   reconciles burn ZERO respawn counter, so a slow scan can no longer
+//!   manufacture a false dead_session{respawn_exhausted}. An unreadable
+//!   store (post-readiness) and a missing provider home answer
+//!   error{session_store_unreadable} / error{provider_unavailable}
+//!   respectively — also never respawns, identity retained.
 
 use freshell_protocol::{PaneVerdict, ReconcilePane, ReconcileVerdict, SessionLocator};
 
@@ -111,11 +120,39 @@ pub enum FreshAgentPresence {
     OnDisk,
     GoneObserved,
     NeverObserved,
+    /// Ladder-compat placeholder for duplicate claims (the duplicate arm
+    /// short-circuits before presence is consulted). The respawn-with-cap
+    /// ladder mapping for this variant is pinned by
+    /// `unknown_prefers_respawn_over_memory_loss`.
     Unknown,
+    /// Kata vnpc Task 4 (round-1 finding 4): known provider, index
+    /// PUBLISHED, but this identity's store could not be read. The ladder
+    /// answers the honest `error{session_store_unreadable}` — NEVER a
+    /// respawn-driving presence (which would burn the respawn counter on an
+    /// unreadable store), identity retained, no counter burn.
+    StoreUnreadable,
+    /// Kata vnpc Task 4 (round-3 finding 2): cold index + NO ledger
+    /// `ever_bound` evidence. Parks as `error{index_warming}` like the
+    /// terminal lane until readiness-driven recovery re-derives when the
+    /// first sweep publishes; burns ZERO respawn counter (three reconnects
+    /// during a slow scan must not manufacture a false
+    /// dead_session{respawn_exhausted} for a session the index never
+    /// adjudicated). `E::Unknown` WITH ledger evidence keeps `OnDisk`
+    /// (positive disk truth — respawn is honest there).
+    IndexWarming,
+    /// Kata vnpc Task 4 (round-3 finding 2): known provider with no home on
+    /// this machine (July §3 doctrine: a missing provider home is never
+    /// warming, and respawn-for-an-uninstalled-provider was the same
+    /// fail-open workaround Unknown had). The ladder answers the honest
+    /// `error{provider_unavailable}`, identity retained, no counter burn.
+    ProviderUnavailable,
 }
-// B1 pre-decision (V9/A12): when B1's `SessionExistence::ProviderUnavailable`
-// lands, it maps to FreshAgentPresence::Unknown (conservative: respawn-with-cap,
-// never dead_session). Keep every SessionExistence match exhaustive, no catch-all.
+// B1 hardening doctrine (updated by kata vnpc Task 4): keep every
+// `SessionExistence` match exhaustive, no catch-all. `ProviderUnavailable`
+// maps to presence `ProviderUnavailable` (error{provider_unavailable}),
+// `Unreadable` maps to `StoreUnreadable` (error{session_store_unreadable}),
+// and cold `Unknown` without ledger evidence parks as `IndexWarming`
+// (error{index_warming}) — none of the three burn the respawn counter.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreshAgentPaneFacts {
@@ -219,12 +256,12 @@ pub async fn build_snapshot(
         let presence = if live {
             FreshAgentPresence::Live
         } else {
-            // Exhaustive match, NO catch-all (B1 hardening). ProviderUnavailable
-            // arm is the B4 pre-decision (V9/A12, module doc above): conservative
-            // respawn-with-cap via Unknown, never dead_session.
+            // Exhaustive match, NO catch-all (B1 hardening; doctrine updated
+            // by kata vnpc Task 4 — see the presence enum docs).
             match state.session_existence.exists(&sref.provider, &session_id) {
                 E::Present => FreshAgentPresence::OnDisk,
-                E::ProviderUnavailable => FreshAgentPresence::Unknown,
+                E::ProviderUnavailable => FreshAgentPresence::ProviderUnavailable,
+                E::Unreadable => FreshAgentPresence::StoreUnreadable,
                 E::Absent => {
                     if claude_pending_genesis(state, &sref.provider, &session_id) {
                         FreshAgentPresence::OnDisk
@@ -238,11 +275,17 @@ pub async fn build_snapshot(
                     }
                 }
                 E::Unknown => {
-                    // The ledger is positive evidence the session existed.
+                    // The ledger is positive evidence the session existed —
+                    // keep the respawn-with-cap doctrine ONLY with such
+                    // evidence (kata vnpc round-3 finding 2). Without it, a
+                    // cold index must not burn the respawn counter: park as
+                    // error{index_warming} like the terminal lane;
+                    // readiness-driven recovery re-derives when the first
+                    // sweep publishes.
                     if state.pane_ledger.ever_bound(&sref.provider, &session_id) {
                         FreshAgentPresence::OnDisk
                     } else {
-                        FreshAgentPresence::Unknown
+                        FreshAgentPresence::IndexWarming
                     }
                 }
             }
@@ -287,6 +330,12 @@ pub async fn build_snapshot(
                     }
                 }
             }
+            // Parked/honest-error presences (kata vnpc Task 4) NEVER burn:
+            // no create is armed for them, so the counter must not march a
+            // parked pane toward a false dead_session{respawn_exhausted}.
+            FreshAgentPresence::StoreUnreadable
+            | FreshAgentPresence::IndexWarming
+            | FreshAgentPresence::ProviderUnavailable => false,
             FreshAgentPresence::GoneObserved | FreshAgentPresence::NeverObserved => false,
         };
         facts.insert(
@@ -386,6 +435,32 @@ pub fn verdict_for_pane(
         FreshAgentPresence::NeverObserved => {
             let mut v = base(pane, ReconcileVerdict::Fresh);
             v.reason = Some("identity_never_observed".into());
+            v
+        }
+        // Kata vnpc Task 4: the three honest-error presences. Identity is
+        // retained (session_ref echoed, corrected propagated) — an error
+        // verdict must never replace an unresolved conversation with a new
+        // one, and no create is armed for these, so the respawn counter
+        // stays untouched (the burn accounting above already skipped them).
+        FreshAgentPresence::StoreUnreadable => {
+            let mut v = base(pane, ReconcileVerdict::Error);
+            v.reason = Some("session_store_unreadable".into());
+            v.session_ref = Some(sref);
+            v.corrected = corrected;
+            v
+        }
+        FreshAgentPresence::IndexWarming => {
+            let mut v = base(pane, ReconcileVerdict::Error);
+            v.reason = Some("index_warming".into());
+            v.session_ref = Some(sref);
+            v.corrected = corrected;
+            v
+        }
+        FreshAgentPresence::ProviderUnavailable => {
+            let mut v = base(pane, ReconcileVerdict::Error);
+            v.reason = Some("provider_unavailable".into());
+            v.session_ref = Some(sref);
+            v.corrected = corrected;
             v
         }
     }
@@ -492,6 +567,61 @@ mod tests {
         let s = snap(&[("p", FreshAgentPresence::Unknown, None, false)]);
         let v = verdict_for_pane(Some(&s), &pane("p", Some(("codex", "warm"))));
         assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+    }
+
+    /// Kata vnpc Task 4 (round-1 finding 4): a store the probe could not read
+    /// (after readiness) is the honest error{session_store_unreadable} — the
+    /// ladder NEVER turns it into a respawn-driving presence (which would
+    /// burn the respawn counter on an unreadable store) and NEVER
+    /// dead_session/fresh (the store may hold the session). The claimed
+    /// identity is retained for the error UI and a later retry.
+    #[test]
+    fn store_unreadable_maps_to_error_session_store_unreadable() {
+        let s = snap(&[("p", FreshAgentPresence::StoreUnreadable, None, false)]);
+        let v = verdict_for_pane(Some(&s), &pane("p", Some(("opencode", "locked"))));
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("session_store_unreadable"));
+        assert_eq!(
+            v.session_ref.as_ref().unwrap().session_id,
+            "locked",
+            "identity retained for a later retry"
+        );
+    }
+
+    /// Kata vnpc Task 4 (round-3 finding 2): a cold index with NO ledger
+    /// evidence parks the pane as error{index_warming} (like the terminal
+    /// lane) until readiness-driven recovery re-derives — the ladder never
+    /// turns the parked pane into a respawn (which would burn the counter
+    /// toward a false dead_session{respawn_exhausted} for a session the
+    /// index never adjudicated).
+    #[test]
+    fn index_warming_presence_parks_as_error_index_warming() {
+        let s = snap(&[("p", FreshAgentPresence::IndexWarming, None, false)]);
+        let v = verdict_for_pane(Some(&s), &pane("p", Some(("codex", "cold-1"))));
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("index_warming"));
+        assert_eq!(
+            v.session_ref.as_ref().unwrap().session_id,
+            "cold-1",
+            "identity retained while parked"
+        );
+    }
+
+    /// Kata vnpc Task 4 (round-3 finding 2): a provider with no home on this
+    /// machine is NOT warming and NOT respawning (respawn-for-an-uninstalled
+    /// provider was the same fail-open workaround Unknown had) — the honest
+    /// error{provider_unavailable}, identity retained.
+    #[test]
+    fn provider_unavailable_presence_maps_to_error_provider_unavailable() {
+        let s = snap(&[("p", FreshAgentPresence::ProviderUnavailable, None, false)]);
+        let v = verdict_for_pane(Some(&s), &pane("p", Some(("codex", "pu-1"))));
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("provider_unavailable"));
+        assert_eq!(
+            v.session_ref.as_ref().unwrap().session_id,
+            "pu-1",
+            "identity retained for the error UI"
+        );
     }
 
     #[test]

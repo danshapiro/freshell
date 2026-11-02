@@ -884,6 +884,39 @@ async fn provider_unavailable_is_immediate_and_honest() {
     );
 }
 
+/// Kata vnpc Task 4: an unreadable store is NOT warming either — the request
+/// returns error{reason: "session_store_unreadable"} immediately (no 2s
+/// deferral, no `pane_reconcile.index_warming` event), mirroring
+/// `provider_unavailable_is_immediate_and_honest`.
+#[tokio::test]
+async fn unreadable_store_is_immediate_and_honest_never_deferred() {
+    let (events, _guard) = capture();
+    // A single scripted answer repeats forever — "always Unreadable".
+    let probe = FlippingProbe::new(vec![freshell_ws::existence::SessionExistence::Unreadable]);
+    // Deliberately LARGE budget: proves no deferral happens for this reason.
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 30_000
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    let started = std::time::Instant::now();
+    ws.send(reconcile_request_with_session_ref("claude", "sess-locked"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "session_store_unreadable must never trigger the warming deferral"
+    );
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "error");
+    assert_eq!(v["reason"], "session_store_unreadable");
+    assert!(
+        events_by_name(&events, "pane_reconcile.index_warming").is_empty(),
+        "the warming event must never fire for an unreadable store"
+    );
+}
+
 /// The deferral is real: index warms during the wait -> the SECOND derivation
 /// answers with the warm verdict, not error. The transition log fires
 /// exactly ONCE for the request — the deferral arm — and the still-warming

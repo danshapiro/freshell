@@ -1684,6 +1684,20 @@ impl SessionIndex {
         self.any_cached()
     }
 
+    /// Sync coherent twin of [`Self::snapshot_with_failures`] (kata vnpc
+    /// Task 4): the last PUBLISHED snapshot AND its scan failures of the
+    /// SAME generation, read under ONE snapshot-mutex acquisition — `None`
+    /// when the cache is truly cold. A consumer that pairs the rows with
+    /// the failures (the existence probe's scan-failure honesty: a session
+    /// miss for a provider named in THIS generation's `scan_failures` is
+    /// unreadable, never absent) MUST read them through this accessor:
+    /// pairing [`Self::peek`] with a later [`Self::scan_failures`] call
+    /// lets a refresh publish between the two reads and tear the pair (the
+    /// coherence note on [`Self::scan_failures`]).
+    pub fn peek_with_failures(&self) -> Option<(Arc<Vec<IndexedSession>>, Vec<String>)> {
+        self.cached_pair(false)
+    }
+
     /// Whether the published snapshot (if any) is within the TTL window —
     /// the sync freshness companion to [`Self::peek`].
     pub fn is_fresh(&self) -> bool {
@@ -7533,6 +7547,117 @@ pub(crate) mod tests {
             .await,
             "a newly-failing source with an UNCHANGED change token must still \
              record a scan failure (health is re-evidenced every sweep)"
+        );
+    }
+
+    /// Kata vnpc Task 4: the SYNC coherent-read twin of
+    /// [`SessionIndex::snapshot_with_failures`] — items AND scan failures
+    /// of ONE published generation, read under ONE snapshot-mutex
+    /// acquisition (the same-generation guarantee the module's coherence
+    /// note promises). The phases publish generations whose items and
+    /// failures move TOGETHER; every observed pair must describe exactly
+    /// one generation — never a failed-scan snapshot paired with a cleared
+    /// failure set, nor a recovered snapshot paired with stale failures
+    /// (the torn shape a `peek()` + later `scan_failures()` pairing would
+    /// race against a refresh publish).
+    #[tokio::test]
+    async fn peek_with_failures_returns_items_and_failures_from_one_generation() {
+        struct TogglingDirectSource {
+            broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            item: IndexedSession,
+        }
+        impl SessionSource for TogglingDirectSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("opencode")
+            }
+            // CONSTANT token (the `FlakySource` donor pattern): the mtimes
+            // never move here, so health/clear evidence flows through the
+            // per-sweep health probe, not a token change.
+            fn direct_change_token(&self) -> Option<DirectToken> {
+                Some(DirectToken {
+                    mtime_ns: 42,
+                    size: 0,
+                })
+            }
+            fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+                if self.broken.load(Ordering::SeqCst) {
+                    Err("unable to open database file".to_string())
+                } else {
+                    Ok(vec![self.item.clone()])
+                }
+            }
+            fn direct_health_check(&self) -> Result<(), String> {
+                if self.broken.load(Ordering::SeqCst) {
+                    Err("unable to open database file".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let source = TogglingDirectSource {
+            broken: std::sync::Arc::clone(&broken),
+            item: mk("ses_coherence00000000000000000", "opencode", 100),
+        };
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(source) as _],
+            std::time::Duration::ZERO, // every snapshot() sweeps
+            None,
+        );
+
+        // Cold cache: NOTHING published — no items, no failures either.
+        assert!(
+            index.peek_with_failures().is_none(),
+            "a cold index has no generation to read — None, never a torn default"
+        );
+
+        // Generation 1 — failing source, nothing ever cached: the sweep
+        // publishes empty items WITH the recorded failure (one generation).
+        let _ = index.snapshot().await;
+        let (items, failures) = index
+            .peek_with_failures()
+            .expect("the failing first sweep published a generation");
+        assert!(items.is_empty(), "no listing ever succeeded");
+        assert_eq!(failures, vec!["opencode".to_string()]);
+
+        // Generation 2 — recovery: the failure clears AND the row appears
+        // in the SAME read (never new items paired with the stale failure).
+        broken.store(false, Ordering::SeqCst);
+        let _ = index.snapshot().await; // stale-while-revalidate: poll for it
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                index.peek_with_failures().is_some_and(|(items, failures)| {
+                    items.len() == 1
+                        && items[0].session_id == "ses_coherence00000000000000000"
+                        && failures.is_empty()
+                })
+            })
+            .await,
+            "recovery must publish the row AND the cleared failure set together"
+        );
+
+        // Generation 3 — failing again with an UNCHANGED token: the health
+        // probe re-records the failure while the row stays cached — both
+        // facts observable in one coherent pair.
+        broken.store(true, Ordering::SeqCst);
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                index.peek_with_failures().is_some_and(|(items, failures)| {
+                    items.len() == 1
+                        && items[0].session_id == "ses_coherence00000000000000000"
+                        && failures == vec!["opencode".to_string()]
+                })
+            })
+            .await,
+            "the outage must be published WITH its preserved rows in one generation"
         );
     }
 

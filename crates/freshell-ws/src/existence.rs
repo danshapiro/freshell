@@ -11,6 +11,11 @@
 //!   known provider* (boot sweep not finished / index unavailable) — it is
 //!   what makes the `error{index_warming}` verdict honest instead of
 //!   guessing (§5.3 row 5).
+//! * [`SessionExistence::Unreadable`] (kata vnpc Task 4) means a known
+//!   provider, index PUBLISHED, but THIS identity's store could not be read —
+//!   the honest `error{session_store_unreadable}` verdict: not warming (the
+//!   banner would lie), not dead_session/fresh (the store may hold the
+//!   session; identity is preserved for a later retry).
 //!
 //! Trait-shaped so crate tests inject a fake; the real implementation is
 //! backed by the shared `freshell_sessions::directory_index::SessionIndex`
@@ -33,6 +38,14 @@ pub enum SessionExistence {
     /// it will never warm up, so downstream answers an immediate
     /// `error{provider_unavailable}` with NO deferral (never `index_warming`).
     ProviderUnavailable,
+    /// Known provider, index PUBLISHED, but this identity's store could not
+    /// be read (locked DB, unreadable transcript/dir). NEVER answered while
+    /// the index is cold — pre-readiness uncertainty stays `Unknown`
+    /// (warming), because the scan may still speak. Downstream this is the
+    /// honest `error{session_store_unreadable}` verdict: not warming (the
+    /// banner would lie), not dead_session/fresh (the store may hold the
+    /// session; identity is preserved for a later retry).
+    Unreadable,
 }
 
 /// The reconcile derivation's read-only view of disk session truth.

@@ -243,6 +243,25 @@ fn error_verdict_carries_reason_and_no_retry_after_ms() {
     assert!(wire.get("retryAfterMs").is_none());
 }
 
+/// Kata vnpc Task 4: the honest unreadable-store verdict reason serializes
+/// verbatim (extends the error-reason pin above with the new value).
+#[test]
+fn unreadable_store_error_verdict_serializes_the_session_store_unreadable_reason() {
+    let verdict = PaneVerdict {
+        pane_key: "p".to_string(),
+        verdict: ReconcileVerdict::Error,
+        terminal_id: None,
+        session_ref: None,
+        corrected: None,
+        reason: Some("session_store_unreadable".to_string()),
+        duplicate: None,
+    };
+    let wire = serde_json::to_value(&verdict).expect("serializes");
+    assert_eq!(wire["verdict"], "error");
+    assert_eq!(wire["reason"], "session_store_unreadable");
+    assert!(wire.get("retryAfterMs").is_none());
+}
+
 // --- error codes --------------------------------------------------------------
 
 #[test]
