@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -10,16 +11,23 @@ import {
   buildSelectedArtifacts,
   buildReopenCandidates,
   createJsonLogger,
+  createProductionDependencyAdapters,
+  createProductionDependencies,
+  deriveOwner,
   parseManagedUpdateMode,
+  readExactApprovalLine,
   runManagedUpdateBootstrap,
   runManagedUpdateCli,
   runManagedRuntimeUpdate,
   runManagedRuntimeWorker,
+  assertRunningSupervisorProcess,
   swapDirectoryOnDestination,
+  waitForSupervisorReadiness,
   webActionCanReachSupervisor,
   type ManagedRuntimeUpdateDependencies,
   type RuntimeView,
   type SystemdUnitGraph,
+  type ParsedUnit,
 } from '../../../scripts/update-managed-runtime.js'
 
 const owner = {
@@ -62,17 +70,50 @@ function view(overrides: Partial<RuntimeView> = {}): RuntimeView {
   }
 }
 
+function ownerUnitFixture(
+  kind: 'web' | 'supervisor',
+  imageEnvironmentFile: string,
+  overrides: Partial<ParsedUnit> = {},
+): ParsedUnit {
+  const checkoutRoot = '/srv/freshell'
+  const executable = path.join(checkoutRoot, `target/release/freshell-${kind === 'web' ? 'server' : 'supervisor'}`)
+  const common: ParsedUnit = {
+    loadState: 'loaded', activeState: 'active', mainPid: kind === 'web' ? 1001 : 1002,
+    workingDirectory: checkoutRoot, executable, argv: [executable], environment: {},
+    environmentFiles: kind === 'supervisor' ? [imageEnvironmentFile] : [],
+  }
+  if (kind === 'web') {
+    common.environment = {
+      FRESHELL_MANAGED_RUNTIME_V1: '1',
+      FRESHELL_RUNTIME_CONTROL_SOCKET: owner.controlSocket,
+      FRESHELL_RUNTIME_CONTROL_SECRET_FILE: owner.controlSecretFile,
+    }
+  } else {
+    common.argv.push(
+      'serve', '--registry-root', owner.registryRoot,
+      '--control-socket', owner.controlSocket,
+      '--control-secret-file', owner.controlSecretFile,
+      '--docker-socket', owner.dockerSocket,
+      '--runtime-root', owner.runtimeRoot,
+      '--host-binary', owner.sessionHostBinary,
+      '--image-ref', owner.imageReference,
+    )
+  }
+  return { ...common, ...overrides }
+}
+
 function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {}) {
   const effects: string[] = []
   const events: Record<string, unknown>[] = []
-  const runtimeApi = fakeRuntimeApi(effects)
+  let supervisorRestarted = false
+  const runtimeApi = fakeRuntimeApi(effects, () => supervisorRestarted ? 8 : 7)
   const defaultDeps = {
     paths: {
       checkoutRoot: '/srv/freshell',
       home: '/home/operator',
       runtimeDirectory: '/run/user/1000',
       node: '/usr/bin/node',
-      tsxEntry: '/srv/freshell/node_modules/tsx/dist/cli.mjs',
+      tsxLoader: '/srv/freshell/node_modules/tsx/dist/loader.mjs',
       updaterScript: '/srv/freshell/scripts/update-managed-runtime.ts',
       env: '/usr/bin/env',
       flock: '/usr/bin/flock',
@@ -135,11 +176,17 @@ function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {})
     },
     services: {
       stop: vi.fn(async (unit) => { effects.push(`stop:${unit}`) }),
-      start: vi.fn(async (unit) => { effects.push(`start:${unit}`) }),
+      start: vi.fn(async (unit) => {
+        effects.push(`start:${unit}`)
+        if (unit === owner.supervisorUnit) supervisorRestarted = true
+      }),
       restart: vi.fn(async (unit) => { effects.push(`restart:${unit}`) }),
       isActive: vi.fn(async (unit) => unit === owner.supervisorUnit),
       state: vi.fn(async (unit) => unit === owner.supervisorUnit ? 'active' : 'inactive'),
-      waitSupervisorReady: vi.fn(async () => { effects.push('supervisor-ready') }),
+      waitSupervisorReady: vi.fn(async () => {
+        effects.push('supervisor-ready')
+        return { installationId: 'installation-1', controlEpoch: supervisorRestarted ? 8 : 7 }
+      }),
       waitWebReady: vi.fn(async () => { effects.push('web-ready') }),
       waitCallbackReady: vi.fn(async () => { effects.push('callback-ready') }),
     },
@@ -148,7 +195,7 @@ function dependencies(overrides: Partial<ManagedRuntimeUpdateDependencies> = {})
       currentSchemaVersion: vi.fn(async () => 19),
       health: vi.fn(async () => {
         effects.push('health')
-        return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: 7 }
+        return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: supervisorRestarted ? 8 : 7 }
       }),
       inventory: vi.fn(async () => [view()]),
       maintenanceInventory: vi.fn(async (_supervisorExecutable, _databasePath) => []),
@@ -235,16 +282,16 @@ function readinessReport(overrides: {
   }
 }
 
-function fakeRuntimeApi(effects: string[]): FakeRuntimeApi {
+function fakeRuntimeApi(effects: string[], controlEpoch: () => number = () => 7): FakeRuntimeApi {
   const calls: FakeRuntimeCall[] = []
   const responses = new Map<string, FakeRuntimeResponse | ((body: unknown) => FakeRuntimeResponse)>()
   const key = (method: string, endpoint: string) => `${method} ${endpoint}`
-  const initialReadiness = readinessReport()
   let maintenancePhase = 'open'
   let maintenanceOwner: string | null = null
+  const currentReadiness = () => readinessReport({ controlEpoch: controlEpoch() })
   const defaultResponse = (method: string, endpoint: string, body: unknown): FakeRuntimeResponse => {
     if (method === 'GET' && endpoint === '/api/runtime/readiness') {
-      return { status: 200, body: initialReadiness }
+      return { status: 200, body: currentReadiness() }
     }
     if (method === 'POST' && endpoint === '/api/runtime/maintenance/quiesce') {
       const request = body as { ownerId?: string }
@@ -255,12 +302,12 @@ function fakeRuntimeApi(effects: string[]): FakeRuntimeApi {
           readyToStop: true,
           lease: { ownerId: request.ownerId, leaseId: 'fixture-lease', expiresInMs: 30_000 },
           admission: { phase: 'quiesced', activePermits: 0 },
-          readiness: initialReadiness,
+          readiness: currentReadiness(),
         },
       }
     }
     if (method === 'POST' && endpoint === '/api/runtime/maintenance/commit-stop') {
-      return { status: 200, body: { committed: true, readiness: initialReadiness, admission: { phase: 'shutdown-latched' } } }
+      return { status: 200, body: { committed: true, readiness: currentReadiness(), admission: { phase: 'shutdown-latched' } } }
     }
     if (method === 'POST' && endpoint === '/api/runtime/maintenance/release') {
       return { status: 200, body: { admission: { phase: 'open' } } }
@@ -473,7 +520,7 @@ it('default completion event includes reminder', async () => {
     }))
 })
 
-it('bootstrap invokes resolved tsx entrypoint with pinned node', async () => {
+it('bootstrap invokes the tsx loader in the pinned Node process', async () => {
     const f = dependencies()
 
     const result = await runManagedRuntimeUpdate([], f.deps)
@@ -486,10 +533,484 @@ it('bootstrap invokes resolved tsx entrypoint with pinned node', async () => {
     expect(request?.args).not.toContain('--pipe')
     expect(request?.args).not.toContain('--collect')
     expect(request?.args).toContain('/usr/bin/node')
-    expect(request?.args).toContain('/srv/freshell/node_modules/tsx/dist/cli.mjs')
+    expect(request?.args).toContain('--import')
+    expect(request?.args).toContain('/srv/freshell/node_modules/tsx/dist/loader.mjs')
     expect(request?.args).not.toContain('/srv/freshell/node_modules/.bin/tsx')
     expect(request?.environment).not.toHaveProperty('APPROVED')
 })
+
+it('locked TypeScript worker keeps flock descriptor in the same Node process', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-flock-'))
+  const lockPath = path.join(temp, 'update.lock')
+  const probePath = path.join(temp, 'probe.mts')
+  const loader = fs.realpathSync('node_modules/tsx/dist/loader.mjs')
+  const paths = {
+    ...dependencies().deps.paths,
+    node: process.execPath,
+    tsxLoader: loader,
+    flock: '/usr/bin/flock',
+  }
+  const production = createProductionDependencyAdapters(paths)
+  fs.writeFileSync(probePath, `
+import fs from 'node:fs'
+import path from 'node:path'
+const lockPath = path.resolve(process.argv[2])
+const held = fs.readdirSync('/proc/self/fd').some((descriptor) => {
+  try { return path.resolve(fs.readlinkSync('/proc/self/fd/' + descriptor)) === lockPath }
+  catch { return false }
+})
+process.exitCode = held ? 0 : 19
+`)
+
+  try {
+    const status = await production.handoff.runLockedWorker({
+      lockPath,
+      command: [process.execPath, '--import', loader, probePath, lockPath],
+      environment: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+    })
+
+    expect(status).toBe(0)
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 15_000)
+
+it('production updater preserves the rustup Cargo proxy path', () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-cargo-path-'))
+  const bin = path.join(temp, 'bin')
+  fs.mkdirSync(bin)
+  const rustup = path.join(bin, 'rustup')
+  const cargo = path.join(bin, 'cargo')
+  fs.writeFileSync(rustup, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  fs.symlinkSync('rustup', cargo)
+  const originalPath = process.env.PATH
+  const originalRuntimeDirectory = process.env.XDG_RUNTIME_DIR
+  for (const name of ['pnpm', 'docker', 'sqlite3', 'flock', 'systemd-run', 'systemctl', 'env']) {
+    fs.writeFileSync(path.join(bin, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  }
+
+  try {
+    process.env.PATH = bin
+    process.env.XDG_RUNTIME_DIR = temp
+    const production = createProductionDependencies()
+
+    expect(production.paths.cargo).toBe(cargo)
+    expect(fs.realpathSync(production.paths.cargo)).toBe(rustup)
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH
+    else process.env.PATH = originalPath
+    if (originalRuntimeDirectory === undefined) delete process.env.XDG_RUNTIME_DIR
+    else process.env.XDG_RUNTIME_DIR = originalRuntimeDirectory
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+})
+
+it('canonical systemd image variable resolves against the immutable environment-file digest', () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-owner-'))
+  const imageEnvironmentFile = path.join(temp, 'managed-runtime.env')
+  const imageReference = 'sha256:' + 'c'.repeat(64)
+  fs.writeFileSync(imageEnvironmentFile, `FRESHELL_RUNTIME_IMAGE=${imageReference}\n`)
+  const paths = { ...dependencies().deps.paths, checkoutRoot: '/srv/freshell' }
+  const web: ParsedUnit = {
+    loadState: 'loaded', activeState: 'active', mainPid: 1001,
+    workingDirectory: '/srv/freshell', executable: '/srv/freshell/target/release/freshell-server',
+    argv: ['/srv/freshell/target/release/freshell-server'],
+    environment: {
+      FRESHELL_MANAGED_RUNTIME_V1: '1',
+      FRESHELL_RUNTIME_CONTROL_SOCKET: '/home/operator/.freshell/managed-runtime/control/supervisor.sock',
+      FRESHELL_RUNTIME_CONTROL_SECRET_FILE: '/home/operator/.freshell/managed-runtime/control/secret',
+    },
+    environmentFiles: [],
+  }
+  const supervisor: ParsedUnit = {
+    loadState: 'loaded', activeState: 'active', mainPid: 1002,
+    workingDirectory: '/srv/freshell', executable: '/srv/freshell/target/release/freshell-supervisor',
+    argv: [
+      '/srv/freshell/target/release/freshell-supervisor', 'serve',
+      '--registry-root', '/home/operator/.freshell/managed-runtime/registry',
+      '--control-socket', '/home/operator/.freshell/managed-runtime/control/supervisor.sock',
+      '--control-secret-file', '/home/operator/.freshell/managed-runtime/control/secret',
+      '--docker-socket', '/run/user/1000/docker.sock',
+      '--runtime-root', '/home/operator/.freshell/managed-runtime/runtime',
+      '--host-binary', '/srv/freshell/target/release/freshell-session-host',
+      '--image-ref', '${FRESHELL_RUNTIME_IMAGE}', '--test-run-id', 'managed-runtime',
+    ],
+    environment: {}, environmentFiles: [imageEnvironmentFile],
+  }
+
+  try {
+    const resolved = deriveOwner(paths, web, supervisor)
+
+    expect(resolved.imageReference).toBe(imageReference)
+    expect(resolved.supervisorMainPid).toBe(1002)
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+})
+
+it('inactive supervisor units cannot be accepted as the managed-runtime owner', () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-inactive-owner-'))
+  const imageEnvironmentFile = path.join(temp, 'managed-runtime.env')
+  fs.writeFileSync(imageEnvironmentFile, `FRESHELL_RUNTIME_IMAGE=${owner.imageReference}\n`)
+  const paths = { ...dependencies().deps.paths, checkoutRoot: '/srv/freshell' }
+  const web = ownerUnitFixture('web', imageEnvironmentFile)
+  const supervisor = ownerUnitFixture('supervisor', imageEnvironmentFile, { activeState: 'inactive', mainPid: null })
+
+  try {
+    expect(() => deriveOwner(paths, web, supervisor)).toThrow(/supervisor must be active/i)
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+})
+
+it('replacement supervisor validation checks its live process arguments and executable', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-supervisor-process-'))
+  const processScript = path.join(temp, 'supervisor.mjs')
+  const expectedImage = 'sha256:' + 'd'.repeat(64)
+  fs.writeFileSync(processScript, 'const timer = setInterval(() => {}, 1000); process.stdin.once("end", () => clearInterval(timer)); process.stdin.resume()\n')
+  const child = spawn(process.execPath, [processScript, '--image-ref', expectedImage], {
+    cwd: process.cwd(), stdio: ['pipe', 'ignore', 'ignore'],
+  })
+  const childReady = once(child, 'spawn')
+  const childExit = once(child, 'exit')
+  await childReady
+
+  try {
+    await expect(assertRunningSupervisorProcess(child.pid!, {
+      ...owner,
+      checkoutRoot: process.cwd(),
+      supervisorExecutable: fs.realpathSync(process.execPath),
+    }, expectedImage)).resolves.toBeUndefined()
+    await expect(assertRunningSupervisorProcess(child.pid!, {
+      ...owner,
+      checkoutRoot: process.cwd(),
+      supervisorExecutable: fs.realpathSync(process.execPath),
+    }, owner.imageReference)).rejects.toThrow(/image reference/i)
+  } finally {
+    child.stdin?.end()
+    await childExit
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 5_000)
+
+it('supervisor readiness refuses inactive units', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-supervisor-ready-'))
+  const activeStatePath = path.join(temp, 'active-state')
+  const mainPidPath = path.join(temp, 'main-pid')
+  const systemctlPath = path.join(temp, 'systemctl')
+  const expectedImage = 'sha256:' + 'e'.repeat(64)
+  fs.writeFileSync(activeStatePath, 'inactive')
+  fs.writeFileSync(mainPidPath, '0')
+  const systemctlSource = `#!/bin/sh
+case "$*" in
+  *ActiveState*) cat '${activeStatePath}' ;;
+  *MainPID*) cat '${mainPidPath}' ;;
+esac
+`
+  fs.writeFileSync(systemctlPath, systemctlSource, { mode: 0o755 })
+  const production = createProductionDependencyAdapters({
+    ...dependencies().deps.paths,
+    systemctl: systemctlPath,
+  })
+  const selected = {
+    ...owner,
+    checkoutRoot: process.cwd(),
+    supervisorExecutable: fs.realpathSync(process.execPath),
+    supervisorMainPid: 1001,
+  }
+
+  try {
+    await expect(production.services.waitSupervisorReady(selected, expectedImage, {
+      installationId: 'installation-1', controlEpoch: 7,
+    }))
+      .rejects.toThrow(/supervisor is not active/i)
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 5_000)
+
+it('supervisor readiness timeout preserves the last actionable verification reason', async () => {
+  let checks = 0
+  const lastIssue = 'the live supervisor process image reference does not match the verified managed-runtime image'
+  await expect(waitForSupervisorReadiness(async () => {
+    checks += 1
+    return undefined
+  }, {
+    timeoutMs: 8,
+    intervalMs: 1,
+    timeoutMessage: () => `The restarted managed-runtime supervisor did not become ready with its verified process and authenticated Health identity before the timeout: ${lastIssue}.`,
+  })).rejects.toThrow(/verified process and authenticated Health identity before the timeout: the live supervisor process image reference does not match/i)
+  expect(checks).toBeGreaterThan(0)
+})
+
+it('supervisor readiness timeout reports a persistent process image mismatch', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'mr-supervisor-image-timeout-'))
+  const activeStatePath = path.join(temp, 'active-state')
+  const mainPidPath = path.join(temp, 'main-pid')
+  const systemctlPath = path.join(temp, 'systemctl')
+  const expectedImage = 'sha256:' + 'd'.repeat(64)
+  const runningImage = 'sha256:' + 'e'.repeat(64)
+  const child = spawn(process.execPath, [
+    '-e', 'setInterval(() => {}, 1000)', '--', '--image-ref', runningImage,
+  ], { cwd: process.cwd(), stdio: 'ignore' })
+  const childReady = once(child, 'spawn')
+  const childExit = once(child, 'exit')
+  await childReady
+  fs.writeFileSync(activeStatePath, 'active')
+  fs.writeFileSync(mainPidPath, String(child.pid))
+  fs.writeFileSync(systemctlPath, `#!/bin/sh
+case "$*" in
+  *ActiveState*) cat '${activeStatePath}' ;;
+  *MainPID*) cat '${mainPidPath}' ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o755 })
+  const production = createProductionDependencyAdapters({
+    ...dependencies().deps.paths,
+    checkoutRoot: process.cwd(),
+    systemctl: systemctlPath,
+  }, undefined, { supervisorReadinessTimeoutMs: 60, supervisorReadinessPollIntervalMs: 1 })
+  const selected = {
+    ...owner,
+    checkoutRoot: process.cwd(),
+    supervisorExecutable: fs.realpathSync(process.execPath),
+    supervisorMainPid: child.pid! + 1,
+  }
+
+  try {
+    await expect(production.services.waitSupervisorReady(selected, expectedImage, {
+      installationId: 'installation-1', controlEpoch: 7,
+    })).rejects.toThrow(/live supervisor process image reference does not match/i)
+  } finally {
+    child.kill('SIGTERM')
+    await childExit
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 5_000)
+
+it('supervisor readiness bounds a hanging authenticated Health child by the remaining deadline', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'mr-supervisor-health-timeout-'))
+  const activeStatePath = path.join(temp, 'active-state')
+  const mainPidPath = path.join(temp, 'main-pid')
+  const systemctlPath = path.join(temp, 'systemctl')
+  const adminCliPath = path.join(temp, 'supervisor-admin')
+  const expectedImage = 'sha256:' + 'c'.repeat(64)
+  const socketPath = path.join(tempRoot, `h-${process.pid}.sock`)
+  const child = spawn(process.execPath, [
+    '-e', 'setInterval(() => {}, 1000)', '--', '--image-ref', expectedImage,
+  ], { cwd: process.cwd(), stdio: 'ignore' })
+  const childReady = once(child, 'spawn')
+  const childExit = once(child, 'exit')
+  await childReady
+  fs.writeFileSync(activeStatePath, 'active')
+  fs.writeFileSync(mainPidPath, String(child.pid))
+  fs.writeFileSync(systemctlPath, `#!/bin/sh
+case "$*" in
+  *ActiveState*) cat '${activeStatePath}' ;;
+  *MainPID*) cat '${mainPidPath}' ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o755 })
+  fs.writeFileSync(adminCliPath, `#!${process.execPath}
+process.on('SIGTERM', () => {})
+setInterval(() => {}, 1000)
+`, { mode: 0o755 })
+  const server = net.createServer(socket => socket.destroy())
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+  const production = createProductionDependencyAdapters({
+    ...dependencies().deps.paths,
+    checkoutRoot: process.cwd(),
+    systemctl: systemctlPath,
+  }, undefined, { supervisorReadinessTimeoutMs: 100 })
+  const selected = {
+    ...owner,
+    checkoutRoot: process.cwd(),
+    supervisorExecutable: fs.realpathSync(process.execPath),
+    supervisorMainPid: child.pid! + 1,
+    adminCli: adminCliPath,
+    controlSocket: socketPath,
+    controlSecretFile: path.join(temp, 'secret'),
+  }
+  fs.writeFileSync(selected.controlSecretFile, 'fixture secret')
+  const startedAt = Date.now()
+
+  try {
+    await expect(production.services.waitSupervisorReady(selected, expectedImage, {
+      installationId: 'installation-1', controlEpoch: 7,
+    })).rejects.toThrow(/authenticated Health request timed out/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  } finally {
+    child.kill('SIGTERM')
+    await childExit
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    await fs.promises.rm(socketPath, { force: true })
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 5_000)
+
+it('supervisor readiness bounds a hanging systemd property read', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'mr-supervisor-systemd-timeout-'))
+  const systemctlPath = path.join(temp, 'systemctl')
+  fs.writeFileSync(systemctlPath, '#!/bin/sh\ntrap "" TERM\nwhile :; do :; done\n', { mode: 0o755 })
+  const production = createProductionDependencyAdapters({
+    ...dependencies().deps.paths,
+    checkoutRoot: process.cwd(),
+    systemctl: systemctlPath,
+  }, undefined, { supervisorReadinessTimeoutMs: 60 })
+  const startedAt = Date.now()
+
+  try {
+    await expect(production.services.waitSupervisorReady({
+      ...owner,
+      checkoutRoot: process.cwd(),
+      supervisorExecutable: fs.realpathSync(process.execPath),
+      supervisorMainPid: 1001,
+    }, 'sha256:' + 'f'.repeat(64), {
+      installationId: 'installation-1', controlEpoch: 7,
+    })).rejects.toThrow(/systemctl timed out reading ActiveState/i)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 5_000)
+
+it('supervisor readiness retries a transient old MainPID and waits for authenticated Health identity', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'mr-supervisor-ready-'))
+  const activeStatePath = path.join(temp, 'active-state')
+  const mainPidPath = path.join(temp, 'main-pid')
+  const systemctlPath = path.join(temp, 'systemctl')
+  const adminCliPath = path.join(temp, 'supervisor-admin')
+  const healthCountPath = path.join(temp, 'health-count')
+  const healthArgsPath = path.join(temp, 'health-args')
+  const expectedImage = 'sha256:' + 'f'.repeat(64)
+  const socketPath = path.join(tempRoot, `s-${process.pid}.sock`)
+  const secretPath = path.join(temp, 'secret')
+  const child = spawn(process.execPath, [
+    '-e', 'setInterval(() => {}, 1000)', '--', '--image-ref', expectedImage,
+  ], { cwd: process.cwd(), stdio: 'ignore' })
+  const childReady = once(child, 'spawn')
+  const childExit = once(child, 'exit')
+  await childReady
+  const previousPid = child.pid! + 1
+  fs.writeFileSync(activeStatePath, 'active')
+  fs.writeFileSync(mainPidPath, String(previousPid))
+  fs.writeFileSync(secretPath, 'fixture secret')
+  fs.writeFileSync(systemctlPath, `#!/bin/sh
+case "$*" in
+  *ActiveState*) cat '${activeStatePath}' ;;
+  *MainPID*) cat '${mainPidPath}' ;;
+  *) exit 2 ;;
+esac
+`, { mode: 0o755 })
+  fs.writeFileSync(adminCliPath, `#!/bin/sh
+printf '%s' "$*" > '${healthArgsPath}'
+count=0
+if [ -f '${healthCountPath}' ]; then count=$(cat '${healthCountPath}'); fi
+count=$((count + 1))
+printf '%s' "$count" > '${healthCountPath}'
+if [ "$count" -eq 1 ]; then
+  printf '{"state":"starting"}\\n'
+else
+  printf '{"state":"ok","installationId":"installation-1","controlEpoch":8}\\n'
+fi
+`, { mode: 0o755 })
+  const server = net.createServer(socket => socket.destroy())
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+  const production = createProductionDependencyAdapters({
+    ...dependencies().deps.paths,
+    checkoutRoot: process.cwd(),
+    systemctl: systemctlPath,
+  })
+  const selected = {
+    ...owner,
+    checkoutRoot: process.cwd(),
+    supervisorExecutable: fs.realpathSync(process.execPath),
+    supervisorMainPid: previousPid,
+    adminCli: adminCliPath,
+    controlSocket: socketPath,
+    controlSecretFile: secretPath,
+  }
+  const pidTransition = setTimeout(() => fs.writeFileSync(mainPidPath, String(child.pid)), 50)
+
+  try {
+    const identity = await production.services.waitSupervisorReady(selected, expectedImage, {
+      installationId: 'installation-1', controlEpoch: 7,
+    })
+
+    expect(identity).toEqual({ installationId: 'installation-1', controlEpoch: 8 })
+    expect(Number(fs.readFileSync(healthCountPath, 'utf8'))).toBeGreaterThanOrEqual(2)
+    expect(fs.readFileSync(healthArgsPath, 'utf8')).toContain(`--socket ${socketPath} --secret-file ${secretPath} health`)
+  } finally {
+    clearTimeout(pidTransition)
+    child.kill('SIGTERM')
+    await childExit
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    await fs.promises.rm(socketPath, { force: true })
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+}, 10_000)
+
+it('interactive approval read pauses stdin so the updater can exit while the terminal remains open', async () => {
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-approval-'))
+  const readerPath = path.join(temp, 'reader.mjs')
+  const loader = fs.realpathSync('node_modules/tsx/dist/loader.mjs')
+  const modulePath = path.resolve('scripts/update-managed-runtime.ts')
+  fs.writeFileSync(readerPath, `
+import { readExactApprovalLine } from ${JSON.stringify(modulePath)}
+const value = await readExactApprovalLine()
+process.stdout.write(value)
+`)
+  const child = spawn(process.execPath, ['--import', loader, readerPath], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const childExit = once(child, 'exit')
+  let output = ''
+  child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString() })
+  child.stdin?.write('APPROVED\n')
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    child.stdin?.end()
+  }, 4_000)
+
+  try {
+    const [exitCode] = await childExit as [number]
+    expect(timedOut).toBe(false)
+    expect(exitCode).toBe(0)
+    expect(output).toBe('APPROVED')
+  } finally {
+    clearTimeout(timeout)
+    child.stdin?.end()
+    await childExit
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+}, 10_000)
 
 it('invalid update modes refuse before approval or handoff', async () => {
   const f = dependencies()
@@ -587,6 +1108,10 @@ it('flock contention logs and removes only this invocation approval without work
     }, f.deps)
 
     expect(result).toBe(75)
+    const workerCommand = vi.mocked(f.deps.handoff.runLockedWorker).mock.calls[0]?.[0].command
+    expect(workerCommand?.slice(0, 4)).toEqual([
+      f.deps.paths.node, '--import', f.deps.paths.tsxLoader, f.deps.paths.updaterScript,
+    ])
     expect(f.events).toContainEqual({
       event: 'update.lock_contention',
       severity: 'error',
@@ -614,6 +1139,7 @@ it('handoff completion and JSONL logging survive the launcher process exit', asy
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-boundary-'))
   const modulePath = path.resolve('scripts/update-managed-runtime.ts')
   const tsxEntry = fs.realpathSync('node_modules/tsx/dist/cli.mjs')
+  const tsxLoader = fs.realpathSync('node_modules/tsx/dist/loader.mjs')
   const workerPath = path.join(temp, 'worker.mts')
   const launcherPath = path.join(temp, 'launcher.mts')
   const runId = '20261101T123456789Z-abc123def456'
@@ -627,13 +1153,17 @@ import { spawn } from 'node:child_process'
 import { runManagedRuntimeUpdate } from ${JSON.stringify(modulePath)}
 const home = ${JSON.stringify(temp)}
 const deps = {
-  paths: { checkoutRoot: home, home, runtimeDirectory: home, node: process.execPath, tsxEntry: ${JSON.stringify(tsxEntry)}, updaterScript: ${JSON.stringify(modulePath)}, env: '/usr/bin/env', flock: '/usr/bin/flock', systemdRun: '/usr/bin/systemd-run', systemctl: '/usr/bin/systemctl', pnpm: '/usr/bin/pnpm', cargo: '/usr/bin/cargo', docker: '/usr/bin/docker', sqlite: '/usr/bin/sqlite3', toolPath: '/usr/bin' },
+  paths: { checkoutRoot: home, home, runtimeDirectory: home, node: process.execPath, tsxLoader: ${JSON.stringify(tsxLoader)}, updaterScript: ${JSON.stringify(modulePath)}, env: '/usr/bin/env', flock: '/usr/bin/flock', systemdRun: '/usr/bin/systemd-run', systemctl: '/usr/bin/systemctl', pnpm: '/usr/bin/pnpm', cargo: '/usr/bin/cargo', docker: '/usr/bin/docker', sqlite: '/usr/bin/sqlite3', toolPath: '/usr/bin' },
   approval: { async readLine() { throw new Error('default mode must not prompt') }, async create() { throw new Error('default mode must not create approval') }, async consume() { return false }, async remove() {} },
   handoff: { submit(request) { const child = spawn(process.execPath, [${JSON.stringify(tsxEntry)}, ${JSON.stringify(workerPath)}, request.logPath], { detached: true, stdio: 'ignore' }); child.unref(); return Promise.resolve(0) }, async runLockedWorker() { return 0 } },
   owner: { async resolve() { throw new Error('handoff worker owns update actions') }, async inspectGraph() { return { units: {} } } },
   artifacts: { async build() { throw new Error('handoff worker owns update actions') } },
   filesystem: { async webExecutableIdentity() { return { live: null, selected: null } }, async installExecutable() {}, async swapClientDirectory() {}, async installImageReference() {} },
-  services: { async stop() {}, async start() {}, async restart() {}, async isActive() { return false }, async state() { return 'inactive' }, async waitSupervisorReady() {}, async waitWebReady() {}, async waitCallbackReady() {} },
+  services: {
+    async stop() {}, async start() {}, async restart() {}, async isActive() { return false }, async state() { return 'inactive' },
+    async waitSupervisorReady() { return { installationId: 'installation-1', controlEpoch: 8 } },
+    async waitWebReady() {}, async waitCallbackReady() {},
+  },
   admin: { async candidateSchemaVersion() { return 19 }, async currentSchemaVersion() { return 19 }, async health() { return { state: 'ok' } }, async inventory() { return [] }, async maintenanceInventory() { return [] }, async stop() { return { outcome: 'backend_unavailable' } }, async reopen() { return { outcome: 'failed' } } },
   docker: { async buildImage() { return 'sha256:' + 'b'.repeat(64) }, async verifyDaemon() {} },
   logger: { async event() {}, async operator() {} },
@@ -860,9 +1390,11 @@ it('all mode stops ingress, fences the coding-soul reset, then installs and reop
       }),
     }
   })
+  let healthCount = 0
   f.deps.admin.health = vi.fn(async () => {
+    healthCount += 1
     f.effects.push('health')
-    return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: 7 }
+    return { state: 'ok' as const, installationId: 'installation-1', controlEpoch: healthCount <= 6 ? 7 : 8 }
   })
   f.deps.admin.reopen = vi.fn(async (candidate) => {
     f.effects.push(`reopen:${candidate.soulId}:${candidate.expectedIntentRevision}`)
@@ -957,7 +1489,7 @@ it('coding-provider souls are reset across prepared and recovering states while 
   expect(f.deps.admin.stop).not.toHaveBeenCalledWith('soul-shell', expect.anything(), expect.anything())
 })
 
-it('client directory swap preserves the old sibling and prevents web restart on activation failure', async () => {
+it('client directory rollback preserves the old client and keeps web stopped after server replacement', async () => {
   const f = dependencies()
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-runtime-swap-'))
   const source = path.join(temp, 'staged-client')
@@ -970,7 +1502,8 @@ it('client directory swap preserves the old sibling and prevents web restart on 
   const rename = async (from: Parameters<typeof fs.promises.rename>[0], to: Parameters<typeof fs.promises.rename>[1]) => {
     renameCount += 1
     if (renameCount === 1) return fs.promises.rename(from, to)
-    throw new Error('simulated second rename failure')
+    if (renameCount === 2) throw new Error('simulated second rename failure')
+    return fs.promises.rename(from, to)
   }
   f.deps.filesystem.swapClientDirectory = vi.fn(async () => swapDirectoryOnDestination(source, target, rename))
 
@@ -978,15 +1511,126 @@ it('client directory swap preserves the old sibling and prevents web restart on 
     const result = await runManagedRuntimeWorker('client', f.deps)
 
     expect(result).toBe(1)
-    expect(renameCount).toBe(2)
+    expect(renameCount).toBe(3)
     expect(f.deps.services.restart).not.toHaveBeenCalled()
+    expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
     const message = f.effects.find((effect) => effect.startsWith('operator:Client directory activation failed;'))
-    const retained = message?.match(/prior directory remains at (.+)\. The web service was not restarted\./)?.[1]
-    expect(retained).toBeDefined()
-    expect(fs.readFileSync(path.join(retained!, 'index.html'), 'utf8')).toBe('old client')
+    expect(message).toContain('prior client directory was restored')
+    expect(message).toContain('new server binary remains installed')
+    expect(message).toContain('web service will remain stopped')
+    expect(fs.readFileSync(path.join(target, 'index.html'), 'utf8')).toBe('old client')
+    expect(f.events).toContainEqual(expect.objectContaining({
+      event: 'update.web_restore_after_abort', restored: false,
+      restoration_error_code: 'mixed_client_server_versions',
+    }))
   } finally {
     await fs.promises.rm(temp, { recursive: true, force: true })
   }
+})
+
+it('client activation failure keeps web stopped and reports partial state when old directory rollback fails', async () => {
+  const f = dependencies()
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'managed-runtime-swap-rollback-'))
+  const source = path.join(temp, 'staged-client')
+  const target = path.join(temp, 'served-client')
+  fs.mkdirSync(source)
+  fs.mkdirSync(target)
+  fs.writeFileSync(path.join(source, 'index.html'), 'new client')
+  fs.writeFileSync(path.join(target, 'index.html'), 'old client')
+  let renameCount = 0
+  const rename = async (from: Parameters<typeof fs.promises.rename>[0], to: Parameters<typeof fs.promises.rename>[1]) => {
+    renameCount += 1
+    if (renameCount >= 2) throw new Error('simulated activation and rollback failure')
+    return fs.promises.rename(from, to)
+  }
+  f.deps.filesystem.swapClientDirectory = vi.fn(async () => swapDirectoryOnDestination(source, target, rename))
+
+  try {
+    const result = await runManagedRuntimeWorker('client', f.deps)
+
+    expect(result).toBe(1)
+    expect(fs.existsSync(target)).toBe(false)
+    expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+    expect(f.events).toContainEqual(expect.objectContaining({
+      event: 'update.web_restore_after_abort', restored: false,
+      restoration_error_code: 'client_directory_restore_failed',
+    }))
+    expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.failed', partial_state: true }))
+    expect(f.effects.some((effect) => /prior client directory could not be restored/.test(effect))).toBe(true)
+    expect(f.effects.some((effect) => /new server binary remains installed/.test(effect))).toBe(true)
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+})
+
+it('client staging failure keeps web stopped after the server binary is replaced', async () => {
+  const f = dependencies()
+  f.deps.filesystem.swapClientDirectory = vi.fn(async () => { throw new Error('staging directory could not be created') })
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(1)
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+  const message = f.effects.find((effect) => effect.startsWith('operator:Client directory activation failed:'))
+  expect(message).toContain('client directory state could not be verified')
+  expect(message).toContain('new server binary remains installed')
+  expect(message).toContain('web service will remain stopped')
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.web_restore_after_abort', restored: false,
+    restoration_error_code: 'client_directory_activation_failed',
+  }))
+})
+
+it('all-mode client rollback failure reports the restored client and stopped services', async () => {
+  const f = dependencies()
+  const tempRoot = path.resolve('.test-tmp')
+  fs.mkdirSync(tempRoot, { recursive: true })
+  const temp = fs.mkdtempSync(path.join(tempRoot, 'mr-all-client-rollback-'))
+  const source = path.join(temp, 'staged-client')
+  const target = path.join(temp, 'served-client')
+  fs.mkdirSync(source)
+  fs.mkdirSync(target)
+  fs.writeFileSync(path.join(source, 'index.html'), 'new client')
+  fs.writeFileSync(path.join(target, 'index.html'), 'old client')
+  let renameCount = 0
+  const rename = async (from: Parameters<typeof fs.promises.rename>[0], to: Parameters<typeof fs.promises.rename>[1]) => {
+    renameCount += 1
+    if (renameCount === 2) throw new Error('simulated activation failure')
+    return fs.promises.rename(from, to)
+  }
+  f.deps.filesystem.swapClientDirectory = vi.fn(async () => swapDirectoryOnDestination(source, target, rename))
+
+  try {
+    const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+    expect(result).toBe(1)
+    expect(renameCount).toBe(3)
+    expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+    const message = f.effects.find((effect) => effect.startsWith('operator:Client directory activation failed;'))
+    expect(message).toContain('prior client directory was restored')
+    expect(message).toContain('new managed-runtime binaries, workload image reference, and web server binary remain installed')
+    expect(message).toMatch(/supervisor and web services remain stopped/i)
+  } finally {
+    await fs.promises.rm(temp, { recursive: true, force: true })
+  }
+})
+
+it('all-mode client staging failure reports stopped services even when directory state is unknown', async () => {
+  const f = dependencies()
+  f.deps.filesystem.swapClientDirectory = vi.fn(async () => { throw new Error('staging directory could not be created') })
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.supervisorUnit)
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+  const message = f.effects.find((effect) => effect.startsWith('operator:Client directory activation failed:'))
+  expect(message).toContain('staging directory could not be created')
+  expect(message).toContain('new managed-runtime binaries, workload image reference, and web server binary remain installed')
+  expect(message).toContain('supervisor and web services remain stopped')
+  expect(message).toContain('manual recovery is required')
 })
 
 it('missing isolated Cargo target configuration leaves no staging directory', async () => {
@@ -1921,6 +2565,7 @@ it('reset completion reports post-start host and unknown ownership while leaving
       body: readCount === 1
         ? readinessReport()
         : readinessReport({
+          controlEpoch: 8,
           paneOwnership: {
             panes: [{
               clientId: 'reset-client', tabId: 'reset-tab', paneId: 'reset-pane', kind: 'fresh-agent',
@@ -2016,6 +2661,45 @@ it('reset update compares readiness with the deliberately restarted supervisor i
 
   expect(result).toBe(0)
   expect(f.events).toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+})
+
+it('reset update refuses success when the live supervisor identity did not advance after restart', async () => {
+  const f = dependencies()
+  f.deps.admin.inventory = vi.fn(async () => [])
+  f.deps.admin.health = vi.fn(async () => ({
+    state: 'ok' as const, installationId: 'installation-1', controlEpoch: 7,
+  }))
+  f.deps.services.waitSupervisorReady = vi.fn(async () => ({
+    installationId: 'installation-1', controlEpoch: 7,
+  }))
+  f.runtimeApi.respond('GET', '/api/runtime/readiness', () => ({
+    status: 200, body: readinessReport({ controlEpoch: 7 }),
+  }))
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/quiesce', (body) => {
+    const request = body as { ownerId: string }
+    return {
+      status: 200,
+      body: {
+        drained: true, readyToStop: true,
+        lease: { ownerId: request.ownerId, leaseId: 'fixture-lease', expiresInMs: 30_000 },
+        admission: { phase: 'quiesced', activePermits: 0 },
+        readiness: readinessReport({ controlEpoch: 7 }),
+      },
+    }
+  })
+  f.runtimeApi.respond('POST', '/api/runtime/maintenance/commit-stop', () => ({
+    status: 200,
+    body: { committed: true, readiness: readinessReport({ controlEpoch: 7 }), admission: { phase: 'shutdown-latched' } },
+  }))
+
+  const result = await runManagedRuntimeWorker('all', f.deps, '/run/user/1000/approval')
+
+  expect(result).toBe(1)
+  expect(f.events).not.toContainEqual(expect.objectContaining({ event: 'update.completed' }))
+  expect(f.deps.services.start).not.toHaveBeenCalledWith(owner.webUnit)
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.failed', error_code: 'update_failed', partial_state: true,
+  }))
 })
 
 it('readiness token stays out of args, logs, events, and operator output', async () => {
