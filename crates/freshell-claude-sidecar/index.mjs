@@ -150,7 +150,7 @@ import { randomBytes } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { nativeProfileDigest, nativeResourceDigest } from './native-profile-digest.mjs'
 import { createNativeSessionChannel, inspectNativeForkSource, nativeInputDigest } from './native-session-channel.mjs'
-import { concurrentNativeHookDecision } from './native-checkpoint-release.mjs'
+import { waitForNativeCheckpointRelease } from './native-checkpoint-release.mjs'
 import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
 import { spawnObservedNative } from './native-process.mjs'
 import { configureSession, userMessageContent } from './session-settings.mjs'
@@ -474,49 +474,11 @@ function exitWithoutSession(sdkQuery, code) {
   setTimeout(() => process.exit(code), EXIT_FLUSH_BUDGET_MS)
 }
 
-async function waitForNativeCheckpointRelease(state, input, generation, hookSignal, sessionId) {
-  if (state.nativePendingOperation) {
-    const decision = await concurrentNativeHookDecision(state, generation, hookSignal)
-    if (!decision.allowOrdinary) {
-      log(decision.reason === 'store_check_failed' ? 'warn' : 'info', 'native.concurrent_hook_denied', { sessionId, queryGeneration: generation,
-        reason: decision.reason, ...(decision.inputState ? { inputState: decision.inputState } : {}) })
-    }
-    return decision.allowOrdinary ? null : false
-  }
-  let release
-  const released = new Promise((resolve) => { release = resolve })
-  const pending = { generation, toolUseID: input.tool_use_id,
-    inputDigest: nativeInputDigest(input.tool_input), release }
-  state.nativePendingOperation = pending
-  const cancelled = () => release(false)
-  state.abort.signal.addEventListener('abort', cancelled, { once: true })
-  hookSignal?.addEventListener('abort', cancelled, { once: true })
-  try {
-    const record = await state.nativeStore.readRecoverable()
-    if (state.nativeContinuation) {
-      const original = state.nativeContinuation.checkpoint
-      return original.toolUseID === pending.toolUseID && original.inputDigest === pending.inputDigest
-    }
-    if (!record) return await state.nativeStore.inputState() === 'clear' ? null : false
-    if (record.toolUseID !== pending.toolUseID || record.inputDigest !== pending.inputDigest) return false
-    if (state.abort.signal.aborted || hookSignal?.aborted) return false
-    return await released && state.queryGeneration === generation && state.nativeReady
-      && state.nativeContinuation?.toolUseID === pending.toolUseID
-      && state.nativeContinuation?.inputDigest === pending.inputDigest
-  } catch {
-    return false
-  } finally {
-    state.abort.signal.removeEventListener('abort', cancelled)
-    hookSignal?.removeEventListener('abort', cancelled)
-    if (state.nativePendingOperation === pending) state.nativePendingOperation = undefined
-  }
-}
-
 async function routeNativePermission({ session, sessionId, req, launch, generation, toolName, input, options }) {
   let currentOptions = options
   if (session.nativeStore && req.resumeSessionId && !session.nativeContinuation) {
     const resumed = await waitForNativeCheckpointRelease(session,
-      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, sessionId)
+      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, sessionId, log)
     if (resumed === false) return { behavior: 'deny', message: 'Original native checkpoint has no current fenced release' }
   }
   const record = session.nativeContinuation
@@ -763,7 +725,7 @@ hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (in
           return {}
         }
         if (req.resumeSessionId && state.nativeStore) {
-          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal)
+          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal, sessionId, log)
           if (resumed !== null) return resumed ? {} : deny('Original native checkpoint has no current fenced release')
         }
         // SDK control callbacks and the output iterator have independent

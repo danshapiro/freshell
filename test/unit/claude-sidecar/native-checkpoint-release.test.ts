@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
-import { concurrentNativeHookDecision } from '../../../crates/freshell-claude-sidecar/native-checkpoint-release.mjs'
+import { concurrentNativeHookDecision, waitForNativeCheckpointRelease } from '../../../crates/freshell-claude-sidecar/native-checkpoint-release.mjs'
 
 const generation = 12
 
 function makeState(inputState: string | Promise<string>) {
   return {
     nativePendingOperation: { generation } as { generation: number } | undefined,
-    nativeStore: { inputState: vi.fn(() => Promise.resolve(inputState)) },
+    nativeStore: {
+      inputState: vi.fn(() => Promise.resolve(inputState)),
+      readRecoverable: vi.fn(async () => null),
+    },
     abort: new AbortController(),
     queryGeneration: generation,
     nativeReady: true,
@@ -35,6 +38,49 @@ describe('concurrent native checkpoint inspection', () => {
     state.nativePendingOperation = undefined
     check.resolve('clear')
     await expect(result).resolves.toEqual({ allowOrdinary: true, inputState: 'clear' })
+  })
+
+  it('routes a queued hook through ordinary policy after the first clear inspection releases its slot', async () => {
+    const firstCheck = deferred<string>()
+    const secondCheck = deferred<string>()
+    const state = makeState('clear')
+    state.nativePendingOperation = undefined
+    state.nativeStore.inputState.mockReturnValueOnce(firstCheck.promise).mockReturnValueOnce(secondCheck.promise)
+    const log = vi.fn()
+    const first = waitForNativeCheckpointRelease(state, { tool_use_id: 'first-tool', tool_input: { command: 'first' } }, generation,
+      undefined, 'session-current', log)
+    await expect.poll(() => state.nativeStore.inputState.mock.calls.length).toBe(1)
+
+    const second = waitForNativeCheckpointRelease(state, { tool_use_id: 'second-tool', tool_input: { command: 'second' } }, generation,
+      undefined, 'session-current', log)
+    expect(state.nativeStore.inputState).toHaveBeenCalledTimes(2)
+    firstCheck.resolve('clear')
+    await expect(first).resolves.toBeNull()
+    expect(state.nativePendingOperation).toBeUndefined()
+    secondCheck.resolve('clear')
+    await expect(second).resolves.toBeNull()
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it.each(['recoverable', 'blocked'])('keeps a queued hook denied after the first inspection clears when the store is %s', async (inputState) => {
+    const firstCheck = deferred<string>()
+    const secondCheck = deferred<string>()
+    const state = makeState('clear')
+    state.nativePendingOperation = undefined
+    state.nativeStore.inputState.mockReturnValueOnce(firstCheck.promise).mockReturnValueOnce(secondCheck.promise)
+    const log = vi.fn()
+    const first = waitForNativeCheckpointRelease(state, { tool_use_id: 'first-tool', tool_input: { command: 'first' } }, generation,
+      undefined, 'session-current', log)
+    await expect.poll(() => state.nativeStore.inputState.mock.calls.length).toBe(1)
+    const second = waitForNativeCheckpointRelease(state, { tool_use_id: 'second-tool', tool_input: { command: 'second' } }, generation,
+      undefined, 'session-current', log)
+    firstCheck.resolve('clear')
+    await expect(first).resolves.toBeNull()
+    secondCheck.resolve(inputState)
+    await expect(second).resolves.toBe(false)
+    expect(log).toHaveBeenCalledWith('info', 'native.concurrent_hook_denied', {
+      sessionId: 'session-current', queryGeneration: generation, reason: 'native_input_not_clear', inputState,
+    })
   })
 
   it.each(['recoverable', 'blocked'])('keeps concurrent input denied when the native store is %s', async (inputState) => {
