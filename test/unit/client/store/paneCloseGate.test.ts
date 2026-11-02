@@ -17,6 +17,7 @@ vi.mock('@/lib/ws-client', () => ({
         handlers.delete(handler)
       }
     },
+    onDisconnect: () => () => {},
   }),
 }))
 
@@ -58,6 +59,27 @@ function ackAllPaneCloses(extra: Record<string, unknown> = {}) {
     const m = msg as { type?: string; createRequestId?: string }
     if (m?.type === 'pane.closed' && m.createRequestId) {
       emit({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true, ...extra })
+    }
+  }
+}
+
+/** Confirm each Fresh Agent detach with the exact request and view identity. */
+function ackAllFreshAgentDetaches() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as {
+      type?: string
+      requestId?: string
+      viewId?: string
+      sessionRef?: { provider: string; sessionId: string }
+    }
+    if (m?.type === 'freshAgent.detach' && m.requestId && m.viewId) {
+      emit({
+        type: 'freshAgent.detached',
+        requestId: m.requestId,
+        viewId: m.viewId,
+        ...(m.sessionRef ? { sessionRef: m.sessionRef } : {}),
+        success: true,
+      })
     }
   }
 }
@@ -1326,6 +1348,9 @@ describe('focused-episode-7 round 4 (F2) — fresh-agent panes are gated exactly
   it('closePaneWithCleanup on a fresh-agent pane sends the CRID-only pane.closed and awaits the ack', async () => {
     const store = createMixedStore()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    expect(sentCallsOf('freshAgent.detach')).toHaveLength(1)
+    ackAllFreshAgentDetaches()
+    await vi.waitFor(() => expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-fa' }))
     // Gated: nothing moves before the ack; the message names the pane
     // identity the fresh-agent pane always carries (no terminalId — the
     // in-flight-create shape is the only shape this pane kind knows).
@@ -1339,6 +1364,8 @@ describe('focused-episode-7 round 4 (F2) — fresh-agent panes are gated exactly
   it('a failed fresh-agent pane close keeps the pane and re-asserts it open', async () => {
     const store = createMixedStore()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    ackAllFreshAgentDetaches()
+    await vi.waitFor(() => expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-fa' }))
     emit({ type: 'pane.closed.result', createRequestId: 'req-fa', success: false })
     await close
     expect(paneContents(store, 'tab-1')).toHaveLength(2)
@@ -1350,6 +1377,9 @@ describe('focused-episode-7 round 4 (F2) — fresh-agent panes are gated exactly
   it('replacePaneWithCleanup gates a fresh-agent pane too (the per-REMOVAL evidence, not per-kill)', async () => {
     const store = createMixedStore()
     const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    expect(sentCallsOf('freshAgent.detach')).toHaveLength(1)
+    ackAllFreshAgentDetaches()
+    await vi.waitFor(() => expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-fa' }))
     expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-fa' })
     expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-fa')?.content.kind).toBe('fresh-agent')
     ackAllPaneCloses()
@@ -1360,6 +1390,9 @@ describe('focused-episode-7 round 4 (F2) — fresh-agent panes are gated exactly
   it('a mixed whole-tab close carries BOTH identities in the ONE batch and re-asserts BOTH on failure', async () => {
     const store = createMixedStore()
     const close = store.dispatch(closeTab('tab-1'))
+    expect(sentCallsOf('freshAgent.detach')).toHaveLength(1)
+    ackAllFreshAgentDetaches()
+    await vi.waitFor(() => expect(sentCallsOf('panes.closed')).toHaveLength(1))
     const batches = sentCallsOf('panes.closed')
     expect(batches).toHaveLength(1)
     expect(batches[0].panes).toEqual([
@@ -1378,6 +1411,8 @@ describe('focused-episode-7 round 4 (F2) — fresh-agent panes are gated exactly
     ])
     // And the healthy path: an acked mixed batch removes the whole tab.
     const second = store.dispatch(closeTab('tab-1'))
+    ackAllFreshAgentDetaches()
+    await vi.waitFor(() => expect(sentCallsOf('panes.closed')).toHaveLength(2))
     ackPanesClosedBatches()
     await second
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
@@ -2395,6 +2430,9 @@ describe('delta-round-9 — the removal-refusal compensation', () => {
     }))
     mockSend.mockClear()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    expect(sentCallsOf('freshAgent.detach')).toHaveLength(1)
+    ackAllFreshAgentDetaches()
+    await vi.waitFor(() => expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-fa')).toHaveLength(1))
     expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-fa')).toHaveLength(1)
     store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-1' }))
     emit({ type: 'pane.closed.result', createRequestId: 'req-fa', success: true })
