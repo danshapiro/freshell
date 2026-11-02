@@ -1,12 +1,16 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
-import { collectAllTerminalIds, collectSessionPaneIdentities } from '@/lib/pane-utils'
+import { cancelCreate as markFreshAgentCreateCancelled } from '@/lib/create-cancellation'
+import { collectAllTerminalIds, collectPaneEntries, collectSessionPaneIdentities } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
 import { consumePaneCloseEvidenceMark } from '@/lib/pane-close-evidence-marks'
 import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles, closePane, removeLayout, replacePane } from './panesSlice'
 import type { PaneNode } from './paneTypes'
 
-type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> } }
+type PanesStateSlice = {
+  panes: { layouts: Record<string, PaneNode | undefined> }
+  freshAgent?: { pendingCreates?: Record<string, { sessionId?: string } | undefined> }
+}
 
 /**
  * These actions strip terminalIds ONLY for terminals the server itself
@@ -116,6 +120,35 @@ function collectRemovedPaneIdentities(
   return removed
 }
 
+/** A close can beat the server's create acknowledgment. Retract only the
+ * client-side queued copy; a create already received by the server continues
+ * under server ownership and its eventual result releases this exact view. */
+function cancelRemovedFreshAgentCreates(
+  before: PanesStateSlice['panes']['layouts'],
+  after: PanesStateSlice['panes']['layouts'],
+  state: PanesStateSlice,
+): void {
+  const afterIdentities = collectLayoutSessionPaneIdentities(after)
+  const ws = getWsClient()
+  for (const [tabId, layout] of Object.entries(before)) {
+    if (!layout) continue
+    for (const { paneId, content } of collectPaneEntries(layout)) {
+      if (content.kind !== 'fresh-agent') continue
+      const afterIdentity = afterIdentities.get(`${tabId}:${paneId}`)
+      if (afterIdentity?.createRequestId === content.createRequestId) continue
+
+      const pending = state.freshAgent?.pendingCreates?.[content.createRequestId]
+      const sessionId = content.sessionId
+        ?? pending?.sessionId
+        ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined)
+      if (sessionId) continue
+
+      markFreshAgentCreateCancelled(content.createRequestId, content.viewId ?? content.createRequestId)
+      ws.cancelCreate(content.createRequestId)
+    }
+  }
+}
+
 /**
  * Detach reconciler: whenever an action makes a terminalId disappear from
  * ALL pane layouts, the client no longer references that terminal and must
@@ -154,6 +187,7 @@ export const terminalDetachMiddleware: Middleware = (store) => (next) => (action
   // removal still journals, just without the gate's abort-on-failure
   // behavior.
   if (isPaneClose) {
+    cancelRemovedFreshAgentCreates(beforeLayouts, afterLayouts, store.getState() as PanesStateSlice)
     for (const removed of collectRemovedPaneIdentities(beforeLayouts, afterLayouts)) {
       if (consumePaneCloseEvidenceMark(removed.createRequestId)) continue
       getWsClient().send({

@@ -42,8 +42,11 @@ import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
 import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { unnamedTabTitle } from '@/lib/tab-title'
 import { getWsClient } from '@/lib/ws-client'
-import { detachFreshAgentView } from '@/lib/fresh-agent-view-attachment'
-import type { FreshAgentViewAttachment } from '@shared/fresh-agent-contract'
+import {
+  detachFreshAgentView,
+  freshAgentViewAttachmentForPane,
+  type LocatedFreshAgentViewAttachment,
+} from '@/lib/fresh-agent-view-attachment'
 import { selectPaneOwnerFence } from './selectors/runtimeOwner'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 
@@ -1228,7 +1231,7 @@ type FreshAgentViewCloseTarget = {
   paneId: string
   tabId: string
   content: Extract<PaneContent, { kind: 'fresh-agent' }>
-  attachment: FreshAgentViewAttachment & { sessionId: string }
+  attachment: LocatedFreshAgentViewAttachment
 }
 
 function collectFreshAgentViewCloseTargets(
@@ -1249,22 +1252,30 @@ function collectFreshAgentViewCloseTargets(
     // A still-pending create is canceled at the pane surface. Its late
     // created reply carries the saved viewId and is detached once the locator exists.
     if (!sessionId) return []
-    const sessionRef = content.sessionRef?.provider === content.provider
-      ? content.sessionRef
-      : { provider: content.provider, sessionId }
+    const attachment = freshAgentViewAttachmentForPane(content, sessionId)
+    if (!attachment) return []
     return [{
       paneId,
       tabId,
       content,
-      attachment: {
-        provider: content.provider,
-        sessionType: content.sessionType,
-        sessionId,
-        sessionRef,
-        viewId: content.viewId ?? content.createRequestId,
-      },
+      attachment,
     }]
   })
+}
+
+function collectFreshAgentViewsNotYetDetached(
+  layout: PaneNode | undefined,
+  tabId: string,
+  getState: () => unknown,
+  alreadyDetached: FreshAgentViewCloseTarget[],
+  paneIds?: ReadonlySet<string>,
+): FreshAgentViewCloseTarget[] {
+  const known = new Set(alreadyDetached.map((target) => (
+    `${target.attachment.viewId}\0${target.attachment.sessionId}`
+  )))
+  return collectFreshAgentViewCloseTargets(layout, tabId, getState, paneIds).filter((target) => (
+    !known.has(`${target.attachment.viewId}\0${target.attachment.sessionId}`)
+  ))
 }
 
 /** Re-establish every view after an uncertain or refused close transaction. */
@@ -1539,6 +1550,21 @@ export const closePaneWithCleanup = createAsyncThunk(
           return
         }
       }
+      const lateFreshAgentViews = collectFreshAgentViewsNotYetDetached(
+        (getState() as RootState).panes.layouts[tabId],
+        tabId,
+        getState,
+        freshAgentViews,
+        new Set([paneId]),
+      )
+      if (lateFreshAgentViews.length > 0) {
+        if (!await detachFreshAgentViews(lateFreshAgentViews, getState)) {
+          surfaceFreshAgentViewDetachFailure(dispatch, tabId, lateFreshAgentViews)
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
+        }
+        freshAgentViews.push(...lateFreshAgentViews)
+      }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         reattachFreshAgentViews(freshAgentViews, getState)
         log.warn('managed view detach was not confirmed; the pane stays', { tabId, paneId })
@@ -1667,6 +1693,21 @@ export const closeTab = createAsyncThunk(
         for (const identity of identities) {
           markPaneCloseEvidenceConfirmed(identity.createRequestId)
         }
+      }
+      const lateFreshAgentViews = collectFreshAgentViewsNotYetDetached(
+        (getState() as RootState).panes.layouts[tabId],
+        tabId,
+        getState,
+        freshAgentViews,
+        new Set(collectPaneIds(frozenLayout)),
+      )
+      if (lateFreshAgentViews.length > 0) {
+        if (!await detachFreshAgentViews(lateFreshAgentViews, getState)) {
+          surfaceFreshAgentViewDetachFailure(dispatch, tabId, lateFreshAgentViews)
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+          return
+        }
+        freshAgentViews.push(...lateFreshAgentViews)
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         reattachFreshAgentViews(freshAgentViews, getState)
@@ -1842,6 +1883,21 @@ export const replacePaneWithCleanup = createAsyncThunk(
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
+      }
+      const lateFreshAgentViews = collectFreshAgentViewsNotYetDetached(
+        (getState() as RootState).panes.layouts[tabId],
+        tabId,
+        getState,
+        freshAgentViews,
+        new Set([paneId]),
+      )
+      if (lateFreshAgentViews.length > 0) {
+        if (!await detachFreshAgentViews(lateFreshAgentViews, getState)) {
+          surfaceFreshAgentViewDetachFailure(dispatch, tabId, lateFreshAgentViews)
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
+        }
+        freshAgentViews.push(...lateFreshAgentViews)
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         reattachFreshAgentViews(freshAgentViews, getState)

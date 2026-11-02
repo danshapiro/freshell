@@ -16,11 +16,12 @@ import {
   markTerminalReleased,
   resetTerminalReleaseMarks,
 } from '@/lib/terminal-release-marks'
+import { consumeCancelledCreate, rememberCreateRoute, _resetCancelledCreates } from '@/lib/create-cancellation'
 
-const { mockSend } = vi.hoisted(() => ({ mockSend: vi.fn() }))
+const { mockSend, mockCancelCreate } = vi.hoisted(() => ({ mockSend: vi.fn(), mockCancelCreate: vi.fn() }))
 
 vi.mock('@/lib/ws-client', () => ({
-  getWsClient: () => ({ send: mockSend }),
+  getWsClient: () => ({ send: mockSend, cancelCreate: mockCancelCreate }),
 }))
 
 function createStore() {
@@ -67,7 +68,9 @@ function paneClosedMessages(): Array<{ type?: string; createRequestId?: string; 
 
 beforeEach(() => {
   mockSend.mockClear()
+  mockCancelCreate.mockClear()
   resetTerminalReleaseMarks()
+  _resetCancelledCreates()
 })
 
 describe('terminalDetachMiddleware', () => {
@@ -397,6 +400,27 @@ describe('terminalDetachMiddleware — durable pane-close evidence (delta-r7-r2 
       { type: 'pane.closed', createRequestId: 'req-1', terminalId: 'term-a' },
       { type: 'pane.closed', createRequestId: 'req-fa' },
     ])
+  })
+
+  it('cancels only the removed pending Fresh Agent view and leaves server-owned startup running', () => {
+    const store = createStore()
+    rememberCreateRoute('req-pending-view', { viewId: 'view-pending-a' })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-a', content: {
+      kind: 'fresh-agent',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      createRequestId: 'req-pending-view',
+      viewId: 'view-pending-a',
+      status: 'creating',
+    } }))
+    mockSend.mockClear()
+
+    store.dispatch(removeLayout({ tabId: 'tab-1' }))
+
+    expect(mockCancelCreate).toHaveBeenCalledExactlyOnceWith('req-pending-view')
+    expect(consumeCancelledCreate('req-pending-view', 'view-pending-a')).toBe(true)
+    expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-pending-view' })
+    expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
   it('NON-close removals NEVER journal pane-close evidence (updatePaneContent re-point, reconcile-fold family)', () => {

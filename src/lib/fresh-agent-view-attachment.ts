@@ -1,7 +1,14 @@
 import { nanoid } from 'nanoid'
 import type { FreshAgentViewAttachment } from '@shared/fresh-agent-contract'
+import type { SessionRef } from '@shared/session-contract'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { WsClient } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
+import {
+  consumeCancelledCreateRoute,
+  consumeCreateRoute,
+  getCreateRoute,
+} from '@/lib/create-cancellation'
 
 const log = createLogger('fresh-agent-view-attachment')
 
@@ -25,6 +32,54 @@ export class FreshAgentViewDetachError extends Error {
 }
 
 type FreshAgentViewWs = Pick<WsClient, 'send' | 'onMessage' | 'onDisconnect'>
+export type LocatedFreshAgentViewAttachment = FreshAgentViewAttachment & { sessionId: string }
+
+/** Resolve the connection-scoped attachment represented by one pane. */
+export function freshAgentViewAttachmentForPane(
+  content: Pick<FreshAgentPaneContent, 'provider' | 'sessionType' | 'createRequestId' | 'viewId' | 'sessionId' | 'sessionRef'>,
+  sessionIdOverride?: string,
+): LocatedFreshAgentViewAttachment | undefined {
+  const sessionId = sessionIdOverride
+    ?? content.sessionId
+    ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined)
+  const viewId = content.viewId?.trim() || content.createRequestId.trim()
+  if (!sessionId || !viewId) return undefined
+
+  const sessionRef: SessionRef = content.sessionRef?.provider === content.provider
+    && content.sessionRef.sessionId === sessionId
+    ? content.sessionRef
+    : { provider: content.provider, sessionId }
+  return {
+    provider: content.provider,
+    sessionType: content.sessionType,
+    sessionId,
+    sessionRef,
+    viewId,
+  }
+}
+
+/** Consume a late create result only when it still belongs to the canceled
+ * view; a replacement view may already own the same request route. */
+export function consumeCancelledFreshAgentCreateRoute(requestId: string): {
+  viewId?: string
+  matchesCurrentView: boolean
+} | undefined {
+  const cancelledRoute = consumeCancelledCreateRoute(requestId)
+  if (!cancelledRoute) return undefined
+
+  const currentRoute = getCreateRoute(requestId)
+  const matchesCurrentView = !cancelledRoute.viewId
+    || !currentRoute
+    || currentRoute.viewId === cancelledRoute.viewId
+  const route = matchesCurrentView
+    ? consumeCreateRoute(requestId, cancelledRoute.viewId)
+    : undefined
+
+  return {
+    viewId: cancelledRoute.viewId ?? route?.viewId,
+    matchesCurrentView,
+  }
+}
 
 /** Remove only this pane's connection-scoped delivery interest. The server
  * acknowledgement is correlated by both request and view because two panes
