@@ -413,6 +413,17 @@ function foldFreshAgentVerdict(
       if (verdict.reason === 'index_warming') {
         warmingRefs.push({ tabId, paneId })
         outcome.warming++
+      } else if (verdict.reason === 'session_store_unreadable') {
+        // Honest unreadable-store verdict (auto-restore-warming): the index
+        // PUBLISHED but this identity's store could not be read. NOT
+        // warming (post-readiness warming would be a lying label) — a
+        // per-pane error that preserves the session identity for a later
+        // reconnect-driven retry. Same discipline as the terminal arm.
+        dispatch(setPaneRestoreError({
+          tabId,
+          paneId,
+          restoreError: buildRestoreError('session_store_unreadable'),
+        }))
       } else {
         dispatch(setPaneRestoreError({
           tabId,
@@ -606,6 +617,17 @@ export function foldVerdicts(
           // the pane exactly as it is; `managed-runtime-recovery` reconciles
           // it from the supervisor inventory.
           outcome.managedDeferred++
+        } else if (verdict.reason === 'session_store_unreadable') {
+          // Honest unreadable-store verdict (auto-restore-warming): the
+          // index PUBLISHED but this identity's store could not be read.
+          // NOT warming (post-readiness warming would be a lying label) — a
+          // per-pane error that preserves the session identity for a later
+          // reconnect-driven retry.
+          dispatch(setPaneRestoreError({
+            tabId,
+            paneId,
+            restoreError: buildRestoreError('session_store_unreadable'),
+          }))
         } else {
           // provider_unavailable and any other terminal error reason:
           // per-pane restoreError via the provider-failure rendering path.

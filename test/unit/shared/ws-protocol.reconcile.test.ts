@@ -3,6 +3,10 @@ import {
   PaneReconcileRequestSchema,
   PaneReconcileResultSchema,
   ClientMessageSchema,
+  HelloSchema,
+  ReadyCapabilitiesSchema,
+  SessionsIndexReadySchema,
+  WS_PROTOCOL_VERSION,
 } from '@shared/ws-protocol'
 
 describe('pane.reconcile schemas', () => {
@@ -33,5 +37,32 @@ describe('pane.reconcile schemas', () => {
     }
     expect(PaneReconcileResultSchema.parse(result)).toBeTruthy()
     expect(PaneReconcileResultSchema.safeParse({ ...result, verdicts: [{ paneKey: 'x', verdict: 'retry' }] }).success).toBe(false)
+  })
+})
+
+describe('sessionIndexReadyV1 wire surface (auto-restore-warming Task 2)', () => {
+  it('declares the sessionIndexReadyV1 hello capability (strip hazard)', () => {
+    // HelloSchema is a zod non-strict object: an UNDECLARED key is silently
+    // STRIPPED on parse, so a capability that is only SENT (ws-client) but
+    // not DECLARED here would silently no-op. Assert the key SURVIVES.
+    const parsed = HelloSchema.safeParse({
+      type: 'hello',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      capabilities: { sessionIndexReadyV1: true },
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.success ? parsed.data.capabilities?.sessionIndexReadyV1 : undefined).toBe(true)
+  })
+
+  it('echoes sessionIndexReadyV1 in the ready capabilities (strip hazard)', () => {
+    // Same strip hazard as the hello capability: the ready echo must
+    // SURVIVE parsing, not merely parse successfully.
+    const parsed = ReadyCapabilitiesSchema.safeParse({ sessionIndexReadyV1: true })
+    expect(parsed.success).toBe(true)
+    expect(parsed.success ? parsed.data?.sessionIndexReadyV1 : undefined).toBe(true)
+  })
+
+  it('parses the sessions.index.ready server frame', () => {
+    expect(SessionsIndexReadySchema.safeParse({ type: 'sessions.index.ready' }).success).toBe(true)
   })
 })

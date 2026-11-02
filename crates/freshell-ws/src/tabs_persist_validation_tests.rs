@@ -118,3 +118,58 @@ fn wrong_typed_create_request_id_never_poisons_the_device() {
     assert_eq!(panes[1]["payload"]["createRequestId"], true);
     assert!(list_snapshot_devices(dir.path()).is_ok());
 }
+
+/// Auto-restore-warming Task 5: the persisted restore-error vocabulary gains
+/// `session_store_unreadable` (the honest unreadable-store verdict — the
+/// index is published; this identity's store could not be read). The change
+/// must land on BOTH vocabularies atomically (the TS `RestoreErrorReason`
+/// enum in shared/session-contract.ts and this Rust allowlist), because
+/// `validate_generation` gates BOTH the write-accept and read paths.
+#[test]
+fn restore_error_reason_session_store_unreadable_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut record = open_record("dev:t", "t", 1);
+    record["panes"] = json!([
+        { "paneId": "fresh", "kind": "fresh-agent",
+          "payload": { "sessionType": "freshclaude", "provider": "claude",
+                       "createRequestId": "req-fa-1",
+                       "restoreError": { "code": "RESTORE_UNAVAILABLE",
+                                         "reason": "session_store_unreadable" } } }
+    ]);
+    put(dir.path(), "dev", "c1", 1, 1000, vec![record.clone()]);
+    // Read path: the persisted latch must keep the device readable (a strict
+    // read failure poisons the whole device via all_generations_parsed).
+    assert!(
+        read_device_union(dir.path(), "dev")
+            .expect("session_store_unreadable latch must not corrupt the read")
+            .is_some(),
+        "a persisted session_store_unreadable latch must keep the device readable"
+    );
+    // Write-accept path: the same shared validator accepts it on push.
+    let candidate = json!({
+        "deviceId": "dev", "deviceLabel": "Dev", "clientInstanceId": "client-1",
+        "serverInstanceId": "srv-1", "snapshotRevision": 1, "capturedAt": 0,
+        "records": [record],
+    });
+    assert!(validate_incoming_generation(&candidate).is_ok());
+}
+
+/// The allowlist stays CLOSED: only the six legal reasons validate; an
+/// unknown reason still rejects on the write-accept path.
+#[test]
+fn restore_error_reason_unknown_still_rejects() {
+    let mut record = open_record("dev:t", "t", 1);
+    record["panes"] = json!([
+        { "paneId": "fresh", "kind": "fresh-agent",
+          "payload": { "sessionType": "freshclaude", "provider": "claude",
+                       "createRequestId": "req-fa-1",
+                       "restoreError": { "code": "RESTORE_UNAVAILABLE",
+                                         "reason": "not_a_legal_reason" } } }
+    ]);
+    let candidate = json!({
+        "deviceId": "dev", "deviceLabel": "Dev", "clientInstanceId": "client-1",
+        "serverInstanceId": "srv-1", "snapshotRevision": 1, "capturedAt": 0,
+        "records": [record],
+    });
+    assert!(validate_incoming_generation(&candidate).is_err());
+}

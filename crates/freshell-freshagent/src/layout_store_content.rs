@@ -127,12 +127,16 @@ pub fn is_valid_percent(n: f64) -> bool {
 const FRESH_AGENT_SESSION_TYPES: [&str; 4] =
     ["freshclaude", "freshcodex", "kilroy", "freshopencode"];
 
-const RESTORE_ERROR_REASONS: [&str; 5] = [
+const RESTORE_ERROR_REASONS: [&str; 6] = [
     "missing_canonical_identity",
     "invalid_legacy_restore_target",
     "dead_live_handle",
     "provider_runtime_failed",
     "durable_artifact_missing",
+    // Auto-restore-warming: the honest unreadable-store verdict (twin of
+    // shared/session-contract.ts RestoreErrorReasonSchema and the
+    // shared/fresh-agent.ts RESTORE_ERROR_REASONS Set).
+    "session_store_unreadable",
 ];
 
 /// Keys the migration re-derives (`shared/fresh-agent.ts:254-263`).

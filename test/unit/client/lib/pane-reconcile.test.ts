@@ -562,6 +562,23 @@ describe('foldVerdicts', () => {
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
   })
 
+  it('folds error{session_store_unreadable} into an honest per-pane restore error, never warming', () => {
+    // Honest unreadable-store verdict (auto-restore-warming): the index is
+    // PUBLISHED but this identity's store could not be read — NOT warming
+    // (post-readiness warming would be a lying label). A per-pane error
+    // that preserves the session identity for a later reconnect retry.
+    const { req, dispatch, dispatched } = foldHarness([['error', { reason: 'session_store_unreadable' }]])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.warming).toBe(0)
+    expect(dispatched.countOf(setReconcileWarming.type)).toBe(0)
+    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+    expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'session_store_unreadable' },
+    })
+  })
+
   it('invalid becomes a per-pane restoreError and counts as invalid', () => {
     const { req, dispatch, dispatched } = foldHarness([['invalid', { reason: 'unsupported_kind' }]])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))

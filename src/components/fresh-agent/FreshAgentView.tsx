@@ -915,6 +915,11 @@ function getRestoreErrorMessage(reason: RestoreErrorReason): string {
       return 'This session cannot be resumed because the saved session artifact is no longer available.'
     case 'provider_runtime_failed':
       return 'This session cannot be resumed because the provider runtime rejected the restore request.'
+    case 'session_store_unreadable':
+      // Auto-restore-warming: the session index published, but this
+      // identity's saved store could not be read. Honest error — never
+      // warming; reconnecting retries once the store is readable.
+      return 'This session cannot be resumed because its saved session store could not be read. Reconnecting will retry once the store is readable.'
     default:
       return 'This session cannot be resumed.'
   }
