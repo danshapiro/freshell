@@ -567,6 +567,12 @@ function recordInputFileReads(method, params) {
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
+function appendNativeLifecycle(event) {
+  const logPath = behavior.appendNativeLifecycleLogPath
+  if (!logPath) return
+  fs.mkdirSync(path.dirname(logPath), { recursive: true })
+  fs.appendFileSync(logPath, `${JSON.stringify({ event, pid: process.pid, at: new Date().toISOString() })}\n`, 'utf8')
+}
 if (process.env.FAKE_CODEX_APP_SERVER_ARG_LOG) {
   fs.writeFileSync(process.env.FAKE_CODEX_APP_SERVER_ARG_LOG, JSON.stringify({
     argv: process.argv.slice(2),
@@ -651,6 +657,10 @@ const wss = portFile
       fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
     })
   : new WebSocketServer({ host, port })
+
+if (behavior.appendNativeLifecycleLogPath) {
+  wss.once('listening', () => appendNativeLifecycle('native_boot'))
+}
 const watches = new Map()
 const activeThreadIds = new Set()
 // kata 1wxv (LBC-1): thread/revert is paginated-only. Threads THIS process
@@ -1202,6 +1212,7 @@ process.on('SIGTERM', () => {
   if (process.env.FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM === '1') {
     return
   }
+  appendNativeLifecycle('native_stop')
   if (behavior.signalFileOnSigterm) {
     fs.writeFileSync(behavior.signalFileOnSigterm, `${process.pid}\n`, 'utf8')
   }

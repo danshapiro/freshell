@@ -202,6 +202,7 @@ describe('fresh-agent-ws', () => {
       resumeSessionId: 'thread-1',
       sessionType: 'freshcodex',
       provider: 'codex',
+      viewId: 'view-1',
     })
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
@@ -218,13 +219,14 @@ describe('fresh-agent-ws', () => {
     })
   })
 
-  it('kills a late freshAgent.created session when its create request was cancelled', () => {
+  it('detaches a late freshAgent.created view when its create request was cancelled', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
 
     registerFreshAgentCreate(store.dispatch, 'req-orphan', {
       sessionType: 'freshcodex',
       provider: 'codex',
+      viewId: 'view-orphan',
     })
     cancelCreate('req-orphan')
 
@@ -237,23 +239,26 @@ describe('fresh-agent-ws', () => {
     }, ws)
 
     expect(handled).toBe(true)
-    expect(ws.send).toHaveBeenCalledWith({
-      type: 'freshAgent.kill',
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
+      requestId: expect.any(String),
+      viewId: 'view-orphan',
       sessionId: 'thread-orphan',
       sessionType: 'freshcodex',
       provider: 'codex',
-    })
+    }))
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
     expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-orphan']).toBeUndefined()
   })
 
-  it('routes a cancelled late FreshOpenCode create cleanup through the original cwd', () => {
+  it('routes a cancelled late FreshOpenCode create cleanup to its original view', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
 
     registerFreshAgentCreate(store.dispatch, 'req-opencode-orphan', {
       sessionType: 'freshopencode',
       provider: 'opencode',
-      cwd: '/repo/route-aware',
+      viewId: 'view-opencode-orphan',
     })
     cancelCreate('req-opencode-orphan')
 
@@ -266,13 +271,14 @@ describe('fresh-agent-ws', () => {
     }, ws)
 
     expect(handled).toBe(true)
-    expect(ws.send).toHaveBeenCalledWith({
-      type: 'freshAgent.kill',
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
+      requestId: expect.any(String),
+      viewId: 'view-opencode-orphan',
       sessionId: 'ses_orphan',
       sessionType: 'freshopencode',
       provider: 'opencode',
-      cwd: '/repo/route-aware',
-    })
+    }))
     expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_orphan']).toBeUndefined()
   })
 
@@ -306,7 +312,7 @@ describe('fresh-agent-ws', () => {
     registerFreshAgentCreate(store.dispatch, 'req-reserved-1', {
       sessionType: 'freshclaude',
       provider: 'claude',
-      cwd: '/repo/reserved-route',
+      viewId: 'view-reserved-1',
     })
 
     const handled = handleFreshAgentMessage(store.dispatch, {
@@ -319,8 +325,7 @@ describe('fresh-agent-ws', () => {
     expect(handled).toBe(true)
     expect(store.getState().freshAgent.pendingCreateFailures['req-reserved-1']).toBeUndefined()
 
-    // Route NOT consumed: a later cancelled created still routes its cleanup
-    // kill through the ORIGINAL cwd (the observable the route carries).
+    // Route NOT consumed: a later cancelled created still detaches its view.
     cancelCreate('req-reserved-1')
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
@@ -329,13 +334,14 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
     }, ws)
-    expect(ws.send).toHaveBeenCalledWith({
-      type: 'freshAgent.kill',
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
+      requestId: expect.any(String),
+      viewId: 'view-reserved-1',
       sessionId: 'ses_reserved_late',
       sessionType: 'freshclaude',
       provider: 'claude',
-      cwd: '/repo/reserved-route',
-    })
+    }))
   })
 
   it('non-reserved create.failed still projects into pendingCreateFailures (regression)', () => {
@@ -382,6 +388,7 @@ describe('fresh-agent-ws', () => {
     registerFreshAgentCreate(store.dispatch, 'req-placeholder', {
       sessionType: 'freshopencode',
       provider: 'opencode',
+      viewId: 'view-placeholder',
     })
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
@@ -1540,6 +1547,7 @@ describe('runtime-owner folds (kata b8ke)', () => {
     registerFreshAgentCreate(store.dispatch, 'req-owner-conflict', {
       sessionType: 'freshcodex',
       provider: 'codex',
+      viewId: 'view-owner-conflict',
     })
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.create.failed',
@@ -1562,12 +1570,13 @@ describe('runtime-owner folds (kata b8ke)', () => {
     })
   })
 
-  it('the cancelled-create cleanup kill carries the observed ownership fence', () => {
+  it('the cancelled-create cleanup detaches its view without terminating the session', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
     registerFreshAgentCreate(store.dispatch, 'req-orphan-fence', {
       sessionType: 'freshcodex',
       provider: 'codex',
+      viewId: 'view-orphan-fence',
     })
     cancelCreate('req-orphan-fence')
     const handled = handleFreshAgentMessage(store.dispatch, {
@@ -1583,21 +1592,23 @@ describe('runtime-owner folds (kata b8ke)', () => {
     ))
     expect(handled).toBe(true)
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
+      type: 'freshAgent.detach',
+      requestId: expect.any(String),
+      viewId: 'view-orphan-fence',
       sessionId: 'thread-orphan-fence',
       sessionType: 'freshcodex',
       provider: 'codex',
-      observedEpoch: 4,
-      observedGeneration: 9,
     }))
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
-  it('the cancelled-create cleanup kill stays legacy-unfenced when no owner record is known', () => {
+  it('a cancelled late create always routes detach through its saved view id', () => {
     const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
     registerFreshAgentCreate(store.dispatch, 'req-orphan-plain', {
       sessionType: 'freshcodex',
       provider: 'codex',
+      viewId: 'view-orphan-plain',
     })
     cancelCreate('req-orphan-plain')
     handleFreshAgentMessage(store.dispatch, {
@@ -1607,9 +1618,12 @@ describe('runtime-owner folds (kata b8ke)', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
     }, ws, () => undefined)
-    const sent = ws.send.mock.calls[0][0] as Record<string, unknown>
-    expect(sent.observedEpoch).toBeUndefined()
-    expect(sent.observedGeneration).toBeUndefined()
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.detach',
+      viewId: 'view-orphan-plain',
+      sessionId: 'thread-orphan-plain',
+    }))
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 })
 

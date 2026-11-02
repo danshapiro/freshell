@@ -22,8 +22,6 @@ import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 import { getWsClient } from '@/lib/ws-client'
-import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
-import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import { api } from '@/lib/api'
 import { isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
@@ -39,14 +37,8 @@ import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import {
-  clearPendingCreate as clearFreshAgentPendingCreate,
-  removeSession as removeFreshAgentSession,
-  sessionError as freshAgentSessionError,
-} from '@/store/freshAgentSlice'
 import { buildFreshAgentPaneContent } from '@/lib/fresh-agent-create-content'
 import { cancelCreate } from '@/lib/create-cancellation'
-import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup } from '@/store/types'
@@ -385,72 +377,21 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     if (content.kind === 'fresh-agent') {
       clearDraft(paneId)
       const pendingCreate = freshAgentPendingCreates[content.createRequestId]
-      const pendingSessionId = pendingCreate?.sessionId
-      // b8ke ext r6 F3: the kill target is the pane's DURABLE session —
-      // content.sessionId OR the provider-matched sessionRef.sessionId
-      // (pre-r6 a sessionRef-only restored pane skipped the kill and
-      // removed the pane while its runtime kept running — the same
-      // fallback the replacement/restart actions took in ext F2).
       const sessionId = content.sessionId
-        || pendingSessionId
-        || (content.sessionRef?.provider === content.provider
-          ? content.sessionRef.sessionId
-          : undefined)
-      if (sessionId) {
-        const cwd = getFreshOpenCodeRouteCwd(content, { freshAgentSessions, sessionId })
-        // b8ke ext r6 F4: the close carries the pane's observed
-        // (epoch, generation) fence so the server's generation fencing
-        // typed-refuses a stale close — the WS client queues across
-        // disconnects, and an old close arriving after a
-        // handoff-away-and-back must never kill the NEWER generation's
-        // runtime.
-        const fence = selectPaneOwnerFence(appStore.getState(), content)
-        // Focused-episode-6 round 2 (Finding 6): AWAIT the killed answer
-        // before dropping the pane — a close the server did NOT confirm
-        // durable is not a close. `success:false` (and the bounded 5s
-        // timeout) leaves the pane standing: the server-answered failure
-        // already surfaces through the pane's ordinary session-error banner
-        // (the freshAgent.killed fold writes it); an unanswered wait
-        // surfaces there too (same banner surface, timeout copy).
-        void sendFreshAgentKillAndAwait({
-          sessionId,
-          sessionType: content.sessionType,
-          provider: content.provider,
-          ...(cwd ? { cwd } : {}),
-          ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
-        }).then((ack) => {
-          if (!ack.ok) {
-            // The pane's ordinary session-error banner carries the failure
-            // (idempotent with the freshAgent.killed fold's own write — one
-            // shared copy, kill-ack.ts).
-            dispatch(freshAgentSessionError({
-              sessionId,
-              sessionType: content.sessionType,
-              provider: content.provider,
-              code: 'KILL_FAILED',
-              message: ack.timedOut ? KILL_ACK_TIMEOUT_MESSAGE : KILL_FAILED_MESSAGE,
-            }))
-            return
-          }
-          if (!content.sessionId && pendingSessionId) {
-            dispatch(removeFreshAgentSession({
-              sessionId: pendingSessionId,
-              sessionType: content.sessionType,
-              provider: content.provider,
-            }))
-            dispatch(clearFreshAgentPendingCreate({ requestId: content.createRequestId }))
-          }
-          dispatch(closePaneWithCleanup({ tabId, paneId }))
-        })
-        return
+        || pendingCreate?.sessionId
+        || (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined)
+      if (!sessionId) {
+        // A create with no locator yet cannot be detached. Retract it locally;
+        // if the provider finishes later, its create acknowledgment fold
+        // sends a view detach using the remembered viewId.
+        cancelCreate(content.createRequestId)
+        ws.cancelCreate(content.createRequestId)
       }
-      cancelCreate(content.createRequestId)
-      ws.cancelCreate(content.createRequestId)
     }
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [appStore, dispatch, freshAgentPendingCreates, freshAgentSessions, tabId, ws])
+  }, [dispatch, freshAgentPendingCreates, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     // Decision 1: visiting any pane of the tab (a click into it) dismisses the

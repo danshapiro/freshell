@@ -12,6 +12,7 @@ import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
+import { FreshAgentViewAttachmentSchema } from './fresh-agent-contract.js'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
 import { TabNameSourceSchema } from './session-names.js'
 import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage, ManagedRuntimeRecoverySummary } from './managed-runtime.js'
@@ -849,6 +850,8 @@ export const CodingCliKillSchema = z.object({
 export const FreshAgentCreateSchema = z.object({
   type: z.literal('freshAgent.create'),
   requestId: z.string().min(1),
+  /** Connection-scoped delivery identity for this pane; older clients omit it. */
+  viewId: z.string().min(1).optional(),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']).optional(),
   cwd: z.string().optional(),
@@ -887,6 +890,8 @@ export const FreshAgentCreateSchema = z.object({
 export const FreshAgentAttachSchema = z.object({
   type: z.literal('freshAgent.attach'),
   sessionId: z.string().min(1),
+  /** Connection-scoped delivery identity for this pane; older clients omit it. */
+  viewId: z.string().min(1).optional(),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
   /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
@@ -902,6 +907,12 @@ export const FreshAgentAttachSchema = z.object({
    *  (epoch, generation) pair. */
   observedEpoch: z.number().int().nonnegative().optional(),
   observedGeneration: z.number().int().nonnegative().optional(),
+})
+
+export const FreshAgentDetachSchema = z.object({
+  type: z.literal('freshAgent.detach'),
+  requestId: z.string().min(1),
+  ...FreshAgentViewAttachmentSchema.shape,
 })
 
 export const FreshAgentSendSchema = z.object({
@@ -1121,6 +1132,7 @@ export const FreshAgentRedoSchema = z.object({
 export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
+  FreshAgentDetachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
   FreshAgentConfigureSchema,
@@ -1299,6 +1311,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliKillSchema,
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
+  FreshAgentDetachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
   FreshAgentConfigureSchema,
@@ -1935,6 +1948,7 @@ export type FreshAgentCheckpointOutcome = z.infer<typeof FreshAgentCheckpointOut
 
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
+  | { type: 'freshAgent.detached'; requestId: string; viewId: string; sessionRef?: { provider: string; sessionId: string }; success: boolean; code?: string; message?: string }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
       /** kata b8ke: ownership-conflict refusals only — the owning kind, its
        *  generation, and the emitting server's boot epoch, so the client

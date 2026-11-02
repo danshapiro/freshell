@@ -62,15 +62,17 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator,
-    SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated,
-    TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
-    TerminalResize, FRESH_AGENT_DISABLED_REFUSAL, LEGACY_RESUME_IDENTITY_REFUSAL,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentDetached,
+    FreshAgentEvent, PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage,
+    SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
+    TerminalCreated, TerminalDetach, TerminalIdOnly, TerminalInputBlocked,
+    TerminalInputBlockedReason, TerminalKill, TerminalResize, FRESH_AGENT_DISABLED_REFUSAL,
+    LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
+use crate::fresh_agent_view_routes::FreshAgentViewRoutes;
 use crate::WsState;
 
 #[cfg(test)]
@@ -416,6 +418,9 @@ async fn run_loop(
     // registry-side deferrals die with the subscribers remove_connection
     // sweeps), a detach cancels one, a re-attach replaces it.
     let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+    // Fresh Agent event subscriptions belong to this socket and disappear
+    // with it. They never own or stop a provider runtime.
+    let mut fresh_agent_views = FreshAgentViewRoutes::default();
     // Round-2 finding F1 + E2R1 finding 1 + E2R2 finding: the
     // connection's staged-exit routing. A natural exit while a paced
     // session's deferral is armed STAGES the exit registry-side (final
@@ -592,7 +597,7 @@ async fn run_loop(
             inbound = ws_rx.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_client_text(
+                        if !handle_client_text_with_view_routes(
                             text.as_str(),
                             &mut ws_tx,
                             state,
@@ -607,6 +612,7 @@ async fn run_loop(
                             &mut host_stats_last_refresh_at,
                             &mut conn_identity,
                             &mut paced_sessions,
+                            &mut fresh_agent_views,
                             &paced_exit_notify,
                         )
                         .await
@@ -715,6 +721,9 @@ async fn run_loop(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
+                        if !fresh_agent_views.should_deliver(&json) {
+                            continue;
+                        }
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             close_reason = "send_error";
                             break;
@@ -887,6 +896,7 @@ async fn run_loop(
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
 /// connection (only on an unrecoverable send failure).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, one call site.
 async fn handle_client_text(
     text: &str,
@@ -914,12 +924,52 @@ async fn handle_client_text(
     // paced_exit_rx arm routes it into the exit-drain.
     paced_exit_notify: &Option<freshell_terminal::PacedExitNotify>,
 ) -> bool {
+    let mut fresh_agent_views = FreshAgentViewRoutes::default();
+    handle_client_text_with_view_routes(
+        text,
+        ws_tx,
+        state,
+        conn_id,
+        conn_sink,
+        terminal_output_batch_v1,
+        paced_terminal_replay_v1,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        interactive_create_tx,
+        create_cancel_rx,
+        host_stats_last_refresh_at,
+        conn_identity,
+        paced_sessions,
+        &mut fresh_agent_views,
+        paced_exit_notify,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, one call site.
+async fn handle_client_text_with_view_routes(
+    text: &str,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+    conn_id: u64,
+    conn_sink: &FrameSink,
+    terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
+    pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
+    interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
+    create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    host_stats_last_refresh_at: &mut Option<std::time::Instant>,
+    conn_identity: &mut ConnectionIdentity,
+    paced_sessions: &mut crate::paced_replay::PacedSessions,
+    fresh_agent_views: &mut FreshAgentViewRoutes,
+    paced_exit_notify: &Option<freshell_terminal::PacedExitNotify>,
+) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return true;
     };
-
     // The `tabs.sync.*` family is carried as opaque envelopes (its records aren't
     // in the typed `ClientMessage` enum), so dispatch it from the raw JSON before
     // the typed parse — mirrors the dedicated `case 'tabs.sync.*'` arms in
@@ -1027,6 +1077,10 @@ async fn handle_client_text(
         }
     }
 
+    // Ignore unsupported or malformed raw legacy-restore frames above before
+    // changing connection-local view interest. Valid routed Fresh Agent frames
+    // are observed before the typed dispatch below.
+    fresh_agent_views.observe_client_value(&value);
     let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
@@ -1894,7 +1948,9 @@ async fn handle_client_text(
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
             if state.fresh_codex.is_enabled() {
+                let request_id = create.request_id.clone();
                 let Some(create) = freshell_protocol::direct_provider_create(create) else {
+                    fresh_agent_views.forget_create(&request_id);
                     return true;
                 };
                 // D8 (restore-open-sessions-only): thread this connection's
@@ -1955,9 +2011,39 @@ async fn handle_client_text(
                     owner_generation: None,
                     owner_epoch: None,
                 });
+                fresh_agent_views.forget_create(&create.request_id);
                 return send(ws_tx, &reply).await;
             }
             true
+        }
+        ClientMessage::FreshAgentDetach(detach) => {
+            // This is only a connection-local subscription update. It does
+            // not reach any provider runtime or durable ownership state.
+            fresh_agent_views.detach_view(&detach.view_id);
+            let session_ref = detach.session_ref.or_else(|| {
+                detach.session_id.map(|session_id| SessionLocator {
+                    provider: match detach.provider {
+                        AgentProvider::Claude => "claude",
+                        AgentProvider::Codex => "codex",
+                        AgentProvider::Opencode => "opencode",
+                        AgentProvider::Amplifier => "amplifier",
+                    }
+                    .to_string(),
+                    session_id,
+                })
+            });
+            send(
+                ws_tx,
+                &ServerMessage::FreshAgentDetached(FreshAgentDetached {
+                    request_id: detach.request_id,
+                    view_id: detach.view_id,
+                    session_ref,
+                    success: true,
+                    code: None,
+                    message: None,
+                }),
+            )
+            .await
         }
         // `freshAgent.attach` (PR-4, reload-rehydrate): route codex/opencode to their
         // handlers (re-emit a status snapshot, transparently recover a crashed codex

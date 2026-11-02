@@ -52,6 +52,7 @@ const {
   cancelCreateSpy,
   cancelWsCreateSpy,
   wsMessageHandlers,
+  wsDisconnectHandlers,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -75,6 +76,7 @@ const {
   cancelCreateSpy: vi.fn(),
   cancelWsCreateSpy: vi.fn(),
   wsMessageHandlers: new Set<(msg: unknown) => void>(),
+  wsDisconnectHandlers: new Set<() => void>(),
 }))
 
 /** Deliver a server frame to every subscribed ws handler (the kill-ack waits). */
@@ -97,16 +99,17 @@ function ackPaneClosesMocked() {
   }
 }
 
-/** Answer the in-flight fresh-agent kills with success. */
-function ackFreshAgentKillsMocked() {
+/** Resolve a scoped Fresh Agent view detach only when the caller explicitly
+ * releases that acknowledgement in a test. */
+function ackFreshAgentDetachesMocked() {
   for (const [msg] of mockSend.mock.calls) {
-    const m = msg as { type?: string; sessionId?: string; sessionType?: string; provider?: string }
-    if (m?.type === 'freshAgent.kill' && m.sessionId) {
+    const m = msg as { type?: string; viewId?: string; requestId?: string; sessionRef?: unknown }
+    if (m?.type === 'freshAgent.detach' && m.viewId && m.requestId) {
       emitWsMessage({
-        type: 'freshAgent.killed',
-        sessionId: m.sessionId,
-        sessionType: m.sessionType,
-        provider: m.provider,
+        type: 'freshAgent.detached',
+        viewId: m.viewId,
+        requestId: m.requestId,
+        sessionRef: m.sessionRef,
         success: true,
       })
     }
@@ -139,6 +142,12 @@ vi.mock('@/lib/ws-client', () => ({
       wsMessageHandlers.add(handler)
       return () => {
         wsMessageHandlers.delete(handler)
+      }
+    },
+    onDisconnect: (handler: () => void) => {
+      wsDisconnectHandlers.add(handler)
+      return () => {
+        wsDisconnectHandlers.delete(handler)
       }
     },
   }),
@@ -466,6 +475,8 @@ const createMockResponse = (data: unknown, ok = true) => ({
 describe('PaneContainer', () => {
   beforeEach(() => {
     mockSend.mockClear()
+    wsMessageHandlers.clear()
+    wsDisconnectHandlers.clear()
     mockTerminalView.mockClear()
     mockFreshAgentView.mockClear()
     mockBrowserPane.mockClear()
@@ -496,7 +507,7 @@ describe('PaneContainer', () => {
   })
 
   describe('terminal cleanup on pane close', () => {
-    it('closes a managed Fresh Agent after kill hides its view before inventory reaches the browser', async () => {
+    it('detaches a managed Fresh Agent view and closes it without killing its shared session', async () => {
       const node: PaneNode = {
         type: 'leaf', id: 'pane-managed-close',
         content: {
@@ -507,27 +518,28 @@ describe('PaneContainer', () => {
         },
       }
       const store = createStore({ layouts: { 'tab-1': node }, activePane: { 'tab-1': node.id } })
-      let stopped = false
+      let detachConfirmed = false
       mockManagedVisibility.mockImplementation(async (viewId, visibility, revision, soulRevision) => {
-        expect(stopped).toBe(true)
+        expect(detachConfirmed).toBe(true)
         expect([viewId, visibility, revision, soulRevision]).toEqual(['managed-close-view', 'detached', 2, 7])
-        // The real supervisor contract verifies that the hidden, verified
-        // stopped view satisfies this stale detach without a new mutation.
         return { viewId, soulId: 'managed-close-soul', visibility: 'hidden', revision: 3, soulIntentRevision: 8 }
       })
       renderWithStore(<PaneContainer tabId="tab-1" node={node} />, store)
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
-      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'managed-close-thread' }))
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.detach', viewId: 'managed-close-create', sessionId: 'managed-close-thread',
+      }))
+      expect(mockSend.mock.calls.some(([msg]) => msg.type === 'freshAgent.kill')).toBe(false)
       expect(mockManagedVisibility).not.toHaveBeenCalled()
-      stopped = true
-      await act(async () => ackFreshAgentKillsMocked())
+      detachConfirmed = true
+      await act(async () => ackFreshAgentDetachesMocked())
       await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ type: 'panes.closed' })))
       expect(store.getState().panes.layouts['tab-1']).toEqual(node)
       await act(async () => ackPanesClosedBatchesMocked())
       await waitFor(() => expect(store.getState().tabs.tabs).toEqual([]))
       expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
       expect(mockManagedVisibility).toHaveBeenCalledTimes(1)
-      expect(mockSend.mock.calls.some(([msg]) => msg.type === 'freshAgent.create')).toBe(false)
+      expect(mockSend.mock.calls.some(([msg]) => ['freshAgent.create', 'freshAgent.kill'].includes(msg.type))).toBe(false)
     })
 
     it('closing a pane sends the plain identity-driven detach AND the pane-close evidence keyed by the pane\'s createRequestId (delta-round-7 F2 / delta-r7-r2 F2)', async () => {
@@ -1328,6 +1340,98 @@ describe('PaneContainer', () => {
   })
 
   describe('pane close behavior', () => {
+    it('detaches one view before closing it while another pane keeps the shared session', async () => {
+      const sharedSessionId = 'thread-shared-close'
+      const sharedSessionKey = makeFreshAgentSessionKey({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId: sharedSessionId,
+      })
+      const sharedSession = {
+        sessionKey: sharedSessionKey,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId: sharedSessionId,
+        status: 'idle',
+        turns: [],
+        historyItems: [],
+        historyBodies: {},
+        streamingActive: false,
+        pendingPermissions: {},
+        pendingQuestions: {},
+      } as unknown as FreshAgentSessionState
+      const paneA: PaneNode = {
+        type: 'leaf',
+        id: 'pane-shared-a',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'create-shared-a',
+          viewId: 'view-shared-a',
+          sessionId: sharedSessionId,
+          sessionRef: { provider: 'codex', sessionId: sharedSessionId },
+          status: 'connected',
+        },
+      }
+      const paneB: PaneNode = {
+        type: 'leaf',
+        id: 'pane-shared-b',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'create-shared-b',
+          viewId: 'view-shared-b',
+          sessionId: sharedSessionId,
+          sessionRef: { provider: 'codex', sessionId: sharedSessionId },
+          status: 'connected',
+        },
+      }
+      const layout: PaneNode = {
+        type: 'split',
+        id: 'split-shared-close',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [paneA, paneB],
+      }
+      const store = createStore(
+        {
+          layouts: { 'tab-1': layout },
+          activePane: { 'tab-1': 'pane-shared-a' },
+        },
+        {},
+        {},
+        { sessions: { [sharedSessionKey]: sharedSession } },
+      )
+
+      renderWithStore(<PaneContainer tabId="tab-1" node={layout} />, store)
+      fireEvent.click(screen.getAllByTitle('Close pane')[0])
+
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.detach',
+        viewId: 'view-shared-a',
+        sessionId: sharedSessionId,
+      }))
+      expect(store.getState().panes.layouts['tab-1']).toEqual(layout)
+      expect(store.getState().freshAgent.sessions[sharedSessionKey]).toEqual(sharedSession)
+      expect(mockSend.mock.calls.some(([message]) => ['freshAgent.kill', 'freshAgent.recovery.stop'].includes(message.type))).toBe(false)
+
+      await act(async () => { ackFreshAgentDetachesMocked() })
+      await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'pane.closed',
+        createRequestId: 'create-shared-a',
+      })))
+      await act(async () => { ackPaneClosesMocked() })
+
+      await waitFor(() => expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        id: 'pane-shared-b',
+      }))
+      expect(store.getState().freshAgent.sessions[sharedSessionKey]).toEqual(sharedSession)
+      expect(mockSend.mock.calls.some(([message]) => ['freshAgent.kill', 'freshAgent.recovery.stop'].includes(message.type))).toBe(false)
+    })
+
     it('closes the pane from Redux state when close button is clicked', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
@@ -1436,7 +1540,7 @@ describe('PaneContainer', () => {
       expect((state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id).toBe(pane1Id)
     })
 
-    it('sends freshAgent.kill when a fresh-agent pane is closed', () => {
+    it('detaches a fresh-agent view by its view id when its pane is closed', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fresh-agent',
@@ -1464,23 +1568,20 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'freshAgent.kill',
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.detach',
+        viewId: 'req-fresh-close',
+        requestId: expect.any(String),
         sessionId: 'thread-codex-1',
         sessionType: 'freshcodex',
         provider: 'codex',
-      })
+      }))
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
     })
 
-    // b8ke ext r6 F3/F4: the ordinary pane-close lifecycle for restored
-    // panes — the kill target is the durable session (content.sessionId OR
-    // the provider-matched sessionRef.sessionId; pre-r6 a sessionRef-only
-    // pane skipped the kill and removed the pane over the live runtime),
-    // and the close carries the pane's observed (epoch, generation) fence
-    // so the server's generation fencing refuses stale closes (the WS
-    // client queues across disconnects — an old close arriving after a
-    // handoff-away-and-back must never kill the newer runtime).
-    it('sends freshAgent.kill for a sessionRef-only pane close before removal', () => {
+    // Restored panes may persist only the durable locator; the detach still
+    // identifies the view and never retires the shared provider session.
+    it('detaches a restored sessionRef-only pane by its durable locator', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-ref-only-close',
@@ -1510,16 +1611,17 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      // F3: the kill targets the durable sessionRef session.
       expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'freshAgent.kill',
+        type: 'freshAgent.detach',
+        viewId: 'req-ref-only-close',
         sessionId: 'thread-ref-only-close',
         sessionType: 'freshcodex',
         provider: 'codex',
       }))
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
     })
 
-    it('carries the observed epoch/generation fence on the close kill', () => {
+    it('keeps owner fences off a connection-local view detach', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fenced-close',
@@ -1562,20 +1664,14 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      // F4: the close kill carries the observed fence pair so the server
-      // typed-refuses a stale-generation close (pre-r6 the close sent no
-      // fence and a delayed close could kill the newer generation).
-      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'freshAgent.kill',
-        sessionId: 'thread-fenced-close',
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        observedEpoch: 11,
-        observedGeneration: 4,
-      }))
+      const detach = mockSend.mock.calls.map(([message]) => message).find((message) => message.type === 'freshAgent.detach')
+      expect(detach).toMatchObject({ viewId: 'req-fenced-close', sessionId: 'thread-fenced-close' })
+      expect(detach).not.toHaveProperty('observedEpoch')
+      expect(detach).not.toHaveProperty('observedGeneration')
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
     })
 
-    it('sends the pane cwd when a FreshOpenCode pane is closed', () => {
+    it('detaches a FreshOpenCode view without terminating the durable session', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-freshopencode',
@@ -1604,16 +1700,17 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'freshAgent.kill',
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.detach',
+        viewId: 'req-freshopencode-close',
         sessionId: 'ses_freshopencode_close',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        cwd: '/repo/route-aware',
-      })
+      }))
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
     })
 
-    it('uses session-state cwd when closing a recovered FreshOpenCode pane without initialCwd', () => {
+    it('uses the recovered FreshOpenCode session locator for view detach', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-freshopencode',
@@ -1655,16 +1752,17 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'freshAgent.kill',
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.detach',
+        viewId: 'req-freshopencode-close',
         sessionId: 'ses_freshopencode_close',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        cwd: '/repo/session-state',
-      })
+      }))
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
     })
 
-    it('closes the fresh-agent pane only once the killed answer confirms the durable close', async () => {
+    it('closes the fresh-agent pane only after view detach and durable close acknowledgments', async () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fresh-agent-ack',
@@ -1692,20 +1790,17 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      // The kill is in flight; the pane must NOT be dropped before the
-      // correlated answer arrives (focused-episode-6 round 2, Finding 6).
-      expect(mockSend).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-codex-ack' }),
-      )
+      // View detach is in flight; the pane must remain until its own ack and
+      // the durable pane-close evidence both settle.
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.detach', viewId: 'req-fresh-ack-close', sessionId: 'thread-codex-ack',
+      }))
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
       expect(
         (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>)?.id,
       ).toBe('pane-fresh-agent-ack')
 
-      ackFreshAgentKillsMocked()
-      // Focused-episode-7 round 4 (F2): the kill's retiring envelope and the
-      // pane-gate's per-REMOVAL close coexist — the last-pane cascade's
-      // closeTab sends the batch envelope covering the fresh-agent identity
-      // and awaits ITS correlated answer before the layout moves.
+      await act(async () => ackFreshAgentDetachesMocked())
       await waitFor(() => {
         expect(mockSend).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -1720,7 +1815,7 @@ describe('PaneContainer', () => {
       })
     })
 
-    it('keeps the fresh-agent pane standing when the kill answers success:false', async () => {
+    it('keeps the pane and restores its view when detach answers success:false', async () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fresh-agent-fail',
@@ -1748,22 +1843,27 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      emitWsMessage({
-        type: 'freshAgent.killed',
-        sessionId: 'thread-codex-fail',
-        sessionType: 'freshcodex',
-        provider: 'codex',
+      const detach = mockSend.mock.calls.map(([message]) => message).find((message) => message.type === 'freshAgent.detach')
+      expect(detach).toMatchObject({ viewId: 'req-fresh-fail-close', sessionId: 'thread-codex-fail' })
+      await act(async () => emitWsMessage({
+        type: 'freshAgent.detached',
+        requestId: detach.requestId,
+        viewId: detach.viewId,
         success: false,
-      })
-      await new Promise((resolve) => setTimeout(resolve, 0))
+        code: 'VIEW_DETACH_REFUSED',
+      }))
 
       expect(
         store.getState().panes.layouts['tab-1'],
-        'an unacknowledged/unrecorded close is not a close: the pane stays',
+        'a view that was not detached remains displayed',
       ).toBeTruthy()
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.attach', viewId: 'req-fresh-fail-close', sessionId: 'thread-codex-fail',
+      }))
+      expect(mockSend.mock.calls.some(([message]) => ['pane.closed', 'panes.closed', 'freshAgent.kill'].includes(message.type))).toBe(false)
     })
 
-    it.each([false, true])('settles a sessionRef-only Close with success:%s while preserving native ownership until acknowledged cleanup', async (success) => {
+    it('closes a sessionRef-only view while preserving shared native ownership', async () => {
       const node: PaneNode = {
         type: 'leaf', id: 'pane-native-close', content: {
           kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
@@ -1785,37 +1885,22 @@ describe('PaneContainer', () => {
       const key = makeFreshAgentSessionKey({ sessionType: 'freshcodex', provider: 'codex', sessionId: 'native-close' })
       renderWithStore(<PaneContainer tabId="tab-1" node={node} />, store)
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
-      const kills = mockSend.mock.calls.map(([message]) => message).filter((message) => message.type === 'freshAgent.kill')
-      expect(kills).toEqual([{
-        type: 'freshAgent.kill', sessionId: 'native-close', sessionType: 'freshcodex', provider: 'codex',
-        observedEpoch: 11, observedGeneration: 4,
-      }])
-      const reply = { type: 'freshAgent.killed', sessionId: 'native-close', sessionType: 'freshcodex', provider: 'codex', success }
-      await act(async () => {
-        emitWsMessage({ ...reply, sessionId: 'foreign-native' })
-        emitWsMessage({ ...reply, provider: 'claude' })
-      })
+      const detach = mockSend.mock.calls.map(([message]) => message).find((message) => message.type === 'freshAgent.detach')
+      expect(detach).toMatchObject({ viewId: 'create-native-close', sessionId: 'native-close' })
+      expect(mockSend.mock.calls.some(([message]) => message.type === 'freshAgent.kill')).toBe(false)
       expect(store.getState().panes.layouts['tab-1']).toEqual(node)
       expect(store.getState().freshAgent.sessions[key]?.lastErrorCode).toBeUndefined()
       expect(mockSend.mock.calls.some(([message]) => ['pane.closed', 'panes.closed'].includes(message.type))).toBe(false)
 
-      await act(async () => { emitWsMessage(reply) })
-      if (success) {
-        await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
-          type: 'panes.closed', panes: [{ createRequestId: 'create-native-close' }],
-        })))
-        expect(store.getState().panes.layouts['tab-1']).toEqual(node)
-        await act(async () => { ackPanesClosedBatchesMocked() })
-        await waitFor(() => expect(store.getState().panes.layouts['tab-1']).toBeUndefined())
-      } else {
-        // This error is written by the actual Close promise's failure branch,
-        // proving settlement from the ACK rather than mere absence of cleanup.
-        await waitFor(() => expect(store.getState().freshAgent.sessions[key]?.lastErrorCode).toBe('KILL_FAILED'))
-        expect(store.getState().panes.layouts['tab-1']).toEqual(node)
-        expect(store.getState().freshAgent.runtimeOwners['codex:native-close']).toEqual(canonicalOwner)
-        expect(mockSend.mock.calls.some(([message]) => ['pane.closed', 'panes.closed'].includes(message.type))).toBe(false)
-      }
-      expect(mockSend.mock.calls.filter(([message]) => message.type === 'freshAgent.kill')).toHaveLength(1)
+      await act(async () => ackFreshAgentDetachesMocked())
+      await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'panes.closed', panes: [{ createRequestId: 'create-native-close' }],
+      })))
+      expect(store.getState().freshAgent.runtimeOwners['codex:native-close']).toEqual(canonicalOwner)
+      await act(async () => ackPanesClosedBatchesMocked())
+      await waitFor(() => expect(store.getState().panes.layouts['tab-1']).toBeUndefined())
+      expect(store.getState().freshAgent.runtimeOwners['codex:native-close']).toEqual(canonicalOwner)
+      expect(mockSend.mock.calls.filter(([message]) => message.type === 'freshAgent.kill')).toHaveLength(0)
       expect(mockSend.mock.calls.filter(([message]) => [
         'freshAgent.create', 'terminal.create', 'freshAgent.send', 'freshAgent.recovery.stop',
       ].includes(message.type))).toEqual([])

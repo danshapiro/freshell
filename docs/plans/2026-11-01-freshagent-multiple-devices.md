@@ -152,7 +152,7 @@ from accepted/started/completed counts. Desktop/mobile each contain an
 independent context/page; boot/turn holds and release hooks operate on the
 native fixture, and cleanup owns only that fixture's resources.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 ```text
 PaneContainer test: close A while A and B reference the same running session.
@@ -191,7 +191,7 @@ Then use explicit Terminate agent and assert one native stop and desktop stopped
 state.
 ```
 
-- [ ] **Step 2: Run and verify the intended failure**
+- [x] **Step 2: Run and verify the intended failure**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/panes/PaneContainer.test.tsx -t 'shared session' --config config/vitest/vitest.config.ts`
 
@@ -201,7 +201,7 @@ Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-brows
 
 Expected: FAIL because closing A sends Kill/stops B; the new detach acknowledgment/explicit action behavior is absent. Assert nonzero selected counts; setup errors are not the intended red.
 
-- [ ] **Step 3: Apply the precise production patch**
+- [x] **Step 3: Apply the precise production patch**
 
 ```text
 Add additive FreshAgentDetach{provider,sessionType,sessionId,sessionRef?,
@@ -224,7 +224,7 @@ existing process-only recovery-stop action distinct. Generate contracts with
 pnpm run contract:generate; never hand-edit generated JSON.
 ```
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/panes/PaneContainer.test.tsx -t 'shared session' --config config/vitest/vitest.config.ts`
 
@@ -234,11 +234,11 @@ Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-brows
 
 Expected PASS in all four selected browser modes.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep attachment identity and detach acknowledgment timeout in the new helper; remove only now-unused kill-on-close imports/comments. Reuse existing tab cleanup rather than introducing a parallel layout-removal path.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:vitest run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/fresh-agent-view-attachment.test.ts --config config/vitest/vitest.config.ts`
 
@@ -248,7 +248,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features m
 
 Run the Step 2 browser command and `pnpm run typecheck`; expected PASS. Routing/protocol callers are included because every hosted command now receives requester context.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add shared/ws-protocol.ts shared/fresh-agent-contract.ts crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/hosted_fresh_agent.rs crates/freshell-ws/src/hosted_fresh_agent_tests.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/fresh_agent_proxy_tests.rs src/lib/fresh-agent-view-attachment.ts src/components/panes/PaneContainer.tsx src/store/tabsSlice.ts src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/fresh-agent-view-attachment.test.ts test/unit/client/lib/kill-ack.test.ts test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json

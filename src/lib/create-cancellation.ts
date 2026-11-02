@@ -1,20 +1,22 @@
 const cancelledCreateRequestIds = new Set<string>()
-const createRequestRouteById = new Map<string, { cwd?: string }>()
+const createRequestRouteById = new Map<string, { viewId?: string }>()
 
 export function cancelCreate(requestId: string): void {
   cancelledCreateRequestIds.add(requestId)
 }
 
-export function rememberCreateRoute(requestId: string, route: { cwd?: string }): void {
-  const cwd = route.cwd?.trim()
-  if (cwd) {
-    createRequestRouteById.set(requestId, { cwd })
+export function rememberCreateRoute(requestId: string, route: { viewId?: string }): void {
+  const viewId = route.viewId?.trim()
+  if (viewId) {
+    createRequestRouteById.set(requestId, {
+      ...(viewId ? { viewId } : {}),
+    })
   } else {
     createRequestRouteById.delete(requestId)
   }
 }
 
-export function consumeCreateRoute(requestId: string): { cwd?: string } | undefined {
+export function consumeCreateRoute(requestId: string): { viewId?: string } | undefined {
   const route = createRequestRouteById.get(requestId)
   createRequestRouteById.delete(requestId)
   return route

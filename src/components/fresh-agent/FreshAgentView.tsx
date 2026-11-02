@@ -770,6 +770,7 @@ function buildFreshAgentAttachMessage(
   return {
     type: 'freshAgent.attach',
     sessionId: content.sessionId,
+    viewId: content.viewId ?? content.createRequestId,
     sessionType: content.sessionType,
     provider: content.provider,
     ...(sessionRef ? { sessionRef } : {}),
@@ -2308,6 +2309,7 @@ export function FreshAgentView({
     return {
       type: 'freshAgent.create',
       requestId: content.createRequestId,
+      viewId: content.viewId ?? content.createRequestId,
       sessionType: content.sessionType,
       provider: content.provider,
       cwd: content.initialCwd,
@@ -2589,6 +2591,7 @@ export function FreshAgentView({
         registerFreshAgentCreate(dispatch, current.createRequestId, {
           sessionType: current.sessionType,
           provider: current.provider,
+          viewId: current.viewId ?? current.createRequestId,
           resumeSessionId: current.resumeSessionId,
           sessionRef: current.sessionRef,
           cwd: current.initialCwd,
@@ -2911,6 +2914,7 @@ export function FreshAgentView({
       registerFreshAgentCreate(dispatch, current.createRequestId, {
         sessionType: current.sessionType,
         provider: current.provider,
+        viewId: current.viewId ?? current.createRequestId,
         resumeSessionId: current.resumeSessionId,
         sessionRef: current.sessionRef,
         cwd: current.initialCwd,
@@ -4679,7 +4683,36 @@ export function FreshAgentView({
   const canRedoNow = !lifecycleBlocked && snapshot?.capabilities?.redo === true && snapshot?.rollback?.canRedo === true
   // Pane context-menu registration: "Undo last turn"/"Redo last turn" ride the
   // pane-action registry; both still run the advisory gates at commit time.
+  const terminateSharedAgent = useCallback(() => {
+    const current = paneContentRef.current
+    const sessionId = current.sessionId
+      ?? (current.sessionRef?.provider === current.provider ? current.sessionRef.sessionId : undefined)
+    if (!sessionId) return
+    const fence = selectPaneOwnerFence(appStore.getState(), current)
+    const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: agentSession?.cwd, sessionId })
+    void sendFreshAgentKillAndAwait({
+      sessionId,
+      sessionType: current.sessionType,
+      provider: current.provider,
+      ...(cwd ? { cwd } : {}),
+      ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+    }, { send: (message) => sendFreshAgentMessage(message as Record<string, unknown>) }).then((ack) => {
+      if (ack.ok || !isMountedRef.current) return
+      dispatch(sessionError({
+        sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+        code: 'KILL_FAILED',
+        message: ack.timedOut ? KILL_ACK_TIMEOUT_MESSAGE : KILL_FAILED_MESSAGE,
+      }))
+    })
+  }, [agentSession?.cwd, appStore, dispatch, sendFreshAgentMessage])
   useEffect(() => registerFreshAgentPaneActions(paneId, {
+    terminate: terminateSharedAgent,
+    canTerminate: Boolean(paneContent.sessionId
+      || (paneContent.sessionRef?.provider === paneContent.provider && paneContent.sessionRef.sessionId)),
+    terminateSupported: Boolean(paneContent.sessionId
+      || (paneContent.sessionRef?.provider === paneContent.provider && paneContent.sessionRef.sessionId)),
     undo: () => sendRollback('undo', 'step'),
     redo: () => sendRollback('redo', 'step'),
     canUndo: canRollback && !isBusy && Boolean(snapshot?.sessionId ?? paneContent.sessionId),
@@ -4688,7 +4721,7 @@ export function FreshAgentView({
     // server-side, so its menu never offers a dead "Redo last turn" row.
     undoSupported: canRollback,
     redoSupported: snapshot?.capabilities?.redo === true,
-  }), [paneId, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo, paneContent.sessionId])
+  }), [paneId, terminateSharedAgent, paneContent.sessionId, paneContent.sessionRef, paneContent.provider, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo])
   // Task 14: SESSION_RESERVED is a transient reservation the view re-drives
   // through -- never surfaced as a pane-level error banner.
   const sessionErrorMessage = (agentSession as { lastError?: string; lastErrorCode?: string } | undefined)?.lastErrorCode === 'SESSION_RESERVED'

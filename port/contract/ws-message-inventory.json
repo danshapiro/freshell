@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 43,
+    "count": 44,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -14,6 +14,7 @@
       "freshAgent.compact",
       "freshAgent.configure",
       "freshAgent.create",
+      "freshAgent.detach",
       "freshAgent.elicitation.respond",
       "freshAgent.fork",
       "freshAgent.interrupt",
@@ -50,7 +51,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 70,
+    "count": 71,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -73,6 +74,7 @@
       "freshAgent.checkpoint.outcome",
       "freshAgent.create.failed",
       "freshAgent.created",
+      "freshAgent.detached",
       "freshAgent.event",
       "freshAgent.forked",
       "freshAgent.killed",

@@ -27,7 +27,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, PANE_CLOSE_REMOVAL_REFUSED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
-import { collectSessionPaneIdentities, collectPaneContents, findPaneContent } from '@/lib/pane-utils'
+import { collectSessionPaneIdentities, collectPaneContents, collectPaneEntries, findPaneContent } from '@/lib/pane-utils'
 import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
@@ -41,6 +41,11 @@ import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
 import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { unnamedTabTitle } from '@/lib/tab-title'
+import { getWsClient } from '@/lib/ws-client'
+import { detachFreshAgentView } from '@/lib/fresh-agent-view-attachment'
+import type { FreshAgentViewAttachment } from '@shared/fresh-agent-contract'
+import { selectPaneOwnerFence } from './selectors/runtimeOwner'
+import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 
 
 const log = createLogger('TabsSlice')
@@ -1217,6 +1222,124 @@ function surfaceManagedViewDetachFailure(
   }
 }
 
+const FRESH_AGENT_VIEW_DETACH_FAILURE = 'The shared agent view could not be detached, so the pane was left open. Try again.'
+
+type FreshAgentViewCloseTarget = {
+  paneId: string
+  tabId: string
+  content: Extract<PaneContent, { kind: 'fresh-agent' }>
+  attachment: FreshAgentViewAttachment & { sessionId: string }
+}
+
+function collectFreshAgentViewCloseTargets(
+  layout: PaneNode | undefined,
+  tabId: string,
+  getState: () => unknown,
+  paneIds?: ReadonlySet<string>,
+): FreshAgentViewCloseTarget[] {
+  if (!layout) return []
+  const state = getState() as RootState
+  return collectPaneEntries(layout).flatMap(({ paneId, content }) => {
+    if (paneIds && !paneIds.has(paneId)) return []
+    if (content.kind !== 'fresh-agent') return []
+    const pendingSessionId = state.freshAgent?.pendingCreates?.[content.createRequestId]?.sessionId
+    const sessionId = content.sessionId
+      || pendingSessionId
+      || (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined)
+    // A still-pending create is canceled at the pane surface. Its late
+    // created reply carries the saved viewId and is detached once the locator exists.
+    if (!sessionId) return []
+    const sessionRef = content.sessionRef?.provider === content.provider
+      ? content.sessionRef
+      : { provider: content.provider, sessionId }
+    return [{
+      paneId,
+      tabId,
+      content,
+      attachment: {
+        provider: content.provider,
+        sessionType: content.sessionType,
+        sessionId,
+        sessionRef,
+        viewId: content.viewId ?? content.createRequestId,
+      },
+    }]
+  })
+}
+
+/** Re-establish every view after an uncertain or refused close transaction. */
+function reattachFreshAgentViews(targets: FreshAgentViewCloseTarget[], getState: () => unknown): void {
+  if (targets.length === 0) return
+  const ws = getWsClient()
+  const state = getState() as RootState
+  for (const target of targets) {
+    const fence = selectPaneOwnerFence(state, target.content)
+    const cwd = getFreshOpenCodeRouteCwd(target.content, {
+      freshAgentSessions: state.freshAgent?.sessions ?? {},
+      sessionId: target.attachment.sessionId,
+    })
+    try {
+      ws.send({
+        type: 'freshAgent.attach',
+        ...target.attachment,
+        ...(cwd ? { cwd } : {}),
+        tabId: target.tabId,
+        paneId: target.paneId,
+        ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+      })
+    } catch (error) {
+      log.error('could not reattach a Fresh Agent view after a close was refused', {
+        event: 'fresh_agent.view.detach_compensation_failed',
+        tabId: target.tabId,
+        paneId: target.paneId,
+        viewId: target.attachment.viewId,
+        provider: target.attachment.provider,
+        sessionId: target.attachment.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+}
+
+async function detachFreshAgentViews(
+  targets: FreshAgentViewCloseTarget[],
+  getState: () => unknown,
+): Promise<boolean> {
+  if (targets.length === 0) return true
+  const ws = getWsClient()
+  const outcomes = await Promise.allSettled(
+    targets.map((target) => detachFreshAgentView(ws, target.attachment)),
+  )
+  const failures = outcomes.flatMap((outcome, index) => outcome.status === 'rejected'
+    ? [{ target: targets[index], error: outcome.reason }]
+    : [])
+  if (failures.length === 0) return true
+
+  for (const failure of failures) {
+    log.warn('Fresh Agent view detach failed; preserving the pane and restoring its delivery interest', {
+      event: 'fresh_agent.view.detach_close_refused',
+      tabId: failure.target.tabId,
+      paneId: failure.target.paneId,
+      viewId: failure.target.attachment.viewId,
+      provider: failure.target.attachment.provider,
+      sessionId: failure.target.attachment.sessionId,
+      error: failure.error instanceof Error ? failure.error.message : String(failure.error),
+    })
+  }
+  reattachFreshAgentViews(targets, getState)
+  return false
+}
+
+function surfaceFreshAgentViewDetachFailure(
+  dispatch: (action: unknown) => void,
+  tabId: string,
+  targets: FreshAgentViewCloseTarget[],
+): void {
+  for (const target of targets) {
+    dispatch(setPaneCloseError({ tabId, paneId: target.paneId, error: FRESH_AGENT_VIEW_DETACH_FAILURE }))
+  }
+}
+
 /**
  * Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the acknowledged
  * close gate. EVERY user- or system-initiated pane removal routes through one
@@ -1387,6 +1510,7 @@ export const closePaneWithCleanup = createAsyncThunk(
     // F2: confirm the durable close evidence BEFORE the layout loses the pane.
     const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
     const managedViews = collectManagedViewProjections(before).filter((view) => view.paneId === paneId)
+    const freshAgentViews = collectFreshAgentViewCloseTargets(before, tabId, getState, new Set([paneId]))
     if (identity.length > 0) {
       // Focused-episode-7 round 5 (Finding F2): freeze THIS pane's identity
       // while the acknowledgement is outstanding — the one shared guard
@@ -1398,9 +1522,15 @@ export const closePaneWithCleanup = createAsyncThunk(
       dispatch(markPaneClosing({ tabId, paneId }))
     }
     try {
+      if (freshAgentViews.length > 0 && !await detachFreshAgentViews(freshAgentViews, getState)) {
+        surfaceFreshAgentViewDetachFailure(dispatch, tabId, freshAgentViews)
+        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+        return
+      }
       if (identity.length > 0) {
         const failed = await awaitPaneCloseEvidence(identity)
         if (failed.length > 0) {
+          reattachFreshAgentViews(freshAgentViews, getState)
           log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
           surfacePaneCloseFailures(dispatch, tabId, failed)
           // The display check (round-8 F2) re-reads the CURRENT layout
@@ -1410,6 +1540,7 @@ export const closePaneWithCleanup = createAsyncThunk(
         }
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
+        reattachFreshAgentViews(freshAgentViews, getState)
         log.warn('managed view detach was not confirmed; the pane stays', { tabId, paneId })
         surfaceManagedViewDetachFailure(dispatch, tabId, identity.length > 0 ? identity : managedViews)
         reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
@@ -1436,6 +1567,7 @@ export const closePaneWithCleanup = createAsyncThunk(
       log.warn('the pane close evidence committed but the layout refused the removal; the pane stays open and is re-asserted', { tabId, paneId })
       dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
       reassertKeptPanesOpen(after, tabId, identity)
+      reattachFreshAgentViews(freshAgentViews, getState)
       return
     }
     if (before !== after) {
@@ -1501,11 +1633,23 @@ export const closeTab = createAsyncThunk(
     const frozenPaneTitleSetByUser = stateAtClose.panes.paneTitleSetByUser?.[tabId]
     const identities = collectPaneCloseIdentities(frozenLayout)
     const managedViews = collectManagedViewProjections(frozenLayout)
+    const freshAgentViews = collectFreshAgentViewCloseTargets(
+      frozenLayout,
+      tabId,
+      getState,
+      new Set(collectPaneIds(frozenLayout)),
+    )
     dispatch(markTabClosing({ tabId }))
     try {
+      if (freshAgentViews.length > 0 && !await detachFreshAgentViews(freshAgentViews, getState)) {
+        surfaceFreshAgentViewDetachFailure(dispatch, tabId, freshAgentViews)
+        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+        return
+      }
       if (identities.length > 0) {
         const ack = await sendPanesClosedAndAwait(tabId, identities, { timeoutMs: KILL_ACK_TIMEOUT_MS })
         if (!ack.ok) {
+          reattachFreshAgentViews(freshAgentViews, getState)
           log.warn('tab close evidence was not confirmed; the tab stays', {
             tabId,
             gatedPanes: identities.map((i) => i.paneId),
@@ -1525,6 +1669,7 @@ export const closeTab = createAsyncThunk(
         }
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
+        reattachFreshAgentViews(freshAgentViews, getState)
         log.warn('managed view detach was not confirmed; the tab stays', { tabId })
         surfaceManagedViewDetachFailure(dispatch, tabId, identities.length > 0 ? identities : managedViews)
         reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
@@ -1670,6 +1815,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
     const layout = (getState() as RootState).panes.layouts[tabId]
     const identity = collectPaneCloseIdentities(layout).filter((i) => i.paneId === paneId)
     const managedViews = collectManagedViewProjections(layout).filter((view) => view.paneId === paneId)
+    const freshAgentViews = collectFreshAgentViewCloseTargets(layout, tabId, getState, new Set([paneId]))
     if (identity.length > 0) {
       // Focused-episode-7 round 5 (Finding F2): freeze the discarded pane's
       // identity while the acknowledgement is outstanding (the same shared
@@ -1677,9 +1823,15 @@ export const replacePaneWithCleanup = createAsyncThunk(
       dispatch(markPaneClosing({ tabId, paneId }))
     }
     try {
+      if (freshAgentViews.length > 0 && !await detachFreshAgentViews(freshAgentViews, getState)) {
+        surfaceFreshAgentViewDetachFailure(dispatch, tabId, freshAgentViews)
+        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+        return
+      }
       if (identity.length > 0) {
         const failed = await awaitPaneCloseEvidence(identity)
         if (failed.length > 0) {
+          reattachFreshAgentViews(freshAgentViews, getState)
           log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
             tabId,
             paneId,
@@ -1692,6 +1844,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
         }
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
+        reattachFreshAgentViews(freshAgentViews, getState)
         log.warn('managed view detach was not confirmed; the pane keeps its content', { tabId, paneId })
         surfaceManagedViewDetachFailure(dispatch, tabId, identity.length > 0 ? identity : managedViews)
         reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)

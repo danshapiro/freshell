@@ -1356,6 +1356,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (action === 'prompt_async' && req.method === 'POST') {
+      if (process.env.FAKE_OPENCODE_RECORD_NATIVE_STOP === '1') {
+        res.once('close', () => {
+          if (!res.writableEnded) {
+            appendAudit({ event: 'native_stop', sessionId, operation: 'prompt_async', routeDirectory: directory })
+          }
+        })
+      }
       const body = parseJsonText(await readRequestBody(req)) || {}
       const parts = Array.isArray(body.parts) ? body.parts : []
       const promptTextFromParts = parts

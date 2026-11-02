@@ -81,6 +81,7 @@ pub(crate) fn hosted_route(message: &ClientMessage) -> HostedRoute {
         | ClientMessage::TerminalInput(_)
         | ClientMessage::TerminalResize(_)
         | ClientMessage::TerminalKill(_)
+        | ClientMessage::FreshAgentDetach(_)
         | ClientMessage::CodexActivityList(_)
         | ClientMessage::OpencodeActivityList(_)
         | ClientMessage::ClaudeActivityList(_)

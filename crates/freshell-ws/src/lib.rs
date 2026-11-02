@@ -48,6 +48,7 @@ pub mod create_dedupe;
 pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
+pub(crate) mod fresh_agent_view_routes;
 pub mod host_stats_collector;
 pub mod host_stats_interest;
 pub mod hosted_fresh_agent;

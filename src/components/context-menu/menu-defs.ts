@@ -871,6 +871,18 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     // canRedo gate enabled state (busy, no live session, nothing to redo yet).
     if (target.paneId) {
       const freshAgentActions = getFreshAgentPaneActions(target.paneId)
+      if (freshAgentActions?.terminateSupported === true) {
+        items.push({
+          type: 'separator',
+          id: 'fc-terminate-sep',
+        }, {
+          type: 'item',
+          id: 'fresh-agent-terminate',
+          label: 'Terminate agent',
+          disabled: !freshAgentActions.canTerminate,
+          onSelect: () => freshAgentActions.terminate(),
+        })
+      }
       const rollbackItems: MenuItem[] = []
       if (freshAgentActions?.undoSupported === true) {
         rollbackItems.push({ type: 'item', id: 'fresh-agent-undo', label: 'Undo last turn', disabled: !freshAgentActions.canUndo, onSelect: () => freshAgentActions.undo() })

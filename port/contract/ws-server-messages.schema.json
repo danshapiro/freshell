@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 70,
+  "messageCount": 71,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1242,6 +1242,54 @@
         "sessionId",
         "sessionType",
         "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.detached": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "freshAgent.detached",
+          "type": "string"
+        },
+        "viewId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "success",
+        "type",
+        "viewId"
       ],
       "type": "object"
     },
@@ -5165,7 +5213,8 @@
                       "blocked",
                       "recovering",
                       "stopped",
-                      "lost"
+                      "lost",
+                      "data_repair_complete"
                     ],
                     "type": "string"
                   }
@@ -5872,7 +5921,8 @@
                 "blocked",
                 "recovering",
                 "stopped",
-                "lost"
+                "lost",
+                "data_repair_complete"
               ],
               "type": "string"
             }
