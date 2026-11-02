@@ -4724,6 +4724,20 @@ fn initialize_empty_initial_host_provider_home(
     initial_owner: (u32, u32),
     selected_owner: (u32, u32),
 ) -> Result<(), String> {
+    initialize_empty_initial_host_provider_home_with_owner_transfer(
+        home,
+        initial_owner,
+        selected_owner,
+        set_owner,
+    )
+}
+
+fn initialize_empty_initial_host_provider_home_with_owner_transfer(
+    home: &Path,
+    initial_owner: (u32, u32),
+    selected_owner: (u32, u32),
+    transfer_owner: fn(&Path, u32, u32) -> Result<(), String>,
+) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata =
@@ -4752,6 +4766,7 @@ fn initialize_empty_initial_host_provider_home(
     {
         return Err("provider HOME is not in the known initial host-owned state".into());
     }
+    let initial_mode = permissions & 0o7777;
     if std::fs::read_dir(home)
         .map_err(|_| "provider HOME emptiness is unknown".to_string())?
         .next()
@@ -4763,7 +4778,14 @@ fn initialize_empty_initial_host_provider_home(
     set_mode(home, 0o700)?;
     // Ownership is the final mutation: all metadata changes are complete
     // before the private HOME becomes traversable by the provider identity.
-    set_owner(home, selected_owner.0, selected_owner.1)?;
+    if let Err(error) = transfer_owner(home, selected_owner.0, selected_owner.1) {
+        return match set_mode(home, initial_mode) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; restoring the initial provider HOME mode failed: {rollback_error}"
+            )),
+        };
+    }
     verify_initialized_provider_home(home, selected_owner.0, selected_owner.1)?;
     emit_environment_event(serde_json::json!({
         "severity": "info", "event": "provider.home.initialization.completed",
@@ -17277,6 +17299,78 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                     (after.ino(), after.uid(), after.gid(), after.mode()),
                     (before.ino(), before.uid(), before.gid(), before.mode())
                 );
+            }
+        }
+
+        #[test]
+        fn provider_home_initialization_owner_transfer_failure_restores_initial_state_for_retry() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let before = std::fs::symlink_metadata(&home).unwrap();
+            let initial_owner = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+
+            let error =
+                super::super::initialize_empty_initial_host_provider_home_with_owner_transfer(
+                    &home,
+                    initial_owner,
+                    (initial_owner.0.wrapping_add(1), initial_owner.1),
+                    |_, _, _| Err("injected owner transfer failure".into()),
+                )
+                .unwrap_err();
+
+            assert!(error.contains("injected owner transfer failure"), "{error}");
+            let after_failure = std::fs::symlink_metadata(&home).unwrap();
+            assert_eq!(
+                (
+                    after_failure.ino(),
+                    after_failure.uid(),
+                    after_failure.gid(),
+                    after_failure.mode()
+                ),
+                (before.ino(), before.uid(), before.gid(), before.mode())
+            );
+            assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+
+            super::super::initialize_empty_initial_host_provider_home_with_owner_transfer(
+                &home,
+                initial_owner,
+                initial_owner,
+                super::super::set_owner,
+            )
+            .expect("a failed ownership change must leave the fresh HOME retryable");
+            let after_retry = std::fs::symlink_metadata(&home).unwrap();
+            assert_eq!((after_retry.uid(), after_retry.gid()), initial_owner);
+            assert_eq!(after_retry.mode() & 0o7777, 0o700);
+        }
+
+        #[test]
+        fn provider_home_initialization_cross_uid_transfer_targets_65534_0() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let initial_owner = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+            let provider_owner = (65_534, 0);
+            assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+
+            if initial_owner.0 == 0 {
+                initialize(&home, initial_owner, provider_owner)
+                    .expect("the root-backed sandbox can transfer ownership to the provider UID");
+                let after = std::fs::symlink_metadata(&home).unwrap();
+                assert_eq!((after.uid(), after.gid()), provider_owner);
+                assert_eq!(after.mode() & 0o7777, 0o700);
+            } else {
+                let error = initialize(&home, initial_owner, provider_owner).unwrap_err();
+                assert!(error.contains("lchown"), "{error}");
+                let after = std::fs::symlink_metadata(&home).unwrap();
+                assert_eq!((after.uid(), after.gid()), initial_owner);
+                assert_eq!(after.mode() & 0o7777, 0o755);
             }
         }
 
