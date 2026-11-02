@@ -514,6 +514,8 @@ export type FreshAgentPaneContent = {
   kind: 'fresh-agent'
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
+  /** Stable connection-scoped identity for this pane's delivery interest. */
+  viewId?: string
   sessionId?: string
   createRequestId: string
   status: SdkSessionStatus

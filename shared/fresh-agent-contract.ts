@@ -3,6 +3,17 @@ import { z } from 'zod'
 export const FreshAgentSessionTypeSchema = z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode'])
 export const FreshAgentRuntimeProviderSchema = z.enum(['claude', 'codex', 'opencode'])
 
+/** A browser view's delivery interest in one Fresh Agent conversation. The
+ * locator may be absent while the pane's first create is still pending. */
+export const FreshAgentViewAttachmentSchema = z.object({
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
+  sessionId: z.string().min(1).optional(),
+  sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
+  viewId: z.string().min(1),
+}).strict()
+export type FreshAgentViewAttachment = z.infer<typeof FreshAgentViewAttachmentSchema>
+
 export const FreshAgentThreadLocatorSchema = z.object({
   sessionType: FreshAgentSessionTypeSchema,
   provider: FreshAgentRuntimeProviderSchema,

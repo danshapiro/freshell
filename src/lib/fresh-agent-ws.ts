@@ -1,4 +1,5 @@
 import type { AppDispatch } from '@/store/store'
+import { nanoid } from 'nanoid'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
@@ -8,6 +9,7 @@ import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from 
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
+import { markFreshAgentPanesExited } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting, applyFreshAgentQuestionAvailable, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
@@ -53,6 +55,7 @@ type FreshAgentCreatedMessage = {
   sessionType: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
   runtimeProvider?: FreshAgentRuntimeProvider
+  sessionRef?: SessionRef
 }
 
 type FreshAgentCreateFailedMessage = {
@@ -144,6 +147,7 @@ function foldFreshAgentKilled(
     }))
     return
   }
+  dispatch(markFreshAgentPanesExited(locator))
   dispatch(removeSession(locator))
 }
 
@@ -164,9 +168,10 @@ export function registerFreshAgentCreate(
     sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
     cwd?: string
+    viewId: string
   },
 ): void {
-  rememberCreateRoute(requestId, { cwd: options.cwd })
+  rememberCreateRoute(requestId, { viewId: options.viewId })
   dispatch(registerPendingCreate({
     requestId,
     sessionType: options.sessionType,
@@ -189,20 +194,18 @@ export function handleFreshAgentMessage(
       const provider = created.provider ?? created.runtimeProvider
       const route = consumeCreateRoute(created.requestId)
       if (consumeCancelledCreate(created.requestId)) {
-        if (provider) {
-          // kata b8ke (round-3 F6): the cleanup kill is a lifecycle
-          // producer — it carries the observed (epoch, generation) fence so
-          // a stale callback can never issue an unfenced kill (no known
-          // record means legacy-unfenced; the server falls back to its
-          // retained stamp).
-          const fence = getOwnerFence?.(provider, created.sessionId)
+        if (provider && route?.viewId) {
+          // A late create belongs to a pane that has already gone away. Drop
+          // only that connection's view interest; the shared session remains
+          // available to other panes and devices.
           ws?.send({
-            type: 'freshAgent.kill',
+            type: 'freshAgent.detach',
+            requestId: nanoid(),
+            viewId: route.viewId,
             sessionId: created.sessionId,
             sessionType: created.sessionType,
             provider,
-            ...(route?.cwd ? { cwd: route.cwd } : {}),
-            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+            ...(created.sessionRef ? { sessionRef: created.sessionRef } : {}),
           })
         }
         return true

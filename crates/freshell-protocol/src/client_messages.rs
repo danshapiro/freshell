@@ -97,6 +97,8 @@ pub enum ClientMessage {
     FreshAgentCreate(FreshAgentCreate),
     #[serde(rename = "freshAgent.attach")]
     FreshAgentAttach(FreshAgentAttach),
+    #[serde(rename = "freshAgent.detach")]
+    FreshAgentDetach(FreshAgentDetach),
     #[serde(rename = "freshAgent.send")]
     FreshAgentSend(FreshAgentSend),
     #[serde(rename = "freshAgent.interrupt")]
@@ -158,6 +160,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 43] = [
     "freshAgent.compact",
     "freshAgent.configure",
     "freshAgent.create",
+    "freshAgent.detach",
     "freshAgent.fork",
     "freshAgent.interrupt",
     "freshAgent.kill",
@@ -995,6 +998,21 @@ pub struct FreshAgentAttach {
     pub tab_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
+}
+
+/// Remove one browser pane's connection-local event subscription. This never
+/// stops, retires, or changes ownership of the shared provider runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentDetach {
+    pub provider: AgentProvider,
+    pub request_id: String,
+    pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    pub view_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

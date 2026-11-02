@@ -397,8 +397,30 @@ describe('buildMenuItems — fresh-agent rollback rows (kata 1wxv)', () => {
     }
   }
 
+  it('offers the explicit shared-agent termination action for an attached pane', () => {
+    const terminate = vi.fn()
+    const items = buildFreshAgentMenu('pane-terminate', {
+      terminate,
+      canTerminate: true,
+      terminateSupported: true,
+      undo: vi.fn(),
+      redo: vi.fn(),
+      canUndo: false,
+      canRedo: false,
+      undoSupported: false,
+      redoSupported: false,
+    })
+    const item = items.find((entry) => entry.type === 'item' && entry.id === 'fresh-agent-terminate')
+    expect(item).toMatchObject({ label: 'Terminate agent', disabled: false })
+    if (item?.type === 'item') item.onSelect()
+    expect(terminate).toHaveBeenCalledTimes(1)
+  })
+
   it('a freshcodex pane menu NEVER renders the "Redo last turn" row (enabled or disabled) — the undo row stands alone after one separator', () => {
     const items = buildFreshAgentMenu('pane-rb-codex', {
+      terminate: vi.fn(),
+      canTerminate: false,
+      terminateSupported: false,
       undo: vi.fn(),
       redo: vi.fn(),
       canUndo: true,
@@ -423,6 +445,9 @@ describe('buildMenuItems — fresh-agent rollback rows (kata 1wxv)', () => {
     const undo = vi.fn()
     const redo = vi.fn()
     const items = buildFreshAgentMenu('pane-rb-claude', {
+      terminate: vi.fn(),
+      canTerminate: false,
+      terminateSupported: false,
       undo,
       redo,
       canUndo: true,
@@ -444,6 +469,9 @@ describe('buildMenuItems — fresh-agent rollback rows (kata 1wxv)', () => {
 
   it('a redo-capable pane with nothing to redo keeps the row disabled — only capability omission hides the row', () => {
     const items = buildFreshAgentMenu('pane-rb-idle', {
+      terminate: vi.fn(),
+      canTerminate: false,
+      terminateSupported: false,
       undo: vi.fn(),
       redo: vi.fn(),
       canUndo: true,
@@ -457,6 +485,9 @@ describe('buildMenuItems — fresh-agent rollback rows (kata 1wxv)', () => {
 
   it('omits the whole rollback section — separator included — when the pane stamps neither capability', () => {
     const items = buildFreshAgentMenu('pane-rb-legacy', {
+      terminate: vi.fn(),
+      canTerminate: false,
+      terminateSupported: false,
       undo: vi.fn(),
       redo: vi.fn(),
       canUndo: false,

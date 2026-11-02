@@ -205,6 +205,11 @@ function normalizePaneContent(
       options?.inheritCreateRequestId && previous?.kind === 'fresh-agent'
         ? previous.createRequestId
         : undefined
+    const viewId = typeof rawFreshAgent.viewId === 'string' && rawFreshAgent.viewId.length > 0
+      ? rawFreshAgent.viewId
+      : previous?.kind === 'fresh-agent'
+        ? previous.viewId || previous.createRequestId
+        : nanoid()
     const existingRestoreError = sanitizeRestoreError(rawFreshAgent.restoreError)
     const restoreErrorSessionRef = sanitizeSessionRef(rawFreshAgent.sessionRef)
     const retainedRestoreErrorSessionRef = existingRestoreError?.reason !== 'invalid_legacy_restore_target'
@@ -267,6 +272,7 @@ function normalizePaneContent(
         return {
           kind: 'fresh-agent',
           ...normalizeManagedRuntimeProjection(rawFreshAgent),
+          viewId,
           sessionType: input.sessionType,
           provider: input.provider,
           sessionId: retainedRestoreErrorSessionRef?.provider === 'claude'
@@ -361,6 +367,7 @@ function normalizePaneContent(
     return {
       kind: 'fresh-agent',
       ...normalizeManagedRuntimeProjection(rawFreshAgent),
+      viewId,
       closeError,
       sessionType: input.sessionType,
       provider: input.provider,
@@ -1857,6 +1864,37 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
+    /** Reflect explicit shared-session termination in every local pane that
+     * displays its durable locator, including views on other tabs. */
+    markFreshAgentPanesExited: (
+      state,
+      action: PayloadAction<{
+        sessionId: string
+        sessionType: FreshAgentPaneContent['sessionType']
+        provider: FreshAgentPaneContent['provider']
+      }>,
+    ) => {
+      const { sessionId, sessionType, provider } = action.payload
+      for (const [tabId, root] of Object.entries(state.layouts)) {
+        if (!root) continue
+        function update(node: PaneNode): PaneNode {
+          if (node.type === 'leaf') {
+            const content = node.content
+            if (content.kind !== 'fresh-agent'
+              || content.sessionType !== sessionType
+              || content.provider !== provider
+              || (content.sessionId !== sessionId && content.sessionRef?.sessionId !== sessionId)) {
+              return node
+            }
+            const nextContent = { ...content, status: 'exited' as const, pendingLocalEcho: undefined }
+            return { ...node, content: nextContent }
+          }
+          return { ...node, children: [update(node.children[0]), update(node.children[1])] }
+        }
+        state.layouts[tabId] = update(root)
+      }
+    },
+
     materializeFreshAgentSession: (
       state,
       action: PayloadAction<FreshAgentSessionMaterializedPayload>
@@ -3197,6 +3235,7 @@ export const {
   replacePane,
   swapPanes,
   updatePaneContent,
+  markFreshAgentPanesExited,
   materializeFreshAgentSession,
   mergePaneContent,
   restartFreshAgentCreate,

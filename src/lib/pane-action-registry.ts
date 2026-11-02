@@ -41,6 +41,9 @@ const browserRegistry = new Map<string, BrowserActions>()
  * canRedo are stamped per registration from the owning view's busy state and
  * decide ENABLED state on shown rows. */
 export type FreshAgentPaneActions = {
+  terminate: () => void
+  canTerminate: boolean
+  terminateSupported: boolean
   undo: () => void
   redo: () => void
   canUndo: boolean

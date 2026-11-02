@@ -75,6 +75,8 @@ pub enum ServerMessage {
     ExtensionsRegistry(ExtensionsRegistry),
     #[serde(rename = "freshAgent.create.failed")]
     FreshAgentCreateFailed(FreshAgentCreateFailed),
+    #[serde(rename = "freshAgent.detached")]
+    FreshAgentDetached(FreshAgentDetached),
     #[serde(rename = "freshAgent.checkpoint.outcome")]
     FreshAgentCheckpointOutcome(FreshAgentCheckpointOutcome),
     #[serde(rename = "freshAgent.created")]
@@ -229,7 +231,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 73] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 74] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "antigravity.activity.list.response",
@@ -253,6 +255,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 73] = [
     "freshAgent.checkpoint.outcome",
     "freshAgent.create.failed",
     "freshAgent.created",
+    "freshAgent.detached",
     "freshAgent.event",
     "freshAgent.forked",
     "freshAgent.killed",
@@ -1101,6 +1104,22 @@ pub struct FreshAgentCreated {
     /// Additive optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_ref: Option<SessionNameRef>,
+}
+
+/// Requester-scoped confirmation that one pane's delivery interest was
+/// removed. It says nothing about the shared provider runtime's lifetime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentDetached {
+    pub request_id: String,
+    pub view_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 94,
+  "schemaCount": 95,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2207,6 +2207,10 @@
             "type": {
               "const": "freshAgent.create",
               "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
             }
           },
           "required": [
@@ -2285,6 +2289,10 @@
             "type": {
               "const": "freshAgent.attach",
               "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
             }
           },
           "required": [
@@ -2292,6 +2300,70 @@
             "sessionId",
             "sessionType",
             "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionRef": {
+              "additionalProperties": false,
+              "properties": {
+                "provider": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "sessionId": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.detach",
+              "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionType",
+            "provider",
+            "viewId"
           ],
           "type": "object"
         },
@@ -3690,6 +3762,10 @@
         "type": {
           "const": "freshAgent.attach",
           "type": "string"
+        },
+        "viewId": {
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
@@ -3951,6 +4027,10 @@
             "type": {
               "const": "freshAgent.create",
               "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
             }
           },
           "required": [
@@ -4029,6 +4109,10 @@
             "type": {
               "const": "freshAgent.attach",
               "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
             }
           },
           "required": [
@@ -4036,6 +4120,70 @@
             "sessionId",
             "sessionType",
             "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionRef": {
+              "additionalProperties": false,
+              "properties": {
+                "provider": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "sessionId": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.detach",
+              "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionType",
+            "provider",
+            "viewId"
           ],
           "type": "object"
         },
@@ -5161,12 +5309,81 @@
         "type": {
           "const": "freshAgent.create",
           "type": "string"
+        },
+        "viewId": {
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
         "type",
         "requestId",
         "sessionType"
+      ],
+      "type": "object"
+    },
+    "FreshAgentDetachSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.detach",
+          "type": "string"
+        },
+        "viewId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionType",
+        "provider",
+        "viewId"
       ],
       "type": "object"
     },

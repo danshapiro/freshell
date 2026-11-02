@@ -622,6 +622,13 @@ function recordInputFileReads(method, params) {
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
+function appendNativeLifecycle(event) {
+  const logPath = behavior.appendNativeLifecycleLogPath
+  if (!logPath) return
+  fs.mkdirSync(path.dirname(logPath), { recursive: true })
+  fs.appendFileSync(logPath, `${JSON.stringify({ event, pid: process.pid, at: new Date().toISOString() })}\n`, 'utf8')
+}
+
 // Opt-in observations only. No listener, retry, or startup control flow is changed.
 const diagnosticLogPath = process.env.FAKE_CODEX_APP_SERVER_DIAGNOSTIC_LOG
 let diagnosticSequence = 0
@@ -829,6 +836,10 @@ if (diagnosticLogPath) {
     }
     diagnosticEvent('listener.ready')
   })
+}
+
+if (behavior.appendNativeLifecycleLogPath) {
+  wss.once('listening', () => appendNativeLifecycle('native_boot'))
 }
 const watches = new Map()
 const notificationOptOuts = new WeakMap()
@@ -1428,6 +1439,7 @@ process.on('SIGTERM', () => {
   if (process.env.FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM === '1') {
     return
   }
+  appendNativeLifecycle('native_stop')
   if (behavior.signalFileOnSigterm) {
     fs.writeFileSync(behavior.signalFileOnSigterm, `${process.pid}\n`, 'utf8')
   }

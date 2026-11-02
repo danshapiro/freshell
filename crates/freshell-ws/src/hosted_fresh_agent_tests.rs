@@ -12,6 +12,7 @@ fn fresh_agent_sample(kind: &str) -> serde_json::Value {
     let extra = match kind {
         "freshAgent.create" => json!({"requestId": "create-1"}),
         "freshAgent.attach" => json!({}),
+        "freshAgent.detach" => json!({"requestId": "detach-1", "viewId": "view-1"}),
         "freshAgent.send" => json!({"text": "hello"}),
         "freshAgent.interrupt" => json!({}),
         "freshAgent.configure" => {
@@ -66,7 +67,7 @@ fn every_fresh_agent_client_message_is_consumed_by_the_hosted_gateway() {
         .iter()
         .chain(EXTENSION_CLIENT_MESSAGE_TYPES.iter())
         .copied()
-        .filter(|kind| kind.starts_with("freshAgent."))
+        .filter(|kind| kind.starts_with("freshAgent.") && *kind != "freshAgent.detach")
         .collect();
     assert!(
         !kinds.is_empty(),
@@ -89,6 +90,13 @@ fn every_fresh_agent_client_message_is_consumed_by_the_hosted_gateway() {
         unrouted.is_empty(),
         "fresh-agent messages fell through the hosted gateway: {unrouted:?}"
     );
+}
+
+#[test]
+fn fresh_agent_detach_stays_local_to_the_requesting_connection() {
+    let message: ClientMessage = serde_json::from_value(fresh_agent_sample("freshAgent.detach"))
+        .expect("detach sample must decode");
+    assert!(matches!(hosted_route(&message), HostedRoute::NotFreshAgent));
 }
 
 #[test]

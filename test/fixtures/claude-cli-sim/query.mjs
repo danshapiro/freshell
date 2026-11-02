@@ -86,6 +86,11 @@
 //                                       applyFlagSettings, with its arguments),
 //                                       `emission` (program steps), and `result`
 //                                       (a turn's result reached the SDK stream)
+//   FRESHELL_CLAUDE_SIM_HOLD_PROMPT_GATE_PATH  when set, a streamed text turn
+//                                       pauses after its first chunk until this
+//                                       file exists (opt-in browser fixture seam)
+//   FRESHELL_CLAUDE_SIM_RECORD_NATIVE_STOP  '1' records an interrupted live
+//                                       simulator as a `native_stop` ledger row
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -424,6 +429,9 @@ class SimulatedCli {
   /** The stream ends with `error` (a CLI death) or normally (close). */
   terminate(error) {
     if (this.dead) return
+    if (this.booted && !this.closing && this.env.FRESHELL_CLAUDE_SIM_RECORD_NATIVE_STOP === '1') {
+      this.ledger('native_stop', { sessionId: this.sessionId })
+    }
     this.dead = true
     // Work still unwinding after the death (an aborted tool settling) must
     // not reach the disk: the real CLI is gone and writes nothing more.
@@ -849,6 +857,16 @@ class SimulatedCli {
     for (const piece of pieces) {
       this.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } })
       text += piece
+      const holdGatePath = this.env.FRESHELL_CLAUDE_SIM_HOLD_PROMPT_GATE_PATH
+      if (text === piece && holdGatePath && !fs.existsSync(holdGatePath)) {
+        this.ledger('native_gate_wait', { sessionId: this.sessionId })
+        while (!fs.existsSync(holdGatePath) && !this.dead && !turn.aborted) {
+          if (await this.wait(25, turn)) {
+            await this.abortStreaming(turn, text)
+            return false
+          }
+        }
+      }
       if (pace && await this.wait(pace, turn)) {
         await this.abortStreaming(turn, text)
         return false
