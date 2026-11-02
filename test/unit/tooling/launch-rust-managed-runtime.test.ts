@@ -63,19 +63,21 @@ function createFixture(buildInfo = '{"managedRuntimeV1":false}'): LaunchFixture 
   return fixture
 }
 
-function run(fixture: LaunchFixture, args: string[], managedRuntime = false) {
+function run(fixture: LaunchFixture, args: string[], managedRuntime: boolean | null = false) {
   const buildInfo = fs.readFileSync(path.join(fixture.root, '.build-info'), 'utf8')
+  const env = {
+    ...process.env,
+    PATH: `${fixture.bin}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+    FRESHELL_HOME: fixture.home,
+    PORT: fixture.port,
+    COMMAND_LOG: fixture.commandLog,
+    FAKE_BUILD_INFO: buildInfo,
+    ...(managedRuntime === null ? {} : { FRESHELL_MANAGED_RUNTIME_V1: managedRuntime ? '1' : '' }),
+  }
+  if (managedRuntime === null) delete env.FRESHELL_MANAGED_RUNTIME_V1
   return spawnSync('bash', [fixture.script, ...args], {
     cwd: fixture.root,
-    env: {
-      ...process.env,
-      PATH: `${fixture.bin}:${process.env.PATH ?? '/usr/bin:/bin'}`,
-      FRESHELL_HOME: fixture.home,
-      PORT: fixture.port,
-      COMMAND_LOG: fixture.commandLog,
-      FAKE_BUILD_INFO: buildInfo,
-      ...(managedRuntime ? { FRESHELL_MANAGED_RUNTIME_V1: '1' } : { FRESHELL_MANAGED_RUNTIME_V1: '' }),
-    },
+    env,
     encoding: 'utf8',
     timeout: 10_000,
   })
@@ -113,6 +115,22 @@ describe('launch-rust managed runtime feature guard', () => {
     expect(restarted.status).not.toBe(0)
     expect(`${restarted.stdout}${restarted.stderr}`).toContain('managed-runtime-v1')
     expect(() => process.kill(pid, 0)).not.toThrow()
+  })
+
+  it('honors the managed runtime request in .env before rebuilding or stopping', () => {
+    const fixture = createFixture('{"managedRuntimeV1":false}')
+    const started = run(fixture, ['--skip-build'])
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+    fs.writeFileSync(path.join(fixture.root, '.env'), 'AUTH_TOKEN=fixture-token\nFRESHELL_MANAGED_RUNTIME_V1=1\n')
+
+    const restarted = run(fixture, ['--restart'], null)
+
+    expect(restarted.status).not.toBe(0)
+    expect(`${restarted.stdout}${restarted.stderr}`).toContain('managed-runtime-v1')
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).toContain('--features managed-runtime-v1')
+    expect(() => process.kill(pid, 0)).not.toThrow()
+    expect(Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())).toBe(pid)
   })
 
   it('keeps featureless launches working when managed runtime is not requested', () => {

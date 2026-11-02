@@ -1874,21 +1874,25 @@ it('web-only completion reports post-start host and unknown ownership while leav
     post_start_ownership: {
       observed_after_replacement_startup: true,
       outside_durable_soul_ownership: true,
-      remain_running: true,
+      protected_or_migrated_by_updater: false,
       covered_by_prior_maintenance_lease: false,
       panes: [{
         client_id: 'client_post-start', tab_id: 'tab_post-start', pane_id: 'pane_post-start', kind: 'fresh-agent',
         provider: 'claude', terminal_id: 'terminal-post-start', session_id: 'session:post-start', ownership: 'host-managed',
+        running_status: 'running',
       }],
       unattached_processes: [{
         kind: 'terminal', provider: 'codex', terminal_id: 'unknown_terminal', session_id: 'unknown:session', ownership: 'unknown',
+        running_status: 'unknown',
       }],
     },
   }))
   const output = f.effects.filter((effect) => effect.startsWith('operator:')).join('\n')
   expect(output).toContain('observed after replacement startup')
   expect(output).toContain('outside durable-soul ownership')
-  expect(output).toContain('remain running')
+  expect(output).toContain('Host-managed rows remain running')
+  expect(output).toContain('Running status for unknown rows is unconfirmed')
+  expect(output).toContain('not protected or migrated by this updater')
   expect(output).toContain('not covered by the prior maintenance lease')
   expect(output).toContain('client_post-start')
   expect(output).toContain('host-managed')
@@ -1934,15 +1938,18 @@ it('reset completion reports post-start host and unknown ownership while leaving
     post_start_ownership: expect.objectContaining({
       observed_after_replacement_startup: true,
       outside_durable_soul_ownership: true,
-      remain_running: true,
+      protected_or_migrated_by_updater: false,
       covered_by_prior_maintenance_lease: false,
-      panes: [expect.objectContaining({ pane_id: 'reset-pane', ownership: 'host-managed' })],
-      unattached_processes: [expect.objectContaining({ terminal_id: 'reset-unknown-terminal', ownership: 'unknown' })],
+      panes: [expect.objectContaining({ pane_id: 'reset-pane', ownership: 'host-managed', running_status: 'running' })],
+      unattached_processes: [expect.objectContaining({ terminal_id: 'reset-unknown-terminal', ownership: 'unknown', running_status: 'unknown' })],
     }),
   }))
   const output = f.effects.filter((effect) => effect.startsWith('operator:')).join('\n')
   expect(output).toContain('reset-pane')
   expect(output).toContain('reset-unknown-terminal')
+  expect(output).toContain('Host-managed rows remain running')
+  expect(output).toContain('Running status for unknown rows is unconfirmed')
+  expect(output).toContain('not protected or migrated by this updater')
   expect(output).toContain('not covered by the prior maintenance lease')
   expect(f.deps.admin.stop).toHaveBeenCalledTimes(1)
   expect(f.deps.admin.stop).not.toHaveBeenCalledWith('reset-pane', expect.anything(), expect.anything())

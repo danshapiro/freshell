@@ -291,6 +291,7 @@ interface PostStartPaneOwnership {
   pane_id: string
   kind: string
   ownership: NonDurableOwnership
+  running_status: 'running' | 'unknown'
   provider?: string
   terminal_id?: string
   session_id?: string
@@ -299,6 +300,7 @@ interface PostStartPaneOwnership {
 interface PostStartProcessOwnership {
   kind: string
   ownership: NonDurableOwnership
+  running_status: 'running' | 'unknown'
   provider?: string
   terminal_id?: string
   session_id?: string
@@ -307,7 +309,7 @@ interface PostStartProcessOwnership {
 interface PostStartOwnershipSummary {
   observed_after_replacement_startup: true
   outside_durable_soul_ownership: true
-  remain_running: true
+  protected_or_migrated_by_updater: false
   covered_by_prior_maintenance_lease: false
   panes: PostStartPaneOwnership[]
   unattached_processes: PostStartProcessOwnership[]
@@ -852,6 +854,7 @@ function summarizePostStartOwnership(report: ReadinessReport): PostStartOwnershi
       pane_id: safeIdentifier(value.paneId),
       kind: safeIdentifier(value.kind),
       ownership: value.ownership,
+      running_status: value.ownership === 'host-managed' ? 'running' : 'unknown',
       ...(provider ? { provider } : {}),
       ...(terminalId ? { terminal_id: terminalId } : {}),
       ...(sessionId ? { session_id: sessionId } : {}),
@@ -867,6 +870,7 @@ function summarizePostStartOwnership(report: ReadinessReport): PostStartOwnershi
     unattachedProcesses.push({
       kind: safeIdentifier(value.kind),
       ownership: value.ownership,
+      running_status: value.ownership === 'host-managed' ? 'running' : 'unknown',
       ...(provider ? { provider } : {}),
       ...(terminalId ? { terminal_id: terminalId } : {}),
       ...(sessionId ? { session_id: sessionId } : {}),
@@ -876,7 +880,7 @@ function summarizePostStartOwnership(report: ReadinessReport): PostStartOwnershi
   return {
     observed_after_replacement_startup: true,
     outside_durable_soul_ownership: true,
-    remain_running: true,
+    protected_or_migrated_by_updater: false,
     covered_by_prior_maintenance_lease: false,
     panes,
     unattached_processes: unattachedProcesses,
@@ -896,9 +900,19 @@ async function reportPostStartOwnership(
     ...summary.panes.map((pane) => `pane ${JSON.stringify(pane)}`),
     ...summary.unattached_processes.map((process) => `unattached process ${JSON.stringify(process)}`),
   ]
+  const ownerships = [
+    ...summary.panes.map((pane) => pane.ownership),
+    ...summary.unattached_processes.map((process) => process.ownership),
+  ]
+  const ownershipStatuses = [
+    ...(ownerships.includes('host-managed') ? ['Host-managed rows remain running.'] : []),
+    ...(ownerships.includes('unknown') ? ['Running status for unknown rows is unconfirmed.'] : []),
+  ].join(' ')
   await dependencies.logger.operator(
     'Post-start ownership notice: host-managed or unknown work was observed after replacement startup. '
-    + 'These rows are outside durable-soul ownership, remain running, and were not covered by the prior maintenance lease. '
+    + 'These rows are outside durable-soul ownership and were not protected or migrated by this updater. '
+    + (ownershipStatuses ? `${ownershipStatuses} ` : '')
+    + 'They were not covered by the prior maintenance lease. '
     + rows.join('; '),
   )
 }
