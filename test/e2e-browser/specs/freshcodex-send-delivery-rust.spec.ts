@@ -49,6 +49,7 @@ test(`Freshcodex retains a ${delivery.name} prompt with its delivery reason`, as
     await input.fill('Keep the original prompt')
     await pane.getByRole('button', { name: 'Send', exact: true }).click()
     await expect(input).toHaveValue('Keep the original prompt', { timeout: 15_000 })
+    await expect(pane.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
     if (delivery.name === 'refused') {
       await expect(pane.getByText(/Message not sent:.*refused before admission/)).toBeVisible()
       await expect(pane.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()

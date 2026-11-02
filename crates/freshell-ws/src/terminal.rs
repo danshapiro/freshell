@@ -207,14 +207,15 @@ where
 /// opencode locator sweep; amplifier's post-spawn locator was deleted —
 /// kata qmpk — but fresh amplifier creates carry a launcher-minted resume
 /// id, so the marker branch only fires for the accepted legacy
-/// identity-less restore case). NOT "any non-shell mode" (V7.md):
+/// identity-less restore case; antigravity resolves via the disk locator —
+/// antigravity plan Task 6). NOT "any non-shell mode" (V7.md):
 /// claude has create-time identity (pre-allocation) and NO resolver — its
 /// degenerate no-identity payloads (mismatched-provider sessionRef,
 /// empty-string session id; V5.md) spawn un-resumable and stay ledgerless
 /// by design; kimi/gemini/custom extension modes have no resolver, so a
 /// marker for them could never resolve and would only leak until the TTL
 /// sweep. Every mode listed here MUST have a resolution hook (Tasks 8-9).
-pub(crate) const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
+pub(crate) const MARKER_MODES: [&str; 4] = ["codex", "opencode", "amplifier", "antigravity"];
 
 /// Map the protocol `shell` enum to the platform `ShellType`.
 fn map_shell(shell: Shell) -> ShellType {
@@ -2027,6 +2028,10 @@ async fn handle_client_text(
                             Box::pin(async move { fresh_opencode.handle_send(send).await })
                         }
                         freshell_protocol::AgentProvider::Amplifier => Box::pin(async {}),
+                        // Antigravity plan Task 8: no fresh-agent runtime
+                        // (the amplifier shape) — a (contract-invalid)
+                        // freshAgent.send naming it is dropped.
+                        freshell_protocol::AgentProvider::Antigravity => Box::pin(async {}),
                     };
                     tokio::spawn(
                         Arc::clone(&service)
@@ -2065,6 +2070,10 @@ async fn handle_client_text(
                 // freshAgent.send naming it is dropped, same as legacy's
                 // zod parse rejecting it.
                 freshell_protocol::AgentProvider::Amplifier => {}
+                // Antigravity plan Task 8: the amplifier shape — the enum
+                // member exists for the terminal.turn.complete broadcast
+                // only; a freshAgent.send naming it is dropped.
+                freshell_protocol::AgentProvider::Antigravity => {}
             }
             true
         }
@@ -2678,6 +2687,26 @@ async fn handle_client_text(
                 ws_tx,
                 &ServerMessage::AmplifierActivityListResponse(
                     freshell_protocol::AmplifierActivityListResponse {
+                        request_id: list.request_id.clone(),
+                        terminals,
+                        latest_turn_completions: Some(latest),
+                    },
+                ),
+            )
+            .await
+        }
+        // Antigravity plan Task 8: the amplifier list's additive twin —
+        // reconnect seeding from the live tracker (same per-terminal
+        // `completionSeq` contract as the other families).
+        ClientMessage::AntigravityActivityList(list) => {
+            let (terminals, latest) = match &state.activity {
+                Some(hub) => hub.antigravity_list(),
+                None => (Vec::new(), Vec::new()),
+            };
+            send(
+                ws_tx,
+                &ServerMessage::AntigravityActivityListResponse(
+                    freshell_protocol::AntigravityActivityListResponse {
                         request_id: list.request_id.clone(),
                         terminals,
                         latest_turn_completions: Some(latest),
@@ -3993,6 +4022,18 @@ mod managed_runtime_id_tests {
                 "managed routing drifted from release qualification for {mode}"
             );
         }
+        // Task 14: the antigravity mirror row is fully blocked. The loop above
+        // only covers providers the manifest lists, so the row's presence and
+        // its blocked managed routing are pinned explicitly.
+        let antigravity = manifest["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider"] == "antigravity")
+            .expect("antigravity must publish a mirror capability row");
+        assert_eq!(antigravity["certificationState"], "not_applicable");
+        assert_eq!(antigravity["managedEnabled"], false);
+        assert!(!managed_runtime_mode("antigravity"));
     }
 
     #[test]
@@ -9734,6 +9775,8 @@ fn agent_provider_wire(provider: AgentProvider) -> &'static str {
         AgentProvider::Codex => "codex",
         AgentProvider::Opencode => "opencode",
         AgentProvider::Amplifier => "amplifier",
+        // Antigravity plan Task 8: the additive enum member's wire name.
+        AgentProvider::Antigravity => "antigravity",
     }
 }
 

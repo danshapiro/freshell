@@ -548,6 +548,17 @@ function composerLocator(page: Page) {
   return page.locator('[data-context="fresh-agent"]').last().getByRole('textbox', { name: 'Chat message input' })
 }
 
+/** Show the requested feedback in its semantic notice channel. */
+async function showNotice(page: Page, text: string | RegExp): Promise<void> {
+  const entry = page.locator('[data-agent-error="notice"]:not(:has(.fresh-agent-diagnostic-body)) > summary, [data-agent-error="notice"] .fresh-agent-diagnostic-body > p, [data-agent-notice="notice"]').filter({ hasText: text })
+  await expect(entry).toHaveCount(1, { timeout: 30_000 })
+  const disclosure = entry.locator('xpath=ancestor::details[1]')
+  if (await disclosure.count() && !(await disclosure.evaluate(node => node.hasAttribute('open')))) {
+    await disclosure.locator('summary').click()
+  }
+  await expect(entry).toBeVisible()
+}
+
 /** Type a slash command into the composer and commit it with Enter. */
 async function typeSlash(page: Page, text: string): Promise<void> {
   const composer = composerLocator(page)
@@ -673,14 +684,19 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       const redone = await snap()
       expect(redone?.rollback ?? null).toBeNull()
       expect(redone?.rolledBackTurns ?? null).toBeNull()
+      await expect(page.getByRole('button', { name: 'Toggle rolled-back history' })).toHaveCount(0)
 
       // ── DOUBLE undo: turn 2 then turn 1 roll back; the marker bucket lists
       // both steps in CONVERSATION order (user-role filter first — one undone
       // step contributes a user row AND an assistant row). ──
       await typeSlash(page, '/undo')
       await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(1)
+      // REST can settle before the browser processes rolledBack and refills
+      // the composer. Wait for that ack so it cannot overwrite the next /undo.
+      await expect.poll(() => composerLocator(page).inputValue(), { timeout: 15_000 }).toBe('prompt two')
       await typeSlash(page, '/undo')
       await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(0)
+      await expect.poll(() => composerLocator(page).inputValue(), { timeout: 15_000 }).toBe('prompt one')
       await expect
         .poll(
           async () => ((await snap())?.rolledBackTurns ?? [])
@@ -864,8 +880,11 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // Typed /redo never reaches the wire: the composer's reserved-name
       // interception answers with the pinned codex undo-only copy.
       await typeSlash(page, '/redo')
+      const notices = page.getByRole('region', { name: 'Agent errors' })
+      await expect(notices).toBeVisible({ timeout: 15_000 })
+      await showNotice(page, /Redo is not available for Codex sessions/)
       await expect(
-        page.getByText(/Redo is not available for Codex sessions/),
+        notices.getByText(/Redo is not available for Codex sessions/),
         'the REDO_CODEX_UNSUPPORTED_NOTICE prefix renders on the notice banner',
       ).toBeVisible({ timeout: 15_000 })
       expect(userRows(await snap())).toBe(0) // transcript unchanged
@@ -1159,6 +1178,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
 
       // The CLI refused the guarded fork; the server's pinned reason renders
       // verbatim on the notice banner, never a guard-less retry.
+      await showNotice(page, "Claude folded another message into that turn, so it can't be undone to that point.")
       await expect(
         page.getByText("Claude folded another message into that turn, so it can't be undone to that point."),
         'the honest refusal renders on the notice banner',
@@ -1323,6 +1343,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // Mid-turn /undo: the client busy gate answers with the pinned steer
       // copy — no rollback frame ever leaves the client.
       await typeSlash(page, '/undo')
+      await showNotice(page, /queue a message to steer it/)
       await expect(
         page.getByText(/queue a message to steer it/),
         'the pinned busy copy renders on the notice banner',
@@ -1341,6 +1362,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await expect(card).toBeHidden({ timeout: 15_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await typeSlash(page, '/undo')
+      await showNotice(page, /the removed prompt is back in the composer/)
       await expect(
         page.getByText(/the removed prompt is back in the composer/),
         'UNDO_REFILL_NOTICE: the post-turn /undo succeeds',

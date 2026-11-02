@@ -50,6 +50,7 @@ pub enum ResumeHintProvider {
     Codex,
     Opencode,
     Amplifier,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -118,6 +119,19 @@ static COMMAND_HINTS: LazyLock<Vec<(Regex, ResumeHintProvider)>> = LazyLock::new
             Regex::new(r"(?i)(?-u:\b)amplifier\s+(?:--resume|resume)(?-u:\b)")
                 .expect("static regex"),
             ResumeHintProvider::Amplifier,
+        ),
+        // Antigravity (plan Task 7): the CLI's resume form is
+        // `agy --conversation <id>` (the manifest's `resumeArgs`,
+        // extensions/antigravity/freshell.json); the provider name is an
+        // accepted alias for the same command shape. Command-shape only —
+        // no WORD_HINTS row (a bare provider word is not resume evidence).
+        (
+            Regex::new(r"(?i)(?-u:\b)agy\s+--conversation(?-u:\b)").expect("static regex"),
+            ResumeHintProvider::Antigravity,
+        ),
+        (
+            Regex::new(r"(?i)(?-u:\b)antigravity\s+--conversation(?-u:\b)").expect("static regex"),
+            ResumeHintProvider::Antigravity,
         ),
     ]
 });

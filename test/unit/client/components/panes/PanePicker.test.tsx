@@ -45,6 +45,10 @@ const mockKimiExt: ClientExtensionEntry = {
   name: 'kimi', version: '1.0.0', label: 'Kimi', description: '', category: 'cli',
   cli: {},
 }
+const mockAntigravityExt: ClientExtensionEntry = {
+  name: 'antigravity', version: '1.0.0', label: 'Antigravity CLI', description: '', category: 'cli',
+  cli: {},
+}
 const defaultCliExtensions: ClientExtensionEntry[] = [mockClaudeExt, mockCodexExt]
 
 // Mock lucide-react icons
@@ -272,6 +276,20 @@ describe('PanePicker', () => {
       })
 
       expect(screen.getByRole('button', { name: 'OpenCode' })).toBeInTheDocument()
+    })
+
+    it('shows the Antigravity CLI tile when the registry entry is available and enabled', () => {
+      const { onSelect } = renderPicker({
+        availableClis: { antigravity: true },
+        enabledProviders: ['antigravity'],
+        extensions: [mockAntigravityExt],
+      })
+
+      const tile = screen.getByRole('button', { name: 'Antigravity CLI' })
+      expect(tile).toBeInTheDocument()
+      fireEvent.click(tile)
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('antigravity')
     })
 
     it('hides Claude CLI when not available on system', () => {
@@ -571,6 +589,20 @@ describe('PanePicker', () => {
       fireEvent.keyDown(getContainer(), { key: 'x' })
       completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('codex')
+    })
+
+    it('activates the Antigravity CLI tile through its default shortcut key', () => {
+      // No manifest shortcut is set, so the tile defaults to the name's first
+      // letter ('A'). Only the antigravity entry is registered here, so the
+      // amplifier 'A' collision cannot interfere in this test.
+      const { onSelect } = renderPicker({
+        availableClis: { antigravity: true },
+        enabledProviders: ['antigravity'],
+        extensions: [mockAntigravityExt],
+      })
+      fireEvent.keyDown(getContainer(), { key: 'a' })
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('antigravity')
     })
 
     it('does not fire shortcuts when an element outside the picker has focus', () => {

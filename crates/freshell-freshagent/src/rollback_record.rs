@@ -401,6 +401,11 @@ fn agent_provider_wire(provider: AgentProvider) -> &'static str {
         AgentProvider::Codex => "codex",
         AgentProvider::Opencode => "opencode",
         AgentProvider::Amplifier => "amplifier",
+        // Antigravity plan Task 8: the enum member exists for the
+        // terminal.turn.complete broadcast only (no fresh-agent runtime —
+        // the amplifier shape); a rollback op can never carry it, but the
+        // wire mapping stays total.
+        AgentProvider::Antigravity => "antigravity",
     }
 }
 

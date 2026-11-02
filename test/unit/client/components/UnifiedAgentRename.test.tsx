@@ -25,6 +25,7 @@ import {
   selectPaneDisplayName,
   selectTabDisplayName,
   selectSessionDisplayName,
+  selectSessionRowRecord,
 } from '@/store/selectors/sessionNameSelectors'
 import { isUnifiedAgentMode, sessionNameRefKey, type SessionNameRecord, type SessionNameRef, type SessionNameUpdate } from '@shared/session-names'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
@@ -615,13 +616,14 @@ describe('unified agent rename — one shared session name', () => {
     expect(selectPaneDisplayName(state, 'tab-1', 'pane-1')).toBe('My shell label')
   })
 
-  it('covers all six scoped modes through the real selectors, excluding kilroy and shells', () => {
+  it('covers all seven scoped modes through the real selectors, excluding kilroy and shells', () => {
     const { store } = scopedPaneStore()
     act(() => {
       store.dispatch(receiveSessionNames([
         updateOf({ ref: { kind: 'session', provider: 'claude', sessionId: 'six-claude' }, name: 'Claude CLI name', source: 'freshell_ai', revision: 1 }, 1),
         updateOf({ ref: { kind: 'session', provider: 'codex', sessionId: 'six-codex' }, name: 'Codex CLI name', source: 'freshell_ai', revision: 1 }, 1),
         updateOf({ ref: { kind: 'session', provider: 'opencode', sessionId: 'six-opencode' }, name: 'OpenCode CLI name', source: 'freshell_ai', revision: 1 }, 1),
+        updateOf({ ref: { kind: 'session', provider: 'antigravity', sessionId: 'six-antigravity' }, name: 'Antigravity CLI name', source: 'freshell_ai', revision: 1 }, 1),
         updateOf({ ref: { kind: 'pending', id: 'fresh-handle' }, name: 'Fresh handle name', source: 'directory', revision: 1 }, 1),
       ]))
     })
@@ -630,6 +632,7 @@ describe('unified agent rename — one shared session name', () => {
       { kind: 'terminal', mode: 'claude', expected: 'Claude CLI name' },
       { kind: 'terminal', mode: 'codex', expected: 'Codex CLI name' },
       { kind: 'terminal', mode: 'opencode', expected: 'OpenCode CLI name' },
+      { kind: 'terminal', mode: 'antigravity', expected: 'Antigravity CLI name' },
       { kind: 'fresh-agent', sessionType: 'freshclaude', expected: 'Claude CLI name' },
       { kind: 'fresh-agent', sessionType: 'freshcodex', expected: 'Codex CLI name' },
       { kind: 'fresh-agent', sessionType: 'freshopencode', expected: 'OpenCode CLI name' },
@@ -707,5 +710,13 @@ describe('unified agent rename — one shared session name', () => {
     // Session display name: canonical record by ref, fallback otherwise.
     expect(selectSessionDisplayName(store.getState(), { kind: 'session', provider: 'claude', sessionId: 'six-claude' }, 'fallback')).toBe('Claude CLI name')
     expect(selectSessionDisplayName(store.getState(), { kind: 'session', provider: 'gemini', sessionId: 'nope' }, 'Gemini fallback')).toBe('Gemini fallback')
+
+    // The durable-key row projection (sidebar/history rows, T5-N5): the
+    // antigravity saved name resolves — the projection no longer drops the
+    // provider — while an out-of-scope provider row still resolves nothing.
+    const cache = store.getState().sessionNames
+    expect(selectSessionRowRecord(cache, 'antigravity', 'six-antigravity')?.name).toBe('Antigravity CLI name')
+    expect(selectSessionRowRecord(cache, 'gemini', 'nope')).toBeUndefined()
+    expect(selectSessionRowRecord(cache, 'kimi', 'nope')).toBeUndefined()
   })
 })

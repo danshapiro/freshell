@@ -117,11 +117,14 @@ test.describe('freshclaude durable transcript (real CLI transcripts, Rust server
       await expect(paneRoot.getByText('All done.')).toBeVisible({ timeout: 15_000 })
 
       // The changed-files panel lists both edited files with their status.
-      const created = paneRoot.getByRole('button', { name: 'Diff: /fixture/ws/a.txt' })
+      await paneRoot.getByRole('button', { name: /^Diffs:/ }).click()
+      const changes = page.getByRole('dialog', { name: 'Changes' })
+      const created = changes.getByRole('button', { name: 'Diff: /fixture/ws/a.txt' })
       await expect(created).toBeVisible()
       await expect(created).toContainText('created')
-      await expect(paneRoot.getByRole('button', { name: 'Diff: /fixture/ws/b.txt' })).toContainText('+1 −0')
+      await expect(changes.getByRole('button', { name: 'Diff: /fixture/ws/b.txt' })).toContainText('+1 −0')
 
+      await changes.getByRole('button', { name: 'Close', exact: true }).click()
       await expandActivity(paneRoot)
       const delegation = paneRoot.getByTestId('fresh-agent-delegation-block')
       await expect(delegation).toHaveCount(1)

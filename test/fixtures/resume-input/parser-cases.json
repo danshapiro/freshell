@@ -223,6 +223,24 @@
         { "token": "task_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w3", "kind": "prefixed-id" }
       ],
       "hint": null
+    },
+    {
+      "name": "agy --conversation command",
+      "input": "agy --conversation 11111111-2222-4333-8444-555555555555",
+      "candidates": [{ "token": "11111111-2222-4333-8444-555555555555", "kind": "uuid" }],
+      "hint": { "provider": "antigravity", "source": "command" }
+    },
+    {
+      "name": "antigravity --conversation command",
+      "input": "antigravity --conversation 11111111-2222-4333-8444-555555555555",
+      "candidates": [{ "token": "11111111-2222-4333-8444-555555555555", "kind": "uuid" }],
+      "hint": { "provider": "antigravity", "source": "command" }
+    },
+    {
+      "name": "antigravity word alone does not hint (command shape only)",
+      "input": "the antigravity session 417e8345",
+      "candidates": [{ "token": "417e8345", "kind": "hex-prefix" }],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
     }
   ]
 }

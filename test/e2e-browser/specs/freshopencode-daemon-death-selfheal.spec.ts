@@ -314,10 +314,10 @@ test.describe('Freshopencode daemon-death self-heal (local lane)', () => {
       }, { timeout: 15_000 }).toBeTruthy()
 
       // (3) The pane shows the OPENCODE_DAEMON_LOST "Agent error:" banner.
-      const daemonLostBanner = page.getByRole('alert').filter({
-        hasText: 'The opencode serve daemon was lost unexpectedly',
-      })
-      await expect(daemonLostBanner).toBeVisible({ timeout: 30_000 })
+      const daemonLostBanner = page.locator('[data-agent-error="session"]')
+      await expect(daemonLostBanner.getByRole('alert')).toHaveText('Agent error', { timeout: 30_000 })
+      await daemonLostBanner.locator('summary').click()
+      await expect(daemonLostBanner).toContainText('The opencode serve daemon was lost unexpectedly')
       await expect(daemonLostBanner).toContainText('Agent error:')
 
       // The typed edge: exactly ONE OPENCODE_DAEMON_LOST frame for the

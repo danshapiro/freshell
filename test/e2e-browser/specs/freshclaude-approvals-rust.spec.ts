@@ -138,6 +138,7 @@ test.describe('freshclaude approvals (production sidecar over the CLI simulator,
       await lane.send(pane, PLAN_PROMPT)
       const card = pane.paneRoot.getByRole('alert', { name: 'Plan approval request' })
       await expect(card).toBeVisible({ timeout: 30_000 })
+      await card.locator('summary').filter({ hasText: 'Plan details' }).click()
       await expect(card.getByRole('heading', { name: 'Ship the parser' })).toBeVisible()
       await expect(pane.paneRoot.getByRole('alert', { name: /permission request/i })).toHaveCount(0)
 

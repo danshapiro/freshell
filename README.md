@@ -125,7 +125,9 @@ The service is standalone and independent of Electron.
 
 Freshclaude, Freshcodex, and Freshopencode share a chat interface with live tool output, attachments, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Freshcodex lists models offered by its running Codex installation and also accepts an exact custom model ID. Changes apply to your next message; the picker remembers recent choices for each project. **Default** removes Freshell’s thinking-level override; Codex may still use its own configuration or a choice retained from earlier turns.
 
-In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. Freshcodex shows the decisions offered by Codex for each request, including “Allow for this session” when available.
+Fresh Agent panels stay compact above the conversation. Diffs shows the changed-file count and opens Changes at the side. Requests keep their answer buttons visible; open Command or Request details for long arguments. Routine notices share a status row, and errors expand to show diagnostics and recovery actions. Pending requests scroll within a bounded area, with their count above it. In very short split panes, scroll the pane to reach the conversation and composer.
+
+In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card or under Permission changes for long lists (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. Freshcodex shows the decisions offered by Codex for each request, including “Allow for this session” when available.
 
 Freshcodex settings separate **Build or Plan**, **File access**, and approval policy. “Never ask” does not expand file or network access. Incompatible model, effort, or provider settings produce a diagnostic instead of silently broadening access.
 
@@ -222,6 +224,8 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `CODEX_CMD` | No | Codex CLI command override |
 | `OPENCODE_CMD` | No | OpenCode CLI command override |
 | `GEMINI_CMD` | No | Gemini CLI command override |
+| `ANTIGRAVITY_CMD` | No | Antigravity CLI command override |
+| `FRESHELL_ANTIGRAVITY_HOME` | No | Antigravity store root override (default: `~/.gemini/antigravity-cli`; snap installs fall back to `~/snap/antigravity-cli/common/.gemini/antigravity-cli`) |
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for automatic conversation names and terminal summaries; takes precedence over Settings at startup |
@@ -240,6 +244,7 @@ Freshell indexes local session history and can launch terminals for these coding
 | **Codex** | Yes | Yes | `~/.codex` |
 | **OpenCode** | Yes | Yes | `XDG_DATA_HOME/opencode` (or platform default) |
 | **Gemini** | — | Yes | — |
+| **Antigravity** | Yes | Yes | `~/.gemini/antigravity-cli` |
 | **Kimi** | — | Yes | — |
 | **Amplifier** | Yes | Yes | `~/.amplifier` |
 
@@ -256,6 +261,46 @@ OneCLI grant
 through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
 the provider child when the session starts.
+
+Antigravity CLI support launches `agy` panes (with no launch flags — the
+real CLI starts interactive by default, as probed against pinned binaries
+1.4.10 and 1.4.12), indexes native conversation history, binds one
+conversation identity per pane, and shows busy and turn-completion
+state — with these recorded limitations. Freshell reads Antigravity
+conversations from `~/.gemini/antigravity-cli` (or the
+`FRESHELL_ANTIGRAVITY_HOME` override); snap installs keep their store
+under `~/snap/antigravity-cli/common/.gemini/antigravity-cli`, which
+Freshell falls back to automatically whenever the default root holds no
+conversations — the chosen root is named in the server log at startup,
+and neither root existing is logged loudly. Freshell's view of Antigravity's
+on-disk conversation format follows Google's documented store, but the
+transcript record schema and the store's authority have not been
+validated against a real authenticated `agy` session, so they remain
+candidate contracts. Freshell installs no Antigravity hooks and writes no
+Antigravity configuration anywhere; identity and activity are read-only
+views over the CLI's own files. Managed execution, durable recovery, live
+qualification, and a pinned runtime image for Antigravity are not built — the
+runtime capability row is fully blocked and records why. Renaming a
+conversation works inside Freshell but is never written back to the
+Antigravity CLI itself (native rename is unsupported). Binding a pane to
+its conversation depends on Freshell rebuilding the typed prompt from
+keystrokes: prompts entered through history recall (Up/Down), Tab
+completion, bracketed paste, or keys Freshell does not model never bind,
+and the pane binds again on its next clean typed prompt. On a resumed or
+restored pane, busy and turn-completion state only appear after the first
+clean typed submit — turns before that show no busy state and no
+completion bell. An approval or
+question is only marked separately when the transcript tailer can prove it;
+today terminal Antigravity panes show only the broader busy/idle state and
+have no waiting-for-approval attention signal (the same treatment as other
+terminal CLI panes). Resuming passes the conversation
+id to `agy` verbatim without Freshell-side validation for now; the real CLI
+(probed) prints a warning for an unknown conversation id and continues into
+a fresh interactive session rather than failing, and the pane then rebinds
+to that fresh conversation on its next typed prompt — so a stale resume id
+is not caught for you, but it never dead-ends the pane and never silently
+substitutes: enabling the validated resume
+gate is deferred until real-binary transcript evidence exists.
 
 ### Standalone CLI and MCP client
 

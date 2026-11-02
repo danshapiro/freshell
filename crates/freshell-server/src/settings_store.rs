@@ -214,12 +214,14 @@ impl SettingsStore {
         let mut migrated_legacy = false;
         {
             const LEGACY: [&str; 2] = ["claude", "codex"];
-            // Node's four-provider `DEFAULT_ENABLED_CLI_PROVIDERS`
+            // Node's five-provider `DEFAULT_ENABLED_CLI_PROVIDERS`
             // (`shared/coding-cli-defaults.ts:3`) — a persisted legacy list
             // must gain `amplifier` here exactly as it does on Node
             // (`server/settings-migrate.ts:35-46`), or the provider stays
-            // unsearched and its indexed sessions filtered out.
-            const DEFAULTS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+            // unsearched and its indexed sessions filtered out. `antigravity`
+            // rides the same contract (added with its bundled extension;
+            // still gated on discovery below).
+            const DEFAULTS: [&str; 5] = ["claude", "codex", "opencode", "amplifier", "antigravity"];
             let enabled_norm =
                 normalize_trimmed_string_list(&settings.coding_cli.enabled_providers);
             let legacy_match = enabled_norm.len() == LEGACY.len()
@@ -2603,11 +2605,14 @@ mod tests {
     }
 
     /// Task 5 (resolve parity): a FRESH home's default enabled-provider list
-    /// must be Node's authoritative four-provider
-    /// `DEFAULT_ENABLED_CLI_PROVIDERS` (`shared/coding-cli-defaults.ts:3`) —
-    /// including `amplifier`. Pins the live parity defect where the Rust
-    /// default omitted `amplifier`, leaving that provider unsearched and its
-    /// indexed sessions filtered out.
+    /// must be the authoritative `DEFAULT_ENABLED_CLI_PROVIDERS`
+    /// (`shared/coding-cli-defaults.ts:3`) — five providers,
+    /// including `amplifier` and `antigravity`. Pins the live parity defect
+    /// where the Rust default omitted `amplifier`, leaving that provider
+    /// unsearched and its indexed sessions filtered out; `antigravity` rides
+    /// the same contract (fresh installs take `enabledProviders` from the
+    /// defaults — without it the picker tile never shows even with `agy`
+    /// installed).
     #[tokio::test]
     async fn coding_cli_enabled_providers_defaults_match_node_default_set() {
         let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
@@ -2620,6 +2625,7 @@ mod tests {
                 "codex".to_string(),
                 "opencode".to_string(),
                 "amplifier".to_string(),
+                "antigravity".to_string(),
             ]
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -2650,6 +2656,43 @@ mod tests {
         assert_eq!(
             s.coding_cli.enabled_providers,
             vec!["claude", "codex", "opencode", "amplifier"]
+        );
+        assert_eq!(s.coding_cli.known_providers, Some(discovered));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Antigravity registration (plan Task 2): the legacy-default migration
+    /// mirrors the FIVE-provider `DEFAULT_ENABLED_CLI_PROVIDERS` — a
+    /// persisted legacy `["claude","codex"]` gains `antigravity` under
+    /// exactly the same availability gating as `opencode`/`amplifier`
+    /// (only when discovered). This is the existing-install arm of the
+    /// fresh-install default pin above.
+    #[tokio::test]
+    async fn legacy_default_enabled_providers_migration_includes_antigravity() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","codex"],"providers":{},"mcpServer":true}}}"#,
+        )
+        .unwrap();
+        let discovered: Vec<String> = [
+            "claude",
+            "codex",
+            "gemini",
+            "kimi",
+            "opencode",
+            "amplifier",
+            "antigravity",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let store = SettingsStore::load(Some(&dir), discovered.clone());
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.enabled_providers,
+            vec!["claude", "codex", "opencode", "amplifier", "antigravity"]
         );
         assert_eq!(s.coding_cli.known_providers, Some(discovered));
         std::fs::remove_dir_all(&dir).ok();
@@ -3228,6 +3271,17 @@ mod tests {
         // fixture comparison here — `load_full_settings` seeds `[]`, matching
         // an isolated boot with no discovered CLI extensions.
         expected_settings["codingCli"]["knownProviders"] = json!([]);
+        // enabledProviders: the captured original predates antigravity, so the
+        // frozen fixture pins the four-provider set. Freshell's fresh-install
+        // default now intentionally includes `antigravity` (registration plan
+        // Task 2: fresh installs take `enabledProviders` from
+        // `DEFAULT_ENABLED_CLI_PROVIDERS`, and without it a fresh install
+        // never enables the provider — the append-and-enable migration only
+        // covers existing installs). `port/**` is frozen provenance and must
+        // not be edited, so the divergence is pinned explicitly here, the
+        // same way knownProviders is; every other field stays byte-for-byte.
+        expected_settings["codingCli"]["enabledProviders"] =
+            json!(["claude", "codex", "opencode", "amplifier", "antigravity"]);
 
         let dir = std::env::temp_dir().join(format!("frs-fixture-{}", uuid_like()));
         let freshell = dir.join(".freshell");

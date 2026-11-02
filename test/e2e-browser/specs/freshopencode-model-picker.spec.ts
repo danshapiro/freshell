@@ -516,7 +516,7 @@ test.describe('Freshopencode model + thinking selector', () => {
     await expect(composer).toBeEnabled({ timeout: 15_000 })
     await composer.fill('/model')
     await composer.press('Enter')
-    await expect(page.getByRole('alert').filter({ hasText: 'Model catalog unavailable — try again' })).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByRole('alert', { name: 'Agent warning' })).toHaveText('Model catalog unavailable — try again', { timeout: 10_000 })
     await expect(page.getByRole('dialog', { name: 'Model and thinking level' })).toHaveCount(0)
   })
 })

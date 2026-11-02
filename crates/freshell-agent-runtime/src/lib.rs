@@ -570,6 +570,33 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         live_gate: "not-enabled",
         blocked_reason: Some("BLOCKED_RECOVERY_IMPLEMENTATION"),
     },
+    // Task 14: antigravity is a launch/history/attention terminal provider
+    // today; its managed runtime is deliberately NOT built. The row is fully
+    // blocked (NotApplicable, BLOCKED_RECOVERY_IMPLEMENTATION) and every
+    // managed claim stays off until the named blocker chain clears: the
+    // qualification spec, QUALIFIABLE_TERMINAL_PROVIDERS, the runtime image
+    // pin, the ProviderPreparation/secret/bootstrap arms, and any managed
+    // doorway. The identity/state values record the Stage-1 candidate
+    // contract honestly (terminal locator + the documented transcript path);
+    // neither is a managed-recovery claim.
+    ProviderCapability {
+        provider: "antigravity",
+        certification_state: CertificationState::NotApplicable,
+        qualification_ready: false,
+        managed_enabled: false,
+        durable_recovery_enabled: false,
+        recovery_paths: &[],
+        managed_modes: &["antigravity"],
+        execution_boundary: "legacy-extension",
+        identity_capture: "terminal locator (candidate contract; managed identity unimplemented)",
+        state_store: "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)",
+        resume_command: None,
+        zero_turn_policy: "no-continuity-claim",
+        checkpoint_policy: "none",
+        bootstrap: "extension-owned",
+        live_gate: "not-enabled",
+        blocked_reason: Some("BLOCKED_RECOVERY_IMPLEMENTATION"),
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4556,6 +4583,72 @@ mod tests {
                 capability.provider
             );
         }
+    }
+
+    #[test]
+    fn antigravity_row_is_fully_blocked_and_not_applicable() {
+        // Task 14: the antigravity managed-runtime row is FULLY BLOCKED. Every
+        // release promise is disabled and the typed blocked reason names the
+        // recovery-implementation blocker chain: the qualification spec,
+        // QUALIFIABLE_TERMINAL_PROVIDERS, the runtime image pin, the
+        // ProviderPreparation/secret/bootstrap arms, and any managed doorway
+        // are all deliberately absent. The row may not widen the deferred or
+        // certified-durable scope, and the qualification policy must reject it
+        // exactly as it rejects the other legacy extension providers.
+        let row =
+            capability("antigravity").expect("antigravity must publish an explicit capability row");
+        assert_eq!(row.certification_state, CertificationState::NotApplicable);
+        assert!(!row.qualification_ready);
+        assert!(!row.managed_enabled);
+        assert!(!row.durable_recovery_enabled);
+        assert!(row.recovery_paths.is_empty());
+        assert_eq!(row.managed_modes, &["antigravity"][..]);
+        assert_eq!(row.execution_boundary, "legacy-extension");
+        assert_eq!(
+            row.identity_capture,
+            "terminal locator (candidate contract; managed identity unimplemented)"
+        );
+        assert_eq!(
+            row.state_store,
+            "$HOME/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl (candidate)"
+        );
+        assert_eq!(row.resume_command, None);
+        assert_eq!(row.zero_turn_policy, "no-continuity-claim");
+        assert_eq!(row.checkpoint_policy, "none");
+        assert_eq!(row.bootstrap, "extension-owned");
+        assert_eq!(row.live_gate, "not-enabled");
+        assert_eq!(row.blocked_reason, Some("BLOCKED_RECOVERY_IMPLEMENTATION"));
+        assert!(!durable_souls_certified("antigravity"));
+        assert!(!managed_provider_enabled("antigravity"));
+        // No runtime image pin exists for antigravity (named blocker chain).
+        assert!(pinned_provider_version("antigravity").is_none());
+
+        let deferred: Vec<_> = PROVIDER_CAPABILITIES
+            .iter()
+            .filter(|capability| {
+                capability.certification_state
+                    == CertificationState::PendingLiveProviderCertification
+            })
+            .map(|capability| capability.provider)
+            .collect();
+        // Main's durable-souls work promoted claude and codex to certified;
+        // amplifier is the only provider still pending live certification.
+        // The load-bearing invariant for THIS test: antigravity is in NONE of
+        // these lists (fully blocked, NotApplicable).
+        assert_eq!(deferred, ["amplifier"]);
+
+        let certified_durable: Vec<_> = PROVIDER_CAPABILITIES
+            .iter()
+            .filter(|capability| durable_souls_certified(capability.provider))
+            .map(|capability| capability.provider)
+            .collect();
+        // Main's durable-souls work certified claude and codex alongside
+        // opencode. Antigravity must never appear here (fully blocked).
+        assert_eq!(certified_durable, ["claude", "opencode", "codex"]);
+
+        // The qualification policy rejects antigravity (the gemini rejection
+        // model, qualification_policy.rs).
+        assert!(qualification_policy_from_value(Some("antigravity")).is_err());
     }
 
     fn resume_spec_for_test(provider: &str, session_id: &str, provider_home: &Path) -> ResumeSpec {

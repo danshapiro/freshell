@@ -1,4 +1,4 @@
-import { useId } from 'react'
+import { useId, type ReactNode } from 'react'
 import DiffView from '@/components/fresh-agent/shared/DiffView'
 import type { FreshAgentPendingApproval } from '@shared/fresh-agent-contract'
 import {
@@ -44,6 +44,26 @@ export function FreshAgentApprovalCard(props: FreshAgentApprovalCardProps) {
   return <FreshAgentToolApprovalCard {...props} />
 }
 
+function isVerbose(text: string) {
+  return text.length > 240 || text.split('\n').length > 3
+}
+
+function formatInputPreview(input: Record<string, unknown>) {
+  const compact = JSON.stringify(input)
+  return isVerbose(compact) ? JSON.stringify(input, null, 2) : compact
+}
+
+function Preview({ text, children, command, toolName }: { text: string; children: ReactNode; command?: boolean; toolName?: string }) {
+  if (!isVerbose(text)) return children
+  return <>
+    {command ? <p className="fresh-agent-command-identity text-xs">{toolName}: {text.split('\n')[0].slice(0, 80)}</p> : null}
+    <details className="fresh-agent-request-details">
+      <summary>{command ? 'Command details' : 'Request details'}</summary>
+      {children}
+    </details>
+  </>
+}
+
 function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprovalCardProps) {
   const native = approval.native ?? {}
   const offered = Array.isArray(native.availableDecisions) ? native.availableDecisions : ['accept', 'decline', 'cancel']
@@ -53,18 +73,26 @@ function NativeApprovalCard({ approval, disabled, onRespond }: FreshAgentApprova
   const labels = { accept: 'Allow', acceptForSession: 'Allow for this session', decline: 'Decline', cancel: 'Stop' }
   const details = {
     ...(native.kind ? { action: native.kind } : {}),
-    ...(native.command ? { command: native.command } : {}),
     ...(native.cwd ? { directory: native.cwd } : {}),
     ...(native.permissions ? { permissions: native.permissions } : {}),
     ...(native.additionalPermissions ? { additionalPermissions: native.additionalPermissions } : {}),
     ...(native.grantRoot ? { path: native.grantRoot } : {}),
   }
+  const detailsText = formatInputPreview(details)
   return (
     <div role="alert" aria-label={`Permission request for ${approval.toolName ?? 'Tool'}`} className="fresh-agent-approval-card rounded-md border border-amber-500/50 p-3 space-y-2">
       <p className="font-medium">{native.kind === 'writeStdin' ? 'Write to a running command' : approval.toolName}</p>
       {network ? <p>Connect to {network.host} {network.protocol ? `using ${network.protocol}` : ''}</p> : null}
+      {typeof native.grantRoot === 'string' ? <p className="fresh-agent-approval-path text-xs">{native.grantRoot}</p> : null}
       {approval.decisionReason ? <p>{approval.decisionReason}</p> : null}
-      {Object.keys(details).length ? <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(details, null, 2)}</pre> : null}
+      {typeof native.command === 'string' ? <Preview text={native.command} command toolName={approval.toolName}>
+        <pre className="fresh-agent-approval-preview whitespace-pre-wrap text-xs">{native.command}</pre>
+      </Preview> : null}
+      {Object.keys(details).length ? (
+        <Preview text={detailsText}>
+          <pre className="fresh-agent-approval-preview whitespace-pre-wrap text-xs">{detailsText}</pre>
+        </Preview>
+      ) : null}
       {approval.toolName === 'Additional permissions' ? <p className="text-xs">Allow the requested permissions for this turn.</p> : null}
       <div className="flex flex-wrap gap-2">
         {supported.filter((choice) => choices.includes(choice)).map((choice) => (
@@ -89,7 +117,21 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
     && typeof input.new_string === 'string'
     ? { oldStr: input.old_string, newStr: input.new_string, filePath: typeof input.file_path === 'string' ? input.file_path : undefined }
     : null
+  const requestPath = approval.blockedPath ?? (typeof input.file_path === 'string' ? input.file_path : undefined)
+  const inputText = formatInputPreview(input)
   const remember = suggestions.length > 0 ? rememberLabel(suggestions) : null
+
+  const suggestionsList = (
+    <ul
+      id={suggestionsId}
+      aria-label={`What "${remember}" saves`}
+      className="fresh-agent-approval-suggestions mt-2 list-disc space-y-0.5 pl-5 text-xs text-muted-foreground"
+    >
+      {suggestions.map((update, index) => (
+        <li key={index}>{describePermissionUpdate(update)}</li>
+      ))}
+    </ul>
+  )
 
   return (
     <div
@@ -102,8 +144,8 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
           approval
         </span>
         <span className="fresh-agent-approval-tool">{toolName}</span>
-        {approval.blockedPath ? (
-          <span className="fresh-agent-approval-path truncate font-mono text-xs text-muted-foreground">{approval.blockedPath}</span>
+        {requestPath ? (
+          <span className="fresh-agent-approval-path truncate font-mono text-xs text-muted-foreground">{requestPath}</span>
         ) : null}
       </div>
       {approval.decisionReason ? (
@@ -111,17 +153,17 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
       ) : null}
 
       {command ? (
-        <pre className="fresh-agent-approval-preview mt-2 overflow-x-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
+        <Preview text={command} command toolName={toolName}><pre className="fresh-agent-approval-preview mt-2 whitespace-pre-wrap rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
           {command}
-        </pre>
+        </pre></Preview>
       ) : editDiff ? (
-        <div className="fresh-agent-approval-preview mt-2 text-xs">
+        <Preview text={editDiff.oldStr + '\n' + editDiff.newStr}><div className="fresh-agent-approval-preview mt-2 text-xs">
           <DiffView oldStr={editDiff.oldStr} newStr={editDiff.newStr} filePath={editDiff.filePath} />
-        </div>
+        </div></Preview>
       ) : Object.keys(input).length > 0 ? (
-        <pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
-          {JSON.stringify(input, null, 2)}
-        </pre>
+        <Preview text={inputText}><pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
+          {inputText}
+        </pre></Preview>
       ) : null}
 
       <div className="fresh-agent-approval-actions mt-2 flex flex-wrap gap-2">
@@ -166,17 +208,12 @@ function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAll
           Deny
         </button>
       </div>
-      {remember ? (
-        <ul
-          id={suggestionsId}
-          aria-label={`What "${remember}" saves`}
-          className="fresh-agent-approval-suggestions mt-2 list-disc space-y-0.5 pl-5 text-xs text-muted-foreground"
-        >
-          {suggestions.map((update, index) => (
-            <li key={index}>{describePermissionUpdate(update)}</li>
-          ))}
-        </ul>
-      ) : null}
+      {remember ? (isVerbose(suggestions.map(describePermissionUpdate).join('\n')) ? (
+        <details>
+          <summary>Permission changes</summary>
+          {suggestionsList}
+        </details>
+      ) : suggestionsList) : null}
     </div>
   )
 }

@@ -122,6 +122,7 @@ import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
+import { setAntigravityActivitySnapshot, upsertAntigravityActivity, removeAntigravityActivity, resetAntigravityActivity } from '@/store/antigravityActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { hostStatsReset, hostStatsSnapshotReceived, hostStatsSubscribedSet, resolveHostStatsRefresh, failHostStatsRefresh } from '@/store/hostStatsSlice'
 import { subscribeHostStats } from '@/lib/host-stats-ws'
@@ -310,10 +311,12 @@ export default function App() {
   const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
   const claudeActivityListRequestSeqRef = useRef(new Map<string, number>())
   const amplifierActivityListRequestSeqRef = useRef(new Map<string, number>())
+  const antigravityActivityListRequestSeqRef = useRef(new Map<string, number>())
   const opencodeActivityListRequestSeqRef = useRef(new Map<string, number>())
   const codexActivityOrderRef = useRef(0)
   const claudeActivityOrderRef = useRef(0)
   const amplifierActivityOrderRef = useRef(0)
+  const antigravityActivityOrderRef = useRef(0)
   const opencodeActivityOrderRef = useRef(0)
   const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // pane.reconcile adoption: capability of the CURRENT connection (re-captured
@@ -622,6 +625,7 @@ export default function App() {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
           resetAmplifierActivityOverlay()
+          resetAntigravityActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError('Authentication failed'))
@@ -987,6 +991,17 @@ export default function App() {
         })
       }
 
+      // Antigravity plan Task 8: the amplifier list request's additive twin.
+      const requestAntigravityActivityList = () => {
+        const requestId = `antigravity-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const requestSeq = ++antigravityActivityOrderRef.current
+        antigravityActivityListRequestSeqRef.current.set(requestId, requestSeq)
+        ws.send({
+          type: 'antigravity.activity.list',
+          requestId,
+        })
+      }
+
       const requestOpencodeActivityList = () => {
         const requestId = `opencode-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         const requestSeq = ++opencodeActivityOrderRef.current
@@ -1012,6 +1027,12 @@ export default function App() {
         dispatch(resetAmplifierActivity())
       }
 
+      // Antigravity plan Task 8: the amplifier reset's additive twin.
+      const resetAntigravityActivityOverlay = () => {
+        antigravityActivityListRequestSeqRef.current.clear()
+        dispatch(resetAntigravityActivity())
+      }
+
       const resetOpencodeActivityOverlay = () => {
         opencodeActivityListRequestSeqRef.current.clear()
         dispatch(resetOpencodeActivity())
@@ -1031,6 +1052,7 @@ export default function App() {
         resetCodexActivityOverlay()
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
+        resetAntigravityActivityOverlay()
         resetOpencodeActivityOverlay()
         // The hoststats subscription died with the socket; keep last-known values.
         dispatch(hostStatsReset())
@@ -1294,6 +1316,7 @@ export default function App() {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
           resetAmplifierActivityOverlay()
+          resetAntigravityActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
@@ -1445,6 +1468,7 @@ export default function App() {
           requestCodexActivityList()
           requestClaudeActivityList()
           requestAmplifierActivityList()
+          requestAntigravityActivityList()
           requestOpencodeActivityList()
           // hoststats: the old socket's subscription died; keep last live/manual
           // values and resubscribe iff any Host Stats panes are mounted.
@@ -1810,6 +1834,36 @@ export default function App() {
             }))
           }
         }
+        // Antigravity plan Task 8: the amplifier record's ingestion twin.
+        if (msg.type === 'antigravity.activity.list.response') {
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          if (!requestId) return
+          const requestSeq = antigravityActivityListRequestSeqRef.current.get(requestId)
+          antigravityActivityListRequestSeqRef.current.delete(requestId)
+          if (requestSeq === undefined) return
+          dispatch(setAntigravityActivitySnapshot({
+            terminals: msg.terminals || [],
+            requestSeq,
+          }))
+        }
+        if (msg.type === 'antigravity.activity.updated') {
+          const mutationSeq = ++antigravityActivityOrderRef.current
+          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
+          if (upsert.length > 0) {
+            dispatch(upsertAntigravityActivity({
+              terminals: upsert,
+              mutationSeq,
+            }))
+          }
+
+          const remove = Array.isArray(msg.remove) ? msg.remove : []
+          if (remove.length > 0) {
+            dispatch(removeAntigravityActivity({
+              terminalIds: remove,
+              mutationSeq,
+            }))
+          }
+        }
         if (msg.type === 'opencode.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
           if (!requestId) return
@@ -1996,6 +2050,7 @@ export default function App() {
         resetCodexActivityOverlay()
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
+        resetAntigravityActivityOverlay()
         resetOpencodeActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
@@ -2014,6 +2069,7 @@ export default function App() {
           requestCodexActivityList()
           requestClaudeActivityList()
           requestAmplifierActivityList()
+          requestAntigravityActivityList()
           requestOpencodeActivityList()
         }
         void recoverMissingStartupState()
@@ -2030,6 +2086,7 @@ export default function App() {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
           resetAmplifierActivityOverlay()
+          resetAntigravityActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))

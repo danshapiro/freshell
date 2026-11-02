@@ -61,6 +61,15 @@ impl TurnCompletionLedger {
             .filter_map(|id| self.latest_by_terminal_id.get(id).cloned())
             .collect()
     }
+
+    /// The `at` of the last recorded completion for this terminal, if any —
+    /// the per-settle dedupe baseline (a settle record replayed with an
+    /// `at` at/before it is the SAME settle, never a new turn end).
+    pub fn last_completion_at(&self, terminal_id: &str) -> Option<i64> {
+        self.latest_by_terminal_id
+            .get(terminal_id)
+            .map(|snapshot| snapshot.at)
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +102,15 @@ mod tests {
         assert_eq!(latest[0].completion_seq, 2);
         assert_eq!(latest[1].terminal_id, "t2");
         assert_eq!(latest[1].completion_seq, 1);
+    }
+
+    #[test]
+    fn last_completion_at_reads_the_latest_snapshot_and_none_when_absent() {
+        let mut ledger = TurnCompletionLedger::new();
+        assert_eq!(ledger.last_completion_at("t1"), None);
+        ledger.record_turn_completion("t1", 100);
+        ledger.record_turn_completion("t1", 200);
+        assert_eq!(ledger.last_completion_at("t1"), Some(200));
+        assert_eq!(ledger.last_completion_at("t2"), None);
     }
 }

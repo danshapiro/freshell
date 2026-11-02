@@ -1170,16 +1170,19 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       // Back on the tab: the session reads as ended, with Resume, and the
       // composer is disabled (nothing typed there could be lost).
       await tabLocator.click()
+      await expect(paneRoot.locator('[data-agent-error="session"] summary')).toBeVisible({ timeout: 30_000 })
+      await paneRoot.locator('[data-agent-error="session"] summary').click()
       await expect(
-        page.getByRole('alert').filter({ hasText: 'exited unexpectedly' }),
+        paneRoot.locator('[data-agent-error="session"]').getByRole('alert').filter({ hasText: 'exited unexpectedly' }),
         'the sidecar death must surface as a visible banner',
       ).toBeVisible({ timeout: 30_000 })
-      await expect(paneRoot.getByText('This session has ended')).toBeVisible({ timeout: 30_000 })
+      await expect(paneRoot.locator('[data-agent-error="ended"]')).toBeVisible({ timeout: 30_000 })
       await waitForPaneStatus(lane.harness, lane.tabId, 'exited')
       await expect(paneRoot.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
 
       // Resume reopens the SAME durable session in place, with no reload.
-      await paneRoot.getByRole('button', { name: 'Resume session' }).click()
+      await paneRoot.locator('[data-agent-error="ended"] summary').click()
+        await paneRoot.getByRole('button', { name: 'Resume session' }).click()
       await waitForSimRow(
         lane.simLedger,
         (row) => row.kind === 'query' && row.options?.resume === durableBefore,
@@ -1187,7 +1190,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       )
       expect(await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
       await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
-      await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
+      await expect(paneRoot.locator('[data-agent-error="ended"]')).toHaveCount(0)
       expect(
         await page.evaluate(() => (window as any).__freshellNoReloadMarker),
         'Resume must not reload the page',
@@ -1216,7 +1219,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await sendComposerText(page, 'CRASH_NOW')
       await expect.poll(crashes, { timeout: 30_000, message: 'the second fixture crash' }).toBe(2)
       await waitForPaneStatus(lane.harness, lane.tabId, 'exited')
-      await expect(paneRoot.getByText('This session has ended')).toBeVisible({ timeout: 30_000 })
+      await expect(paneRoot.locator('[data-agent-error="ended"]')).toBeVisible({ timeout: 30_000 })
       await flushPersistence(page)
       await page.reload({ waitUntil: 'domcontentloaded' })
       await waitForWsReady(page)
@@ -1230,7 +1233,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       }).toBe(resumesBeforeReload + 1)
       expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
       await waitForPaneStatus(harness2, tabId2, ['idle', 'connected'])
-      await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
+      await expect(paneRoot.locator('[data-agent-error="ended"]')).toHaveCount(0)
       await sendComposerText(page, 'post-reload recovery turn')
       await waitForSimRow(
         lane.simLedger,
@@ -1948,7 +1951,10 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       const pane = page.locator('[data-context="fresh-agent"]').last()
       await expect(pane).toContainText('Codex durable transcript', { timeout: 30_000 })
       await expect(pane).toContainText('feature/fresh-agent')
-      await expect(pane).toContainText('README.md')
+      await pane.getByRole('button', { name: /^Diffs:/ }).click()
+      const changes = page.getByRole('dialog', { name: 'Changes' })
+      await expect(changes).toContainText('README.md')
+      await changes.getByRole('button', { name: 'Close', exact: true }).click()
       await expect(pane).toContainText('review-1')
       await expect(pane).toContainText('pending')
       await expect(pane).toContainText('thread-parent-1')
@@ -2289,7 +2295,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
-      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+      const stuckAlert = paneRoot.locator('[data-agent-error="stuck"]')
       const threadId = ((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId ?? '') as string
       expect(threadId, 'freshcodex thread id materialized before the send').toBeTruthy()
 
@@ -2351,6 +2357,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       const turnsBefore = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns
       expect(turnsBefore?.length).toBeGreaterThan(0)
       const opsBeforeRestart = readCodexOps(lane.opLogPath).length
+      await stuckAlert.locator('summary').click()
       await stuckAlert.getByRole('button', { name: /restart sidecar/i }).click()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(stuckAlert).toHaveCount(0)
@@ -2389,7 +2396,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
-      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+      const stuckAlert = paneRoot.locator('[data-agent-error="stuck"]')
 
       await sendComposerText(page, 'a slow but healthy turn')
       const sentAt = Date.now()

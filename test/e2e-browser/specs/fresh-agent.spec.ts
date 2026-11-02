@@ -1179,10 +1179,13 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.getByText('private style reasoning starts collapsed')).toBeVisible()
     // This style test consumes the diff metadata already present in the
     // routed snapshot. Full Rust diff loading is covered separately.
+    await page.keyboard.press('Escape')
+    await freshcodexRoot.getByRole('button', { name: /^Diffs:/ }).click()
+    const changes = page.getByRole('dialog', { name: 'Changes' })
     const diffPanel = freshcodexRoot.locator('.fresh-agent-diff-panel').first()
     await expect(diffPanel).toBeVisible()
-    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('src/index.css')
-    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('modified')
+    await expect(changes.locator('.fresh-agent-file-diff').first()).toContainText('src/index.css')
+    await expect(changes.locator('.fresh-agent-file-diff').first()).toContainText('modified')
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
     expect(transcriptFont.toLowerCase()).toContain('georgia')
     const rootFont = await freshcodexRoot.evaluate((node) => getComputedStyle(node).fontFamily)
@@ -1199,9 +1202,10 @@ test.describe('Fresh Agent', () => {
     const questionBackground = await freshcodexRoot.locator('.fresh-agent-question-card').first()
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(questionBackground).toBe('rgb(251, 250, 247)')
-    const diffBackground = await diffPanel
+    const diffBackground = await changes
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(diffBackground).toBe('rgb(251, 250, 247)')
+    await changes.getByRole('button', { name: 'Close', exact: true }).click()
     const composerButtonFont = await freshcodexRoot.locator('.fresh-agent-composer-action').first()
       .evaluate((node) => getComputedStyle(node).fontFamily)
     expect(composerButtonFont.toLowerCase()).toContain('ibm plex mono')
@@ -1784,7 +1788,10 @@ test.describe('Fresh Agent', () => {
 
     await expect(page.getByText('Codex transcript')).toBeVisible()
     await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
-    await expect(page.getByText('README.md')).toBeVisible()
+    await page.getByRole('button', { name: /^Diffs:/ }).click()
+    const changes = page.getByRole('dialog', { name: 'Changes' })
+    await expect(changes.getByText('README.md')).toBeVisible()
+    await changes.getByRole('button', { name: 'Close', exact: true }).click()
     await expect(page.getByText('review-1')).toBeVisible()
     await expect(page.getByText('pending')).toBeVisible()
     await expect(page.getByText('thread-parent-1')).toBeVisible()

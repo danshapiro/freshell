@@ -1,0 +1,4 @@
+{"type":"session_start","conversationId":"11111111-2222-3333-4444-555555555555","workspacePaths":["/home/u/proj"],"model":"gemini-3-pro","startedAt":"2026-10-29T20:00:00.000Z"}
+{"type":"user_message","conversationId":"11111111-2222-3333-4444-555555555555","text":"Fix the flaky test","at":"2026-10-29T20:00:01.000Z"}
+{"type":"assistant_message","conversationId":"11111111-2222-3333-4444-555555555555","text":"Fixed the test.","at":"2026-10-29T20:00:05.000Z","usage":{"inputTokens":10,"outputTokens":20,"cachedTokens":0,"totalTokens":30}}
+{"type":"turn_settled","conversationId":"11111111-2222-3333-4444-555555555555","at":"2026-10-29T20:00:05.500Z","outcome":"completed","fullyIdle":true}

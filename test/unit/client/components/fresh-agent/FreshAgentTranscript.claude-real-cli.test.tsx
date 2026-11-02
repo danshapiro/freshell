@@ -128,6 +128,7 @@ describe('claude real-CLI snapshots feed the diff panel', () => {
     const snapshot = golden('tools-sync')
     expect(snapshot.capabilities.diffs).toBe(true)
     render(<FreshAgentDiffPanel diffs={snapshot.diffs} cwd="/fixture/ws" />)
+    fireEvent.click(screen.getByRole('button', { name: /^Diffs:/ }))
     const created = screen.getByRole('button', { name: 'Diff: /fixture/ws/a.txt' })
     expect(created).toHaveTextContent('created')
     const edited = screen.getByRole('button', { name: 'Diff: /fixture/ws/b.txt' })

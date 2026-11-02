@@ -1,7 +1,7 @@
 /**
  * HARNESS-03 — deterministic provider fixtures: fixture-only contract spec.
  *
- * Invokes the six remaining fake provider executables DIRECTLY (no Freshell
+ * Invokes the seven provider fixture executables DIRECTLY (no Freshell
  * server boots — the fixtures are the deliverable; later TERM/AGENT items wire
  * them into the real pane picker/server later) and asserts, per provider:
  *
@@ -61,7 +61,18 @@ const PROBE_ENV = {
   FRESHELL_FAKE_ENV_RECORD: 'HARNESS03_PROBE',
 }
 
-for (const provider of ['claude', 'gemini', 'kimi'] as const) {
+// Each provider's REAL resume argv shape (antigravity's is the adjacent
+// `--conversation <id>` pair — real binary v1.4.10: "Resume a previous
+// conversation by ID"; see the Task-1 contract probe — while the other
+// terminal CLIs keep `--resume <id>`).
+const RESUME_ARGS: Record<string, string[]> = {
+  claude: ['--resume', 'sess-resumed-9'],
+  gemini: ['--resume', 'sess-resumed-9'],
+  kimi: ['--resume', 'sess-resumed-9'],
+  agy: ['--conversation', 'sess-resumed-9'],
+}
+
+for (const provider of ['claude', 'gemini', 'kimi', 'agy'] as const) {
   test.describe(`terminal CLI fixture: ${provider}`, () => {
     let fixture: LaunchedFixture
     test.afterEach(async () => {
@@ -102,7 +113,7 @@ for (const provider of ['claude', 'gemini', 'kimi'] as const) {
     test('resume argv yields a resume event + resumed marker', async () => {
       fixture = await launchProviderFixture({
         fixture: `fake-${provider}.mjs`,
-        args: ['--resume', 'sess-resumed-9'],
+        args: RESUME_ARGS[provider],
         env: { ...PROBE_ENV, HARNESS03_PROBE: `probe-${provider}` },
       })
       const resume = await fixture.waitEvent('resume')
@@ -531,7 +542,7 @@ test.describe('opencode server fixture', () => {
 // decoy-secret control proves the ledger can never exfiltrate credentials.
 
 test.describe('provider fixtures are hermetic', () => {
-  for (const provider of ['claude', 'gemini', 'kimi', 'amplifier'] as const) {
+  for (const provider of ['claude', 'gemini', 'kimi', 'agy', 'amplifier'] as const) {
     test(`${provider}: full turn contract with scrubbed PATH, no children`, async () => {
       const fixture = await launchProviderFixture({
         fixture: provider === 'amplifier' ? 'fake-amplifier.mjs' : `fake-${provider}.mjs`,

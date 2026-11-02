@@ -482,7 +482,7 @@ test.describe('fresh-agent user Stop on the production claude sidecar', () => {
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
         const sendButton = paneRoot.getByRole('button', { name: 'Send' })
         const stopButton = paneRoot.getByRole('button', { name: 'Stop' })
-        const errorBanner = paneRoot.getByText(/^Agent error:/)
+        const errorBanner = paneRoot.locator('[data-agent-error="session"]')
         const tabALocator = page.locator(`[data-context="tab"][data-tab-id="${tabA}"]`)
         const paneStatus = () => expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabA)
@@ -648,8 +648,9 @@ test.describe('fresh-agent crash on the production claude sidecar', () => {
 
         // ── Back on the tab: ended, with Resume ──────────────────────────
         await tabALocator.click()
-        await expect(paneRoot.getByText('This session has ended')).toBeVisible({ timeout: 15_000 })
+        await expect(paneRoot.locator('[data-agent-error="ended"]')).toBeVisible({ timeout: 15_000 })
         await expect(composer, 'nothing can be typed into an ended session').toBeDisabled()
+        await paneRoot.locator('[data-agent-error="ended"] summary').click()
         const resume = paneRoot.getByRole('button', { name: 'Resume session' })
         await expect(resume).toBeVisible()
         await resume.click()
@@ -661,7 +662,7 @@ test.describe('fresh-agent crash on the production claude sidecar', () => {
           .toBe(1)
         await paneStatus().toMatch(/^(connected|idle)$/)
         expect((await paneLeaf())?.content?.sessionRef?.sessionId, 'the pane keeps its durable id').toBe(durable)
-        await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
+        await expect(paneRoot.locator('[data-agent-error="ended"]')).toHaveCount(0)
         // ...shows the conversation it had, and the page never reloaded.
         await expect(paneRoot).toContainText('remember this line', { timeout: 30_000 })
         expect(await page.evaluate(() => (window as any).__freshellNoReloadMarker), 'Resume must not reload the page')

@@ -592,7 +592,7 @@ test.describe('Freshopencode reservation-refusal survival', () => {
       // The transient reservation is never surfaced as a pane error banner
       // (the Task-14 filter reads lastErrorCode) — the refusal is recorded,
       // not shown.
-      await expect(paneRoot.getByText(/^Agent error:/)).toHaveCount(0)
+      await expect(paneRoot.locator('[data-agent-error="session"]')).toHaveCount(0)
 
       // Parked-ness after the refusal: no idle can have been emitted since
       // the prompt receipt — the reservation refusal never ended the turn.

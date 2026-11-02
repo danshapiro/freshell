@@ -57,6 +57,18 @@ describe('settingsSlice', () => {
     expect(defaultSettings.terminal.scrollback).toBe(10000)
   })
 
+  it('fresh-install server settings default includes antigravity among the enabled CLI providers', async () => {
+    // The slice's initial `serverSettings` comes from
+    // `createDefaultServerSettings()` → `DEFAULT_ENABLED_CLI_PROVIDERS`;
+    // a fresh install takes `enabledProviders` from these defaults (the
+    // append-and-enable migration only covers existing installs).
+    const { default: settingsReducer } = await importFreshSettingsSlice()
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    expect(initialState.serverSettings.codingCli.enabledProviders).toEqual([
+      'claude', 'codex', 'opencode', 'amplifier', 'antigravity',
+    ])
+  })
+
   it('resolves the panes.floatingActionButton platform default at boot: desktop true, mobile false', async () => {
     // jsdom's matchMedia mock boots desktop-ambient (test/setup/dom.ts resets
     // __MOBILE_MATCHES__ to false), so a fresh slice import resolves the

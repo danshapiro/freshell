@@ -374,6 +374,42 @@ describe('FreshAgentView live transcript (transcript-live D5)', () => {
 })
 
 describe('provider notices (transcript-live D6)', () => {
+  it('keeps routine notice details until the user finishes reading', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    const message = 'Code rewound successfully. '.repeat(20).trim()
+    deliver(store, { type: 'freshAgent.notice', level: 'info', code: 'REWOUND', message })
+    const summary = screen.getByText('Notice details').closest('summary')!
+    fireEvent.click(summary)
+    await advance(0)
+    expect(summary.closest('details')).toHaveAttribute('open')
+    await advance(10_000)
+    expect(screen.getByText(message)).toBeVisible()
+    fireEvent.click(summary)
+    await advance(0)
+    await advance(6_001)
+    expect(screen.queryByText(message)).not.toBeInTheDocument()
+  })
+
+  it('keeps expanded provider diagnostics until the user finishes reading', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    await mount(store)
+    const message = 'Provider could not complete the turn. '.repeat(20)
+    deliver(store, { type: 'freshAgent.notice', level: 'error', code: 'PROVIDER_FAILED', message })
+    const summary = screen.getByRole('alert').closest('summary')!
+    fireEvent.click(summary)
+    await advance(0)
+    expect(summary.closest('details')).toHaveAttribute('open')
+    await advance(10_000)
+    expect(screen.getByText(message.trim())).toBeVisible()
+    fireEvent.click(summary)
+    await advance(0)
+    await advance(6_001)
+    expect(screen.queryByText(message.trim())).not.toBeInTheDocument()
+  })
+
   it('shows a notice in the pane banner without ending the running turn', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()
@@ -389,6 +425,7 @@ describe('provider notices (transcript-live D6)', () => {
     })
 
     expect(screen.getByRole('alert')).toHaveTextContent('Error during compaction: API Error: 400 prompt is too long')
+    expect(screen.getByRole('alert')).toBeVisible()
     expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
     expect(store.getState().freshAgent.sessions[KEY].status).toBe('running')
     expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
@@ -410,6 +447,7 @@ describe('provider notices (transcript-live D6)', () => {
     })
 
     const banner = screen.getByRole('alert')
+    expect(banner).toBeVisible()
     expect(banner).toHaveTextContent('You have reached your Claude usage limit.')
     expect(banner).toHaveTextContent(expectedTime)
   })
@@ -421,12 +459,14 @@ describe('provider notices (transcript-live D6)', () => {
     const notice = { type: 'freshAgent.notice', level: 'warning', code: 'INFORMATIONAL', message: 'Hook feedback: lint failed' }
 
     deliver(store, notice)
-    expect(screen.getByRole('alert')).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
     await advance(10_000)
     expect(screen.queryByText('Hook feedback: lint failed')).not.toBeInTheDocument()
 
     deliver(store, notice)
-    expect(screen.getByRole('alert')).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Hook feedback: lint failed')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
   })
 })
 

@@ -51,6 +51,7 @@ const selectCodexActivityByTerminalId = (state: RootState) => state.codexActivit
 const selectClaudeActivityByTerminalId = (state: RootState) => state.claudeActivity?.byTerminalId ?? EMPTY_BY_ID
 const selectAmplifierActivityByTerminalId = (state: RootState) => state.amplifierActivity?.byTerminalId ?? EMPTY_BY_ID
 const selectOpencodeActivityByTerminalId = (state: RootState) => state.opencodeActivity?.byTerminalId ?? EMPTY_BY_ID
+const selectAntigravityActivityByTerminalId = (state: RootState) => state.antigravityActivity?.byTerminalId ?? EMPTY_BY_ID
 const selectPaneRuntimeActivityByPaneId = (state: RootState) => state.paneRuntimeActivity?.byPaneId ?? EMPTY_BY_ID
 const selectFreshAgentSessions = (state: RootState) => state.freshAgent?.sessions ?? EMPTY_BY_ID
 const selectRemoteOpen = (state: RootState) => state.tabRegistry?.remoteOpen ?? EMPTY_REGISTRY_RECORDS
@@ -85,6 +86,7 @@ export const makeSelectSessionStatusTiers = () =>
       selectClaudeActivityByTerminalId,
       selectAmplifierActivityByTerminalId,
       selectOpencodeActivityByTerminalId,
+      selectAntigravityActivityByTerminalId,
       selectPaneRuntimeActivityByPaneId,
       selectFreshAgentSessions,
       selectRemoteOpen,
@@ -97,6 +99,7 @@ export const makeSelectSessionStatusTiers = () =>
       claudeActivityByTerminalId,
       amplifierActivityByTerminalId,
       opencodeActivityByTerminalId,
+      antigravityActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       freshAgentSessions,
       remoteOpen,
@@ -108,6 +111,7 @@ export const makeSelectSessionStatusTiers = () =>
         claudeActivityByTerminalId,
         amplifierActivityByTerminalId,
         opencodeActivityByTerminalId,
+        antigravityActivityByTerminalId,
         paneRuntimeActivityByPaneId,
         freshAgentSessions,
       }

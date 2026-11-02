@@ -13,9 +13,9 @@ import type {
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { Tab } from '@/store/types'
-import type { CodexActivityRecord, ClaudeActivityRecord, AmplifierActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
+import type { AntigravityActivityRecord, CodexActivityRecord, ClaudeActivityRecord, AmplifierActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
 
-type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'amplifier' | 'fresh-agent' | 'browser'
+type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'amplifier' | 'antigravity' | 'fresh-agent' | 'browser'
 
 export type PaneActivityProjection = {
   isBusy: boolean
@@ -125,6 +125,7 @@ export function resolvePaneActivity(input: {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
+  antigravityActivityByTerminalId: Record<string, AntigravityActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): PaneActivityProjection {
@@ -181,6 +182,16 @@ export function resolvePaneActivity(input: {
         : IDLE_PANE_ACTIVITY
     }
 
+    if (effectiveMode === 'antigravity') {
+      const terminalId = input.content.terminalId
+      const record = terminalId
+        ? input.antigravityActivityByTerminalId[terminalId]
+        : undefined
+      return record?.phase === 'busy'
+        ? { isBusy: true, source: 'antigravity' }
+        : IDLE_PANE_ACTIVITY
+    }
+
     return IDLE_PANE_ACTIVITY
   }
 
@@ -206,7 +217,7 @@ export function resolvePaneActivity(input: {
   return IDLE_PANE_ACTIVITY
 }
 
-const TRULY_IDLE_CLI_MODES = new Set(['claude', 'codex', 'opencode', 'amplifier'])
+const TRULY_IDLE_CLI_MODES = new Set(['claude', 'codex', 'opencode', 'amplifier', 'antigravity'])
 
 /** Terminal CLI modes whose alerting (green/bell/shade) is server-authoritative. */
 export function isTrulyIdleCliMode(mode: string | undefined): boolean {
@@ -233,6 +244,7 @@ export function resolvePaneIdleGreen(input: {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
+  antigravityActivityByTerminalId: Record<string, AntigravityActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): boolean {
@@ -251,6 +263,7 @@ export function resolvePaneIdleGreen(input: {
     ? (effectiveMode === 'codex' && input.codexActivityByTerminalId[terminalId])
       || (effectiveMode === 'claude' && input.claudeActivityByTerminalId[terminalId])
       || (effectiveMode === 'amplifier' && input.amplifierActivityByTerminalId[terminalId])
+      || (effectiveMode === 'antigravity' && input.antigravityActivityByTerminalId[terminalId])
       || (effectiveMode === 'opencode' && input.opencodeActivityByTerminalId[terminalId])
       || undefined
     : undefined
@@ -269,6 +282,7 @@ export function getBusyPaneIdsForTab(input: {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
+  antigravityActivityByTerminalId: Record<string, AntigravityActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): string[] {
@@ -286,6 +300,7 @@ export function getBusyPaneIdsForTab(input: {
       opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       claudeActivityByTerminalId: input.claudeActivityByTerminalId,
       amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+      antigravityActivityByTerminalId: input.antigravityActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
       freshAgentSessions: input.freshAgentSessions,
     }).isBusy
@@ -304,6 +319,7 @@ export function getBusyPaneIdsForTab(input: {
       opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       claudeActivityByTerminalId: input.claudeActivityByTerminalId,
       amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+      antigravityActivityByTerminalId: input.antigravityActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
       freshAgentSessions: input.freshAgentSessions,
     }).isBusy)
@@ -315,6 +331,7 @@ type PaneActivityMaps = {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
+  antigravityActivityByTerminalId: Record<string, AntigravityActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }
@@ -354,6 +371,7 @@ function resolveBusyPaneSessionKey(input: PaneActivityMaps & {
     opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
     claudeActivityByTerminalId: input.claudeActivityByTerminalId,
     amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+    antigravityActivityByTerminalId: input.antigravityActivityByTerminalId,
     paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
     freshAgentSessions: input.freshAgentSessions,
   }).isBusy
@@ -473,6 +491,7 @@ export function collectPaneIdentityActivity(input: PaneActivityMaps & {
         opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         claudeActivityByTerminalId: input.claudeActivityByTerminalId,
         amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+        antigravityActivityByTerminalId: input.antigravityActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
         freshAgentSessions: input.freshAgentSessions,
       })
@@ -499,6 +518,7 @@ export function collectBusySessionKeys(input: PaneActivityMaps & {
     opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
     claudeActivityByTerminalId: input.claudeActivityByTerminalId,
     amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
+    antigravityActivityByTerminalId: input.antigravityActivityByTerminalId,
     paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
     freshAgentSessions: input.freshAgentSessions,
   }

@@ -331,7 +331,7 @@ test.describe('Freshopencode snapshot-409 recovery (cloud-legal)', () => {
 
     // No dismiss-only dead-end banner remains, and the composer is usable
     // again — the pane recovered instead of dead-ending.
-    await expect(page.getByRole('alert').filter({ hasText: 'still running on the server' })).toHaveCount(0)
+    await expect(page.locator('[data-agent-error="load"], [data-agent-error="session"]')).toHaveCount(0)
     const composer = page.getByRole('textbox', { name: 'Chat message input' })
     await expect(composer).toBeEnabled({ timeout: 15_000 })
   })
