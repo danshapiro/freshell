@@ -174,7 +174,15 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: 
   return { update: async changes => {
     const previousHits = hits()
     current = { ...current, ...changes, revision: Number(current.revision ?? 1) + 1 }
-    await page.evaluate(v => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({ type: 'freshAgent.event', sessionId: `compact-${v.sessionType}`, sessionType: v.sessionType, provider: v.provider, event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: v.revision } }), { ...variant, revision: Number(current.revision) })
+    const status = FreshAgentSnapshotSchema.parse({
+      ...freshAgentSnapshot(variant.sessionType, variant.provider, `compact-${variant.sessionType}`),
+      ...current,
+    }).status
+    await page.evaluate(v => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({ type: 'freshAgent.event', sessionId: `compact-${v.sessionType}`, sessionType: v.sessionType, provider: v.provider, event: { type: 'freshAgent.session.snapshot', status: v.status, revision: v.revision } }), {
+      ...variant,
+      revision: Number(current.revision),
+      status,
+    })
     await expect.poll(hits).toBeGreaterThan(previousHits)
   } }
 }
@@ -665,6 +673,26 @@ for (const [name, diffs, label] of [
   await trigger.press('Enter')
   const dialog = page.getByRole('dialog', { name: 'Changes' })
   await expect(dialog).toBeVisible()
+  const close = dialog.getByRole('button', { name: 'Close', exact: true })
+  await close.focus()
+  await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!
+    const s = h.getState()
+    const tabId = s.tabs.activeTabId!
+    h.dispatch({ type: 'panes/setActivePane', payload: { tabId, paneId: s.panes.activePane[tabId], focusNudge: true } })
+  })
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect(close).toBeFocused()
+  const statusComposer = page.getByRole('textbox', { name: 'Chat message input' })
+  await expect(statusComposer).toBeEnabled()
+  await state.update({ status: 'exited' })
+  await expect(statusComposer).toBeDisabled()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect(close).toBeFocused()
+  await state.update({ status: 'idle' })
+  await expect(statusComposer).toBeEnabled()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect(close).toBeFocused()
   await dialog.getByRole('button', { name: 'Diff: Turn changes' }).press('Space')
   const controls = dialog.locator('button:visible')
   await controls.last().focus()

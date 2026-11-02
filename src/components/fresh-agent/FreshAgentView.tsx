@@ -4745,6 +4745,9 @@ export function FreshAgentView({
     if (!isActivePane) return
     const frame = requestAnimationFrame(() => {
       const active = document.activeElement
+      const drawer = active instanceof Element ? active.closest('.fresh-agent-diff-drawer-overlay') : null
+      if (drawer?.getAttribute('data-tab-id') === tabId
+        && drawer.getAttribute('data-pane-id') === paneId) return
       if (active instanceof HTMLElement
         && paneRootRef.current?.contains(active)
         && isEditableTarget(active)) return
@@ -4756,7 +4759,7 @@ export function FreshAgentView({
       composerRef.current?.focus()
     })
     return () => cancelAnimationFrame(frame)
-  }, [isActivePane, composerDisabled, mayFocusNow])
+  }, [isActivePane, composerDisabled, mayFocusNow, tabId, paneId])
 
   // Fallback poll while the agent is (or claims to be) working: if a
   // transport event is missed, the pane self-heals within a few seconds

@@ -429,12 +429,14 @@ function StoreBackedFreshAgentView({
 }) {
   const paneContent = useAppSelector((state) => {
     const layout = state.panes.layouts[tabId]
-    if (!layout || layout.type !== 'leaf' || layout.id !== paneId || layout.content.kind !== 'fresh-agent') {
+    const content = layout ? findPaneContent(layout, paneId) : null
+    if (!content || content.kind !== 'fresh-agent') {
       throw new Error(`Missing fresh-agent pane ${paneId}`)
     }
-    return layout.content
+    return content
   })
-  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} />
+  const focusEpoch = useAppSelector((state) => state.panes.focusEpochByPaneId?.[paneId] ?? 0)
+  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} focusEpoch={focusEpoch} />
 }
 
 function StoreBackedFreshAgentSettingsButton({
@@ -18814,6 +18816,203 @@ describe('diff panel view wiring (ekc6)', () => {
     expect(composer).toHaveValue(originalText)
     await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'true'))
     expect(screen.queryByText('Diff unavailable for this file.')).toBeNull()
+  })
+
+  const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+  const sessionId = native.threadId
+  const inlineDiff = {
+    id: 'codex-turn:latest',
+    title: 'Turn changes',
+    diff: 'diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new',
+  }
+  const snapshot = FreshAgentSnapshotSchema.parse({
+    ...native,
+    status: 'idle',
+    capabilities: { ...native.capabilities, send: true },
+    diffs: [inlineDiff],
+    extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+  })
+
+  async function mountDiffView() {
+    const store = createStore()
+    const locator = { sessionId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const currentSnapshot = { value: snapshot }
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => currentSnapshot.value)
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        ...locator,
+        createRequestId: 'req-owned-diff-drawer',
+        status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+
+    const changes = await screen.findByRole('button', { name: /^Diffs:/ })
+    const composer = await screen.findByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    await waitFor(() => expect(composer).toHaveFocus())
+    fireEvent.change(composer, { target: { value: 'Keep this draft during refresh' } })
+    return {
+      store,
+      locator,
+      changes,
+      composer,
+      draft: 'Keep this draft during refresh',
+      setStatus: (status: 'idle' | 'exited') => {
+        currentSnapshot.value = FreshAgentSnapshotSchema.parse({ ...currentSnapshot.value, status })
+        deliverSnapshotStatus(store, locator, status)
+      },
+    }
+  }
+
+  async function openDiffDrawer(changes: HTMLElement) {
+    await userEvent.click(changes)
+    const dialog = await screen.findByRole('dialog', { name: 'Changes' })
+    const fileToggle = within(dialog).getByRole('button', { name: 'Diff: Turn changes' })
+    return { dialog, fileToggle }
+  }
+
+  function deliverSnapshotStatus(
+    store: ReturnType<typeof createStore>,
+    locator: { sessionId: string; sessionType: 'freshcodex'; provider: 'codex' },
+    status: 'idle' | 'exited',
+  ) {
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event',
+        ...locator,
+        event: { type: 'freshAgent.session.snapshot', latestTurnId: null, status },
+      })
+    })
+  }
+
+  async function advanceFocusFrames() {
+    await act(async () => {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    })
+  }
+
+  it.each(['Close', 'file toggle', 'comment'] as const)(
+    'keeps the focused %s control in the owned drawer through retained session snapshots',
+    async (target) => {
+      const { changes, composer, draft, setStatus } = await mountDiffView()
+      const { dialog, fileToggle } = await openDiffDrawer(changes)
+      let control: HTMLElement
+      if (target === 'Close') {
+        control = within(dialog).getByRole('button', { name: 'Close', exact: true })
+      } else if (target === 'file toggle') {
+        control = fileToggle
+      } else {
+        await userEvent.click(fileToggle)
+        control = within(dialog).getAllByRole('button', { name: 'Comment on this line for the agent' }).at(-1)!
+      }
+      control.focus()
+      expect(control).toHaveFocus()
+      expect(composer).toHaveValue(draft)
+
+      for (const status of ['exited', 'idle'] as const) {
+        setStatus(status)
+        if (status === 'exited') expect(composer).toBeDisabled()
+        else expect(composer).toBeEnabled()
+        await advanceFocusFrames()
+        expect(control).toHaveFocus()
+        expect(composer).toHaveValue(draft)
+        expect(screen.getByRole('button', { name: /^Diffs:/ })).toBeInTheDocument()
+        expect(screen.getByRole('dialog', { name: 'Changes' })).toBeVisible()
+      }
+    },
+  )
+
+  it('keeps focus on an owned drawer control after an explicit focus-epoch bump', async () => {
+    const { store, changes, composer, draft } = await mountDiffView()
+    const { dialog } = await openDiffDrawer(changes)
+    const close = within(dialog).getByRole('button', { name: 'Close', exact: true })
+    close.focus()
+
+    act(() => store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1', focusNudge: true })))
+    await advanceFocusFrames()
+
+    expect(close).toHaveFocus()
+    expect(composer).toHaveValue(draft)
+  })
+
+  it('checks drawer ownership when a pending adoption frame runs after Changes opens', async () => {
+    const { changes, composer, draft, setStatus } = await mountDiffView()
+
+    // Exiting schedules a new pane-adoption frame. Open Changes synchronously
+    // before that frame runs, so callback-time ownership is exercised.
+    setStatus('exited')
+    expect(composer).toBeDisabled()
+    fireEvent.click(changes)
+    const dialog = screen.getByRole('dialog', { name: 'Changes' })
+    const close = within(dialog).getByRole('button', { name: 'Close', exact: true })
+    close.focus()
+    await advanceFocusFrames()
+
+    expect(close).toHaveFocus()
+    expect(composer).toHaveValue(draft)
+    setStatus('idle')
+    expect(composer).toBeEnabled()
+    await advanceFocusFrames()
+    expect(close).toHaveFocus()
+    expect(composer).toHaveValue(draft)
+  })
+
+  it('still adopts focus when a different pane owns the open Changes drawer', async () => {
+    const store = createStore()
+    const firstSessionId = 'thread-drawer-owner-one'
+    const secondSessionId = 'thread-drawer-owner-two'
+    const firstLocator = { sessionId: firstSessionId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const secondLocator = { sessionId: secondSessionId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const contentFor = (locator: typeof firstLocator, createRequestId: string) => ({
+      kind: 'fresh-agent' as const,
+      ...locator,
+      createRequestId,
+      status: 'idle' as const,
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_sessionType, _provider, requestedSessionId) =>
+      FreshAgentSnapshotSchema.parse({
+        ...snapshot,
+        threadId: requestedSessionId,
+        sessionId: requestedSessionId,
+      }))
+    store.dispatch(sessionInit(firstLocator))
+    store.dispatch(sessionInit(secondLocator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: contentFor(firstLocator, 'req-drawer-owner-one') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newPaneId: 'pane-2',
+      newContent: contentFor(secondLocator, 'req-drawer-owner-two'),
+      activate: false,
+    }))
+    render(<Provider store={store}>
+      <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-2" />
+    </Provider>)
+
+    const firstRoot = document.querySelector('[data-context="fresh-agent"][data-pane-id="pane-1"]') as HTMLElement
+    const secondRoot = document.querySelector('[data-context="fresh-agent"][data-pane-id="pane-2"]') as HTMLElement
+    const firstComposer = within(firstRoot).getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(firstComposer).not.toBeDisabled())
+    await waitFor(() => expect(firstComposer).toHaveFocus())
+    await waitFor(() => expect(within(secondRoot).getByRole('button', { name: /^Diffs:/ })).toBeVisible())
+    await userEvent.click(within(secondRoot).getByRole('button', { name: /^Diffs:/ }))
+    const secondDrawer = await screen.findByRole('dialog', { name: 'Changes' })
+    const secondClose = within(secondDrawer).getByRole('button', { name: 'Close', exact: true })
+    expect(secondDrawer.closest('.fresh-agent-diff-drawer-overlay')).toHaveAttribute('data-pane-id', 'pane-2')
+    expect(secondClose).toHaveFocus()
+
+    act(() => store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1', focusNudge: true })))
+    await advanceFocusFrames()
+
+    expect(firstComposer).toHaveFocus()
+    expect(secondClose).not.toHaveFocus()
   })
 })
 
