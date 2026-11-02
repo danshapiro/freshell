@@ -65,7 +65,7 @@ The three on-machine real conversations (produced by agy 1.2.11 and 1.4.12 — s
 
 Consequences this plan owns (sanctioned by the Accepted tradeoffs — correction, not promotion):
 
-1. The kata's `turn_settled.at` question is unanswerable as literally posed: no such record exists. The binary answer is: (i) no real settle record exists, so the per-settle dedupe has no real referent to swallow; (ii) real `created_at` is second-granularity and demonstrably collides, so ANY dedupe keyed on wall-clock alone WOULD collide; (iii) `step_index` is the collision-proof per-record identity (unique per record, strictly increasing across turns). The corrected dedupe therefore keys on the record identity `(created_at, step_index)`, and the property "two genuine turns can never share a dedupe key" holds by construction — pinned by the Task 2 tracker test `same_second_settles_with_distinct_step_indexes_both_complete` against today's swallowing rule.
+1. The kata's `turn_settled.at` question is unanswerable as literally posed: no such record exists. The binary answer is: (i) no real settle record exists, so the per-settle dedupe has no real referent to swallow; (ii) real `created_at` is second-granularity and demonstrably collides, so ANY dedupe keyed on wall-clock alone WOULD collide; (iii) `step_index` is the collision-proof per-record identity (unique per record, strictly increasing across turns). The corrected dedupe therefore keys on the record identity `(created_at, step_index)`, and the property "two genuine turns can never share a dedupe key" holds by construction. THE BINARY PROOF is the receipts — the corpus facts (Task 1 Step 2) plus the fresh same-conversation receipts (Task 1 Step 6: step_index unique per record, strictly increasing across turns, on a conversation this run minted) — NOT any test. The Task 2 tracker test `same_second_settles_with_distinct_step_indexes_both_complete` pins the dedupe MACHINERY against today's swallowing rule using the labeled fake-contract `turn_settled` extension (Consequence 2); it exercises the code path end to end but supplies no binary evidence about records the binary does not produce, and the gate-flip citation (Task 3) rests on the receipts alone.
 2. Two structures the candidate schema invented are retained ONLY as explicitly-labeled fake-contract test extensions (the e2e/rebind fakes append them to drive the locator and attention machinery): the `session_start` ownership record (the locator's cwd/ownership anchor — real transcripts carry no ownership or workspace evidence, so transcript-driven identity binding does not engage on real-format sessions; recorded limitation) and the `turn_settled` settle record (the attention machinery's settle signal — real transcripts carry none; recorded limitation). Both carry the real-shaped field discipline (`created_at`, `step_index`) so the corrected dedupe is exercised end to end.
 3. The resume path itself reads NO transcript records: the gate consults the path-anchored by-id locator (`crates/freshell-server/src/antigravity_existence_by_id.rs` — `File::open(brain/<id>/.system_generated/logs/transcript.jsonl)`), which the real corpus validates. The flip is therefore safe for on-disk conversations the moment the corrected schema lands and a real resume is proven — the sequencing this plan enforces.
 4. The real format carries no workspace evidence, so real conversations index with cwd `None` (project "unknown"). The Task 2 removal of the antigravity cwd gate is the decided tradeoff that makes real conversations visible in history at all.
@@ -137,8 +137,16 @@ cp "$AGY_STORE/settings.json" /tmp/opencode/yhqb/settings.json.backup
 fence() {
   now=$(sha256sum "$AGY_STORE/settings.json" | cut -d' ' -f1)
   if [ "$now" != "$(cat /tmp/opencode/yhqb/settings.sha.base)" ]; then
-    cp /tmp/opencode/yhqb/settings.json.backup "$AGY_STORE/settings.json"
-    echo "settings.json MUTATED by the last invocation — byte-exact backup restored; ABORT (GC2 violation: record the diff and mtime in the evidence report)"
+    # GC2: never blindly overwrite the shared settings.json. Restore ONLY the
+    # run's own damage signature — a modelProvider insertion the baseline did
+    # not carry. Any other diff is a concurrent legitimate change: leave it in
+    # place, abort, and record it verbatim for the user.
+    if ! grep -q '"modelProvider"' /tmp/opencode/yhqb/settings.json.backup && grep -q '"modelProvider"' "$AGY_STORE/settings.json"; then
+      cp /tmp/opencode/yhqb/settings.json.backup "$AGY_STORE/settings.json"
+      echo "settings.json MUTATED by the last invocation with this run's damage signature (modelProvider insertion) — byte-exact backup restored; ABORT (GC2 violation: record the diff and mtime in the evidence report)"
+    else
+      echo "settings.json CHANGED by a concurrent actor (NOT this run's signature) — left untouched; ABORT and record the diff and mtime verbatim in the evidence report"
+    fi
     exit 1
   fi
   stat -c '%y %s' "$AGY_STORE/settings.json"
@@ -146,7 +154,7 @@ fence() {
 cat /tmp/opencode/yhqb/settings.sha.base
 ```
 
-Expected: the printed sha256 is `134d65225f7cacfc1bfbfbfe29e6289363b6f5914d88cae206ff2ddd591b78b1` (baseline captured 2026-11-02; mtime 2026-10-30 01:04:06, 443 B). Run `fence` after EVERY agy invocation in Steps 4-5 — the `--settings` key form AND the OAuth-fallback form both touch the live store — and record the before/after checksums in the evidence report. On mismatch the guard restores the byte-exact backup (which lives OUTSIDE the store) and aborts; the mutation itself is recorded verbatim (diff + mtime + which invocation), never papered over. The binary's own `--help` claims the overlay is "Settings for this session only, never saved" — this fence is the on-host proof, not a restatement of that claim.
+Expected: the printed sha256 is `134d65225f7cacfc1bfbfbfe29e6289363b6f5914d88cae206ff2ddd591b78b1` (baseline captured 2026-11-02; mtime 2026-10-30 01:04:06, 443 B). Run `fence` after EVERY agy invocation in Steps 4-5 — the `--settings` key form AND the OAuth-fallback form both touch the live store — and record the before/after checksums in the evidence report. On mismatch the guard restores the byte-exact backup (which lives OUTSIDE the store) ONLY when the diff matches this run's own damage signature (a `modelProvider` insertion the baseline did not carry); a concurrent legitimate change is left untouched, with the diff + mtime + which invocation recorded verbatim and the run aborted — never papered over, never clobbered. The binary's own `--help` claims the overlay is "Settings for this session only, never saved" — this fence is the on-host proof, not a restatement of that claim.
 
 - [ ] **Step 4: Mint a fresh scratch conversation this run owns (headless turn)**
 
@@ -168,7 +176,7 @@ comm -13 /tmp/opencode/yhqb/brain-before.txt /tmp/opencode/yhqb/brain-after.txt
 
 Shared-file pre-run baselines (2026-11-02, strategist receipts): settings.json `134d6522…b78b1` (Oct 30 01:04:06, 443 B — must NOT move; the Step 3b fence guards it); cache/last_conversations.json `28feeb29…30da` (Oct 31 11:47:14, 230 B — expected to move: the pointer); history.jsonl `1f7334be…39387` (Oct 31 11:28:56, 1741 B — expected display lines); conversation_summaries.db `2ceb7213…236c` (Oct 31 11:29:45, 20480 B — possible ghost row); cli.log `03924560…7f3a` (Oct 31 11:29:14, 27 B). Re-run the same stat+sha256 loop after every scratch turn and record all deltas in the evidence report — record, do not "fix"; these are the CLI's own files.
 
-Expected: exit 0; the nonce echoed; the fence passes (settings.json unchanged); exactly one new `<uuid>` under `brain/`. Auth ordering (strategist receipts, 2026-11-02): (1) if the coordinator obtains a key (user-approved source: the Freshell config's `settings.ai.geminiApiKey`, OneCLI after `onecli auth login`, or a user-supplied key), run the primary command as written (`--settings` overlay + the key exported into the probe env only, never printed); (2) on ANY key-path failure (invalid key, CLI-setup error) or no key, run the same invocations WITHOUT `--settings` and without the env guard (the machine's live OAuth sign-in — GC15) — the fallback invocation is itself the OAuth-liveness probe (the token file carries no readable expiry; `auth_method` is `consumer`; last refreshed 2026-10-31) — and record which auth produced the evidence; (3) if the OAuth path also fails, STOP: record the blocker in the evidence report and `run-state.md`, and do NOT run Task 3's flip (GC13) — Task 2 still lands (the correction is warranted by the corpus evidence alone), and the run reports the gate item as blocked. A key-path failure is "try OAuth", never an immediate STOP.
+Expected: exit 0; the nonce echoed; the fence passes (settings.json unchanged); exactly one new `<uuid>` under `brain/`. Auth ordering (strategist receipts, 2026-11-02; overlay-first on BOTH paths — the modelProvider precondition is the User Request's explicit constraint, not an API-key-only nicety): (1) if the coordinator obtains a key (user-approved source: the Freshell config's `settings.ai.geminiApiKey`, OneCLI after `onecli auth login`, or a user-supplied key), run the primary command as written (`--settings` overlay + the key exported into the probe env only, never printed); (2) on ANY key-path failure (invalid key, CLI-setup error) or no key, run the same invocations WITH the `--settings` overlay and without the env guard (the machine's live OAuth sign-in — GC15) — the fallback invocation is itself the OAuth-liveness probe (the token file carries no readable expiry; `auth_method` is `consumer`; last refreshed 2026-10-31) — and record which auth produced the evidence; (2b) ONLY if the binary rejects the `--settings '{"modelProvider":"gemini"}'` overlay under OAuth auth (a CLI-setup error naming the combination), retry once WITHOUT the overlay and record the deviation explicitly as a constraint residual in the evidence report (the sessions still run the gemini provider through the OAuth account — evidenced by the receipts — but the overlay precondition could not be satisfied on this path); (3) if the OAuth path also fails, STOP: record the blocker in the evidence report and `run-state.md`, and do NOT run Task 3's flip (GC13) — Task 2 still lands (the correction is warranted by the corpus evidence alone), and the run reports the gate item as blocked. A key-path failure is "try OAuth", never an immediate STOP.
 
 Resolve the conversation id (disambiguate by the nonce if more than one new dir appeared):
 
@@ -183,11 +191,11 @@ esac
 echo "CONV_ID=$CONV_ID" | tee /tmp/opencode/yhqb/conv-id.txt
 ```
 
-The UUID-shape guard is MANDATORY (Critical load-bearing finding C1): if the nonce-grep prints nothing (auth failure, transcript lag, store-root divergence), an empty `CONV_ID` would otherwise expand the Step 7 cleanup to the user's ENTIRE `brain/` tree — irreversible loss of every real conversation. Never bypass the guard; never run the cleanup unless Steps 4-6's receipts all passed.
+The UUID-shape guard is MANDATORY (Critical load-bearing finding C1): if the nonce-grep prints nothing (auth failure, transcript lag, store-root divergence), an empty `CONV_ID` would otherwise expand the Step 7 cleanup to the user's ENTIRE `brain/` tree — irreversible loss of every real conversation. Never bypass the guard. Cleanup is NOT gated on receipt success: once `CONV_ID` is validated, the scratch conversation is this run's litter and MUST be removed even when Steps 4-6's receipts fail or the STOP branch fires — record the receipts (or their failure) FIRST, then clean up. The only legitimate cleanup-preventing condition is an unresolvable `CONV_ID` (the guard refuses): in that case record the residue honestly (the new `brain/<uuid>` path(s), the nonce, and why resolution failed) in the evidence report and `run-state.md`. The receipts gate the GATE FLIP (GC13), never the cleanup.
 
 - [ ] **Step 5: Real resume probe + back-to-back turns (the never-probed headless resume)**
 
-Read-only de-risk (2026-11-02): the binary's `--help` documents both flags independently (`--conversation  Resume a previous conversation by ID`; `-p`, short alias of `--print  Run a single prompt non-interactively and print the response`) with no mutual-exclusion note, and the store's 17 CLI logs record no argv at all (no `--conversation` or `--print` lines), so this step remains the first-ever probe of the combination — on rejection, the bounded-PTY fallback is `agy --conversation <id>` on a pty (the documented `--prompt-interactive` middle shape also exists), recording whichever shape the binary actually supports. When riding the OAuth path, run these invocations WITHOUT `--settings` (the Step 4 auth ordering applies here too).
+Read-only de-risk (2026-11-02): the binary's `--help` documents both flags independently (`--conversation  Resume a previous conversation by ID`; `-p`, short alias of `--print  Run a single prompt non-interactively and print the response`) with no mutual-exclusion note, and the store's 17 CLI logs record no argv at all (no `--conversation` or `--print` lines), so this step remains the first-ever probe of the combination — on rejection, the bounded-PTY fallback is `agy --conversation <id>` on a pty (the documented `--prompt-interactive` middle shape also exists), recording whichever shape the binary actually supports. Keep the `--settings` overlay on the OAuth path too (overlay-first per the Step 4 auth ordering); drop it only as the evidenced, recorded deviation of Step 4's branch (2b).
 
 ```bash
 timeout 240 agy -p --conversation "$CONV_ID" --settings '{"modelProvider":"gemini"}' \
@@ -794,7 +802,7 @@ Also update the existing locator test plants (`:865`, `:1044`, `:1143`, `:1255-1
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-The parity tests call the NEW two-argument signature. To keep the red behavioral rather than syntactic, the red commit carries BOTH the new tests AND the minimal signature change (add the `conversation_id: &str` parameter, store it as `meta.session_id`, keep the candidate parse body) — the failure is then the `None` return, not a compile error.
+The parity tests call the NEW two-argument signature. To keep the red behavioral rather than syntactic, the red commit carries BOTH the new tests AND the minimal signature change (add the `conversation_id: &str` parameter, store it as `meta.session_id`, keep the candidate parse body) AND the minimal call-site updates so the whole library still compiles — every existing caller of `parse_antigravity_session_content` (the `AntigravitySource::parse` call in `crates/freshell-sessions/src/antigravity.rs` and any other in-tree caller, found by grep, not line anchors) passes the directory-derived id or an empty-string placeholder in this same commit. The failure is then the `None` return, not a compile error.
 
 Run: `cargo test -p freshell-sessions --test antigravity_fixture_parity`
 
@@ -999,6 +1007,11 @@ pub fn parse_antigravity_session_content(
     /// v1.4.12): the directory name IS the conversation identity.
     pub fn conversation_id_from_path(path: &std::path::Path) -> Option<String> {
         let mut components = path.components().rev();
+        // Reversed walk of brain/<conversationId>/.system_generated/logs/transcript.jsonl:
+        // consume the file name first, then each directory component in reverse order.
+        if components.next()?.as_os_str().to_str()? != "transcript.jsonl" {
+            return None;
+        }
         for expected in ["logs", ".system_generated"] {
             if components.next()?.as_os_str().to_str()? != expected {
                 return None;
@@ -1661,6 +1674,10 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       }
       expect(convId, 'the new conversation whose transcript carries the nonce').toBeTruthy()
 
+      // Cleanup ALWAYS runs once convId is resolved — on success AND on any
+      // assertion failure, timeout, or rejected resume (a failed tier run
+      // must not leave its scratch conversation in the live store).
+      try {
       // Binary record-schema pins on the run-owned transcript (the
       // corrected contract; evidence: real-binary-transcript-evidence.md).
       const transcriptPath = path.join(brainDir, convId!, '.system_generated', 'logs', 'transcript.jsonl')
@@ -1709,15 +1726,16 @@ This is a contract probe pinning behavior Task 1 already evidenced (the google-c
       expect(new Set(userSteps).size).toBe(userSteps.length)
       expect(userSteps[userSteps.length - 1]).toBeGreaterThan(userSteps[0])
 
-      // Cleanup: this run owns the conversation it created (the
-      // contract-probe hygiene precedent). Record the id in the test
-      // output via the expect above; remove BOTH store trees this
+      // Cleanup (finally): this run owns the conversation it created (the
+      // contract-probe hygiene precedent). Remove BOTH store trees this
       // conversation owns (Task 1 Step 7 parity): brain/<id> (the
       // transcript) and conversations/<id>.db (the per-conversation
       // sidecar db — verified present per conversation in the real store).
-      const storeRoot = await resolveAgyStoreRoot()
-      await fs.rm(path.join(brainDir, convId!), { recursive: true, force: true }).catch(() => {})
-      await fs.rm(path.join(storeRoot, 'conversations', `${convId}.db`), { force: true }).catch(() => {})
+      } finally {
+        const storeRoot = await resolveAgyStoreRoot()
+        await fs.rm(path.join(brainDir, convId!), { recursive: true, force: true }).catch(() => {})
+        await fs.rm(path.join(storeRoot, 'conversations', `${convId}.db`), { force: true }).catch(() => {})
+      }
     },
     420_000,
   )
@@ -1802,3 +1820,5 @@ The run-state baseline ledger records the managed fresh-agent parity failures (k
 Self-review performed before commit (per the usual-writing-plans contract): spec coverage, no silent deferrals (the two retained fake-contract extensions are explicitly labeled with their no-real-referent binary evidence and their limitation records — not silent), file/interface consistency (all paths/line anchors verified against the worktree at base_ref), executable tests (every red step names its intended failure; every command is runnable as written), placeholder scan (no TBD/TODO/vague directions), and operational completeness (cleanup, logging, README, e2e/smoke coverage). No `UNRESOLVED COVERAGE GAP`: the one conditional outcome — the authenticated session being unavailable — is handled by the explicit STOP branch (Task 1 Step 4 / GC13), not deferred.
 
 Load-bearing amendments (Stage 2, 2026-11-02, after the finder/strategist audit — reports under the run's logs dir): the Critical cleanup guard (UUID-shape `CONV_ID` assertion before first use and before every store deletion — an unguarded empty expansion would have deleted the user's entire `brain/` tree); the Step 3b settings.json checksum fence around every probe (sha256 + stat, byte-exact out-of-store backup, abort-on-mismatch) with the captured baseline `134d6522…b78b1`; the shared-file stat+sha256 residue receipts (last_conversations.json / history.jsonl / conversation_summaries.db / cli.log — record, do not fix) and the tier-4 cleanup extended to `conversations/<id>.db`; the H3 failure clause (fresh receipts that disprove step-index uniqueness/increase block the flip per GC13); the auth-ordering replacement (key path → OAuth fallback → STOP; key-path failure is "try OAuth", never an immediate STOP) with the key-source decision (the Freshell config's `settings.ai.geminiApiKey`, present on this host — recorded by name only, never printed); the corpus version stamps corrected to "agy 1.2.11 + 1.4.12 (store-log-attributed, schemas identical)" with bare 1.4.12 reserved for fresh receipts; the PLANNER_RESPONSE empty-content nuance (42/45 corpus records null/empty; only the turn-final planner record carries the reply) added to the evidence requirements; the tier-3 `--settings` overlay fix (its omission would fail the first key-bearing gated run at tier 3 before tier 4 executes) and the smoke's known-type-scoped stamp assertions with a version receipt; the tier-4 delivered-not-exercised honesty rule (a skip is never coverage); and grep-driven sweeps preferred over line anchors for the fake-writer plant sites (the rebind fake-writer anchors drifted; two locator plant sites sit outside the plan's listed anchors). The auditor's R1-R6 verifications (resume path never consults the transcript parser; the gate flip's blast radius is exactly the enumerated set with the `NoIndexProbe`/Unknown→Proceed behavior keeping the rebind suite green; the fixture-consumer set is complete; no google-cli spec sits in `CLOUD_SKIP_SPECS`; the refusal-notice shape; the doc anchors) are carried as settled facts into the evidence report.
+
+Plan-review round 1 remediation (2026-11-02): six Major findings CLEARED in the plan (see the run's plan-review-log.md) — the binary proof is the receipts, not the synthetic test (Consequence 1); `conversation_id_from_path` consumes `transcript.jsonl` first (the draft always returned `None`); the Task 2 red commit carries the call-site updates so the red is behavioral, not a compile error; the settings fence restores only this run's own damage signature and otherwise leaves a concurrent change untouched (GC2); the `--settings` overlay is passed on BOTH auth paths, with the no-overlay form only as the evidenced recorded deviation of branch (2b); cleanup runs unconditionally (tier-4 `finally`; Task 1 cleanup not gated on receipt success — receipts gate the flip, never cleanup).
