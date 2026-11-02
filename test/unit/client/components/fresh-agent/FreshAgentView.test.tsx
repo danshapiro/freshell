@@ -19083,23 +19083,29 @@ describe('task6 late retained source after native replacement', () => {
     apiMock.getFreshAgentThreadSnapshot.mockReturnValue(refresh.promise)
     const retained = {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.backpressure',retainedState:{source:{projectionId:'old-source',ownerEpoch:0,ownerGeneration:0,soulId:'soul',incarnationId:'incarnation',hostBootId:'host'},snapshot:original,pendingControls:[],attentionMarks:[]}}}
     const receive = (message: any) => {handleFreshAgentMessage(store.dispatch,message);for (const handler of handlers) handler(message)}
+    const dispatchAndStartEventSnapshotRead = async (message: any) => {
+      vi.useFakeTimers()
+      try {
+        act(() => receive(message))
+        await act(async () => {await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)})
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      } finally {vi.useRealTimers()}
+    }
     try {
-      act(() => receive(earlierRetained ? retained : {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}}))
-      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await dispatchAndStartEventSnapshotRead(earlierRetained ? retained : {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}})
       await act(async () => refresh.resolve(replacement))
       await expectRenderedText('Output from the current native source')
       if (late === 'retained') act(() => receive(retained))
       else {
         apiMock.getFreshAgentThreadSnapshot.mockClear()
         apiMock.getFreshAgentThreadSnapshot.mockReturnValue(lateNative.promise)
-        act(() => receive({type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}}))
-        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+        await dispatchAndStartEventSnapshotRead({type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}})
         await act(async () => lateNative.resolve(original))
       }
       expect(store.getState().freshAgentLive.bySession[`freshcodex:codex:${native.threadId}`].projection?.id).toBe('replacement-source')
       expect(screen.getByText('Output from the current native source')).toBeVisible()
       expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
-    } finally {cleanup();await act(async () => {refresh.resolve(replacement);lateNative.resolve(replacement)})}
+    } finally {vi.useRealTimers();cleanup();await act(async () => {refresh.resolve(replacement);lateNative.resolve(replacement)})}
   })
 })
 
