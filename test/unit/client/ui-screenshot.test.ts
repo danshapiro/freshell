@@ -812,6 +812,7 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
   })
 
   it('fails honestly when the capture target never appears', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] })
     try {
       const suspends: number[] = []
@@ -829,6 +830,7 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
 
       expect(result.ok).toBe(false)
       expect(result.error).toBe('capture target not found')
+      expect(errorLog).toHaveBeenCalledWith(expect.objectContaining({ stage: 'target', error: result.error }))
       expect(result.changedFocus).toBe(false)
       // A never-found target suspends nothing at all — the renderer
       // suspension starts only around the main render, after resolution.
@@ -840,6 +842,7 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
   })
 
   it('resumes terminal renderers when the render fails', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
     document.body.innerHTML = `
       <div data-pane-shell="true" data-pane-id="pane-err">Err</div>
     `
@@ -858,6 +861,7 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error).toBe('renderer exploded')
+    expect(errorLog).toHaveBeenCalledWith(expect.objectContaining({ stage: 'render', error: result.error }))
     expect(resumes).toHaveLength(1)
   })
 })
@@ -902,8 +906,11 @@ describe('captureUiScreenshot transcript viewport', () => {
     const resume = vi.fn(async () => {})
     vi.mocked(suspendTerminalRenderersForScreenshot).mockResolvedValue(resume)
     const render = mockPrunedRender(fail)
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
     const result = await captureUiScreenshot({ scope: 'pane', paneId: 'target' })
     expect(result.ok).toBe(!fail)
+    if (fail) expect(errorLog).toHaveBeenCalledWith(expect.objectContaining({ stage: 'render', error: result.error }))
+    else expect(errorLog).not.toHaveBeenCalled()
     expect(render.visited.map((node) => node.id)).toContain('visible')
     expect(render.visited.map((node) => node.id)).toContain('tail')
     for (const id of ['old', 'old-token', 'future', 'future-token', 'unrelated', 'editor', 'editor-token']) {
@@ -1086,6 +1093,7 @@ describe('captureUiScreenshot transcript viewport', () => {
   })
 
   it.each(['count', 'pane owner'])('fails clearly and resumes renderers on clone transcript %s drift', async (drift) => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
     document.body.innerHTML = `<div data-pane-shell="true" data-pane-id="target"><div data-context="fresh-agent-transcript">
       <article>current viewport</article><article id="old"><span id="old-token">history</span></article>
     </div></div>`
@@ -1102,6 +1110,7 @@ describe('captureUiScreenshot transcript viewport', () => {
     const result = await captureUiScreenshot({ scope: 'pane', paneId: 'target' })
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/screenshot transcript (tree|identity) changed during capture/)
+    expect(errorLog).toHaveBeenCalledWith(expect.objectContaining({ stage: 'render', error: result.error }))
     expect(resume).toHaveBeenCalledOnce()
     expect(html2canvas).toHaveBeenCalledOnce()
     expect(render.visited.map((row) => row.id)).not.toContain('old-token')

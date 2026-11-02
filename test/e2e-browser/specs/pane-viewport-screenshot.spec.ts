@@ -9,6 +9,79 @@ const require = createRequire(import.meta.url)
 const TRANSCRIPT = '[data-context="fresh-agent-transcript"]'
 let nextFixture = 0
 
+test('screenshot progress is visible during capture, excluded from PNG, and clears on success and failure', async ({ freshellPage: _p, page, serverInfo, terminal }, testInfo) => {
+  await terminal.waitForTerminal()
+  // A real html2canvas clone waits for fonts. Hold only that clone's font
+  // readiness, leaving the live app free to paint and receive input.
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-context="global"]')!
+    const patch = document.createElement('div')
+    patch.id = 'screenshot-toast-canary'
+    patch.style.cssText = 'position:fixed;right:0;bottom:0;width:400px;height:120px;z-index:90;background:rgb(17,91,143);pointer-events:none'
+    root.appendChild(patch)
+    const input = document.createElement('textarea')
+    input.id = 'screenshot-feedback-editor'; input.value = 'keep selection'
+    input.style.cssText = 'position:fixed;left:2px;top:2px;width:140px;height:30px;z-index:101'
+    root.appendChild(input); input.focus(); input.setSelectionRange(2, 6)
+    const append = document.body.appendChild
+    document.body.appendChild = function<T extends Node>(child: T): T {
+      const result = append.call(this, child) as T
+      if (child instanceof HTMLIFrameElement && child.classList.contains('html2canvas-container')) {
+        document.body.appendChild = append
+        const ready = new Promise<void>((resolve) => { (window as any).__releaseScreenshotFonts = resolve })
+        Object.defineProperty(child.contentDocument!, 'fonts', { configurable: true, value: { ready } })
+      }
+      return result
+    }
+    const h = window.__FRESHELL_TEST_HARNESS__!, s = h.getState()
+    ;(window as any).__screenshotFeedbackBefore = { tab: s.tabs.activeTabId, pane: s.panes.activePane, scroll: [scrollX, scrollY] }
+  })
+  const shotPromise = png(page, serverInfo, 'view', 'toast-exclusion')
+  const toast = page.getByRole('status').filter({ hasText: 'Taking screenshot' })
+  await expect(toast).toBeVisible()
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__releaseScreenshotFonts)).toBe('function')
+  const toastBox = await toast.boundingBox()
+  expect(toastBox).not.toBeNull()
+  await page.keyboard.insertText('Z')
+  await expect(page.locator('#screenshot-feedback-editor')).toHaveValue('keZelection')
+  await expect(toast).toBeVisible()
+  await page.evaluate(() => (window as any).__releaseScreenshotFonts())
+  const shot = await shotPromise
+  await expect(toast).toHaveCount(0)
+  const observed = await page.evaluate(async ({ base64, box }) => {
+    const image = new Image(); image.src = `data:image/png;base64,${base64}`; await image.decode()
+    const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height
+    const context = canvas.getContext('2d')!; context.drawImage(image, 0, 0)
+    const scale = image.width / innerWidth
+    const bytes = context.getImageData(Math.ceil((box.x + 2) * scale), Math.ceil((box.y + 2) * scale), Math.floor((box.width - 4) * scale), Math.floor((box.height - 4) * scale)).data
+    let mismatched = 0
+    for (let i = 0; i < bytes.length; i += 4) if (bytes[i] !== 17 || bytes[i + 1] !== 91 || bytes[i + 2] !== 143 || bytes[i + 3] !== 255) mismatched++
+    const before = (window as any).__screenshotFeedbackBefore, state = window.__FRESHELL_TEST_HARNESS__!.getState()
+    return { mismatched, pixels: bytes.length / 4, focus: document.activeElement?.id,
+      selection: [state.tabs.activeTabId === before.tab, JSON.stringify(state.panes.activePane) === JSON.stringify(before.pane)],
+      scroll: [scrollX, scrollY], beforeScroll: before.scroll }
+  }, { base64: shot.base64, box: toastBox! })
+  expect(observed.mismatched).toBe(0)
+  expect(observed.pixels).toBeGreaterThan(1000)
+  expect(observed.focus).toBe('screenshot-feedback-editor')
+  expect(observed.selection).toEqual([true, true])
+  expect(observed.scroll).toEqual(observed.beforeScroll)
+  await testInfo.attach('capture-progress-excluded', { body: Buffer.from(shot.base64, 'base64'), contentType: 'image/png' })
+
+  // Missing targets keep progress through the bounded resolution wait and
+  // return an honest HTTP failure before dismissing it.
+  const failure = fetch(`${serverInfo.baseUrl}/api/screenshots`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-auth-token': serverInfo.token },
+    body: JSON.stringify({ scope: 'pane', paneId: 'nonexistent-feedback-pane', name: `feedback-error-${Date.now()}` }),
+  })
+  await expect(toast).toBeVisible()
+  const response = await failure
+  expect(response.status).toBe(422)
+  expect(JSON.stringify(await response.json())).toContain('capture target not found')
+  await expect(toast).toHaveCount(0)
+  expect(await page.evaluate(() => document.activeElement?.id)).toBe('screenshot-feedback-editor')
+})
+
 async function settle(page: Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 }
