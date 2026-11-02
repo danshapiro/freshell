@@ -28,6 +28,11 @@ const providers = [
   { provider: 'opencode', sessionType: 'freshopencode', config: 'custom-xdg/opencode/opencode.jsonc' },
 ] as const
 
+// Native name synchronization allows retries no sooner than 5s and then
+// 30s after the first two failed cycles. Include one 20s Codex metadata
+// request and worker scheduling margin for the final attempt.
+const NATIVE_NAME_SYNC_TIMEOUT_MS = 60_000
+
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -653,9 +658,21 @@ tool_timeout_sec = 120
       const publicApiCounts = { total: apiRequests.length,
         byRoute: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.route] = (counts[row.route] ?? 0) + 1; return counts }, {}),
         byStatus: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.status] = (counts[row.status] ?? 0) + 1; return counts }, {}) }
+      const relevantNativeNameLogs = (output: string) => output.split('\n')
+        .filter(line => /freshagent\.native_name_refused|freshagent\.codex\.native_name_failed|session_names\.native_route_unavailable/i.test(line))
+        .slice(-100)
+      const captureNativeNameLogs = (capture: () => string) => {
+        try { return relevantNativeNameLogs(capture()) }
+        catch (error) { return [`capture_failed: ${String(error).slice(0, 500)}`] }
+      }
+      const nativeNameDiagnostics = {
+        supervisorLifecycle: captureNativeNameLogs(() =>
+          fs.readFileSync(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8')),
+      }
       return { created, initialView: view, currentViews, nativeContext, final,
         fixtureContext: model?.context, traffic, sentControls: wire.sentControls, frames: wire.frames,
-        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, ownedHostEvidence: ownedHostEvidence() }
+        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, nativeNameDiagnostics,
+        ownedHostEvidence: ownedHostEvidence() }
     }
     const catalogResponse = await fetch(`${rig.info.baseUrl}/api/fresh-agent/model-capabilities/freshcodex?${new URLSearchParams({ sessionId: created.sessionId, sessionRef: JSON.stringify(created.sessionRef), cwd: workspace })}`, { headers })
     expect(catalogResponse.ok, await catalogResponse.clone().text()).toBe(true)
@@ -693,9 +710,16 @@ tool_timeout_sec = 120
     })
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
-    await send('Question: Which managed environment? Answer: Staging.', { effort: null })
+    const contextualAnswer = await send('Question: Which managed environment? Answer: Staging.', { effort: null })
+    expect(contextualAnswer.submittedTurnId).toBeTruthy()
     await waitFor('managed contextual answer at loopback model', async () => (await model!.readTraffic()).some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
-    await waitFor('managed contextual answer completion', async () => (await snapshot()).status === 'idle' ? true : undefined)
+    await wire.wait(frame => frame.type === 'freshAgent.event'
+      && frame.event?.type === 'freshAgent.transcript.patch'
+      && frame.provider === 'codex'
+      && frame.sessionType === 'freshcodex'
+      && frame.event.ops?.some((operation: any) => operation.op === 'settleTurn'
+        && operation.nativeTurnId === contextualAnswer.submittedTurnId
+        && operation.status === 'completed'))
     const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
     expect(resumedResponse.ok, await resumedResponse.clone().text()).toBe(true)
@@ -729,13 +753,23 @@ tool_timeout_sec = 120
     }
     expect((await inspectNativeContext()).pid).toBe(nativeContext.pid)
     const durableNameRef = { kind: 'session', provider: 'codex', sessionId: view.nativeSessionId }
-    const readNameFor = async (ref: unknown) => {
+    const readNameUpdateFor = async (ref: unknown) => {
       const response = await observeRead('/api/session-names/read', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify({ refs: [ref] }) })
       expect(response.ok, `name read ${response.status}: ${await response.clone().text()}`).toBe(true)
-      return (await response.json()).names[0]?.record
+      return (await response.json()).names[0]
     }
+    const readNameFor = async (ref: unknown) => (await readNameUpdateFor(ref))?.record
     const readName = () => readNameFor(durableNameRef)
+    const waitForNativeNameSync = (ref: unknown, expected: any, label: string) => waitFor(label, async () => {
+      const update = await readNameUpdateFor(ref)
+      return update?.record?.revision === expected.revision
+        && update.record.name === expected.name
+        && update.nativeSync?.status === 'synced'
+        && update.nativeSync.desiredRevision === expected.revision
+        ? update
+        : undefined
+    }, NATIVE_NAME_SYNC_TIMEOUT_MS)
     const nativeMetadata = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path');
       const env=Object.fromEntries(fs.readFileSync('/proc/${nativeContext.pid}/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
@@ -792,6 +826,7 @@ tool_timeout_sec = 120
         if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
     const nativeNameBeforeWait = await readNativeName()
     rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
+    await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization')
     await waitFor('managed native name writeback', async () => {
       const observation = await readNativeName()
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
@@ -828,7 +863,7 @@ tool_timeout_sec = 120
           && wire.frames.slice(frameCursor).some(frame => {
             const event = frame.type === 'freshAgent.event' ? frame.event : frame
             const nativeTurn = value.turns.find((turn: any) => turn.role === 'user' && turn.items?.some((item: any) => item.text === 'MANAGED_EFFECT_'+choice))?.nativeTurnId
-            return event.type === 'freshAgent.transcript.patch' && event.sessionId === created.sessionId
+            return event.type === 'freshAgent.transcript.patch' && event.sessionId === view.nativeSessionId
               && event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurn && ['completed', 'interrupted', 'failed'].includes(op.status))
           })
           && (choice === 'DECLINE' || JSON.stringify(value.turns).includes('Managed '+file+' result:')) ? value : undefined
@@ -1034,11 +1069,14 @@ tool_timeout_sec = 120
       headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ target: recoveredNameRef,
         name: 'Managed recovered saved name', nameIntent: 'user' }) })
     expect(renamedRecovery.ok, await renamedRecovery.clone().text()).toBe(true)
+    const recoveredCanonicalName = await readNameFor(recoveredNameRef)
+    expect(recoveredCanonicalName).toMatchObject({ ref: recoveredNameRef, name: 'Managed recovered saved name', source: 'manual' })
     rig.runtime.writeIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
       oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await readName(), firstNewName: recoveredName,
       manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archiveManifest })
     const recoveredNativeContext = await inspectNativeContext()
     expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
+    await waitForNativeNameSync(recoveredNameRef, recoveredCanonicalName, 'recovered native name synchronization')
     await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
     const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)
