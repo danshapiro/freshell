@@ -4766,10 +4766,10 @@ fn prepare_fresh_opencode_provider_home_before_input_validation(
         || terminal.opencode_transfer_attempt_id.is_some()
         || terminal.opencode_adoption.is_some()
         || !terminal.provider_bootstrap_files.is_empty()
-        || !terminal
+        || terminal
             .provider_launch_context
             .as_ref()
-            .is_some_and(|context| context.prepared_inputs.is_some())
+            .is_none_or(|context| context.prepared_inputs.is_none())
     {
         return Ok(());
     }
