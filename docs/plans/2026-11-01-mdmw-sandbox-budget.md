@@ -68,7 +68,7 @@ Task 1 produces the clean implementation commit. Task 2 accepts exactly that com
 - Smoke CLI: node scripts/testing/sandbox-budget-smoke.mjs EXPECTED_JOBS, optionally followed by exactly --cli-jobs EXPECTED_JOBS or --project-jobs EXPECTED_JOBS. Expected jobs is 1 or 2; other argument forms fail. Each mode observes actual build-script NUM_JOBS.
 - Stage 2 corrected decisions below intentionally replace invalid unexecuted draft implementation snippets. No newly authored unexecuted product code is prescribed as validated code.
 
-- [ ] **Step 1: Write failing real-wrapper behavioral tests**
+- [x] **Step 1: Write failing real-wrapper behavioral tests**
 
 Extend the existing fixture, preserving its owner/volume/guard model. Add completed fake modes budget-success, budget-failure, budget-137, and budget-launch-failure. Preserve real argv recording and volume creation. The first three publish full CID a repeated 64 times, create the object, then remove the object before return when --rm applies; retain the CIDfile, matching Docker's established contract. Return 0, 37, 137 respectively. Launch failure returns 125 without publication. The fake must never fabricate diagnostic rows.
 
@@ -85,7 +85,7 @@ Add behavioral cases that:
 
 Keep the original fixture working against unchanged source for RED. Add copies of the new helper only in Step 3 when that file is created; do not turn RED into a missing-helper setup failure. Existing budget/default assertions must fail because the real launcher lacks the new CPU/receipt/forwarding behavior.
 
-- [ ] **Step 2: Run focused RED in the existing strict enclosure**
+- [x] **Step 2: Run focused RED in the existing strict enclosure**
 
 From this task worktree, run:
 
@@ -95,7 +95,7 @@ scripts/sandbox-test.sh --runtime-suite 'pnpm run test:vitest run test/unit/tool
 
 Expected: intended assertions fail against unchanged launcher behavior. Save the exact source identification and log. Fix setup errors and rerun until the missing behavior causes failure; tools, permission, or helper-copy errors are not RED. A fresh VM is not a prerequisite for these finite fake-Docker cases. No compiler/pressure reproduction is part of this step.
 
-- [ ] **Step 3: Implement the smallest production behavior**
+- [x] **Step 3: Implement the smallest production behavior**
 
 In the single shared Docker argument block add CPU 2 and explicit total RAM-plus-swap 16g; retain RAM 8g and PIDs 512. Append the CARGO_BUILD_JOBS environment argument only for a caller-supplied nonempty value. An empty/unset value follows Cargo's native default. Do not validate/restrict deliberate strings or inject 2; Cargo remains responsible for its own config/CLI/error semantics.
 
@@ -123,15 +123,15 @@ Add selftest default, project 1, exported 1, inline 1 and CLI 1 cases through th
 
 Document the fixed CPU budget for all workloads, higher-job override throughput limits, requested versus observed controls, and compact diagnostics in the existing agent test-sandbox documentation. State plainly that unavailable OOM state remains null and exit 137 is never classified as OOM by this launcher.
 
-- [ ] **Step 4: Run focused GREEN**
+- [x] **Step 4: Run focused GREEN**
 
 Repeat Step 2's exact strict command from the task worktree. Expected: all selected cases pass, after real RED evidence. Ensure the secret sentinel appears nowhere in added metadata and published CID survives modeled auto-removal. Later Task 2 executes the actual literal quote/newline caller to verify bytes beyond fake argv.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep one shared resource budget and one lifecycle owner. Keep JSON/numeric/null formatting in the helper; remove new duplicated shell JSON except a fixed unavailable fallback. Reuse existing cleanup/recording fixtures. Repeat the focused tests. No unrelated cache, provider, runtime or owner-guard restructuring.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 From the task worktree, preserve the strict enclosure for process-signal fixtures:
 
@@ -149,7 +149,7 @@ git diff --check
 
 Expected: all commands exit 0 and selected tests actually run, covering resource/ownership/guard cases, Cargo callers, per-worktree caches, native-contract dispatch and runtime preparation/startup. Tests invoking real substantial compilation must use Task 2's qualified guest; finite fixture cases may stay in the task's strict enclosure.
 
-- [ ] **Step 7: Commit the coherent implementation**
+- [x] **Step 7: Commit the coherent implementation**
 
 ~~~bash
 git add scripts/sandbox-test.sh scripts/testing/sandbox-diagnostics.mjs scripts/testing/sandbox-budget-smoke.mjs test/unit/tooling/sandbox-test.sandbox.ts test/unit/tooling/testing/codex-sandbox-cache.test.ts scripts/sandbox-selftest.sh scripts/sandbox-cache-selftest.sh scripts/test/sandbox-runtime-startup.test.sh docs/development/test-sandbox.md
@@ -172,7 +172,7 @@ Expected: staged whitespace check exits 0 and the summary shows both new .mjs fi
 - Produce distinct actual workload/attached-Docker/launcher/cleanup statuses plus a separate acceptance judgment. Never change child statuses to encode a policy pass.
 - A small task-specific setup/runner may orchestrate this one guest and finite evidence collection. No prescribed permanent driver API, cloning framework, host-pressure monitor or product supervisor.
 
-- [ ] **Step 1: Prepare and qualify one fresh bounded guest before real acceptance compilation**
+- [x] **Step 1: Prepare and qualify one fresh bounded guest before real acceptance compilation**
 
 The read-only cloud route is unavailable with current Compute API/robot authority. Use the available rootful Docker/KVM tool image, not missing old disks/harnesses. Immediately before allocation, perform one read-only capacity admission: require host MemAvailable at least 28 GiB (20 GiB outer cap plus 8 GiB reserve), at least 120 GiB free on each backing filesystem used for the 100 GiB guest disk and Docker storage, and at least 28 GiB remaining under every finite host ancestor memory.max. Missing readings or lower capacity stop setup without allocation; do not add a host-pressure monitor or change host policy. Pre-create every task bind directory as the current user, verify its ownership and the documented Git ignores, then create one exact-owned outer container explicitly in host system.slice: RAM 20 GiB, total RAM-plus-swap 20 GiB, CPUs 4, host PIDs 512, only /dev/kvm passthrough. Give the Ubuntu 24.04 guest RAM 16 GiB/four vCPUs and one new 100 GiB virtual disk. Keep outer/guest allocations finite; never pair the larger guest with the old 12 GiB outer cap. No garageserver package/service/policy change.
 
@@ -186,7 +186,7 @@ Before releasing a compiler, prove actual outer placement/bounds, guest memory/C
 
 Keep evidence sampling finite and focused on the guest workload. Hard outer containment and headroom remove reliance on the historical host/outer pressure-monitoring framework. If normal-security boot/rootless/controllers/export cannot qualify, stop before compilation and report the concrete blocker; do not compile under garageserver's user manager, enable cloud services, or raise/remove limits to get a pass.
 
-- [ ] **Step 2: Exercise actual defaults, overrides, diagnostics and selftest**
+- [x] **Step 2: Exercise actual defaults, overrides, diagnostics and selftest**
 
 Transfer the exact clean Task 1 archive; record commit/tree/archive and file manifest. Install pinned dependencies frozen in this isolated source. Attribute canonical image identity and actual Rust/Cargo version. Guest source is the required isolated acceptance input; no extra host checkout is created.
 
@@ -212,7 +212,7 @@ Run the actual wrapper with exit 37 and literal exit 137; preserve their exact s
 
 Retain --rm and corroborate published full CID after ordinary auto-removal before wrapper control cleanup. Record actual guest Docker version; source-matched installed-host CLI evidence is not a substitute for its real route. Remove fixture projects after each run.
 
-- [ ] **Step 3: Run exact final-source cold supported-toolchain Clippy**
+- [x] **Step 3: Run exact final-source cold supported-toolchain Clippy**
 
 Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it; never accept Clippy evidence for source older than the last correction.
 
@@ -258,6 +258,51 @@ No PR or deployment is authorized. Prepare the clean committed result and ask fo
 
 ## Final committed-source gate
 
+### Execution checkpoint
+
+Task 1 implementation is committed at `0a6db8f23ce520575d795407cf4ab53388fbb1a1`
+(tree `e46e0571ca6ede11b0fba876ca8c4196fefcd47a`). Its independent requirements
+review passed and quality review approved with zero findings. That exact clean
+source, archived with SHA256
+`3c64c4cfb49db80c09f70871e66af11d9f9b2ef678a38c4e73e1e147cd015373`,
+is the product source compiled for Task 2. This later checkpoint changes only
+plan progress; it is not a new compiled product source.
+
+Task 2's empirical steps passed in one fresh bounded KVM guest with ordinary
+UID 1000, normal rootless Docker/systemd cgroup delegation, private networking,
+16 GiB RAM, four vCPUs and over 8 GiB usable physical swap. Actual own and
+ancestor controls were qualified before compilation. All seven ordinary/runtime
+smokes observed the expected jobs and overlap, overrides remained effective,
+the distinct-control non-root observer probe passed, literal caller bytes and
+negative statuses were preserved, both strict impacted selections passed
+(81 and 76 tests), and the full sandbox selftest reported ALL PROOFS PASSED.
+
+The exact Rust/Clippy 1.96.0 cold payload completed with child/Docker status 0
+in 155.385 seconds. Twenty-three unchanged graph build-script children each
+reported NUM_JOBS=2. Across 159 samples, peak memory was 3,088,547,840 bytes,
+leaving 5,501,386,752 bytes (64.045%) of RAM headroom; own sampled swap use,
+memory pressure and OOM event deltas were zero, and every unrelated-service
+health check passed. This supports the observed requested graph; it does not
+prove unexercised swap/oomd failure paths or future workloads. The canonical
+image's floating Cargo/Rust 1.99.1 is separately attributed from the pinned
+payload's 1.96.0.
+
+Evidence and failed setup-attempt dispositions are retained under
+`/home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/acceptance/attempt-001/`.
+Forty published CIDs were verified absent, eleven unreferenced guest volumes
+were removed, 462 exported files were checked byte-for-byte, and the guest,
+outer container, owned processes, disk, seed, keys and task temporary inputs
+were removed. The feature worktree and branch remain for review. No product
+correction, host-policy change, production restart, deployment, push or PR
+occurred during Task 2.
+
+Task 2 Step 4's fresh independent review and Step 5's review-dependent handoff
+remain pending for the coordinator, so those checkboxes remain unchecked.
+The final-HEAD full-suite gate and whole-branch review below are also pending;
+the earlier unidentified base failure grants no exemption.
+
+### Pending final gate
+
 After both planned tasks, their corrections and task reviews are complete, the parent runs the configured coordinated full-suite gate on the final committed HEAD from this feature worktree, before whole-branch review. Follow usual-executing-plans for periodic gates, adopting exact-HEAD results, recording failures and rerunning after committed fixes; Task 1's precommit checks and an older commit's full-suite result do not substitute for this gate. Wait for any foreign coordinator holder.
 
 ~~~bash
@@ -275,6 +320,6 @@ Expected: every configured phase, cloud local companion and local Electron lane 
 5. Safety/scope: approved immutable failing base, task worktree, finite strict fixture route, qualified bounded disposable guest for cold evidence, exact cleanup, no unrelated repair/production/PR.
 6. Review/commit: focused implementation checkpoint and actual evidence with fresh independent gates. Unknown baseline failure grants no exemption.
 
-Stage 2 decision evidence stays in the external run reports: load-bearing-finder.md, load-bearing-strategist.md and load-bearing-validator-{env-cgroup,cid,override,budget-clippy}.md under /home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/reports/. Static proof selected the architecture; guest qualification, actual observer/defaults and cold outcomes remain unperformed execution gates.
+Stage 2 decision evidence stays in the external run reports: load-bearing-finder.md, load-bearing-strategist.md and load-bearing-validator-{env-cgroup,cid,override,budget-clippy}.md under /home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/reports/. Static proof selected the architecture; the execution checkpoint above records the subsequent actual guest, observer/defaults and cold outcomes without treating that earlier static proof as empirical evidence.
 
 Self-review: the canonical User Request remains unchanged exactly once; every obligation maps above. Removed invalid env-default implementation drafts and VM-before-finite-fake-test dependency; retained intended behavior and exact interfaces rather than substituting new unexecuted product snippets. No deferred product behavior, stub-as-acceptance, unrelated source task, host-monitoring framework or blanket failure exemption is introduced.
