@@ -15449,9 +15449,20 @@ pub(crate) mod tests {
             json!({ "threadId": "thread-1", "turnId": "turn-1", "status": "completed" }),
         );
 
-        // Deterministic sync: the consumer clears `active_turn` BEFORE it broadcasts the
-        // resulting frames, so waiting for the idle snapshot frame here proves the clear
-        // has already happened by the time `get_snapshot` is called below.
+        // The newly observed turn first initializes and settles its retained
+        // projection. Its lifecycle snapshot still follows both frames.
+        let init: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(init["event"]["type"], "freshAgent.session.init");
+        let patch: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(patch["event"]["type"], "freshAgent.transcript.patch");
+        assert!(patch["event"]["ops"].as_array().unwrap().iter().any(|op| {
+            op["op"] == "settleTurn"
+                && op["nativeTurnId"] == "turn-1"
+                && op["status"] == "completed"
+        }));
+
+        // Deterministic sync: the consumer clears `active_turn` BEFORE its
+        // lifecycle snapshot, so this wait proves the clear has happened.
         let frame = rx.recv().await.expect("idle snapshot frame");
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["event"]["type"], "freshAgent.session.snapshot");
@@ -18856,6 +18867,170 @@ pub(crate) mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_socket_exit_waits_for_stalled_drain_and_preserves_the_provider_error() {
+        let _process_fixture = crate::session_lease::process_fixture::lock().await;
+        let dir = tempfile::tempdir().expect("owned fake app-server files");
+        let port_file = dir.path().join("port");
+        let ownership_id = mint_ownership_id();
+        let message = "Selected model is at capacity. Please try a different model.";
+        let mut command = tokio::process::Command::new("node");
+        command
+            .arg(fake_codex_app_server_cmd())
+            .arg("--listen")
+            .arg("ws://127.0.0.1:0")
+            .env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+            .env("FAKE_CODEX_APP_SERVER_PORT_FILE", &port_file)
+            .env(
+                "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+                json!({
+                    "notificationsAfterMethods": {"model/list": [{
+                        "method":"error", "params":{"threadId":"thread-real-drain",
+                        "turnId":"turn-1", "willRetry":false,"error":{"message":message}}
+                    }]}
+                })
+                .to_string(),
+            )
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn the owned fake app-server");
+        let pid = child.id().expect("fake app-server PID");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let transport = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("fake app-server exited before connecting: {status}");
+            }
+            if let Ok(port) = std::fs::read_to_string(&port_file) {
+                if let Ok(port) = port.trim().parse::<u16>() {
+                    if let Ok(transport) =
+                        TungsteniteTransport::connect(&format!("ws://127.0.0.1:{port}")).await
+                    {
+                        break transport;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fake app-server never listened"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let (client, mut socket_events) = CodexAppServerClient::connect(Arc::new(transport));
+        let client = Arc::new(client);
+        client
+            .initialize()
+            .await
+            .expect("initialize the real WebSocket client");
+
+        // Relay each real decoded notification unchanged. Its observation
+        // proves the socket reader queued the error before the child dies;
+        // the held emission gate then makes the consumer's drain stall.
+        let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarded_error = Arc::new(AtomicBool::new(false));
+        let observed = forwarded_error.clone();
+        let relay = tokio::spawn(async move {
+            while let Some(notification) = socket_events.recv().await {
+                let is_error = matches!(&notification, CodexNotification::Other { method, .. } if method == "error");
+                if relay_tx.send(notification).is_err() {
+                    break;
+                }
+                if is_error {
+                    observed.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        let (state, mut events) = state_with_bus();
+        insert_fake_session_with_real_consumer(
+            &state,
+            "thread-real-drain",
+            client.clone(),
+            Arc::new(StdMutex::new(Some("turn-1".into()))),
+            relay_rx,
+            child,
+            &ownership_id,
+        )
+        .await;
+        let gate = state.sessions.lock().await["thread-real-drain"]
+            .event_emission_gate
+            .clone();
+        let held = gate.lock().await;
+        client
+            .list_models(None)
+            .await
+            .expect("trigger the real provider notification");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !forwarded_error.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real socket decoded the diagnostic before exit");
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+
+        let warning = collect_frames_until(&mut events, Duration::from_secs(5), |frame| {
+            frame["event"]["code"] == "CODEX_NOTIFICATION_DRAIN_PENDING"
+        })
+        .await;
+        let reserved = matches!(
+            state.ensure_session_alive("thread-real-drain", None).await,
+            Err(EnsureAliveError::Draining)
+        );
+        assert!(
+            warning.matched,
+            "a stalled real socket drain reports a warning: {:?}",
+            warning.frames
+        );
+        assert!(!warning
+            .frames
+            .iter()
+            .any(|frame| frame["event"]["type"] == "freshAgent.status"
+                && frame["event"]["status"] == "exited"));
+        assert!(
+            reserved,
+            "the current source stays reserved while its real socket drains"
+        );
+
+        drop(held);
+        let exited = collect_frames_until(&mut events, Duration::from_secs(5), |frame| {
+            frame["event"]["type"] == "freshAgent.status" && frame["event"]["status"] == "exited"
+        })
+        .await;
+        let completion = collect_frames_until(&mut events, Duration::from_secs(5), |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        let trailing = collect_frames_until(&mut events, Duration::from_millis(300), |frame| {
+            frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        let retained = state.retained_state("thread-real-drain").await.unwrap();
+        state.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("real socket relay ends")
+            .unwrap();
+        assert!(
+            exited.matched,
+            "the process exit follows the drained socket: {:?}",
+            exited.frames
+        );
+        assert!(
+            exited.frames.iter().any(|frame| frame["event"]["type"]
+                == "freshAgent.transcript.patch"
+                && frame["event"]["ops"].to_string().contains(message)),
+            "the queued provider error precedes exit: {:?}",
+            exited.frames
+        );
+        assert!(
+            completion.matched && !trailing.matched,
+            "the crash rings exactly once"
+        );
+        assert!(retained["snapshot"]["turns"].to_string().contains(message));
     }
 
     #[tokio::test]
@@ -25646,6 +25821,9 @@ pub(crate) mod tests {
         // never kill_tx). Safety: a targeted SIGKILL of this test's own fixture
         // child (the `sleep` process spawned above) — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // The channel peer models the killed process's WebSocket: close it
+        // so the exit watcher can drain the already-decoded notifications.
+        peer.disconnect();
 
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
@@ -25763,6 +25941,7 @@ pub(crate) mod tests {
         // Safety: a targeted SIGKILL of this test's own fixture child
         // (the `sleep` process spawned above) — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -25977,6 +26156,7 @@ pub(crate) mod tests {
         // SIGKILL of this test's own fixture child — never a broad kill
         // pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -26080,6 +26260,7 @@ pub(crate) mod tests {
         // completion retired nothing. Safety: a targeted SIGKILL of this
         // test's own fixture child — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -26194,6 +26375,7 @@ pub(crate) mod tests {
         // targeted SIGKILL of this test's own fixture child (the `sleep`
         // process spawned above) — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -26379,6 +26561,7 @@ pub(crate) mod tests {
         // Safety: a targeted SIGKILL of this test's OWN fixture child (the
         // `sleep` process spawned above) — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -26508,6 +26691,7 @@ pub(crate) mod tests {
         // edge to the turn). Safety: a targeted SIGKILL of this test's own
         // fixture child — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -26806,6 +26990,7 @@ pub(crate) mod tests {
         // fixture child (the `sleep` process spawned above) — never a
         // broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -26944,6 +27129,7 @@ pub(crate) mod tests {
         // Safety: a targeted SIGKILL of this test's OWN sleep fixture
         // child — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
@@ -27230,6 +27416,7 @@ pub(crate) mod tests {
         // SIGKILL of this test's OWN sleep fixture child — never a broad
         // kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        peer.disconnect();
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
         })
