@@ -2329,7 +2329,11 @@ mod tests {
         use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
         use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
 
-        let root = tempfile::tempdir().unwrap();
+        let root = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(directory) => tempfile::tempdir_in(directory),
+            None => tempfile::tempdir(),
+        }
+        .unwrap();
         let script = root.path().join("handoff-terminal.sh");
         std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
