@@ -2917,6 +2917,133 @@ describe('FreshAgentView', () => {
       })
     })
 
+    async function setupSteeringWithNewerLiveProjection(includeSecondMatch: boolean) {
+      const store = createStore()
+      const locator = { sessionId: 'codex-newer-live-steer', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const projectionId = 'newer-live-steer-source'
+      const prompt = 'Shared steered context'
+      const userRow = (id: string, text: string, nativeId?: string) => ({
+        id, turnId: id, role: 'user' as const, summary: text, ...(nativeId ? { nativeTurnId: nativeId } : {}),
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      const assistantRow = (id: string, text: string) => ({
+        id, turnId: id, role: 'assistant' as const, summary: text,
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      const projection = (eventRevision: number, turnRows: Record<string, string[]>) => ({
+        id: projectionId, historyGeneration: 0, eventRevision, eventOwnedTurnIds: [],
+        nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows, turnOutputStates: {},
+      })
+      const initial = FreshAgentSnapshotSchema.parse({
+        threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision: 1, status: 'idle', capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        turns: [userRow('shared-turn', 'Earlier request', 'shared-turn')],
+        extensions: { codex: { projection: projection(0, { 'shared-turn': ['shared-turn'] }) } },
+      })
+      const heldRead = createDeferred<unknown>()
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(initial).mockImplementation(async () => {
+        heldReadStarted = true
+        return heldRead.promise
+      })
+      store.dispatch(sessionInit(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'newer-live-steer-create', status: 'idle',
+        resumeSessionId: locator.sessionId, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      await screen.findByText('Earlier request')
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+      fireEvent.change(composer, { target: { value: 'Follow up after the active turn' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+        requestId: sent!.requestId, submittedTurnId: 'shared-turn' }))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      const sessionKey = 'freshcodex:codex:codex-newer-live-steer'
+      const statusVersion = store.getState().freshAgent.sessions[sessionKey].statusVersion
+      const liveRows = [
+        userRow('shared-turn:row-0', 'Earlier request'),
+        assistantRow('shared-turn:row-1', 'Earlier response'),
+        userRow('shared-turn:row-2', prompt),
+        assistantRow('shared-turn:row-3', 'Newer live turn activity'),
+        ...(includeSecondMatch ? [userRow('shared-turn:row-4', prompt)] : []),
+      ]
+      const patch = { type: 'freshAgent.event', ...locator, event: {
+        type: 'freshAgent.transcript.patch', sessionId: locator.sessionId, projectionId, historyGeneration: 0, afterRevision: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'shared-turn', revision: 2, turns: liveRows }],
+      } }
+      act(() => { handleFreshAgentMessage(store.dispatch, patch); listener(patch) })
+      await screen.findByText('Newer live turn activity')
+      expect(store.getState().freshAgent.sessions[sessionKey].statusVersion).toBe(statusVersion)
+      expect(store.getState().freshAgentLive.bySession[sessionKey].projection?.eventRevision).toBe(2)
+      const olderIdle = FreshAgentSnapshotSchema.parse({
+        ...initial, revision: 2, status: 'idle',
+        turns: [userRow('shared-turn:row-0', 'Earlier request'), assistantRow('shared-turn:row-1', 'Earlier response'),
+          userRow('shared-turn:row-2', prompt), assistantRow('snapshot-marker', 'Older idle snapshot applied')],
+        extensions: { codex: { projection: projection(1, {
+          'shared-turn': ['shared-turn:row-0', 'shared-turn:row-1', 'shared-turn:row-2'],
+          'snapshot-marker': ['snapshot-marker'],
+        }) } },
+      })
+      return { store, sent: sent!, prompt, async applyOlderIdle() {
+        await act(async () => heldRead.resolve(olderIdle))
+        await screen.findByText('Older idle snapshot applied')
+      } }
+    }
+
+    it('keeps an ambiguous echo when a newer live projection adds a second matching row', async () => {
+      const steer = await setupSteeringWithNewerLiveProjection(true)
+      await steer.applyOlderIdle()
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: steer.prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('does not settle steering from an older idle snapshot after newer live activity', async () => {
+      const steer = await setupSteeringWithNewerLiveProjection(false)
+      await steer.applyOlderIdle()
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: steer.prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('settles the full matching steered prompt when another new prompt shares its first 80 characters', async () => {
+      const prefix = 'Shared request template '.repeat(5)
+      expect(prefix.length).toBeGreaterThan(80)
+      const prompt = `${prefix}Choose the first option`
+      const otherPrompt = `${prefix}Choose the second option`
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        steer.userRow('shared-turn:row-2', prompt),
+        steer.assistantRow('shared-turn:row-3', 'Intervening response'),
+        steer.userRow('shared-turn:row-4', otherPrompt),
+      ]
+      await steer.releaseAcceptedRead('running', rows('Distinct shared-prefix prompts are running'))
+      await screen.findByText('Distinct shared-prefix prompts are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      await steer.refresh('idle', rows('Distinct shared-prefix prompts completed'), 'Distinct shared-prefix prompts completed')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+    })
+
     it.each([
       { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
       { label: 'ordinary acceptance arrives in the same batch as a landed snapshot', ambiguous: false },
