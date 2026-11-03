@@ -4,7 +4,7 @@ import path from 'path'
 import { promisify } from 'util'
 import type { CDPSession, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
-import type { TestHarness } from '../helpers/test-harness.js'
+import { selectShellFromPicker, type TestHarness } from '../helpers/test-harness.js'
 import type { TerminalHelper } from '../helpers/terminal-helpers.js'
 
 const execFileAsync = promisify(execFile)
@@ -87,18 +87,6 @@ function timestampsWithinInterval(timestamps: number[], startAtMs: number, endAt
 
 function timestampsAfter(timestamps: number[], atMs: number): number[] {
   return timestamps.filter((timestamp) => timestamp >= atMs)
-}
-
-async function selectShellFromPicker(page: Page): Promise<void> {
-  const terminal = page.locator('.xterm').first()
-  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
-  // Boot may already own a terminal. Observe one of the actual ready surfaces
-  // instead of assuming the picker has settled after a 500ms sleep.
-  await expect.poll(async () => await terminal.isVisible() || await picker.isVisible()).toBe(true)
-  if (await terminal.isVisible()) return
-  await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
-    .first().press('Enter')
-  await expect(terminal).toBeVisible({ timeout: 30_000 })
 }
 
 async function getActiveTerminalId(harness: TestHarness): Promise<string> {
