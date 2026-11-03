@@ -491,12 +491,21 @@ describe('collapsed error diagnostics', () => {
 
     const disclosure = document.querySelector(`[data-agent-error="${id}"]`) as HTMLElement
     expect(disclosure).toBeInTheDocument()
-    expect(disclosure).not.toHaveAttribute('open')
     const summary = disclosure.querySelector('summary')!
+    const body = disclosure.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
+    if (id === 'create') {
+      expect(disclosure).toHaveAttribute('open')
+      expect(body).toBeVisible()
+      expect(body).toHaveTextContent(message)
+      expect(within(body).getByRole('button', { name: 'Retry' })).toBeVisible()
+      fireEvent.click(summary)
+    }
+    expect(disclosure).not.toHaveAttribute('open')
+    expect(body).not.toBeVisible()
     expect(summary).toBeVisible()
     expect(summary).toHaveTextContent(message)
     fireEvent.click(summary)
-    const body = disclosure.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
+    expect(disclosure).toHaveAttribute('open')
     expect(body).toBeVisible()
     expect(body).toHaveTextContent(message)
     if (id === 'create') expect(within(body).getByRole('button', { name: 'Retry' })).toBeVisible()
