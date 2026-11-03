@@ -8,7 +8,7 @@ import { collectPaneEntries } from '@/lib/pane-utils'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
-import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
+import { freshAgentPaneMatchesMaterializedSession, materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting, applyFreshAgentQuestionAvailable, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
@@ -256,8 +256,7 @@ export function handleFreshAgentMessage(
           && Object.values(getState().panes?.layouts ?? {}).some((layout) => collectPaneEntries(layout).some(({ content }) => {
             if (content.kind !== 'fresh-agent' || content.provider !== materialized.provider
               || content.sessionType !== materialized.sessionType) return false
-            const matches = [content.sessionId, content.resumeSessionId, content.sessionRef?.sessionId]
-              .some((id) => id === materialized.previousSessionId)
+            const matches = freshAgentPaneMatchesMaterializedSession(content, materialized)
             const previousNative = content.sessionRef?.provider === 'codex'
               ? content.sessionRef.sessionId
               : (content.resumeSessionId ?? content.sessionId)

@@ -193,6 +193,51 @@ describe('fresh-agent-ws', () => {
     ])
   })
 
+  it('keeps Codex presentations distinct when a native resume is replayed to every client', () => {
+    const makeStore = (includeNative: boolean) => {
+      const store = configureStore({
+        reducer: {
+          freshAgent: freshAgentReducer,
+          freshAgentLive: freshAgentLiveReducer,
+          panes: panesReducer,
+        },
+      })
+      for (const [id, native] of [['managed', 'native-b'], ...(includeNative ? [['native-b', 'native-b']] : [])]) {
+        store.dispatch(initLayout({ tabId: id, paneId: id, content: {
+          kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex', sessionId: id,
+          sessionRef: { provider: 'codex', sessionId: native }, createRequestId: `create-${id}`,
+          status: 'running',
+        } }))
+        store.dispatch(sessionCreated({ provider: 'codex', sessionType: 'freshcodex', requestId: `create-${id}`, sessionId: id }))
+      }
+      return store
+    }
+    const clients = [makeStore(true), makeStore(false)]
+    for (const store of clients) {
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.session.materialized', provider: 'codex', sessionType: 'freshcodex',
+        previousSessionId: 'native-b', sessionId: 'native-b',
+        sessionRef: { provider: 'codex', sessionId: 'native-b' },
+      })
+      for (const sessionId of ['managed', 'native-b']) {
+        handleFreshAgentMessage(store.dispatch, {
+          type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex', sessionId,
+          event: { type: 'freshAgent.error', sessionId, code: `ERROR-${sessionId}`, message: `for ${sessionId}` },
+        })
+      }
+      const managed = store.getState().panes.layouts.managed
+      if (managed.type !== 'leaf') throw new Error('expected a managed pane')
+      expect(managed.content).toMatchObject({ sessionId: 'managed', sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+      expect(store.getState().freshAgent.sessions['freshcodex:codex:managed']).toMatchObject({ lastError: 'for managed' })
+      if (store.getState().panes.layouts['native-b']) {
+        const native = store.getState().panes.layouts['native-b']
+        if (native.type !== 'leaf') throw new Error('expected a native pane')
+        expect(native.content).toMatchObject({ sessionId: 'native-b', sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+        expect(store.getState().freshAgent.sessions['freshcodex:codex:native-b']).toMatchObject({ lastError: 'for native-b' })
+      }
+    }
+  })
+
   it('a continuation follows its authoritative child name instead of the original spent handle', () => {
     const store = createFreshAgentPaneStore()
     store.dispatch(initLayout({

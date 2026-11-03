@@ -758,12 +758,21 @@ function clearManagedRuntimeProjection(
   content.recoverySummary = undefined
 }
 
-function freshAgentPaneMatchesMaterializedSession(
+export function freshAgentPaneMatchesMaterializedSession(
   content: FreshAgentPaneContent,
-  materialized: FreshAgentSessionMaterializedPayload,
+  materialized: Pick<FreshAgentSessionMaterializedPayload, 'provider' | 'sessionType' | 'sessionId' | 'previousSessionId'>,
 ): boolean {
   if (content.sessionType !== materialized.sessionType || content.provider !== materialized.provider) {
     return false
+  }
+
+  // Same-ID Codex announcements address one presentation, even when other
+  // panes reference the same native conversation. An unbound pane can still
+  // match by its saved resume identity.
+  if (materialized.provider === 'codex'
+    && materialized.previousSessionId === materialized.sessionId
+    && content.sessionId) {
+    return content.sessionId === materialized.sessionId
   }
 
   return [
