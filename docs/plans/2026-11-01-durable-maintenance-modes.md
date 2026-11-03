@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Implement the three managed-runtime update modes: default updates the web/client without restarting the durable supervisor or resetting managed coding sessions; `--all` updates the web/client and durable runtime; `--durable-only` updates durable components while leaving the web/client unchanged. Fix the pre-existing managed-provider qualification compile failure so tests can run. Add deployment verification so the server refuses to start with managed runtime enabled when its binary lacks `managed-runtime-v1`, supported deployment paths cannot install such a binary, and an updater verifies authenticated runtime readiness connected to the intended supervisor before reporting success. Prove through ordinary UI creation paths that supported terminal and Fresh Agent agents receive managed runtime identities and remain attached to the same managed sessions across a web-only update. Detect and report open panes whose agents still run outside durable souls, preserving their work.
+Implement the three managed-runtime update modes: default updates the web/client without restarting the durable supervisor or resetting managed coding sessions; `--all` updates the web/client and durable runtime; `--durable-only` updates durable components while leaving the web/client unchanged. Fix the pre-existing managed-provider qualification compile failure so tests can run. Add deployment verification so the server refuses to start with managed runtime enabled when its binary lacks `managed-runtime-v1`, supported deployment paths cannot install such a binary, and an updater verifies authenticated runtime readiness connected to the intended supervisor before reporting success. Prove through ordinary UI creation paths that supported terminal and Fresh Agent agents receive managed runtime identities and remain attached to the same managed sessions across a web-only update. Detect and report open panes whose agents still run outside durable souls, preserving their work. Review the complete change against current local `main`, and fix substantiated issues that could plausibly degrade user experience within the stated threat model.
 
 ### Explicit constraints
 - Require the user to say “APPROVED” verbatim before either reset-capable mode, based on the mode/action category and without compatibility analysis.
@@ -22,11 +22,14 @@ Implement the three managed-runtime update modes: default updates the web/client
 - Detect and report open panes whose agents are still host-managed outside durable souls. Preserve their running work; any migration that can interrupt them must be a separate deliberate operation.
 - Use the-usual workflow. Fix the pre-existing baseline compile failure in the dedicated worktree before continuing implementation.
 - Do not deploy or restart live production services as part of this code change.
+- Do not use the Fresheyes workflow for the final review. Use up to three independent GPT helper reviewers, with complete changed-file coverage, then report findings before applying fixes.
+- Keep scope to user-experience regressions within the threat model; discard findings outside it and remove unnecessary overbuilding.
 
 ### Accepted tradeoffs and residuals
 - An approved update may interrupt active coding sessions; saved history remains and reopening is attempted, but recovery is not guaranteed. Manually reopening or porting sessions afterward is acceptable if needed.
 - Do not require a particular session-transition mechanism for approved resets beyond attempting reopen; manual session porting afterward is acceptable.
 - Existing host-managed agents may remain outside durable-soul protection until a separate deliberate migration is authorized; preserve their running work during this task.
+- The final review compares current local `main` to the rebased feature `HEAD`; the recorded original `base_ref` remains unchanged as provenance.
 
 ## Deployment and host-pane safety decisions
 
