@@ -95,6 +95,10 @@ async fn send_case_for_provider(
                     "unpublished-refusal" => Some(serde_json::json!({
                         "outcome":"refused"
                     })),
+                    "blocked-new-refusal" => Some(serde_json::json!({
+                        "outcome":"refused",
+                        "message":"The hosted session is blocked during recovery (STORE_UNREADABLE); this message was not sent."
+                    })),
                     _ => None,
                 };
                 if let Some(diagnostic) = diagnostic {
@@ -188,6 +192,164 @@ async fn hosted_send_preserves_published_provider_diagnostic_before_journal_repl
         assert_eq!(frame["requestId"], "initiating-pane-request");
         assert_eq!(frame["message"], expected);
     }
+}
+
+#[tokio::test]
+async fn hosted_codex_send_preserves_typed_recovery_refusal() {
+    let frame = send_case("blocked-new-refusal", Some("blocked-codex-send")).await;
+    assert_eq!(frame["type"], "error", "{frame}");
+    assert_eq!(frame["requestId"], "blocked-codex-send");
+    assert!(frame["message"]
+        .as_str()
+        .unwrap()
+        .contains("STORE_UNREADABLE"));
+    assert!(!frame["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("CODEX_DELIVERY_AMBIGUOUS:"));
+}
+
+#[tokio::test]
+async fn hosted_blocked_send_distinguishes_new_from_queued_input() {
+    use super::readiness_tests::readiness_fixture;
+    use freshell_runtime_protocol::RecoveryBlockReason;
+    use rusqlite::OptionalExtension;
+    use std::sync::atomic::Ordering;
+
+    for queued in [false, true] {
+        let fixture = readiness_fixture().await;
+        fixture.ready.store(true, Ordering::SeqCst);
+        let request = RequestId::parse(if queued {
+            "blocked-queued"
+        } else {
+            "blocked-new"
+        })
+        .unwrap();
+        if queued {
+            fixture
+                .registry
+                .begin_input(
+                    fixture.soul.clone(),
+                    request.clone(),
+                    b"one original browser input",
+                    Some(b"null"),
+                )
+                .await
+                .unwrap();
+        }
+        let context = fixture
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap();
+        fixture
+            .registry
+            .mark_recovery_blocked(
+                fixture.soul.clone(),
+                None,
+                RecoveryBlockReason::StoreUnreadable,
+                Vec::new(),
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        let (proxy, mut frames) = configure_proxy(
+            &fixture.control_socket,
+            HashMap::from([(
+                ("claude".into(), "owned-public-parent".into()),
+                fixture.soul.clone(),
+            )]),
+        );
+        proxy.dispatch_send(serde_json::from_value(serde_json::json!({
+            "provider":"claude", "sessionId":"owned-public-parent", "sessionType":"freshclaude",
+            "requestId":request.as_str(), "text":"one original browser input"
+        })).unwrap()).await;
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        if queued {
+            assert_eq!(
+                frame["event"]["type"], "freshAgent.send.uncertain",
+                "{frame}"
+            );
+            assert_eq!(frame["event"]["requestId"], request.as_str());
+        } else {
+            assert_eq!(frame["type"], "error", "{frame}");
+            assert_eq!(frame["requestId"], request.as_str());
+            assert!(
+                frame["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("STORE_UNREADABLE"),
+                "{frame}"
+            );
+        }
+        assert!(
+            fixture.sent_roots.lock().unwrap().is_empty(),
+            "a blocked send must not reach the host"
+        );
+        let database =
+            rusqlite::Connection::open(fixture.root.path().join("registry/runtime.sqlite3"))
+                .unwrap();
+        let state: Option<String> = database
+            .query_row(
+                "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                rusqlite::params![fixture.soul.as_str(), request.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(state.as_deref(), if queued { Some("queued") } else { None });
+    }
+}
+
+#[tokio::test]
+async fn hosted_unknown_soul_after_host_dispatch_remains_uncertain() {
+    use super::readiness_tests::readiness_fixture;
+    use std::sync::atomic::Ordering;
+    let fixture = readiness_fixture().await;
+    fixture.ready.store(true, Ordering::SeqCst);
+    *fixture.send_failure.lock().unwrap() = Some(RuntimeError::new(
+        RuntimeErrorCode::UnknownSoul,
+        "the reply followed a possibly accepted input",
+    ));
+    let (proxy, mut frames) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(
+            ("claude".into(), "owned-public-parent".into()),
+            fixture.soul.clone(),
+        )]),
+    );
+    proxy
+        .dispatch_send(
+            serde_json::from_value(serde_json::json!({
+                "provider":"claude", "sessionId":"owned-public-parent", "sessionType":"freshclaude",
+                "requestId":"unknown-after-dispatch", "text":"one original browser input"
+            }))
+            .unwrap(),
+        )
+        .await;
+    let frame: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        frame["event"]["type"], "freshAgent.send.uncertain",
+        "{frame}"
+    );
+    assert_eq!(frame["event"]["requestId"], "unknown-after-dispatch");
+    assert_eq!(
+        fixture.sent_roots.lock().unwrap().len(),
+        1,
+        "the host saw the input"
+    );
 }
 
 #[tokio::test]

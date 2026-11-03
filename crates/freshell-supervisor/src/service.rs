@@ -14559,3 +14559,7 @@ mod control_connection_tests {
 #[cfg(test)]
 #[path = "native_clear_service_tests.rs"]
 mod native_clear_service_tests;
+
+#[cfg(test)]
+#[path = "fresh_agent_blocked_send_tests.rs"]
+mod fresh_agent_blocked_send_tests;
