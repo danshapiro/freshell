@@ -174,9 +174,17 @@ pub(crate) const GENERATION_RETRY_1_MS: i64 = 30_000;
 pub(crate) const GENERATION_RETRY_2_MS: i64 = 300_000;
 /// Task 3: a desired canonical revision gets at most three native cycles.
 pub(crate) const MAX_NATIVE_CYCLES: u32 = 3;
-/// Task 3: each desired revision permits at most three writes and six reads
-/// (one pre-reconciliation read + one write + one confirming read per cycle).
+/// Task 3: each desired revision permits at most three write cycles. Up to
+/// six actual native reads are allowed per lifecycle-contention retry window;
+/// a due durable cooldown starts a fresh read window without replenishing the
+/// write-cycle allowance.
 pub(crate) const MAX_NATIVE_READS: u32 = 6;
+/// Lifecycle-lock refusals get a short bounded retry window before moving to
+/// a durable cooldown. The window resets only when its scheduled retry is
+/// claimed, so restarting the worker cannot turn contention into a hot loop.
+pub(crate) const MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS: u32 = 6;
+const NATIVE_LIFECYCLE_BUSY_RETRY_BASE_MS: i64 = 1_000;
+pub(crate) const NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS: i64 = 60_000;
 /// Task 3: cycle 2 becomes ready at least this long after a cycle-1 failure.
 const NATIVE_CYCLE_RETRY_1_MS: i64 = 5_000;
 /// Task 3: cycle 3 becomes ready at least this long after a cycle-2 failure.
@@ -302,6 +310,13 @@ struct NativeWriteState {
     cycles_consumed: u32,
     #[serde(default)]
     reads_consumed: u32,
+    /// Number of pre-dispatch lifecycle-lock refusals in this desired series.
+    #[serde(default)]
+    lifecycle_busy_deferrals: u32,
+    /// A provider write was acknowledged but still needs a current-location
+    /// readback. Later claims carrying this receipt are read-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmation_pending_receipt: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attempted_receipts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1272,7 +1287,10 @@ impl SessionNames {
         let now = effective_now_ms(&self.core.data_dir);
         let mut items = Vec::new();
         for (key, state) in &document.native_write {
-            if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
+            if state.settled
+                || (state.cycles_consumed >= MAX_NATIVE_CYCLES
+                    && state.confirmation_pending_receipt.is_none())
+            {
                 continue;
             }
             if state.status == NativeSyncStatus::Synced
@@ -1318,6 +1336,8 @@ impl SessionNames {
                     .unwrap_or_else(|| record.name.clone()),
                 desired_source: state.desired_source.unwrap_or(record.source),
                 cycles_consumed: state.cycles_consumed,
+                series_epoch: state.series_epoch.unwrap_or(record.revision),
+                lifecycle_busy_deferrals: state.lifecycle_busy_deferrals,
                 next_due: state.next_due,
             });
         }
@@ -1335,7 +1355,10 @@ impl SessionNames {
         let document = &view.document;
         let mut refs = Vec::new();
         for (key, state) in &document.native_write {
-            if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
+            if state.settled
+                || (state.cycles_consumed >= MAX_NATIVE_CYCLES
+                    && state.confirmation_pending_receipt.is_none())
+            {
                 continue;
             }
             if state.status == NativeSyncStatus::Synced
@@ -1382,18 +1405,81 @@ impl SessionNames {
         }))
     }
 
-    /// Task 3: charge one read against the six-per-revision allowance,
-    /// persisted before the read dispatch, carrying the dispatching series'
-    /// epoch. `false` = the allowance is exhausted (or the series was
-    /// superseded) and the read must not run.
-    pub(crate) fn charge_native_read(
+    /// Claim only the exact due item whose route was just capability-probed.
+    /// A rename, route change, or intervening cycle makes the queued snapshot
+    /// stale and consumes nothing; the next worker pass must probe fresh work.
+    pub(crate) fn claim_native_cycle_for_item(
         &self,
-        target: SessionNameRef,
-        series_epoch: NameRevision,
+        item: crate::session_name_native::NativeWorkItem,
+        receipt_id: String,
+    ) -> NameFuture<Option<crate::session_name_native::NativeCycleClaim>> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, meta| {
+            if !native_work_item_matches(doc, &item) {
+                return Ok(Decision::Read(None));
+            }
+            claim_native_cycle_decision(doc, meta, &item.target, &receipt_id)
+        }))
+    }
+
+    /// Recheck a claim after an awaited native read and immediately before a
+    /// write dispatch. This fences changes that completed during the read.
+    /// The check and the following provider dispatch are not one atomic
+    /// cross-process operation; an already-dispatched request can still land
+    /// late if its provider call times out.
+    pub(crate) fn native_claim_is_current(
+        &self,
+        claim: crate::session_name_native::NativeCycleClaim,
     ) -> NameFuture<bool> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, _meta| {
-            charge_native_read_decision(doc, &target, series_epoch)
+            Ok(Decision::Read(native_claim_is_current(doc, &claim)))
+        }))
+    }
+
+    /// Charge one read against the six-per-window allowance, persisted before
+    /// dispatch. The full claim identity is checked so a stale route or
+    /// pre-bind claim cannot spend the surviving series' allowance. `false`
+    /// means the claim is stale or the allowance is exhausted.
+    pub(crate) fn charge_native_read(
+        &self,
+        claim: crate::session_name_native::NativeCycleClaim,
+    ) -> NameFuture<bool> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, _meta| {
+            charge_native_read_decision(doc, &claim)
+        }))
+    }
+
+    /// A supervisor lifecycle-lock refusal happened before provider/native
+    /// dispatch. Release only the exact current claim, optionally refunding
+    /// its cycle/read charge according to which earlier operations actually
+    /// ran. The deferral count and cooldown are durable; the three-cycle
+    /// write limit remains per desired revision, while reads use a bounded
+    /// window that restarts only after the lifecycle cooldown becomes due.
+    pub(crate) fn defer_native_lifecycle_busy(
+        &self,
+        claim: crate::session_name_native::NativeCycleClaim,
+        refund_cycle: bool,
+        refund_read: bool,
+    ) -> NameFuture<crate::session_name_native::NativeLifecycleDeferralResult> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, meta| {
+            defer_native_lifecycle_busy_decision(doc, meta, &claim, refund_cycle, refund_read)
+        }))
+    }
+
+    /// Record a typed lifecycle refusal from a route probe without reserving
+    /// a provider cycle. The snapshot identity, cooldown window, and due time
+    /// are revalidated atomically so a stale probe cannot affect successor
+    /// work, and process death cannot strand a claimed cycle before a refund.
+    pub(crate) fn defer_native_lifecycle_busy_for_item(
+        &self,
+        item: crate::session_name_native::NativeWorkItem,
+    ) -> NameFuture<crate::session_name_native::NativeLifecycleDeferralResult> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, meta| {
+            defer_native_lifecycle_busy_item_decision(doc, meta, &item)
         }))
     }
 
@@ -1406,21 +1492,12 @@ impl SessionNames {
     /// status-only frame (`changed: false`).
     pub(crate) fn fold_native_outcome(
         &self,
-        target: SessionNameRef,
-        attempted_location_revision: NameRevision,
-        series_epoch: NameRevision,
+        claim: crate::session_name_native::NativeCycleClaim,
         outcome: crate::session_name_native::NativeOutcomeFold,
     ) -> NameFuture<SessionNameUpdate> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, meta| {
-            fold_native_outcome_decision(
-                doc,
-                meta,
-                &target,
-                attempted_location_revision,
-                series_epoch,
-                outcome,
-            )
+            fold_native_outcome_decision(doc, meta, &claim, outcome)
         }))
     }
 }
@@ -2698,6 +2775,8 @@ fn reset_native_series(document: &mut StoredDocument, key: &str, record: &Sessio
     entry.next_due = None;
     entry.cycles_consumed = 0;
     entry.reads_consumed = 0;
+    entry.lifecycle_busy_deferrals = 0;
+    entry.confirmation_pending_receipt = None;
     entry.receipt_id = None;
     entry.unsynced_reason = None;
 }
@@ -2726,6 +2805,57 @@ fn apply_verified_location(
                 location_revision: existing.location_revision + 1,
             });
             true
+        }
+    }
+}
+
+/// Invalidate route-specific observations and confirmation state after the
+/// verified route changes. A settled series is rearmed when its cycle and
+/// read budgets allow useful work, or when a pending lifecycle cooldown will
+/// reset the read window on its due claim. Counters and retry time remain
+/// untouched here.
+fn rearm_native_after_verified_route_change(document: &mut StoredDocument, key: &str) {
+    let record_revision = document
+        .record_at(key)
+        .map(|record| record.revision)
+        .expect("the record exists");
+    if let Some(state) = document.native_write.get_mut(key) {
+        let current_series = state.desired_revision == Some(record_revision);
+        if !current_series {
+            return;
+        }
+
+        // An acknowledged write or readback at the old route cannot confirm
+        // the newly acquired route.
+        state.confirmation_pending_receipt = None;
+        state.observed_current = None;
+
+        let usable_reconciliation_budget =
+            state.cycles_consumed < MAX_NATIVE_CYCLES && state.reads_consumed < MAX_NATIVE_READS;
+        let lifecycle_cooldown_can_resume = state.cycles_consumed < MAX_NATIVE_CYCLES
+            && state.lifecycle_busy_deferrals >= MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS
+            && state.next_due.is_some();
+        let reconciliation_can_resume =
+            usable_reconciliation_budget || lifecycle_cooldown_can_resume;
+        if state.status == NativeSyncStatus::Synced {
+            state.status = NativeSyncStatus::Unsynced;
+            state.unsynced_reason = Some(
+                "native route changed; the previous title confirmation is no longer current"
+                    .to_string(),
+            );
+        }
+
+        if reconciliation_can_resume
+            && (state.status == NativeSyncStatus::Unsupported || state.settled)
+        {
+            state.status = NativeSyncStatus::Unsynced;
+            state.settled = false;
+            state.unsynced_reason =
+                Some("native route reacquired; remaining cycles re-armed".to_string());
+        } else if !reconciliation_can_resume {
+            // No further claim can perform a read and a write safely. Keep
+            // the new route visibly unsynced without exposing useless work.
+            state.settled = true;
         }
     }
 }
@@ -2770,25 +2900,71 @@ fn union_generation_state(document: &mut StoredDocument, from_key: &str, to_key:
     }
 }
 
-/// Transfer native-write state on bind: consumed cycles and read allowance
-/// move conservatively — the summed counts CAP at the per-revision
-/// allowances (the persisted counters never read past three cycles / six
-/// reads) — the desired revision rebases to the bound record (binding is
-/// not a new name decision, so the series EPOCH transfers with the series),
-/// and original receipts are retained.
+/// Transfer native-write state on bind: consumed cycles, read allowance,
+/// lifecycle deferrals, and retry time move conservatively; summed counters
+/// cap at their per-revision allowances. The desired revision rebases to the
+/// bound record (binding is not a new name decision, so the series EPOCH
+/// transfers with the series), and original receipts are retained. The
+/// returned receipt context lets bind keep confirmation-only state only when
+/// both the verified route and the desired title still match.
+struct NativeConfirmationTransfer {
+    receipt: String,
+    attempted_location: Option<NativeLocation>,
+    attempted_location_revision: Option<NameRevision>,
+    source_route: Option<(NativeLocation, NameRevision)>,
+    desired_name: Option<String>,
+}
+
+fn native_confirmation_transfer(
+    state: &NativeWriteState,
+    source_route: Option<(NativeLocation, NameRevision)>,
+) -> Option<NativeConfirmationTransfer> {
+    state
+        .confirmation_pending_receipt
+        .as_ref()
+        .map(|receipt| NativeConfirmationTransfer {
+            receipt: receipt.clone(),
+            attempted_location: state.attempted_location.clone(),
+            attempted_location_revision: state.attempted_location_revision,
+            source_route,
+            desired_name: state.desired_name.clone(),
+        })
+}
+
 fn transfer_native_write(
     document: &mut StoredDocument,
     from_key: &str,
     to_key: &str,
     record: &SessionNameRecord,
-) {
+    pending_route: Option<(NativeLocation, NameRevision)>,
+    durable_route: Option<(NativeLocation, NameRevision)>,
+) -> Option<NativeConfirmationTransfer> {
+    let mut retained_confirmation = None;
     if let Some(mut pending_state) = document.native_write.remove(from_key) {
+        let pending_confirmation_route =
+            native_confirmation_transfer(&pending_state, pending_route.clone());
         match document.native_write.get_mut(to_key) {
             Some(durable) => {
                 durable.cycles_consumed = (durable.cycles_consumed + pending_state.cycles_consumed)
                     .min(MAX_NATIVE_CYCLES);
                 durable.reads_consumed =
                     (durable.reads_consumed + pending_state.reads_consumed).min(MAX_NATIVE_READS);
+                durable.lifecycle_busy_deferrals = (durable.lifecycle_busy_deferrals
+                    + pending_state.lifecycle_busy_deferrals)
+                    .min(MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS);
+                durable.next_due = match (durable.next_due, pending_state.next_due) {
+                    (Some(durable_due), Some(pending_due)) => Some(durable_due.max(pending_due)),
+                    (Some(due), None) | (None, Some(due)) => Some(due),
+                    (None, None) => None,
+                };
+                if durable.confirmation_pending_receipt.is_none() {
+                    durable.confirmation_pending_receipt =
+                        pending_state.confirmation_pending_receipt.clone();
+                    retained_confirmation = pending_confirmation_route;
+                } else {
+                    retained_confirmation =
+                        native_confirmation_transfer(durable, durable_route.clone());
+                }
                 for receipt in pending_state.attempted_receipts {
                     if !durable.attempted_receipts.contains(&receipt) {
                         durable.attempted_receipts.push(receipt);
@@ -2807,6 +2983,7 @@ fn transfer_native_write(
                 pending_state.desired_revision = Some(record.revision);
                 pending_state.desired_name = Some(record.name.clone());
                 pending_state.desired_source = Some(record.source);
+                retained_confirmation = pending_confirmation_route;
                 document
                     .native_write
                     .insert(to_key.to_string(), pending_state);
@@ -2818,6 +2995,13 @@ fn transfer_native_write(
         state.desired_name = Some(record.name.clone());
         state.desired_source = Some(record.source);
     }
+    if retained_confirmation.is_none() {
+        retained_confirmation = document
+            .native_write
+            .get(to_key)
+            .and_then(|state| native_confirmation_transfer(state, durable_route));
+    }
+    retained_confirmation
 }
 
 /// Move pending-key location evidence onto the bound record (keeping any
@@ -3029,6 +3213,11 @@ fn bind_pending_decision(
 
     let pending_key = name_ref_key(&pending);
     let target_key = name_ref_key(&target);
+    // Keep each identity's route stamp before moving pending evidence. These
+    // source stamps validate the acknowledged receipt; the acquisition below
+    // supplies the target route that can inherit it.
+    let pending_route_before_bind = native_route_of(document, &pending_key);
+    let target_route_before_bind = native_route_of(document, &target_key);
 
     // Already bound: idempotent for the same target, a conflict otherwise.
     if let Some(existing) = document.redirects.get(&pending_key).cloned() {
@@ -3115,8 +3304,70 @@ fn bind_pending_decision(
     // Internal state transfers (never user-visible wire fields).
     move_location_evidence(document, &pending_key, &target_key);
     union_generation_state(document, &pending_key, &target_key, meta.now_ms);
-    transfer_native_write(document, &pending_key, &target_key, &record);
-    apply_verified_location(document, &target_key, acquisition.location);
+    let confirmation = transfer_native_write(
+        document,
+        &pending_key,
+        &target_key,
+        &record,
+        pending_route_before_bind,
+        target_route_before_bind,
+    );
+    let route_changed = apply_verified_location(document, &target_key, acquisition.location);
+    if route_changed {
+        rearm_native_after_verified_route_change(document, &target_key);
+    }
+    if let Some(confirmation) = confirmation {
+        let target_route = native_route_of(document, &target_key);
+        let attempted_route = confirmation
+            .attempted_location
+            .clone()
+            .zip(confirmation.attempted_location_revision);
+        let source_route_is_current = confirmation.source_route == attempted_route;
+        let target_location_matches = target_route.as_ref().is_some_and(|(location, _)| {
+            confirmation.attempted_location.as_ref() == Some(location)
+        });
+        let winning_title_matches =
+            confirmation.desired_name.as_deref() == Some(record.name.as_str());
+        if source_route_is_current && target_location_matches && winning_title_matches {
+            if let (Some(state), Some((location, location_revision))) =
+                (document.native_write.get_mut(&target_key), target_route)
+            {
+                // Route revisions are scoped to a name-ref key. Once the
+                // exact source route and title have been validated, carry the
+                // acknowledgement to the acquired destination route and
+                // stamp its revision. The next claim remains fenced as
+                // read-only confirmation.
+                state.confirmation_pending_receipt = Some(confirmation.receipt);
+                state.attempted_location = Some(location);
+                state.attempted_location_revision = Some(location_revision);
+                state.status = NativeSyncStatus::Unsynced;
+                state.observed_current = None;
+                state.settled = false;
+            }
+        } else if let Some(state) = document.native_write.get_mut(&target_key) {
+            if state.confirmation_pending_receipt.as_deref() == Some(confirmation.receipt.as_str())
+            {
+                // A stale source route, a different acquired location, or a
+                // losing title cannot authorize confirmation on the winner.
+                // Keep the receipt in attemptedReceipts as provenance.
+                state.confirmation_pending_receipt = None;
+                if target_location_matches && !winning_title_matches {
+                    state.status = NativeSyncStatus::Unsynced;
+                    state.observed_current = None;
+                    state.unsynced_reason = Some(
+                        "native title changed during pending-session bind; reconciling bound title"
+                            .to_string(),
+                    );
+                    let reconciliation_budget_remaining = state.cycles_consumed < MAX_NATIVE_CYCLES
+                        && state.reads_consumed < MAX_NATIVE_READS;
+                    state.settled = !reconciliation_budget_remaining;
+                    if state.settled {
+                        state.next_due = None;
+                    }
+                }
+            }
+        }
+    }
 
     // Task 4 — the explicit-open hook: a pending handle exists only through
     // an explicit create/open/resume lane, so this bind IS the user opening
@@ -3501,24 +3752,7 @@ fn record_acquisition_decision(
             // replenished; a differing current-location observation governs
             // beyond this point.
             if changed {
-                let record_revision = document
-                    .record_at(&key)
-                    .map(|record| record.revision)
-                    .expect("the record exists");
-                if let Some(state) = document.native_write.get_mut(&key) {
-                    let current_series = state.desired_revision == Some(record_revision);
-                    let usable_cycles = state.cycles_consumed < MAX_NATIVE_CYCLES;
-                    if current_series
-                        && usable_cycles
-                        && (state.status == NativeSyncStatus::Unsupported
-                            || (state.settled && state.status != NativeSyncStatus::Unsupported))
-                    {
-                        state.status = NativeSyncStatus::Unsynced;
-                        state.settled = false;
-                        state.unsynced_reason =
-                            Some("native route reacquired; remaining cycles re-armed".to_string());
-                    }
-                }
+                rearm_native_after_verified_route_change(document, &key);
             }
             if changed {
                 Ok(commit_decision_publishing_status(document, &key))
@@ -3873,6 +4107,77 @@ fn native_route_of(document: &StoredDocument, key: &str) -> Option<(NativeLocati
     })
 }
 
+fn native_work_item_matches(
+    document: &StoredDocument,
+    item: &crate::session_name_native::NativeWorkItem,
+) -> bool {
+    let Ok((key, record)) = required_record(document, &item.target) else {
+        return false;
+    };
+    let Some(state) = document.native_write.get(&key) else {
+        return false;
+    };
+    let current_name = state
+        .desired_name
+        .as_deref()
+        .unwrap_or(record.name.as_str());
+    let current_source = state.desired_source.unwrap_or(record.source);
+    record.revision == item.desired_revision
+        && state.desired_revision == Some(item.desired_revision)
+        && current_name == item.desired_name
+        && current_source == item.desired_source
+        && state.cycles_consumed == item.cycles_consumed
+        && state.series_epoch.unwrap_or(item.desired_revision) == item.series_epoch
+        && state.lifecycle_busy_deferrals == item.lifecycle_busy_deferrals
+        && state.next_due == item.next_due
+        && native_route_of(document, &key).as_ref()
+            == Some(&(item.location.clone(), item.location_revision))
+}
+
+/// Full identity fence shared by late folds and pre-write rechecks. Numeric
+/// route revisions alone are insufficient: pending and durable identities
+/// can each have revision one, and distinct prospective routes both have
+/// revision zero. Busy deferrals apply the same identity checks plus their
+/// operation-specific refund requirements.
+fn native_claim_is_current(
+    document: &StoredDocument,
+    claim: &crate::session_name_native::NativeCycleClaim,
+) -> bool {
+    let Ok((key, record)) = required_record(document, &claim.target) else {
+        return false;
+    };
+    let Some(state) = document.native_write.get(&key) else {
+        return false;
+    };
+    let desired_name = state
+        .desired_name
+        .as_deref()
+        .unwrap_or(record.name.as_str());
+    let desired_source = state.desired_source.unwrap_or(record.source);
+    let confirmation_matches = if claim.confirmation_only {
+        state.confirmation_pending_receipt.as_deref() == claim.confirmation_receipt_id.as_deref()
+    } else {
+        state
+            .confirmation_pending_receipt
+            .as_deref()
+            .is_none_or(|receipt| receipt == claim.receipt_id)
+    };
+    record.revision == claim.desired_revision
+        && record.name == claim.title
+        && record.source == claim.source
+        && state.desired_revision == Some(claim.desired_revision)
+        && desired_name == claim.title
+        && desired_source == claim.source
+        && state.series_epoch == Some(claim.series_epoch)
+        && state.receipt_id.as_deref() == Some(claim.receipt_id.as_str())
+        && state.cycles_consumed == claim.cycle
+        && state.attempted_location.as_ref() == Some(&claim.location)
+        && state.attempted_location_revision == Some(claim.location_revision)
+        && native_route_of(document, &key).as_ref()
+            == Some(&(claim.location.clone(), claim.location_revision))
+        && confirmation_matches
+}
+
 /// The retry delay that makes the next remaining cycle eligible after the
 /// cycle-1/cycle-2 failure ("minimum five seconds after cycle 1 failure, then
 /// 30 seconds after cycle 2 failure"). These are eligibility delays, not
@@ -3894,7 +4199,8 @@ fn native_series_claimable(
     now: i64,
 ) -> Option<(SessionNameRecord, NameSource)> {
     let state = document.native_write.get(key)?;
-    if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
+    let confirmation_pending = state.confirmation_pending_receipt.is_some();
+    if state.settled || (state.cycles_consumed >= MAX_NATIVE_CYCLES && !confirmation_pending) {
         return None;
     }
     if state.status == NativeSyncStatus::Synced || state.status == NativeSyncStatus::Unsupported {
@@ -3931,25 +4237,42 @@ fn claim_native_cycle_decision(
     // revision, attempted location/locationRevision, title, source, and the
     // unique own-write receipt. A restart discovering this interrupted cycle
     // consumes it exactly once.
-    {
+    let (cycle, cycle_charged, confirmation_receipt_id) = {
         let entry = document
             .native_write
             .get_mut(&key)
             .expect("claimable series exists");
+        // A due claim after the lifecycle-busy cooldown begins a fresh
+        // bounded retry window. Keep the exhausted count visible throughout
+        // the cooldown itself, including across worker restarts.
+        begin_native_lifecycle_busy_window(entry);
         // Backfill a legacy series' epoch (documents written before the
         // stamp existed): the claimable series' desired revision IS its
         // arming revision.
         if entry.series_epoch.is_none() {
             entry.series_epoch = Some(record.revision);
         }
-        entry.cycles_consumed += 1;
+        let confirmation_receipt_id = entry.confirmation_pending_receipt.clone();
+        let cycle_charged = entry.cycles_consumed < MAX_NATIVE_CYCLES;
+        if cycle_charged {
+            entry.cycles_consumed += 1;
+        }
         entry.receipt_id = Some(receipt_id.to_string());
-        if !entry.attempted_receipts.contains(&receipt_id.to_string()) {
+        // A confirmation-only claim is a read reservation, not a new native
+        // write receipt. The acknowledged receipt remains separately pinned.
+        if confirmation_receipt_id.is_none()
+            && !entry.attempted_receipts.contains(&receipt_id.to_string())
+        {
             entry.attempted_receipts.push(receipt_id.to_string());
         }
         entry.attempted_location = Some(location.clone());
         entry.attempted_location_revision = Some(location_revision);
-    }
+        (
+            entry.cycles_consumed,
+            cycle_charged,
+            confirmation_receipt_id,
+        )
+    };
     // The persisted alternating class cursor: this claim served native.
     document.scheduling_cursor.last_class = Some("native".to_string());
     let series_epoch = document
@@ -3967,11 +4290,10 @@ fn claim_native_cycle_decision(
         title: record.name.clone(),
         source,
         receipt_id: receipt_id.to_string(),
-        cycle: document
-            .native_write
-            .get(&key)
-            .expect("the series exists")
-            .cycles_consumed,
+        cycle,
+        confirmation_only: confirmation_receipt_id.is_some(),
+        confirmation_receipt_id,
+        cycle_charged,
     };
     // Bookkeeping-only generation (the in-flight receipt): publishes nothing.
     let _value = update_after_commit(document, &key, false, RedirectScope::ToRecord)
@@ -3984,24 +4306,18 @@ fn claim_native_cycle_decision(
 
 fn charge_native_read_decision(
     document: &mut StoredDocument,
-    target: &SessionNameRef,
-    series_epoch: NameRevision,
+    claim: &crate::session_name_native::NativeCycleClaim,
 ) -> Result<Decision<bool>, NameError> {
-    let (key, record) = required_record(document, target)?;
+    let (key, _) = required_record(document, &claim.target)?;
+    if !native_claim_is_current(document, claim) {
+        return Ok(Decision::Read(false));
+    }
     let Some(state) = document.native_write.get_mut(&key) else {
         return Ok(Decision::Read(false));
     };
-    // Only the CURRENT series' reads charge the allowance — a superseded
-    // series' late operations are provenance, never budget. The desired-
-    // revision guard catches a series superseded by a newer record revision;
-    // the EPOCH guard catches a series superseded by a newer name decision on
-    // the same record.
-    if state.desired_revision != Some(record.revision) {
-        return Ok(Decision::Read(false));
-    }
-    if state.series_epoch != Some(series_epoch) {
-        return Ok(Decision::Read(false));
-    }
+    // The claim fence above includes the desired revision, series epoch,
+    // receipt, cycle and full route identity. A stale pre-bind or old-route
+    // read must not consume the surviving series' allowance.
     if state.reads_consumed >= MAX_NATIVE_READS {
         return Ok(Decision::Read(false));
     }
@@ -4015,6 +4331,152 @@ fn charge_native_read_decision(
     })
 }
 
+fn native_lifecycle_busy_retry_delay_ms(deferrals: u32) -> i64 {
+    let exponent = deferrals.saturating_sub(1).min(3);
+    NATIVE_LIFECYCLE_BUSY_RETRY_BASE_MS * (1_i64 << exponent)
+}
+
+fn defer_native_lifecycle_busy_decision(
+    document: &mut StoredDocument,
+    meta: &TxnMeta,
+    claim: &crate::session_name_native::NativeCycleClaim,
+    refund_cycle: bool,
+    refund_read: bool,
+) -> Result<Decision<crate::session_name_native::NativeLifecycleDeferralResult>, NameError> {
+    use crate::session_name_native::NativeLifecycleDeferralResult as ResultKind;
+
+    let (key, _) = required_record(document, &claim.target)?;
+    let before = native_sync_projection(document, &key);
+    if !native_claim_is_current(document, claim) {
+        return Ok(Decision::Read(ResultKind::Stale));
+    }
+    let Some(state) = document.native_write.get_mut(&key) else {
+        return Ok(Decision::Read(ResultKind::Stale));
+    };
+
+    // Release only the reservation we created, against the exact desired
+    // series and current route. In particular, a stale result from an old
+    // name or moved location cannot alter the successor's budgets/backoff.
+    if (refund_read && state.reads_consumed == 0)
+        || (refund_cycle && claim.cycle_charged && state.cycles_consumed == 0)
+    {
+        return Ok(Decision::Read(ResultKind::Stale));
+    }
+
+    if refund_read {
+        state.reads_consumed -= 1;
+    }
+    if refund_cycle && claim.cycle_charged {
+        state.cycles_consumed -= 1;
+    }
+    if !claim.confirmation_only && refund_cycle {
+        // The receipt was reserved before the initial read, but this typed
+        // busy result proves no native write was admitted. Discard that
+        // provisional receipt with the released claim.
+        state
+            .attempted_receipts
+            .retain(|receipt| receipt != &claim.receipt_id);
+    }
+    state.receipt_id = None;
+    let result = record_native_lifecycle_busy(state, meta.now_ms);
+
+    let after = native_sync_projection(document, &key);
+    let publish = if before != after {
+        vec![PublishSpec {
+            key: key.clone(),
+            changed: false,
+            change: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(Decision::Write {
+        value: result,
+        publish,
+    })
+}
+
+fn defer_native_lifecycle_busy_item_decision(
+    document: &mut StoredDocument,
+    meta: &TxnMeta,
+    item: &crate::session_name_native::NativeWorkItem,
+) -> Result<Decision<crate::session_name_native::NativeLifecycleDeferralResult>, NameError> {
+    use crate::session_name_native::NativeLifecycleDeferralResult as ResultKind;
+
+    let (key, _) = required_record(document, &item.target)?;
+    if !native_work_item_matches(document, item)
+        || native_series_claimable(document, &key, meta.now_ms).is_none()
+    {
+        return Ok(Decision::Read(ResultKind::Stale));
+    }
+    let before = native_sync_projection(document, &key);
+    let Some(state) = document.native_write.get_mut(&key) else {
+        return Ok(Decision::Read(ResultKind::Stale));
+    };
+    // No cycle, read, receipt, or fairness cursor is reserved by a route
+    // probe. Its refusal and retry deadline are one atomic durable change.
+    let result = record_native_lifecycle_busy(state, meta.now_ms);
+    let after = native_sync_projection(document, &key);
+    let publish = if before != after {
+        vec![PublishSpec {
+            key: key.clone(),
+            changed: false,
+            change: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(Decision::Write {
+        value: result,
+        publish,
+    })
+}
+
+fn record_native_lifecycle_busy(
+    state: &mut NativeWriteState,
+    now_ms: i64,
+) -> crate::session_name_native::NativeLifecycleDeferralResult {
+    use crate::session_name_native::NativeLifecycleDeferralResult as ResultKind;
+
+    // The claim/probe is only made after nextDue. That due attempt starts a
+    // new durable window, resetting per-window refusal and physical-read
+    // counts together while leaving the global write-cycle/receipt state
+    // untouched.
+    begin_native_lifecycle_busy_window(state);
+    state.lifecycle_busy_deferrals = state.lifecycle_busy_deferrals.saturating_add(1);
+    let deferral_count = state.lifecycle_busy_deferrals;
+    if deferral_count >= MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS {
+        let retry_in_ms = NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS;
+        state.status = NativeSyncStatus::Unsynced;
+        state.unsynced_reason = Some(
+            "native name synchronization is waiting to retry after repeated lifecycle lock contention"
+                .to_string(),
+        );
+        state.settled = false;
+        state.next_due = Some(now_ms.saturating_add(retry_in_ms));
+        // An acknowledged write remains confirmation-only across the
+        // cooldown. Clearing its receipt here could cause a duplicate write.
+        ResultKind::CooldownScheduled {
+            deferral_count,
+            retry_in_ms,
+        }
+    } else {
+        let retry_in_ms = native_lifecycle_busy_retry_delay_ms(deferral_count);
+        state.next_due = Some(now_ms.saturating_add(retry_in_ms));
+        ResultKind::Deferred {
+            deferral_count,
+            retry_in_ms,
+        }
+    }
+}
+
+fn begin_native_lifecycle_busy_window(state: &mut NativeWriteState) {
+    if state.lifecycle_busy_deferrals >= MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS {
+        state.lifecycle_busy_deferrals = 0;
+        state.reads_consumed = 0;
+    }
+}
+
 /// The Task 3 outcome fold. Guards: an old acknowledgement (or read) can never
 /// synchronize a newer revision or a relocated target — the series'
 /// `desired_revision` must still be the accepted record's revision, the fold's
@@ -4026,40 +4488,23 @@ fn charge_native_read_decision(
 fn fold_native_outcome_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
-    target: &SessionNameRef,
-    attempted_location_revision: NameRevision,
-    series_epoch: NameRevision,
+    claim: &crate::session_name_native::NativeCycleClaim,
     outcome: crate::session_name_native::NativeOutcomeFold,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
     use crate::session_name_native::NativeOutcomeFold;
 
-    let (key, record) = required_record(document, target)?;
+    let (key, record) = required_record(document, &claim.target)?;
     let before = native_sync_projection(document, &key);
-    let verified_revision = document
-        .locations
-        .get(&key)
-        .and_then(|location| location.verified.as_ref())
-        .map(|verified| verified.location_revision);
-    let Some(state) = document.native_write.get_mut(&key) else {
-        // No series (or a pure observation-only entry): a stale late outcome.
-        return Ok(Decision::Read(read_update(document, &key)));
-    };
-    // Stale fold guards: a newer name decision superseded the series, or the
-    // target relocated since the attempt. Nothing changes — unknown old
-    // outcomes cannot change the saved winner.
-    let series_current =
-        state.desired_revision == Some(record.revision) && state.series_epoch == Some(series_epoch);
-    let location_current = match verified_revision {
-        Some(current) => attempted_location_revision == current,
-        // No verified route: the attempt targeted a prospective route that is
-        // still the series' attempted evidence.
-        None => state
-            .attempted_location_revision
-            .is_none_or(|attempted| attempted == attempted_location_revision),
-    };
-    if !series_current || !location_current {
+    if !native_claim_is_current(document, claim) {
+        // A late read/write result can only affect the exact claim that
+        // produced it. This includes the original desired revision, receipt,
+        // cycle and full route identity, not just numeric route revision.
         return Ok(Decision::Read(read_update(document, &key)));
     }
+    let state = document
+        .native_write
+        .get_mut(&key)
+        .expect("the exact native claim has a state");
 
     let now = meta.now_ms;
     let desired_name = state
@@ -4079,6 +4524,7 @@ fn fold_native_outcome_decision(
             // Exhaustion is FINAL for this revision.
             state.settled = true;
             state.next_due = None;
+            state.confirmation_pending_receipt = None;
         } else if let Some(delay) = native_retry_delay_ms(cycles_consumed) {
             state.next_due = Some(now + delay);
         }
@@ -4098,6 +4544,7 @@ fn fold_native_outcome_decision(
                         "ambiguous native write; matching readback observed but not proof an older external request cannot land"
                             .to_string(),
                     );
+                    state.confirmation_pending_receipt = None;
                 } else {
                     // A current-revision readback at the attempted target is
                     // the ONLY thing that establishes synchronization — of
@@ -4107,6 +4554,7 @@ fn fold_native_outcome_decision(
                     state.next_due = None;
                     state.unsynced_reason = None;
                     state.observed_current = Some(true);
+                    state.confirmation_pending_receipt = None;
                     if let Some(receipt) = receipt {
                         state.last_confirmed_receipt = Some(receipt);
                     }
@@ -4129,11 +4577,12 @@ fn fold_native_outcome_decision(
             // A confirmed ack clears ambiguity for THIS dispatch — the
             // confirming readback (folded as a `Read`) decides synchronization.
             state.ambiguous = false;
+            state.confirmation_pending_receipt = Some(receipt.clone());
             if !state.attempted_receipts.contains(&receipt) {
                 state.attempted_receipts.push(receipt);
             }
         }
-        NativeOutcomeFold::Undelivered { reason } => {
+        NativeOutcomeFold::Undelivered { reason } | NativeOutcomeFold::ReadFailure { reason } => {
             state.status = NativeSyncStatus::Unsynced;
             state.unsynced_reason = Some(reason);
             schedule_native_retry(state, now, exhausted, cycles_consumed);
@@ -4149,6 +4598,7 @@ fn fold_native_outcome_decision(
             state.unsynced_reason = Some(reason);
             state.settled = true;
             state.next_due = None;
+            state.confirmation_pending_receipt = None;
         }
     }
 
