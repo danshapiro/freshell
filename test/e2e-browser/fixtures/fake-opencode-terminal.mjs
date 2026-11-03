@@ -26,6 +26,16 @@
 // Both modes stay alive (`stdin.resume()`) so the pane's terminal status
 // remains 'running', matching a real interactive TUI rather than a one-shot
 // process the exit-surfacing path would treat as exited.
+//
+// Delta fix (auto-restore-warming finding 3) adds two faithful behaviors:
+//   - STARTUP STORE CHECK: if <data home>/opencode.db exists but is not a
+//     readable file (e.g. a DIRECTORY seeded by a spec — SQLite open fails
+//     on a directory for any euid), the fake mirrors the real CLI: it
+//     cannot open its session store, prints an error, and exits 1. A
+//     missing db is the normal fresh-machine shape and passes.
+//   - EXIT affordance: typing the literal line `exit` exits cleanly (0) —
+//     the natural "the CLI session ended" shape. No other spec types
+//     `exit`, so this is inert everywhere else.
 
 import fs from 'node:fs'
 import http from 'node:http'
@@ -262,6 +272,26 @@ startTitleServer()
 
 const resumeSessionId = argValue('--session')
 
+// Startup store check (delta fix, auto-restore-warming finding 3): the real
+// CLI cannot start when its session store cannot be opened — mirror that
+// honestly so a seeded unreadable store (a directory at opencode.db)
+// surfaces as a dead CLI, never a silently working one.
+{
+  const dbPath = path.join(opencodeDataHome(), 'opencode.db')
+  if (fs.existsSync(dbPath)) {
+    let isReadableFile = false
+    try {
+      isReadableFile = fs.statSync(dbPath).isFile()
+    } catch {
+      isReadableFile = false
+    }
+    if (!isReadableFile) {
+      process.stderr.write('opencode: cannot open session store (unreadable)\r\n')
+      process.exit(1)
+    }
+  }
+}
+
 if (resumeSessionId) {
   process.stdout.write(`opencode: resumed session ${resumeSessionId}\r\n`)
   process.stdin.resume()
@@ -290,6 +320,12 @@ if (resumeSessionId) {
   let sessionCreated = false
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', (chunk) => {
+    // Exit affordance (delta fix, auto-restore-warming finding 3): runs on
+    // EVERY chunk, before the first-submit handling below.
+    if (String(chunk).trim() === 'exit') {
+      process.stdout.write('opencode: bye\r\n')
+      process.exit(0)
+    }
     // Any input at all counts as "the first submit" for this fixture's
     // purposes -- the real locator arms only on Enter-shaped WS input, and
     // the pty's own cooked-mode line discipline already withholds bytes

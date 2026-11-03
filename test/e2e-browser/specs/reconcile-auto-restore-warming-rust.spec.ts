@@ -9,36 +9,34 @@
  * then fires at a known time. No page.click on "Retry now" anywhere in this
  * spec — the automatic recovery IS the assertion.
  *
- * PARKING MECHANICS (as the tree actually behaves, discovered in this
- * task's RED run): only a pane whose provider answers
- * SessionExistence::Unknown while cold parks as warming. Codex is the
- * deterministic park class (AD-4: no cold by-id locator); the shell pane
- * needs no index (folds fresh immediately) and a seeded claude transcript
- * would resolve Present via the EXISTING cold by-id locator. The park is
- * the SERVER's verdict (witnessed durably via the harness's received-WS
- * log: the pane.reconcile.result carrying error{index_warming} for the
- * pane's key) and the CLIENT's banner (witnessed via a page-side
- * MutationObserver flag, because the park is TRANSIENT for terminal
- * panes: the pre-existing INVALID_TERMINAL_ID reconnect recovery
- * (TerminalView's resumeRecoveryCreate — deliberately fail-open for
- * unreadable stores, resume_validation.rs) resumes the pane's OWN saved
- * identity ~1s after the warming fold, long before readiness. That lane is
- * itself zero-interaction automatic recovery (the SAME session identity —
- * never a new conversation, never a dead-session inference), so it
- * satisfies the kata's requested result; the ReconcileWarmingRecoveryDriver
- * (plan Task 6) is what then keeps the banner honest: its identity guard
- * clears the warming state the moment a parked pane moved on, and it
- * re-drives the reconcile at readiness for panes that stay parked. With the
- * driver unmounted (this spec's RED), the pane still self-restores but the
- * warming state NEVER clears — the banner lies forever over a restored
- * pane — which is the deterministic RED door for every test here.
+ * DURABLE-PARK MECHANICS (delta fix, finding 3): the natural pane class
+ * whose park SURVIVES the cold window is an OPEN pane whose CLI session
+ * EXITED before the restart (the exit fold clears terminalId but RETAINS
+ * sessionRef + createRequestId + status 'exited'). A running pane's park
+ * is transient — TerminalView's INVALID_TERMINAL_ID reconnect recovery
+ * resumes it ~1s after the fold and RE-KEYS the pane (a new
+ * createRequestId), so the driver's identity guard clears the park without
+ * ever re-driving (tests 2 and 4 exercise that lane). An EXITED pane has no
+ * self-recovery lane (the INVALID_TERMINAL_ID gate requires a live attach
+ * and a non-exited status), so it STAYS PARKED through the whole hold —
+ * and at readiness the ReconcileWarmingRecoveryDriver's re-drive is the
+ * ONE thing that moves it:
+ *   - test 1 (codex, readable store): the parked pane is resumed by its own
+ *     un-anchored create lane mid-park (same createRequestId — the park
+ *     survives, the pane becomes usable while the banner honestly waits),
+ *     and the readiness re-drive derives `attach` onto the live terminal.
+ *   - test 3 (opencode, unreadable store): the resumed CLI dies on the
+ *     unreadable store (a directory at opencode.db — the faithful fake
+ *     mirrors the real CLI's startup failure), the server's own bounded
+ *     crash-retry churn settles, and the readiness re-drive derives the
+ *     honest error{session_store_unreadable} — the per-pane restoreError,
+ *     the visible in-buffer explanation line, and a cleared banner.
  *
  * The unreadable-store case seeds a DIRECTORY at
  * <isolated data home>/opencode/opencode.db: SQLite open fails on a
  * directory for any euid, so the opencode by-id locator answers Unreadable
- * (cold => Unknown => the pane parks; the recovery lane resumes the
- * identity fail-open). The pane must NEVER fold a false verdict for it
- * (no dead_session / fresh / restoreError) and its identity must survive.
+ * (cold => Unknown => the pane parks; warm => the honest
+ * error{session_store_unreadable}).
  *
  * Like reconcile-client-adoption-rust.spec.ts (the bootAdoption donor), this
  * spec constructs its OWN RustServer({env}) — the hold env must reach the
@@ -76,7 +74,13 @@ const FAKE_OPENCODE_TERMINAL_SOURCE = path.resolve(
 // bounded deferral included) answers warming well inside the window. The
 // first boot's own publish is held too, so a seeded sidebar row appears
 // only after that first readiness — every wait below is sized for it.
+// Tests 1/2/4 use the default; test 3 (the unreadable store) uses a LONGER
+// hold so the server's own bounded crash-retry churn (the resumed fake CLI
+// dies on the unreadable store; auto-resume retries 2x with backoff)
+// settles well before readiness and the re-drive derives the honest error
+// against a deterministically dead pane.
 const HOLD_MS = 15_000
+const UNREADABLE_HOLD_MS = 30_000
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- see file doc comment)
@@ -194,6 +198,78 @@ async function witnessedWarmingVerdict(
     && m.verdicts.some(
       (v: any) =>
         v?.verdict === 'error' && v?.reason === 'index_warming' && v?.paneKey === key,
+    ))
+}
+
+/**
+ * The readiness-broadcast witness: the server's once-per-boot
+ * sessions.index.ready frame reached this client (the real client
+ * negotiated sessionIndexReadyV1, so the frame is capability-gated IN, not
+ * synthesized).
+ */
+async function witnessedReadinessBroadcast(harness: TestHarness): Promise<boolean> {
+  const received = await harness.getReceivedWsMessages()
+  return received.some((m: any) => m?.type === 'sessions.index.ready')
+}
+
+/** Count of pane.reconcile.requests THIS client sent naming the pane's key. */
+async function sentReconcileRequestCount(
+  harness: TestHarness,
+  tabId: string,
+  paneId: string,
+): Promise<number> {
+  const sent = await harness.getSentWsMessages()
+  const key = paneKeyOf(tabId, paneId)
+  return sent.filter((m: any) =>
+    m?.type === 'pane.reconcile.request'
+    && Array.isArray(m?.panes)
+    && m.panes.some((p: any) => p?.paneKey === key),
+  ).length
+}
+
+/**
+ * The DRIVER's re-drive verdict witness: a received pane.reconcile.result
+ * carrying a NON-warming verdict (attach/respawn/…) for the pane's key —
+ * the boot reconcile already answered error{index_warming}, so a later
+ * result with a resolution verdict is the readiness-driven re-drive's own
+ * round-trip.
+ */
+async function witnessedResolutionVerdict(
+  harness: TestHarness,
+  tabId: string,
+  paneId: string,
+): Promise<boolean> {
+  const received = await harness.getReceivedWsMessages()
+  const key = paneKeyOf(tabId, paneId)
+  return received.some((m: any) =>
+    m?.type === 'pane.reconcile.result'
+    && Array.isArray(m?.verdicts)
+    && m.verdicts.some(
+      (v: any) => v?.paneKey === key && v?.verdict !== 'error',
+    ))
+}
+
+/**
+ * The DRIVER's re-drive honest-error witness: a received
+ * pane.reconcile.result carrying error{session_store_unreadable} for the
+ * pane's key (the boot reconcile answered error{index_warming} — the warm
+ * index's Unreadable answer is the re-drive's).
+ */
+async function witnessedUnreadableVerdict(
+  harness: TestHarness,
+  tabId: string,
+  paneId: string,
+): Promise<boolean> {
+  const received = await harness.getReceivedWsMessages()
+  const key = paneKeyOf(tabId, paneId)
+  return received.some((m: any) =>
+    m?.type === 'pane.reconcile.result'
+    && Array.isArray(m?.verdicts)
+    && m.verdicts.some(
+      (v: any) =>
+        v?.verdict === 'error'
+        && v?.reason === 'session_store_unreadable'
+        && v?.paneKey === key,
     ))
 }
 
@@ -324,12 +400,13 @@ async function bootWithHold(
   options: {
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
+    holdMs?: number
   } = {},
 ): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({
     env: {
       ...options.env,
-      FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS: String(HOLD_MS),
+      FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS: String(options.holdMs ?? HOLD_MS),
     },
     setupHome: options.setupHome,
   })
@@ -430,7 +507,7 @@ async function stableCount(count: () => Promise<number>, settleMs = 5_000): Prom
 test.describe('reconcile auto-restore warming (rust server, zero interaction)', () => {
   test.setTimeout(240_000)
 
-  test('slow index: parked codex pane restores automatically with zero interaction', async ({
+  test('slow index: an exited codex pane stays parked, then restores at readiness through the driver re-drive — zero interaction', async ({
     page,
   }) => {
     const CODEX_SESSION_ID = 'bbbbbbbb-cccc-4ddd-8eee-000000000001'
@@ -492,32 +569,48 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         .not.toBeNull()
         .then(async () => (await findLeafById(harness, codexPane.tabId, codexPane.leafId))!.content.terminalId)
 
+      // 2. EXIT the CLI session (the fake's exit affordance): the exit
+      //    fold clears the terminalId but RETAINS the session identity —
+      //    the OPEN-pane-with-no-process shape whose park survives a
+      //    restart (see the file doc comment). A clean exit never
+      //    auto-resumes.
+      await page.locator(`[data-context="pane"][data-pane-id="${codexPane.leafId}"]`).click()
+      await page.keyboard.type('exit')
+      await page.keyboard.press('Enter')
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, codexPane.tabId, codexPane.leafId)
+          return l?.content?.status === 'exited' && !l?.content?.terminalId ? 'exited' : null
+        }, { timeout: 20_000 })
+        .toBe('exited')
+
       await flushPersistence(page)
       const leavesBefore = await allTerminalLeaves(harness)
       const tabCountBefore = await harness.getTabCount()
       const argvCountBeforeRestart = (await readArgvLog(argLogPath)).length
 
-      // 2. Graceful restart (the ONE this test uses); the live client's WS
+      // 3. Graceful restart (the ONE this test uses); the live client's WS
       //    reconnects inside the cold window and reconciles on the new
-      //    ready. The shell pane has no index identity (fresh verdict); the
-      //    codex pane's provider answers Unknown while cold (AD-4), so the
-      //    verdict is error{index_warming} and the pane parks.
-      await observeWarmingBanner(page)
+      //    ready. The shell pane has no index identity (fresh verdict, live
+      //    again immediately); the exited codex pane's provider answers
+      //    Unknown while cold (AD-4: codex has no cold by-id locator), so
+      //    the verdict is error{index_warming} and the pane PARKS —
+      //    durably: no self-recovery lane exists for an exited pane.
       await server.restart()
       await waitForWsReady(page)
 
-      // 3. The park is witnessed durably: the server's reconcile result
-      //    carries error{index_warming} for the codex pane's own key, and
-      //    the client surfaced the warming banner (page-side observer —
-      //    the park is transient, see the file doc comment).
+      // 4. The park is witnessed BOTH ways — the server's warming verdict
+      //    (durable in the received-WS ring) and the client's VISIBLE
+      //    banner (the park is durable now, so a visibility poll cannot
+      //    miss it).
       await expect
         .poll(async () => witnessedWarmingVerdict(harness, codexPane.tabId, codexPane.leafId), {
           timeout: 30_000,
         })
         .toBe(true)
-      expect(await warmingBannerWasSeen(page)).toBe(true)
+      await expect(warmingBanner(page)).toBeVisible({ timeout: 20_000 })
 
-      // 4. The shell pane needs no index — it is live again with a NEW
+      // 5. The shell pane needs no index — it is live again with a NEW
       //    terminalId (the fresh verdict's respawn).
       await expect
         .poll(async () => {
@@ -527,35 +620,37 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         }, { timeout: 60_000 })
         .not.toBeNull()
 
-      // 5. ZERO-INTERACTION RESTORE: no click anywhere. The codex pane is
-      //    back — a NEW terminalId, running, no restoreError, the SAME
-      //    sessionRef — resumed with the plain `codex resume <id>` argv
-      //    (two independent proofs: the pane buffer's marker and the fake
-      //    CLI's argv log), and the banner has cleared itself.
-      const restoredTerminalId: string = await expect
+      // 6. MID-PARK USABILITY ("existing live agents remain attached and
+      //    usable during indexing"): the parked pane's own un-anchored
+      //    create lane resumes the session with the SAME createRequestId
+      //    (council rule 2 — never re-minted), so the park SURVIVES the
+      //    recovery and the pane is alive while the banner honestly waits.
+      //    The resumed CLI carries the plain `codex resume <id>` argv.
+      const resumedTerminalId: string = await expect
         .poll(async () => {
           const l = await findLeafById(harness, codexPane.tabId, codexPane.leafId)
           const tid = l?.content?.terminalId ?? null
           return tid && tid !== codexTerminalIdBefore && l?.content?.status === 'running'
-            && !l?.content?.restoreError
             ? tid
             : null
-        }, { timeout: 90_000 })
+        }, { timeout: 30_000 })
         .not.toBeNull()
         .then(async () => {
           const l = await findLeafById(harness, codexPane.tabId, codexPane.leafId)
           return l!.content.terminalId as string
         })
-      const restoredContent = (await findLeafById(harness, codexPane.tabId, codexPane.leafId))?.content
-      expect(restoredContent?.sessionRef?.provider).toBe('codex')
-      expect(restoredContent?.sessionRef?.sessionId).toBe(CODEX_SESSION_ID)
-      await expect
-        .poll(async () => {
-          const buffer = await harness.getTerminalBuffer(restoredTerminalId)
-          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
-          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
-        }, { timeout: 30_000 })
-        .toBe(true)
+      // While the index is STILL not ready, the park must hold over the
+      // live pane (the banner honestly waits). Conditional on readiness
+      // not having fired yet: on a slow machine readiness may land mid-step,
+      // and the hard chain witnesses below (re-drive + resolution) carry
+      // the contract either way.
+      {
+        const state = (await harness.getState())
+        if (state?.connection?.sessionIndexReady !== true) {
+          expect(state?.panes?.reconcileWarming).not.toBeNull()
+          await expect(warmingBanner(page)).toBeVisible()
+        }
+      }
       await expect
         .poll(async () => {
           const entries = await readArgvLog(argLogPath)
@@ -564,17 +659,60 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
             .some((e) => hasFlagPair(e.argv, 'resume', CODEX_SESSION_ID))
         }, { timeout: 30_000 })
         .toBe(true)
-      // The warming state and its banner are GONE (the recovery driver's
-      // identity guard clears the park the moment the pane moved on) —
-      // with the driver unmounted this never happens (the RED door).
+      // The parked identity is the SAME session, never a new conversation.
+      const parkedContent = (await findLeafById(harness, codexPane.tabId, codexPane.leafId))?.content
+      expect(parkedContent?.sessionRef).toMatchObject({
+        provider: 'codex',
+        sessionId: CODEX_SESSION_ID,
+      })
+      expect(parkedContent?.restoreError).toBeFalsy()
+
+      // 7. READINESS: the once-per-boot broadcast reaches this client (the
+      //    real SPA negotiated sessionIndexReadyV1), the flag folds, and
+      //    the DRIVER re-drives the reconcile for the parked pane — a NEW
+      //    pane.reconcile.request naming the pane's key, beyond the boot
+      //    reconcile's own.
+      const requestCountBeforeReadiness = await sentReconcileRequestCount(
+        harness,
+        codexPane.tabId,
+        codexPane.leafId,
+      )
+      expect(requestCountBeforeReadiness).toBeGreaterThanOrEqual(1)
+      await waitForSessionIndexReady(harness)
+      expect(await witnessedReadinessBroadcast(harness)).toBe(true)
+      await expect
+        .poll(
+          async () => sentReconcileRequestCount(harness, codexPane.tabId, codexPane.leafId),
+          { timeout: 30_000 },
+        )
+        .toBeGreaterThan(requestCountBeforeReadiness)
+
+      // 8. The re-drive's OWN result resolves the pane: a non-warming
+      //    verdict (attach onto the live resumed terminal) folds, and the
+      //    warming state + banner clear — ZERO interaction. With the
+      //    driver unmounted (the RED door) the re-drive never fires and
+      //    the park never clears.
+      await expect
+        .poll(async () => witnessedResolutionVerdict(harness, codexPane.tabId, codexPane.leafId), {
+          timeout: 30_000,
+        })
+        .toBe(true)
       await expect
         .poll(async () => (await harness.getState())?.panes?.reconcileWarming ?? null, {
           timeout: 20_000,
         })
         .toBe(null)
       await expect(warmingBanner(page)).toHaveCount(0)
+      const restoredContent = (await findLeafById(harness, codexPane.tabId, codexPane.leafId))?.content
+      expect(restoredContent?.terminalId).toBe(resumedTerminalId)
+      expect(restoredContent?.status).toBe('running')
+      expect(restoredContent?.sessionRef).toMatchObject({
+        provider: 'codex',
+        sessionId: CODEX_SESSION_ID,
+      })
+      expect(restoredContent?.restoreError).toBeFalsy()
 
-      // 6. No respawn storm: exactly ONE running codex terminal carries the
+      // 9. No respawn storm: exactly ONE running codex terminal carries the
       //    session identity server-side, and pane/tab counts are unchanged.
       await expect
         .poll(async () => {
@@ -720,7 +858,7 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
     }
   })
 
-  test('unreadable store: identity preserved, no false verdict, banner clears automatically', async ({
+  test('unreadable store: parked pane resolves to the honest per-pane error with a visible explanation — zero interaction', async ({
     page,
   }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-warming-unreadable-'))
@@ -730,11 +868,17 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       'opencode',
       path.join(sharedRoot, 'bin'),
     )
+    // The hold is LONGER than the default: the resumed fake CLI dies on the
+    // unreadable store and the server's bounded crash-retry churn (2
+    // auto-resumes with 2s/10s backoff) must SETTLE before readiness, so
+    // the re-drive derives the honest error against a deterministically
+    // dead pane.
     const { server, harness, info } = await bootWithHold(page, {
       env: {
         OPENCODE_CMD: fakeOpencodePath,
         FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath,
       },
+      holdMs: UNREADABLE_HOLD_MS,
       setupHome: async (homeDir) => {
         const freshellDir = path.join(homeDir, '.freshell')
         await fs.mkdir(freshellDir, { recursive: true })
@@ -781,7 +925,7 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
 
       // Mint the session: click the pane, type, press Enter (the fake
       // writes the opencode.db row on its first stdin data event).
-      await page.locator('.xterm').last().click()
+      await page.locator(`[data-context="pane"][data-pane-id="${opencodeLeaf.id}"]`).click()
       await page.keyboard.type('hello warming unreadable')
       await page.keyboard.press('Enter')
       const associatedSessionId: string = await expect
@@ -796,25 +940,38 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         })
       expect(associatedSessionId).toMatch(/^ses_e2e_/)
 
-      await flushPersistence(page)
-      const leavesBefore = await allTerminalLeaves(harness)
-      const tabCountBefore = await harness.getTabCount()
-      const argvCountBeforeRestart = (await readArgvLog(argLogPath)).length
+      // 2. EXIT the CLI session cleanly (the fake's exit affordance): the
+      //    pane keeps its identity with no live process — the durable-park
+      //    shape. A clean exit never auto-resumes.
+      await page.keyboard.type('exit')
+      await page.keyboard.press('Enter')
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, opencodeLeaf.id)
+          return l?.content?.status === 'exited' && !l?.content?.terminalId ? 'exited' : null
+        }, { timeout: 20_000 })
+        .toBe('exited')
 
-      // 2. Seed the unreadable store: replace <data home>/opencode.db with
+      // 3. Seed the unreadable store: replace <data home>/opencode.db with
       //    a DIRECTORY (SQLite open fails on a directory for any euid), so
       //    the by-id locator answers Unreadable — cold => Unknown => the
-      //    pane parks as warming. A claude transcript DIRECTORY would be a
-      //    clean miss (Absent — the pane would fold dead/fresh and never
-      //    park) — the DB directory is the honest unreadable shape.
+      //    pane parks as warming; warm => the honest
+      //    error{session_store_unreadable}. A claude transcript DIRECTORY
+      //    would be a clean miss (Absent — the pane would fold dead/fresh
+      //    and never park) — the DB directory is the honest unreadable
+      //    shape.
       const dbPath = path.join(info.homeDir, '.local', 'share', 'opencode', 'opencode.db')
       await fs.access(dbPath) // fail loud: the fake must have written the db
       await fs.rm(dbPath)
       await fs.mkdir(dbPath)
 
-      // 3. Graceful restart; the pane parks during the hold (the received
-      //    verdict + the banner witness it).
-      await observeWarmingBanner(page)
+      await flushPersistence(page)
+      const leavesBefore = await allTerminalLeaves(harness)
+      const tabCountBefore = await harness.getTabCount()
+
+      // 4. Graceful restart; the exited pane PARKS during the hold (the
+      //    received warming verdict + the VISIBLE banner witness it — the
+      //    park is durable for an exited pane).
       await server.restart()
       await waitForWsReady(page)
       await expect
@@ -822,47 +979,61 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
           timeout: 30_000,
         })
         .toBe(true)
-      expect(await warmingBannerWasSeen(page)).toBe(true)
+      await expect(warmingBanner(page)).toBeVisible({ timeout: 20_000 })
 
-      // 4. ZERO INTERACTION, IDENTITY-PRESERVING RECOVERY, NO FALSE
-      //    VERDICT: the pane's own reconnect recovery resumes the SAME
-      //    ses_* identity (the resume gate deliberately fails open for a
-      //    store the probe cannot read — resume_validation.rs — so the
-      //    CLI itself owns surfacing the store failure; the fake CLI
-      //    resumes fine). The pane must NEVER fold a false verdict for
-      //    the unreadable store: no dead_session, no fresh, no
-      //    restoreError — the identity is preserved verbatim.
-      const restoredTerminalId: string = await expect
-        .poll(async () => {
-          const l = await findLeafById(harness, tabId, opencodeLeaf.id)
-          const tid = l?.content?.terminalId ?? null
-          return tid && tid !== opencodeTerminalIdBefore && l?.content?.status === 'running'
-            && !l?.content?.restoreError
-            ? tid
-            : null
-        }, { timeout: 90_000 })
-        .not.toBeNull()
-        .then(async () => {
-          const l = await findLeafById(harness, tabId, opencodeLeaf.id)
-          return l!.content.terminalId as string
-        })
-      const restoredContent = (await findLeafById(harness, tabId, opencodeLeaf.id))?.content
-      expect(
-        restoredContent?.sessionRef?.sessionId ?? restoredContent?.resumeSessionId,
-        'the recoverable identity is preserved',
-      ).toBe(associatedSessionId)
-      expect(restoredContent?.restoreError, 'an unreadable store is never a false death').toBeFalsy()
+      // 5. The resumed CLI dies on the unreadable store and the server's
+      //    own BOUNDED crash-retry churn settles: by the readiness window
+      //    the pane is deterministically exited again (no live terminal,
+      //    identity retained) — the park SURVIVES the whole churn because
+      //    every retry keeps the pane's createRequestId.
       await expect
         .poll(async () => {
-          const entries = await readArgvLog(argLogPath)
-          return entries
-            .slice(argvCountBeforeRestart)
-            .some((e) => hasFlagPair(e.argv, '--session', associatedSessionId))
+          const l = await findLeafById(harness, tabId, opencodeLeaf.id)
+          return l?.content?.status === 'exited' && !l?.content?.terminalId ? 'exited' : null
         }, { timeout: 30_000 })
+        .toBe('exited')
+
+      // 6. READINESS: the broadcast reaches the client, the flag folds,
+      //    and the DRIVER re-drives the reconcile for the parked pane —
+      //    which now derives the HONEST error{session_store_unreadable}
+      //    (the index published; the by-id locator cannot read the
+      //    directory store). NEVER a lying warming banner over a dead
+      //    pane, and never a false death (no dead_session/fresh).
+      await waitForSessionIndexReady(harness, 90_000)
+      expect(await witnessedReadinessBroadcast(harness)).toBe(true)
+      await expect
+        .poll(async () => witnessedUnreadableVerdict(harness, tabId, opencodeLeaf.id), {
+          timeout: 60_000,
+        })
         .toBe(true)
 
-      // 5. The banner cleared itself (the driver's identity guard) — the
-      //    RED door: without the driver the warming state never clears.
+      // 7. The honest error FOLDS: a per-pane restoreError with the exact
+      //    reason, the identity PRESERVED verbatim, and the VISIBLE
+      //    in-buffer explanation line (finding 1's notice machinery) on
+      //    the pane's own surface — no user interaction anywhere. The
+      //    witness is the pane's rendered DOM text: the line is written
+      //    into the pane's xterm buffer, so it is what the user sees
+      //    (row-wrapping is irrelevant to textContent concatenation).
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, opencodeLeaf.id)
+          return l?.content?.restoreError?.reason === 'session_store_unreadable' ? l : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+      const erroredContent = (await findLeafById(harness, tabId, opencodeLeaf.id))?.content
+      expect(
+        erroredContent?.sessionRef?.sessionId ?? erroredContent?.resumeSessionId,
+        'the recoverable identity is preserved',
+      ).toBe(associatedSessionId)
+      expect(erroredContent?.reconcileNotice, 'the durable visible-explanation mint').toBeTruthy()
+      await expect(
+        page.locator(`[data-context="pane"][data-pane-id="${opencodeLeaf.id}"]`),
+      ).toContainText('saved session store could not be read', { timeout: 30_000 })
+
+      // 8. The banner cleared itself at the fold (warming === 0 — the
+      //    pane resolved, honestly to an error) — the RED door: without
+      //    the driver the re-drive never fires and neither the honest
+      //    error nor the clear happens.
       await expect
         .poll(async () => (await harness.getState())?.panes?.reconcileWarming ?? null, {
           timeout: 20_000,
@@ -870,20 +1041,14 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         .toBe(null)
       await expect(warmingBanner(page)).toHaveCount(0)
 
-      // 6. No respawn storm: exactly ONE running opencode terminal carries
-      //    the identity; structure unchanged; zero dialogs. Warming never
-      //    returns: after a settle window the warming state stays cleared.
-      await expect
-        .poll(async () => {
-          const terms = await listTerminals(info)
-          const running = terms.filter((t) => t.mode === 'opencode' && t.status === 'running')
-          return (
-            running.length === 1
-            && running[0].sessionRef?.provider === 'opencode'
-            && running[0].sessionRef?.sessionId === associatedSessionId
-          )
-        }, { timeout: 30_000 })
-        .toBe(true)
+      // 9. No storm, no dialogs, warming never returns: after a settle
+      //    window no opencode terminal runs for the identity, the
+      //    structure is unchanged, and the warming state stays cleared.
+      const opencodeTerminalsForIdentity = async () =>
+        (await listTerminals(info)).filter(
+          (t) => t.mode === 'opencode' && t.status === 'running',
+        ).length
+      expect(await stableCount(opencodeTerminalsForIdentity)).toBe(0)
       expect((await allTerminalLeaves(harness)).length).toBe(leavesBefore.length)
       expect(await harness.getTabCount()).toBe(tabCountBefore)
       await new Promise((resolve) => setTimeout(resolve, 5_000))
