@@ -120,7 +120,8 @@ impl LogCapture {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no log event: {what}"
+                "no log event: {what}; observed Stop outcomes: {:?}",
+                self.matching(|event| event.message == "freshagent.claude.stop")
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

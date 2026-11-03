@@ -204,8 +204,16 @@ export function query(params) {{
         let rig = ClaudeRig::start_with_env(RigKind::Sim, &extra).await;
         let mut conn = rig.connect().await;
         let id = conn.create("refused-stop-create").await;
+        eprintln!("{}", json!({"severity":"info","event":"test.reissued_stop.session","session_id":&id}));
         conn.send_text(&id, "the-running-turn", "TOOL:sleep=0.5")
             .await;
+        if reissued {
+            conn.wait_for("the send accepted before Stop", |frame| {
+                frame["type"] == "freshAgent.send.accepted"
+                    && frame["requestId"] == "the-running-turn"
+            })
+            .await;
+        }
         if !reissued {
             conn.wait_for("the running tool", |frame| {
                 frame["event"]["content"]
