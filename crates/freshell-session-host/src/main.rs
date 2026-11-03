@@ -1075,23 +1075,102 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
-                    let actor = state
-                        .fresh_agent
-                        .lock()
-                        .await
-                        .clone()
-                        .ok_or_else(unsupported_fresh_agent)?;
+                    let actor = state.fresh_agent.lock().await.clone();
+                    let persisted = {
+                        let persisted = state.persisted.lock().await;
+                        (persisted.provider.as_deref() == Some("codex")).then(|| persisted.clone())
+                    };
+                    let trace_codex_recovery = persisted.is_some();
+                    let (actor_profile, actor_is_live) = if trace_codex_recovery {
+                        if let Some(actor) = actor.as_ref() {
+                            (Some(actor.profile().await), Some(actor.is_live().await))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    let admission =
+                        match (persisted.as_ref(), actor_profile.as_ref(), actor_is_live) {
+                            (Some(persisted), Some(profile), Some(actor_is_live)) => {
+                                Some(codex_recovery_send_admission_diagnostic(
+                                    state,
+                                    persisted,
+                                    profile,
+                                    actor_is_live,
+                                ))
+                            }
+                            _ => None,
+                        };
+                    if trace_codex_recovery {
+                        let admitted = admission.as_ref().is_some_and(|check| check.admitted);
+                        append_event_with_secret(
+                            &state.state_dir,
+                            &state.secret,
+                            "host.codex_recovery_send_trace",
+                            serde_json::json!({
+                                "severity": if admitted { "info" } else { "warn" },
+                                "stage": "host_recovery_gate",
+                                "actorPresent": actor.is_some(),
+                                "actorIsLive": actor_is_live,
+                                "admitted": admitted,
+                                "reason": admission.as_ref().map_or("actor_missing", |check| check.reason),
+                                "checks": admission.as_ref().map(|check| check.checks.clone()),
+                            }),
+                        )
+                        .ok();
+                    }
+                    let codex_recovery_send =
+                        admission.as_ref().is_some_and(|check| check.admitted);
+                    if !codex_recovery_send {
+                        ensure_current_fresh_native_observation(state).await?;
+                    }
+                    let actor = actor.ok_or_else(unsupported_fresh_agent)?;
                     let before = actor.profile().await;
-                    let command_state = actor
+                    let trace_actor_dispatch = trace_codex_recovery;
+                    if trace_actor_dispatch {
+                        append_event_with_secret(
+                            &state.state_dir,
+                            &state.secret,
+                            "host.codex_recovery_send_trace",
+                            serde_json::json!({
+                                "severity": "info",
+                                "stage": "actor_dispatch",
+                                "outcome": "started",
+                                "admitted": codex_recovery_send,
+                            }),
+                        )
+                        .ok();
+                    }
+                    let actor_dispatch = actor
                         .dispatch_with_checkpoint_identity(
                             request_id,
                             text,
                             settings,
                             checkpoint_logical_attempt_id,
                         )
-                        .await
-                        .map_err(map_actor_error)?;
+                        .await;
+                    if trace_actor_dispatch {
+                        let (severity, outcome, actor_error_kind) = match &actor_dispatch {
+                            Ok(_) => ("info", "provider_accepted", None),
+                            Err(error) => {
+                                ("error", "actor_error", Some(actor_error_category(error)))
+                            }
+                        };
+                        append_event_with_secret(
+                            &state.state_dir,
+                            &state.secret,
+                            "host.codex_recovery_send_trace",
+                            serde_json::json!({
+                                "severity": severity,
+                                "stage": "actor_dispatch",
+                                "outcome": outcome,
+                                "actorErrorKind": actor_error_kind,
+                            }),
+                        )
+                        .ok();
+                    }
+                    let command_state = actor_dispatch.map_err(map_actor_error)?;
                     let after = actor.profile().await;
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
@@ -1496,6 +1575,23 @@ fn configure_outcome_event(
         Err(error) => logged["code"] = serde_json::json!(error.code),
     }
     logged
+}
+
+fn actor_error_category(error: &freshell_agent_runtime::host_actor::ActorError) -> &'static str {
+    use freshell_agent_runtime::host_actor::ActorError;
+    match error {
+        ActorError::RequestConflict => "request_conflict",
+        ActorError::AmbiguousDispatch => "ambiguous_dispatch",
+        ActorError::NativeIdentityMismatch => "native_identity_mismatch",
+        ActorError::UnknownDecision => "unknown_decision",
+        ActorError::DecisionAlreadyResolved => "decision_already_resolved",
+        ActorError::WriterBusy => "writer_busy",
+        ActorError::UnsupportedOperation => "unsupported_operation",
+        ActorError::InvalidProfile => "invalid_profile",
+        ActorError::ProviderStartFailed { .. } => "provider_start_failed",
+        ActorError::Transport(_) => "transport",
+        ActorError::Persistence(_) => "persistence",
+    }
 }
 
 fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> RuntimeError {
@@ -2696,6 +2792,271 @@ async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<()
         RuntimeErrorCode::RecoveryWrongIdentity,
         "current native provider observation is unavailable",
     ))
+}
+
+#[cfg(test)]
+mod codex_recovery_send_admission_tests {
+    use super::*;
+
+    #[test]
+    fn codex_recovery_send_requires_a_dead_current_managed_writer() {
+        let state = tests::test_host_state();
+        let incarnation_id = state.incarnation_id.clone();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: incarnation_id.clone(),
+            launch_nonce: "current-launch".into(),
+            evidence_revision: 3,
+            execution_generation: 7,
+            requested_native_session_id: Some("native-root".into()),
+        };
+        let persisted = PersistedHostState {
+            native_identity_launch: Some(launch.clone()),
+            max_control_epoch: 4,
+            max_execution_generation: 7,
+            provider: Some("codex".into()),
+            worker_pid: Some(4242),
+            worker_launch_count: 1,
+            ..PersistedHostState::default()
+        };
+        *state.control_fence.lock().unwrap() = HostControlFence {
+            max_control_epoch: 4,
+            max_execution_generation: 7,
+            stopped: false,
+        };
+        let profile: freshell_agent_runtime::host_actor::FreshAgentProfile =
+            serde_json::from_value(serde_json::json!({
+                "provider": "codex",
+                "runtimeVariant": "codex-app-server",
+                "cwd": "/workspace",
+                "model": null,
+                "effort": null,
+                "permissionMode": null,
+                "sandbox": null,
+                "providerStoreId": "codex-store",
+                "nativeSessionId": "native-root"
+            }))
+            .unwrap();
+
+        assert!(codex_recovery_send_is_admissible(
+            &state, &persisted, &profile, false,
+        ));
+        assert!(!codex_recovery_send_is_admissible(
+            &state, &persisted, &profile, true,
+        ));
+
+        let mut other_provider = profile.clone();
+        other_provider.provider = freshell_runtime_protocol::FreshProvider::Claude;
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &persisted,
+            &other_provider,
+            false,
+        ));
+        let mut other_runtime = profile.clone();
+        other_runtime.runtime_variant = "codex-cli".into();
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &persisted,
+            &other_runtime,
+            false,
+        ));
+        let mut missing_root = profile.clone();
+        missing_root.native_session_id = None;
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &persisted,
+            &missing_root,
+            false,
+        ));
+        let mut changed_root = profile.clone();
+        changed_root.native_session_id = Some("different-root".into());
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &persisted,
+            &changed_root,
+            false,
+        ));
+
+        let mut wrong_provider = persisted.clone();
+        wrong_provider.provider = Some("claude".into());
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &wrong_provider,
+            &profile,
+            false,
+        ));
+        let mut missing_launch = persisted.clone();
+        missing_launch.native_identity_launch = None;
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &missing_launch,
+            &profile,
+            false,
+        ));
+        let mut wrong_incarnation = persisted.clone();
+        wrong_incarnation
+            .native_identity_launch
+            .as_mut()
+            .unwrap()
+            .incarnation_id = IncarnationId::new();
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &wrong_incarnation,
+            &profile,
+            false,
+        ));
+        let mut wrong_root = persisted.clone();
+        wrong_root
+            .native_identity_launch
+            .as_mut()
+            .unwrap()
+            .requested_native_session_id = Some("different-root".into());
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &wrong_root,
+            &profile,
+            false,
+        ));
+        let mut wrong_generation = persisted.clone();
+        wrong_generation.max_execution_generation = 8;
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &wrong_generation,
+            &profile,
+            false,
+        ));
+        let mut missing_worker = persisted.clone();
+        missing_worker.worker_pid = None;
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &missing_worker,
+            &profile,
+            false,
+        ));
+        let mut missing_launch_count = persisted.clone();
+        missing_launch_count.worker_launch_count = 0;
+        assert!(!codex_recovery_send_is_admissible(
+            &state,
+            &missing_launch_count,
+            &profile,
+            false,
+        ));
+
+        state.control_fence.lock().unwrap().stopped = true;
+        assert!(!codex_recovery_send_is_admissible(
+            &state, &persisted, &profile, false,
+        ));
+    }
+}
+
+#[cfg(test)]
+fn codex_recovery_send_is_admissible(
+    state: &HostState,
+    persisted: &PersistedHostState,
+    profile: &freshell_agent_runtime::host_actor::FreshAgentProfile,
+    actor_is_live: bool,
+) -> bool {
+    codex_recovery_send_admission_diagnostic(state, persisted, profile, actor_is_live).admitted
+}
+
+struct CodexRecoverySendAdmissionDiagnostic {
+    admitted: bool,
+    reason: &'static str,
+    checks: serde_json::Value,
+}
+
+fn codex_recovery_send_admission_diagnostic(
+    state: &HostState,
+    persisted: &PersistedHostState,
+    profile: &freshell_agent_runtime::host_actor::FreshAgentProfile,
+    actor_is_live: bool,
+) -> CodexRecoverySendAdmissionDiagnostic {
+    let control_fence = state.control_fence.lock().unwrap();
+    let control_fence_not_stopped = !control_fence.stopped;
+    let control_epoch_matches = control_fence.max_control_epoch == persisted.max_control_epoch;
+    let execution_generation_matches =
+        control_fence.max_execution_generation == persisted.max_execution_generation;
+    let persisted_provider_is_codex = persisted.provider.as_deref() == Some("codex");
+    let worker_pid_is_usable = persisted.worker_pid.is_some_and(|pid| pid > 0);
+    let worker_launch_count_is_positive = persisted.worker_launch_count > 0;
+    let profile_provider_is_codex =
+        profile.provider == freshell_runtime_protocol::FreshProvider::Codex;
+    let profile_runtime_is_codex_app_server = profile.runtime_variant == "codex-app-server";
+    let root = profile
+        .native_session_id
+        .as_deref()
+        .filter(|root| !root.is_empty() && !root.chars().any(char::is_control));
+    let launch = persisted.native_identity_launch.as_ref();
+    let launch_incarnation_matches =
+        launch.is_some_and(|launch| launch.incarnation_id == state.incarnation_id);
+    let launch_nonce_is_present = launch.is_some_and(|launch| !launch.launch_nonce.is_empty());
+    let launch_execution_generation_is_positive =
+        launch.is_some_and(|launch| launch.execution_generation > 0);
+    let launch_execution_generation_matches = launch
+        .is_some_and(|launch| launch.execution_generation == persisted.max_execution_generation);
+    let launch_requested_native_root_matches =
+        launch.is_some_and(|launch| launch.requested_native_session_id.as_deref() == root);
+    let ordered_checks = [
+        ("actor_is_not_live", !actor_is_live),
+        ("control_fence_not_stopped", control_fence_not_stopped),
+        ("control_epoch_matches", control_epoch_matches),
+        ("execution_generation_matches", execution_generation_matches),
+        ("persisted_provider_is_codex", persisted_provider_is_codex),
+        ("worker_pid_is_usable", worker_pid_is_usable),
+        (
+            "worker_launch_count_is_positive",
+            worker_launch_count_is_positive,
+        ),
+        ("profile_provider_is_codex", profile_provider_is_codex),
+        (
+            "profile_runtime_is_codex_app_server",
+            profile_runtime_is_codex_app_server,
+        ),
+        ("native_root_is_valid", root.is_some()),
+        ("native_identity_launch_is_present", launch.is_some()),
+        ("launch_incarnation_matches", launch_incarnation_matches),
+        ("launch_nonce_is_present", launch_nonce_is_present),
+        (
+            "launch_execution_generation_is_positive",
+            launch_execution_generation_is_positive,
+        ),
+        (
+            "launch_execution_generation_matches",
+            launch_execution_generation_matches,
+        ),
+        (
+            "launch_requested_native_root_matches",
+            launch_requested_native_root_matches,
+        ),
+    ];
+    let admitted = ordered_checks.iter().all(|(_, passed)| *passed);
+    let reason = ordered_checks
+        .iter()
+        .find_map(|(name, passed)| (!passed).then_some(*name))
+        .unwrap_or("admitted");
+
+    CodexRecoverySendAdmissionDiagnostic {
+        admitted,
+        reason,
+        checks: serde_json::json!({
+            "actorIsNotLive": !actor_is_live,
+            "controlFenceNotStopped": control_fence_not_stopped,
+            "controlEpochMatches": control_epoch_matches,
+            "executionGenerationMatches": execution_generation_matches,
+            "persistedProviderIsCodex": persisted_provider_is_codex,
+            "workerPidIsUsable": worker_pid_is_usable,
+            "workerLaunchCountIsPositive": worker_launch_count_is_positive,
+            "profileProviderIsCodex": profile_provider_is_codex,
+            "profileRuntimeIsCodexAppServer": profile_runtime_is_codex_app_server,
+            "nativeRootIsValid": root.is_some(),
+            "nativeIdentityLaunchIsPresent": launch.is_some(),
+            "launchIncarnationMatches": launch_incarnation_matches,
+            "launchNonceIsPresent": launch_nonce_is_present,
+            "launchExecutionGenerationIsPositive": launch_execution_generation_is_positive,
+            "launchExecutionGenerationMatches": launch_execution_generation_matches,
+            "launchRequestedNativeRootMatches": launch_requested_native_root_matches,
+        }),
+    }
 }
 
 fn adoption_status_for_required(required: bool) -> OpenCodeAdoptionStatus {

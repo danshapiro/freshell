@@ -43,6 +43,12 @@ struct ClassifiedFailure {
     http_status: Option<u16>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreshHostAdmissionPurpose {
+    Send,
+    Other,
+}
+
 impl ClassifiedFailure {
     fn timeout(error: RuntimeError) -> Self {
         Self {
@@ -863,16 +869,49 @@ impl Supervisor {
                 Ok(AdminResult::TerminalOutput(output))
             }
             AdminCommand::FreshAgentSend(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
+                let trace_codex_send = self
+                    .registry
+                    .recovery_context(request.soul_id.clone())
+                    .await
+                    .is_ok_and(|context| context.provider == "codex");
+                if trace_codex_send {
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "admin_dispatch",
+                        "received",
+                        "info",
+                        None,
+                        None,
+                    );
+                }
+                let epoch_matches = request
+                    .expected_control_epoch
+                    .is_none_or(|expected| expected == self.registry.control_epoch());
+                let epoch_check = self.registry.assert_epoch(request.expected_control_epoch);
+                if trace_codex_send {
+                    let (outcome, severity, error_category) = match &epoch_check {
+                        Ok(()) => ("accepted", "info", None),
+                        Err(RegistryError::StaleControlEpoch { .. }) => {
+                            ("rejected", "warn", Some("stale_control_epoch"))
+                        }
+                        Err(_) => ("error", "error", Some("registry")),
+                    };
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "control_epoch",
+                        outcome,
+                        severity,
+                        Some(epoch_matches),
+                        error_category,
+                    );
+                }
+                epoch_check.map_err(map_registry)?;
                 let state = self
-                    .fresh_agent_send(
+                    .fresh_agent_send_with_dispatch_trace(
                         envelope.request_id,
                         request.soul_id,
                         request.text,
                         request.settings,
                         request.checkpoint_logical_attempt_id,
+                        trace_codex_send,
                     )
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
@@ -2408,6 +2447,26 @@ impl Supervisor {
         settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
         checkpoint_logical_attempt_id: Option<String>,
     ) -> Result<CommandState, RuntimeError> {
+        self.fresh_agent_send_with_dispatch_trace(
+            request_id,
+            soul_id,
+            text,
+            settings,
+            checkpoint_logical_attempt_id,
+            false,
+        )
+        .await
+    }
+
+    async fn fresh_agent_send_with_dispatch_trace(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        text: String,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
+        trace_codex_send: bool,
+    ) -> Result<CommandState, RuntimeError> {
         if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -2428,7 +2487,7 @@ impl Supervisor {
                 "fresh-agent settings could not be correlated",
             )
         })?;
-        match self
+        let journal_result = self
             .registry
             .recorded_input_outcome(
                 soul_id.clone(),
@@ -2436,27 +2495,125 @@ impl Supervisor {
                 text.as_bytes(),
                 Some(&settings_correlation),
             )
-            .await
-            .map_err(map_registry)?
-        {
-            Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
-            Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
-            Some(InputJournalDisposition::Dispatch) | None => {}
+            .await;
+        let journal_disposition = match journal_result {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "input_journal",
+                        "error",
+                        "error",
+                        None,
+                        Some(registry_error_category(&error)),
+                    );
+                }
+                return Err(map_registry(error));
+            }
+        };
+        match journal_disposition {
+            Some(InputJournalDisposition::Completed) => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "input_journal",
+                        "completed",
+                        "info",
+                        None,
+                        None,
+                    );
+                }
+                return Ok(CommandState::Completed);
+            }
+            Some(InputJournalDisposition::Ambiguous) => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "input_journal",
+                        "ambiguous",
+                        "warn",
+                        None,
+                        None,
+                    );
+                }
+                return Ok(CommandState::Ambiguous);
+            }
+            Some(InputJournalDisposition::Dispatch) | None => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "input_journal",
+                        "dispatch",
+                        "info",
+                        None,
+                        None,
+                    );
+                }
+            }
         }
-        let active = self
-            .registry
-            .active_handle_for_soul(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
+        let active = match self.registry.active_handle_for_soul(soul_id.clone()).await {
+            Ok(active) => active,
+            Err(error) => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_dispatch_trace(
+                        "active_handle",
+                        "rejected",
+                        "warn",
+                        None,
+                        Some(registry_error_category(&error)),
+                    );
+                }
+                return Err(map_registry(error));
+            }
+        };
         if active.fresh_agent().is_none() {
+            if trace_codex_send {
+                self.record_fresh_agent_send_dispatch_trace(
+                    "active_handle",
+                    "unsupported_workload",
+                    "warn",
+                    None,
+                    Some("unsupported_workload"),
+                );
+            }
             return Err(RuntimeError::new(
                 RuntimeErrorCode::UnsupportedWorkload,
                 "soul is not a hosted fresh-agent",
             ));
         }
+        let trace_codex_send = trace_codex_send
+            && active.fresh_agent().is_some_and(|spec| {
+                spec.provider == freshell_runtime_protocol::FreshProvider::Codex
+            });
+        if trace_codex_send {
+            self.record_fresh_agent_send_trace("request_received", "pending", "info", None, None);
+        }
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &active)
-            .await?;
+            .authenticate_current_fresh_host(&soul_id, &active, FreshHostAdmissionPurpose::Send)
+            .await;
+        let host = match host {
+            Ok(host) => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_trace(
+                        "host_recovery_gate",
+                        "admitted",
+                        "info",
+                        Some(true),
+                        None,
+                    );
+                }
+                host
+            }
+            Err(error) => {
+                if trace_codex_send {
+                    self.record_fresh_agent_send_trace(
+                        "host_recovery_gate",
+                        "rejected",
+                        "warn",
+                        Some(false),
+                        Some(&error),
+                    );
+                }
+                return Err(error);
+            }
+        };
         let (disposition, incarnation_id) = self
             .registry
             .begin_fresh_input(
@@ -2487,6 +2644,15 @@ impl Supervisor {
             .recovery_write_fence(soul_id.clone())
             .await
             .map_err(map_registry)?;
+        if trace_codex_send {
+            self.record_fresh_agent_send_trace(
+                "host_command_dispatch",
+                "started",
+                "info",
+                None,
+                None,
+            );
+        }
         let response = self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -2501,6 +2667,41 @@ impl Supervisor {
                 },
             )
             .await;
+        if trace_codex_send {
+            match &response {
+                Ok(HostResult::FreshAgentCommand { state, .. }) => {
+                    self.record_fresh_agent_send_trace(
+                        "host_command_reply",
+                        match state {
+                            CommandState::ProviderAcked | CommandState::Completed => "accepted",
+                            CommandState::Ambiguous => "ambiguous",
+                            _ => "other",
+                        },
+                        match state {
+                            CommandState::ProviderAcked | CommandState::Completed => "info",
+                            CommandState::Ambiguous => "warn",
+                            _ => "warn",
+                        },
+                        None,
+                        None,
+                    );
+                }
+                Ok(_) => self.record_fresh_agent_send_trace(
+                    "host_command_reply",
+                    "unexpected_reply",
+                    "error",
+                    None,
+                    None,
+                ),
+                Err(error) => self.record_fresh_agent_send_trace(
+                    "host_command_reply",
+                    "error",
+                    "error",
+                    None,
+                    Some(error),
+                ),
+            }
+        }
         match response {
             Ok(HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
@@ -2579,10 +2780,53 @@ impl Supervisor {
         }
     }
 
+    fn record_fresh_agent_send_trace(
+        &self,
+        stage: &'static str,
+        outcome: &'static str,
+        severity: &'static str,
+        admitted: Option<bool>,
+        error: Option<&RuntimeError>,
+    ) {
+        append_event(
+            &self.config.lifecycle_log,
+            "fresh_agent.send_recovery_trace",
+            serde_json::json!({
+                "severity": severity,
+                "stage": stage,
+                "outcome": outcome,
+                "admitted": admitted,
+                "errorCode": error.map(|error| format!("{:?}", error.code)),
+            }),
+        );
+    }
+
+    fn record_fresh_agent_send_dispatch_trace(
+        &self,
+        stage: &'static str,
+        outcome: &'static str,
+        severity: &'static str,
+        epoch_matches: Option<bool>,
+        error_category: Option<&'static str>,
+    ) {
+        append_event(
+            &self.config.lifecycle_log,
+            "fresh_agent.send_recovery_trace",
+            serde_json::json!({
+                "severity": severity,
+                "stage": stage,
+                "outcome": outcome,
+                "epochMatches": epoch_matches,
+                "errorCategory": error_category,
+            }),
+        );
+    }
+
     async fn authenticate_current_fresh_host(
         &self,
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
+        purpose: FreshHostAdmissionPurpose,
     ) -> Result<AuthenticatedHost, RuntimeError> {
         let host = self
             .authenticate_host(active.incarnation_id(), active.runtime_dir())
@@ -2671,15 +2915,18 @@ impl Supervisor {
                 ));
             }
         }
+        let codex_recovery_send =
+            codex_recovery_send_is_admissible(purpose, &current, active, &status, &host);
         if current.desired_state != freshell_runtime_protocol::DesiredState::Running
             || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || status.exited
+            || (status.exited && !codex_recovery_send)
             || (!fixture
                 && (!host
                     .capabilities
                     .iter()
                     .any(|capability| capability == "native-identity-observation-v1")
-                    || crate::recovery::current_native_observation(&current, &status).is_none()))
+                    || (crate::recovery::current_native_observation(&current, &status).is_none()
+                        && !codex_recovery_send)))
         {
             append_event(
                 &self.config.lifecycle_log,
@@ -2708,7 +2955,7 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
-        self.authenticate_current_fresh_host(&soul_id, &active)
+        self.authenticate_current_fresh_host(&soul_id, &active, FreshHostAdmissionPurpose::Other)
             .await?;
         Ok(())
     }
@@ -2849,7 +3096,7 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &handle)
+            .authenticate_current_fresh_host(&soul_id, &handle, FreshHostAdmissionPurpose::Other)
             .await?;
         let context = self
             .registry
@@ -3421,7 +3668,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &handle)
+            .authenticate_current_fresh_host(&soul_id, &handle, FreshHostAdmissionPurpose::Other)
             .await?;
         let fence = self
             .registry
@@ -5436,6 +5683,275 @@ pub(crate) struct HostStatus {
     pub(crate) native_session_id: Option<String>,
     pub(crate) opencode_adoption: freshell_runtime_protocol::OpenCodeAdoptionStatus,
     pub(crate) opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
+}
+
+fn codex_recovery_send_is_admissible(
+    purpose: FreshHostAdmissionPurpose,
+    current: &crate::registry::RecoveryContext,
+    active: &crate::registry::OwnedRuntimeHandle,
+    status: &HostStatus,
+    host: &AuthenticatedHost,
+) -> bool {
+    if purpose != FreshHostAdmissionPurpose::Send
+        || current.provider != "codex"
+        || current.desired_state != freshell_runtime_protocol::DesiredState::Running
+        || current.fixture.is_some()
+        || current.provider_store_id != active.provider_store_id()
+        || current.prior_handle.incarnation_id() != active.incarnation_id()
+        || current.prior_handle.launch_nonce() != active.launch_nonce()
+        || status.host_boot_id != host.host_boot_id
+        || !status.exited
+        || status.worker_pid.is_none_or(|pid| pid == 0)
+        || status.worker_launch_count == 0
+        || status
+            .native_session_id
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || host
+            .capabilities
+            .iter()
+            .all(|capability| capability != "native-identity-observation-v1")
+        || host
+            .capabilities
+            .iter()
+            .all(|capability| capability != "fresh-agent-v1")
+        || status.native_identity_observation.is_some()
+    {
+        return false;
+    }
+
+    let Some(profile) = current.fresh_agent.as_ref() else {
+        return false;
+    };
+    let Some(active_profile) = active.fresh_agent() else {
+        return false;
+    };
+    let Some(root) = current
+        .native_session_id
+        .as_deref()
+        .filter(|root| !root.is_empty() && !root.chars().any(char::is_control))
+    else {
+        return false;
+    };
+    let Some(launch) = current.native_identity_launch.as_ref() else {
+        return false;
+    };
+
+    let same_profile_identity = |candidate: &FreshAgentLaunchSpec| {
+        candidate.session_id == profile.session_id
+            && candidate.provider == profile.provider
+            && candidate.session_type == profile.session_type
+            && candidate.runtime_variant == profile.runtime_variant
+            && candidate.provider_store_id == profile.provider_store_id
+            && candidate.native_session_id == profile.native_session_id
+    };
+
+    profile.provider == freshell_runtime_protocol::FreshProvider::Codex
+        && profile.session_type == "freshcodex"
+        && profile.runtime_variant == "codex-app-server"
+        && profile.provider_store_id == current.provider_store_id
+        && profile.fixture_transport.is_none()
+        && profile.native_session_id.as_deref() == Some(root)
+        && same_profile_identity(active_profile)
+        && active_profile.fixture_transport.is_none()
+        && launch.incarnation_id == *active.incarnation_id()
+        && !launch.launch_nonce.is_empty()
+        && launch.launch_nonce == active.launch_nonce().as_str()
+        && launch.execution_generation > 0
+        && launch.execution_generation == status.max_execution_generation
+        && launch.requested_native_session_id.as_deref() == Some(root)
+        && status
+            .native_session_id
+            .as_deref()
+            .is_none_or(|observed| observed == root)
+}
+
+#[cfg(test)]
+mod codex_recovery_send_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn codex_recovery_admission_is_send_only_and_requires_the_current_launch_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul_id = SoulId::new();
+        let workspace = dir.path().canonicalize().unwrap();
+        let profile: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId": "fresh-codex-admission",
+            "provider": "codex",
+            "sessionType": "freshcodex",
+            "runtimeVariant": "codex-app-server",
+            "providerStoreId": "codex-admission-store",
+            "cwd": workspace,
+            "workspacePath": workspace,
+            "runAsUid": 65534,
+            "runAsGid": 0,
+            "nativeSessionId": null
+        }))
+        .unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul_id.clone(),
+                provider: "codex".into(),
+                provider_store_id: "codex-admission-store".into(),
+                native_session_id: None,
+                creation_seed_ref: "codex-admission-seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "codex-admission".into(),
+                requested_limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 64 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 32,
+                },
+                profile: freshell_runtime_protocol::RuntimeProfile::Custom,
+                project_key: "codex-admission-project".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(profile),
+                view_intent: None,
+                admission: Default::default(),
+            })
+            .await
+            .unwrap();
+        let runtime_dir = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref='phase3-test-image',runtime_dir=?3,host_binary_path=?4,immutable_config_digest='sha256:codex-admission',launch_state='running',execution_generation=1 WHERE incarnation_id=?5",
+            rusqlite::params![
+                freshell_runtime_protocol::DockerDaemonId::new().as_str(),
+                format!("container-{}", prepared.incarnation_id),
+                runtime_dir.to_string_lossy(),
+                runtime_dir.join("freshell-session-host").to_string_lossy(),
+                prepared.incarnation_id.as_str(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                soul_id.clone(),
+                prepared.incarnation_id.clone(),
+                "native-codex-root".into(),
+            )
+            .await
+            .unwrap();
+        let before_binding = registry.recovery_context(soul_id.clone()).await.unwrap();
+        registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: before_binding.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: before_binding.evidence_revision,
+                execution_generation: 1,
+                requested_native_session_id: Some("native-codex-root".into()),
+            })
+            .await
+            .unwrap();
+        let current = registry.recovery_context(soul_id.clone()).await.unwrap();
+        let active = registry.active_handle_for_soul(soul_id).await.unwrap();
+        let host_boot_id = HostBootId::new();
+        let host = AuthenticatedHost {
+            capabilities: vec![
+                "native-identity-observation-v1".into(),
+                "fresh-agent-v1".into(),
+            ],
+            host_boot_id: host_boot_id.clone(),
+            secret: Vec::new(),
+            effective_limits: RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 64 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 32,
+            },
+        };
+        let mut status = HostStatus {
+            max_execution_generation: 1,
+            native_identity_observation: None,
+            host_boot_id,
+            worker_pid: Some(4321),
+            worker_launch_count: 1,
+            fixture_evidence: serde_json::json!({}),
+            exited: true,
+            native_session_id: None,
+            opencode_adoption: freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+            opencode_transfer_receipt: None,
+        };
+
+        assert!(codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &current,
+            &active,
+            &status,
+            &host,
+        ));
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Other,
+            &current,
+            &active,
+            &status,
+            &host,
+        ));
+
+        let mut changed = current.clone();
+        changed.provider = "claude".into();
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &changed,
+            &active,
+            &status,
+            &host,
+        ));
+        changed = current.clone();
+        changed.native_session_id = Some("changed-root".into());
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &changed,
+            &active,
+            &status,
+            &host,
+        ));
+        changed = current.clone();
+        changed.fresh_agent.as_mut().unwrap().native_session_id = Some("changed-root".into());
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &changed,
+            &active,
+            &status,
+            &host,
+        ));
+        changed = current.clone();
+        changed
+            .native_identity_launch
+            .as_mut()
+            .unwrap()
+            .launch_nonce = "different-launch".into();
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &changed,
+            &active,
+            &status,
+            &host,
+        ));
+
+        status.exited = false;
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &current,
+            &active,
+            &status,
+            &host,
+        ));
+        status.exited = true;
+        status.worker_pid = None;
+        assert!(!codex_recovery_send_is_admissible(
+            FreshHostAdmissionPurpose::Send,
+            &current,
+            &active,
+            &status,
+            &host,
+        ));
+    }
 }
 
 pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result<(), String> {
@@ -9786,6 +10302,15 @@ fn map_registry(error: RegistryError) -> RuntimeError {
         _ => RuntimeErrorCode::RegistryFailure,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+fn registry_error_category(error: &RegistryError) -> &'static str {
+    match error {
+        RegistryError::UnknownSoul(_) => "unknown_soul",
+        RegistryError::StaleControlEpoch { .. } => "stale_control_epoch",
+        RegistryError::InvalidState(_) => "invalid_state",
+        _ => "registry",
+    }
 }
 
 pub(crate) fn map_backend(error: BackendError) -> RuntimeError {
