@@ -561,10 +561,22 @@ function countNewNativeTextMatches(
 ): number {
   if (!previousTurnKeys || !echo.text) return 0
   const text = echo.text.trim()
-  return turns.filter((turn) => turn.role === 'user'
-    && belongsToNativeTurn(turn, submittedTurnId)
-    && !isTurnBeforeEchoBoundary(turn, previousTurnKeys)
-    && freshAgentTurnText(turn).trim() === text).length
+  return turns.reduce((count, turn) => {
+    if (turn.role !== 'user' || !belongsToNativeTurn(turn, submittedTurnId)
+      || isTurnBeforeEchoBoundary(turn, previousTurnKeys)) return count
+    // Codex groups consecutive user messages into one display row. Its text
+    // parts share the message ID before the :part:<index> suffix.
+    const messages = new Map<string, string[]>()
+    for (const item of turn.items) {
+      if (item.kind !== 'text') continue
+      const messageId = item.id.replace(/:part:\d+$/, '')
+      const parts = messages.get(messageId) ?? []
+      parts.push(item.text)
+      messages.set(messageId, parts)
+    }
+    if (messages.size === 0) return count + (turn.summary.trim() === text ? 1 : 0)
+    return count + [...messages.values()].filter((parts) => parts.join(' ').trim() === text).length
+  }, 0)
 }
 
 function localEchoLanded(
@@ -4177,14 +4189,17 @@ export function FreshAgentView({
       }
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
-      const displayTurns = mergeFreshAgentTranscriptProjection(displaySnapshot, liveProjection)
+      // The accepted snapshot may have replaced the projection in Redux.
+      // Read it back so the superseded projection cannot block a current idle.
+      const currentLiveProjection = appStore.getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(projectionLocator)]?.projection
+      const displayTurns = mergeFreshAgentTranscriptProjection(displaySnapshot, currentLiveProjection)
       // A live patch newer than this read may contain additional user rows or
       // ongoing work. An older idle read cannot settle the send or its echo.
-      const snapshotCoversLiveProjection = !liveProjection || Boolean(projectionMetadata
-        && liveProjection.id === projectionMetadata.id
-        && (liveProjection.historyGeneration < projectionMetadata.historyGeneration
-          || (liveProjection.historyGeneration === projectionMetadata.historyGeneration
-            && liveProjection.eventRevision <= projectionMetadata.eventRevision)))
+      const snapshotCoversLiveProjection = !currentLiveProjection || Boolean(projectionMetadata
+        && currentLiveProjection.id === projectionMetadata.id
+        && (currentLiveProjection.historyGeneration < projectionMetadata.historyGeneration
+          || (currentLiveProjection.historyGeneration === projectionMetadata.historyGeneration
+            && currentLiveProjection.eventRevision <= projectionMetadata.eventRevision)))
       const allowSettledTextMatch = snapshotAccepted && displaySnapshot.status === 'idle'
         && snapshotStatusAuthoritative
         && snapshotCoversLiveProjection
