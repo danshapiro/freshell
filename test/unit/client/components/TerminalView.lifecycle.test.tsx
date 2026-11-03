@@ -17984,6 +17984,21 @@ describe('unreadable-store notice line (session_store_unreadable, no-modal contr
       .filter((msg) => msg?.type === 'terminal.create')
   }
 
+  // Replay the captured write sequence into a modeled buffer: a mounted
+  // reconstruction reset WIPES it, every other write appends (the dead
+  // notice describe's modeledFinalBuffer, mirrored).
+  function modeledUnreadableFinalBuffer(ofTerm: { write: { mock: { calls: Array<[unknown]> } } }): string {
+    let buffer = ''
+    for (const data of terminalWriteStrings(ofTerm)) {
+      if (data === MOUNTED_RECONSTRUCTION) {
+        buffer = ''
+        continue
+      }
+      buffer += data
+    }
+    return buffer
+  }
+
   // Dispatch exactly what the fold's terminal session_store_unreadable arm
   // dispatches (setPaneRestoreError + the unreadable-store reconcileNotice
   // mint) — the fold level is pinned in pane-reconcile.test.ts.
@@ -18144,6 +18159,100 @@ describe('unreadable-store notice line (session_store_unreadable, no-modal contr
     expect(respawnCreate.sessionRef).toMatchObject({ provider: 'claude', sessionId: 'sess-unreadable-1' })
     expect(leafContent(store).restoreError).toBeUndefined()
     expect(leafContent(store).reconcileNotice).toBeUndefined()
+  })
+
+  it('retains the mint across terminal.created while the unreadable latch persists — no duplicate line, and a later surface reconstruction restores it (focused review round 4)', async () => {
+    // The finding's create-after-error path: the unreadable-store pane's
+    // create lane is NOT stood down (the dead-only stand-down doctrine), so
+    // its reconnect-retry resume create can anchor (terminal.created) while
+    // the pane's error{session_store_unreadable} latch and its durable mint
+    // still hold — the store remains unreadable, no recovery fold fired.
+    // The created anchor must treat the durable mint EXACTLY like the
+    // attach path does: neither write nor clear. Pre-fix the anchor wrote
+    // the raw STORE copy as a duplicate explanation line and CONSUMED the
+    // mint, leaving a later surface reconstruction with no copy source.
+    const harness = setupUnreadableNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('session_store_unreadable'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+    const { store } = harness
+    const first = render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={TAB_ID} paneId={PANE_ID} />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    // The boot re-fold mints (latch + notice) and the invariant writes the
+    // ONE honest framed line; the not-stood-down create lane fires its
+    // resume create (the permitted automatic create on reconnect).
+    foldUnreadableVerdict(store)
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+    await waitFor(() => {
+      expect(sentCreates()).toHaveLength(1)
+    })
+    expect(sentCreates()[0].requestId).toBe('req-unreadable-notice')
+
+    // The create anchors while the error latch persists.
+    const firstSurface = term()
+    await act(async () => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-unreadable-notice',
+        terminalId: 'term-unreadable-created-1',
+        createdAt: Date.now(),
+      })
+    })
+    await act(async () => {})
+
+    // RETENTION (the fix): the anchor consumed NOTHING — the latch
+    // persists (no recovery folded) and the mint stays RESIDENT with it,
+    // exactly like the attach path's retention.
+    expect(leafContent(store).restoreError?.reason).toBe('session_store_unreadable')
+    expect(leafContent(store).reconcileNotice).toBe(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE)
+
+    // NO duplicate line: the first surface's surviving buffer holds exactly
+    // ONE explanation — the level-triggered writer's framed line, re-issued
+    // after the anchor's reconstruction wipe — and NEVER the raw STORE copy
+    // (the one-shot anchor write pre-fix).
+    await waitFor(() => {
+      expect(modeledUnreadableFinalBuffer(firstSurface).split(NOTICE_LINE).length - 1).toBe(1)
+    })
+    expect(modeledUnreadableFinalBuffer(firstSurface)).not.toContain(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE)
+    expect(terminalWriteStrings(firstSurface).some((data) => data.includes(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE))).toBe(false)
+
+    // A later surface reconstruction (App view navigation unmount/remount)
+    // restores the line from the retained mint: the fresh surface — blank
+    // buffer, fresh refs — gets its explanation back.
+    first.unmount()
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={TAB_ID} paneId={PANE_ID} />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    const remountedSurface = terminalInstances[terminalInstances.length - 1]
+    expect(remountedSurface).not.toBe(firstSurface)
+    await waitFor(() => {
+      // FINAL SURVIVING BUFFER STATE (the round-3 assertion contract): the
+      // remount's attach legitimately wipes the notice-dirtied surface and
+      // the invariant re-issues the line post-wipe — read the modeled
+      // buffer, not the raw write count. Exactly ONE explanation line.
+      expect(modeledUnreadableFinalBuffer(remountedSurface).split(NOTICE_LINE).length - 1).toBe(1)
+    })
+    expect(modeledUnreadableFinalBuffer(remountedSurface)).not.toContain(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE)
+    // The mint is STILL resident — never re-consumed at a write.
+    expect(leafContent(store).reconcileNotice).toBe(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE)
   })
 
   it('category-honest copy source: a DEAD mint under the unreadable latch explains nothing (and never writes)', async () => {

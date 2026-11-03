@@ -6613,13 +6613,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           // One-shot reconcile notice (respawn/fresh verdicts — corrected,
           // fresh-by-reason, duplicate copies): render it now that the pane
-          // anchored, then clear it from the store. The dead-session mint is
-          // the RESIDENT durable copy source with exactly TWO writers (the
-          // INVALID_TERMINAL_ID stand-down gate and the notice effect's
-          // settled-surface writers) and is cleared with the dead latch by
-          // the store folds — this anchor neither writes nor clears it.
+          // anchored, then clear it from the store. The DURABLE mints (the
+          // dead copy and the unreadable-store copy) are the RESIDENT copy
+          // sources with their own machinery (the INVALID_TERMINAL_ID
+          // stand-down gate and the notice effect's settled-surface
+          // writers) and are cleared with their latches by the store folds
+          // — this anchor neither writes nor clears them, exactly like the
+          // attach path's retention (focused review round 4: the
+          // unreadable-store pane's create lane is never stood down, so
+          // this anchor is reachable with that latch persisting and must
+          // not consume its mint — the folds remain its only consumer, on
+          // error-cleared / pane-recovered).
           const createdReconcileNotice = contentRef.current?.reconcileNotice
-          if (createdReconcileNotice && !isDeadSessionReconcileNotice(createdReconcileNotice)) {
+          if (
+            createdReconcileNotice
+            && !isDeadSessionReconcileNotice(createdReconcileNotice)
+            && !isSessionStoreUnreadableReconcileNotice(createdReconcileNotice)
+          ) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
             if (createdReconcileNotice === RECONCILE_NOTICE_FRESH_BY_RACE) {
               setFreshByRaceNotice(createdReconcileNotice)
