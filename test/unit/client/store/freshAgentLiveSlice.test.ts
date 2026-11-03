@@ -506,6 +506,37 @@ describe('websocket routing into the live tail (transcript-live D3)', () => {
     },
   )
 
+  it.each([
+    ['CODEX_UNATTRIBUTED_PROVIDER_ERROR', 'warning'],
+    ['CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', 'info'],
+    ['CODEX_PENDING_PROVIDER_ERROR', 'warning'],
+    ['CODEX_PENDING_PROVIDER_ERROR_CLEARED', 'info'],
+  ] as const)('keeps user-facing feedback when %s follows in the same batch', (code, level) => {
+    const store = createStore()
+    const codex = { sessionId: 'codex-notice', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const codexFrame = (event: Record<string, unknown>) => ({
+      type: 'freshAgent.event', ...codex, event: { sessionId: codex.sessionId, ...event },
+    })
+    const warning = { type: 'freshAgent.notice', level: 'warning', code: 'CLI_WARNING', message: 'Check the configured provider.' }
+    expect(handleFreshAgentMessage(store.dispatch, codexFrame(warning))).toBe(true)
+    expect(handleFreshAgentMessage(store.dispatch, codexFrame({
+      type: 'freshAgent.notice', level, code, turnId: 'turn-1', message: 'Retained diagnostic changed.',
+    }))).toBe(true)
+    expect(tail(store, 'freshcodex:codex:codex-notice')?.notice).toMatchObject({
+      level: 'warning', code: warning.code, message: warning.message,
+    })
+  })
+
+  it('preserves notices with a matching code from another provider', () => {
+    const store = createStore()
+    expect(handleFreshAgentMessage(store.dispatch, frame({
+      type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', message: 'Provider feedback',
+    }))).toBe(true)
+    expect(tail(store)?.notice).toMatchObject({
+      level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', message: 'Provider feedback',
+    })
+  })
+
   it('applies a session\'s pending stream events before a stopped recovery removes it, leaving no tail behind', () => {
     vi.useFakeTimers()
     const store = createStore()
