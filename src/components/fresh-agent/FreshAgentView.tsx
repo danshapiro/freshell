@@ -1317,14 +1317,26 @@ export function FreshAgentView({
     level: 'info' | 'warning' | 'error'
     prominent?: boolean
     sourceSessionKey?: string
+    sourceCanonicalSessionKey?: string
     codexProviderError?: boolean
   } | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
-  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', sourceSessionKey?: string, codexProviderError = false) => {
+  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', source?: {
+    sessionKey: string
+    canonicalSessionKey?: string
+    codexProviderError?: boolean
+  }) => {
     setNoticeState(current => {
       if (text === null) return null
-      if (current?.text === text && current.level === level && current.sourceSessionKey === sourceSessionKey && Boolean(current.codexProviderError) === codexProviderError) return current
-      return { text, level, ...(sourceSessionKey ? { sourceSessionKey } : {}), ...(codexProviderError ? { codexProviderError } : {}) }
+      if (current?.text === text && current.level === level && current.sourceSessionKey === source?.sessionKey
+        && current.sourceCanonicalSessionKey === source?.canonicalSessionKey
+        && Boolean(current.codexProviderError) === Boolean(source?.codexProviderError)) return current
+      return {
+        text, level,
+        ...(source ? { sourceSessionKey: source.sessionKey } : {}),
+        ...(source?.canonicalSessionKey ? { sourceCanonicalSessionKey: source.canonicalSessionKey } : {}),
+        ...(source?.codexProviderError ? { codexProviderError: true } : {}),
+      }
     })
   }, [])
   const deliveryNoticeRef = useRef<{ requestId: string; text: string } | null>(null)
@@ -4781,6 +4793,11 @@ export function FreshAgentView({
   const liveSessionKey = paneContent.sessionId
     ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
     : undefined
+  const savedNoticeSessionId = (paneContent.sessionRef?.provider === paneContent.provider
+    ? paneContent.sessionRef.sessionId : undefined) ?? paneContent.resumeSessionId
+  const savedNoticeSessionKey = savedNoticeSessionId
+    ? makeFreshAgentSessionKey({ sessionId: savedNoticeSessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
+    : undefined
   const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
   const retainedSnapshot = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.retainedSnapshot : undefined)
   useEffect(() => {
@@ -4854,12 +4871,29 @@ export function FreshAgentView({
       || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR'
       || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
     const codexProviderError = paneContent.provider === 'codex' && liveNotice.code === 'CODEX_PROVIDER_ERROR'
-    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level, liveSessionKey, codexProviderError)
-  }, [liveNotice, liveSessionKey, paneContent.provider, setNotice])
+    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level, liveSessionKey ? {
+      sessionKey: liveSessionKey, canonicalSessionKey: savedNoticeSessionKey, codexProviderError,
+    } : undefined)
+  }, [liveNotice, liveSessionKey, paneContent.provider, savedNoticeSessionKey, setNotice])
   useLayoutEffect(() => {
-    if (!notice?.sourceSessionKey || !liveSessionKey || notice.sourceSessionKey === liveSessionKey) return
+    if (!notice?.sourceSessionKey) return
+    if (notice.sourceSessionKey === liveSessionKey) {
+      // A canonical identity may be learned after the live notice arrived.
+      if (!notice.sourceCanonicalSessionKey && savedNoticeSessionKey) {
+        setNoticeState(current => current === notice ? { ...current, sourceCanonicalSessionKey: savedNoticeSessionKey } : current)
+      }
+      return
+    }
+    const sameSavedConversation = savedNoticeSessionKey
+      && (savedNoticeSessionKey === notice.sourceSessionKey || savedNoticeSessionKey === notice.sourceCanonicalSessionKey)
+    if (sameSavedConversation) {
+      if (liveSessionKey) {
+        setNoticeState(current => current === notice ? { ...current, sourceSessionKey: liveSessionKey } : current)
+      }
+      return
+    }
     setNoticeState(current => current === notice ? null : current)
-  }, [notice, liveSessionKey])
+  }, [notice, liveSessionKey, savedNoticeSessionKey])
   const rawUnattributedCodexError = paneContent.provider === 'codex'
     ? snapshot?.extensions?.codex?.unattributedProviderError : undefined
   const unattributedCodexError = codexDiagnostic?.identity === snapshotHydrationIdentity

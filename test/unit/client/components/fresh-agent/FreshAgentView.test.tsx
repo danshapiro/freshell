@@ -2102,15 +2102,16 @@ describe('FreshAgentView', () => {
     })
 
     it.each([
-      [false, 'clears the old notice when no saved conversation remains'],
-      [true, 'retains the notice when the saved conversation is reconnecting'],
-    ])('%s: %s while the active session ID is absent', async (keepSavedIdentity) => {
+      [false, 'notice-gap-thread-a', 'clears the old notice when no saved conversation remains'],
+      [true, 'notice-gap-thread-a', 'retains the notice when the saved conversation is reconnecting'],
+      [true, 'notice-gap-durable-a', 'retains the notice when the saved conversation uses a different ID'],
+    ] as const)('%s: %s: %s while the active session ID is absent', async (keepSavedIdentity, savedSessionId) => {
       const store = createStore()
       const sessionId = 'notice-gap-thread-a'
       const first = {
         kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
-        createRequestId: 'notice-gap-create-a', sessionId, resumeSessionId: sessionId,
-        sessionRef: { provider: 'codex' as const, sessionId }, status: 'idle' as const,
+        createRequestId: 'notice-gap-create-a', sessionId, resumeSessionId: savedSessionId,
+        sessionRef: { provider: 'codex' as const, sessionId: savedSessionId }, status: 'idle' as const,
       }
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
         status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
@@ -2140,11 +2141,22 @@ describe('FreshAgentView', () => {
       act(() => store.dispatch(updatePaneContent({
         tabId: 'tab-1', paneId: 'pane-1', content: {
           ...first, sessionId: undefined, createRequestId: 'notice-gap-next-attempt',
+          status: keepSavedIdentity ? 'creating' : 'idle',
           resumeSessionId: keepSavedIdentity ? first.resumeSessionId : undefined,
           sessionRef: keepSavedIdentity ? first.sessionRef : undefined,
         },
       })))
       if (keepSavedIdentity) {
+        await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+        const newLiveId = 'notice-gap-rebound-live-handle'
+        apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+          status: 'idle', threadId: newLiveId, capabilities: { send: true, interrupt: true }, turns: [],
+        })
+        act(() => store.dispatch(updatePaneContent({
+          tabId: 'tab-1', paneId: 'pane-1', content: {
+            ...first, sessionId: newLiveId, createRequestId: 'notice-gap-rebound', status: 'idle',
+          },
+        })))
         await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
       } else {
         await waitFor(() => expect(notice()).toBeNull())
