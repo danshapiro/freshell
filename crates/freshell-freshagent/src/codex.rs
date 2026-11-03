@@ -1088,6 +1088,12 @@ enum EnsureAliveOutcome {
     Respawned { new_session_id: String },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrashRecoveryPolicy {
+    AllowNewThread,
+    SameRootOnly,
+}
+
 /// Why [`FreshCodexState::ensure_session_alive`] could not guarantee a live session.
 #[derive(Debug)]
 enum EnsureAliveError {
@@ -4233,7 +4239,10 @@ impl FreshCodexState {
                 }
             };
 
-        match self.ensure_session_alive(&session_id, send_fence).await {
+        match self
+            .ensure_session_alive(&session_id, send_fence, CrashRecoveryPolicy::AllowNewThread)
+            .await
+        {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
             // FIX-2: a resume-recovered session keeps its ORIGINAL id -- nothing for
             // `handle_send` to update, same as the already-running case.
@@ -5223,6 +5232,16 @@ impl FreshCodexState {
     /// `FreshAgentLostSessionError` parity) so the pane engages `markSessionLost`
     /// recovery rather than showing a dead-end banner.
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
+        self.handle_compact_with_recovery(msg, true).await;
+    }
+
+    /// Hosted compact has no typed root-transition result. Never mint a
+    /// conversation if its native runtime exits after the host's live check.
+    pub async fn handle_compact_current_native(&self, msg: FreshAgentCompact) {
+        self.handle_compact_with_recovery(msg, false).await;
+    }
+
+    async fn handle_compact_with_recovery(&self, msg: FreshAgentCompact, recover: bool) {
         let mut session_id = msg.session_id.clone();
 
         // b8ke ext r21 F2: the compact's delayed-request fence (the new
@@ -5244,7 +5263,19 @@ impl FreshCodexState {
                 }
             };
 
-        match self.ensure_session_alive(&session_id, compact_fence).await {
+        let alive = if recover {
+            self.ensure_session_alive(
+                &session_id,
+                compact_fence,
+                CrashRecoveryPolicy::AllowNewThread,
+            )
+            .await
+        } else if self.has_live_session(&session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning)
+        } else {
+            Err(EnsureAliveError::Reserved)
+        };
+        match alive {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
             // A resume-recovered session keeps its ORIGINAL id — nothing to re-key,
             // same as the already-running case.
@@ -5473,7 +5504,11 @@ impl FreshCodexState {
         // sidecar transparently respawns; genuinely lost sessions answer the
         // client's recovery-engaging INVALID_SESSION_ID shape.
         let thread_id = match self
-            .ensure_session_alive(&op.session_id, rollback_fence)
+            .ensure_session_alive(
+                &op.session_id,
+                rollback_fence,
+                CrashRecoveryPolicy::AllowNewThread,
+            )
             .await
         {
             Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
@@ -5864,7 +5899,14 @@ impl FreshCodexState {
                 }
             };
 
-        let parent_id = match self.ensure_session_alive(&msg.session_id, fork_fence).await {
+        let parent_id = match self
+            .ensure_session_alive(
+                &msg.session_id,
+                fork_fence,
+                CrashRecoveryPolicy::AllowNewThread,
+            )
+            .await
+        {
             Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
                 // A resume-recovered parent keeps its ORIGINAL id.
                 msg.session_id.clone()
@@ -7526,7 +7568,11 @@ impl FreshCodexState {
 
         let (session_id, active_turn_present, should_emit_snapshot) = if tracked {
             let (resolved_id, should_emit_snapshot) = match self
-                .ensure_session_alive(&msg.session_id, attach_fence)
+                .ensure_session_alive(
+                    &msg.session_id,
+                    attach_fence,
+                    CrashRecoveryPolicy::AllowNewThread,
+                )
                 .await
             {
                 Ok(EnsureAliveOutcome::AlreadyRunning) => (msg.session_id.clone(), false),
@@ -7683,6 +7729,7 @@ impl FreshCodexState {
         // map cannot confirm → the Adopt double-check), never a silent
         // recreation.
         observed: Option<freshell_ownership::ObservedFence>,
+        policy: CrashRecoveryPolicy,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
         // A natural exit whose writer tree was not yet confirmed leaves a
         // condemned identity and a typed coordinator fence. Finish that
@@ -7853,6 +7900,9 @@ impl FreshCodexState {
                         if live_session_key == session_id {
                             return Ok(EnsureAliveOutcome::Recovered);
                         }
+                        if policy == CrashRecoveryPolicy::SameRootOnly {
+                            return Err(EnsureAliveError::Reserved);
+                        }
                         return Ok(EnsureAliveOutcome::Respawned {
                             new_session_id: live_session_key,
                         });
@@ -7912,6 +7962,11 @@ impl FreshCodexState {
         // attempt (and the sidecar it would burn to re-prove it) and go straight to the
         // mint-new-thread fallback, which needs a fresh sidecar of its own regardless.
         if self.is_known_dead_thread(session_id).await {
+            if policy == CrashRecoveryPolicy::SameRootOnly {
+                return Err(EnsureAliveError::RespawnFailed(
+                    "same-root native history is unavailable".into(),
+                ));
+            }
             // kata b8ke Task 3: the mint-new fallback registers under a NEW
             // thread id — fail this OLD key's coordinator claim (RAII drop)
             // so it reopens; the fallback claims the new key itself.
@@ -8085,6 +8140,16 @@ impl FreshCodexState {
                 // NEW thread id — fail this OLD key's coordinator claim
                 // (RAII drop) so it reopens.
                 drop(own_ticket.take());
+                if policy == CrashRecoveryPolicy::SameRootOnly {
+                    // The failed resume's exact tree was confirmed dead above.
+                    // Unlike mint recovery, no successor consumes this guard.
+                    if let Some(mut guard) = lease_guard.take() {
+                        guard.fail();
+                    }
+                    return Err(EnsureAliveError::RespawnFailed(
+                        "same-root native history is unavailable".into(),
+                    ));
+                }
                 return self
                     .respawn_as_new_thread_after_crash(
                         session_id,
@@ -8352,6 +8417,31 @@ impl FreshCodexState {
         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.crash_recovery.resumed_same_thread");
 
         Ok(EnsureAliveOutcome::Recovered)
+    }
+
+    /// Prepare only an already established exact native root, without a user
+    /// turn. The mapped provider settings include accepted explicit clears.
+    pub async fn prepare_same_root_native_session(&self, session_id: &str) -> Result<(), String> {
+        match self
+            .ensure_session_alive(session_id, None, CrashRecoveryPolicy::SameRootOnly)
+            .await
+        {
+            Ok(EnsureAliveOutcome::AlreadyRunning | EnsureAliveOutcome::Recovered)
+                if self.has_live_session(session_id).await =>
+            {
+                Ok(())
+            }
+            Ok(_) => {
+                Err("same-root native preparation did not confirm its original runtime".into())
+            }
+            Err(EnsureAliveError::Reserved) => {
+                Err("SESSION_RESERVED: native cleanup or ownership is unsettled".into())
+            }
+            Err(EnsureAliveError::NotFound) => {
+                Err("same-root native session is not registered".into())
+            }
+            Err(EnsureAliveError::RespawnFailed(error)) => Err(error),
+        }
     }
 
     /// The ORIGINAL crash-recovery fallback (kept verbatim in behavior, just extracted so

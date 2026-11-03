@@ -308,6 +308,10 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn prepare_native_readiness(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Explicit readiness for Compact may resume only its retained native root.
+    async fn prepare_same_root_native_readiness(&self) -> Result<(), String> {
+        Err("same-root native readiness is unsupported".into())
+    }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
     async fn dispatch(
         &self,
@@ -966,6 +970,35 @@ impl FreshAgentHostActor {
             .await
             .map_err(ActorError::Transport)?;
         if self.stopped.load(Ordering::SeqCst) {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    pub async fn prepare_same_root_native_readiness(&self) -> Result<(), ActorError> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let profile = self.profile().await;
+        if self.stopped.load(Ordering::SeqCst)
+            || self.native_identity_transition.load(Ordering::SeqCst)
+            || profile.provider != FreshProvider::Codex
+            || profile.native_session_id.is_none()
+            || *self.observed_native_session_id.lock().await != profile.native_session_id
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        let result = self.transport.prepare_same_root_native_readiness().await;
+        if self.stopped.load(Ordering::SeqCst) {
+            // Stop revokes authority immediately. Its first shutdown can run
+            // before a held native resume registers; reap that late runtime too.
+            Arc::clone(&self.transport)
+                .stop()
+                .await
+                .map_err(ActorError::Transport)?;
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        result.map_err(ActorError::Transport)?;
+        if self.profile().await != profile || self.native_identity_transition.load(Ordering::SeqCst)
+        {
             return Err(ActorError::NativeIdentityMismatch);
         }
         Ok(())

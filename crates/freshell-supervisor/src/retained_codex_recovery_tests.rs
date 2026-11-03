@@ -79,6 +79,8 @@ struct ControlledCodex {
     source: Arc<std::sync::Mutex<NativeIdentityObservation>>,
     exited: Arc<AtomicBool>,
     inputs: Arc<AtomicUsize>,
+    prepares: Arc<AtomicUsize>,
+    compacts: Arc<AtomicUsize>,
     hold_ack: Arc<AtomicBool>,
     sending: Arc<Notify>,
     release: Arc<Notify>,
@@ -86,6 +88,7 @@ struct ControlledCodex {
     worker: Arc<AtomicBool>,
     capability: Arc<AtomicBool>,
     bad_ack: Arc<AtomicBool>,
+    prepare_refuse: Arc<AtomicBool>,
     peer: JoinHandle<()>,
 }
 
@@ -165,6 +168,8 @@ impl ControlledCodex {
         let source = Arc::new(std::sync::Mutex::new(parent));
         let exited = Arc::new(AtomicBool::new(true));
         let inputs = Arc::new(AtomicUsize::new(0));
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let compacts = Arc::new(AtomicUsize::new(0));
         let hold_ack = Arc::new(AtomicBool::new(false));
         let sending = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -172,11 +177,14 @@ impl ControlledCodex {
         let worker = Arc::new(AtomicBool::new(true));
         let capability = Arc::new(AtomicBool::new(true));
         let bad_ack = Arc::new(AtomicBool::new(false));
+        let prepare_refuse = Arc::new(AtomicBool::new(false));
         let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
         let peer = {
             let source = source.clone();
             let exited = exited.clone();
             let inputs = inputs.clone();
+            let prepares = prepares.clone();
+            let compacts = compacts.clone();
             let hold_ack = hold_ack.clone();
             let sending = sending.clone();
             let release = release.clone();
@@ -184,6 +192,7 @@ impl ControlledCodex {
             let worker = worker.clone();
             let capability = capability.clone();
             let bad_ack = bad_ack.clone();
+            let prepare_refuse = prepare_refuse.clone();
             let epoch = registry.control_epoch();
             tokio::spawn(async move {
                 loop {
@@ -191,6 +200,8 @@ impl ControlledCodex {
                     let source = source.clone();
                     let exited = exited.clone();
                     let inputs = inputs.clone();
+                    let prepares = prepares.clone();
+                    let compacts = compacts.clone();
                     let hold_ack = hold_ack.clone();
                     let sending = sending.clone();
                     let release = release.clone();
@@ -200,6 +211,7 @@ impl ControlledCodex {
                     let worker = worker.clone();
                     let capability = capability.clone();
                     let bad_ack = bad_ack.clone();
+                    let prepare_refuse = prepare_refuse.clone();
                     tokio::spawn(async move {
                         let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
                         if !matches!(request.body, HostCommand::Hello { .. }) {
@@ -233,6 +245,9 @@ impl ControlledCodex {
                                     ];
                                     if capability.load(Ordering::SeqCst) {
                                         values.push("fresh-agent-codex-recovery-source-v1".into());
+                                        values.push(
+                                            "fresh-agent-codex-same-root-readiness-v1".into(),
+                                        );
                                     }
                                     values
                                 },
@@ -294,6 +309,53 @@ impl ControlledCodex {
                                     }),
                                 }
                             }
+                            HostCommand::FreshAgentPrepareNative { .. } => {
+                                prepares.fetch_add(1, Ordering::SeqCst);
+                                if prepare_refuse.load(Ordering::SeqCst) {
+                                    write_frame(
+                                        &mut socket,
+                                        &HostReply {
+                                            request_id: request.request_id,
+                                            result: Err(RuntimeError::new(
+                                                RuntimeErrorCode::RecoveryBlocked,
+                                                "same-root history is unavailable",
+                                            )),
+                                        },
+                                    )
+                                    .await
+                                    .unwrap();
+                                    return;
+                                }
+                                sending.notify_one();
+                                if hold_ack.load(Ordering::SeqCst) {
+                                    release.notified().await;
+                                }
+                                exited.store(false, Ordering::SeqCst);
+                                HostResult::FreshAgentCommand {
+                                    state: CommandState::ProviderAcked,
+                                    claude_fork: None,
+                                    native_identity: None,
+                                    native_session_id: Some(
+                                        source.lock().unwrap().native_session_id.clone(),
+                                    ),
+                                }
+                            }
+                            HostCommand::FreshAgentCompact { .. } => {
+                                assert!(!exited.load(Ordering::SeqCst));
+                                compacts.fetch_add(1, Ordering::SeqCst);
+                                sending.notify_one();
+                                if hold_ack.load(Ordering::SeqCst) {
+                                    release.notified().await;
+                                }
+                                HostResult::FreshAgentCommand {
+                                    state: CommandState::ProviderAcked,
+                                    claude_fork: None,
+                                    native_identity: None,
+                                    native_session_id: Some(
+                                        source.lock().unwrap().native_session_id.clone(),
+                                    ),
+                                }
+                            }
                             HostCommand::ProbeRecovery {
                                 resume_spec: Some(resume_spec),
                                 ..
@@ -344,6 +406,8 @@ impl ControlledCodex {
             source,
             exited,
             inputs,
+            prepares,
+            compacts,
             hold_ack,
             sending,
             release,
@@ -351,6 +415,7 @@ impl ControlledCodex {
             worker,
             capability,
             bad_ack,
+            prepare_refuse,
             peer,
         }
     }
@@ -368,6 +433,25 @@ impl ControlledCodex {
                         settings: None,
                         expected_control_epoch: Some(self.supervisor.registry.control_epoch()),
                         checkpoint_logical_attempt_id: None,
+                    },
+                ),
+            })
+            .await
+            .result
+    }
+    async fn compact(&self) -> Result<AdminResult, RuntimeError> {
+        self.supervisor
+            .dispatch(Envelope {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                request_id: RequestId::new(),
+                role: ControlRole::Web,
+                auth: Some("synthetic-secret".into()),
+                body: AdminCommand::FreshAgentCompact(
+                    freshell_runtime_protocol::FreshAgentCompactRequest {
+                        soul_id: self.soul.clone(),
+                        instructions: None,
+                        cwd: None,
+                        expected_control_epoch: Some(self.supervisor.registry.control_epoch()),
                     },
                 ),
             })
@@ -424,6 +508,38 @@ impl Drop for ControlledCodex {
     fn drop(&mut self) {
         self.peer.abort();
     }
+}
+
+#[tokio::test]
+async fn public_compact_prepares_retained_codex_same_root_without_input_or_replacement() {
+    let fixture = ControlledCodex::new().await;
+    fixture.supervisor.observe_once().await.unwrap();
+    fixture.assert_retained().await;
+    let before = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.compact().await.unwrap(),
+        AdminResult::FreshAgentCommand {
+            state: CommandState::ProviderAcked
+        }
+    ));
+    fixture.compact().await.unwrap();
+    let after = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(before.native_session_id, after.native_session_id);
+    assert_eq!(before.write_fence(), after.write_fence());
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 2);
+    fixture.assert_retained().await;
 }
 
 #[tokio::test]
@@ -524,6 +640,127 @@ async fn observer_does_not_spend_attempt_while_native_ack_is_in_flight() {
     fixture.assert_retained().await;
     fixture.supervisor.observe_once().await.unwrap();
     fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn public_compact_rechecks_writer_and_generation_after_held_readiness() {
+    for case in [
+        "writer",
+        "generation",
+        "source",
+        "nonce",
+        "revision",
+        "host-boot",
+        "intent",
+        "stopped",
+        "capability",
+    ] {
+        let fixture = Arc::new(ControlledCodex::new().await);
+        fixture.hold_ack.store(true, Ordering::SeqCst);
+        let compact = {
+            let fixture = fixture.clone();
+            tokio::spawn(async move { fixture.compact().await })
+        };
+        fixture.sending.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), fixture.supervisor.observe_once())
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.assert_retained().await;
+        let conn = Connection::open(fixture.supervisor.registry.database_path()).unwrap();
+        match case {
+            "writer" => {
+                conn.execute("DELETE FROM writer_claims", []).unwrap();
+            }
+            "generation" => {
+                conn.execute("UPDATE incarnations SET execution_generation=2", [])
+                    .unwrap();
+            }
+            "source" => fixture.source.lock().unwrap().native_session_id = "foreign-root".into(),
+            "nonce" => fixture.source.lock().unwrap().launch_nonce = "foreign-nonce".into(),
+            "revision" => fixture.source.lock().unwrap().evidence_revision += 1,
+            "host-boot" => {
+                conn.execute(
+                    "UPDATE incarnations SET host_boot_id=?1",
+                    [HostBootId::new().as_str()],
+                )
+                .unwrap();
+            }
+            "intent" => {
+                conn.execute("UPDATE souls SET intent_revision=intent_revision+1", [])
+                    .unwrap();
+            }
+            "stopped" => {
+                conn.execute("UPDATE souls SET desired_state='stopped'", [])
+                    .unwrap();
+            }
+            "capability" => fixture.capability.store(false, Ordering::SeqCst),
+            _ => unreachable!(),
+        }
+        fixture.release.notify_one();
+        assert!(
+            compact.await.unwrap().is_err(),
+            "changed {case} must refuse before strict Compact"
+        );
+        assert_eq!(fixture.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.compacts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.attempts(), 0);
+    }
+}
+
+#[tokio::test]
+async fn public_compact_refusal_preserves_later_explicit_send_recovery() {
+    let fixture = ControlledCodex::new().await;
+    fixture.prepare_refuse.store(true, Ordering::SeqCst);
+    assert!(fixture.compact().await.is_err());
+    fixture.supervisor.observe_once().await.unwrap();
+    fixture.assert_retained().await;
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    fixture.send(RequestId::new()).await.unwrap();
+    fixture.send(RequestId::new()).await.unwrap();
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture
+            .supervisor
+            .registry
+            .recovery_context(fixture.soul.clone())
+            .await
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("native-child")
+    );
+    fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn observer_during_compact_readiness_and_compact_does_not_spend_attempt() {
+    for preparing in [false, true] {
+        let fixture = Arc::new(ControlledCodex::new().await);
+        fixture.exited.store(preparing, Ordering::SeqCst);
+        fixture.hold_ack.store(true, Ordering::SeqCst);
+        let operation = {
+            let fixture = fixture.clone();
+            tokio::spawn(async move { fixture.compact().await })
+        };
+        fixture.sending.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), fixture.supervisor.observe_once())
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.assert_retained().await;
+        fixture.hold_ack.store(false, Ordering::SeqCst);
+        fixture.release.notify_one();
+        operation.await.unwrap().unwrap();
+        fixture.assert_retained().await;
+        fixture.peer.abort();
+        fixture.backend.ended.store(true, Ordering::SeqCst);
+        fixture.supervisor.observe_once().await.unwrap();
+        assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.attempts(), 1);
+    }
 }
 
 #[tokio::test]
@@ -670,6 +907,17 @@ async fn public_send_recovery_keeps_owner_source_and_control_fences() {
         }
         let before = fixture.inputs.load(Ordering::SeqCst);
         assert!(fixture.send(RequestId::new()).await.is_err(), "{case}");
+        assert!(fixture.compact().await.is_err(), "{case} Compact");
+        assert_eq!(
+            fixture.prepares.load(Ordering::SeqCst),
+            0,
+            "{case} never prepares"
+        );
+        assert_eq!(
+            fixture.compacts.load(Ordering::SeqCst),
+            0,
+            "{case} never compacts"
+        );
         assert_eq!(
             fixture.inputs.load(Ordering::SeqCst),
             before,
@@ -681,11 +929,6 @@ async fn public_send_recovery_keeps_owner_source_and_control_fences() {
 #[tokio::test]
 async fn retained_codex_recovery_does_not_admit_native_controls() {
     let fixture = ControlledCodex::new().await;
-    assert!(fixture
-        .supervisor
-        .fresh_agent_compact(RequestId::new(), fixture.soul.clone(), None, None)
-        .await
-        .is_err());
     assert!(fixture
         .supervisor
         .fresh_agent_resolve(

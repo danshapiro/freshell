@@ -797,6 +797,7 @@ async fn dispatch_with_effects(
                     "native-identity-observation-v1".into(),
                     "fresh-agent-native-readiness-v1".into(),
                     "fresh-agent-codex-recovery-source-v1".into(),
+                    "fresh-agent-codex-same-root-readiness-v1".into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
@@ -1032,6 +1033,9 @@ async fn dispatch_with_effects(
                 HostCommand::FreshAgentPrepareNative { incarnation_id } => {
                     let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
+                    // Keep the recovery future off every command's dispatch
+                    // stack, including SEND's existing native recovery path.
+                    Box::pin(prepare_same_root_codex_native(state)).await?;
                     ensure_current_fresh_native_observation(state).await?;
                     let persisted = state.persisted.lock().await.clone();
                     let observation = current_native_observation(state, &persisted)
@@ -2727,6 +2731,55 @@ async fn commit_fresh_native_transition(
         serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
         "executionGeneration":persisted.max_execution_generation,
         "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
+    Ok(())
+}
+
+async fn prepare_same_root_codex_native(state: &HostState) -> Result<(), RuntimeError> {
+    let before = state.persisted.lock().await.clone();
+    if before.provider.as_deref() != Some("codex")
+        || current_native_observation(state, &before).await.is_some()
+    {
+        return Ok(());
+    }
+    let refuse = || {
+        RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "same-root native readiness requires the current retained Codex source",
+        )
+    };
+    let actor = state.fresh_agent.lock().await.clone().ok_or_else(refuse)?;
+    let source = retained_codex_recovery_source(state, &before, &actor)
+        .await
+        .ok_or_else(refuse)?;
+    actor
+        .prepare_same_root_native_readiness()
+        .await
+        .map_err(map_actor_error)?;
+    let current = state.persisted.lock().await.clone();
+    if current.native_identity_launch != before.native_identity_launch
+        || current.max_execution_generation != before.max_execution_generation
+        || current.max_control_epoch != before.max_control_epoch
+        || current.host_boot_id != before.host_boot_id
+        || !state
+            .control_fence
+            .lock()
+            .unwrap()
+            .is_current_running(current.max_control_epoch, current.max_execution_generation)
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|attached| Arc::ptr_eq(attached, &actor))
+        || current_native_observation(state, &current)
+            .await
+            .is_none_or(|proof| proof.native_session_id != source.native_session_id)
+    {
+        // A changed launch/control fence revokes this preparation. It may
+        // have registered after the earlier owner was stopped or replaced.
+        actor.stop().await.map_err(map_actor_error)?;
+        return Err(refuse());
+    }
     Ok(())
 }
 
@@ -10772,6 +10825,23 @@ mod tests {
         .await
         .unwrap();
         *state.fresh_agent.lock().await = Some(actor.clone());
+        for command in [
+            HostCommand::FreshAgentPrepareNative {
+                incarnation_id: state.incarnation_id.clone(),
+            },
+            HostCommand::FreshAgentCompact {
+                incarnation_id: state.incarnation_id.clone(),
+                request_id: RequestId::new(),
+                instructions: None,
+                cwd: None,
+            },
+        ] {
+            assert!(
+                dispatch(authenticated_host_envelope(&state, command), &state)
+                    .await
+                    .is_err()
+            );
+        }
         let result = dispatch(
             authenticated_host_envelope(
                 &state,

@@ -36,6 +36,13 @@ use tokio::{
     time::{sleep, Duration, Instant},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreshNativeAdmission {
+    Live,
+    CodexSendRecovery,
+    CodexCompactReadiness,
+}
+
 /// Private cause information retained before the public runtime error projection.
 struct ClassifiedFailure {
     error: RuntimeError,
@@ -2455,7 +2462,7 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_fresh_host(&soul_id, &active, true)
+            .authenticate_fresh_host(&soul_id, &active, FreshNativeAdmission::CodexSendRecovery)
             .await?;
         let (disposition, incarnation_id) = self
             .registry
@@ -2584,14 +2591,15 @@ impl Supervisor {
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
     ) -> Result<AuthenticatedHost, RuntimeError> {
-        self.authenticate_fresh_host(soul_id, active, false).await
+        self.authenticate_fresh_host(soul_id, active, FreshNativeAdmission::Live)
+            .await
     }
 
     async fn authenticate_fresh_host(
         &self,
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
-        allow_codex_recovery: bool,
+        admission: FreshNativeAdmission,
     ) -> Result<AuthenticatedHost, RuntimeError> {
         let host = self
             .authenticate_host(active.incarnation_id(), active.runtime_dir())
@@ -2634,11 +2642,21 @@ impl Supervisor {
                     .iter()
                     .any(|capability| capability == required)
             });
-        if can_prepare
+        let codex_prepare = admission == FreshNativeAdmission::CodexCompactReadiness
+            && host
+                .capabilities
+                .iter()
+                .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1")
+            && self
+                .retained_codex_host_eligible(&current, &host, &status)
+                .await?;
+        if (can_prepare || codex_prepare)
             && (status.exited
                 || crate::recovery::current_native_observation(&current, &status).is_none())
         {
             let before = current.write_fence();
+            let before_launch = current.native_identity_launch.clone();
+            let before_root = current.native_session_id.clone();
             let result = self
                 .await_running_startup(
                     soul_id,
@@ -2665,6 +2683,29 @@ impl Supervisor {
                     "unexpected fresh-agent native readiness reply",
                 ));
             }
+            if codex_prepare {
+                if !matches!(&result, HostResult::FreshAgentCommand { native_session_id, .. } if native_session_id == &before_root)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "same-root readiness acknowledged a different native root",
+                    ));
+                }
+                let refreshed = self
+                    .authenticate_host(active.incarnation_id(), active.runtime_dir())
+                    .await?;
+                if refreshed.host_boot_id != host.host_boot_id
+                    || !refreshed
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "fresh-agent-codex-same-root-readiness-v1")
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::HostAuthenticationFailed,
+                        "native readiness changed its authenticated host",
+                    ));
+                }
+            }
             status = self
                 .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
                 .await?;
@@ -2673,14 +2714,50 @@ impl Supervisor {
                 .recovery_context(soul_id.clone())
                 .await
                 .map_err(map_registry)?;
-            if current.write_fence() != before {
+            if current.write_fence() != before
+                || (codex_prepare
+                    && (current.native_identity_launch != before_launch
+                        || current.native_session_id != before_root
+                        || status.native_session_id != before_root))
+            {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::StaleIntentRevision,
                     "fresh-agent owner or intent changed during native readiness",
                 ));
             }
+            if codex_prepare {
+                let proof = crate::recovery::current_native_observation(&current, &status)
+                    .filter(|_| {
+                        status.host_boot_id == host.host_boot_id
+                            && status.max_control_epoch == current.control_epoch
+                            && status.worker_pid.is_some()
+                            && !status.exited
+                    })
+                    .ok_or_else(|| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "same-root readiness did not publish current live native proof",
+                        )
+                    })?;
+                if !self
+                    .registry
+                    .validate_fresh_codex_recovery_source(
+                        soul_id.clone(),
+                        proof.clone(),
+                        status.host_boot_id.clone(),
+                        before,
+                    )
+                    .await
+                    .map_err(map_registry)?
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "same-root readiness lost its current native writer",
+                    ));
+                }
+            }
         }
-        let retained_codex = allow_codex_recovery
+        let retained_codex = admission == FreshNativeAdmission::CodexSendRecovery
             && self
                 .retained_codex_host_eligible(&current, &host, &status)
                 .await?;
@@ -2872,7 +2949,11 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &handle)
+            .authenticate_fresh_host(
+                &soul_id,
+                &handle,
+                FreshNativeAdmission::CodexCompactReadiness,
+            )
             .await?;
         let context = self
             .registry
