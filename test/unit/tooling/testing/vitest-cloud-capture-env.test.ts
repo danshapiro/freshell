@@ -5,6 +5,8 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 const fixtureRoots: string[] = []
+const captureEnvironmentKey = 'FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT'
+const captureEnvironmentAssignment = `${captureEnvironmentKey}=1`
 
 afterEach(() => {
   for (const root of fixtureRoots.splice(0)) rmSync(root, { recursive: true, force: true })
@@ -17,6 +19,25 @@ function getUpdateEnvVarsValue(args: string[]): string | undefined {
 
   const flagArgument = args[flagIndex]
   return flagArgument === flag ? args[flagIndex + 1] : flagArgument.slice(flag.length + 1)
+}
+
+function parseEnvironmentAssignments(value: string): string[] {
+  let delimiter = ','
+  let assignments = value
+  if (value.startsWith('^')) {
+    const prefix = value.match(/^\^([^^]+)\^/)
+    if (!prefix) throw new Error('Malformed custom environment delimiter prefix')
+    delimiter = prefix[1]
+    assignments = value.slice(prefix[0].length)
+  }
+  return assignments.split(delimiter)
+}
+
+function getEnvironmentAssignmentsForKey(entries: string[], key: string): string[] {
+  return entries.filter(entry => {
+    const separatorIndex = entry.indexOf('=')
+    return separatorIndex >= 0 && entry.slice(0, separatorIndex) === key
+  })
 }
 
 function runCloudVitestWrapper(captureEnabled: boolean): string[] {
@@ -76,15 +97,37 @@ exit 0
 }
 
 describe('Cloud Vitest capture environment', () => {
+  it('parses comma-delimited env map entries', () => {
+    expect(parseEnvironmentAssignments('TEST_MODE=vitest,VITEST_CONFIGS=default')).toEqual([
+      'TEST_MODE=vitest',
+      'VITEST_CONFIGS=default',
+    ])
+  })
+
+  it('derives custom delimiters and keeps embedded assignment text in its value', () => {
+    const embeddedValue = `^|^TEST_MODE=vitest|VITEST_ARGS_JSON=["test/file","${captureEnvironmentAssignment}"]`
+    const entries = parseEnvironmentAssignments(embeddedValue)
+
+    expect(entries).toEqual([
+      'TEST_MODE=vitest',
+      `VITEST_ARGS_JSON=["test/file","${captureEnvironmentAssignment}"]`,
+    ])
+    expect(getEnvironmentAssignmentsForKey(entries, captureEnvironmentKey)).toEqual([])
+  })
+
   it('forwards the native Codex capture opt-in only when requested', () => {
     const enabledArgs = runCloudVitestWrapper(true)
     const enabledUpdateEnvVars = getUpdateEnvVarsValue(enabledArgs)
     expect(enabledUpdateEnvVars).toBeDefined()
-    expect(enabledUpdateEnvVars).toContain('FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT=1')
+    const enabledEntries = parseEnvironmentAssignments(enabledUpdateEnvVars!)
+    expect(getEnvironmentAssignmentsForKey(enabledEntries, captureEnvironmentKey)).toEqual([
+      captureEnvironmentAssignment,
+    ])
 
     const disabledArgs = runCloudVitestWrapper(false)
     const disabledUpdateEnvVars = getUpdateEnvVarsValue(disabledArgs)
     expect(disabledUpdateEnvVars).toBeDefined()
-    expect(disabledUpdateEnvVars).not.toContain('FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT')
+    const disabledEntries = parseEnvironmentAssignments(disabledUpdateEnvVars!)
+    expect(getEnvironmentAssignmentsForKey(disabledEntries, captureEnvironmentKey)).toEqual([])
   })
 })
