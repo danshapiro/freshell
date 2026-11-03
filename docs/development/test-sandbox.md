@@ -112,7 +112,9 @@ the selected Playwright case. The browser test runs inside
 `scripts/sandbox-test.sh`; the host never executes its test body. The owner
 hands the sandbox a private read-only descriptor file, and the browser process
 receives only the five target/run identity values plus the fixed spec and title.
-The sandbox gets no Docker socket, provider home, or cloud credential.
+The file sits in a host directory with owner-only access; its read-only mode
+lets the nonroot sandbox user read the mounted descriptor. The sandbox gets no
+Docker socket, provider home, or cloud credential.
 
 The browser container uses the existing `freshell-sandbox` bridge so it can
 reach the owner's HTTPS/WSS tunnel. Its root remains read-only, it runs as the

@@ -3346,14 +3346,14 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     this.sandboxHandoffDirectory = directory
     await fsp.chmod(directory, 0o700)
     const file = path.join(directory, 'external-target.json')
-    await fsp.writeFile(file, `${JSON.stringify(handoff)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
-    await fsp.chmod(file, 0o600)
+    await fsp.writeFile(file, `${JSON.stringify(handoff)}\n`, { encoding: 'utf8', mode: 0o444, flag: 'wx' })
+    await fsp.chmod(file, 0o444)
     const directoryStat = await fsp.stat(directory)
     const fileStat = await fsp.lstat(file)
     if (!fileStat.isFile() || fileStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700
-      || (fileStat.mode & 0o777) !== 0o600 || directoryStat.uid !== process.getuid?.()
+      || (fileStat.mode & 0o777) !== 0o444 || directoryStat.uid !== process.getuid?.()
       || fileStat.uid !== process.getuid?.()) {
-      throw new Error('P2-G01 handoff must remain in a private owner-only temporary file')
+      throw new Error('P2-G01 handoff must remain in an owner-only directory with a read-only descriptor')
     }
     this.sandboxHandoffFile = file
     return file

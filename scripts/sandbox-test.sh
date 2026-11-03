@@ -218,9 +218,9 @@ else
     DESCRIPTOR_DIR="$(dirname "${EXTERNAL_DESCRIPTOR_PATH}")"
     DESCRIPTOR_DIR_MODE="$(stat -c '%a' "${DESCRIPTOR_DIR}")"
     DESCRIPTOR_DIR_UID="$(stat -c '%u' "${DESCRIPTOR_DIR}")"
-    if [ "${DESCRIPTOR_FILE_MODE}" != 600 ] || [ "${DESCRIPTOR_DIR_MODE}" != 700 ] \
+    if [ "${DESCRIPTOR_FILE_MODE}" != 444 ] || [ "${DESCRIPTOR_DIR_MODE}" != 700 ] \
       || [ "${DESCRIPTOR_FILE_UID}" != "$(id -u)" ] || [ "${DESCRIPTOR_DIR_UID}" != "$(id -u)" ]; then
-      echo '[sandbox] P2-G01 descriptor and parent directory must be owned by the caller with modes 0600 and 0700' >&2
+      echo '[sandbox] P2-G01 descriptor must be caller-owned, read-only 0444 inside its private 0700 parent directory' >&2
       exit 2
     fi
     python3 - "${EXTERNAL_DESCRIPTOR_PATH}" <<'PY'

@@ -72,6 +72,9 @@ chmod 0700 "${FAKE_BIN}/docker"
 
 write_descriptor() {
   local target_path="$1" selector="$2"
+  if [ -e "${target_path}" ]; then
+    chmod 0600 "${target_path}"
+  fi
   python3 - "${target_path}" "${selector}" <<'PY'
 import json
 import sys
@@ -89,7 +92,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(descriptor, stream)
     stream.write("\n")
 PY
-  chmod 0600 "${target_path}"
+  chmod 0444 "${target_path}"
 }
 
 run_external() {
