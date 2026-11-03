@@ -2229,7 +2229,25 @@ async fn verified_loss_cleanup_preserves_an_unadmitted_send_refusal() {
     use freshell_runtime_protocol::RequestId;
 
     let dir = tempfile::tempdir().unwrap();
-    let (registry, initial) = prepared_context(dir.path()).await;
+    let (registry, original) = prepared_context(dir.path()).await;
+    let queued = RequestId::parse("queued-before-loss").unwrap();
+    let completed = RequestId::parse("completed-before-loss").unwrap();
+    for request in [&queued, &completed] {
+        registry
+            .begin_input(
+                original.soul_id.clone(),
+                (*request).clone(),
+                b"already admitted",
+                Some(b"null"),
+            )
+            .await
+            .unwrap();
+    }
+    registry
+        .mark_input_completed(original.soul_id.clone(), completed.clone())
+        .await
+        .unwrap();
+    let initial = registry.recovery_context(original.soul_id).await.unwrap();
     registry
         .mark_recovery_blocked(
             initial.soul_id.clone(),
@@ -2283,6 +2301,17 @@ async fn verified_loss_cleanup_preserves_an_unadmitted_send_refusal() {
             .unwrap(),
         Some(InputJournalDisposition::Refused(refusal))
     );
+    let database = Connection::open(registry.database_path()).unwrap();
+    for (request, expected) in [(&queued, "cancelled"), (&completed, "completed")] {
+        let state: String = database
+            .query_row(
+                "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                params![initial.soul_id.as_str(), request.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, expected);
+    }
     let after = registry.recovery_context(initial.soul_id).await.unwrap();
     assert_eq!(after.accepted_command_count, initial.accepted_command_count);
     assert_eq!(
