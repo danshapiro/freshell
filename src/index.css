@@ -1624,8 +1624,8 @@ body {
 @container (max-width: 899px) or (max-height: 479px) {
   .fresh-agent-error-summary-full { display: none; }
   .fresh-agent-error-summary-compact { display: inline; }
-  /* Keep room for pending requests; the disclosure retains the full message. */
-  .fresh-agent-error-summaries > details:not([open]) > summary {
+  /* Bound errors while leaving warning instructions readable before opening. */
+  .fresh-agent-error-summaries > details[data-agent-diagnostic-level="error"]:not([open]) > summary {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
