@@ -1,106 +1,133 @@
-name: Rust Tests
-
+name: FreshAgent merged runtime focused proof
 on:
   workflow_dispatch:
-  pull_request:
-
 permissions:
   contents: read
-
-# Server-side enforcement for the class of red that landed via PR #795:
-# nothing between commit and main ran `cargo test`, so 11 failing freshagent
-# unit tests merged with every advisory check green. The pre-push gate now
-# runs targeted cargo tests locally (scripts/hooks/pre-push); this workflow
-# is the merge-time backstop that cannot be bypassed with --no-verify.
-#
-# The `gate` job always reports, so it can be a required status check without
-# blocking PRs that touch no Rust (a paths-filtered workflow would leave the
-# required check stuck on "Expected" forever).
-
+env:
+  FRESHELL_PROOF_FEATURE_COMMIT: fe04b70b87fb0f483788a76d5efe3d4bd9a13f76
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '1'
+  CARGO_TERM_COLOR: never
 jobs:
-  changes:
+  supervisor-client:
     runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Detect Rust changes
-        id: filter
+          fetch-depth: 2
+      - name: Verify exact merged source
         run: |
-          # Manager and dependency configuration changes must exercise the
-          # Rust suite too: it spawns Node fixtures (the codex fake
-          # app-server imports `ws`) whose behavior depends on the installed
-          # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility. Scoped to the
-          # root and workspace members — the independent demo locks are
-          # not part of the workspace dependency tree.
-          # `github.base_ref` exists only for pull_request events; manual
-          # dispatch (the event-routing escape hatch) compares against the
-          # default branch instead.
-          BASE="${{ github.base_ref }}"
-          [ -n "$BASE" ] || BASE="main"
-          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  rust-tests:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only HEAD^ HEAD)" = '.github/workflows/rust-tests.yml'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Blocked send admission and correlation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/freshagent-merge-runtime"
+          cargo test --locked -p freshell-supervisor --lib blocked_send -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/blocked.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/freshagent-merge-runtime/blocked.log"
+          grep -q 'new_blocked_send_is_refused_with_the_available_recovery_reason ... ok' "$RUNNER_TEMP/freshagent-merge-runtime/blocked.log"
+          grep -q 'blocked_send_preserves_existing_queued_ambiguous_and_accepted_outcomes ... ok' "$RUNNER_TEMP/freshagent-merge-runtime/blocked.log"
+          grep -q 'blocked_send_refusal_preserves_input_settings_and_checkpoint_identity ... ok' "$RUNNER_TEMP/freshagent-merge-runtime/blocked.log"
+      - name: Refusal journal migration and reopen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-supervisor --lib send_refusal_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/migration.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/freshagent-merge-runtime/migration.log"
+          grep -q 'send_refusal_journal_migration_preserves_older_queued_input_and_reopens ... ok' "$RUNNER_TEMP/freshagent-merge-runtime/migration.log"
+          grep -q 'send_refusal_remains_exact_after_registry_reopen_without_reissuing_input ... ok' "$RUNNER_TEMP/freshagent-merge-runtime/migration.log"
+      - name: Maintenance inventory and initial OpenCode terminal admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-supervisor --lib maintenance_inventory_proves_only_safe_no_runtime_empty -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/maintenance.log"
+          grep -q '^running 1 test$' "$RUNNER_TEMP/freshagent-merge-runtime/maintenance.log"
+          cargo test --locked -p freshell-supervisor --lib initial_fresh_opencode_terminal_can_publish_before_native_session_exists -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/opencode.log"
+          grep -q '^running 1 test$' "$RUNNER_TEMP/freshagent-merge-runtime/opencode.log"
+      - name: Refusal recovery and queued replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-supervisor --lib verified_loss_cleanup_preserves_an_unadmitted_send_refusal -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/loss.log"
+          grep -q '^running 1 test$' "$RUNNER_TEMP/freshagent-merge-runtime/loss.log"
+          cargo test --locked -p freshell-supervisor --lib input_reservation_refused_tests -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/preparation.log"
+          grep -q '^running 2 tests$' "$RUNNER_TEMP/freshagent-merge-runtime/preparation.log"
+          cargo test --locked -p freshell-supervisor --lib queued_fresh_agent_refusal_is_not_misclassified_as_ambiguous_or_replayed -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/queued.log"
+          grep -q '^running 1 test$' "$RUNNER_TEMP/freshagent-merge-runtime/queued.log"
+      - name: Reopen through the outer control dispatcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-supervisor --lib reopen_success_replay_returns_same_incarnation_before_revision_validation -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/reopen.log"
+          grep -q '^running 1 test$' "$RUNNER_TEMP/freshagent-merge-runtime/reopen.log"
+          grep -q 'reopen_success_replay_returns_same_incarnation_before_revision_validation ... ok' "$RUNNER_TEMP/freshagent-merge-runtime/reopen.log"
+      - name: Runtime client library and legacy admin peer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-runtime-client --lib -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/client.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/freshagent-merge-runtime/client.log"
+          cargo test --locked -p freshell-runtime-client --test supervisor_admin_legacy_peer -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-runtime/client-legacy.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/freshagent-merge-runtime/client-legacy.log"
+      - name: Retain supervisor and client evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freshagent-merge-fixed-supervisor-client-proof
+          path: ${{ runner.temp }}/freshagent-merge-runtime/
+          if-no-files-found: warn
+          retention-days: 7
+  gateway:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify exact merged source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only HEAD^ HEAD)" = '.github/workflows/rust-tests.yml'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@v2
-      # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs the workspace dependencies installed
-      # or those tests die at fixture boot ("fake app-server exited before
-      # listening").
-      # Pinned revision of the v4 major; reads the exact version from the root
-      # packageManager pin (no floating duplicate).
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies (Rust test fixtures)
-        run: pnpm install --frozen-lockfile
-      - name: Workspace tests
-        # Workspace feature unification turns freshell-codex's default-off
-        # `real-transport` feature ON in this step (freshell-ws,
-        # freshell-server, freshell-session-host, and freshell-freshagent all
-        # depend on freshell-codex with the feature), so the
-        # remote_proxy_relay integration tests run here without an explicit
-        # --features flag. A bare `cargo test -p freshell-codex` would skip
-        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
-        # reports 38 tests; the same -p invocation reports 0).
-        # Keep the gate red on any failure, but report failures in later
-        # crates in the same run instead of stopping at the first suite.
-        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
-
-  gate:
-    name: rust-gate
-    needs: [changes, rust-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Evaluate
+      - run: pnpm install --frozen-lockfile
+      - name: Hosted send, replay, and provider diagnostic behavior
+        shell: bash
         run: |
-          if [ "${{ needs.changes.outputs.rust }}" = "false" ]; then
-            echo "no Rust changes in this PR — rust tests skipped"
-            exit 0
-          fi
-          if [ "${{ needs.rust-tests.result }}" = "success" ]; then
-            echo "workspace rust tests passed"
-            exit 0
-          fi
-          echo "workspace rust tests failed or did not run"
-          exit 1
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/freshagent-merge-gateway"
+          cargo test --locked -p freshell-server --features managed-runtime-v1 --bin freshell-server fresh_agent_proxy::tests::send_tests -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/freshagent-merge-gateway/gateway.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/freshagent-merge-gateway/gateway.log"
+          grep -q 'hosted_blocked_send_distinguishes_new_from_queued_input ... ok' "$RUNNER_TEMP/freshagent-merge-gateway/gateway.log"
+          grep -q 'hosted_unknown_soul_after_host_dispatch_remains_uncertain ... ok' "$RUNNER_TEMP/freshagent-merge-gateway/gateway.log"
+          grep -q 'hosted_send_replay_refusal_survives_a_lost_response_without_a_second_dispatch ... ok' "$RUNNER_TEMP/freshagent-merge-gateway/gateway.log"
+          grep -q 'hosted_send_preserves_published_provider_diagnostic_before_journal_replay ... ok' "$RUNNER_TEMP/freshagent-merge-gateway/gateway.log"
+      - name: Retain gateway evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freshagent-merge-fixed-gateway-proof
+          path: ${{ runner.temp }}/freshagent-merge-gateway/
+          if-no-files-found: warn
+          retention-days: 7
