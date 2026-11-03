@@ -1,106 +1,111 @@
-name: Rust Tests
+name: FreshAgent supplementary proof
 
+# This file is intended only for a disposable proof ref. The unchanged
+# feature ref runs the full workspace workflow separately.
 on:
   workflow_dispatch:
-  pull_request:
 
 permissions:
   contents: read
 
-# Server-side enforcement for the class of red that landed via PR #795:
-# nothing between commit and main ran `cargo test`, so 11 failing freshagent
-# unit tests merged with every advisory check green. The pre-push gate now
-# runs targeted cargo tests locally (scripts/hooks/pre-push); this workflow
-# is the merge-time backstop that cannot be bypassed with --no-verify.
-#
-# The `gate` job always reports, so it can be a required status check without
-# blocking PRs that touch no Rust (a paths-filtered workflow would leave the
-# required check stuck on "Expected" forever).
+env:
+  FRESHELL_PROOF_FEATURE_COMMIT: 55770152984d6f92fe38b37f57ab68b3084521d1
+  CARGO_BUILD_JOBS: '1'
+  RUST_TEST_THREADS: '1'
+  TOKIO_WORKER_THREADS: '2'
 
 jobs:
-  changes:
+  prepush-checks:
+    name: Supplementary pre-push checks
     runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Detect Rust changes
-        id: filter
+          fetch-depth: 2
+      - name: Verify proof commit and feature parent
+        shell: bash
         run: |
-          # Manager and dependency configuration changes must exercise the
-          # Rust suite too: it spawns Node fixtures (the codex fake
-          # app-server imports `ws`) whose behavior depends on the installed
-          # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility. Scoped to the
-          # root and workspace members — the independent demo locks are
-          # not part of the workspace dependency tree.
-          # `github.base_ref` exists only for pull_request events; manual
-          # dispatch (the event-routing escape hatch) compares against the
-          # default branch instead.
-          BASE="${{ github.base_ref }}"
-          [ -n "$BASE" ] || BASE="main"
-          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  rust-tests:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only "$FRESHELL_PROOF_FEATURE_COMMIT" HEAD)" = '.github/workflows/rust-tests.yml'
+          printf 'Proof commit: %s\nFeature commit: %s\n' "$GITHUB_SHA" "$FRESHELL_PROOF_FEATURE_COMMIT"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.96.0
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs the workspace dependencies installed
-      # or those tests die at fixture boot ("fake app-server exited before
-      # listening").
-      # Pinned revision of the v4 major; reads the exact version from the root
-      # packageManager pin (no floating duplicate).
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies (Rust test fixtures)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Workspace tests
-        # Workspace feature unification turns freshell-codex's default-off
-        # `real-transport` feature ON in this step (freshell-ws,
-        # freshell-server, freshell-session-host, and freshell-freshagent all
-        # depend on freshell-codex with the feature), so the
-        # remote_proxy_relay integration tests run here without an explicit
-        # --features flag. A bare `cargo test -p freshell-codex` would skip
-        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
-        # reports 38 tests; the same -p invocation reports 0).
-        # Keep the gate red on any failure, but report failures in later
-        # crates in the same run instead of stopping at the first suite.
-        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check workspace Clippy
+        run: cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings
+      - name: Typecheck
+        run: pnpm run --silent typecheck
 
-  gate:
-    name: rust-gate
-    needs: [changes, rust-tests]
-    if: always()
+  managed-gateway-tests:
+    name: Managed gateway regressions
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - name: Evaluate
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify proof commit and feature parent
+        shell: bash
         run: |
-          if [ "${{ needs.changes.outputs.rust }}" = "false" ]; then
-            echo "no Rust changes in this PR — rust tests skipped"
-            exit 0
-          fi
-          if [ "${{ needs.rust-tests.result }}" = "success" ]; then
-            echo "workspace rust tests passed"
-            exit 0
-          fi
-          echo "workspace rust tests failed or did not run"
-          exit 1
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only "$FRESHELL_PROOF_FEATURE_COMMIT" HEAD)" = '.github/workflows/rust-tests.yml'
+          printf 'Proof commit: %s\nFeature commit: %s\n' "$GITHUB_SHA" "$FRESHELL_PROOF_FEATURE_COMMIT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Answer attempts retain distinct correlated failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-server --features managed-runtime-v1 --bin freshell-server hosted_answer_attempts_broadcast_distinct_correlated_failures -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/answer-attempts.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/answer-attempts.log"
+      - name: Attach replays source-fenced answer attempts and receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-server --features managed-runtime-v1 --bin freshell-server hosted_attach_replays_source_fenced_answer_starts_and_delayed_receipts -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/answer-attach.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/answer-attach.log"
+      - name: Restarted poller marks replayed answer attempts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-server --features managed-runtime-v1 --bin freshell-server restarted_gateway_poller_marks_its_initial_answer_starts_as_replay -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/poller-replay.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/poller-replay.log"
+      - name: Control failures preserve correlation and uncertainty
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-server --features managed-runtime-v1 --bin freshell-server hosted_non_send_failures_keep_operation_correlation_and_uncertain_outcomes -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/control-failures.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/control-failures.log"
+      - name: Elicitation preserves typed content and opaque IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p freshell-server --features managed-runtime-v1 --bin freshell-server task5_hosted_elicitation_reuses_resolve_with_tagged_typed_content_and_opaque_ids -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/elicitation.log"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$RUNNER_TEMP/elicitation.log"
