@@ -4275,7 +4275,9 @@ export function FreshAgentView({
             previousTurnKeys: echoBoundary,
           })
         : false
-      const ambiguousNativeEcho = Boolean(echo && echoSubmittedTurnId && allowSettledTextMatch
+      // A status change can revoke this read's authority to settle a send,
+      // but it cannot make multiple possible matches safe to discard.
+      const ambiguousNativeEcho = Boolean(echo && echoSubmittedTurnId
         && countNewNativeTextMatches(displaySnapshot.turns, echo, echoSubmittedTurnId, echoBoundary) > 1)
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
       // stale-echo clear, INDEPENDENT of the retry-exhaustion gate below.
@@ -5328,7 +5330,15 @@ export function FreshAgentView({
     if (!current.sessionId || isFreshAgentLifecycleBlocked(current)) return
     const requestId = nanoid()
     const logicalAttemptId = nanoid()
-    outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
+    const sessionKey = paneSessionScope(current).sourceSessionKey
+    const liveProjection = sessionKey ? appStore.getState().freshAgentLive?.bySession[sessionKey]?.projection : undefined
+    const currentSnapshot = snapshotRef.current
+    // Capture exactly the rows already visible, including live projection
+    // rows that have not yet reached the saved snapshot.
+    const previousTurns = currentSnapshot
+      ? mergeFreshAgentTranscriptProjection(currentSnapshot, liveProjection)
+      : liveProjection?.turns ?? []
+    outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns }
     // Task 16: a new send starts a fresh idle-incomplete re-poll budget.
     idleIncompleteRetryCountRef.current = 0
     const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
@@ -5376,7 +5386,7 @@ export function FreshAgentView({
     const nextLocalEcho: LocalEcho = {
       text,
       requestId,
-      previousTurnKeys: (snapshotRef.current?.turns ?? []).map(getTurnKey),
+      previousTurnKeys: previousTurns.map(getTurnKey),
     }
     localEchoSendBoundaryRef.current = {
       requestId,
@@ -5396,7 +5406,7 @@ export function FreshAgentView({
       checkpointAvailabilityScope(latest) === checkpointScope
       && latest.sessionId === current.sessionId
     ) sendFreshAgentSendFrame(requestId, text, routeCwd)
-  }, [dispatch, paneId, publishCheckpointAvailability, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
+  }, [appStore, dispatch, paneId, publishCheckpointAvailability, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
 
   // Providers accept one active turn. Keep follow-ups until the session can
   // actually accept them, including across disconnects and provider failures.
