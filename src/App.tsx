@@ -94,6 +94,7 @@ import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
+import { ReconcileWarmingRecoveryDriver } from '@/components/ReconcileWarmingRecoveryDriver'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { MachineChooser } from '@/components/MachineChooser'
@@ -2615,6 +2616,7 @@ pnpm run serve`}</pre>
       <AuthRequiredModal />
       <TerminalInterestReporter workspaceVisible={view === 'terminal'} />
       <ReconcileWarmingBanner />
+      <ReconcileWarmingRecoveryDriver />
       {showSetupWizard && (
         <SetupWizard
           initialStep={wizardInitialStep}
