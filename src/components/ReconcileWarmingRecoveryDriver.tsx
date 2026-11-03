@@ -174,23 +174,32 @@ export function ReconcileWarmingRecoveryDriver(): null {
           )
           return
         }
-        // Delta fix finding 2: TERMINAL outcomes are warn-level (the
-        // production client-logger default records warn, suppresses info).
-        // A parked pane THIS drive sent resolving to an error verdict is a
-        // failure transition — log it once per drive result with the pane
-        // and session identifiers, the failure cause, and the drive's
-        // elapsed time (focused review round 2, finding 1: the elapsed time
-        // must live in THIS record — the info-level `settled` message that
-        // also carries it is suppressed in production). A still-warming
-        // verdict is the unchanged WAIT, not a terminal outcome: it never
-        // produces a per-pane warn here (the bounded backoff debug log and
-        // the gave-up aggregate warn at the retry limit are its records),
-        // so nothing repeats per poll. Focused review round 2, finding 3:
-        // only panes STILL warming-relevant at settle (present in the
-        // settle-time warming map with the same createRequestId) get a
-        // failure record — a pane closed or rebound mid-drive never does.
+        // Delta fix finding 2 + focused review round 3, finding 1:
+        // TERMINAL outcomes are warn-level (the production client-logger
+        // default records warn, suppresses info). A pane THIS drive sent
+        // that is STILL warming-relevant at settle and resolves to a
+        // terminal failure outcome — an error verdict (any non-warming
+        // reason), dead_session (the readiness re-drive confirmed the
+        // saved session is gone), or invalid (the claim was rejected) —
+        // is a failure transition: log it once per drive result with the
+        // verdict and failure cause, the pane and session identifiers,
+        // and the drive's elapsed time (focused review round 2, finding
+        // 1: the elapsed time must live in THIS record — the info-level
+        // `settled` message that also carries it is suppressed in
+        // production). A still-warming verdict is the unchanged WAIT, not
+        // a terminal outcome: it never produces a per-pane warn here (the
+        // bounded backoff debug log and the gave-up aggregate warn at the
+        // retry limit are its records), so nothing repeats per poll.
+        // Focused review round 2, finding 3: only panes STILL
+        // warming-relevant at settle (present in the settle-time warming
+        // map with the same createRequestId) get a failure record — a
+        // pane closed or rebound mid-drive never does.
         for (const verdict of msg.verdicts) {
-          if (verdict.verdict !== 'error' || verdict.reason === 'index_warming') continue
+          const terminalFailureOutcome =
+            verdict.verdict === 'dead_session'
+            || verdict.verdict === 'invalid'
+            || (verdict.verdict === 'error' && verdict.reason !== 'index_warming')
+          if (!terminalFailureOutcome) continue
           const pane = request.panes.find((p) => p.paneKey === verdict.paneKey)
           if (!pane) continue
           const stillWarmingAtSettle = warmingAtSettle?.paneRefs.some(
@@ -200,7 +209,7 @@ export function ReconcileWarmingRecoveryDriver(): null {
           )
           if (!stillWarmingAtSettle) continue
           log.warn(
-            `parked pane resolved to an error (cause=${verdict.reason ?? 'unknown'}, elapsedMs=${Date.now() - startedAt}, paneKey=${verdict.paneKey}, session=${pane.sessionRef ? `${pane.sessionRef.provider}:${pane.sessionRef.sessionId}` : '-'}, reconcileId=${request.reconcileId})`,
+            `parked pane recovery failed (verdict=${verdict.verdict}, cause=${verdict.reason ?? 'unknown'}, elapsedMs=${Date.now() - startedAt}, paneKey=${verdict.paneKey}, session=${pane.sessionRef ? `${pane.sessionRef.provider}:${pane.sessionRef.sessionId}` : '-'}, reconcileId=${request.reconcileId})`,
           )
         }
         if (outcome.warming === 0) {

@@ -255,7 +255,7 @@ describe('ReconcileWarmingRecoveryDriver', () => {
     // must record that a parked pane it drove resolved to an ERROR — the
     // honest failure transition, with the pane/session identifiers and the
     // failure cause. The happy-path settle stays info; only terminal
-    // outcomes (exhaustion, watchdog, refusal, and per-pane error folds)
+    // outcomes (exhaustion, watchdog, refusal, and per-pane failure folds)
     // are warn.
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
@@ -282,14 +282,111 @@ describe('ReconcileWarmingRecoveryDriver', () => {
         reason: 'session_store_unreadable',
       })
       const text = warnText(warnSpy)
+      expect(text).toContain('parked pane recovery failed')
+      expect(text).toContain('verdict=error')
       expect(text).toContain('tab-1:p1')
       expect(text).toContain('claude:sess-p1')
+      expect(text).toContain(`reconcileId=${req.reconcileId}`)
       expect(text).toContain('cause=session_store_unreadable')
       // Focused review round 2, finding 1: the warn-level failure record
       // must carry the drive's elapsed time ITSELF — the info-level
       // `settled` message that also carries it is suppressed in production
       // (client-logger default level `warn`), so without elapsedMs here a
       // routine failure leaves no production recovery-duration record.
+      const elapsedMatch = text.match(/elapsedMs=(\d+)/)
+      expect(elapsedMatch).not.toBeNull()
+      const elapsedMs = Number(elapsedMatch![1])
+      expect(Number.isFinite(elapsedMs)).toBe(true)
+      expect(elapsedMs).toBeGreaterThanOrEqual(0)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('logs the terminal outcome at warn when its own drive folds a dead_session verdict for a pane it drove (focused review round 3, finding 1)', () => {
+    // dead_session is a TERMINAL failure outcome of a still-warming pane:
+    // the pane waited through cold indexing and the readiness re-drive
+    // confirmed its saved session is gone. Production (client-logger
+    // default level `warn`) suppresses the info-level `settled` message,
+    // so without this record the failure leaves no correlated production
+    // log with this drive's request id and duration.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 1, paneRefs: [ref('p1')] },
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      deliverServerFrame({
+        type: 'pane.reconcile.result',
+        reconcileId: req.reconcileId,
+        bootId: 'boot-1',
+        serverInstanceId: 'srv-1',
+        verdicts: [{
+          paneKey: 'tab-1:p1',
+          verdict: 'dead_session',
+          reason: 'session_not_on_disk',
+        }],
+      })
+      // The fold latched the dead latch and the drive settled (banner
+      // cleared — a dead pane is resolved, not re-parked).
+      expect(store.getState().panes.reconcileWarming).toBeNull()
+      expect(terminalContentOf(store).restoreError).toMatchObject({
+        reason: 'durable_artifact_missing',
+      })
+      const text = warnText(warnSpy)
+      expect(text).toContain('parked pane recovery failed')
+      expect(text).toContain('verdict=dead_session')
+      expect(text).toContain('cause=session_not_on_disk')
+      expect(text).toContain('tab-1:p1')
+      expect(text).toContain('claude:sess-p1')
+      expect(text).toContain(`reconcileId=${req.reconcileId}`)
+      const elapsedMatch = text.match(/elapsedMs=(\d+)/)
+      expect(elapsedMatch).not.toBeNull()
+      const elapsedMs = Number(elapsedMatch![1])
+      expect(Number.isFinite(elapsedMs)).toBe(true)
+      expect(elapsedMs).toBeGreaterThanOrEqual(0)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('logs the terminal outcome at warn when its own drive folds an invalid verdict for a pane it drove (focused review round 3, finding 1)', () => {
+    // invalid is a TERMINAL failure outcome of a still-warming pane: the
+    // readiness re-drive rejected the pane's claim. Same warn record
+    // shape — cause, identifiers, elapsed time — never only the
+    // production-suppressed info `settled` message.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 1, paneRefs: [ref('p1')] },
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      deliverServerFrame({
+        type: 'pane.reconcile.result',
+        reconcileId: req.reconcileId,
+        bootId: 'boot-1',
+        serverInstanceId: 'srv-1',
+        verdicts: [{
+          paneKey: 'tab-1:p1',
+          verdict: 'invalid',
+          reason: 'unsupported_kind',
+        }],
+      })
+      expect(store.getState().panes.reconcileWarming).toBeNull()
+      expect(terminalContentOf(store).restoreError).toMatchObject({
+        reason: 'missing_canonical_identity',
+      })
+      const text = warnText(warnSpy)
+      expect(text).toContain('parked pane recovery failed')
+      expect(text).toContain('verdict=invalid')
+      expect(text).toContain('cause=unsupported_kind')
+      expect(text).toContain('tab-1:p1')
+      expect(text).toContain('claude:sess-p1')
+      expect(text).toContain(`reconcileId=${req.reconcileId}`)
       const elapsedMatch = text.match(/elapsedMs=(\d+)/)
       expect(elapsedMatch).not.toBeNull()
       const elapsedMs = Number(elapsedMatch![1])
@@ -313,7 +410,7 @@ describe('ReconcileWarmingRecoveryDriver', () => {
       // Still-warming is the unchanged WAIT: bounded backoff, no per-pane
       // failure warn (transitions only — the gave-up warn at the retry
       // limit is the wait's own terminal record, pinned elsewhere).
-      expect(warnText(warnSpy)).not.toContain('resolved to an error')
+      expect(warnText(warnSpy)).not.toContain('parked pane recovery failed')
       expect(warnText(warnSpy)).not.toContain('gave up')
     } finally {
       warnSpy.mockRestore()
@@ -631,7 +728,7 @@ describe('ReconcileWarmingRecoveryDriver', () => {
       })
       expect(store.getState().panes.reconcileWarming).toBeNull()
       deliverServerFrame(terminalErrorResultFor(req, 'session_store_unreadable'))
-      expect(warnText(warnSpy)).not.toContain('resolved to an error')
+      expect(warnText(warnSpy)).not.toContain('parked pane recovery failed')
     } finally {
       warnSpy.mockRestore()
     }
@@ -666,7 +763,7 @@ describe('ReconcileWarmingRecoveryDriver', () => {
       })
       expect(store.getState().panes.reconcileWarming).toBeNull()
       deliverServerFrame(terminalErrorResultFor(req, 'session_store_unreadable'))
-      expect(warnText(warnSpy)).not.toContain('resolved to an error')
+      expect(warnText(warnSpy)).not.toContain('parked pane recovery failed')
       // The rebound pane keeps its new identity untouched.
       expect(terminalContentOf(store).createRequestId).toBe('cr-new')
       expect(terminalContentOf(store).terminalId).toBeUndefined()
