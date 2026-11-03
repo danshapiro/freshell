@@ -33,7 +33,7 @@ async fn task010_hosted_new_conversation_admits_only_its_verified_current_name()
                     installation_id: InstallationId::new(),
                 },
                 AdminCommand::Inventory => {
-                    if switch.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    if switch.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     }) == Ok(1)
                     {

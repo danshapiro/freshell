@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn codex_rest_previous_unknown_delivery_refuses_the_new_request_with_its_own_correlation() {
     let session = "rest-earlier-unknown";
-    let (state, peer) = channel_session(session).await;
+    let (state, peer, _) = channel_session(session).await;
     let (router, pane) = http_pane(state.clone(), session);
     let uri = format!("/api/panes/{pane}/send-keys");
     let first = {
@@ -57,7 +57,7 @@ async fn codex_rest_previous_unknown_delivery_refuses_the_new_request_with_its_o
 async fn codex_rest_matched_failed_turn_preserves_the_exact_provider_diagnostic() {
     for scenario in ["completion", "prior-error", "missing"] {
         let session = format!("rest-failed-{scenario}");
-        let (state, peer) = channel_session(&session).await;
+        let (state, peer, ownership_id) = channel_session(&session).await;
         let (router, pane) = http_pane(state.clone(), &session);
         let uri = format!("/api/panes/{pane}/send-keys");
         let mut frames = state.broadcast_tx.subscribe();
@@ -106,7 +106,7 @@ async fn codex_rest_matched_failed_turn_preserves_the_exact_provider_diagnostic(
         assert_eq!(body["message"], expected, "{scenario}: {body}");
         assert_eq!(body["sessionId"], session);
         assert_eq!(body["requestId"], "owned-request");
-        assert_eq!(body["incarnationId"], format!("task009-owner-{session}"));
+        assert_eq!(body["incarnationId"], ownership_id);
         assert_eq!(body["submittedTurnId"], "owned-turn");
         assert_eq!(body["retryable"], false);
     }
@@ -115,7 +115,7 @@ async fn codex_rest_matched_failed_turn_preserves_the_exact_provider_diagnostic(
 #[tokio::test]
 async fn codex_rest_provider_start_refusal_is_correlated_to_the_request() {
     let session = "rest-refused-start";
-    let (state, peer) = channel_session(session).await;
+    let (state, peer, _) = channel_session(session).await;
     let (router, pane) = http_pane(state.clone(), session);
     let uri = format!("/api/panes/{pane}/send-keys");
     let submitting = tokio::spawn(async move {
