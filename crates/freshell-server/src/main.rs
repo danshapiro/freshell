@@ -131,6 +131,18 @@ fn load_dotenv_from(dir: &Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
 }
 
+fn server_build_info() -> serde_json::Value {
+    serde_json::json!({
+        "managedRuntimeV1": cfg!(feature = "managed-runtime-v1"),
+    })
+}
+
+fn managed_runtime_feature_error(requested: Option<&str>, compiled: bool) -> Option<String> {
+    (requested == Some("1") && !compiled).then(|| {
+        "FRESHELL_MANAGED_RUNTIME_V1=1 requires freshell-server to be built with the managed-runtime-v1 feature; rebuild with `cargo build -p freshell-server --release --features managed-runtime-v1`".to_string()
+    })
+}
+
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the close-evidence
 /// retention gate input — every pane identity the retained snapshot
 /// generations reference, scanned from the SAME `tabs-snapshots` store the
@@ -803,12 +815,28 @@ fn runtime_ownership_for_ledger(
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("--build-info"))
+    {
+        println!("{}", server_build_info());
+        return ExitCode::SUCCESS;
+    }
+
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
     // `.env` from cwd before the module reads ANY process env — including the
     // AUTH_TOKEN check immediately below. A cwd we can't resolve, or a cwd with
     // no `.env`, is a silent no-op either way.
     if let Ok(cwd) = std::env::current_dir() {
         load_dotenv_from(&cwd);
+    }
+
+    if let Some(error) = managed_runtime_feature_error(
+        std::env::var("FRESHELL_MANAGED_RUNTIME_V1").ok().as_deref(),
+        cfg!(feature = "managed-runtime-v1"),
+    ) {
+        eprintln!("freshell-server: {error}");
+        return ExitCode::FAILURE;
     }
 
     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
@@ -1179,6 +1207,7 @@ async fn main() -> ExitCode {
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
             .with_layout(layout_store.clone())
             .with_ownership(Arc::clone(&ownership));
+    let host_agent_admission = fresh_agent_state.host_agent_admission();
     fresh_agent_state
         .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
         .expect("OpenCode checkpoint event persister is installed once");
@@ -3189,7 +3218,13 @@ async fn main() -> ExitCode {
             eprintln!("managed runtime API initialization failed: {error}");
             std::process::exit(1);
         })
-        .with_terminal_controller(managed_runtime_controller.clone());
+        .with_terminal_controller(managed_runtime_controller.clone())
+        .with_readiness_ownership_sources(
+            layout_store.clone(),
+            registry.clone(),
+            Arc::clone(&ownership),
+        )
+        .with_host_agent_admission(host_agent_admission.clone());
         state.spawn_projector();
         managed_runtime_api::router(state)
     };
@@ -3551,6 +3586,7 @@ async fn main() -> ExitCode {
     shutdown_signal(
         Arc::clone(&shutdown_notify),
         std::sync::Arc::clone(&shutdown_started),
+        host_agent_admission.clone(),
     )
     .await;
     rebind.shutdown_all().await;
@@ -3652,6 +3688,14 @@ async fn main() -> ExitCode {
 /// nonzero if the process is still alive once it elapses.
 const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn latch_host_admission_for_shutdown(
+    gate: &freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
+    shutdown_started: &std::sync::atomic::AtomicBool,
+) {
+    gate.latch_shutdown();
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Resolve once a shutdown signal arrives (SIGTERM from the oracle harness's
 /// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so every owned
 /// child (PTY terminals, the Codex/claude/opencode sidecars) is reaped before
@@ -3659,6 +3703,7 @@ const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 async fn shutdown_signal(
     notify_ws: Arc<tokio::sync::Notify>,
     shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+    host_agent_admission: freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
 ) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -3704,9 +3749,12 @@ async fn shutdown_signal(
     // server stop intentionally, and on which signal".
     tracing::info!(signal = signal_name, "server.stopping");
 
+    // Close host-agent admission before any teardown starts. This is the
+    // signal-path backstop for creates that entered before the updater's
+    // pre-stop maintenance API ran.
     // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
     // creates consult this flag around registry.create.
-    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+    latch_host_admission_for_shutdown(&host_agent_admission, &shutdown_started);
 
     // Forensics FIRST, before any teardown step, so the record survives even
     // if teardown hangs. Sync + bounded (a handful of tiny /proc reads) —
@@ -4878,6 +4926,41 @@ mod sessions_sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_info_reports_the_compiled_managed_runtime_feature() {
+        assert_eq!(
+            server_build_info(),
+            serde_json::json!({
+                "managedRuntimeV1": cfg!(feature = "managed-runtime-v1"),
+            })
+        );
+    }
+
+    #[test]
+    fn requested_managed_runtime_without_its_feature_has_an_actionable_error() {
+        let error = managed_runtime_feature_error(Some("1"), false)
+            .expect("a featureless binary must reject requested managed runtime");
+        assert!(error.contains("FRESHELL_MANAGED_RUNTIME_V1=1"));
+        assert!(error.contains("managed-runtime-v1"));
+        assert!(error.contains("--features managed-runtime-v1"));
+        assert!(managed_runtime_feature_error(Some("1"), true).is_none());
+        assert!(managed_runtime_feature_error(Some("true"), false).is_none());
+    }
+
+    #[test]
+    fn signal_shutdown_latches_host_agent_admission_before_teardown() {
+        let gate = freshell_freshagent::host_agent_admission::HostAgentAdmissionGate::new();
+        let shutdown_started = std::sync::atomic::AtomicBool::new(false);
+
+        latch_host_admission_for_shutdown(&gate, &shutdown_started);
+
+        assert!(shutdown_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            gate.try_admit(),
+            Err(freshell_freshagent::host_agent_admission::AdmissionError::ShutdownLatched)
+        ));
+    }
 
     #[test]
     fn boot_epoch_is_reserved_before_constructing_runtime_ownership() {

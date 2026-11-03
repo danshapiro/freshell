@@ -207,21 +207,22 @@ export function query(params) {{
         let id = conn.create("refused-stop-create").await;
         conn.send_text(&id, "the-running-turn", "TOOL:sleep=0.5")
             .await;
-        if reissued {
+        let submitted_turn_id = if reissued {
             let accepted = conn
-                .wait_for("the send accepted before Stop", |frame| {
+                .wait_for("the accepted turn under test", |frame| {
                     frame["type"] == "freshAgent.send.accepted"
                         && frame["requestId"] == "the-running-turn"
                 })
                 .await;
-            let turn_id = accepted["submittedTurnId"]
+            let submitted_turn_id = accepted["submittedTurnId"]
                 .as_str()
-                .expect("the accepted send has a turn id");
+                .expect("send.accepted carries submittedTurnId")
+                .to_owned();
             let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
             while !rig
                 .ledger_rows("cold_hold_ready")
                 .iter()
-                .any(|row| row["uuid"] == turn_id)
+                .any(|row| row["uuid"] == submitted_turn_id)
             {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -229,36 +230,99 @@ export function query(params) {{
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }
-        if !reissued {
+            logs.wait_for("the accepted turn's queued lifecycle", |event| {
+                event.message == "freshagent.claude.command"
+                    && event.field("session_id") == Some(&id)
+                    && event.field("uuid") == Some(&submitted_turn_id)
+                    && event.field("state") == Some("queued")
+            })
+            .await;
+            Some(submitted_turn_id)
+        } else {
             conn.wait_for("the running tool", |frame| {
                 frame["event"]["content"]
                     .as_array()
                     .is_some_and(|content| content.iter().any(|block| block["type"] == "tool_use"))
             })
             .await;
-        }
+            None
+        };
         conn.send(
             json!({"type":"freshAgent.interrupt", "provider":"claude", "sessionType":"freshclaude",
         "sessionId":id, "requestId":"refused-stop-request"}),
         )
         .await;
-        logs.wait_for("the refused interrupt receipt", |event| {
-            event.message == "freshagent.claude.stop"
-                && event.field("session_id") == Some(&id)
-                && event.field("outcome") == Some("refused")
-        })
-        .await;
-        conn.read_for(Duration::from_millis(100)).await;
+
+        let expected_stop_id = if reissued {
+            let sent = logs
+                .wait_for("the initial Stop request", |event| {
+                    event.message == "freshagent.claude.stop"
+                        && event.field("session_id") == Some(&id)
+                        && event.field("outcome") == Some("sent")
+                })
+                .await;
+            let stop_id = sent
+                .field("stop_id")
+                .expect("the initial Stop log carries stop_id")
+                .to_owned();
+            let submitted_turn_id = submitted_turn_id
+                .as_deref()
+                .expect("the reissued case captured the accepted turn id");
+            let reissued_stop = logs
+                .wait_for("the queued cold-miss reissue", |event| {
+                    event.message == "freshagent.claude.stop"
+                        && event.field("session_id") == Some(&id)
+                        && event.field("outcome") == Some("reissued")
+                        && event.field("stop_id") == Some(&stop_id)
+                })
+                .await;
+            assert_eq!(reissued_stop.field("case"), Some("A"));
+            assert_eq!(reissued_stop.field("target"), Some(submitted_turn_id));
+            assert_eq!(reissued_stop.field("reissues"), Some("1"));
+
+            let interrupts = rig.ledger_rows("interrupt");
+            assert_eq!(interrupts.len(), 1, "the first cold Stop: {interrupts:?}");
+            assert_eq!(interrupts[0]["missed"], submitted_turn_id, "{interrupts:?}");
+            assert_eq!(
+                interrupts[0]["stillQueued"],
+                json!([submitted_turn_id]),
+                "the cold receipt names the accepted queued command: {interrupts:?}"
+            );
+            assert_eq!(interrupts[0]["running"], false, "{interrupts:?}");
+            Some(stop_id)
+        } else {
+            None
+        };
+
+        let refused = logs
+            .wait_for("the refused interrupt receipt", |event| {
+                event.message == "freshagent.claude.stop"
+                    && event.field("session_id") == Some(&id)
+                    && event.field("outcome") == Some("refused")
+                    && expected_stop_id
+                        .as_deref()
+                        .is_none_or(|stop_id| event.field("stop_id") == Some(stop_id))
+            })
+            .await;
+        if let Some(stop_id) = expected_stop_id.as_deref() {
+            assert_eq!(refused.field("stop_id"), Some(stop_id));
+        }
         let failure = conn
-            .frames
-            .iter()
-            .find(|frame| frame["event"]["code"] == "CLAUDE_INTERRUPT_FAILED")
-            .expect("a refused Stop must report a nested session error");
+            .wait_for("the refused Stop's correlated session error", |frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["code"] == "CLAUDE_INTERRUPT_FAILED"
+                    && frame["event"]["requestId"] == "refused-stop-request"
+            })
+            .await;
         assert_eq!(failure["event"]["requestId"], "refused-stop-request");
         conn.wait_for_event("freshAgent.result").await;
         conn.wait_for_event("freshAgent.turn.complete").await;
         conn.read_for(Duration::from_millis(50)).await;
+        assert_eq!(
+            conn.events_seen("freshAgent.result"),
+            1,
+            "the failed Stop leaves exactly one result"
+        );
         assert_eq!(
             conn.events_seen("freshAgent.turn.complete"),
             1,

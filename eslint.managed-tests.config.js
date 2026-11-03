@@ -25,6 +25,7 @@ const runtime = [
   "scripts/testing/qualification-observations.ts",
   "scripts/testing/task002-retained-fixture.ts",
   "scripts/testing/runtime-external-browser.ts",
+  "scripts/testing/external-browser-sandbox.ts",
   "scripts/testing/runtime-sandbox.ts",
   "scripts/testing/task007-destructive-sandbox.ts",
   "scripts/testing/runtime-test-broker.ts",

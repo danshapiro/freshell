@@ -1,6 +1,6 @@
 import { defineConfig } from '@playwright/test'
 import baseConfig from './playwright.config.js'
-import { LOCAL_ONLY_SPECS, managedExternal } from './playwright.config.js'
+import { LOCAL_ONLY_SPECS, managedExternal, managedExternalP2G01Artifacts } from './playwright.config.js'
 import { fileURLToPath } from 'node:url'
 
 // Cloud Run Playwright config.
@@ -103,7 +103,8 @@ export default defineConfig({
   },
   reporter: [
     ['line'],
-    ['html', { open: 'never' }],
+    ['html', { open: 'never', ...(managedExternalP2G01Artifacts
+      ? { outputFolder: managedExternalP2G01Artifacts.htmlReportDir } : {}) }],
     ...(managedExternal ? [[fileURLToPath(new URL('../../scripts/testing/runtime-external-browser.ts', import.meta.url))] as const] : []),
     ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }] as const] : []),
   ],

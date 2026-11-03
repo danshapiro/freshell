@@ -1059,6 +1059,12 @@ fn turn_status_probe(sessions: &OpencodeSessions) -> crate::OpencodeTurnStatusPr
 }
 
 impl FreshOpencodeState {
+    /// Return the same host-agent admission gate installed on the REST state
+    /// that this WS provider wraps.
+    pub fn host_agent_admission(&self) -> crate::host_agent_admission::HostAgentAdmissionGate {
+        self.fresh_agent.host_agent_admission()
+    }
+
     /// b8ke e3 post-cap F2: test seam — retain a condemned-session
     /// witness (the kill path's retained accepted-daemon-turn evidence).
     /// Test-only seeding route for cross-crate consumers; production code

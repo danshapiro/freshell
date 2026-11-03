@@ -6897,7 +6897,16 @@ await import(parameters.source)
                 let result: Result<(), String> = async {
                     let actor = FreshAgentHostActor::open(owned.path().join("actor"), profile, transport.clone())
                         .await.map_err(|error| error.to_string())?;
-                    let before = crate::fresh_native_observation(&launch, &actor).await.ok_or("initial parent observation missing")?;
+                    let before = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Some(observation) = crate::fresh_native_observation(&launch, &actor).await {
+                                break observation;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .map_err(|_| "initial parent observation missing")?;
                     let proof = actor.observed_native_identity_evidence().await.ok_or("initial proof missing")?;
                     let snapshot = actor.snapshot().await.map_err(|error| error.to_string())?;
                     if snapshot["capabilities"]["undo"] != true { return Err("setup must support Undo".into()); }

@@ -1,6 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { test, expect, createFreshE2ePage } from '../helpers/fixtures.js'
 import { CLOUD_LANE_GOTO_BOUND_MS, CLOUD_LANE_HARNESS_WAIT_BOUND_MS, TestHarness, isCloudLaneWindowConfigured, selectShellFromPicker } from '../helpers/test-harness.js'
+import { CompactPanelScreenshotRetention } from '../helpers/compact-panel-screenshot-retention.js'
 import { FreshAgentSnapshotSchema } from '../../../shared/fresh-agent-contract.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -185,6 +186,15 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{
   }, variant)
   await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-session-id', `compact-${variant.sessionType}`)
   await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-style', variant.style)
+  // Startup failures now open by default. This synthetic diagnostic exercises
+  // the compact, closed layout after the user collapses its details.
+  const createFailure = page.locator('[data-agent-error="create"]')
+  await expect(createFailure).toHaveAttribute('open', '')
+  const createFailureDetails = createFailure.locator('.fresh-agent-diagnostic-body')
+  await expect(createFailureDetails).toBeVisible()
+  await expect(createFailureDetails).toContainText('Detailed create diagnostic')
+  await createFailure.locator('summary').click()
+  await expect(createFailure).not.toHaveAttribute('open', '')
   if (variant.theme === 'dark') await expect(page.locator('html')).toHaveClass(/\bdark\b/)
   else await expect(page.locator('html')).not.toHaveClass(/\bdark\b/)
   await expect.poll(() => page.evaluate(() => Number(getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')))).toBe(variant.scale ?? 1)
@@ -317,29 +327,15 @@ async function assertUsefulSpace(page: Page): Promise<void> {
   assertUsefulSpaceSnapshot(await captureUsefulSpace(page))
 }
 
-const emittedScreenshotPaths = new Set<string>()
+const screenshotRetention = new CompactPanelScreenshotRetention()
 
 async function saveScreenshot(page: Page, path: string): Promise<boolean> {
   const bytes = await page.screenshot({ path })
-  // Cloud Run has no persistent filesystem artifact export. Retain the four
-  // existing review images, representative geometry failures, and both
-  // approved nested tiny-pane captures; avoid streaming every failed matrix
-  // cell into the logs.
-  const reviewImages = [
-    'compact-freshclaude-desktop',
-    'compact-serif-light-split',
-    'compact-mono-light-narrow',
-    'compact-phone-dark',
-    'compact-geometry-failure-painted-freshclaude-metadata-diagnostics-and-request-decisions-share-560x320',
-    'compact-geometry-failure-painted-ambiguous-Codex-delivery-keeps-the-original-prompt-and-instruction-at-390x700',
-    'compact-geometry-failure-painted-WebFetch-compact-approval-JSON-wraps-fully-at-390px',
-    'compact-geometry-failure-composer-270px-empty-compact-pane-keeps-the-complete-composer-visible-without-scrolling',
-    'compact-tiny-200px',
-    'compact-tiny-120px',
-  ]
-  if (emittedScreenshotPaths.has(path)) return true
-  if (!reviewImages.some(name => path.includes(name))) return false
-  emittedScreenshotPaths.add(path)
+  // Cloud Run has no persistent filesystem artifact export. Keep the named
+  // review images and a bounded sample of other geometry failures in logs.
+  const decision = await screenshotRetention.decide(path, test.info().project.outputDir)
+  if (decision === 'already-emitted') return true
+  if (decision === 'skip') return false
   const base64 = bytes.toString('base64')
   for (let offset = 0; offset < base64.length; offset += 12000) console.log(JSON.stringify({ event: 'compact_panel_screenshot', severity: 'INFO', path, offset, data: base64.slice(offset, offset + 12000) }))
   return true

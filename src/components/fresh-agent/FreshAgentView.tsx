@@ -5778,7 +5778,7 @@ export function FreshAgentView({
     { id: 'codex-unattributed', level: 'warning' as const, summary: errorSummary('Codex error; turn unconfirmed', unattributedCodexError), compactSummary: 'Codex warning', content: (unattributedCodexError ? (
                 <FreshAgentApprovalBanner text={`Codex reported an error, but the associated turn could not be confirmed: ${unattributedCodexError}`} />
               ) : null) },
-    { id: 'create', summary: errorSummary('Agent could not start', (pendingCreateFailure ?? paneContent.createError)?.message), compactSummary: 'Start failed', content: (pendingCreateFailure || paneContent.createError ? (
+    { id: 'create', summary: errorSummary('Agent could not start', (pendingCreateFailure ?? paneContent.createError)?.message), compactSummary: 'Start failed', initiallyExpanded: true, content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
                     text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'}

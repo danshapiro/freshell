@@ -93,6 +93,18 @@ async function open(options: Record<string, unknown>, env: Record<string, string
   return { q, prompt, messages, until, home, get ended() { return ended } }
 }
 
+async function waitForLedgerRow(file: string, what: string, predicate: (row: any) => boolean) {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const contents = await fs.readFile(file, 'utf8').catch(() => '')
+    const rows = contents.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const match = rows.find(predicate)
+    if (match) return match
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`timed out waiting for simulator ledger row: ${what}`)
+}
+
 /** Every file under `root` (relative path to contents). */
 async function snapshotTree(root: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {}
@@ -264,13 +276,28 @@ describe('Claude CLI simulator programs', () => {
     ['started', [], [], ['queued', 'started']],
   ] as const)('FRESHELL_CLAUDE_SIM_COLD_COMMAND=%s: a Stop while the first command starts misses it with that receipt', async (shape, stillQueued, beforeStop, beforeReceipt) => {
     const uuid = '55555555-5555-4555-8555-555555555555'
-    const s = await open({}, { FRESHELL_CLAUDE_SIM_COLD_COMMAND: shape, FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    const ledgerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-cold-ledger-'))
+    cleanups.push(() => fs.rm(ledgerDir, { recursive: true, force: true }))
+    const ledger = path.join(ledgerDir, 'ledger.jsonl')
+    const s = await open({}, {
+      FRESHELL_CLAUDE_SIM_COLD_COMMAND: shape,
+      FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1',
+      FRESHELL_CLAUDE_SIM_LEDGER: ledger,
+      ...(shape === 'queued'
+        ? { FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD: '1' }
+        : { FRESHELL_CLAUDE_SIM_HOLD_COLD: '1' }),
+    })
     await s.q.initializationResult()
     const lifecycle = () => s.messages.filter((m) => m.type === 'command_lifecycle' && m.command_uuid === uuid).map((m) => m.state)
     s.prompt.push('SLOW cold', uuid)
     // The command is still starting, at the point each shape names.
     if (beforeStop.length) await s.until(() => lifecycle().length === beforeStop.length)
-    else await new Promise((resolve) => setTimeout(resolve, 20))
+    else {
+      const boot = await waitForLedgerRow(ledger, 'the simulator boot', (row) => row.kind === 'boot')
+      await waitForLedgerRow(ledger, `${shape} cold boundary for ${uuid}`, (row) =>
+        row.kind === 'cold' && row.query === boot.query && row.sessionId === boot.sessionId && row.uuid === uuid && row.shape === shape,
+      )
+    }
     expect(lifecycle(), 'the command lifecycle the CLI reported before the Stop').toEqual(beforeStop)
     const receipt = await s.q.interrupt()
     expect(lifecycle(), 'the command lifecycle the CLI reported before its receipt').toEqual(beforeReceipt)
@@ -308,6 +335,32 @@ describe('Claude CLI simulator programs', () => {
     await s.until(() => lifecycle().at(-1) === 'completed')
     expect(lifecycle()).toEqual(['queued', 'started', 'completed'])
     expect(results(s.messages)).toHaveLength(1)
+  })
+
+  it('FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD=1: keeps a queued cold command pending until Stop', async () => {
+    const uuid = '88888888-8888-4888-8888-888888888888'
+    const s = await open({}, {
+      FRESHELL_CLAUDE_SIM_COLD_COMMAND: 'queued',
+      FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD: '1',
+      FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1',
+    })
+    await s.q.initializationResult()
+    const lifecycle = () => s.messages
+      .filter((m) => m.type === 'command_lifecycle' && m.command_uuid === uuid)
+      .map((m) => m.state)
+    s.prompt.push('TOOL:sleep=45', uuid)
+    await s.until(() => lifecycle().includes('queued'))
+    // The normal cold-start timeout is 150 ms at this time scale. The opt-in
+    // hold must keep the command queued beyond that timer until interrupted.
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(lifecycle()).toEqual(['queued'])
+    expect(results(s.messages)).toHaveLength(0)
+
+    await expect(s.q.interrupt()).resolves.toEqual({ still_queued: [uuid] })
+    await s.until(() => lifecycle().includes('started'))
+    await expect(s.q.interrupt()).resolves.toEqual({ still_queued: [] })
+    await s.until(() => results(s.messages).length === 1)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
   })
 
   it('FRESHELL_CLAUDE_SIM_COLD_COMMAND: an interrupt sent once the cold command runs aborts it', async () => {
