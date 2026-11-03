@@ -2055,6 +2055,89 @@ describe('FreshAgentView', () => {
       }
     })
 
+    it('keeps a provider error while an informational notice appears and expires', async () => {
+      const queue = await setup('idle')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Keep this unsent draft' } })
+      deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible()
+
+      vi.useFakeTimers()
+      try {
+        deliver({ type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message: 'Settings saved' })
+        expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Settings saved')
+        expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible()
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+        expect(screen.queryByRole('status', { name: 'Agent notices' })).toBeNull()
+        expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible()
+        expect(composer).toHaveValue('Keep this unsent draft')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it.each(['error-first', 'warning-first'] as const)(
+      'keeps a provider error and uncertain delivery independently visible (%s)', async (order) => {
+        const queue = await setup('idle')
+        const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        const diagnostic = 'Selected model is at capacity. Please try a different model.'
+        const original = 'Keep the original uncertain prompt'
+        queue.send(original)
+        const [sent] = sentFreshAgentMessages('freshAgent.send')
+        expect(sent?.requestId).toBeTruthy()
+        const deliverError = () => act(() => {
+          const message = { type: 'freshAgent.event', ...locator, event: {
+            type: 'freshAgent.notice', sessionId: locator.sessionId, level: 'error',
+            code: 'CODEX_PROVIDER_ERROR', message: diagnostic,
+          } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        })
+        const deliverUncertainty = () => act(() => listener({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: sent.requestId,
+          message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+        }))
+        if (order === 'error-first') {
+          deliverError()
+          deliverUncertainty()
+        } else {
+          deliverUncertainty()
+          deliverError()
+        }
+
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        await waitFor(() => expect(composer).toHaveValue(original))
+        const providerError = screen.getByRole('alert', { name: diagnostic })
+        expect(providerError).toBeVisible()
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+        const errorDetails = providerError.closest('details')!
+        fireEvent.click(errorDetails.querySelector('summary')!)
+        fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+        const dismiss = await within(errorDetails).findByRole('button', { name: 'Dismiss', exact: true })
+        fireEvent.click(dismiss)
+        expect(screen.queryByRole('alert', { name: diagnostic })).toBeNull()
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+
+        act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+          requestId: sent.requestId, submittedTurnId: 'accepted-uncertain-turn' }))
+        await waitFor(() => expect(screen.queryByRole('alert', { name: 'Agent warning' })).toBeNull())
+        expect(composer).toHaveValue(original)
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
     it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
       const store = createStore()
       const first = {

@@ -2108,6 +2108,63 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
   })
 }
 
+test('a provider error and uncertain delivery remain independently reachable', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, {
+    sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light',
+    snapshot: { pendingApprovals: [], pendingQuestions: [], pendingElicitations: [] },
+  })
+  await fitRoot(page, { width: 800, height: 900 })
+  await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!
+    const state = h.getState()
+    const tabId = state.tabs.activeTabId!
+    h.dispatch({ type: 'panes/mergePaneContent', payload: {
+      tabId, paneId: state.panes.activePane[tabId], updates: { createError: undefined, reconcileNotice: undefined },
+    } })
+  })
+  const pane = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
+  const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+  const prompt = 'Keep this original uncertain prompt'
+  await composer.fill(prompt)
+  await hitAndClick(pane.getByRole('button', { name: 'Send', exact: true }))
+  const sends = async () => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.send') ?? [])
+  await expect.poll(sends).toHaveLength(1)
+  const [sent] = await sends()
+  expect(sent.requestId).toEqual(expect.any(String))
+  const requestId = sent.requestId as string
+
+  const diagnostic = 'Selected model is at capacity. Please try a different model.'
+  await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+    event: { type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message },
+  }), diagnostic)
+  await expect(pane.getByRole('alert', { name: diagnostic })).toBeVisible()
+  await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'error', code: 'INTERNAL_ERROR', requestId,
+    message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+  }), requestId)
+
+  const providerAlert = pane.getByRole('alert', { name: diagnostic })
+  const warning = pane.getByRole('alert', { name: 'Agent warning' })
+  await expect(providerAlert).toBeVisible()
+  await expect(warning).toContainText('Delivery is uncertain')
+  await expect(composer).toHaveValue(prompt)
+  expect(await sends()).toHaveLength(1)
+
+  const providerSummary = providerAlert.locator('..')
+  await hitAndClick(providerSummary)
+  await expect(providerSummary.locator('..').locator('.fresh-agent-diagnostic-body').getByText(diagnostic, { exact: true })).toBeVisible()
+  await hitAndClick(providerSummary)
+  const warningSummary = warning.locator('..')
+  await hitAndClick(warningSummary)
+  await expect(warningSummary.locator('..').locator('.fresh-agent-diagnostic-body')).toContainText('response was lost')
+  await expect(composer).toHaveValue(prompt)
+  expect(await sends()).toHaveLength(1)
+})
+
 test('Changes closes on programmatic and keyboard tab switches', async ({ freshellPage, page, terminal }) => {
   void freshellPage
   await terminal.waitForTerminal()
