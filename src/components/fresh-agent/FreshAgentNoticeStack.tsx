@@ -2,7 +2,7 @@ import { useLayoutEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 
 export type FreshAgentNotice = { id: string; text: string; prominent?: boolean }
-export type FreshAgentError = { id: string; summary: string; content: ReactNode; level?: 'warning' | 'error'; onToggle?: (expanded: boolean) => void }
+export type FreshAgentError = { id: string; summary: string; compactSummary?: string; content: ReactNode; level?: 'warning' | 'error'; onToggle?: (expanded: boolean) => void }
 
 function NoticeDisclosure({ children, errorId, onExpandedChange }: {
   children: ReactNode
@@ -56,7 +56,14 @@ export function FreshAgentNoticeStack({ notices, errors, onNoticesExpandedChange
         <span role="img" aria-label={diagnosticCount} title={diagnosticCount} className="fresh-agent-diagnostic-count text-xs text-muted-foreground">{errors.length}</span>
         <div className="fresh-agent-error-summaries">{errors.map(error => (
           <NoticeDisclosure key={error.id} errorId={error.id} onExpandedChange={error.onToggle}>
-            <summary aria-label={error.summary}><span role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : undefined}>{error.summary}</span></summary>
+            <summary aria-label={error.summary}>
+              <span role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : error.summary}>
+                {errors.length > 1 && error.compactSummary ? <>
+                  <span className="fresh-agent-error-summary-full" aria-hidden="true">{error.summary}</span>
+                  <span className="fresh-agent-error-summary-compact" aria-hidden="true">{error.compactSummary}</span>
+                </> : error.summary}
+              </span>
+            </summary>
             {error.content !== null ? <div className="fresh-agent-diagnostic-body">{error.content}</div> : null}
           </NoticeDisclosure>
         ))}</div>

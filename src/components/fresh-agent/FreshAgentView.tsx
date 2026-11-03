@@ -5452,14 +5452,14 @@ export function FreshAgentView({
       ? 'Check the conversation before sending again. Delivery is uncertain.'
       : verboseNotice ? summarizeDiagnostic(notice.text) : notice?.text
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice || uncertainDelivery ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
-    { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), content: (pendingCodexError ? (
+      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, compactSummary: notice.level === 'warning' ? 'Warning' : 'Error', level: notice.level, content: <p>{notice.text}</p>, onToggle: setNoticeExpanded }] : []),
+    { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), compactSummary: 'Codex error', content: (pendingCodexError ? (
                 <FreshAgentApprovalBanner text={`Codex reported an error: ${pendingCodexError.message}`} />
               ) : null) },
-    { id: 'codex-unattributed', level: 'warning' as const, summary: errorSummary('Codex error; turn unconfirmed', unattributedCodexError), content: (unattributedCodexError ? (
+    { id: 'codex-unattributed', level: 'warning' as const, summary: errorSummary('Codex error; turn unconfirmed', unattributedCodexError), compactSummary: 'Codex warning', content: (unattributedCodexError ? (
                 <FreshAgentApprovalBanner text={`Codex reported an error, but the associated turn could not be confirmed: ${unattributedCodexError}`} />
               ) : null) },
-    { id: 'create', summary: errorSummary('Agent could not start', (pendingCreateFailure ?? paneContent.createError)?.message), content: (pendingCreateFailure || paneContent.createError ? (
+    { id: 'create', summary: errorSummary('Agent could not start', (pendingCreateFailure ?? paneContent.createError)?.message), compactSummary: 'Start failed', content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
                     text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'}
@@ -5504,13 +5504,13 @@ export function FreshAgentView({
                   ) : null}
                 </div>
               ) : null) },
-    { id: 'restore', summary: errorSummary('Restore failed', visibleRestoreFailure), content: (visibleRestoreFailure ? (
+    { id: 'restore', summary: errorSummary('Restore failed', visibleRestoreFailure), compactSummary: 'Restore failed', content: (visibleRestoreFailure ? (
                 <FreshAgentApprovalBanner
                   text={visibleRestoreFailure}
                   onDismiss={() => dispatch(clearRestoreFailure(sessionRecordLocator))}
                 />
               ) : null) },
-    { id: 'pane-restore', summary: errorSummary('Pane restore failed', visiblePaneRestoreFailure), content: (visiblePaneRestoreFailure ? (
+    { id: 'pane-restore', summary: errorSummary('Pane restore failed', visiblePaneRestoreFailure), compactSummary: 'Pane restore', content: (visiblePaneRestoreFailure ? (
                 <FreshAgentApprovalBanner
                   text={visiblePaneRestoreFailure}
                   onDismiss={() => dispatch(updatePaneContent({
@@ -5523,22 +5523,22 @@ export function FreshAgentView({
                   }))}
                 />
               ) : null) },
-    { id: 'load', summary: errorSummary('Conversation could not load', visibleLoadError), content: (visibleLoadError ? (
+    { id: 'load', summary: errorSummary('Conversation could not load', visibleLoadError), compactSummary: 'Load failed', content: (visibleLoadError ? (
                 <FreshAgentApprovalBanner text={visibleLoadError} onDismiss={() => setLoadError(null)} />
               ) : null) },
-    { id: 'session', summary: errorSummary('Agent error', sessionErrorMessage), content: (sessionErrorMessage ? (
+    { id: 'session', summary: errorSummary('Agent error', sessionErrorMessage), compactSummary: 'Agent error', content: (sessionErrorMessage ? (
                 <FreshAgentApprovalBanner
                   text={`Agent error: ${sessionErrorMessage}`}
                   onDismiss={() => dispatch(clearSessionError(sessionRecordLocator))}
                 />
               ) : null) },
-    { id: 'close', summary: errorSummary('Close failed', paneContent.closeError), content: (paneContent.closeError ? (
+    { id: 'close', summary: errorSummary('Close failed', paneContent.closeError), compactSummary: 'Close failed', content: (paneContent.closeError ? (
                 <FreshAgentApprovalBanner
                   text={`Close failed: ${paneContent.closeError}`}
                   onDismiss={() => dispatch(clearPaneCloseError({ tabId, paneId }))}
                 />
               ) : null) },
-    { id: 'stuck', summary: 'Agent appears stuck', content: (effectiveStatus === 'stuck' && !lifecycleBlocked && !managedRecoveryActive ? (
+    { id: 'stuck', summary: 'Agent appears stuck', compactSummary: 'Agent stuck', content: (effectiveStatus === 'stuck' && !lifecycleBlocked && !managedRecoveryActive ? (
                 <div
                   className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
                   role="alert"
@@ -5564,7 +5564,7 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null) },
-    { id: 'handoff', summary: errorSummary('Reopen failed', paneContent.handoffError?.message), content: (paneContent.handoffError ? (
+    { id: 'handoff', summary: errorSummary('Reopen failed', paneContent.handoffError?.message), compactSummary: 'Reopen failed', content: (paneContent.handoffError ? (
                 <SessionHandoffErrorBanner
                   error={paneContent.handoffError}
                   appStore={appStore}
@@ -5572,7 +5572,7 @@ export function FreshAgentView({
                   paneId={paneId}
                 />
               ) : null) },
-    { id: 'owner', summary: ownerDivergence?.fencedReason !== undefined ? 'Session needs recovery' : 'Session opened elsewhere', content: (ownerDivergence?.fencedReason !== undefined ? (
+    { id: 'owner', summary: ownerDivergence?.fencedReason !== undefined ? 'Session needs recovery' : 'Session opened elsewhere', compactSummary: 'Session', content: (ownerDivergence?.fencedReason !== undefined ? (
                 <div
                   className="fresh-agent-fenced-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
                   role="alert"
@@ -5615,7 +5615,7 @@ export function FreshAgentView({
                   ) : null}
                 </div>
               ) : null) },
-    { id: 'ended', summary: 'Session ended', content: (!managedRecoveryActive && sessionEnded ? (
+    { id: 'ended', summary: 'Session ended', compactSummary: 'Session ended', content: (!managedRecoveryActive && sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
                   <div className="flex flex-wrap gap-2">

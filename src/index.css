@@ -1618,6 +1618,13 @@ body {
   overflow: auto;
 }
 .fresh-agent-error-summaries > details { min-width: 0; max-width: 100%; }
+.fresh-agent-error-summary-compact { display: none; }
+/* Multiple diagnostics share one small row in compact panes. Their full
+   descriptions remain available in each disclosure and its accessible name. */
+@container (max-width: 899px) or (max-height: 479px) {
+  .fresh-agent-error-summary-full { display: none; }
+  .fresh-agent-error-summary-compact { display: inline; }
+}
 .fresh-agent-errors:has(details[open]) { display: block; }
 .fresh-agent-errors:has(details[open]) .fresh-agent-error-summaries { display: block; }
 .fresh-agent-notices { min-width: 0; max-width: 100%; }
