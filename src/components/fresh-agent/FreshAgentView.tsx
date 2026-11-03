@@ -3560,17 +3560,17 @@ export function FreshAgentView({
           const outgoing = outgoingTurnRef.current
           const echoSlotAvailable = (!echo || echo.requestId === message.requestId)
             && (!current.pendingLocalEcho || current.pendingLocalEcho.requestId === message.requestId)
-          if (echoSlotAvailable && outgoing?.requestId === message.requestId) {
-            setLocalEcho({ requestId: outgoing.requestId, text: outgoing.text,
-              previousTurnKeys: outgoing.previousTurns.map(getTurnKey),
-              ...(submittedTurnId ? { submittedTurnId } : {}) })
-          } else if (echoSlotAvailable && !outgoing && pending.text
-            && localEchoSendBoundaryRef.current?.requestId === message.requestId) {
+          const matchingOutgoing = outgoing?.requestId === message.requestId ? outgoing : null
+          const recoveredText = matchingOutgoing?.text ?? (!outgoing ? pending.text : undefined)
+          const boundary = matchingOutgoing
+            ? new Set(matchingOutgoing.previousTurns.map(getTurnKey))
+            : !outgoing && localEchoSendBoundaryRef.current?.requestId === message.requestId
+              ? localEchoSendBoundaryRef.current.turnKeys : undefined
+          if (echoSlotAvailable && recoveredText && boundary) {
             // A busy-to-idle transition can retire the outgoing ref before a
-            // delayed receipt. Recover this request's echo from its retained
-            // text and original boundary unless the transcript has landed.
-            const boundary = localEchoSendBoundaryRef.current.turnKeys
-            const recoveredEcho = { requestId: message.requestId, text: pending.text,
+            // delayed receipt. Recover the original text and boundary, but
+            // only if the transcript does not already contain this send.
+            const recoveredEcho = { requestId: message.requestId, text: recoveredText,
               previousTurnKeys: [...boundary], ...(submittedTurnId ? { submittedTurnId } : {}) }
             const snapshot = snapshotRef.current
             const snapshotIdentity = snapshot ? getSnapshotIdentity(snapshot) : null
@@ -3586,7 +3586,9 @@ export function FreshAgentView({
               ? mergeFreshAgentTranscriptProjection(snapshot, projection)
               : projection?.turns ?? []
             if (!localEchoLanded(turns, recoveredEcho, pending, {
-              allowTextMatch: true, previousTurnKeys: new Set(boundary),
+              // A known submitted ID distinguishes another client's identical
+              // text from this request. Legacy receipts can still match text.
+              allowTextMatch: !submittedTurnId, previousTurnKeys: new Set(boundary),
             })) setLocalEcho(recoveredEcho)
           }
         }
@@ -3608,7 +3610,7 @@ export function FreshAgentView({
           if (outgoingTurnRef.current?.requestId === message.requestId) {
             outgoingTurnRef.current.submittedTurnId = submittedTurnId
           }
-          if (echo?.requestId === message.requestId
+          if (!pending?.deliveryAmbiguous && echo?.requestId === message.requestId
             && (!current.pendingLocalEcho || current.pendingLocalEcho.requestId === message.requestId)) {
             setLocalEcho({ ...echo, submittedTurnId })
           }
