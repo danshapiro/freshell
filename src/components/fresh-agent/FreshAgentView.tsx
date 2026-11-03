@@ -3558,6 +3558,7 @@ export function FreshAgentView({
               : { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true, ...currentScope })
           }
           const outgoing = outgoingTurnRef.current
+          console.log('SETTLED_ECHO_DIAGNOSTIC', { outgoing, echo, current, snapshot: snapshotRef.current, pending, originalPending, scope: currentScope })
           const echoSlotAvailable = (!echo || echo.requestId === message.requestId)
             && (!current.pendingLocalEcho || current.pendingLocalEcho.requestId === message.requestId)
           if (echoSlotAvailable && outgoing?.requestId === message.requestId) {
