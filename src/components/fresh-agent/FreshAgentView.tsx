@@ -189,7 +189,8 @@ const ProjectedFreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fre
   snapshot: FreshAgentSnapshot | null
   sessionKey?: string
   hidden: boolean
-}>(function ProjectedFreshAgentTranscript({ snapshot, sessionKey, hidden, turns: savedTurns, localEcho, ...props }, ref) {
+  echoMetadata: LocalEcho | null
+}>(function ProjectedFreshAgentTranscript({ snapshot, sessionKey, hidden, turns: savedTurns, localEcho, echoMetadata, ...props }, ref) {
   const projection = useAppSelector((state) => !hidden && sessionKey ? state.freshAgentLive?.bySession[sessionKey]?.projection : undefined)
   const previousTurns = useRef<FreshAgentTurn[]>([])
   const turns = useMemo(() => {
@@ -197,7 +198,9 @@ const ProjectedFreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fre
     previousTurns.current = shareUnchangedTurns(previousTurns.current, next)
     return previousTurns.current
   }, [snapshot, projection, savedTurns])
-  const echoLanded = localEcho && turns.some((row) => row.role === 'user' && (row.nativeTurnId === localEcho.turnId || row.turnId === localEcho.turnId))
+  const echoLanded = localEcho && echoMetadata && localEchoLanded(turns, echoMetadata, {}, {
+    previousTurnKeys: echoMetadata.previousTurnKeys ? new Set(echoMetadata.previousTurnKeys) : null,
+  })
   return <FreshAgentTranscript {...props} ref={ref} turns={turns} localEcho={echoLanded ? undefined : localEcho} />
 })
 type SnapshotAuditStage = 'refresh_requested' | 'effect_skipped' | 'request_captured' | 'request_queued'
@@ -537,37 +540,64 @@ function paneCaptureInFlight(
   return false
 }
 
+function isTurnBeforeEchoBoundary(turn: FreshAgentTurn, previousTurnKeys: Set<string> | null): boolean {
+  if (!previousTurnKeys) return false
+  const key = getTurnKey(turn)
+  if (previousTurnKeys.has(key)) return true
+  // A one-row native turn is re-keyed to row-0 when later output arrives.
+  return key.endsWith(':row-0') && previousTurnKeys.has(key.slice(0, -':row-0'.length))
+}
+
+function belongsToNativeTurn(turn: FreshAgentTurn, submittedTurnId: string): boolean {
+  const key = getTurnKey(turn)
+  const rowPrefix = `${submittedTurnId}:row-`
+  return turn.nativeTurnId === submittedTurnId || key === submittedTurnId
+    || (key.startsWith(rowPrefix) && /^\d+$/.test(key.slice(rowPrefix.length)))
+}
+
+function countNewNativeTextMatches(
+  turns: readonly FreshAgentTurn[], echo: LocalEcho, submittedTurnId: string,
+  previousTurnKeys: Set<string> | null,
+): number {
+  if (!previousTurnKeys || !echo.text) return 0
+  const needle = echo.text.slice(0, 80)
+  return turns.filter((turn) => turn.role === 'user'
+    && belongsToNativeTurn(turn, submittedTurnId)
+    && !isTurnBeforeEchoBoundary(turn, previousTurnKeys)
+    && echoTextMatchesTurn(echo.text, needle, freshAgentTurnText(turn))).length
+}
+
 function localEchoLanded(
   turns: readonly FreshAgentTurn[],
   echo: LocalEcho,
   pending?: PendingSendMetadata,
   options: {
     allowTextMatch?: boolean
+    allowSettledTextMatch?: boolean
     previousTurnKeys?: Set<string> | null
   } = {},
 ): boolean {
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
   const previousTurnKeys = options.previousTurnKeys ?? null
-  // An accepted native turn ID identifies this send even when another user
-  // submits identical text. Legacy receipts without an ID still match text.
-  const canMatchText = Boolean(needle) && !submittedTurnId && (
+  const userTurns = turns.filter((turn) => turn.role === 'user')
+  if (userTurns.some((turn) => (turn as { requestId?: unknown }).requestId === echo.requestId
+    && !isTurnBeforeEchoBoundary(turn, previousTurnKeys))) return true
+  if (submittedTurnId) {
+    const nativeRows = userTurns.filter((turn) => belongsToNativeTurn(turn, submittedTurnId))
+    // Multiple user rows can share a native turn ID when a turn is steered.
+    // Only a single new row can be identified by that ID alone.
+    if (nativeRows.length === 1 && !isTurnBeforeEchoBoundary(nativeRows[0], previousTurnKeys)) return true
+    return options.allowSettledTextMatch === true
+      && countNewNativeTextMatches(userTurns, echo, submittedTurnId, previousTurnKeys) === 1
+  }
+  const canMatchText = Boolean(needle) && (
     options.allowTextMatch === true
     || pending?.legacyAccepted === true
     || !pending
   )
-  return turns.some((turn) => (
-    turn.role === 'user'
-    && (
-      (submittedTurnId ? getFreshAgentDisplayTurnKey(turn) === submittedTurnId || turn.nativeTurnId === submittedTurnId : false)
-      || (turn as { requestId?: unknown }).requestId === echo.requestId
-      || (
-        canMatchText
-        && (!previousTurnKeys || !previousTurnKeys.has(getTurnKey(turn)))
-        && echoTextMatchesTurn(echo.text, needle, freshAgentTurnText(turn))
-      )
-    )
-  ))
+  return canMatchText && userTurns.some((turn) => !isTurnBeforeEchoBoundary(turn, previousTurnKeys)
+    && echoTextMatchesTurn(echo.text, needle, freshAgentTurnText(turn)))
 }
 
 function isSnapshotInFlight(snapshot: FreshAgentSnapshot): boolean {
@@ -582,7 +612,9 @@ function shouldClearStaleLocalEcho(
   if (isSnapshotInFlight(snapshot)) return false
   const accepted = Boolean(echo.submittedTurnId || pending?.submittedTurnId || pending?.legacyAccepted)
   if (!accepted) return false
-  return !localEchoLanded(snapshot.turns, echo, pending)
+  return !localEchoLanded(snapshot.turns, echo, pending, {
+    previousTurnKeys: echo.previousTurnKeys ? new Set(echo.previousTurnKeys) : null,
+  })
 }
 
 function isNativeHistoryOnlySnapshot(snapshot: FreshAgentSnapshot | null): boolean {
@@ -4145,6 +4177,9 @@ export function FreshAgentView({
       }
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
+      const allowSettledTextMatch = snapshotAccepted && displaySnapshot.status === 'idle'
+        && snapshotStatusAuthoritative
+        && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
       const outgoing = outgoingTurnRef.current
       if (
         outgoing && outgoing.requestId === requestOutgoingTurnId
@@ -4153,6 +4188,7 @@ export function FreshAgentView({
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
+          allowSettledTextMatch,
           previousTurnKeys: new Set((outgoing.previousTurns ?? []).map(getTurnKey)),
         })
       ) {
@@ -4230,12 +4266,17 @@ export function FreshAgentView({
       }
       const echo = localEchoRef.current
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
+      const echoSubmittedTurnId = echo?.submittedTurnId ?? echoPendingMetadata?.submittedTurnId
+      const echoBoundary = echo?.previousTurnKeys ? new Set(echo.previousTurnKeys) : null
       const landedEcho = echo
         ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
             allowTextMatch: snapshotAccepted,
-            previousTurnKeys: echo.previousTurnKeys ? new Set(echo.previousTurnKeys) : null,
+            allowSettledTextMatch,
+            previousTurnKeys: echoBoundary,
           })
         : false
+      const ambiguousNativeEcho = Boolean(echo && echoSubmittedTurnId && allowSettledTextMatch
+        && countNewNativeTextMatches(displaySnapshot.turns, echo, echoSubmittedTurnId, echoBoundary) > 1)
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
       // stale-echo clear, INDEPENDENT of the retry-exhaustion gate below.
       const echoStillPending = echo
@@ -4246,6 +4287,7 @@ export function FreshAgentView({
       // echo still clears immediately.
       const staleEcho = echo
         ? snapshotAccepted
+          && !ambiguousNativeEcho
           && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
         : false
@@ -6027,6 +6069,7 @@ export function FreshAgentView({
                     paneId={paneId}
                     turns={turns}
                     localEcho={localEchoTurn}
+                    echoMetadata={localEcho}
                     canFork={canFork}
                     canRollback={canRollback}
                     rollbackBusy={isBusy}
