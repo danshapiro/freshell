@@ -307,6 +307,7 @@ struct HostedTransport {
     native_incarnation: Mutex<Option<String>>,
     prepared_native_checkpoints: std::sync::Mutex<Option<Vec<Value>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
+    native_evidence_rx: Mutex<watch::Receiver<Option<Value>>>,
     /// The native identity's writer, shared with the bridge: a claude fork
     /// points it at the child the moment the transition is known (the bridge
     /// announces only an id it has not recorded, so the child's first turn
@@ -515,7 +516,7 @@ impl HostedTransport {
     ) -> Arc<Self> {
         let (created_tx, created_rx) = watch::channel(None);
         let (native_tx, native_rx) = watch::channel(None);
-        let (native_evidence_tx, _) = watch::channel(None);
+        let (native_evidence_tx, native_evidence_rx) = watch::channel(None);
         let native_identity = Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default()));
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (send_outcomes, _) = broadcast::channel(64);
@@ -553,6 +554,7 @@ impl HostedTransport {
             prepared_native_checkpoints: std::sync::Mutex::new(None),
             created_rx: Mutex::new(created_rx),
             native_rx: Mutex::new(native_rx),
+            native_evidence_rx: Mutex::new(native_evidence_rx),
             native_tx,
             native_identity,
             send_outcomes,
@@ -624,19 +626,44 @@ impl HostedTransport {
 
     async fn wait_exact_native(&self, expected: &str) -> Result<String, String> {
         let mut receiver = self.native_rx.lock().await;
+        let mut evidence = self.native_evidence_rx.lock().await;
+        let expected_launch = self
+            .native_identity
+            .lock()
+            .expect("native identity lock")
+            .launch
+            .clone();
+        let requires_current_proof =
+            matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy)
+                && expected_launch.is_some();
         tokio::time::timeout(CREATE_TIMEOUT, async {
             loop {
-                if let Some(observed) = receiver.borrow().clone() {
-                    return if observed == expected {
-                        Ok(observed)
-                    } else {
-                        Err("provider resumed a different native session".into())
-                    };
+                let observed = receiver.borrow_and_update().clone();
+                let current_evidence = evidence.borrow_and_update().clone();
+                if let Some(observed) = observed {
+                    if observed != expected {
+                        return Err("provider resumed a different native session".into());
+                    }
+                    if !requires_current_proof
+                        || current_evidence.as_ref().is_some_and(|proof| {
+                            proof["nativeSessionId"].as_str() == Some(expected)
+                                && proof["queryGeneration"]
+                                    .as_u64()
+                                    .is_some_and(|generation| generation > 0)
+                                && proof["launch"] == json!(expected_launch)
+                        })
+                    {
+                        return Ok(observed);
+                    }
                 }
-                receiver
-                    .changed()
-                    .await
-                    .map_err(|_| "provider identity channel closed".to_string())?;
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        changed.map_err(|_| "provider identity channel closed".to_string())?;
+                    }
+                    changed = evidence.changed() => {
+                        changed.map_err(|_| "provider identity evidence channel closed".to_string())?;
+                    }
+                }
             }
         })
         .await
@@ -2957,6 +2984,77 @@ mod tests {
             .await
             .expect("owned bridge must close without another provider frame");
         assert!(final_event.is_none());
+    }
+
+    #[tokio::test]
+    async fn claude_exact_native_waits_for_current_proof_after_created_announcement() {
+        let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
+        const NATIVE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+            serde_json::from_value(json!({
+                "incarnationId":"current", "launchNonce":"current-nonce",
+                "evidenceRevision":0, "executionGeneration":1,
+                "requestedNativeSessionId":NATIVE
+            }))
+            .unwrap();
+        let transport = HostedTransport::new(FreshProvider::Claude).await;
+        {
+            let mut identity = transport.native_identity.lock().unwrap();
+            identity.launch = Some(launch.clone());
+            identity.producer_launch = Some(launch.clone());
+        }
+        let mut native = transport.native_rx.lock().await;
+        transport
+            .provider_frames
+            .send(
+                json!({"type":"freshAgent.created", "sessionId":"host-session",
+                    "sessionRef":{"provider":"claude", "sessionId":NATIVE}})
+                .to_string(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if native.borrow_and_update().as_deref() == Some(NATIVE) {
+                    break;
+                }
+                native.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("created session reference should be announced");
+        drop(native);
+
+        let wait = transport.wait_exact_native(NATIVE);
+        tokio::pin!(wait);
+        let returned_before_proof = tokio::select! {
+            biased;
+            result = &mut wait => Some(result),
+            _ = tokio::time::sleep(Duration::ZERO) => None,
+        };
+        assert!(
+            returned_before_proof.is_none(),
+            "a created session reference is not current native identity proof"
+        );
+        transport
+            .provider_frames
+            .send(
+                json!({"type":"freshAgent.event", "event":{"type":"freshAgent.session.init",
+                    "cliSessionId":NATIVE, "nativeIdentityEvidence":{"launch":launch,
+                    "digest":"a".repeat(64), "source":"resume", "queryGeneration":1}}})
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut wait)
+                .await
+                .unwrap()
+                .unwrap(),
+            NATIVE
+        );
+        assert_eq!(
+            transport.native_identity_evidence().await.unwrap()["nativeSessionId"],
+            NATIVE
+        );
     }
 
     // The real host actor drains the tested bridge; startup is already complete
