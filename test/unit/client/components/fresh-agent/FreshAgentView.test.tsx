@@ -2520,13 +2520,30 @@ describe('FreshAgentView', () => {
         sessionRef: { provider: 'opencode' as const, sessionId }, status: 'idle' as const,
       }
       let otherTurnLanded = false
-      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, requestedSessionId) => ({
+      let ourTurnLanded = false
+      let holdRefresh = false
+      let heldRefreshStarted = false
+      const snapshot = (requestedSessionId: string, afterAcceptance = false) => ({
         status: 'idle', threadId: requestedSessionId,
         sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
-        turns: otherTurnLanded ? [{ id: 'other-turn', turnId: 'other-turn', role: 'user',
-          items: [{ id: 'other-text', kind: 'text', text: prompt }] }] : [],
+        turns: [
+          ...(otherTurnLanded ? [{ id: 'other-turn', turnId: 'other-turn', role: 'user',
+            items: [{ id: 'other-text', kind: 'text', text: prompt }] }] : []),
+          ...(afterAcceptance ? [{ id: 'other-answer', turnId: 'other-answer', role: 'assistant',
+            items: [{ id: 'other-answer-text', kind: 'text', text: 'Snapshot refreshed after acceptance' }] }] : []),
+          ...(ourTurnLanded ? [{ id: 'our-accepted-turn', turnId: 'our-accepted-turn', role: 'user',
+            items: [{ id: 'our-text', kind: 'text', text: prompt }] }] : []),
+        ],
         extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
-      }))
+      })
+      const heldRefresh = createDeferred<ReturnType<typeof snapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, requestedSessionId) => {
+        if (holdRefresh) {
+          heldRefreshStarted = true
+          return heldRefresh.promise
+        }
+        return snapshot(requestedSessionId)
+      })
       store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
       const composer = screen.getByRole('textbox', { name: 'Chat message input' })
@@ -2548,6 +2565,7 @@ describe('FreshAgentView', () => {
         expect(rows).toHaveLength(1)
         expect(within(rows[0]).getByText(prompt)).toBeVisible()
       })
+      holdRefresh = true
       act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
         sessionType: content.sessionType, provider: content.provider,
         requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn' }))
@@ -2558,9 +2576,98 @@ describe('FreshAgentView', () => {
       })
       expect(composer).toHaveValue(prompt)
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      // Acceptance itself schedules a refresh. A different turn with the
+      // same text must not clear the accepted echo during that read either.
+      await waitFor(() => expect(heldRefreshStarted).toBe(true))
+      holdRefresh = false
+      await act(async () => { heldRefresh.resolve(snapshot(sessionId, true)) })
+      await screen.findByText('Snapshot refreshed after acceptance')
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn', text: prompt,
+      })
+
+      ourTurnLanded = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
     })
 
-    it('does not resurrect a landed echo when uncertainty and acceptance arrive in the same batch', async () => {
+    it('recognizes a landed split Codex user row by its native turn ID on delayed acceptance', async () => {
+      const store = createStore()
+      const sessionId = 'codex-split-landed-acceptance'
+      const prompt = 'The Codex prompt already landed'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'codex-split-landed-create', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'codex' as const, sessionId }, status: 'idle' as const,
+      }
+      let landed = false
+      let holdIdleRead = false
+      let idleReadStarted = false
+      const snapshot = (status: 'idle' | 'running') => ({
+        status, threadId: sessionId, sessionType: content.sessionType, provider: content.provider,
+        capabilities: { send: true, interrupt: true },
+        turns: landed ? [
+          { id: 'codex-native-turn:row-0', turnId: 'codex-native-turn:row-0', nativeTurnId: 'codex-native-turn',
+            role: 'user', items: [{ id: 'codex-user', kind: 'text', text: prompt }] },
+          { id: 'codex-native-turn:row-1', turnId: 'codex-native-turn:row-1', role: 'assistant',
+            items: [{ id: 'codex-answer', kind: 'text', text: 'Codex is responding' }] },
+        ] : [],
+      })
+      const idleRead = createDeferred<ReturnType<typeof snapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        if (holdIdleRead) {
+          idleReadStarted = true
+          return idleRead.promise
+        }
+        return snapshot(landed ? 'running' : 'idle')
+      })
+      store.dispatch(sessionInit({ sessionId, sessionType: content.sessionType, provider: content.provider }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
+
+      landed = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await screen.findByText('Codex is responding')
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      holdIdleRead = true
+      act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
+        sessionType: content.sessionType, provider: content.provider,
+        requestId: sent!.requestId, submittedTurnId: 'codex-native-turn' }))
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+
+      // A phantom persisted echo would block this authoritative idle read
+      // from releasing the queued follow-up for the same session.
+      fireEvent.change(composer, { target: { value: 'A queued follow-up' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      await waitFor(() => expect(idleReadStarted).toBe(true))
+      holdIdleRead = false
+      await act(async () => { idleRead.resolve(snapshot('idle')) })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'A queued follow-up' })
+    })
+
+    it.each([
+      { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
+      { label: 'ordinary acceptance arrives in the same batch as a landed snapshot', ambiguous: false },
+    ])('does not resurrect a landed echo when $label', async ({ ambiguous }) => {
       const store = createStore()
       const sessionId = 'ses_landed_batched_receipts'
       const prompt = 'The prompt already saved before both receipts'
@@ -2606,7 +2713,7 @@ describe('FreshAgentView', () => {
           await Promise.resolve()
         }
         expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
-        listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        if (ambiguous) listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
           message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' })
         listener({ type: 'freshAgent.send.accepted', sessionId,
           sessionType: content.sessionType, provider: content.provider,
@@ -2618,7 +2725,7 @@ describe('FreshAgentView', () => {
       expect(rows).toHaveLength(1)
       expect(within(rows[0]).getByText(prompt)).toBeVisible()
       expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
-      expect(composer).toHaveValue(prompt)
+      expect(composer).toHaveValue(ambiguous ? prompt : '')
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
