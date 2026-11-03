@@ -5753,9 +5753,15 @@ impl WorkspaceGitChild {
                 .name("workspace-git-stderr".into())
                 .spawn(move || {
                     #[cfg(all(test, target_os = "linux"))]
-                    started_tx
-                        .send(unsafe { libc::syscall(libc::SYS_gettid) as u32 })
-                        .expect("owned test drainer receiver");
+                    {
+                        let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+                        let identity = workspace_metadata_test_hooks::drainer_identity(tid)
+                            .expect("read owned drainer identity")
+                            .expect("running owned drainer exists");
+                        started_tx
+                            .send(identity)
+                            .expect("owned test drainer receiver");
+                    }
                     let mut retained = Vec::new();
                     let mut bytes = [0; 8192];
                     loop {
@@ -6005,9 +6011,68 @@ mod workspace_metadata_test_hooks {
         pub fail_drain_read: bool,
         pub fail_drain_join: bool,
         #[cfg(target_os = "linux")]
-        pub drainer_tids: Vec<u32>,
+        pub drainer_tids: Vec<DrainerIdentity>,
     }
     thread_local! { pub(super) static STATE: RefCell<State> = RefCell::new(State::default()); }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct DrainerIdentity {
+        tid: u32,
+        start_ticks: u64,
+    }
+
+    /// A numeric TID can be reused by another thread after the owned drainer
+    /// exits. Record the kernel's start time while the drainer is still alive.
+    #[cfg(target_os = "linux")]
+    pub(super) fn drainer_identity(tid: u32) -> io::Result<Option<DrainerIdentity>> {
+        let stat = match fs::read_to_string(format!("/proc/self/task/{tid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let fields = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid drainer task stat"))?
+            .1;
+        let start_ticks = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing drainer start time")
+            })?
+            .parse::<u64>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Some(DrainerIdentity { tid, start_ticks }))
+    }
+
+    /// A successful join can precede the kernel removing the task from /proc.
+    /// Wait only for this original identity, not a later reused numeric TID.
+    #[cfg(target_os = "linux")]
+    pub(super) fn wait_for_original_drainer_exit(
+        identity: DrainerIdentity,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if drainer_identity(identity.tid)? != Some(identity) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("owned stderr drainer {} remains after join", identity.tid),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub(super) fn spawned(pid: u32) {
         STATE.with(|state| state.borrow_mut().owned_pids.push(pid));
         count("spawn");
@@ -6132,6 +6197,37 @@ mod workspace_metadata_test_hooks {
                 let peak = state.counts.entry(peak).or_default();
                 *peak = (*peak).max(live);
             }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drainer_exit_wait_tracks_the_original_live_thread_identity() {
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let held = scope.spawn(move || {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+                let identity = drainer_identity(tid).unwrap().unwrap();
+                started_tx.send(identity).unwrap();
+                let _ = release_rx.recv();
+            });
+            let identity = started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let error = wait_for_original_drainer_exit(identity, Duration::from_millis(30))
+                .expect_err("the original live thread must not be considered gone");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+            let other_identity = DrainerIdentity {
+                start_ticks: identity.start_ticks.checked_add(1).unwrap(),
+                ..identity
+            };
+            wait_for_original_drainer_exit(other_identity, Duration::ZERO)
+                .expect("the same numeric TID with a different start time is not the original");
+
+            drop(release_tx);
+            held.join().expect("join held test thread");
+            wait_for_original_drainer_exit(identity, Duration::from_secs(2))
+                .expect("the joined original thread must disappear");
         });
     }
 
@@ -12872,8 +12968,12 @@ mod native_source_inventory_tests {
                     assert!(!Path::new(&format!("/proc/{pid}")).exists());
                 }
                 #[cfg(target_os = "linux")]
-                for tid in &state.drainer_tids {
-                    assert!(!Path::new(&format!("/proc/self/task/{tid}")).exists());
+                for identity in &state.drainer_tids {
+                    workspace_metadata_test_hooks::wait_for_original_drainer_exit(
+                        *identity,
+                        Duration::from_secs(2),
+                    )
+                    .expect("exact owned stderr drainer disappeared after join");
                 }
             });
         }
@@ -13154,11 +13254,12 @@ mod native_source_inventory_tests {
                 let state = state.borrow();
                 assert_eq!(state.counts["all_spawn"], state.counts["all_reap"]);
                 assert_eq!(state.counts["all_peak"], 1);
-                for tid in &state.drainer_tids {
-                    assert!(
-                        !Path::new(&format!("/proc/self/task/{tid}")).exists(),
-                        "exact owned stderr drainer joined"
-                    );
+                for identity in &state.drainer_tids {
+                    workspace_metadata_test_hooks::wait_for_original_drainer_exit(
+                        *identity,
+                        Duration::from_secs(2),
+                    )
+                    .expect("exact owned stderr drainer disappeared after join");
                 }
                 state.counts.clone()
             });
