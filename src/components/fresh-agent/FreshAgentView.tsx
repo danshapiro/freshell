@@ -143,7 +143,7 @@ import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
 import { withSharedTurns, shareUnchangedTurns } from '@/lib/fresh-agent-turn-sharing'
-import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
+import { formatFreshAgentNotice, isCodexRetainedDiagnosticNotice } from '@/lib/fresh-agent-notice'
 import { buildAllowDecision, type FreshAgentApprovalDecision } from '@/lib/fresh-agent-permission-updates'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
@@ -4967,10 +4967,7 @@ export function FreshAgentView({
       seen.current = item.seq
       // These notices update the retained diagnostic panel, independently of
       // transient notices such as an uncertain delivery warning.
-      if (item.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
-        || item.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
-        || item.code === 'CODEX_PENDING_PROVIDER_ERROR'
-        || item.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
+      if (isCodexRetainedDiagnosticNotice(paneContent.provider, item.code)) return
       const codexProviderError = paneContent.provider === 'codex' && item.code === 'CODEX_PROVIDER_ERROR'
       setNotice(formatFreshAgentNotice(item), item.level, liveSessionKey ? {
         sessionKey: liveSessionKey, canonicalSessionKey: savedNoticeSessionKey, codexProviderError,
