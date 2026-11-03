@@ -3346,6 +3346,22 @@ export function FreshAgentView({
       ) {
         const current = paneContentRef.current
         const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
+        // Materialization explicitly moves this pane's conversation from the
+        // previous live handle to the durable one. Carry its current notice
+        // across that verified transition before the pane identity changes.
+        const previousNoticeSessionKey = makeFreshAgentSessionKey({
+          sessionId: message.previousSessionId, sessionType: message.sessionType, provider: message.provider,
+        })
+        const nextNoticeSessionKey = makeFreshAgentSessionKey({
+          sessionId: message.sessionId, sessionType: message.sessionType, provider: message.provider,
+        })
+        const canonicalNoticeSessionKey = makeFreshAgentSessionKey({
+          sessionId: sessionRef.provider === message.provider ? sessionRef.sessionId : message.sessionId,
+          sessionType: message.sessionType, provider: message.provider,
+        })
+        setNoticeState(notice => notice?.sourceSessionKey === previousNoticeSessionKey
+          ? { ...notice, sourceSessionKey: nextNoticeSessionKey, sourceCanonicalSessionKey: canonicalNoticeSessionKey }
+          : notice)
         const nextContent = {
           ...current,
           sessionId: message.sessionId,
