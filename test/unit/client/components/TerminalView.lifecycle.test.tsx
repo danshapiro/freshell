@@ -633,6 +633,43 @@ describe('TerminalView lifecycle updates', () => {
     }
   })
 
+  it('registers the pane-scoped buffer key that survives terminalId loss (delta fix focused review, finding 2)', async () => {
+    // E2E notice-line assertions must read the xterm buffer API
+    // (renderer-independent), but the terminalId-keyed registration
+    // unregisters exactly when an exited pane clears its terminalId — the
+    // moment the durable-park notice line lands. The PANE-scoped registry
+    // keeps the same buffer reachable by pane id for the component's whole
+    // lifetime, and never leaks into getRegisteredTerminalIds (whose
+    // consumers treat every key as a terminal id).
+    const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+    const emulator = new actual.Terminal({ cols: 13, rows: 12, allowProposedApi: true })
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: undefined, status: 'creating',
+    })
+    installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const view = render(<Provider store={store}>
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+    </Provider>)
+    const term = terminalInstances.at(-1)!
+    expect(term, 'xterm surface must be mounted without a terminalId').toBeTruthy()
+    term.buffer = emulator.buffer
+    try {
+      const line = 'pane-scoped-buffer-witness-line'
+      await new Promise<void>(done => emulator.write(line, done))
+      // The pane-scoped key reads the pane's rendered buffer.
+      expect(harness.getPaneTerminalBuffer?.(paneId)).toContain(line)
+      // The pane-scoped registry is SEPARATE: this pane registers no
+      // terminalId key at all.
+      expect(harness.getRegisteredTerminalIds()).not.toContain(paneId)
+      view.unmount()
+      expect(harness.getPaneTerminalBuffer?.(paneId)).toBeNull()
+    } finally {
+      view.unmount()
+      emulator.dispose()
+    }
+  })
+
   it('skips terminal create when the e2e harness suppresses terminal network effects for the pane', () => {
     window.__FRESHELL_TEST_HARNESS__ = {
       getState: vi.fn(),

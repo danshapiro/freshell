@@ -2218,6 +2218,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
   }, [terminalContent?.terminalId])
 
+  // Pane-scoped buffer registration (delta fix focused review, finding 2):
+  // e2e notice-line assertions read the xterm buffer API
+  // (renderer-independent), but the terminalId-keyed registration above
+  // unregisters exactly when an exited pane clears its terminalId — the
+  // moment the durable-park notice line lands. This registration keeps the
+  // SAME buffer text reachable under the pane id for this component's whole
+  // lifetime. It lives in the harness's SEPARATE pane-scoped registry
+  // (getRegisteredTerminalIds keeps returning terminalIds only, because
+  // its consumers treat every key as a terminal id).
+  useEffect(() => {
+    if (!window.__FRESHELL_TEST_HARNESS__ || !paneId) return
+    window.__FRESHELL_TEST_HARNESS__.registerPaneTerminalBuffer?.(paneId, () => {
+      const t = termRef.current
+      if (!t) return ''
+      return terminalBufferText(t.buffer.active)
+    })
+    return () => {
+      window.__FRESHELL_TEST_HARNESS__?.unregisterPaneTerminalBuffer?.(paneId)
+    }
+  }, [paneId])
+
   // Sync visibility at commit phase (layout effect, not passive effect): a
   // passive effect would leave a window where a queued attach callback could
   // read a stale hiddenRef; a layout effect runs synchronously with the

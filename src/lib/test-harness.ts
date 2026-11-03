@@ -75,6 +75,18 @@ export interface FreshellTestHarness {
   unregisterTerminalModes: (terminalId: string) => void
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
+  /**
+   * Pane-scoped buffer registry (delta fix focused review, finding 2): the
+   * same renderer-independent xterm buffer text, addressed by the PANE id so
+   * it stays reachable when the pane holds NO terminalId (the durable-park
+   * shapes: an exited pane's restore-notice line lands exactly when the
+   * cleared terminalId unregisters the terminalId-keyed accessor). Kept in
+   * its OWN registry — getRegisteredTerminalIds keeps returning terminalIds
+   * only, because its consumers treat every key as a terminal id.
+   */
+  getPaneTerminalBuffer?: (paneId: string) => string | null
+  registerPaneTerminalBuffer?: (paneId: string, accessor: () => string) => void
+  unregisterPaneTerminalBuffer?: (paneId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
   getSentWsMessages?: () => unknown[]
   getSentWsMessagesWithTimestamps?: () => Array<{ __sentAt?: number; type?: string; requestId?: string }>
@@ -138,6 +150,10 @@ export function installTestHarness(
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
   const receivedWsMessages: unknown[] = []
+  // Pane-scoped buffer accessors, keyed by paneId (delta fix focused
+  // review, finding 2) — separate from the terminalId-keyed registry above
+  // so getRegisteredTerminalIds never surfaces pane keys.
+  const paneTerminalBuffers = new Map<string, () => string>()
   const terminalWriteEvents: TerminalWriteEvent[] = []
   let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
@@ -203,6 +219,13 @@ export function installTestHarness(
     },
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
+    },
+    getPaneTerminalBuffer: (paneId: string) => paneTerminalBuffers.get(paneId)?.() ?? null,
+    registerPaneTerminalBuffer: (paneId: string, accessor: () => string) => {
+      paneTerminalBuffers.set(paneId, accessor)
+    },
+    unregisterPaneTerminalBuffer: (paneId: string) => {
+      paneTerminalBuffers.delete(paneId)
     },
     getTerminalModes: (terminalId?: string) => {
       if (terminalId) {

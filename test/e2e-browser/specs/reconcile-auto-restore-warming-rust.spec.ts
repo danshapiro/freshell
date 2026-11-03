@@ -1026,9 +1026,19 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         'the recoverable identity is preserved',
       ).toBe(associatedSessionId)
       expect(erroredContent?.reconcileNotice, 'the durable visible-explanation mint').toBeTruthy()
-      await expect(
-        page.locator(`[data-context="pane"][data-pane-id="${opencodeLeaf.id}"]`),
-      ).toContainText('saved session store could not be read', { timeout: 30_000 })
+      // The line's witness reads the xterm BUFFER through the pane-scoped
+      // harness registry (delta fix focused review, finding 2): the
+      // configured terminal can render through WebGL/canvas, whose painted
+      // pixels never reach pane textContent, and this pane holds NO
+      // terminalId (exited), so the pane-scoped key is the
+      // renderer-independent path. Soft row-wrapping is already
+      // logical-line-joined by the buffer text accessor, so the exact
+      // phrase matches.
+      await expect
+        .poll(async () => (await harness.getPaneTerminalBuffer(opencodeLeaf.id)) ?? '', {
+          timeout: 30_000,
+        })
+        .toContain('saved session store could not be read')
 
       // 8. The banner cleared itself at the fold (warming === 0 — the
       //    pane resolved, honestly to an error) — the RED door: without
