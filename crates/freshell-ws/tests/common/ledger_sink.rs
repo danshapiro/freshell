@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub struct LedgerWriteGate {
     entered: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
+    remaining: std::sync::atomic::AtomicUsize,
 }
 
 impl LedgerWriteGate {
@@ -25,6 +26,14 @@ impl LedgerWriteGate {
         Self {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
+            remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    pub fn once() -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicUsize::new(1),
+            ..Self::new()
         }
     }
 
@@ -37,6 +46,17 @@ impl LedgerWriteGate {
     }
 
     async fn hold(&self) -> std::io::Result<()> {
+        if self
+            .remaining
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
         self.entered.notify_one();
         self.release
             .acquire()

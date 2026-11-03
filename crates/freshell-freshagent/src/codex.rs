@@ -4809,14 +4809,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                let _ = self
-                    .settle_removed_session(&thread_id, session, own_ticket.take(), None)
-                    .await;
             }
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -4849,14 +4844,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                let _ = self
-                    .settle_removed_session(&thread_id, session, own_ticket.take(), None)
-                    .await;
             }
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -7841,14 +7831,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(&child_id) {
-                let _ = self
-                    .settle_removed_session(&child_id, session, own_ticket.take(), None)
-                    .await;
             }
             let _ = parent_client.unarchive_thread(&child_id).await;
             reply_sink(fork_error_frame(
@@ -7883,14 +7868,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(&child_id) {
-                let _ = self
-                    .settle_removed_session(&child_id, session, own_ticket.take(), None)
-                    .await;
             }
             let _ = parent_client.unarchive_thread(&child_id).await;
             reply_sink(fork_error_frame(
@@ -10046,14 +10026,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(session_id) {
-                let _ = self
-                    .settle_removed_session(session_id, session, own_ticket.take(), None)
-                    .await;
             }
             if let Some(mut guard) = lease_guard.take() {
                 guard.fail();
@@ -10085,14 +10060,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(session_id) {
-                let _ = self
-                    .settle_removed_session(session_id, session, own_ticket.take(), None)
-                    .await;
             }
             if let Some(mut guard) = lease_guard.take() {
                 guard.fail();
@@ -10459,14 +10429,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
-                let _ = self
-                    .settle_removed_session(&new_thread_id, session, own_ticket.take(), None)
-                    .await;
             }
             if let Some(mut guard) = lease_guard.take() {
                 guard.fail();
@@ -10498,14 +10463,9 @@ impl FreshCodexState {
                 .repair_now()
                 .await;
             if repaired {
-                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
-                let _ = self
-                    .settle_removed_session(&new_thread_id, session, own_ticket.take(), None)
-                    .await;
             }
             if let Some(mut guard) = lease_guard.take() {
                 guard.fail();
@@ -12699,14 +12659,9 @@ impl FreshCodexState {
                     .repair_now()
                     .await;
                 if repaired {
-                    own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
                 } else {
                     drop(binding_guard.take());
-                }
-                if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                    let _ = self
-                        .settle_removed_session(thread_id, session, own_ticket.take(), None)
-                        .await;
                 }
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -12752,14 +12707,9 @@ impl FreshCodexState {
                         .repair_now()
                         .await;
                     if repaired {
-                        own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                        drop(binding_guard.take().and_then(|guard| guard.finish()));
                     } else {
                         drop(binding_guard.take());
-                    }
-                    if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                        let _ = self
-                            .settle_removed_session(thread_id, session, own_ticket.take(), None)
-                            .await;
                     }
                     if let Some(mut g) = lease_guard.take() {
                         g.fail();
@@ -25845,6 +25795,93 @@ pub(crate) mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         let _ = stall.release.send(());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sink.repairs.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the exact old runtime is settled and its failed binding repaired");
+        assert!(crate::ownership_lane::partial_pid_confirmed_dead(
+            original_pid
+        ));
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(
+            replacement_pid
+        ));
+        assert_eq!(
+            state
+                .sessions
+                .lock()
+                .await
+                .get(id)
+                .unwrap()
+                .sidecar_ownership_id,
+            replacement_id
+        );
+        assert!(matches!(registry.observe(PROVIDER, id).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.ownership_id.as_deref() == Some("replacement-owner")));
+        let _ = state.settle_removed_session(id, original, None, None).await;
+        state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_registered_startup_preserves_replacement_runtime_and_owner() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, _rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let id = "cancel-replaced-startup";
+        let stall = sink.arm_binding_stall(PROVIDER, id);
+        let mut msg = create_msg("cancel-replaced-startup");
+        msg.resume_session_id = Some(id.into());
+        let st = state.clone();
+        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let original = state.sessions.lock().await.remove(id).unwrap();
+        let original_pid = original.sidecar_pid.unwrap();
+        let claim = sink
+            .bindings
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .claim
+            .clone()
+            .unwrap();
+
+        let mut replacement_msg = create_msg("replacement-runtime");
+        replacement_msg.resume_session_id = Some("replacement-runtime".into());
+        assert!(matches!(
+            state.handle_create(replacement_msg, None).await,
+            CodexCreateOutcome::Created { .. }
+        ));
+        let replacement = state
+            .sessions
+            .lock()
+            .await
+            .remove("replacement-runtime")
+            .unwrap();
+        let replacement_pid = replacement.sidecar_pid.unwrap();
+        let replacement_id = replacement.sidecar_ownership_id.clone();
+        state.sessions.lock().await.insert(id.into(), replacement);
+        // Model a superseding lifecycle owner while the old request is parked.
+        registry.fail(PROVIDER, id, &claim.operation_id, claim.generation, false);
+        let crate::ownership_lane::LaneClaim::Granted(ticket) =
+            state.begin_lane_claim_at(id, "replacement-owner", None, "test")
+        else {
+            panic!("new owner is granted after supersession")
+        };
+        state
+            .commit_lane_claim_at(&mut Some(ticket), id, id, Some(replacement_pid))
+            .unwrap();
+
+        let _ = stall.release.send(());
+        assert!(matches!(
+            task.await.unwrap(),
+            CodexCreateOutcome::Failed { .. }
+        ));
         tokio::time::timeout(Duration::from_secs(10), async {
             while sink.repairs.lock().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;

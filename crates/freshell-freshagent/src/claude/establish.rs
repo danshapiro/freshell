@@ -290,6 +290,80 @@ impl FreshClaudeState {
         }
     }
 
+    /// Own the exact booted tree before registration or binding can suspend.
+    /// Cancellation resumes this same cleanup before repair releases Starting.
+    fn registered_binding_guard(
+        &self,
+        ticket: Option<freshell_ownership::OperationTicket>,
+        claim: Option<crate::identity_sink::BindingClaim>,
+        map_key: &str,
+        runtime: &BootedSidecar,
+        lease: Option<&crate::FreshSessionLeaseGuard>,
+    ) -> crate::identity_sink::BindingWriteGuard {
+        let handoff = claim
+            .as_ref()
+            .is_some_and(|claim| claim.kind == crate::identity_sink::BindingClaimKind::Handoff);
+        let mut guard =
+            crate::identity_sink::BindingWriteGuard::new(ticket, claim, self.identity_sink());
+        let runtime_id = runtime.ownership_id.clone();
+        let recorded = runtime.child.id().map(|pid| {
+            crate::session_lease::record_condemned_runtime_identity(
+                pid,
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                &runtime_id,
+            )
+        });
+        let lease = lease.map(|lease| (lease.session_id.clone(), lease.request_id.clone()));
+        let state = self.clone();
+        let id = map_key.to_string();
+        guard.settle_startup_before_repair(async move {
+            let session = {
+                let mut sessions = state.sessions.lock().await;
+                if sessions.get(&id).is_some_and(|s| s.ownership_id == runtime_id) {
+                    // The outer handoff runner may enter its cleanup after
+                    // this guard removes the cell. Preserve its native witness
+                    // before removal so AlreadyGone cannot mean a live tree.
+                    if handoff {
+                        if let Some(pid) = sessions[&id].child.id() {
+                            state.condemned_priors.lock().expect("condemned priors lock").insert(
+                                id.clone(),
+                                crate::session_lease::record_condemned_runtime_identity(
+                                    pid, CLAUDE_SIDECAR_OWNERSHIP_ENV, &runtime_id,
+                                ),
+                            );
+                        }
+                    }
+                    sessions.remove(&id)
+                } else {
+                    None
+                }
+            };
+            let confirmed = if let Some(session) = session {
+                match state.teardown_removed_session_logged(session).await {
+                    LoggedTeardown::Confirmed => true,
+                    LoggedTeardown::NotConfirmed { escalation } => escalation.await.unwrap_or(false),
+                    LoggedTeardown::PlatformLimited => false,
+                }
+            } else if let Some(recorded) = recorded {
+                crate::session_lease::kill_and_confirm_recorded_tree_dead(&recorded, CLAUDE_SIDECAR_OWNERSHIP_ENV).await
+            } else {
+                false
+            };
+            if !confirmed {
+                tracing::error!(target: "invariant", provider = PROVIDER,
+                    session_id = %id, ownership_id = %runtime_id,
+                    "freshagent.claude.canceled_startup_unconfirmed: retaining ownership until exact tree death is proven");
+                std::future::pending::<()>().await;
+            }
+            state.leases.clear_binding_if_matches(PROVIDER, &id, &id, &runtime_id);
+            if let Some((lease_id, request_id)) = lease {
+                state.leases.clear_binding_if_matches(PROVIDER, &lease_id, &id, &runtime_id);
+                state.leases.fail(PROVIDER, &lease_id, &request_id);
+            }
+        });
+        guard
+    }
+
     /// Claim the provider lease on `durable` for the launch `request_id`, the
     /// one claim every launch of a durable id makes (create-resume, attach,
     /// handoff resume, rollback). A holder whose lease expired with a recorded
@@ -645,6 +719,22 @@ impl FreshClaudeState {
                 return Err(error);
             }
         };
+        let write_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| binding_claim.clone());
+        let mut binding_write_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            write_claim.clone(),
+            &map_key,
+            &booted,
+            lease_guard.as_ref(),
+        ));
         let BootedSidecar {
             mut child,
             stdin,
@@ -789,19 +879,9 @@ impl FreshClaudeState {
                     "freshagent.claude.claim_late_orphan_torn_down: a close landed between the \
                      claim's commit and its registration; the registered orphan is torn down"
                 );
-                if let Some(session) = self.sessions.lock().await.remove(&map_key) {
-                    // R2-2: this unwind holds no coordinator fence, so the
-                    // helper's typed log and detached escalation are the whole
-                    // discipline here.
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
-                // Demote, never drop: a later kill naming the seat still
-                // resolves the durable.
 
-                if let Some(mut guard) = lease_guard.take() {
-                    guard.fail();
-                }
+                // Drop retains ownership while the exact registered tree
+                // settles and its failed binding is repaired.
                 return Err(EstablishError::ClosedInFlight);
             }
         }
@@ -809,27 +889,12 @@ impl FreshClaudeState {
         // A created session is already a durable identity, including before
         // its first prompt. Write lineage/genesis while the ownership claim
         // still fences the registration, before Live or the acknowledgement.
-        let mut binding_write_guard: Option<crate::identity_sink::BindingWriteGuard>;
         {
             let settings_update = match (lane, recorded_settings) {
                 (EstablishLane::AttachResume, None) => crate::identity_sink::SettingsUpdate::Keep,
                 (_, Some(settings)) => crate::identity_sink::SettingsUpdate::Replace(settings),
                 (_, None) => crate::identity_sink::SettingsUpdate::Keep,
             };
-            let write_claim = own_ticket
-                .as_ref()
-                .and_then(|ticket| {
-                    crate::identity_sink::BindingClaim::from_ticket(
-                        ticket,
-                        crate::identity_sink::BindingClaimKind::Starting,
-                    )
-                })
-                .or_else(|| binding_claim.clone());
-            binding_write_guard = Some(crate::identity_sink::BindingWriteGuard::new(
-                own_ticket.take(),
-                write_claim.clone(),
-                self.identity_sink(),
-            ));
             if let Err(error) = self
                 .record_established_binding(
                     &map_key,
@@ -847,14 +912,6 @@ impl FreshClaudeState {
                 )
                 .await
             {
-                if let Some(session) = self.sessions.lock().await.remove(&map_key) {
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
-
-                if let Some(mut guard) = lease_guard.take() {
-                    guard.fail();
-                }
                 if let Some(claim) = claim.as_ref().filter(|claim| claim.dead_state.is_some()) {
                     self.rollback_session_claim(&claim.durable).await;
                 }
@@ -872,14 +929,6 @@ impl FreshClaudeState {
             }
             if let Some(claim) = claim.as_ref() {
                 if self.claim_dead_state_advanced(&claim.durable, claim.dead_state) {
-                    if let Some(session) = self.sessions.lock().await.remove(&map_key) {
-                        let _teardown: LoggedTeardown =
-                            self.teardown_removed_session_logged(session).await;
-                    }
-
-                    if let Some(mut guard) = lease_guard.take() {
-                        guard.fail();
-                    }
                     let repaired = binding_write_guard
                         .as_mut()
                         .expect("binding write guard is present")
@@ -908,12 +957,6 @@ impl FreshClaudeState {
         // holder) means the session must not be kept.
         if let Some(mut guard) = lease_guard.take() {
             if !guard.complete(&map_key) {
-                if let Some(session) = self.sessions.lock().await.remove(&map_key) {
-                    session.consumer.abort();
-                    let mut child = session.child;
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&session.ownership_id);
-                }
                 if let Some(claim) = claim.as_ref() {
                     // Finding 5's re-raise: the one post-commit failure arm. The
                     // session is torn back down, so the close the commit undid is
@@ -921,7 +964,6 @@ impl FreshClaudeState {
                     self.rollback_session_claim(&claim.durable).await;
                     // Finding 1: demote, never drop.
                 }
-                guard.fail(); // own tree torn down: reopen the key
                 let repaired = binding_write_guard
                     .as_mut()
                     .expect("binding write guard is present")
@@ -959,10 +1001,7 @@ impl FreshClaudeState {
                     "{event}: the coordinator moved on while the session registered; the \
                      uncommitted session is torn down"
                 );
-                if let Some(session) = self.sessions.lock().await.remove(&map_key) {
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
+
                 let repaired = binding_write_guard
                     .as_mut()
                     .expect("binding write guard is present")

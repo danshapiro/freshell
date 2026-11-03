@@ -7737,3 +7737,208 @@ async fn canceled_codex_registered_startup_settles_native_ledger_and_owner() {
         "cleanup never launches a replacement"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registered_startup_claude_and_kilroy_cancellation_settles_production_binding() {
+    for mode in ["freshclaude", "kilroy"] {
+        let env = ClaudeSimEnvironment::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        env.seed_transcript(&id);
+        let gate = Arc::new(common::ledger_sink::LedgerWriteGate::new());
+        let (h, ledger) =
+            spawn_merged_server_with_ledger_and_binding_gate(Some(&env), Some(gate.clone())).await;
+        let state = h.ws_state.fresh_claude.clone();
+        let msg = serde_json::from_value(json!({
+            "type": "freshAgent.create", "requestId": format!("cancel-registered-{mode}"),
+            "sessionType": mode, "provider": "claude", "cwd": env.workspace(),
+            "sessionRef": {"provider":"claude", "sessionId":id}
+        }))
+        .unwrap();
+        let task = tokio::spawn(async move { state.handle_create(msg, None).await });
+        tokio::time::timeout(Duration::from_secs(20), gate.wait_until_entered())
+            .await
+            .unwrap();
+        let row = ledger.load_binding("claude", &id).unwrap();
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+        assert!(h.ws_state.fresh_claude.has_live_session(&id).await);
+        let pids: Vec<u32> = env
+            .rows("boot")
+            .iter()
+            .filter_map(|r| r["cliPid"].as_u64().map(|p| p as u32))
+            .collect();
+        assert!(!pids.is_empty());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        gate.release();
+        let registry = h.ws_state.ownership.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !matches!(
+                registry.observe("claude", &id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !h.ws_state.fresh_claude.has_live_session(&id).await,
+            "{mode}: a canceled registered runtime must be removed before claim release"
+        );
+        assert!(pids
+            .iter()
+            .all(|pid| !freshell_terminal::registry::pid_alive(*pid)));
+        let repaired = ledger.load_binding("claude", &id).unwrap();
+        assert_eq!(
+            repaired.retired_reason,
+            Some(freshell_ws::pane_ledger::RetiredReason::FailedTransition)
+        );
+        assert_eq!(repaired.owner_operation_id, row.owner_operation_id);
+        h.ws_state.fresh_claude.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registered_startup_opencode_cancellation_settles_production_binding_without_stopping_daemon(
+) {
+    let _guard = ENV_LOCK.lock().await;
+    let fake = FakeOpencodeServeEnv::install();
+    let gate = Arc::new(common::ledger_sink::LedgerWriteGate::once());
+    let (h, ledger) =
+        spawn_merged_server_with_ledger_and_binding_gate(None, Some(gate.clone())).await;
+    let id = "ses_registered_cancel_production";
+    let state = h.ws_state.fresh_opencode.clone();
+    let task = tokio::spawn(async move {
+        state.handle_create(serde_json::from_value(json!({
+            "type":"freshAgent.create", "requestId":"cancel-opencode", "provider":"opencode",
+            "sessionType":"freshopencode", "sessionRef":{"provider":"opencode", "sessionId":id}
+        })).unwrap(), None).await
+    });
+    tokio::time::timeout(Duration::from_secs(20), gate.wait_until_entered())
+        .await
+        .unwrap();
+    assert!(h.ws_state.fresh_opencode.has_live_session(id).await);
+    let row = ledger.load_binding("opencode", id).unwrap();
+    assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+    let daemon = fake.serve_pids();
+    assert_eq!(daemon.len(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    gate.release();
+    let registry = h.ws_state.ownership.as_ref().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            registry.observe("opencode", id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !h.ws_state.fresh_opencode.has_live_session(id).await,
+        "claim release must follow exact session removal"
+    );
+    let repaired = ledger.load_binding("opencode", id).unwrap();
+    assert_eq!(
+        repaired.retired_reason,
+        Some(freshell_ws::pane_ledger::RetiredReason::FailedTransition)
+    );
+    assert_eq!(repaired.owner_operation_id, row.owner_operation_id);
+    assert!(freshell_terminal::registry::pid_alive(daemon[0] as u32));
+    h.ws_state.fresh_opencode.handle_create(serde_json::from_value(json!({
+        "type":"freshAgent.create", "requestId":"other-session", "provider":"opencode",
+        "sessionType":"freshopencode", "sessionRef":{"provider":"opencode", "sessionId":"ses_other_session"}
+    })).unwrap(), None).await;
+    assert!(
+        h.ws_state
+            .fresh_opencode
+            .has_live_session("ses_other_session")
+            .await
+    );
+    assert_eq!(fake.serve_pids(), daemon);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registered_startup_codex_explicit_stale_commit_preserves_replacement_and_ledger() {
+    let _guard = ENV_LOCK.lock().await;
+    let fake = DualRoleCodexFake::install();
+    let gate = Arc::new(common::ledger_sink::LedgerWriteGate::once());
+    let (h, ledger) =
+        spawn_merged_server_with_ledger_and_binding_gate(None, Some(gate.clone())).await;
+    let id = "registered-replaced-production";
+    let create = |request: &str| {
+        serde_json::from_value(json!({
+            "type":"freshAgent.create", "requestId":request, "provider":"codex",
+            "sessionType":"freshcodex", "sessionRef":{"provider":"codex", "sessionId":id}
+        }))
+        .unwrap()
+    };
+    let state = h.ws_state.fresh_codex.clone();
+    let msg = create("old-startup");
+    let old = tokio::spawn(async move { state.handle_create(msg, None).await });
+    tokio::time::timeout(Duration::from_secs(20), gate.wait_until_entered())
+        .await
+        .unwrap();
+    let registry = h.ws_state.ownership.as_ref().unwrap();
+    let snapshot = registry.observe("codex", id);
+    let freshell_ownership::OwnershipState::Starting {
+        operation_id,
+        generation,
+        ..
+    } = snapshot.state
+    else {
+        panic!("old startup holds claim")
+    };
+    let pid = fake.sidecar_spawn_rows()[0]["pid"].as_u64().unwrap() as u32;
+    // Complete a superseding lifecycle while the old binding response is
+    // delayed. The public stop removes the old process; the replacement
+    // then establishes a newer exact owner and durable identity at this key.
+    assert_eq!(
+        registry.commit_live(
+            "codex",
+            id,
+            &operation_id,
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(id.into()),
+                pid: Some(pid),
+                ownership_id: Some(operation_id.clone())
+            }
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    h.ws_state.fresh_codex.handle_kill(serde_json::from_value(json!({
+        "type":"freshAgent.kill", "provider":"codex", "sessionType":"freshcodex", "sessionId":id,
+        "observedEpoch":snapshot.epoch, "observedGeneration":generation
+    })).unwrap()).await;
+    assert!(!h.ws_state.fresh_codex.has_live_session(id).await);
+    assert!(matches!(
+        h.ws_state
+            .fresh_codex
+            .handle_create(create("replacement-startup"), None)
+            .await,
+        freshell_freshagent::codex::CodexCreateOutcome::Created { .. }
+    ));
+    let replacement = registry.observe("codex", id);
+    let replacement_row = ledger.load_binding("codex", id).unwrap();
+    let spawned = fake.sidecar_spawn_rows();
+    assert_eq!(spawned.len(), 2);
+    let replacement_pid = spawned[1]["pid"].as_u64().unwrap() as u32;
+    gate.release();
+    assert!(matches!(
+        old.await.unwrap(),
+        freshell_freshagent::codex::CodexCreateOutcome::Failed { .. }
+    ));
+    assert!(
+        h.ws_state.fresh_codex.has_live_session(id).await,
+        "old explicit cleanup must preserve the replacement map entry"
+    );
+    assert!(freshell_terminal::registry::pid_alive(replacement_pid));
+    assert_eq!(registry.observe("codex", id), replacement);
+    assert_eq!(ledger.load_binding("codex", id).unwrap(), replacement_row);
+    h.ws_state.fresh_codex.shutdown().await;
+}

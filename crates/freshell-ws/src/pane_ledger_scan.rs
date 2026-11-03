@@ -821,14 +821,17 @@ impl PaneLedger {
     /// new as or newer than the row's own liveness stamp) is the split-write
     /// crash remnant (`retire_closed`'s tombstone landed; its row retire
     /// never did) — the tombstone is the author of truth, so the row is
-    /// retired Closed NOW, durably. Focused-ep5-r3 Finding 4: dominance has
+    /// retired with its close or failed-transition reason NOW, durably.
+    /// Focused-ep5-r3 Finding 4: dominance has
     /// NO TTL — a tombstone paired with a still-Bound row is the only durable
     /// evidence of the close, and a restart hours past the TTL must still
     /// converge it (the TTL only ever prunes converged/missing-row pairs).
     /// A CLAIM-RESIDUE pair (the row's liveness visibly postdates the
     /// tombstone) is deliberately NOT dominated: that row is an accepted
     /// claim's committed revive whose clear crashed mid-commit, and retiring
-    /// it would undo the claim the crash froze half-way. The re-read
+    /// it would undo the claim the crash froze half-way.
+    /// Failed-transition fences cover only their exact orphan; unrelated
+    /// rows are never subject to their timestamp dominance. The re-read
     /// discipline covers the live claim-lane interleaving identically: under
     /// THIS guard instant tombstone and row are evaluated together, so a
     /// claim that already cleared the fence misses the check, and a claim
@@ -851,26 +854,22 @@ impl PaneLedger {
         };
         match row.state {
             RowState::Bound => {
-                let dominant = index
-                    .kill_tombstones
-                    .get(key)
-                    .cloned()
-                    .is_some_and(|entry| {
-                        let killed_at = entry.at_ms;
-                        classify_kill_tombstone(
-                            killed_at,
+                let dominant = index.kill_tombstones.get(key).filter(|entry| {
+                    entry.covers_row(&row)
+                        && classify_kill_tombstone(
+                            entry.at_ms,
                             Some((row.state, row.updated_at)),
                             now_ms,
                         ) == KillTombstoneVerdict::Dominant
-                    });
-                if dominant {
-                    let killed_at = index
-                        .kill_tombstones
-                        .get(key)
-                        .map(|entry| entry.at_ms)
-                        .unwrap_or_default();
+                });
+                if let Some(entry) = dominant {
+                    let killed_at = entry.at_ms;
                     row.state = RowState::Retired;
-                    row.retired_reason = Some(RetiredReason::Closed);
+                    row.retired_reason = Some(if entry.scope.is_some() {
+                        RetiredReason::FailedTransition
+                    } else {
+                        RetiredReason::Closed
+                    });
                     row.updated_at = now_ms;
                     match self.write_binding(root, index, &row) {
                         Ok(()) => {

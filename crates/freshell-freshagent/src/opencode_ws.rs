@@ -1312,6 +1312,66 @@ impl FreshOpencodeState {
         )
     }
 
+    /// A registered startup owns this exact session cell until its binding is
+    /// committed. Cleanup settles only its turn and bridge, never the daemon
+    /// or a replacement registered at the same durable key.
+    fn registered_binding_guard(
+        &self,
+        ticket: Option<freshell_ownership::OperationTicket>,
+        claim: Option<crate::identity_sink::BindingClaim>,
+        session_arc: &Arc<OpencodeSessionCell>,
+    ) -> crate::identity_sink::BindingWriteGuard {
+        let mut guard =
+            crate::identity_sink::BindingWriteGuard::new(ticket, claim, self.identity_sink());
+        let state = self.clone();
+        let expected = session_arc.clone();
+        guard.settle_startup_before_repair(async move {
+            let (turn, bridge, real, cwd, accepted) = {
+                let mut session = expected.lock().await;
+                session.killed.store(true, Ordering::SeqCst);
+                while let Some(queued) = session.pending_sends.pop_front() {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session.placeholder_id, request_id = ?queued.request_id,
+                        "freshagent.opencode.startup_send_dropped: startup did not commit");
+                }
+                (
+                    session.turn_task.take(),
+                    session.serve_bridge.take(),
+                    session.real_session_id.clone(),
+                    session.cwd.clone(),
+                    session.daemon_turn_accepted.clone(),
+                )
+            };
+            {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(real) = real.as_deref() {
+                    if sessions
+                        .get(real)
+                        .is_some_and(|candidate| Arc::ptr_eq(candidate, &expected))
+                    {
+                        state.leases.clear_binding(PROVIDER, real);
+                    }
+                }
+                sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &expected));
+            }
+            if let Some(turn) = turn {
+                turn.abort_and_settle().await;
+            }
+            if let Some(real) = real.as_deref() {
+                if accepted.load(Ordering::SeqCst) {
+                    state
+                        .abort_accepted_daemon_turn(real, &cwd, &accepted)
+                        .await;
+                }
+            }
+            if let Some(bridge) = bridge {
+                bridge.abort();
+                let _ = bridge.await;
+            }
+        });
+        guard
+    }
+
     /// Hold a map-hit adoption's exact Starting claim until its durable
     /// binding is present and the same provider runtime is still registered.
     /// The recovery callback is installed before the caller's first awaited
@@ -2796,16 +2856,23 @@ impl FreshOpencodeState {
         }
 
         let op_guard = checkpoint_send_guard.take();
-        self.send_locked(
-            &session_arc,
-            &mut session,
-            msg,
-            session_id,
-            send_fence,
-            op_guard,
-            false,
-        )
-        .await;
+        let cleanup = self
+            .send_locked(
+                &session_arc,
+                &mut session,
+                msg,
+                session_id,
+                send_fence,
+                op_guard,
+                false,
+            )
+            .await;
+        drop(session);
+        if let Some(mut guard) = cleanup {
+            if guard.repair_now().await {
+                drop(guard.finish());
+            }
+        }
     }
 
     /// The post-gate send body (flag resets → … → run_turn spawn →
@@ -2813,7 +2880,9 @@ impl FreshOpencodeState {
     /// send-during-compact drain re-enters the EXACT send path for a
     /// queued entry. CONTRACT: the caller HOLDS this session's mutex for
     /// the whole call (the same discipline the inline body had — the
-    /// session→map lock pair stays the only permitted ordering).
+    /// session→map lock pair stays the only permitted ordering). A failed
+    /// registration returns its cleanup guard; the caller unlocks before
+    /// awaiting repair, and cancellation transfers cleanup through guard Drop.
     /// `already_accepted` suppresses the `freshAgent.send.accepted`
     /// broadcast when the queue arm already emitted it (never
     /// double-fire). `op_guard` (Task 5): the ownership attach guard the
@@ -2832,7 +2901,7 @@ impl FreshOpencodeState {
         send_fence: Option<freshell_ownership::ObservedFence>,
         op_guard: Option<freshell_ownership::AttachGuard>,
         already_accepted: bool,
-    ) {
+    ) -> Option<crate::identity_sink::BindingWriteGuard> {
         let request_id = msg.request_id.clone();
         let checkpoint_identity = checkpoint_turn_identity(&msg);
         // A previous local idle wait may have ended while its daemon-side
@@ -3018,7 +3087,7 @@ impl FreshOpencodeState {
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                     );
-                    return;
+                    return None;
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::opencode",
@@ -3047,7 +3116,7 @@ impl FreshOpencodeState {
                     // never a session-scoped degradation the slice's
                     // preservation branch would keep "running".
                     self.send_error(&request_id, "SESSION_RESERVED", message);
-                    return;
+                    return None;
                 }
             }
             let created = match manager.create_session(None, None, cwd.as_deref()).await {
@@ -3058,7 +3127,7 @@ impl FreshOpencodeState {
                         "OPENCODE_SESSION_CREATE_FAILED",
                         &err.to_string(),
                     );
-                    return;
+                    return None;
                 }
             };
             let durable_id = created.id;
@@ -3107,7 +3176,7 @@ impl FreshOpencodeState {
                             "SESSION_RESERVED",
                             "The minted session id was claimed by another owner during the create",
                         );
-                        return;
+                        return None;
                     }
                 }
             }
@@ -3129,6 +3198,18 @@ impl FreshOpencodeState {
                 session.cwd = Some(cwd);
             }
 
+            let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            });
+            let mut binding_guard = Some(self.registered_binding_guard(
+                own_ticket.take(),
+                binding_claim.clone(),
+                session_arc,
+            ));
+
             self.sessions
                 .lock()
                 .await
@@ -3142,17 +3223,6 @@ impl FreshOpencodeState {
             // session missing from the authoritative recovery registry);
             // the ticket's RAII drop settles the rekeyed claim typed and
             // the pane answers the typed recoverable error.
-            let binding_claim = own_ticket.as_ref().and_then(|ticket| {
-                crate::identity_sink::BindingClaim::from_ticket(
-                    ticket,
-                    crate::identity_sink::BindingClaimKind::Starting,
-                )
-            });
-            let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
-                own_ticket.take(),
-                binding_claim.clone(),
-                self.identity_sink(),
-            ));
             if let Err(e) = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                     genesis: crate::identity_sink::GenesisUpdate::Keep,
@@ -3216,22 +3286,9 @@ impl FreshOpencodeState {
                     "freshagent.opencode.materialize_binding_failed_typed: the durable \
                      row write failed — the session is torn down (kata b8ke ext r26 F4)"
                 );
-                let repaired = binding_guard
-                    .as_mut()
-                    .expect("binding guard is present")
-                    .repair_now()
-                    .await;
-                if repaired {
-                    drop(binding_guard.take().and_then(|guard| guard.finish()));
-                } else {
-                    drop(binding_guard.take());
-                }
-                {
-                    let mut guard = self.sessions.lock().await;
-                    guard.remove(&session.placeholder_id);
-                    guard.remove(&durable_id);
-                }
-                session.real_session_id = None;
+                // send_locked holds this cell's mutex. Its cleanup continuation
+                // takes the mutex after the caller unlocks, retaining Starting
+                // through session/bridge settlement and durable repair.
                 session.killed.store(true, Ordering::SeqCst);
                 self.emit_fresh_agent_error(
                     &session_id,
@@ -3239,7 +3296,7 @@ impl FreshOpencodeState {
                     "This session's resume record could not be persisted; the pane is \
                      not materialized — retry the send",
                 );
-                return;
+                return binding_guard.take();
             }
 
             // The durable binding is established before ownership becomes
@@ -3257,28 +3314,16 @@ impl FreshOpencodeState {
                     "freshagent.opencode.materialize_commit_stale: the coordinator moved on \
                      after the binding was persisted; the uncommitted session is torn down"
                 );
-                let repaired = binding_guard
-                    .as_mut()
-                    .expect("binding guard is present")
-                    .repair_now()
-                    .await;
-                if repaired {
-                    drop(binding_guard.take().and_then(|guard| guard.finish()));
-                } else {
-                    drop(binding_guard.take());
-                }
-                {
-                    let mut guard = self.sessions.lock().await;
-                    guard.remove(&session.placeholder_id);
-                    guard.remove(&durable_id);
-                }
+                // send_locked holds this cell's mutex. Its cleanup continuation
+                // takes the mutex after the caller unlocks, retaining Starting
+                // through session/bridge settlement and durable repair.
                 session.killed.store(true, Ordering::SeqCst);
                 self.emit_fresh_agent_error(
                     &session_id,
                     "SESSION_RESERVED",
                     "Session ownership changed during materialization",
                 );
-                return;
+                return binding_guard.take();
             }
             drop(binding_guard.take().map(|guard| guard.finish()));
 
@@ -3655,6 +3700,7 @@ impl FreshOpencodeState {
             compact_settled_rx: None,
             settling,
         });
+        None
     }
 
     /// Send-during-compact drain: drives at most ONE queued send (FIFO)
@@ -3778,16 +3824,23 @@ impl FreshOpencodeState {
                 None // ordinary unfenced sends retain their direct-path tolerance
             };
             session.pending_sends.pop_front();
-            self.send_locked(
-                &session_arc,
-                &mut session,
-                msg,
-                real_id,
-                send_fence,
-                op_guard,
-                true,
-            )
-            .await;
+            let cleanup = self
+                .send_locked(
+                    &session_arc,
+                    &mut session,
+                    msg,
+                    real_id,
+                    send_fence,
+                    op_guard,
+                    true,
+                )
+                .await;
+            drop(session);
+            if let Some(mut guard) = cleanup {
+                if guard.repair_now().await {
+                    drop(guard.finish());
+                }
+            }
             return; // one entry driven; its settle tail continues the FIFO
         }
     }
@@ -6794,6 +6847,18 @@ impl FreshOpencodeState {
         // verifies this exact `Arc` against the map (a same-key
         // replacement for the child can never satisfy it).
         let child_session_arc = session_cell(child_session);
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            &child_session_arc,
+        ));
+
         self.sessions
             .lock()
             .await
@@ -6809,17 +6874,6 @@ impl FreshOpencodeState {
         // authoritative recovery registry (the pre-r26 log-and-continue
         // discarded the Result); the ticket's RAII drop settles the rekeyed
         // claim typed.
-        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
-            crate::identity_sink::BindingClaim::from_ticket(
-                ticket,
-                crate::identity_sink::BindingClaimKind::Starting,
-            )
-        });
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
-            own_ticket.take(),
-            binding_claim.clone(),
-            self.identity_sink(),
-        ));
         if let Err(e) = self
             .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 genesis: crate::identity_sink::GenesisUpdate::Keep,
@@ -6870,22 +6924,6 @@ impl FreshOpencodeState {
             } else {
                 drop(binding_guard.take());
             }
-            // The sibling stale-commit teardown shape: KEEP the removed value
-            // so the bridge abort and the killed flag actually execute.
-            let removed = {
-                let mut guard = self.sessions.lock().await;
-                guard.remove(&child.id)
-            };
-            if let Some(removed) = removed {
-                let mut s = removed.lock().await;
-                s.killed.store(true, Ordering::SeqCst);
-                if let Some(task) = s.turn_task.take() {
-                    task.abort_and_settle().await;
-                }
-                if let Some(bridge) = s.serve_bridge.take() {
-                    bridge.abort();
-                }
-            }
             reply_sink(event_frame(
                 &msg.session_id,
                 json!({
@@ -6925,26 +6963,6 @@ impl FreshOpencodeState {
                 drop(binding_guard.take().and_then(|guard| guard.finish()));
             } else {
                 drop(binding_guard.take());
-            }
-            // Task 3 review M-1: KEEP the removed value — the re-get below
-            // could never find the just-removed entry, so the bridge abort
-            // and the killed flag never executed (the child's serve-SSE
-            // bridge task leaked, broadcasting for a torn-down session).
-            // The teardown is the sibling stale-commit shape
-            // (`resume_commit_stale` below).
-            let removed = {
-                let mut guard = self.sessions.lock().await;
-                guard.remove(&child.id)
-            };
-            if let Some(removed) = removed {
-                let mut s = removed.lock().await;
-                s.killed.store(true, Ordering::SeqCst);
-                if let Some(task) = s.turn_task.take() {
-                    task.abort_and_settle().await;
-                }
-                if let Some(bridge) = s.serve_bridge.take() {
-                    bridge.abort();
-                }
             }
             reply_sink(event_frame(
                 &msg.session_id,
@@ -8367,9 +8385,39 @@ impl FreshOpencodeState {
             sink.as_ref()
                 .and_then(|s| s.load_provenance(PROVIDER, session_id))
         });
-        self.install_serve_bridge(&manager, &mut session, session_id)
-            .await;
         let session_arc = session_cell(session);
+        // Capture the exact operation before any commit can change coordinator
+        // state. A normal cold resume owns Starting; a handoff continuation
+        // carries the runner's exact Handoff identity.
+        let binding_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                let (operation_id, generation) = handoff?;
+                let registry = self.fresh_agent.ownership.as_ref()?;
+                Some(crate::identity_sink::BindingClaim::handoff(
+                    PROVIDER,
+                    session_id,
+                    operation_id,
+                    registry.boot_epoch(),
+                    generation,
+                ))
+            });
+        let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
+        let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
+        let mut binding_guard = Some(self.registered_binding_guard(
+            own_ticket.take(),
+            binding_claim.clone(),
+            &session_arc,
+        ));
+
+        self.install_serve_bridge(&manager, &mut *session_arc.lock().await, session_id)
+            .await;
 
         self.sessions
             .lock()
@@ -8410,27 +8458,15 @@ impl FreshOpencodeState {
             .commit_session_claim(session_id, claim_dead_state)
             .await
         {
-            // Round 6 lock order (focused-ep5-r5 Finding 1): the map removal
-            // is its OWN synchronous critical section, completed before the
-            // session-lock teardown begins. (The pre-fix `if let Some(removed)
-            // = self.sessions.lock().await.remove(...)` kept the scrutinee
-            // guard alive through the whole body on edition 2021 — the map
-            // stayed locked across `removed.lock().await` and the settle
-            // await, wedging every other opencode map reader for the
-            // duration of an arbitrarily slow settle.)
-            let removed = {
-                let mut guard = self.sessions.lock().await;
-                guard.remove(session_id)
-            };
-            if let Some(removed) = removed {
-                let mut s = removed.lock().await;
-                s.killed.store(true, Ordering::SeqCst);
-                if let Some(task) = s.turn_task.take() {
-                    task.abort_and_settle().await;
-                }
-                if let Some(bridge) = s.serve_bridge.take() {
-                    bridge.abort();
-                }
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
+            } else {
+                drop(binding_guard.take());
             }
             lease_guard.fail();
             return Err(ResumeOpencodeError::Manager(
@@ -8439,36 +8475,6 @@ impl FreshOpencodeState {
                 )),
             ));
         }
-
-        // Capture the exact operation before any commit can change coordinator
-        // state. A normal cold resume owns Starting; a handoff continuation
-        // carries the runner's exact Handoff identity.
-        let binding_claim = own_ticket
-            .as_ref()
-            .and_then(|ticket| {
-                crate::identity_sink::BindingClaim::from_ticket(
-                    ticket,
-                    crate::identity_sink::BindingClaimKind::Starting,
-                )
-            })
-            .or_else(|| {
-                let (operation_id, generation) = handoff?;
-                let registry = self.fresh_agent.ownership.as_ref()?;
-                Some(crate::identity_sink::BindingClaim::handoff(
-                    PROVIDER,
-                    session_id,
-                    operation_id,
-                    registry.boot_epoch(),
-                    generation,
-                ))
-            });
-        let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
-        let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
-            own_ticket.take(),
-            binding_claim.clone(),
-            self.identity_sink(),
-        ));
 
         // Every verified resume establishes identity before the coordinator
         // can publish Live or the caller can answer success. A missing
@@ -8521,20 +8527,7 @@ impl FreshOpencodeState {
             } else {
                 drop(binding_guard.take());
             }
-            let removed = {
-                let mut guard = self.sessions.lock().await;
-                guard.remove(session_id)
-            };
-            if let Some(removed) = removed {
-                let mut session = removed.lock().await;
-                session.killed.store(true, Ordering::SeqCst);
-                if let Some(task) = session.turn_task.take() {
-                    task.abort_and_settle().await;
-                }
-                if let Some(bridge) = session.serve_bridge.take() {
-                    bridge.abort();
-                }
-            }
+
             lease_guard.fail();
             return Err(ResumeOpencodeError::Manager(
                 freshell_opencode::ServeError::Transport(format!(
@@ -8569,20 +8562,7 @@ impl FreshOpencodeState {
                 } else {
                     drop(binding_guard.take());
                 }
-                let removed = {
-                    let mut guard = self.sessions.lock().await;
-                    guard.remove(session_id)
-                };
-                if let Some(removed) = removed {
-                    let mut session = removed.lock().await;
-                    session.killed.store(true, Ordering::SeqCst);
-                    if let Some(task) = session.turn_task.take() {
-                        task.abort_and_settle().await;
-                    }
-                    if let Some(bridge) = session.serve_bridge.take() {
-                        bridge.abort();
-                    }
-                }
+
                 return Err(ResumeOpencodeError::Manager(
                     freshell_opencode::ServeError::Transport(format!(
                         "opencode session {session_id} ownership changed during resume; torn down"
@@ -15794,6 +15774,24 @@ mod tests {
         // The coordinator never committed Live: the ticket's RAII drop
         // settled the rekeyed claim typed (pre-r26 the failure was
         // discarded and the materialization committed Live here).
+        // The same injected I/O outage also blocks durable repair. Even
+        // after runtime settlement, Starting must remain held until that
+        // repair succeeds; an outage cannot license another launch.
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_1").state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        fake.set_fail_writes(false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                registry.observe(PROVIDER, "ses_1").state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful durable repair releases the failed startup");
         assert!(
             matches!(
                 registry.observe(PROVIDER, "ses_1").state,
@@ -17238,6 +17236,252 @@ mod tests {
             identity.repairs.lock().unwrap().is_empty(),
             "a recoverable map-hit write must not tombstone the operation being retried"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_startup_opencode_settles_before_repair_on_cancel_and_failure() {
+        for cancel in [true, false] {
+            let (mut st, _rx, exited, spawns, manager) = selfheal_state(60_000, 120_000).await;
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            st.set_ownership(registry.clone());
+            let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            st.set_identity_sink(sink.clone());
+            let id = "ses_registered_startup_cleanup";
+            let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
+            let task = {
+                let st = st.clone();
+                tokio::spawn(
+                    async move { st.resume_durable_session(id, None, None, None, None).await },
+                )
+            };
+            stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+            let held = st.sessions.lock().await;
+            let incumbent = held[id].clone();
+            let bridge_running = incumbent
+                .lock()
+                .await
+                .serve_bridge
+                .as_ref()
+                .is_some_and(|h| !h.is_finished());
+            assert!(bridge_running);
+            if cancel {
+                task.abort();
+            }
+            let _ = stall.release.send(());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let fenced = matches!(
+                registry.observe(PROVIDER, id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            );
+            let unrepaired = sink.repairs.lock().unwrap().is_empty();
+            drop(held);
+            assert!(
+                fenced && unrepaired,
+                "cancel={cancel}: ownership and binding must wait for registered-session cleanup"
+            );
+            if cancel {
+                assert!(task.await.err().unwrap().is_cancelled());
+            } else {
+                assert!(task.await.unwrap().is_err());
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(
+                    registry.observe(PROVIDER, id).state,
+                    freshell_ownership::OwnershipState::Vacant
+                ) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!st.sessions.lock().await.contains_key(id));
+            let session = incumbent.lock().await;
+            assert!(session.killed.load(Ordering::SeqCst));
+            assert!(session.serve_bridge.is_none());
+            assert!(session.turn_task.is_none());
+            assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+            assert_eq!(spawns.load(Ordering::SeqCst), 1);
+            assert!(!exited.load(Ordering::SeqCst));
+            drop(session);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_startup_opencode_materialize_and_fork_settle_on_cancel_and_failure() {
+        for fork in [false, true] {
+            for cancel in [true, false] {
+                let mut st = if fork {
+                    fork_state(Arc::new(ForkFakeHttp::child_ok())).await
+                } else {
+                    state_with_registry_and_receiver().await.0
+                };
+                let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+                st.set_ownership(registry.clone());
+                let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+                st.set_identity_sink(sink.clone());
+                let manager = st.fresh_agent.peek_running_manager().await.unwrap();
+                let daemon = manager.ownership_id().await;
+                let id = if fork { "ses_child" } else { "ses_1" };
+                if fork {
+                    insert_fork_parent(&st, "ses_parent", None, None, None).await;
+                    seed_live_fresh_owner(&registry, "ses_parent");
+                } else {
+                    st.handle_create(create_msg("startup-materialize"), None)
+                        .await;
+                }
+                let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
+                let task = {
+                    let st = st.clone();
+                    let registry = registry.clone();
+                    tokio::spawn(async move {
+                        if fork {
+                            let mut msg = fork_msg("ses_parent", "startup-fork", None);
+                            (msg.observed_epoch, msg.observed_generation) =
+                                fenced_observed(&registry, "ses_parent");
+                            st.handle_fork(msg, None, capturing_sink().0).await;
+                        } else {
+                            st.handle_send(send_msg(
+                                "freshopencode-startup-materialize",
+                                "first turn",
+                            ))
+                            .await;
+                        }
+                    })
+                };
+                stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+                let held = st.sessions.lock().await;
+                let cell = held[id].clone();
+                if cancel {
+                    task.abort();
+                }
+                let _ = stall.release.send(());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    matches!(
+                        registry.observe(PROVIDER, id).state,
+                        freshell_ownership::OwnershipState::Starting { .. }
+                    ),
+                    "fork={fork}, cancel={cancel}"
+                );
+                assert!(sink.repairs.lock().unwrap().is_empty());
+                drop(held);
+                if cancel {
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    task.await.unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !matches!(
+                        registry.observe(PROVIDER, id).state,
+                        freshell_ownership::OwnershipState::Vacant
+                    ) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!st
+                    .sessions
+                    .lock()
+                    .await
+                    .values()
+                    .any(|candidate| Arc::ptr_eq(candidate, &cell)));
+                let session = cell.lock().await;
+                assert!(session.killed.load(Ordering::SeqCst));
+                assert!(session.turn_task.is_none() && session.serve_bridge.is_none());
+                assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+                assert_eq!(manager.ownership_id().await, daemon);
+                if fork {
+                    assert!(st.has_live_session("ses_parent").await);
+                }
+                drop(session);
+                manager.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_startup_opencode_preserves_replacement_on_cancel_and_failure() {
+        for cancel in [true, false] {
+            let (mut st, _rx, _exited, _spawns, manager) = selfheal_state(60_000, 120_000).await;
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            st.set_ownership(registry.clone());
+            let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            st.set_identity_sink(sink.clone());
+            let id = "ses_replaced_startup";
+            let stall = sink.arm_binding_stall_result(PROVIDER, id, !cancel);
+            let task = {
+                let st = st.clone();
+                tokio::spawn(
+                    async move { st.resume_durable_session(id, None, None, None, None).await },
+                )
+            };
+            stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+            let old = st.sessions.lock().await.remove(id).unwrap();
+            let old_claim = sink
+                .bindings
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .claim
+                .clone()
+                .unwrap();
+            let mut replacement = OpencodeSession::new(id.into(), None, None, None);
+            replacement.real_session_id = Some(id.into());
+            st.install_serve_bridge(&manager, &mut replacement, id)
+                .await;
+            let replacement = session_cell(replacement);
+            st.sessions
+                .lock()
+                .await
+                .insert(id.into(), replacement.clone());
+            registry.fail(
+                PROVIDER,
+                id,
+                &old_claim.operation_id,
+                old_claim.generation,
+                false,
+            );
+            let crate::ownership_lane::LaneClaim::Granted(ticket) =
+                st.begin_lane_claim_at(id, "replacement-owner", None, "test")
+            else {
+                panic!("replacement claim")
+            };
+            st.commit_lane_claim_at(&mut Some(ticket), id).unwrap();
+            let owner = registry.observe(PROVIDER, id);
+            if cancel {
+                task.abort();
+            }
+            let _ = stall.release.send(());
+            if cancel {
+                assert!(task.await.err().unwrap().is_cancelled());
+            } else {
+                assert!(task.await.unwrap().is_err());
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sink.repairs.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(Arc::ptr_eq(&st.sessions.lock().await[id], &replacement));
+            assert_eq!(registry.observe(PROVIDER, id), owner);
+            let replacement = replacement.lock().await;
+            assert!(!replacement.killed.load(Ordering::SeqCst));
+            assert!(replacement
+                .serve_bridge
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()));
+            let old = old.lock().await;
+            assert!(old.killed.load(Ordering::SeqCst));
+            assert!(old.serve_bridge.is_none());
+            drop(old);
+            drop(replacement);
+            manager.shutdown().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23206,6 +23450,24 @@ mod tests {
             !st.has_live_session("ses_child").await,
             "the failed fork must remove the child session entry"
         );
+        // The same injected I/O outage also blocks durable repair. Even
+        // after runtime settlement, Starting must remain held until that
+        // repair succeeds; an outage cannot license another launch.
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_child").state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        fake.set_fail_writes(false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                registry.observe(PROVIDER, "ses_child").state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful durable repair releases the failed startup");
         assert!(
             matches!(
                 registry.observe(PROVIDER, "ses_child").state,
@@ -26003,31 +26265,11 @@ mod tests {
         }
     }
 
-    /// ep2-r2 fresheyes Major (the transitional-window dead bridge): the
-    /// generation-fenced bridge is installed BEFORE the forked child is
-    /// published in `sessions` or committed `Live` (materialization remains
-    /// `Starting`), so a daemon loss that captures the fresh bridge's sender
-    /// inside that window leaves the child with a dead bridge and NO
-    /// recovery trigger: B's one-shot `Started` revival pass either cannot
-    /// see the child (unpublished) or deliberately skips its transitional
-    /// ownership state, and the re-warm's fast path (B already running)
-    /// emits no second `Started`. The operation still answers success — a
-    /// pane with a permanently dead event bridge.
-    ///
-    /// The interleaving, forced deterministically through the REAL paths:
-    /// the child's binding-row write parks the fork between its map
-    /// publication and its `Live` commit (`arm_binding_stall`); while
-    /// parked, daemon A dies through the REAL watcher arm (the take sweeps
-    /// the child's just-subscribed sender — the fanned `Lost` closes the
-    /// bridge's channel and the task exits), B re-warms, and B's one-shot
-    /// `Started` revival pass runs: it rescues the PARENT (`Live`) — and,
-    /// because the pass visits the sorted durable ids ("ses_child" before
-    /// "ses_parent"), the parent's rescue PROVES the pass already visited
-    /// and SKIPPED the `Starting` child. Releasing the park lets the
-    /// commit land, and the operation must not answer success over the
-    /// dead bridge: the post-commit rescue tail restarts it against B and
-    /// pushes the client's recovery snapshot (exactly one; no chime
-    /// anywhere).
+    /// A fork publishes no event bridge before its binding and Live commit.
+    /// Lose daemon A while persistence is parked: B's revival must skip the
+    /// Starting child, and the successful fork must initialize its bridge on
+    /// B. Then lose B after commit to exercise actual bridge recovery, keeping
+    /// the original one-loss-edge, one-snapshot, and no-chime guarantees.
     #[tokio::test(flavor = "multi_thread")]
     async fn transitional_fork_child_survives_a_daemon_loss_in_its_starting_window() {
         // The selfheal manager shape (flag-controlled daemon death,
@@ -26094,6 +26336,11 @@ mod tests {
                 .entered
                 .recv_timeout(std::time::Duration::from_secs(15))
                 .expect("the fork parks between the child's publication and its Live commit");
+            let child = mover_state.sessions.lock().await["ses_child"].clone();
+            assert!(
+                child.lock().await.serve_bridge.is_none(),
+                "a provisional fork cannot publish provider events before its durable binding"
+            );
             // Daemon A dies. The loss completes: the take cleared the
             // running slot (the sweep ran inside the same critical
             // section)...
@@ -26106,10 +26353,8 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            // ...and the fanned `Lost` + dropped swept senders closed BOTH
-            // bridges' channels: the parent's A-era bridge and the parked
-            // child's (the loss captured the child's just-subscribed
-            // sender — the finding's premise).
+            // The parent's A-era bridge closes. The child has no bridge yet:
+            // persistence must precede its first provider subscription.
             await_bridge_liveness(
                 &mover_state,
                 "ses_parent",
@@ -26121,7 +26366,7 @@ mod tests {
                 &mover_state,
                 "ses_child",
                 false,
-                "A's loss drains the parked child's bridge (its sender was swept)",
+                "the parked child remains without a bridge during A's loss",
             )
             .await;
             mover_exited.store(false, Ordering::SeqCst);
@@ -26138,8 +26383,7 @@ mod tests {
             .await;
             assert!(
                 !session_serve_bridge_alive(&mover_state, "ses_child").await,
-                "fixture: the Started revival deliberately skipped the Starting \
-                 child — the dead transitional bridge the tail must rescue"
+                "the Started revival must skip the child until its binding commits"
             );
             stall.release.send(()).expect("release the parked fork");
         });
@@ -26152,8 +26396,7 @@ mod tests {
         st.handle_fork(fork_request, None, sink).await;
         mover.await.expect("the mover completed the interleaving");
 
-        // The operation SUCCEEDED — the finding's premise: a successful
-        // forked reply over the dead transitional bridge.
+        // The fork succeeds once its binding commits, with one reply.
         let captured = captured.lock().expect("captured mutex").clone();
         assert_eq!(
             captured.len(),
@@ -26166,16 +26409,66 @@ mod tests {
         );
         await_freshagent_live(&registry, "ses_child").await;
 
-        // THE BRIDGE: the pane must not dead-end — the child ends up with a
-        // LIVE bridge bound to the successor daemon (RED on HEAD: the
-        // skipped revival left the dead A-era task in place and nothing
-        // ever restarted it).
+        // The first child bridge is initialized on the successor daemon B.
         assert!(
             session_serve_bridge_alive(&st, "ses_child").await,
-            "the fork must not answer success over a dead bridge — the \
-             transitional child's bridge was killed by the daemon loss and \
-             no revival trigger ever came (ep2-r2)"
+            "the fork must not answer success over a missing or dead bridge"
         );
+
+        let startup_frames = drain_frames(&mut rx);
+        assert!(
+            startup_frames.iter().all(|frame| {
+                frame["sessionId"].as_str() != Some("ses_child")
+                    || !is_event(frame, "freshAgent.session.snapshot", Some("idle"))
+            }),
+            "a never-subscribed provisional child has no recovery snapshot: {startup_frames:?}"
+        );
+        // The manager still diagnoses service loss for every materialized
+        // session, including a Starting child whose bridge is not installed.
+        assert_eq!(
+            startup_frames
+                .iter()
+                .filter(|frame| {
+                    frame["sessionId"] == "ses_child"
+                        && frame["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                })
+                .count(),
+            1,
+            "the provisional child receives exactly one service-loss diagnostic"
+        );
+        assert!(
+            startup_frames
+                .iter()
+                .all(|frame| frame["event"]["type"] != "freshAgent.turn.complete"),
+            "startup daemon loss must never chime: {startup_frames:?}"
+        );
+
+        // Now a real child bridge exists. Losing B must recover it on C,
+        // preserving the original daemon-loss assertions below.
+        exited.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while manager.base_url().await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B's loss must settle"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        await_bridge_liveness(
+            &st,
+            "ses_child",
+            false,
+            "B's loss drains the committed child bridge",
+        )
+        .await;
+        exited.store(false, Ordering::SeqCst);
+        await_bridge_liveness(
+            &st,
+            "ses_child",
+            true,
+            "C restores the committed child bridge",
+        )
+        .await;
 
         // THE RECOVERY SNAPSHOT: the client's transcript-refetch push for
         // the actually-restarted bridge.
@@ -26217,9 +26510,12 @@ mod tests {
         );
         assert!(
             manager.base_url().await.is_some(),
-            "fixture: the successor daemon B serves"
+            "fixture: the successor daemon C serves"
         );
-        let _ = spawns;
+        assert!(
+            spawns.load(Ordering::SeqCst) >= 3,
+            "A, B, and C were launched"
+        );
     }
 
     /// ep2-r3 fresheyes Major (the rescue can resurrect a killed/handed-off
