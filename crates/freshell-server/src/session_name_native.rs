@@ -87,7 +87,9 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CAPABILITY_REPROBE_DELAY: Duration = Duration::from_secs(2);
 
 // These refusals dispatch no native operation. Keep their retries within the
-// same phase/receipt, with at most three seconds of paced waiting in total.
+// same phase/receipt, with at most three seconds of paced waiting PER PHASE
+// (nine per cycle). Exhaustion uses the existing finite cycle/backoff budget;
+// each adapter retains its own request deadline and cleanup ownership.
 const LIFECYCLE_RETRY_ATTEMPTS: usize = 16;
 const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -296,7 +298,7 @@ pub enum NativeOutcomeFold {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeLifecyclePhase {
+enum NativeLifecyclePhase {
     PreRead,
     Write,
     ConfirmationRead,
@@ -308,25 +310,23 @@ async fn native_call_with_lifecycle_retry<T>(
     phase: NativeLifecyclePhase,
     mut call: impl FnMut() -> NativeFuture<T>,
 ) -> Option<NativeCallResult<T>> {
-    let deadline = tokio::time::Instant::now() + NATIVE_REQUEST_TIMEOUT;
     for attempt in 0..LIFECYCLE_RETRY_ATTEMPTS {
         match names.native_claim_is_current(claim.clone()).await {
             Ok(true) => {}
-            Ok(false) => return None,
+            Ok(false) => {
+                tracing::info!(target: "freshell_server::session_names",
+                    event = "session_names.native_claim_superseded", ?phase,
+                    revision = claim.desired_revision, receipt_id = %claim.receipt_id,
+                    "native naming cycle no longer owns the current series or route");
+                return None;
+            }
             Err(error) => {
                 tracing::warn!(op = "native_claim_is_current", revision = claim.desired_revision,
                     class = %error.code(), "session_names.operation_failed: {error}");
                 return None;
             }
         }
-        let outcome = match tokio::time::timeout_at(deadline, call()).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                return Some(NativeCallResult::Ambiguous(
-                    "native naming request timed out".into(),
-                ))
-            }
-        };
+        let outcome = call().await;
         if !matches!(outcome, NativeCallResult::LifecycleBusy) {
             if attempt > 0 {
                 tracing::info!(event = "session_names.native_lifecycle_resumed", ?phase,
@@ -336,9 +336,7 @@ async fn native_call_with_lifecycle_retry<T>(
             return Some(outcome);
         }
         let delay = LIFECYCLE_RETRY_DELAY * (attempt as u32 + 1);
-        if attempt + 1 == LIFECYCLE_RETRY_ATTEMPTS
-            || tokio::time::Instant::now() + delay >= deadline
-        {
+        if attempt + 1 == LIFECYCLE_RETRY_ATTEMPTS {
             tracing::warn!(event = "session_names.native_lifecycle_exhausted", ?phase,
                 attempts = attempt + 1, revision = claim.desired_revision,
                 receipt_id = %claim.receipt_id);
@@ -854,7 +852,7 @@ async fn run_cycle(
     let observed = match outcome {
         NativeCallResult::Confirmed(readback) => readback.title,
         NativeCallResult::LifecycleBusy => {
-            finish_lifecycle_contention(names, &claim, NativeLifecyclePhase::PreRead).await;
+            fold_lifecycle_contention(names, &claim).await;
             return;
         }
         NativeCallResult::Undelivered(reason) => {
@@ -922,7 +920,7 @@ async fn run_cycle(
     };
     match outcome {
         NativeCallResult::LifecycleBusy => {
-            finish_lifecycle_contention(names, &claim, NativeLifecyclePhase::Write).await;
+            fold_lifecycle_contention(names, &claim).await;
             return;
         }
         NativeCallResult::Confirmed(()) => {
@@ -1004,8 +1002,7 @@ async fn run_cycle(
     };
     match outcome {
         NativeCallResult::LifecycleBusy => {
-            finish_lifecycle_contention(names, &claim, NativeLifecyclePhase::ConfirmationRead)
-                .await;
+            fold_lifecycle_contention(names, &claim).await;
         }
         NativeCallResult::Confirmed(readback) => {
             fold(
@@ -1053,18 +1050,17 @@ async fn run_cycle(
     }
 }
 
-async fn finish_lifecycle_contention(
-    names: &Arc<SessionNames>,
-    claim: &NativeCycleClaim,
-    phase: NativeLifecyclePhase,
-) {
-    if let Err(error) = names
-        .finish_native_lifecycle_contention(claim.clone(), phase)
-        .await
-    {
-        tracing::warn!(op = "finish_native_lifecycle_contention", revision = claim.desired_revision,
-            class = %error.code(), "session_names.operation_failed: {error}");
-    }
+async fn fold_lifecycle_contention(names: &Arc<SessionNames>, claim: &NativeCycleClaim) {
+    fold(
+        names,
+        &claim.target,
+        claim.location_revision,
+        claim.series_epoch,
+        NativeOutcomeFold::Undelivered {
+            reason: "native naming lifecycle contention exhausted".into(),
+        },
+    )
+    .await;
 }
 
 async fn fold(

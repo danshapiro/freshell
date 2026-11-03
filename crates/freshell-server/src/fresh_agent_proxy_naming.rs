@@ -94,6 +94,7 @@ impl HostedCodexNameBackend {
                 source,
                 codex_home: codex_home.clone(),
                 operation,
+                accepts_lifecycle_busy: true,
                 expected_control_epoch: None,
             })
             .await

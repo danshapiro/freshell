@@ -191,6 +191,17 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
     use freshell_runtime_protocol::{
         FreshAgentNativeNameError as Error, FreshAgentNativeNameReply as Reply,
     };
+    // Frozen pre-opt-in request decoder: old supervisors must still accept
+    // the request emitted by the new caller and keep all authority fields.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyNameRequest {
+        soul_id: freshell_runtime_protocol::SoulId,
+        source: freshell_runtime_protocol::FreshAgentNativeNameSource,
+        codex_home: String,
+        operation: freshell_runtime_protocol::FreshAgentNativeNameOperation,
+        expected_control_epoch: Option<u64>,
+    }
     let dir = tempfile::tempdir().unwrap();
     for scenario in [
         "ok",
@@ -205,6 +216,8 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         "invalid-response",
         "lifecycle-busy",
         "lifecycle-busy-source-changes",
+        "lifecycle-busy-write",
+        "lifecycle-busy-source-changes-write",
     ] {
         let socket = dir.path().join(format!("native-name-{scenario}.sock"));
         let listener = UnixListener::bind(&socket).unwrap();
@@ -231,6 +244,21 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                         })).unwrap()])
                     }
                     AdminCommand::FreshAgentNativeName(request) => {
+                        assert!(
+                            request.accepts_lifecycle_busy,
+                            "the caller opts into the new reply variant"
+                        );
+                        let legacy: LegacyNameRequest =
+                            serde_json::from_value(serde_json::to_value(&request).unwrap())
+                                .unwrap();
+                        assert_eq!(legacy.soul_id, request.soul_id);
+                        assert_eq!(legacy.source, request.source);
+                        assert_eq!(legacy.codex_home, request.codex_home);
+                        assert_eq!(legacy.operation, request.operation);
+                        assert_eq!(
+                            legacy.expected_control_epoch,
+                            request.expected_control_epoch
+                        );
                         assert_eq!(request.soul_id.as_str(), "name-soul");
                         assert_eq!(request.codex_home, "/owning/codex");
                         assert_eq!(request.source.native_session_id, "name-native");
@@ -246,7 +274,13 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                         assert_eq!(request.expected_control_epoch, Some(7));
                         assert_eq!(
                             request.operation,
-                            freshell_runtime_protocol::FreshAgentNativeNameOperation::Read
+                            if scenario.ends_with("write") {
+                                freshell_runtime_protocol::FreshAgentNativeNameOperation::Write {
+                                    title: "Manual Title".into(),
+                                }
+                            } else {
+                                freshell_runtime_protocol::FreshAgentNativeNameOperation::Read
+                            }
                         );
                         seen.lock().await.push(request);
                         AdminResult::FreshAgentNativeName(match scenario {
@@ -270,7 +304,7 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                             "invalid-response" => Reply::Failed(Error::InvalidResponse {
                                 detail: "malformed metadata".into(),
                             }),
-                            "lifecycle-busy" | "lifecycle-busy-source-changes" => {
+                            value if value.starts_with("lifecycle-busy") => {
                                 Reply::Failed(Error::LifecycleBusy)
                             }
                             _ => unreachable!(),
@@ -290,25 +324,41 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
             }
         });
         let backend = snapshot_outage_proxy(&socket).native_name_backend();
-        let reply = backend
-            .read(NativeNameTarget {
-                name_ref: freshell_protocol::session_names::SessionNameRef::Session {
-                    provider: NamedProvider::Codex,
-                    session_id: "name-native".into(),
-                },
-                location: freshell_protocol::native_location::NativeLocation::Codex {
-                    codex_home: "/owning/codex".into(),
-                    native_thread_id: Some("name-native".into()),
-                    rollout_path: None,
-                    persistence_evidence: None,
-                },
-                location_revision: 1,
-            })
-            .await;
+        let target = NativeNameTarget {
+            name_ref: freshell_protocol::session_names::SessionNameRef::Session {
+                provider: NamedProvider::Codex,
+                session_id: "name-native".into(),
+            },
+            location: freshell_protocol::native_location::NativeLocation::Codex {
+                codex_home: "/owning/codex".into(),
+                native_thread_id: Some("name-native".into()),
+                rollout_path: None,
+                persistence_evidence: None,
+            },
+            location_revision: 1,
+        };
+        let reply = if scenario.ends_with("write") {
+            match backend
+                .write(crate::session_name_native::NativeNameAttempt {
+                    target,
+                    desired_revision: 7,
+                    title: "Manual Title".into(),
+                    source: freshell_protocol::session_names::NameSource::Manual,
+                    receipt_id: "busy-write-receipt".into(),
+                    cycle: 1,
+                })
+                .await
+            {
+                NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
+                other => panic!("known zero-dispatch write refusal must stay retryable: {other:?}"),
+            }
+        } else {
+            backend.read(target).await
+        };
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
         match scenario {
-            "lifecycle-busy" | "lifecycle-busy-source-changes" => {
+            value if value.starts_with("lifecycle-busy") => {
                 assert_eq!(reply, NativeCallResult::LifecycleBusy)
             }
             "ok" => assert!(

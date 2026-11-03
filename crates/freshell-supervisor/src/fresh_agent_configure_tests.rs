@@ -1083,6 +1083,7 @@ async fn native_name_lifecycle_contention_is_undispatched_and_fresh_retry_succee
             operation: FreshAgentNativeNameOperation::Write {
                 title: "Manual title".into(),
             },
+            accepts_lifecycle_busy: true,
             expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
         }),
     );
@@ -1133,6 +1134,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         "write",
         "probe",
         "busy",
+        "busy-legacy",
         "stale-native",
         "stale-boot",
         "stale-incarnation",
@@ -1203,6 +1205,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                     "probe" => FreshAgentNativeNameOperation::Probe,
                     _ => FreshAgentNativeNameOperation::Read,
                 },
+                accepts_lifecycle_busy: true,
                 expected_control_epoch: Some(if scenario == "stale-epoch" {
                     epoch + 1
                 } else {
@@ -1211,8 +1214,18 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
             }),
         );
         request.auth = Some(SECRET.into());
+        if scenario == "busy-legacy" {
+            // Deserialize the actual old-client wire shape, which did not
+            // advertise support for a lifecycle_busy reply.
+            let mut legacy = serde_json::to_value(&request).unwrap();
+            legacy["body"]["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("acceptsLifecycleBusy");
+            request = serde_json::from_value(legacy).unwrap();
+        }
         let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
-        let _busy_guard = if scenario == "busy" {
+        let _busy_guard = if scenario.starts_with("busy") {
             Some(lifecycle.lock().await)
         } else {
             None
@@ -1229,6 +1242,23 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
             let AdminResult::FreshAgentNativeName(reply) = reply.result.unwrap() else {
                 panic!("wrong reply")
             };
+            if scenario == "busy-legacy" {
+                // Decode the actual response with the old error shape. An
+                // unknown lifecycle_busy discriminant fails this boundary.
+                #[derive(serde::Deserialize)]
+                #[serde(tag = "kind", rename_all = "snake_case")]
+                enum LegacyNameError {
+                    Unavailable { message: String },
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+                enum LegacyNameReply {
+                    Failed(LegacyNameError),
+                }
+                let LegacyNameReply::Failed(LegacyNameError::Unavailable { message }) =
+                    serde_json::from_value(serde_json::to_value(&reply).unwrap()).unwrap();
+                assert!(!message.is_empty());
+            }
             match scenario {
                 "read" => assert_eq!(
                     reply,
@@ -1254,7 +1284,9 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
         }
         {
             let calls = received.lock().unwrap();
-            if scenario.starts_with("stale-") || scenario == "wrong-provider" || scenario == "busy"
+            if scenario.starts_with("stale-")
+                || scenario == "wrong-provider"
+                || scenario.starts_with("busy")
             {
                 assert!(
                     calls.is_empty(),
@@ -1274,7 +1306,7 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
             }
         }
         let expected_refusal = match scenario {
-            "busy" => Some(("lifecycle_busy", "info")),
+            "busy" | "busy-legacy" => Some(("lifecycle_busy", "info")),
             "stale-native" | "stale-boot" | "stale-incarnation" | "stale-generation"
             | "stale-intent" => Some(("source_mismatch", "warning")),
             "wrong-provider" => Some(("provider_mismatch", "warning")),

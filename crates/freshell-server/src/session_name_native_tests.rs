@@ -157,6 +157,13 @@ fn document_json(dir: &std::path::Path) -> Value {
     serde_json::from_slice(&bytes).expect("document parses")
 }
 
+fn freeze_native_clock(dir: &std::path::Path, now: i64) {
+    crate::session_names::set_test_hooks(
+        dir,
+        vec![crate::session_names::TestHook::FrozenClockMs(now)],
+    );
+}
+
 /// How long a real-clock test waits for a worker cycle to converge. A cycle
 /// is several durable transactions, so it takes as long as the disk does;
 /// this bound only turns a series that never converges into a failure
@@ -690,27 +697,197 @@ async fn lifecycle_contention_retries_only_the_undispatched_phase() {
     }
 }
 
+#[tokio::test]
+async fn lifecycle_contention_mid_bind_keeps_the_cycle_and_receipt() {
+    for (phase, observed_target) in
+        (0..3).flat_map(|phase| [false, true].map(|observed| (phase, observed)))
+    {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = armed_pending(&store, "h-mid-bind", "/h/.claude").await;
+        let durable = session(
+            freshell_protocol::session_names::NamedProvider::Claude,
+            "h-mid-bind",
+        );
+        if observed_target {
+            store.ensure_session(durable.clone(), None).await.unwrap();
+            observe(&store, durable.clone(), "First native baseline", 0)
+                .await
+                .unwrap();
+            observe(&store, durable.clone(), "A newer native title", 0)
+                .await
+                .unwrap();
+            let document = document_json(dir.path());
+            let state = native_entry_for(&document, &durable);
+            assert!(
+                state["seriesEpoch"].is_null(),
+                "the durable record has observations but no armed native series"
+            );
+        }
+        let mut busy = [0; 3];
+        busy[phase] = 1;
+        let backend = LifecycleContentionBackend::new(busy);
+        backend.gate_phase.store(phase as u32, Ordering::SeqCst);
+        let running_store = store.clone();
+        let running_backend = backend.clone();
+        let running_target = target.clone();
+        let running = tokio::spawn(async move {
+            super::run_cycle(&running_store, running_backend.as_ref(), &running_target).await;
+        });
+        tokio::time::timeout(
+            REAL_CLOCK_CONVERGENCE_BOUND,
+            backend.gate_arrived.notified(),
+        )
+        .await
+        .expect("the worker reaches the held naming phase");
+        let claimed = document_json(dir.path());
+        let receipt = native_entry_for(&claimed, &target)["receiptId"].clone();
+        let original_revision = store.get(vec![target.clone()]).await.unwrap()[0]
+            .record
+            .revision;
+        let bound = store
+            .bind_pending(BindNameInput {
+                pending: target,
+                target: durable.clone(),
+                acquisition: verified_acquisition(claude_location("/h/.claude", "h-mid-bind")),
+            })
+            .await
+            .unwrap();
+        assert!(
+            bound.record.revision > original_revision,
+            "binding rebases the record revision"
+        );
+        backend.gate_open.notify_one();
+        tokio::time::timeout(REAL_CLOCK_CONVERGENCE_BOUND, running)
+            .await
+            .expect("the bound cycle settles")
+            .unwrap();
+        assert_eq!(
+            native_sync_of(&store, durable).await.unwrap().status,
+            NativeSyncStatus::Synced,
+            "phase {phase}, observed target {observed_target}: a binding is not a new name decision"
+        );
+        assert_eq!(backend.actual.reads(), 2);
+        assert_eq!(backend.actual.writes(), 1);
+        let document = document_json(dir.path());
+        let state = native_entry_of(&document);
+        assert_eq!(state["cyclesConsumed"], 1);
+        assert_eq!(state["readsConsumed"], 2);
+        assert_eq!(state["lastConfirmedReceipt"], receipt);
+        assert_eq!(state["attemptedReceipts"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_retry_preserves_claude_timeout_cleanup_before_guard_release() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let pending = armed_pending(&store, "h-timeout-cleanup", "/h/.claude").await;
+    let target = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "h-timeout-cleanup",
+    );
+    let mut location = claude_location("/h/.claude", "h-timeout-cleanup");
+    if let NativeLocation::Claude { transcript_cwd, .. } = &mut location {
+        *transcript_cwd = Some("/work/project".into());
+    }
+    store
+        .bind_pending(BindNameInput {
+            pending,
+            target: target.clone(),
+            acquisition: verified_acquisition(location),
+        })
+        .await
+        .unwrap();
+    // The shell becomes sleep, so the adapter owns exactly one child. Its
+    // PID lets us assert reaping rather than merely dropping the future.
+    let helper = dir.path().join("hang.sh");
+    let pid_path = dir.path().join("helper.pid");
+    std::fs::write(
+        &helper,
+        format!(
+            "printf '%s' \"$$\" > '{}'\nexec sleep 300\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    let adapter = super::ClaudeNativeNameAdapter {
+        node: "/bin/sh".into(),
+        helper_path: helper,
+    };
+    let guard = store.try_background_guard().unwrap().unwrap();
+    let running_store = store.clone();
+    let running_target = target.clone();
+    let running_pid_path = pid_path.clone();
+    let running = tokio::spawn(async move {
+        let _guard = guard;
+        super::run_cycle(&running_store, &adapter, &running_target).await;
+        assert!(running_store.try_background_guard().unwrap().is_none());
+        let pid: i32 = std::fs::read_to_string(running_pid_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: this is the exact dedicated child PID recorded by our
+        // helper; WNOHANG cannot block or affect any other process.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(
+            waited, -1,
+            "helper is already reaped while the worker guard is still held"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !pid_path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the helper starts before its deadline");
+    assert!(
+        store.try_background_guard().unwrap().is_none(),
+        "the helper still owns the worker guard"
+    );
+    tokio::time::pause();
+    tokio::time::advance(super::NATIVE_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+    running.await.unwrap();
+    let sync = native_sync_of(&store, target).await.unwrap();
+    assert!(
+        sync.reason
+            .as_deref()
+            .unwrap()
+            .contains("helper exceeded the request bound"),
+        "adapter-specific timeout classification survives: {sync:?}"
+    );
+    assert!(store.try_background_guard().unwrap().is_some());
+}
+
 #[tokio::test(start_paused = true)]
-async fn lifecycle_contention_exhaustion_refunds_only_undispatched_work() {
+async fn lifecycle_contention_exhaustion_preserves_backoff_and_eventual_sync() {
     for phase in 0..3 {
         let dir = temp_data_dir();
+        let now = 1_700_000_000_000_i64;
+        freeze_native_clock(dir.path(), now);
         let store = open_store(dir.path());
         let target = armed_pending(&store, "h-exhaustion", "/h/.claude").await;
         let mut busy = [0; 3];
-        busy[phase] = u32::MAX;
+        busy[phase] = super::LIFECYCLE_RETRY_ATTEMPTS as u32;
         let backend = LifecycleContentionBackend::new(busy);
         super::run_cycle(&store, backend.as_ref(), &target).await;
         let document = document_json(dir.path());
         let state = native_entry_of(&document);
-        assert_eq!(state["cyclesConsumed"], u32::from(phase == 2));
-        assert_eq!(state["readsConsumed"], u32::from(phase != 0));
+        assert_eq!(
+            state["cyclesConsumed"], 1,
+            "a refused cycle is still consumed"
+        );
+        assert_eq!(state["readsConsumed"], 1 + u32::from(phase == 2));
         assert_eq!(backend.actual.reads(), u32::from(phase != 0));
         assert_eq!(backend.actual.writes(), u32::from(phase == 2));
-        assert_eq!(state["settled"], true);
-        assert!(
-            state["receiptId"].is_null(),
-            "retired claim cannot refund twice"
-        );
+        assert_eq!(state["nextDue"], now + 5_000);
+        assert_eq!(state["receiptId"], state["attemptedReceipts"][0]);
         assert_eq!(state["attemptedReceipts"].as_array().unwrap().len(), 1);
         assert!(
             state["lastConfirmedReceipt"].is_null(),
@@ -721,125 +898,175 @@ async fn lifecycle_contention_exhaustion_refunds_only_undispatched_work() {
             NativeSyncStatus::Unsynced
         );
         assert!(store.native_work_snapshot().is_empty());
-        let attempts = backend.attempts.lock().unwrap();
-        let refused: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
-        assert_eq!(refused.len(), super::LIFECYCLE_RETRY_ATTEMPTS);
-        assert!(refused
-            .windows(2)
-            .all(|pair| pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(25)));
+        {
+            let attempts = backend.attempts.lock().unwrap();
+            let refused: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
+            assert_eq!(refused.len(), super::LIFECYCLE_RETRY_ATTEMPTS);
+            assert!(refused
+                .windows(2)
+                .all(|pair| pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(25)));
+        }
+        drop(store);
+        let store = open_store(dir.path());
+        // Matching or genuinely changed observations cannot replenish the
+        // counters or bypass the existing retry floor across a restart.
+        for title in ["Manual Title", "A different native title"] {
+            observe(&store, target.clone(), title, 1).await.unwrap();
+            assert!(store.native_work_snapshot().is_empty());
+            assert_eq!(
+                native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+                1
+            );
+        }
+        freeze_native_clock(dir.path(), now + 5_000);
+        assert_eq!(store.native_work_snapshot().len(), 1);
+        super::run_cycle(&store, backend.as_ref(), &target).await;
+        assert_eq!(
+            native_sync_of(&store, target.clone()).await.unwrap().status,
+            NativeSyncStatus::Synced
+        );
+        assert_eq!(
+            backend.actual.writes(),
+            1,
+            "an acknowledged write is reconciled by readback"
+        );
+        assert_eq!(
+            native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+            2
+        );
+        observe(&store, target.clone(), "Manual Title", 1)
+            .await
+            .unwrap();
+        assert!(
+            store.native_work_snapshot().is_empty(),
+            "a matching echo needs no repair"
+        );
+        backend
+            .actual
+            .set_title(Some("A new external native title"));
+        observe(&store, target.clone(), "A new external native title", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.native_work_snapshot().len(),
+            1,
+            "a differing observation rearms the remaining budget"
+        );
+        super::run_cycle(&store, backend.as_ref(), &target).await;
+        assert_eq!(
+            native_sync_of(&store, target).await.unwrap().status,
+            NativeSyncStatus::Synced
+        );
+        assert_eq!(
+            native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+            3
+        );
+        crate::session_names::clear_test_hooks(dir.path());
     }
 }
 
-#[tokio::test]
-async fn lifecycle_contention_terminal_refund_is_idempotent() {
+#[tokio::test(start_paused = true)]
+async fn lifecycle_contention_exhaustion_stays_bounded_across_restarts_and_binding() {
     let dir = temp_data_dir();
+    let mut now = 1_700_000_000_000_i64;
+    freeze_native_clock(dir.path(), now);
     let store = open_store(dir.path());
-    let target = armed_pending(&store, "h-idempotent", "/h/.claude").await;
-    let claim = store
-        .claim_native_cycle(target.clone(), "owned-receipt".into())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(store.charge_native_read(claim.clone()).await.unwrap());
-    store
-        .finish_native_lifecycle_contention(claim.clone(), super::NativeLifecyclePhase::PreRead)
-        .await
-        .unwrap();
-    let before = document_json(dir.path());
-    store
-        .finish_native_lifecycle_contention(claim, super::NativeLifecyclePhase::PreRead)
-        .await
-        .unwrap();
-    assert_eq!(document_json(dir.path()), before);
+    let target = armed_pending(&store, "h-bounded", "/h/.claude").await;
+    let backend = LifecycleContentionBackend::new([u32::MAX, 0, 0]);
+    for (cycle, delay) in [(1, 0), (2, 5_000), (3, 30_000)] {
+        now += delay;
+        freeze_native_clock(dir.path(), now);
+        super::run_cycle(&store, backend.as_ref(), &target).await;
+        let document = document_json(dir.path());
+        let state = native_entry_of(&document);
+        assert_eq!(state["cyclesConsumed"], cycle);
+        assert_eq!(state["readsConsumed"], cycle);
+        assert_eq!(
+            state["attemptedReceipts"].as_array().unwrap().len(),
+            cycle as usize
+        );
+    }
+    assert_eq!(
+        backend.attempts.lock().unwrap().len(),
+        3 * super::LIFECYCLE_RETRY_ATTEMPTS
+    );
+    assert_eq!(backend.actual.reads(), 0);
+    assert_eq!(backend.actual.writes(), 0);
+    drop(store);
+    let store = open_store(dir.path());
     let durable = session(
         freshell_protocol::session_names::NamedProvider::Claude,
-        "h-idempotent",
+        "h-bounded",
     );
     store
         .bind_pending(BindNameInput {
             pending: target,
-            target: durable,
-            acquisition: verified_acquisition(claude_location("/h/.claude", "h-idempotent")),
+            target: durable.clone(),
+            acquisition: verified_acquisition(claude_location("/h/.claude", "h-bounded")),
         })
         .await
         .unwrap();
-    assert!(
-        store.native_work_snapshot().is_empty(),
-        "binding the same source cannot renew exhaustion"
+    for title in ["Manual Title", "A changed external title"] {
+        observe(&store, durable.clone(), title, 1).await.unwrap();
+        assert!(
+            store.native_work_snapshot().is_empty(),
+            "observations and binds never replenish the three spent cycles"
+        );
+    }
+    rename_user(&store, durable.clone(), "A new name decision")
+        .await
+        .unwrap();
+    super::run_cycle(&store, backend.actual.as_ref(), &durable).await;
+    assert_eq!(
+        native_sync_of(&store, durable).await.unwrap().status,
+        NativeSyncStatus::Synced
     );
+    crate::session_names::clear_test_hooks(dir.path());
 }
 
 #[tokio::test(start_paused = true)]
-async fn lifecycle_contention_exhaustion_survives_same_source_echo() {
-    for rearm in ["name", "source"] {
-        let dir = temp_data_dir();
-        let store = open_store(dir.path());
-        let target = armed_pending(&store, "h-reopen", "/h/.claude").await;
-        observe(&store, target.clone(), "Previous native title", 1)
-            .await
-            .unwrap();
-        let backend = LifecycleContentionBackend::new([u32::MAX, 0, 0]);
-        backend.actual.set_title(Some("Previous native title"));
+async fn lifecycle_contention_second_exhaustion_recovers_after_thirty_second_floor() {
+    let dir = temp_data_dir();
+    let mut now = 1_700_000_000_000_i64;
+    freeze_native_clock(dir.path(), now);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-third-cycle", "/h/.claude").await;
+    let backend =
+        LifecycleContentionBackend::new([2 * super::LIFECYCLE_RETRY_ATTEMPTS as u32, 0, 0]);
+    for delay in [0, 5_000] {
+        now += delay;
+        freeze_native_clock(dir.path(), now);
         super::run_cycle(&store, backend.as_ref(), &target).await;
-        drop(store);
-        let reopened = open_store(dir.path());
-        assert!(reopened.native_work_snapshot().is_empty());
-        record_acquisition(
-            &reopened,
-            target.clone(),
-            verified_acquisition(claude_location("/h/.claude", "h-reopen")),
-        )
-        .await
-        .unwrap();
-        assert!(reopened.native_work_snapshot().is_empty());
-        observe(&reopened, target.clone(), "Previous native title", 1)
-            .await
-            .unwrap();
-        assert!(
-            reopened.native_work_snapshot().is_empty(),
-            "an unchanged native echo must not renew exhausted contention work"
-        );
-        if rearm == "name" {
-            rename_user(&reopened, target.clone(), "New manual title")
-                .await
-                .unwrap();
-        } else {
-            record_acquisition(
-                &reopened,
-                target.clone(),
-                verified_acquisition(claude_location("/moved/.claude", "h-reopen")),
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(
-            reopened.native_work_snapshot().len(),
-            1,
-            "real new-name/source changes retain their existing recovery behavior"
-        );
-        super::run_cycle(&reopened, backend.actual.as_ref(), &target).await;
-        assert_eq!(
-            native_sync_of(&reopened, target).await.unwrap().status,
-            NativeSyncStatus::Synced
-        );
     }
+    let due = now + 30_000;
+    assert_eq!(native_entry_of(&document_json(dir.path()))["nextDue"], due);
+    freeze_native_clock(dir.path(), due - 1);
+    assert!(store.native_work_snapshot().is_empty());
+    freeze_native_clock(dir.path(), due);
+    assert_eq!(store.native_work_snapshot().len(), 1);
+    super::run_cycle(&store, backend.as_ref(), &target).await;
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    assert_eq!(backend.actual.reads(), 2);
+    assert_eq!(backend.actual.writes(), 1);
+    assert_eq!(
+        native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+        3
+    );
+    crate::session_names::clear_test_hooks(dir.path());
 }
 
-#[tokio::test]
-async fn lifecycle_contention_changed_binding_source_rearms() {
+#[tokio::test(start_paused = true)]
+async fn lifecycle_contention_changed_binding_source_preserves_budget_and_backoff() {
     let dir = temp_data_dir();
+    let now = 1_700_000_000_000_i64;
+    freeze_native_clock(dir.path(), now);
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-changed-bind", "/h/.claude").await;
-    let claim = store
-        .claim_native_cycle(target.clone(), "old-source-receipt".into())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(store.charge_native_read(claim.clone()).await.unwrap());
-    store
-        .finish_native_lifecycle_contention(claim.clone(), super::NativeLifecyclePhase::PreRead)
-        .await
-        .unwrap();
+    let backend = LifecycleContentionBackend::new([super::LIFECYCLE_RETRY_ATTEMPTS as u32, 0, 0]);
+    super::run_cycle(&store, backend.as_ref(), &target).await;
     let durable = session(
         freshell_protocol::session_names::NamedProvider::Claude,
         "h-changed-bind",
@@ -853,7 +1080,7 @@ async fn lifecycle_contention_changed_binding_source_rearms() {
         .await
         .unwrap();
     let current_source = store.location_revision_of(&durable);
-    assert!(current_source > claim.location_revision);
+    assert!(current_source > 1);
     observe(
         &store,
         durable.clone(),
@@ -862,22 +1089,30 @@ async fn lifecycle_contention_changed_binding_source_rearms() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        store.native_work_snapshot().len(),
-        1,
-        "a genuinely changed verified binding keeps the existing source-rearm behavior"
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "a changed binding still honors the failure backoff"
     );
-    let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
-    backend.set_title(Some("Previous native title"));
+    assert_eq!(
+        native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+        1
+    );
+    freeze_native_clock(dir.path(), now + 5_000);
     super::run_cycle(&store, backend.as_ref(), &durable).await;
     assert_eq!(
         native_sync_of(&store, durable).await.unwrap().status,
         NativeSyncStatus::Synced
     );
+    assert_eq!(
+        native_entry_of(&document_json(dir.path()))["cyclesConsumed"],
+        2
+    );
+    crate::session_names::clear_test_hooks(dir.path());
 }
 
 #[tokio::test]
-async fn lifecycle_contention_stale_name_or_route_cannot_retry_or_refund() {
+async fn lifecycle_contention_stale_name_or_route_cannot_retry_or_mutate_successor() {
+    let events = crate::test_trace_capture::captured_trace_events();
     for (phase, change) in [
         (0, "name"),
         (1, "name"),
@@ -919,6 +1154,8 @@ async fn lifecycle_contention_stale_name_or_route_cannot_retry_or_refund() {
             super::run_cycle(&running_store, running_backend.as_ref(), &running_target).await;
         });
         backend.gate_arrived.notified().await;
+        let claimed = document_json(dir.path());
+        let receipt = native_entry_of(&claimed)["receiptId"].as_str().unwrap();
         let other = open_store(dir.path());
         if change == "name" {
             rename_user(&other, target.clone(), "New manual title")
@@ -968,6 +1205,15 @@ async fn lifecycle_contention_stale_name_or_route_cannot_retry_or_refund() {
             backend.actual.writes(),
             u32::from(phase == 2),
             "only a write acknowledged before the concurrent rename may have run"
+        );
+        assert!(
+            events
+                .snapshot()
+                .iter()
+                .any(|event| event.fields.get("event").map(String::as_str)
+                    == Some("session_names.native_claim_superseded")
+                    && event.fields.get("receipt_id").map(String::as_str) == Some(receipt)),
+            "a genuinely superseded claim leaves a structured diagnostic"
         );
     }
 }

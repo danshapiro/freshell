@@ -278,10 +278,6 @@ struct StoredObservation {
     stale: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !value
-}
-
 /// Per-record native writeback state: desired revision/name/source, attempted
 /// location and receipts, consumed cycles/reads, and last-observation
 /// provenance. Task 3 drives the cycle machine; Task 1 owns the durable
@@ -333,10 +329,6 @@ struct NativeWriteState {
     /// new name decision. Never replenishes consumed counts.
     #[serde(default)]
     settled: bool,
-    /// Unchanged native observations cannot renew exhausted contention work.
-    /// A real new name or changed verified source keeps its normal rearm path.
-    #[serde(default, skip_serializing_if = "is_false")]
-    lifecycle_contention_exhausted: bool,
     /// Task 3: a matching current-location readback was observed while the
     /// series stayed `unsynced` (ambiguity) — projected as `observedCurrent`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1280,10 +1272,7 @@ impl SessionNames {
         let now = effective_now_ms(&self.core.data_dir);
         let mut items = Vec::new();
         for (key, state) in &document.native_write {
-            if state.settled
-                || state.lifecycle_contention_exhausted
-                || state.cycles_consumed >= MAX_NATIVE_CYCLES
-            {
+            if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
                 continue;
             }
             if state.status == NativeSyncStatus::Synced
@@ -1393,8 +1382,9 @@ impl SessionNames {
         }))
     }
 
-    /// Adopt the latest document and validate exact name, source and receipt
-    /// before another native operation; stale claims authorize no retry.
+    /// Adopt the latest document and validate the semantic series, name,
+    /// source, receipt and route before dispatch. Binding can rebase a record
+    /// revision without replacing its series; stale claims authorize no retry.
     pub(crate) fn native_claim_is_current(
         &self,
         claim: crate::session_name_native::NativeCycleClaim,
@@ -1405,7 +1395,7 @@ impl SessionNames {
         }))
     }
 
-    /// Charge a logical read only for the exact current name/source/receipt.
+    /// Charge a logical read only for the current series/name/source/receipt.
     pub(crate) fn charge_native_read(
         &self,
         claim: crate::session_name_native::NativeCycleClaim,
@@ -1416,43 +1406,6 @@ impl SessionNames {
                 return Ok(Decision::Read(false));
             }
             charge_native_read_decision(doc, &claim.target, claim.series_epoch)
-        }))
-    }
-
-    /// Refund only the definitively undispatched phase, preserve real read
-    /// charges and receipt history, and retire this claim exactly once.
-    pub(crate) fn finish_native_lifecycle_contention(
-        &self,
-        claim: crate::session_name_native::NativeCycleClaim,
-        phase: crate::session_name_native::NativeLifecyclePhase,
-    ) -> NameFuture<SessionNameUpdate> {
-        let core = Arc::clone(&self.core);
-        Box::pin(spawn_txn(core, move |doc, _meta| {
-            let (key, _) = required_record(doc, &claim.target)?;
-            if !native_claim_is_current(doc, &claim) {
-                return Ok(Decision::Read(read_update(doc, &key)));
-            }
-            let state = doc.native_write.get_mut(&key).expect("current claim state");
-            use crate::session_name_native::NativeLifecyclePhase;
-            if phase != NativeLifecyclePhase::Write {
-                state.reads_consumed = state.reads_consumed.checked_sub(1).ok_or_else(|| {
-                    NameError::Persistence("native naming read charge is missing".into())
-                })?;
-            }
-            if phase != NativeLifecyclePhase::ConfirmationRead {
-                state.cycles_consumed = state.cycles_consumed.checked_sub(1).ok_or_else(|| {
-                    NameError::Persistence("native naming cycle charge is missing".into())
-                })?;
-            }
-            // The receipt history includes any acknowledged write. Retire only
-            // the active claim so a duplicate refusal cannot refund it twice.
-            state.receipt_id = None;
-            state.status = NativeSyncStatus::Unsynced;
-            state.unsynced_reason = Some("native naming lifecycle contention exhausted".into());
-            state.settled = true;
-            state.lifecycle_contention_exhausted = true;
-            state.next_due = None;
-            Ok(commit_decision_publishing_status(doc, &key))
         }))
     }
 
@@ -2754,7 +2707,6 @@ fn reset_native_series(document: &mut StoredDocument, key: &str, record: &Sessio
     entry.ambiguous = false;
     entry.observed_current = None;
     entry.settled = false;
-    entry.lifecycle_contention_exhausted = false;
     entry.next_due = None;
     entry.cycles_consumed = 0;
     entry.reads_consumed = 0;
@@ -2771,7 +2723,7 @@ fn apply_verified_location(
     location: NativeLocation,
 ) -> bool {
     let entry = document.locations.entry(key.to_string()).or_default();
-    let changed = match &entry.verified {
+    match &entry.verified {
         None => {
             entry.verified = Some(VerifiedLocation {
                 location,
@@ -2787,13 +2739,7 @@ fn apply_verified_location(
             });
             true
         }
-    };
-    if changed {
-        if let Some(state) = document.native_write.get_mut(key) {
-            state.lifecycle_contention_exhausted = false;
-        }
     }
-    changed
 }
 
 /// Union the colliding generation budgets on bind: combined consumed counts
@@ -2855,8 +2801,6 @@ fn transfer_native_write(
                     .min(MAX_NATIVE_CYCLES);
                 durable.reads_consumed =
                     (durable.reads_consumed + pending_state.reads_consumed).min(MAX_NATIVE_READS);
-                durable.lifecycle_contention_exhausted |=
-                    pending_state.lifecycle_contention_exhausted;
                 for receipt in pending_state.attempted_receipts {
                     if !durable.attempted_receipts.contains(&receipt) {
                         durable.attempted_receipts.push(receipt);
@@ -2865,10 +2809,14 @@ fn transfer_native_write(
                 if durable.last_confirmed_receipt.is_none() {
                     durable.last_confirmed_receipt = pending_state.last_confirmed_receipt;
                 }
-                // The surviving series keeps its own epoch; if only the
-                // transferred series ever armed, its identity rides along.
+                // The surviving series keeps its own epoch. An observation-
+                // only durable entry has no series: the pending series and
+                // its active receipt/route move together in that case.
                 if durable.series_epoch.is_none() {
                     durable.series_epoch = pending_state.series_epoch;
+                    durable.receipt_id = pending_state.receipt_id;
+                    durable.attempted_location = pending_state.attempted_location;
+                    durable.attempted_location_revision = pending_state.attempted_location_revision;
                 }
             }
             None => {
@@ -3472,9 +3420,7 @@ fn observe_native_decision(
                     && diverged
                     && state.cycles_consumed < MAX_NATIVE_CYCLES
                 {
-                    let rearm = state.settled
-                        && !state.lifecycle_contention_exhausted
-                        && state.status != NativeSyncStatus::Unsupported;
+                    let rearm = state.settled && state.status != NativeSyncStatus::Unsupported;
                     if rearm {
                         state.status = NativeSyncStatus::Unsynced;
                         state.settled = false;
@@ -3956,7 +3902,9 @@ fn native_retry_delay_ms(cycles_consumed: u32) -> Option<i64> {
     }
 }
 
-/// Whether this exact receipt still owns the current name and native route.
+/// Whether this receipt still owns the semantic series and exact native route.
+/// A pending-to-durable bind rebases the record revision and may merge spent
+/// budgets, but preserves the winning series epoch and its name decision.
 fn native_claim_is_current(
     document: &StoredDocument,
     claim: &crate::session_name_native::NativeCycleClaim,
@@ -3969,13 +3917,11 @@ fn native_claim_is_current(
     let Some(state) = document.native_write.get(&key) else {
         return false;
     };
-    record.revision == claim.desired_revision
-        && record.name == claim.title
+    record.name == claim.title
         && record.source == claim.source
-        && state.desired_revision == Some(claim.desired_revision)
+        && state.desired_revision == Some(record.revision)
         && state.series_epoch == Some(claim.series_epoch)
         && state.receipt_id.as_deref() == Some(claim.receipt_id.as_str())
-        && state.cycles_consumed == claim.cycle
         && !state.settled
         && state.attempted_location.as_ref() == Some(&claim.location)
         && state.attempted_location_revision == Some(claim.location_revision)
@@ -3991,10 +3937,7 @@ fn native_series_claimable(
     now: i64,
 ) -> Option<(SessionNameRecord, NameSource)> {
     let state = document.native_write.get(key)?;
-    if state.settled
-        || state.lifecycle_contention_exhausted
-        || state.cycles_consumed >= MAX_NATIVE_CYCLES
-    {
+    if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
         return None;
     }
     if state.status == NativeSyncStatus::Synced || state.status == NativeSyncStatus::Unsupported {

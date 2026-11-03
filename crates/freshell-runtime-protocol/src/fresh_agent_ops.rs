@@ -135,6 +135,10 @@ pub struct FreshAgentNativeNameRequest {
     pub source: FreshAgentNativeNameSource,
     pub codex_home: String,
     pub operation: FreshAgentNativeNameOperation,
+    /// Opt in to the supervisor-only no-dispatch lifecycle refusal. Older
+    /// clients omit this and must receive the existing Unavailable variant.
+    #[serde(default)]
+    pub accepts_lifecycle_busy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
