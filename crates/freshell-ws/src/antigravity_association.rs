@@ -1744,6 +1744,7 @@ mod tests {
             None => Arc::new(crate::pane_ledger::PaneLedger::disabled()),
         };
         let state = WsState {
+            session_index_ready: None,
             pane_ledger,
             layout: Default::default(),
             terminal_meta: Default::default(),

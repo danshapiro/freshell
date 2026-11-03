@@ -67,9 +67,13 @@ pub fn map_existence(e: SessionExistence) -> ResumeExistence {
     match e {
         SessionExistence::Present => ResumeExistence::Present,
         SessionExistence::Absent => ResumeExistence::Absent,
-        SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
-            ResumeExistence::Unknown
-        }
+        // Kata vnpc Task 4: `Unreadable` maps beside `Unknown` — a store the
+        // probe cannot read fails open for user creates (never mint a fresh
+        // session over the stale id) and blocks managed recovery (which
+        // requires positive evidence).
+        SessionExistence::Unknown
+        | SessionExistence::ProviderUnavailable
+        | SessionExistence::Unreadable => ResumeExistence::Unknown,
     }
 }
 
@@ -254,10 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_provider_unavailable_fail_open() {
+    fn unknown_provider_unavailable_and_unreadable_fail_open() {
+        // Kata vnpc Task 4: `Unreadable` maps beside `Unknown` — a store the
+        // probe cannot read must never mint a fresh session over a stale id
+        // (fail open for user creates; managed recovery still requires
+        // positive evidence).
         for answer in [
             SessionExistence::Unknown,
             SessionExistence::ProviderUnavailable,
+            SessionExistence::Unreadable,
         ] {
             let probe = FakeProbe {
                 answer,
@@ -352,6 +361,7 @@ mod tests {
         for answer in [
             SessionExistence::Unknown,
             SessionExistence::ProviderUnavailable,
+            SessionExistence::Unreadable,
         ] {
             let probe = FakeProbe {
                 answer,

@@ -27,7 +27,19 @@
 //!   listing is root-filtered, drops cwd-less rows, and excludes archived
 //!   — while the attach arm (`opencode --session <id>`, session.get by
 //!   id, which has none of those filters) resolves them all. Row present
-//!   => `Present`; unreadable DB => `Unknown`, never `Absent`.
+//!   => `Present`; unreadable DB => `Unreadable` (kata vnpc Task 4), never
+//!   `Absent`.
+//! * kata vnpc Task 4 — scan-failure honesty: the warm path reads the rows
+//!   AND the scan failures from ONE generation
+//!   ([`SessionIndex::peek_with_failures`]); a session miss for a provider
+//!   named in THAT generation's `scan_failures` answers `Unreadable`
+//!   (→ error{session_store_unreadable}), never the snapshot-only `Absent`
+//!   that would fold dead_session/fresh for a recoverable identity. A
+//!   by-id fallback's definitive answer (hit OR clean miss) stays
+//!   authoritative even when the scan failed. The provider-root presence
+//!   check runs at the TOP of `exists()` — it holds for the WARM path too,
+//!   so a published snapshot can never adjudicate `Absent` for a provider
+//!   whose root is gone (`ProviderUnavailable`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -46,7 +58,9 @@ const KNOWN_PROVIDERS: [&str; 5] = ["claude", "codex", "opencode", "amplifier", 
 /// roots scan the attach arm trusts (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
 /// platform home `.claude`) — so reconcile and attach can never disagree about
 /// whether a claude transcript exists. Three-state (G28): an unreadable store
-/// maps to `Unknown`, never `Absent`. A closure (not a direct call) keeps this probe
+/// maps to `Unreadable` (kata vnpc Task 4 — post-readiness this is the honest
+/// error{session_store_unreadable}, never `Absent`, and never the cold-only
+/// `Unknown`). A closure (not a direct call) keeps this probe
 /// unit-testable without process-global env mutation; precedent:
 /// `codex_rollout_locator` (main.rs).
 pub type ClaudeTranscriptLocator = Arc<dyn Fn(&str) -> TranscriptLocation + Send + Sync>;
@@ -61,8 +75,10 @@ pub enum OpencodeDbAnswer {
     Absent,
     /// The DB exists but could not be read (WAL lock contention, corruption,
     /// io error, schema variance). LOAD-BEARING: the probe maps this to
-    /// `Unknown`, NEVER `Absent` — Absent-on-error would adjudicate live
-    /// sessions dead under transient lock contention.
+    /// `Unreadable` (kata vnpc Task 4 — the honest
+    /// error{session_store_unreadable} post-readiness; `Unknown` while the
+    /// index is still cold), NEVER `Absent` — Absent-on-error would
+    /// adjudicate live sessions dead under transient lock contention.
     Unreadable,
 }
 
@@ -230,6 +246,33 @@ impl IndexExistenceProbe {
             observed.insert(item.key());
         }
     }
+
+    /// Cold-path by-id adjudication shared by the amplifier/opencode/antigravity
+    /// cold locators (kata vnpc Task 4): a by-id Present is disk truth (feed
+    /// the monotone observed-set), a clean miss is positive Absent, and an
+    /// unreadable store stays `Unknown` while the index is cold —
+    /// pre-readiness uncertainty is warming (the scan may still speak),
+    /// never the post-readiness `Unreadable`.
+    fn cold_by_id_to_existence(
+        &self,
+        provider: &str,
+        session_id: &str,
+        answer: ByIdAnswer,
+    ) -> SessionExistence {
+        match answer {
+            ByIdAnswer::Present => {
+                // On-disk observation — feed the monotone observed-set
+                // (module-doc invariant).
+                self.observed
+                    .lock()
+                    .expect("observed set lock")
+                    .insert(format!("{provider}:{session_id}"));
+                SessionExistence::Present
+            }
+            ByIdAnswer::Absent => SessionExistence::Absent,
+            ByIdAnswer::Unreadable => SessionExistence::Unknown,
+        }
+    }
 }
 
 /// Production opencode locator: by-id check against
@@ -238,8 +281,9 @@ impl IndexExistenceProbe {
 /// busy timeout (NOT the listing's 5000ms; `exists()` is sync on the
 /// reconcile path), no archived/parent/directory filters (attach parity:
 /// opencode's session.get has none of them). Missing DB file => `Absent`
-/// (opencode never ran); any read error => `Unreadable` (=> the probe
-/// answers `Unknown`).
+/// (opencode never ran); any read error => `Unreadable` (kata vnpc Task 4:
+/// the warm-miss arm surfaces it as `Unreadable`, the cold arm keeps the
+/// honest `Unknown` warming label).
 pub fn opencode_db_locator(data_home: PathBuf) -> OpencodeSessionLocator {
     Arc::new(move |session_id: &str| {
         match freshell_sessions::parse::session_exists_by_id(&data_home, session_id) {
@@ -255,54 +299,62 @@ impl SessionExistenceProbe for IndexExistenceProbe {
         if !KNOWN_PROVIDERS.contains(&provider) {
             return SessionExistence::Absent;
         }
+        // Provider-root presence check (kata vnpc round-3 finding 5 hoist):
+        // a known provider whose session root does not exist on this
+        // machine will NEVER warm up — that is an immediate, honest
+        // ProviderUnavailable, on the COLD path AND the WARM path alike (a
+        // published snapshot for a provider whose root is gone must not
+        // adjudicate Absent — that would fold dead_session/fresh for an
+        // uninstalled provider's recoverable identity). A provider with no
+        // registered root keeps going.
+        if self
+            .provider_roots
+            .get(provider)
+            .is_some_and(|root| !root.exists())
+        {
+            return SessionExistence::ProviderUnavailable;
+        }
         // Keep the answer converging: any non-fresh state kicks a detached
         // refresh so a re-query (the client's reconnect-and-re-present loop)
         // eventually reads current disk truth.
         if !self.index.is_fresh() {
             self.kick_refresh();
         }
-        match self.index.peek() {
+        // Scan-failure honesty (kata vnpc Task 4, round-1 finding 3 +
+        // round-2 finding 4): the rows AND the scan failures must come from
+        // ONE generation — `peek_with_failures()` takes the snapshot mutex
+        // once. Pairing `peek()` with a later `scan_failures()` read would
+        // let a refresh publish between the two reads and tear the pair.
+        match self.index.peek_with_failures() {
             None => {
-                // Cold index: a known provider whose session root does not
-                // exist on this machine will NEVER warm up — that's an
-                // immediate, honest provider_unavailable, not index_warming.
-                if self
-                    .provider_roots
-                    .get(provider)
-                    .is_some_and(|root| !root.exists())
-                {
-                    return SessionExistence::ProviderUnavailable;
-                }
                 // Cold-index coverage (resume-validation, A1): the snapshot
                 // is None every boot and the warm sweep is a detached spawn —
                 // restore-time creates race it. amplifier + claude have CHEAP
-                // direct by-id locators; run them so the gate still fires in
-                // the incident scenario. codex/opencode stay Unknown when
-                // cold (AD-4: the codex walk is ~1 s on a real store —
-                // warm-Absent adjudication only).
+                // direct by-id locators, and kata vnpc Task 4 added the same
+                // for opencode (the SQLite by-id check) and antigravity (the
+                // canonical transcript single-open) — run them so a known
+                // identity resolves without waiting for the broad scan.
+                // codex stays Unknown when cold (AD-4: the rollout walk is
+                // ~1 s on a real store — warm-Absent adjudication only); with
+                // the readiness-driven recovery (kata vnpc) codex panes park
+                // briefly as error{index_warming} and resume automatically
+                // when the first sweep publishes.
                 if provider == "amplifier" {
                     if let Some(locator) = &self.amplifier_session_locator {
-                        return match locator(session_id) {
-                            ByIdAnswer::Present => {
-                                // On-disk observation — feed the monotone
-                                // observed-set (module-doc invariant).
-                                self.observed
-                                    .lock()
-                                    .expect("observed set lock")
-                                    .insert(format!("{provider}:{session_id}"));
-                                SessionExistence::Present
-                            }
-                            ByIdAnswer::Absent => SessionExistence::Absent,
-                            ByIdAnswer::Unreadable => SessionExistence::Unknown,
-                        };
+                        return self.cold_by_id_to_existence(
+                            provider,
+                            session_id,
+                            locator(session_id),
+                        );
                     }
                 }
                 if provider == "claude" {
                     // Reuse the EXISTING claude transcript locator (raw-file
                     // check — cheap), same mapping as the warm fallback
                     // below: hit => Present, clean miss => Absent, an
-                    // unreadable store => Unknown (G28: cannot check is a
-                    // bounded deferral, never a dead_session).
+                    // unreadable store => Unknown while cold (G28: cannot
+                    // check is the honest warming label pre-readiness,
+                    // never a dead_session).
                     if let Some(locator) = &self.claude_transcript_locator {
                         return match locator(session_id) {
                             TranscriptLocation::Found(_) => {
@@ -317,9 +369,36 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         };
                     }
                 }
+                if provider == "opencode" {
+                    // Cheap cold by-id (kata vnpc Task 4): the same SQLite
+                    // locator the warm-miss arm uses resolves a known
+                    // identity without the broad scan. Unreadable stays
+                    // Unknown while cold (warming is honest pre-readiness —
+                    // the scan may still speak).
+                    if let Some(locator) = &self.opencode_session_locator {
+                        let answer = match locator(session_id) {
+                            OpencodeDbAnswer::Present => ByIdAnswer::Present,
+                            OpencodeDbAnswer::Absent => ByIdAnswer::Absent,
+                            OpencodeDbAnswer::Unreadable => ByIdAnswer::Unreadable,
+                        };
+                        return self.cold_by_id_to_existence(provider, session_id, answer);
+                    }
+                }
+                if provider == "antigravity" {
+                    // Canonical transcript single-open check (kata vnpc
+                    // Task 4), same locator as the warm-miss arm; matches
+                    // the claude G28 cold-locator precedent.
+                    if let Some(locator) = &self.antigravity_transcript_locator {
+                        return self.cold_by_id_to_existence(
+                            provider,
+                            session_id,
+                            locator(session_id),
+                        );
+                    }
+                }
                 SessionExistence::Unknown
             }
-            Some(items) => {
+            Some((items, scan_failures)) => {
                 self.record_observed(&items);
                 let hit = items
                     .iter()
@@ -327,6 +406,12 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 if hit {
                     return SessionExistence::Present;
                 }
+                // Set when a by-id fallback adjudicated this identity with a
+                // definitive answer (a clean miss — a hit or an unreadable
+                // store return immediately below). The fallback's answer is
+                // the attach arm's own check, so it stays authoritative even
+                // when the broad scan failed (kata vnpc Task 4).
+                let mut fallback_adjudicated = false;
                 // Zero-turn claude fallback (kata 09v1): a claude transcript
                 // can be on disk yet carry no cwd-bearing line (e2e fixture's
                 // create-time 0-byte file; crash-window partial writes), so
@@ -340,8 +425,10 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // check. CLAUDE-scoped only — zero-turn codex genuinely has
                 // no rollout file (reconcile_freshagent.rs module doc) — and
                 // R10b itself stays intact for History listing. An
-                // unreadable store (G28) is Unknown — reconcile's bounded
-                // deferral retries — NEVER a finalized Absent.
+                // unreadable store (G28) is `Unreadable` (kata vnpc Task 4:
+                // reconcile surfaces the honest
+                // error{session_store_unreadable}, identity preserved for a
+                // later retry) — NEVER a finalized Absent.
                 if provider == "claude" {
                     if let Some(locator) = &self.claude_transcript_locator {
                         match locator(session_id) {
@@ -357,8 +444,12 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                     .insert(format!("{provider}:{session_id}"));
                                 return SessionExistence::Present;
                             }
-                            TranscriptLocation::Absent => {}
-                            TranscriptLocation::Unreadable(_) => return SessionExistence::Unknown,
+                            TranscriptLocation::Absent => {
+                                fallback_adjudicated = true;
+                            }
+                            TranscriptLocation::Unreadable(_) => {
+                                return SessionExistence::Unreadable;
+                            }
                         }
                     }
                 }
@@ -372,8 +463,9 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // parent/directory/archived filters) resolves it. The two
                 // arms must agree: before finalizing Absent for
                 // opencode, consult the SAME by-id DB truth. An unreadable
-                // DB (WAL lock contention, corruption) is honest Unknown —
-                // reconcile's bounded deferral retries — NEVER Absent. The
+                // DB (WAL lock contention, corruption) is honest
+                // `Unreadable` (kata vnpc Task 4: reconcile surfaces
+                // error{session_store_unreadable}) — NEVER Absent. The
                 // listing's root-only query itself stays intact for History.
                 if provider == "opencode" {
                     if let Some(locator) = &self.opencode_session_locator {
@@ -389,22 +481,24 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                 return SessionExistence::Present;
                             }
                             OpencodeDbAnswer::Unreadable => {
-                                return SessionExistence::Unknown;
+                                return SessionExistence::Unreadable;
                             }
-                            OpencodeDbAnswer::Absent => {}
+                            OpencodeDbAnswer::Absent => {
+                                fallback_adjudicated = true;
+                            }
                         }
                     }
                 }
                 // Amplifier by-id fallback (resume-validation): a STALE warm
                 // snapshot must never adjudicate a real session absent — a
                 // session created moments before a restart may be missing
-                // from the snapshot, and `peek()` serves snapshots
-                // regardless of TTL. Same adjudication point as the claude/
-                // opencode fallbacks above: only reached when the snapshot
-                // would otherwise answer Absent. The scan is CHEAP (one
-                // read_dir + one metadata per project slug), so it stays on
-                // this sync reconcile-consulted path. After this arm,
-                // `Absent` for claude/opencode/amplifier is POSITIVE
+                // from the snapshot, and `peek_with_failures()` serves
+                // snapshots regardless of TTL. Same adjudication point as
+                // the claude/opencode fallbacks above: only reached when the
+                // snapshot would otherwise answer Absent. The scan is CHEAP
+                // (one read_dir + one metadata per project slug), so it
+                // stays on this sync reconcile-consulted path. After this
+                // arm, `Absent` for claude/opencode/amplifier is POSITIVE
                 // absence; codex `Absent` from `exists()` is SNAPSHOT-ONLY
                 // (non-positive) — the ~1s rollout walk lives in
                 // `exists_for_gate` (below), so positive codex absence is
@@ -422,8 +516,10 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                     .insert(format!("{provider}:{session_id}"));
                                 return SessionExistence::Present;
                             }
-                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
-                            ByIdAnswer::Absent => {}
+                            ByIdAnswer::Unreadable => return SessionExistence::Unreadable,
+                            ByIdAnswer::Absent => {
+                                fallback_adjudicated = true;
+                            }
                         }
                     }
                 }
@@ -440,7 +536,8 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // pane-reconcile dead-session answers today;
                 // `exists_for_gate` inherits it through `exists()` for the
                 // deferred future gate activation. An unreadable store is
-                // honest Unknown (G28: bounded deferral), NEVER Absent.
+                // honest `Unreadable` (kata vnpc Task 4:
+                // error{session_store_unreadable}), NEVER Absent.
                 if provider == "antigravity" {
                     if let Some(locator) = &self.antigravity_transcript_locator {
                         match locator(session_id) {
@@ -454,10 +551,24 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                     .insert(format!("{provider}:{session_id}"));
                                 return SessionExistence::Present;
                             }
-                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
-                            ByIdAnswer::Absent => {}
+                            ByIdAnswer::Unreadable => return SessionExistence::Unreadable,
+                            ByIdAnswer::Absent => {
+                                fallback_adjudicated = true;
+                            }
                         }
                     }
+                }
+                // Scan-failure honesty (kata vnpc Task 4, round-1 finding 3
+                // + round-2 finding 4): a warm miss for a provider whose
+                // listing failed in THIS generation is the honest
+                // `Unreadable` (→ error{session_store_unreadable}), never a
+                // snapshot-only Absent — a failed codex root scan publishing
+                // an empty snapshot must not fold dead_session/fresh for a
+                // recoverable identity. A by-id fallback's definitive answer
+                // (tracked above) stays authoritative: the fallback is the
+                // attach arm's own fresh, targeted check.
+                if !fallback_adjudicated && scan_failures.iter().any(|name| name == provider) {
+                    return SessionExistence::Unreadable;
                 }
                 // After the antigravity arm, `Absent` for
                 // claude/opencode/amplifier/antigravity is POSITIVE absence.
@@ -523,7 +634,9 @@ impl SessionExistenceProbe for IndexExistenceProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_sessions::directory_index::{ClaudeSource, OpencodeSource, SessionSource};
+    use freshell_sessions::directory_index::{
+        ClaudeSource, DirectToken, FileStat, IndexedSession, OpencodeSource, SessionSource,
+    };
     use std::time::Duration;
 
     pub(super) fn temp_claude_home(tag: &str) -> std::path::PathBuf {
@@ -751,19 +864,22 @@ mod tests {
         })
     }
 
-    /// G28 (warm path): an index-Absent claude session whose raw-file
-    /// recheck cannot READ the store is `Unknown` -- reconcile's bounded
-    /// deferral -- never a finalized `Absent` that can derive dead_session.
+    /// G28 (warm path, kata vnpc Task 4): an index-Absent claude session
+    /// whose raw-file recheck cannot READ the store is `Unreadable` — the
+    /// honest error{session_store_unreadable} verdict (post-readiness, an
+    /// unreadable store is NOT warming) — never a finalized `Absent` that
+    /// can derive dead_session. Pre-change this answered `Unknown`.
     #[tokio::test]
-    async fn warm_absent_with_an_unreadable_store_is_unknown_not_absent() {
+    async fn warm_unreadable_claude_store_answers_unreadable_not_absent() {
         let home = temp_claude_home("warm-unreadable");
         let (probe, index) = probe_over(&home);
         let probe = probe.with_claude_transcript_locator(unreadable_locator());
         index.warm().await;
         assert_eq!(
             probe.exists("claude", "6f708192-a3b4-4cc5-8d6e-7f8091021323"),
-            SessionExistence::Unknown,
-            "cannot check the transcript store => cannot adjudicate absence"
+            SessionExistence::Unreadable,
+            "cannot check the transcript store => the honest unreadable-store error, \
+             never absence and never a lying warming label"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -971,6 +1087,315 @@ mod tests {
         let home = temp_claude_home("root-cold");
         let (probe, _index) = probe_over(&home);
         assert_eq!(probe.exists("claude", "s-cold"), SessionExistence::Unknown);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── Kata vnpc Task 4: cold by-id locators + scan-failure honesty ──────
+
+    /// AD-4 stands: codex has NO cold locator — the ~1s sync rollout walk
+    /// remains too expensive for the per-pane sync derive path. With the
+    /// readiness-driven recovery (kata vnpc) codex panes park briefly as
+    /// error{index_warming} and resume automatically when the first sweep
+    /// publishes; `Unknown` is the honest cold label.
+    #[test]
+    fn codex_stays_unknown_when_cold_ad4_stands() {
+        let index_home = temp_claude_home("cold-codex-ad4");
+        let codex_root = index_home.join("codex-sessions");
+        std::fs::create_dir_all(&codex_root).expect("mkdir codex root");
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(index_home.clone())) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        let probe = IndexExistenceProbe::new(
+            index,
+            None,
+            HashMap::from([("codex".to_string(), codex_root)]),
+        );
+        // A chained gate locator proves the cold path never consults it.
+        let probe = probe.with_codex_rollout_locator(Arc::new(|_sid: &str| ByIdAnswer::Present));
+        assert_eq!(
+            probe.exists("codex", "thread-cold"),
+            SessionExistence::Unknown,
+            "cold codex stays Unknown — no cold codex locator was added (AD-4)"
+        );
+        let _ = std::fs::remove_dir_all(&index_home);
+    }
+
+    /// Cold index + the opencode by-id locator: a seeded `opencode.db` row
+    /// resolves Present WITHOUT waiting for the broad scan (the same G28
+    /// precedent as the claude cold transcript check); a missing row is
+    /// positive Absent. Plain #[test] (no tokio runtime) so kick_refresh
+    /// no-ops and the index deterministically stays cold.
+    #[test]
+    fn cold_opencode_resolves_by_id_without_waiting_for_the_scan() {
+        // (a) seeded row => Present.
+        let home = temp_opencode_data_home("cold-by-id-present");
+        seed_opencode_db(
+            &home,
+            &[("ses_root0000000000000000000000", Some("/tmp/p"), None, None)],
+        );
+        let (probe, _index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        assert_eq!(
+            probe.exists("opencode", "ses_root0000000000000000000000"),
+            SessionExistence::Present,
+            "cold index + seeded DB row => Present via the cheap by-id locator"
+        );
+        assert!(
+            probe.ever_observed("opencode", "ses_root0000000000000000000000"),
+            "a cold by-id hit is an on-disk observation and must feed ever_observed"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+
+        // (b) missing row in a readable DB => positive Absent.
+        let home = temp_opencode_data_home("cold-by-id-absent");
+        seed_opencode_db(
+            &home,
+            &[(
+                "ses_other0000000000000000000000",
+                Some("/tmp/p"),
+                None,
+                None,
+            )],
+        );
+        let (probe, _index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        assert_eq!(
+            probe.exists("opencode", "ses_missing0000000000000000000"),
+            SessionExistence::Absent,
+            "cold index + readable DB without the row => positive Absent"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Cold index + the opencode by-id locator hitting an UNREADABLE store
+    /// stays `Unknown` — pre-readiness uncertainty is warming (the scan may
+    /// still speak), NEVER `Unreadable` (the post-readiness honest error).
+    /// Root-proof unreadable seeding (ledger C4a): a DIRECTORY at the
+    /// `opencode.db` path — SQLite's `Connection::open` fails on a directory
+    /// for ANY euid. (Do NOT seed a directory at a claude transcript path:
+    /// the claude locator is metadata-based and a directory is a clean MISS
+    /// => Absent — ledger C4b, a different verdict path, never Unreadable.)
+    #[test]
+    fn cold_unreadable_locator_stays_unknown_warming_is_honest_pre_readiness() {
+        let good = temp_opencode_data_home("cold-unreadable-good");
+        seed_opencode_db(
+            &good,
+            &[("ses_root0000000000000000000000", Some("/tmp/p"), None, None)],
+        );
+        let broken = temp_opencode_data_home("cold-unreadable-broken");
+        std::fs::create_dir_all(broken.join("opencode.db")).expect("mkdir dir-as-db");
+        let (probe, _index) = opencode_probe_over(&good);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(broken.clone()));
+        assert_eq!(
+            probe.exists("opencode", "ses_child000000000000000000000"),
+            SessionExistence::Unknown,
+            "cold + unreadable store => warming is the honest label pre-readiness"
+        );
+        let _ = std::fs::remove_dir_all(&good);
+        let _ = std::fs::remove_dir_all(&broken);
+    }
+
+    /// Cold index + the antigravity canonical-transcript locator: a
+    /// conversation on disk resolves Present, a missing one is positive
+    /// Absent, and an unreadable path stays `Unknown` while cold (warming
+    /// is the honest pre-readiness label). The unreadable seeding is
+    /// root-proof: `.system_generated` as a regular FILE makes the
+    /// transcript path fail with ENOTDIR (not NotFound) for ANY euid.
+    #[test]
+    fn cold_antigravity_resolves_by_transcript_path_without_waiting_for_the_scan() {
+        let home = temp_claude_home("cold-agy-locator");
+        let agy_home = home.join("antigravity-home");
+        let conv = "33333333-4444-5555-6666-777777777777";
+        let logs = agy_home
+            .join("brain")
+            .join(conv)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir antigravity brain");
+        std::fs::write(logs.join("transcript.jsonl"), "{\"v\":1}\n").expect("write transcript");
+
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(home.clone())) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        let probe = IndexExistenceProbe::new(
+            index,
+            None,
+            HashMap::from([("antigravity".to_string(), agy_home.clone())]),
+        )
+        .with_antigravity_transcript_locator(antigravity_transcript_locator(agy_home.clone()));
+
+        assert_eq!(
+            probe.exists("antigravity", conv),
+            SessionExistence::Present,
+            "cold index + canonical transcript on disk => Present via the cheap by-id locator"
+        );
+        assert!(
+            probe.ever_observed("antigravity", conv),
+            "a cold by-id hit is an on-disk observation and must feed ever_observed"
+        );
+        assert_eq!(
+            probe.exists("antigravity", "00000000-1111-2222-3333-444444444444"),
+            SessionExistence::Absent,
+            "cold index + readable store without the conversation => positive Absent"
+        );
+
+        // Unreadable: `.system_generated` as a FILE — the canonical path
+        // beneath it fails with ENOTDIR (never NotFound) for any euid.
+        let unreadable_home = home.join("antigravity-unreadable");
+        std::fs::create_dir_all(unreadable_home.join("brain").join(conv))
+            .expect("mkdir brain conversation");
+        std::fs::write(
+            unreadable_home
+                .join("brain")
+                .join(conv)
+                .join(".system_generated"),
+            "not a directory",
+        )
+        .expect("seed ENOTDIR component");
+        let probe_unreadable = IndexExistenceProbe::new(
+            Arc::new(SessionIndex::with_ttl_and_cache_path(
+                vec![Arc::new(ClaudeSource::new(home.clone())) as Arc<dyn SessionSource>],
+                Duration::from_millis(50),
+                None,
+            )),
+            None,
+            HashMap::from([("antigravity".to_string(), unreadable_home.clone())]),
+        )
+        .with_antigravity_transcript_locator(antigravity_transcript_locator(
+            unreadable_home.clone(),
+        ));
+        assert_eq!(
+            probe_unreadable.exists("antigravity", conv),
+            SessionExistence::Unknown,
+            "cold + unreadable transcript path => warming is the honest label pre-readiness"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Round-1 finding 3 + round-2 finding 4 (scan-failure honesty): the
+    /// sweep publishes with `scan_failures` naming codex and no codex rows;
+    /// a codex session warm-miss must answer `Unreadable`
+    /// (→ error{session_store_unreadable}), NEVER the snapshot-only Absent
+    /// that would fold dead_session/fresh for a recoverable identity. The
+    /// rows AND the failures come from ONE `peek_with_failures()` read
+    /// (same generation). A provider NOT named in this generation's
+    /// failures keeps the honest warm-miss Absent (provider-scoped).
+    #[tokio::test]
+    async fn warm_codex_miss_with_a_failed_codex_scan_answers_unreadable_never_absent() {
+        struct FailingCodexSource(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl SessionSource for FailingCodexSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn parse(&self, _p: &std::path::Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("codex")
+            }
+            fn direct_change_token(&self) -> Option<DirectToken> {
+                Some(DirectToken {
+                    mtime_ns: 42,
+                    size: 0,
+                })
+            }
+            fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("codex root: permission denied".to_string())
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn direct_health_check(&self) -> Result<(), String> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("codex root: permission denied".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let home = temp_claude_home("codex-scan-failure");
+        let codex_root = home.join("codex-sessions");
+        std::fs::create_dir_all(&codex_root).expect("mkdir codex root");
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(FailingCodexSource(std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            ))) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        let probe = IndexExistenceProbe::new(
+            Arc::clone(&index),
+            None,
+            HashMap::from([
+                ("claude".to_string(), home.clone()),
+                ("codex".to_string(), codex_root),
+            ]),
+        );
+        // The sweep publishes the failed generation: empty items +
+        // scan_failures ["codex"].
+        index.warm().await;
+        assert_eq!(
+            probe.exists("codex", "thread-recoverable"),
+            SessionExistence::Unreadable,
+            "a warm miss for a provider whose scan failed in THIS generation \
+             is the honest unreadable-store error — never the Absent that \
+             would fold dead_session/fresh for a recoverable identity"
+        );
+        // Provider-scoped: claude is not named in this generation's
+        // failures, so a claude warm-miss keeps the honest Absent.
+        assert_eq!(
+            probe.exists("claude", "no-such-session"),
+            SessionExistence::Absent,
+            "a provider whose scan succeeded keeps positive-absence semantics"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Round-3 finding 5 (root-check hoist): the provider-root presence
+    /// check holds on the WARM path — a published snapshot with no rows for
+    /// a provider whose root is gone answers ProviderUnavailable, never the
+    /// Absent that would fold dead_session/fresh for an uninstalled
+    /// provider's recoverable identity.
+    #[tokio::test]
+    async fn warm_index_with_a_missing_provider_root_answers_provider_unavailable_never_absent() {
+        let home = temp_claude_home("warm-missing-root");
+        let session_id = "8a9b0c1d-2e3f-4a5b-8c9d-0e1f2a3b4c5d";
+        write_session(&home, session_id);
+        let gone_codex_root = home.join("codex-root-never-created");
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(home.clone())) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        let probe = IndexExistenceProbe::new(
+            Arc::clone(&index),
+            None,
+            HashMap::from([
+                ("claude".to_string(), home.clone()),
+                ("codex".to_string(), gone_codex_root),
+            ]),
+        );
+        index.warm().await;
+        // Control: the provider whose root exists still answers from the
+        // warm snapshot.
+        assert_eq!(
+            probe.exists("claude", session_id),
+            SessionExistence::Present
+        );
+        // The hoist: a WARM miss for a provider whose root is gone is the
+        // immediate, honest ProviderUnavailable — never Absent.
+        assert_eq!(
+            probe.exists("codex", "thread-any"),
+            SessionExistence::ProviderUnavailable,
+            "a warm published snapshot must not adjudicate Absent for a \
+             provider that can never warm up on this machine"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1344,15 +1769,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// LOAD-BEARING: an unreadable DB (here: a DIRECTORY where the file
-    /// should be — the corruption/io-error class) answers Unknown, NEVER
-    /// Absent. Absent-on-error would recreate the dead-session bug under
-    /// WAL lock contention. Reconcile turns Unknown into
-    /// error{index_warming} + its single bounded deferral, then re-derives.
-    /// The index is warmed over a separate GOOD home so the warm-snapshot
-    /// arm (where the fallback lives) is actually exercised.
+    /// LOAD-BEARING (kata vnpc Task 4 flip): an unreadable DB (here: a
+    /// DIRECTORY where the file should be — the corruption/io-error class)
+    /// answers `Unreadable` on the WARM path, NEVER `Absent`.
+    /// Absent-on-error would recreate the dead-session bug under WAL lock
+    /// contention; `Unknown` was the pre-change answer and is now reserved
+    /// for the honest pre-readiness (cold) label. Reconcile turns
+    /// `Unreadable` into error{session_store_unreadable} — identity
+    /// preserved for a later retry. The index is warmed over a separate
+    /// GOOD home so the warm-snapshot arm (where the fallback lives) is
+    /// actually exercised.
     #[tokio::test]
-    async fn unreadable_opencode_db_answers_unknown_never_absent() {
+    async fn unreadable_opencode_db_answers_unreadable_never_absent() {
         let good = temp_opencode_data_home("unreadable-good");
         seed_opencode_db(
             &good,
@@ -1365,9 +1793,9 @@ mod tests {
         index.warm().await;
         assert_eq!(
             probe.exists("opencode", "ses_child000000000000000000000"),
-            SessionExistence::Unknown,
-            "read failure is honest ignorance — reconcile defers and retries; \
-             it must never become a false Absent"
+            SessionExistence::Unreadable,
+            "read failure is the honest unreadable-store error — it must never \
+             become a false Absent and never the cold-only warming label"
         );
         let _ = std::fs::remove_dir_all(&good);
         let _ = std::fs::remove_dir_all(&broken);
@@ -1574,14 +2002,14 @@ mod tests {
         )
         .with_opencode_session_locator(opencode_db_locator(data_home.clone()));
 
-        // Cold-index path stays honest Unknown — the fallback lives ONLY in
-        // the warm-snapshot arm and must never manufacture answers before
-        // the index publishes.
+        // Cold-index path resolves by id (kata vnpc Task 4): the seeded
+        // child row is provable in opencode.db without waiting for the
+        // broad scan — a cheap, fresh, targeted read (the G28 cold-locator
+        // precedent), never a guessed Absent and never a stalled Unknown.
         assert_eq!(
             probe.exists("opencode", CHILD),
-            SessionExistence::Unknown,
-            "cold index answers Unknown, never a guessed Absent or a \
-             fallback-manufactured Present"
+            SessionExistence::Present,
+            "cold index + seeded DB row => Present via the cheap by-id locator"
         );
 
         index.warm().await;

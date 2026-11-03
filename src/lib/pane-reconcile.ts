@@ -40,8 +40,11 @@ import { clearSessionLost } from '@/store/freshAgentSlice'
 import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import {
   DEAD_SESSION_RECONCILE_NOTICES,
+  SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
   deadSessionReconcileNoticeFor,
   isDeadSessionReconcileNotice,
+  isDurableRestoreNoticeMint,
+  isSessionStoreUnreadableReconcileNotice,
 } from '@/lib/dead-session-notice'
 
 // The dead-copy mint vocabulary lives in its own leaf module
@@ -51,8 +54,11 @@ import {
 // mint vocabulary from the reconcile fold's module.
 export {
   DEAD_SESSION_RECONCILE_NOTICES,
+  SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
   deadSessionReconcileNoticeFor,
   isDeadSessionReconcileNotice,
+  isDurableRestoreNoticeMint,
+  isSessionStoreUnreadableReconcileNotice,
 }
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
@@ -318,13 +324,17 @@ function paneRefFromOwnKey(paneKey: string): { tabId: string; paneId: string } {
  * reconcileNotice as a transient status); invalid → restoreError + notice;
  * error → warming batch or restoreError. Returns true iff the verdict was
  * folded.
+ *
+ * Every dispatch carries `expectedCreateRequestId` (the REQUEST-observed
+ * identity) so a stale verdict folds NOTHING onto replaced pane content
+ * (auto-restore-warming round-2 finding 2).
  */
 function foldFreshAgentVerdict(
   dispatch: AppDispatch,
   pane: ReconcilePane,
   verdict: PaneReconcileResultMessage['verdicts'][number],
   result: PaneReconcileResultMessage,
-  warmingRefs: Array<{ tabId: string; paneId: string }>,
+  warmingRefs: Array<{ tabId: string; paneId: string; createRequestId: string }>,
   outcome: FoldOutcome,
   getOwnerDivergence?: (pane: ReconcilePane) => PaneOwnerDivergence | null,
 ): boolean {
@@ -342,6 +352,7 @@ function foldFreshAgentVerdict(
         serverInstanceId: result.serverInstanceId,
         corrected: verdict.corrected,
         duplicate: verdict.duplicate ? true : undefined,
+        expectedCreateRequestId: pane.createRequestId,
       }))
       // Server said Live: the verdict itself is positive existence evidence —
       // revoke a stale `lost` flag left by a transient dead-window race, or the
@@ -378,6 +389,7 @@ function foldFreshAgentVerdict(
         ...(verdict.verdict === 'respawn'
           ? { sessionRef: verdict.sessionRef, corrected: verdict.corrected }
           : { reason: verdict.reason }),
+        expectedCreateRequestId: pane.createRequestId,
       }))
       if (verdict.verdict === 'respawn') outcome.respawned++
       else outcome.fresh++
@@ -388,6 +400,7 @@ function foldFreshAgentVerdict(
         tabId,
         paneId,
         restoreError: buildRestoreError('durable_artifact_missing'),
+        expectedCreateRequestId: pane.createRequestId,
       }))
       return true
     }
@@ -396,12 +409,14 @@ function foldFreshAgentVerdict(
         tabId,
         paneId,
         restoreError: buildRestoreError('missing_canonical_identity'),
+        expectedCreateRequestId: pane.createRequestId,
       }))
       if (verdict.reason) {
         dispatch(setPaneReconcileNotice({
           tabId,
           paneId,
           notice: `Reconcile rejected this pane (${verdict.reason}).`,
+          expectedCreateRequestId: pane.createRequestId,
         }))
       }
       outcome.invalid++
@@ -411,13 +426,26 @@ function foldFreshAgentVerdict(
       // Fresh-agent verdicts never emit 'error' today, but the fold must
       // not crash if one arrives — identical handling to the terminal arm.
       if (verdict.reason === 'index_warming') {
-        warmingRefs.push({ tabId, paneId })
+        warmingRefs.push({ tabId, paneId, createRequestId: pane.createRequestId })
         outcome.warming++
+      } else if (verdict.reason === 'session_store_unreadable') {
+        // Honest unreadable-store verdict (auto-restore-warming): the index
+        // PUBLISHED but this identity's store could not be read. NOT
+        // warming (post-readiness warming would be a lying label) — a
+        // per-pane error that preserves the session identity for a later
+        // reconnect-driven retry. Same discipline as the terminal arm.
+        dispatch(setPaneRestoreError({
+          tabId,
+          paneId,
+          restoreError: buildRestoreError('session_store_unreadable'),
+          expectedCreateRequestId: pane.createRequestId,
+        }))
       } else {
         dispatch(setPaneRestoreError({
           tabId,
           paneId,
           restoreError: buildRestoreError('provider_runtime_failed'),
+          expectedCreateRequestId: pane.createRequestId,
         }))
       }
       return true
@@ -443,6 +471,14 @@ const MANAGED_DEFERRED_REASONS = new Set([
  * Cardinality invariant comes FIRST: verdicts must match the request's
  * panes 1:1 in order. On violation NOTHING is dispatched — the caller
  * sees `cardinalityViolation: true` and falls back to the legacy census.
+ *
+ * Stale-verdict identity guards (auto-restore-warming round-2 finding 2):
+ * EVERY dispatch carries the pane's createRequestId as observed by the
+ * REQUEST (`expectedCreateRequestId`), and the reducers no-op when the
+ * pane's CURRENT content was re-keyed since (Replace pane keeps the paneId
+ * but mints new content) — a response can only clear/warm a pane whose
+ * createRequestId matches, so a delayed verdict can never fold onto (or
+ * latch an error onto) rebound content and block its restoration.
  *
  * Each verdict routes by `request.panes[i].kind` (terminal vs fresh-agent).
  * The optional `onVerdictFolded` hook fires once per successfully-folded
@@ -487,7 +523,7 @@ export function foldVerdicts(
     }
   }
 
-  const warmingRefs: Array<{ tabId: string; paneId: string }> = []
+  const warmingRefs: Array<{ tabId: string; paneId: string; createRequestId: string }> = []
 
   for (let i = 0; i < request.panes.length; i++) {
     const pane = request.panes[i]
@@ -518,6 +554,7 @@ export function foldVerdicts(
           sessionRef: verdict.sessionRef,
           corrected: verdict.corrected,
           duplicate: verdict.duplicate ? true : undefined,
+          expectedCreateRequestId: pane.createRequestId,
         }))
         outcome.attached++
         break
@@ -529,6 +566,7 @@ export function foldVerdicts(
           intent: 'respawn',
           sessionRef: verdict.sessionRef,
           corrected: verdict.corrected,
+          expectedCreateRequestId: pane.createRequestId,
         }))
         outcome.respawned++
         break
@@ -539,6 +577,7 @@ export function foldVerdicts(
           paneId,
           intent: 'fresh',
           reason: verdict.reason,
+          expectedCreateRequestId: pane.createRequestId,
         }))
         outcome.fresh++
         break
@@ -583,6 +622,7 @@ export function foldVerdicts(
           tabId,
           paneId,
           restoreError: buildRestoreError('missing_canonical_identity'),
+          expectedCreateRequestId: pane.createRequestId,
         }))
         if (verdict.reason) {
           // RestoreError's reason enum can't carry the server's machine
@@ -591,6 +631,7 @@ export function foldVerdicts(
             tabId,
             paneId,
             notice: `Reconcile rejected this pane (${verdict.reason}).`,
+            expectedCreateRequestId: pane.createRequestId,
           }))
         }
         outcome.invalid++
@@ -598,7 +639,7 @@ export function foldVerdicts(
       }
       case 'error': {
         if (verdict.reason === 'index_warming') {
-          warmingRefs.push({ tabId, paneId })
+          warmingRefs.push({ tabId, paneId, createRequestId: pane.createRequestId })
           outcome.warming++
         } else if (MANAGED_DEFERRED_REASONS.has(verdict.reason ?? '')) {
           // The server withheld a legacy adjudication because managed runtime
@@ -606,6 +647,34 @@ export function foldVerdicts(
           // the pane exactly as it is; `managed-runtime-recovery` reconciles
           // it from the supervisor inventory.
           outcome.managedDeferred++
+        } else if (verdict.reason === 'session_store_unreadable') {
+          // Honest unreadable-store verdict (auto-restore-warming): the
+          // index PUBLISHED but this identity's store could not be read.
+          // NOT warming (post-readiness warming would be a lying label) — a
+          // per-pane error that preserves the session identity for a later
+          // reconnect-driven retry.
+          dispatch(setPaneRestoreError({
+            tabId,
+            paneId,
+            restoreError: buildRestoreError('session_store_unreadable'),
+            expectedCreateRequestId: pane.createRequestId,
+          }))
+          // Delta fix finding 1: mint the VISIBLE explanation beside the
+          // latch — the dead-copy pattern. Without it a TERMINAL pane
+          // latched unreadable is a silently dead pane (nothing renders
+          // this reason in TerminalView; the warming banner has already
+          // cleared). The mint is the durable copy source for
+          // TerminalView's notice-line machinery: ONE in-buffer line,
+          // written with no user interaction, cleared with the latch by
+          // the recovery folds. The fresh-agent arm above does NOT mint
+          // (FreshAgentView renders this reason through
+          // getRestoreErrorMessage).
+          dispatch(setPaneReconcileNotice({
+            tabId,
+            paneId,
+            notice: SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
+            expectedCreateRequestId: pane.createRequestId,
+          }))
         } else {
           // provider_unavailable and any other terminal error reason:
           // per-pane restoreError via the provider-failure rendering path.
@@ -613,6 +682,7 @@ export function foldVerdicts(
             tabId,
             paneId,
             restoreError: buildRestoreError('provider_runtime_failed'),
+            expectedCreateRequestId: pane.createRequestId,
           }))
         }
         break
@@ -622,7 +692,11 @@ export function foldVerdicts(
     if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
   }
 
-  // Council rule 5: warming verdicts aggregate into ONE dispatch.
+  // Council rule 5: warming verdicts aggregate into ONE dispatch. The refs
+  // are minted IDENTITY-BOUND (auto-restore-warming round-2 finding 3):
+  // each carries the PARKED pane's createRequestId from the request pane
+  // claims, so the recovery driver never transfers a replaced pane's
+  // pending recovery onto its replacement.
   if (warmingRefs.length > 0) {
     dispatch(setReconcileWarming({ count: warmingRefs.length, paneRefs: warmingRefs }))
   }

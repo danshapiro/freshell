@@ -297,7 +297,7 @@ async fn adopt_managed_for_reconcile_binds_naming() {
         }))
         .expect("reconcile request");
 
-    assert!(super::handle_pane_reconcile(request, &mut ws_tx, &state, false, true).await);
+    assert!(super::handle_pane_reconcile(request, &mut ws_tx, &state, false, true, 1).await);
 
     assert!(state.registry.is_managed("T-reconciled"));
     assert_bound_to(

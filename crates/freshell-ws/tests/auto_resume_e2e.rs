@@ -493,6 +493,7 @@ async fn spawn_server_with_hub_and_ownership(
     let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),

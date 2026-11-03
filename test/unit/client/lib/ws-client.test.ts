@@ -99,6 +99,7 @@ describe('WsClient.connect', () => {
       pacedTerminalReplayV1: true,
       terminalLifetimeClaimV1: true,
       managedRuntimeV1: true,
+      sessionIndexReadyV1: true,
     })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
