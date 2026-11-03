@@ -18,6 +18,7 @@ const managed = [
   "test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts",
   "test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts",
   "test/integration/server/managed-provider-parity.test.ts",
+  "test/helpers/supervisor-crash-diagnostics.ts",
   "test/integration/server/fresh-agent-parity.test.ts"
 ]
 const runtime = [
