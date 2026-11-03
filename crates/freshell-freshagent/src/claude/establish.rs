@@ -87,7 +87,7 @@ pub(super) struct GenesisBinding<'a> {
     /// Whose it is (a fork's forking connection); `None` inherits.
     pub(super) provenance: Option<crate::BindProvenance>,
     /// The launch's coordinator claim: the write is fenced with its pair.
-    pub(super) ticket: &'a Option<freshell_ownership::OperationTicket>,
+    pub(super) ticket: &'a mut Option<freshell_ownership::OperationTicket>,
 }
 
 /// What a launch that boots a durable session from its recorded state needs
@@ -119,6 +119,9 @@ pub(super) struct EstablishPlan<'a> {
     /// session runs with them, or with the defaults.
     pub(super) recorded_settings: Option<crate::identity_sink::FreshAgentSettings>,
     pub(super) owning_generation: Option<u64>,
+    /// The handoff runner's immutable claim when this launch runs under its
+    /// ticket instead of a lane-owned Starting ticket.
+    pub(super) binding_claim: Option<crate::identity_sink::BindingClaim>,
     pub(super) provenance: Option<crate::BindProvenance>,
     /// A create's request: its pending naming handle is admitted under the
     /// minted id once the sidecar answered.
@@ -353,23 +356,40 @@ impl FreshClaudeState {
         let Some(sink) = self.identity_sink() else {
             return Ok(());
         };
-        let fenced = binding.ticket.as_ref().map(|ticket| ticket.generation());
-        sink.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-            genesis: crate::identity_sink::GenesisUpdate::Set(binding.genesis.clone()),
-            provider: PROVIDER.into(),
-            session_id: binding.session_id.to_string(),
-            mode: binding.session_type.to_string(),
-            create_request_id: None,
-            resolves_pending: None,
-            supersedes: binding.supersedes.map(str::to_string),
-            name_transition: None,
-            provenance: binding.provenance.into(),
-            observed_epoch: fenced.and(self.ownership.as_ref().map(|r| r.boot_epoch())),
-            observed_generation: fenced,
-            authoritative: false,
-            settings: binding.settings.clone(),
-        })
-        .await
+        let claim = binding.ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut guard = crate::identity_sink::BindingWriteGuard::new(
+            binding.ticket.take(),
+            claim.clone(),
+            Some(sink.clone()),
+        );
+        let result = sink
+            .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Set(binding.genesis.clone()),
+                provider: PROVIDER.into(),
+                session_id: binding.session_id.to_string(),
+                mode: binding.session_type.to_string(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: binding.supersedes.map(str::to_string),
+                name_transition: None,
+                provenance: binding.provenance.into(),
+                observed_epoch: claim.as_ref().map(|claim| claim.epoch),
+                observed_generation: claim.as_ref().map(|claim| claim.generation),
+                claim: claim.clone(),
+                settings: crate::identity_sink::SettingsUpdate::Replace(binding.settings.clone()),
+            })
+            .await;
+        if result.is_err() && !guard.repair_now().await {
+            drop(guard);
+        } else {
+            *binding.ticket = guard.finish();
+        }
+        result
     }
 
     /// The transcript store this lane's sidecars write: the roots their CLI
@@ -583,6 +603,7 @@ impl FreshClaudeState {
             claim,
             recorded_settings,
             owning_generation,
+            binding_claim,
             provenance,
             naming,
             partial_runtime_key,
@@ -788,14 +809,39 @@ impl FreshClaudeState {
         // A created session is already a durable identity, including before
         // its first prompt. Write lineage/genesis while the ownership claim
         // still fences the registration, before Live or the acknowledgement.
-        if naming.is_some() || lane == EstablishLane::AttachResume {
+        let mut binding_write_guard: Option<crate::identity_sink::BindingWriteGuard>;
+        {
+            let settings_update = match (lane, recorded_settings) {
+                (EstablishLane::AttachResume, None) => crate::identity_sink::SettingsUpdate::Keep,
+                (_, Some(settings)) => crate::identity_sink::SettingsUpdate::Replace(settings),
+                (_, None) => crate::identity_sink::SettingsUpdate::Keep,
+            };
+            let write_claim = own_ticket
+                .as_ref()
+                .and_then(|ticket| {
+                    crate::identity_sink::BindingClaim::from_ticket(
+                        ticket,
+                        crate::identity_sink::BindingClaimKind::Starting,
+                    )
+                })
+                .or_else(|| binding_claim.clone());
+            binding_write_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+                own_ticket.take(),
+                write_claim.clone(),
+                self.identity_sink(),
+            ));
             if let Err(error) = self
                 .record_established_binding(
                     &map_key,
                     &spec.session_type,
                     naming.map(|create| create.request_id.as_str()),
                     provenance.as_ref(),
-                    own_ticket,
+                    binding_write_guard
+                        .as_ref()
+                        .expect("binding write guard is present")
+                        .ticket_ref(),
+                    binding_claim.as_ref(),
+                    settings_update,
                 )
                 .await
             {
@@ -810,6 +856,16 @@ impl FreshClaudeState {
                 if let Some(claim) = claim.as_ref().filter(|claim| claim.dead_state.is_some()) {
                     self.rollback_session_claim(&claim.durable).await;
                 }
+                let repaired = binding_write_guard
+                    .as_mut()
+                    .expect("binding write guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
+                } else {
+                    drop(binding_write_guard.take());
+                }
                 return Err(EstablishError::Binding(error.to_string()));
             }
             if let Some(claim) = claim.as_ref() {
@@ -821,6 +877,16 @@ impl FreshClaudeState {
 
                     if let Some(mut guard) = lease_guard.take() {
                         guard.fail();
+                    }
+                    let repaired = binding_write_guard
+                        .as_mut()
+                        .expect("binding write guard is present")
+                        .repair_now()
+                        .await;
+                    if repaired {
+                        *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
+                    } else {
+                        drop(binding_write_guard.take());
                     }
                     return Err(EstablishError::ClosedInFlight);
                 }
@@ -854,6 +920,16 @@ impl FreshClaudeState {
                     // Finding 1: demote, never drop.
                 }
                 guard.fail(); // own tree torn down: reopen the key
+                let repaired = binding_write_guard
+                    .as_mut()
+                    .expect("binding write guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
+                } else {
+                    drop(binding_write_guard.take());
+                }
                 return Err(EstablishError::LeaseRevoked);
             }
         }
@@ -861,7 +937,14 @@ impl FreshClaudeState {
         // Registration survived every teardown gate. Resumed targets now
         // commit their lane claim; fresh creates committed before their ACK.
         if claim.is_some() {
-            if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &map_key, sidecar_pid) {
+            if let Err(outcome) = self.commit_lane_claim_at(
+                binding_write_guard
+                    .as_mut()
+                    .expect("binding write guard is present")
+                    .ticket_mut(),
+                &map_key,
+                sidecar_pid,
+            ) {
                 let event = match lane {
                     EstablishLane::Create => "freshagent.claude.create_commit_stale",
                     EstablishLane::AttachResume | EstablishLane::Rollback | EstablishLane::Fork => {
@@ -878,10 +961,21 @@ impl FreshClaudeState {
                     let _teardown: LoggedTeardown =
                         self.teardown_removed_session_logged(session).await;
                 }
+                let repaired = binding_write_guard
+                    .as_mut()
+                    .expect("binding write guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
+                } else {
+                    drop(binding_write_guard.take());
+                }
 
                 return Err(EstablishError::OwnershipChanged);
             }
         }
+        *own_ticket = binding_write_guard.take().and_then(|guard| guard.finish());
 
         Ok(Established {
             ownership_id,

@@ -4,9 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import freshAgentReducer from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
-import connectionReducer from '@/store/connectionSlice'
+import connectionReducer, { setBootId, setStatus } from '@/store/connectionSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
 import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
@@ -148,6 +148,10 @@ function attachFramesSent() {
 }
 
 function fireReconnect() {
+  act(() => {
+    currentStore.dispatch(setStatus('disconnected'))
+    currentStore.dispatch(setStatus('ready'))
+  })
   // Every registered onReconnect callback, newest-first registration order.
   for (const call of wsMock.onReconnect.mock.calls) {
     act(() => { call[0]() })
@@ -222,14 +226,14 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     vi.useRealTimers()
   })
 
-  it('a HIDDEN pane with a sessionId subscribes to reconnect and re-attaches', () => {
+  it('a HIDDEN pane with a sessionId subscribes to reconnect and re-attaches', async () => {
     const paneContent = { ...basePaneContent, sessionId: SESS_1, status: 'idle' as const }
     renderView({ paneContent, hidden: true })
     // Rebind subscription must exist even while hidden:
     expect(wsMock.onReconnect).toHaveBeenCalled()
     wsMock.send.mockClear()
     fireReconnect()
-    act(() => { vi.advanceTimersByTime(500) }) // drain the rebind queue spacing
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) }) // flush ready microtask and queue spacing
     const attaches = attachFramesSent()
     expect(attaches.length).toBeGreaterThanOrEqual(1)
     expect(attaches[0]).toMatchObject({ type: 'freshAgent.attach', sessionId: SESS_1 })
@@ -240,6 +244,42 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     renderView({ paneContent, hidden: true })
     act(() => { vi.advanceTimersByTime(500) })
     expect(attachFramesSent().length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('duplicate unowned ready producers preserve the queued hidden attach', async () => {
+    renderView({ paneContent: { ...basePaneContent, sessionId: SESS_1, status: 'idle' }, hidden: true })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    wsMock.send.mockClear()
+
+    await act(async () => {
+      currentStore.dispatch(setStatus('disconnected'))
+      currentStore.dispatch(setStatus('ready'))
+      currentStore.dispatch(setBootId('queued-new-boot'))
+    })
+    for (const [handler] of wsMock.onReconnect.mock.calls) act(() => handler())
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(attachFramesSent()).toHaveLength(1)
+  })
+
+  it('a new authoritative fence survives an older queued hidden bootstrap', async () => {
+    renderView({ paneContent: { ...basePaneContent, sessionId: SESS_1, status: 'idle' }, hidden: true })
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    wsMock.send.mockClear()
+    act(() => {
+      currentStore.dispatch(setStatus('disconnected'))
+      currentStore.dispatch(setStatus('ready'))
+      currentStore.dispatch(setBootId('queued-owner-boot'))
+    })
+    const owner = {
+      type: 'session.runtimeOwner' as const, provider: 'claude', sessionId: SESS_1,
+      epoch: 2, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'peer-start',
+    }
+    act(() => currentStore.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-started' })))
+    act(() => currentStore.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-committed' })))
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(attachFramesSent()).toEqual([expect.objectContaining({
+      sessionId: SESS_1, observedEpoch: 2, observedGeneration: 1,
+    })])
   })
 
   it('reveal after a hidden reconnect performs only surface hydration (no duplicate attach)', () => {

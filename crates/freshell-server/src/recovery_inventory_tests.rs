@@ -124,6 +124,7 @@ fn binding_row_at(
         pane_kind: None,
         owner_epoch: None,
         owner_generation: None,
+        owner_operation_id: None,
         model: None,
         sandbox: None,
         permission_mode: None,
@@ -200,6 +201,7 @@ fn closes_with(
                     // b8ke focused ep5 r5 F2: every ordinary close keeps the
                     // identity-wide fence (no transition scope).
                     scope: None,
+                    scope_operation_id: None,
                 })
                 .collect(),
         }],
@@ -3138,7 +3140,6 @@ fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
             plugins: None,
         })
         .expect("late landing binding write");
@@ -3204,7 +3205,6 @@ fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_la
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
             plugins: None,
         })
         .expect("late landing binding write");
@@ -3338,7 +3338,6 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
             plugins: None,
         })
         .expect("fork child binding write");

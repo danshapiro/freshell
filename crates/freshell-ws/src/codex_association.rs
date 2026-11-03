@@ -796,7 +796,6 @@ mod tests {
                 observed_epoch: None,
                 observed_generation: None,
 
-                authoritative: false,
                 now_ms: now_ms(),
                 plugins: None,
             })

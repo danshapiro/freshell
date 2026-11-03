@@ -1450,7 +1450,6 @@ mod tests {
                 observed_epoch: None,
                 observed_generation: None,
 
-                authoritative: false,
                 plugins: None,
             })
             .expect("seed fresh-agent ledger row");

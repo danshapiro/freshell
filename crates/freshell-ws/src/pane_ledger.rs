@@ -295,6 +295,10 @@ pub struct PaneCloseKill {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<(u64, u64)>,
+    /// Exact failed operation protected by a scoped repair fence. Legacy
+    /// rows have no id and therefore are not presumed to be its orphan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_operation_id: Option<String>,
 }
 
 /// b8ke focused ep5 r5 F2: does the tombstone's transition scope LEAVE the
@@ -306,9 +310,19 @@ pub struct PaneCloseKill {
 /// under the fence — fail closed, exactly as before.
 fn tombstone_scope_spares_newer(
     scope: Option<(u64, u64)>,
+    scope_operation_id: Option<&str>,
     candidate_pair: Option<(u64, u64)>,
+    candidate_operation_id: Option<&str>,
 ) -> bool {
     match (scope, candidate_pair) {
+        (Some(scope), Some(pair))
+            if pair == scope
+                && scope_operation_id.is_some()
+                && candidate_operation_id.is_some()
+                && candidate_operation_id != scope_operation_id =>
+        {
+            true
+        }
         (Some(scope), Some(pair)) => pair > scope,
         _ => false,
     }
@@ -721,13 +735,29 @@ fn classify_kill_tombstone(
 /// STRONGER scope wins: an identity-wide kill — scope `None` — outranks a
 /// scoped one, and the newer stamp carries its own scope) keeps the
 /// feed/recompute/boot-scan folds consistent.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct KillTombstoneEntry {
     at_ms: i64,
     scope: Option<(u64, u64)>,
+    scope_operation_id: Option<String>,
 }
 
 impl KillTombstoneEntry {
+    /// A failed transition's repair owns only rows stamped by that exact
+    /// operation. In particular, an untagged legacy row is not its orphan.
+    fn covers_row(&self, row: &BindingRow) -> bool {
+        if let Some(operation_id) = self.scope_operation_id.as_deref() {
+            return self.scope == row.owner_epoch.zip(row.owner_generation)
+                && row.owner_operation_id.as_deref() == Some(operation_id);
+        }
+        !tombstone_scope_spares_newer(
+            self.scope,
+            None,
+            row.owner_epoch.zip(row.owner_generation),
+            row.owner_operation_id.as_deref(),
+        )
+    }
+
     /// Fold one kill into the entry: the max stamp wins; on a stamp tie
     /// the IDENTITY-WIDE (unscoped) fence is the stronger claim.
     fn fold(&mut self, kill: &PaneCloseKill) {
@@ -735,10 +765,12 @@ impl KillTombstoneEntry {
             std::cmp::Ordering::Less => {
                 self.at_ms = kill.at_ms;
                 self.scope = kill.scope;
+                self.scope_operation_id = kill.scope_operation_id.clone();
             }
             std::cmp::Ordering::Equal => {
                 if kill.scope.is_none() {
                     self.scope = None;
+                    self.scope_operation_id = None;
                 }
             }
             std::cmp::Ordering::Greater => {}
@@ -757,6 +789,7 @@ fn feed_close_envelope(index: &mut LedgerIndex, key: String, record: CloseEnvelo
             .or_insert(KillTombstoneEntry {
                 at_ms: kill.at_ms,
                 scope: kill.scope,
+                scope_operation_id: kill.scope_operation_id.clone(),
             });
     }
     index.close_envelopes.insert(key, record);
@@ -857,6 +890,11 @@ pub struct BindingRow {
     pub owner_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_generation: Option<u64>,
+    /// Exact transition/runtime owner that established the durable binding.
+    /// A missing value is a legacy or unfenced row and is never presumed to
+    /// belong to a failed transition that happens to share its generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_operation_id: Option<String>,
     /// Resume-invocation record (campaign plan §4.2): exactly what the
     /// provider-native resume command needs. Updated when the user changes
     /// them. All optional under LEDGER_VERSION 1 — no version bump.
@@ -1368,14 +1406,14 @@ pub struct FreshAgentBindingWrite<'a> {
     /// preserved).
     pub observed_epoch: Option<u64>,
     pub observed_generation: Option<u64>,
-    /// b8ke focused ep5 r2 F1: the write is the HANDOFF RUNNER'S OWN
-    /// authoritative target binding (the r27-F2 under-ticket shape — the
-    /// pair is the runner's supplied handoff generation). The
-    /// terminal-row guard accepts an authoritative PAIRED write over an
-    /// UNSTAMPED terminal row (the normal production shape); every
-    /// non-authoritative write keeps the strictly-newer rule.
-    pub authoritative: bool,
     pub now_ms: i64,
+}
+
+#[derive(Clone, Copy)]
+enum LedgerSettingsUpdate<'a> {
+    FromWrite,
+    Keep,
+    Replace(&'a freshell_freshagent::FreshAgentSettings),
 }
 
 /// A chain-terminus lookup result. `corrected == true` means the caller's
@@ -1428,6 +1466,12 @@ struct LedgerIndex {
     /// conditional, and the recovery inventory's verdict joins — never a
     /// liveness signal.
     kill_tombstones: std::collections::HashMap<(String, String), KillTombstoneEntry>,
+    /// Exact operation scopes whose transitions failed. These process-local
+    /// fences prevent an already-validated spawn_blocking closure from mutating
+    /// after cancellation, even after a later claim consumes the durable close;
+    /// they never suppress a different or newer owner. A process restart
+    /// also stops every such in-flight closure.
+    failed_transition_scopes: std::collections::HashSet<FailedTransitionScope>,
     /// The fence keys backed by a LEGACY `kill-tombstones/` file (the
     /// pre-journal shape). Tracked so the record sweep's un-feed only ever
     /// drops fences no other durable source carries, and the fence sweep's
@@ -1452,6 +1496,15 @@ struct LedgerIndex {
     /// swept by the close-record retention rule. Never a liveness answer: a
     /// standing record says THIS PANE / these identities were closed.
     close_envelopes: std::collections::HashMap<String, CloseEnvelopeRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FailedTransitionScope {
+    provider: String,
+    session_id: String,
+    operation_id: String,
+    epoch: u64,
+    generation: u64,
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -2058,11 +2111,13 @@ impl PaneLedger {
                                         session_id: tombstone.session_id.clone(),
                                         at_ms: tombstone.killed_at_ms,
                                         scope: None,
+                                        scope_operation_id: None,
                                     })
                                 })
                                 .or_insert(KillTombstoneEntry {
                                     at_ms: tombstone.killed_at_ms,
                                     scope: None,
+                                    scope_operation_id: None,
                                 });
                         }
                     }
@@ -2294,6 +2349,7 @@ impl PaneLedger {
             // ownership stamp (the delayed-write fence baseline).
             owner_epoch: w.observed_epoch,
             owner_generation: w.observed_generation,
+            owner_operation_id: None,
             model: None,
             sandbox: None,
             permission_mode: None,
@@ -2489,12 +2545,80 @@ impl PaneLedger {
         &self,
         w: &FreshAgentBindingWrite<'_>,
     ) -> std::io::Result<()> {
+        self.record_fresh_agent_binding_inner(w, None, LedgerSettingsUpdate::FromWrite)
+    }
+
+    /// Persist a binding under the server sink's already-validated exact
+    /// owner claim, applying settings as an explicit Keep or Replace policy.
+    /// The older ledger entry point above remains for terminal/fixed-fixture
+    /// callers that supply a full settings snapshot directly.
+    pub fn record_fresh_agent_binding_claimed(
+        &self,
+        w: &FreshAgentBindingWrite<'_>,
+        claim: Option<&freshell_freshagent::BindingClaim>,
+        settings: &freshell_freshagent::SettingsUpdate,
+    ) -> std::io::Result<()> {
+        let settings = match settings {
+            freshell_freshagent::SettingsUpdate::Keep => LedgerSettingsUpdate::Keep,
+            freshell_freshagent::SettingsUpdate::Replace(settings) => {
+                LedgerSettingsUpdate::Replace(settings)
+            }
+        };
+        self.record_fresh_agent_binding_inner(w, claim, settings)
+    }
+
+    fn record_fresh_agent_binding_inner(
+        &self,
+        w: &FreshAgentBindingWrite<'_>,
+        claim: Option<&freshell_freshagent::BindingClaim>,
+        settings_update: LedgerSettingsUpdate<'_>,
+    ) -> std::io::Result<()> {
+        if let Some(claim) = claim {
+            if claim.provider != w.provider || claim.session_id != w.session_id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "BINDING_CLAIM_KEY_MISMATCH: claim for {}/{} cannot authorize {}/{}",
+                        claim.provider, claim.session_id, w.provider, w.session_id
+                    ),
+                ));
+            }
+            if w.observed_epoch.zip(w.observed_generation) != Some((claim.epoch, claim.generation))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "BINDING_CLAIM_PAIR_MISMATCH: observed pair must match the exact claim",
+                ));
+            }
+        }
         let Some(root) = &self.root else {
             return Ok(());
         };
         let mut index = self.guard();
 
         let key = (w.provider.to_string(), w.session_id.to_string());
+        if let Some(claim) = claim {
+            let scope = FailedTransitionScope {
+                provider: claim.provider.clone(),
+                session_id: claim.session_id.clone(),
+                operation_id: claim.operation_id.clone(),
+                epoch: claim.epoch,
+                generation: claim.generation,
+            };
+            if index.failed_transition_scopes.contains(&scope) {
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    operation_id = %claim.operation_id,
+                    epoch = claim.epoch,
+                    generation = claim.generation,
+                    "pane_ledger_failed_transition_fence_suppressed_binding: the exact \
+                     failed operation's late write is suppressed"
+                );
+                return Ok(());
+            }
+        }
         // Focused-ep5-r1 Finding 2 — the kill-tombstone consult (state, not
         // scheduling): under the SAME guard the write below runs on. A
         // DOMINANT or FRESH tombstone for this identity
@@ -2515,7 +2639,7 @@ impl PaneLedger {
         // A CLAIM-RESIDUE tombstone (a committed claim's revive visibly
         // outranks its own crashed clear) is inert: the write proceeds and
         // the residue is pruned.
-        if let Some(tombstone) = index.kill_tombstones.get(&key).copied() {
+        if let Some(tombstone) = index.kill_tombstones.get(&key).cloned() {
             let killed_at = tombstone.at_ms;
             // b8ke focused ep5 r5 F2: the tombstone's TRANSITION SCOPE. A
             // SCOPED tombstone (a failed handoff transition's repair
@@ -2531,7 +2655,11 @@ impl PaneLedger {
             // force-retire corrupted its recovery row as Closed.
             if tombstone_scope_spares_newer(
                 tombstone.scope,
-                w.observed_epoch.zip(w.observed_generation),
+                tombstone.scope_operation_id.as_deref(),
+                claim
+                    .map(|claim| (claim.epoch, claim.generation))
+                    .or(w.observed_epoch.zip(w.observed_generation)),
+                claim.map(|claim| claim.operation_id.as_str()),
             ) {
                 tracing::info!(
                     target: "freshell_ws::pane_ledger",
@@ -2555,9 +2683,14 @@ impl PaneLedger {
                              for an explicitly-closed identity writes nothing (never Bound)"
                         );
                         if let Some(mut remnant) = index.bindings.get(&key).cloned() {
-                            if remnant.state == RowState::Bound {
+                            if remnant.state == RowState::Bound && tombstone.covers_row(&remnant) {
                                 remnant.state = RowState::Retired;
-                                remnant.retired_reason = Some(RetiredReason::Closed);
+                                remnant.retired_reason =
+                                    Some(if tombstone.scope_operation_id.is_some() {
+                                        RetiredReason::FailedTransition
+                                    } else {
+                                        RetiredReason::Closed
+                                    });
                                 remnant.updated_at = w.now_ms;
                                 tracing::info!(
                                     target: "freshell_ws::pane_ledger",
@@ -2638,28 +2771,31 @@ impl PaneLedger {
         // whose recovery binding belongs to a LIVE TERMINAL:
         //
         // * over a STAMPED row (the handoff's terminal-side commit stamped
-        //   it), a paired write must be STRICTLY NEWER — for everyone,
-        //   authoritative or not: every legitimate reclaim advances the
-        //   generation, the ep5-r1 equal-pair trap stays closed, and a
-        //   DELAYED authoritative target write can never clobber a LATER
-        //   handoff's stamped row.
+        //   it), an exact claimed write must be STRICTLY NEWER. A pair by
+        //   itself is not takeover authority: ordinary settings refreshes
+        //   cannot replace a terminal row, even if a caller supplies a
+        //   newer-looking pair. The strict compare still prevents an old
+        //   claimed write from clobbering a later handoff's stamped row.
         // * over an UNSTAMPED row — the NORMAL production shape (ordinary
         //   WS/REST/MCP terminal binding writes stamp nothing; the
         //   terminal→fresh-agent handoff kills the terminal directly and
-        //   the exit hook leaves the row Bound) — only the handoff
-        //   runner's OWN authoritative target binding (the r27-F2
-        //   under-ticket shape: the pair is the runner's supplied handoff
-        //   generation, marked `authoritative` at exactly the three
-        //   under-ticket write sites) lands; every non-authoritative
-        //   lane write (a stale refresh carrying a pre-handoff pair, an
-        //   unfenced refresh) refuses typed — the pairs alone cannot
-        //   prove newer against a row with no baseline.
+        //   the exit hook leaves the row Bound) — only an exact current
+        //   owner claim lands. The server has revalidated that claim
+        //   against the coordinator before entering the ledger; a pair
+        //   alone cannot prove ownership.
         if existing.is_some_and(|r| r.state == RowState::Bound && r.live_terminal_id.is_some()) {
             let write_pair = w.observed_epoch.zip(w.observed_generation);
             let row_pair = existing.and_then(|r| r.owner_epoch.zip(r.owner_generation));
+            let is_claimed = claim.is_some_and(|claim| {
+                matches!(
+                    claim.kind,
+                    freshell_freshagent::BindingClaimKind::Starting
+                        | freshell_freshagent::BindingClaimKind::Handoff
+                )
+            });
             let accepted = match (write_pair, row_pair) {
-                (Some(_), None) if w.authoritative => true,
-                (Some(write_pair), Some(row_pair)) => write_pair > row_pair,
+                (Some(_), None) if is_claimed => true,
+                (Some(write_pair), Some(row_pair)) if is_claimed => write_pair > row_pair,
                 _ => false,
             };
             if !accepted {
@@ -2669,12 +2805,11 @@ impl PaneLedger {
                     session_id = %w.session_id,
                     live_terminal_id = ?existing.and_then(|r| r.live_terminal_id.clone()),
                     write_pair = ?write_pair, row_pair = ?row_pair,
-                    authoritative = w.authoritative,
+                    claimed = is_claimed,
                     "pane_ledger_binding_refused_over_terminal: a fresh-agent \
                      binding write would clobber a live terminal's recovery row \
-                     without a strictly newer ownership pair (or, over the row's \
-                     unstamped shape, without the handoff runner's authoritative \
-                     target marker) — the write is refused typed (kata b8ke \
+                     without an exact current owner claim and a strictly newer \
+                     pair when the row is stamped — the write is refused typed (kata b8ke \
                      focused ep5 r2 F1)"
                 );
                 return Err(std::io::Error::other(if unfenced {
@@ -2683,9 +2818,9 @@ impl PaneLedger {
                      is refused"
                 } else {
                     "NOT_NEWER_BINDING_OVER_TERMINAL: the row's recovery binding \
-                     belongs to a live terminal; the fresh-agent write must carry \
-                     a strictly newer ownership pair (or, over an unstamped row, \
-                     be the handoff runner's authoritative target binding)"
+                     belongs to a terminal; the fresh-agent write must carry an \
+                     exact current ownership claim and, over a stamped row, a \
+                     strictly newer pair"
                 }));
             }
         }
@@ -2810,7 +2945,11 @@ impl PaneLedger {
             provider: w.provider.to_string(),
             session_id: w.session_id.to_string(),
             mode: w.mode.to_string(),
-            cwd: w.cwd.map(str::to_string),
+            cwd: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.cwd.map(str::to_string),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.cwd.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.cwd.clone(),
+            },
             live_terminal_id: None, // fresh-agent panes have no terminal
             create_request_id,
             origin_create_request_id,
@@ -2824,16 +2963,51 @@ impl PaneLedger {
             // b8ke ext r22 F2: the row's ownership stamp — this write's
             // carried pair (preserved from the prior row when the write is
             // legacy-unfenced).
-            owner_epoch: w.observed_epoch.or(existing.and_then(|r| r.owner_epoch)),
-            owner_generation: w
-                .observed_generation
+            owner_epoch: claim
+                .map(|claim| claim.epoch)
+                .or(w.observed_epoch)
+                .or(existing.and_then(|r| r.owner_epoch)),
+            owner_generation: claim
+                .map(|claim| claim.generation)
+                .or(w.observed_generation)
                 .or(existing.and_then(|r| r.owner_generation)),
-            model: w.model.map(str::to_string),
-            sandbox: w.sandbox.map(str::to_string),
-            permission_mode: w.permission_mode.map(str::to_string),
-            collaboration_mode: w.collaboration_mode.map(str::to_string),
-            effort: w.effort.map(str::to_string),
-            plugins: w.plugins.map(<[String]>::to_vec),
+            owner_operation_id: claim.map(|claim| claim.operation_id.clone()).or_else(|| {
+                let write_pair = w.observed_epoch.zip(w.observed_generation);
+                let row_pair = existing.and_then(|r| r.owner_epoch.zip(r.owner_generation));
+                (write_pair.is_some() && write_pair == row_pair)
+                    .then(|| existing.and_then(|r| r.owner_operation_id.clone()))
+                    .flatten()
+            }),
+            model: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.model.map(str::to_string),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.model.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.model.clone(),
+            },
+            sandbox: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.sandbox.map(str::to_string),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.sandbox.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.sandbox.clone(),
+            },
+            permission_mode: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.permission_mode.map(str::to_string),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.permission_mode.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.permission_mode.clone(),
+            },
+            collaboration_mode: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.collaboration_mode.map(str::to_string),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.collaboration_mode.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.collaboration_mode.clone(),
+            },
+            effort: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.effort.map(str::to_string),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.effort.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.effort.clone(),
+            },
+            plugins: match settings_update {
+                LedgerSettingsUpdate::FromWrite => w.plugins.map(<[String]>::to_vec),
+                LedgerSettingsUpdate::Keep => existing.and_then(|r| r.plugins.clone()),
+                LedgerSettingsUpdate::Replace(settings) => settings.plugins.clone(),
+            },
             // A rebind during recovery must not erase a shutdown marker
             // before a create or attach can acknowledge the interruption.
             turn_interrupted_at: existing.and_then(|row| row.turn_interrupted_at),
@@ -3289,10 +3463,7 @@ impl PaneLedger {
                 // dominate a row that proves STRICTLY NEWER than its
                 // transition pair (a later committed owner's row) — the
                 // same scope predicate the write consult applies.
-                if tombstone_scope_spares_newer(
-                    tombstone.scope,
-                    row.and_then(|r| r.owner_epoch.zip(r.owner_generation)),
-                ) {
+                if row.is_some_and(|row| !tombstone.covers_row(row)) {
                     return false;
                 }
                 let row_view = row.map(|r| (r.state, r.updated_at));
@@ -3570,11 +3741,12 @@ impl PaneLedger {
         create_request_id: Option<&str>,
         panes: &[PaneCloseLinkage],
         now_ms: i64,
-        orphan_filter: Option<(u64, u64)>,
+        orphan_filter: Option<(u64, u64, String)>,
         // b8ke focused ep5 r5 F2: the kills' TRANSITION SCOPE — `None` on
         // every ordinary close (the identity-wide fence); `Some((epoch,
         // generation))` ONLY on the failed-transition repair's fence.
         kill_scope: Option<(u64, u64)>,
+        kill_scope_operation_id: Option<&str>,
     ) -> Result<(), CloseEnvelopeError> {
         let prior = index.close_envelopes.get(key).cloned();
         let mut record = prior.clone().unwrap_or(CloseEnvelopeRecord {
@@ -3597,12 +3769,14 @@ impl PaneLedger {
                 Some(existing) => {
                     existing.at_ms = now_ms;
                     existing.scope = kill_scope;
+                    existing.scope_operation_id = kill_scope_operation_id.map(str::to_string);
                 }
                 None => record.kills.push(PaneCloseKill {
                     provider: provider.clone(),
                     session_id: session_id.clone(),
                     at_ms: now_ms,
                     scope: kill_scope,
+                    scope_operation_id: kill_scope_operation_id.map(str::to_string),
                 }),
             }
         }
@@ -3785,7 +3959,7 @@ impl PaneLedger {
         // owner's row, an already-Retired row) is left exactly as it is:
         // the repair must not demote rows the failed transition never
         // owned.
-        orphan_filter: Option<(u64, u64)>,
+        orphan_filter: Option<(u64, u64, String)>,
     ) {
         for (provider, session_id) in identities {
             let key = (provider.clone(), session_id.clone());
@@ -3793,10 +3967,11 @@ impl PaneLedger {
                 if row.state != RowState::Bound {
                     continue;
                 }
-                if let Some((epoch, generation)) = orphan_filter {
+                if let Some((epoch, generation, operation_id)) = orphan_filter.as_ref() {
                     let is_orphaned_product = row.pane_kind.as_deref() == Some("fresh-agent")
-                        && row.owner_epoch == Some(epoch)
-                        && row.owner_generation == Some(generation);
+                        && row.owner_epoch == Some(*epoch)
+                        && row.owner_generation == Some(*generation)
+                        && row.owner_operation_id.as_deref() == Some(operation_id.as_str());
                     if !is_orphaned_product {
                         continue;
                     }
@@ -3807,7 +3982,7 @@ impl PaneLedger {
                         target: "freshell_ws::pane_ledger",
                         provider = %provider,
                         session_id = %session_id,
-                        epoch, generation,
+                        epoch, generation, operation_id = %operation_id,
                         "pane_ledger_failed_transition_row_repaired: the orphaned \
                          authoritative fresh-agent row (the failed transition's own \
                          binding write) is retired — the coordinator and the recovery \
@@ -3993,6 +4168,7 @@ impl PaneLedger {
                 // b8ke focused ep5 r5 F2: no kill scope — the
                 // identity-wide fence every ordinary close writes.
                 None,
+                None,
             )?;
         }
         for pending_id in pending_ids {
@@ -4052,16 +4228,31 @@ impl PaneLedger {
         &self,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         epoch: u64,
         generation: u64,
         now_ms: i64,
     ) -> std::io::Result<()> {
+        let mut index = self.guard();
+        let scope = FailedTransitionScope {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            epoch,
+            generation,
+        };
+        // Arm the in-memory exact-operation fence before touching disk. If
+        // the close-envelope write fails, an already validated blocking
+        // closure still cannot land this operation's row during this
+        // process lifetime. A newer operation has a distinct scope and is
+        // unaffected. The current process is the only one that can still
+        // own the outstanding blocking closure; restart ends it.
+        index.failed_transition_scopes.insert(scope);
         let Some(root) = self.root.clone() else {
             return Ok(());
         };
-        let mut index = self.guard();
         let identities = [(provider.to_string(), session_id.to_string())];
-        self.close_envelope_locked(
+        let result = self.close_envelope_locked(
             &root,
             &mut index,
             &Self::agent_envelope_key(provider, session_id),
@@ -4070,14 +4261,20 @@ impl PaneLedger {
             None,
             &[],
             now_ms,
-            Some((epoch, generation)),
+            Some((epoch, generation, operation_id.to_string())),
             // b8ke focused ep5 r5 F2: the repair's fence is SCOPED to the
             // failed transition's (epoch, generation) — it suppresses only
             // writes/rows at or before that pair; a strictly newer binding
             // (a later committed owner's) is invisible to it.
             Some((epoch, generation)),
-        )
-        .map_err(|err| {
+            Some(operation_id),
+        );
+        // Keep the exact process-local fence after success as well: the next
+        // legitimate claim can consume the durable close before this old
+        // operation's already-validated blocking closure returns. No such
+        // closure survives a process restart, so no additional durable history
+        // is required beyond the repair envelope.
+        result.map_err(|err| {
             std::io::Error::other(match err {
                 CloseEnvelopeError::Clean(e) => format!("FAILED_TRANSITION_REPAIR_CLEAN: {e}"),
                 CloseEnvelopeError::Persisted(e) => {
@@ -4160,6 +4357,7 @@ impl PaneLedger {
             // b8ke focused ep5 r5 F2: no kill scope — the
             // identity-wide fence every ordinary close writes.
             None,
+            None,
         )?;
         // Step 4 — the marker (LAST; warn-only hygiene — the close is
         // durable by now).
@@ -4226,6 +4424,7 @@ impl PaneLedger {
             // b8ke focused ep5 r5 F2: no kill scope — the
             // identity-wide fence every ordinary close writes.
             None,
+            None,
         )
     }
 
@@ -4265,6 +4464,7 @@ impl PaneLedger {
             None,
             // b8ke focused ep5 r5 F2: no kill scope — the
             // identity-wide fence every ordinary close writes.
+            None,
             None,
         )
     }
@@ -5111,6 +5311,7 @@ impl PaneLedger {
                     session_id: w.session_id.to_string(),
                     at_ms: w.now_ms,
                     scope: None,
+                    scope_operation_id: None,
                 });
             }
             match self.persist_close_envelope_locked(

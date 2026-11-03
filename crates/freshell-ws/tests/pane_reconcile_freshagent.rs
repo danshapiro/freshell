@@ -729,7 +729,6 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
             now_ms: now,
             plugins: None,
         })
@@ -753,7 +752,6 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
             now_ms: now + 1,
             plugins: None,
         })
@@ -797,7 +795,6 @@ fn seed_claude_binding(ledger: &PaneLedger, session_id: &str, genesis: Option<&V
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
             now_ms: 1_000,
         })
         .unwrap();

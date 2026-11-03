@@ -1,10 +1,18 @@
+import { randomUUID } from 'node:crypto'
 import { test, expect } from '../helpers/fixtures.js'
+import {
+  analyzeFreshAgentAttachRounds,
+  type FreshAgentAttachRoundAnalysis,
+  type FreshAgentAttachRoundTarget,
+} from '../helpers/fresh-agent-attach-rounds.js'
 import {
   fetchFreshAgentSnapshot,
   FORK_PARENT_CONTINUATION_PROMPT,
   withTwoDeviceSession,
   type FreshAgentMultipleDeviceMode,
 } from '../helpers/fresh-agent-multiple-devices.js'
+
+type JsonRow = Record<string, unknown>
 
 const MODES: FreshAgentMultipleDeviceMode[] = ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']
 
@@ -26,6 +34,51 @@ function countTranscriptRowsWithSummary(
   summary: string,
 ): number {
   return turns.filter((turn) => turn.role === role && turn.summary === summary).length
+}
+
+function targetAttachProgressSignature(
+  frames: ReadonlyArray<Record<string, unknown>>,
+  target: FreshAgentAttachRoundTarget,
+): string {
+  const attachCount = frames.filter((frame) => frame.direction === 'sent'
+    && frame.type === 'freshAgent.attach'
+    && frame.sessionId === target.sessionId
+    && frame.provider === target.provider
+    && frame.sessionType === target.sessionType
+    && frame.viewId === target.viewId
+    && frame.tabId === target.tabId
+    && frame.paneId === target.paneId).length
+  const reservedCount = frames.filter((frame) => {
+    if (frame.direction !== 'received' || frame.type !== 'freshAgent.event'
+      || frame.sessionId !== target.sessionId || frame.provider !== target.provider
+      || frame.sessionType !== target.sessionType) return false
+    const event = frame.event as Record<string, unknown> | undefined
+    return event?.type === 'freshAgent.error'
+      && event.code === 'SESSION_RESERVED'
+      && event.requestId === undefined
+      && event.rollback !== true
+  }).length
+  return [attachCount, reservedCount].join(':')
+}
+
+async function waitForAttachRoundQuiet(
+  frames: ReadonlyArray<Record<string, unknown>>,
+  target: FreshAgentAttachRoundTarget,
+): Promise<void> {
+  let lastSignature = targetAttachProgressSignature(frames, target)
+  let stableSince = Date.now()
+  await expect.poll(() => {
+    const nextSignature = targetAttachProgressSignature(frames, target)
+    if (nextSignature !== lastSignature) {
+      lastSignature = nextSignature
+      stableSince = Date.now()
+    }
+    return Date.now() - stableSince >= 1_500
+  }, {
+    timeout: 35_000,
+    intervals: [250],
+    message: 'target attach and SESSION_RESERVED retry traffic becomes quiet',
+  }).toBe(true)
 }
 
 test.describe('Fresh Agent shared sessions across desktop and mobile devices (Rust)', () => {
@@ -563,9 +616,36 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       await expect.poll(() => native.stopCount()).toBe(0)
 
       // Prove the new explicit action still terminates the shared session.
-      await native.holdNextTurn()
       const paneRoot = desktop.page.locator('[data-context="fresh-agent"]').last()
-      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill(terminatePrompt)
+      const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+      if (mode === 'freshcodex') {
+        await expect.poll(async () => {
+          const [state, snapshot] = await Promise.all([
+            desktop.harness.getState(),
+            fetchFreshAgentSnapshot(native.info, session),
+          ])
+          const sessions = Object.values(state.freshAgent?.sessions ?? {}) as Array<{
+            provider?: string
+            sessionType?: string
+            sessionId?: string
+            status?: string
+          }>
+          const ownedSession = sessions.find((candidate) =>
+            candidate.provider === session.provider
+            && candidate.sessionType === session.sessionType
+            && candidate.sessionId === session.sessionId)
+          return {
+            status: ownedSession?.status ?? null,
+            canSend: snapshot.capabilities?.send ?? false,
+          }
+        }, {
+          timeout: 30_000,
+          message: 'Codex publishes idle and send-enabled state before the next held prompt',
+        }).toEqual({ status: 'idle', canSend: true })
+        await expect(composer).toBeEnabled()
+      }
+      await native.holdNextTurn()
+      await composer.fill(terminatePrompt)
       await paneRoot.getByRole('button', { name: 'Send', exact: true }).click()
       await native.waitForHeldTurn(terminatePrompt)
       await paneRoot.locator('article[data-turn-index]').last().click({ button: 'right' })
@@ -596,4 +676,260 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       expect(native.bootCount()).toBe(1)
     }))
   }
+
+  for (const mode of MODES) {
+    test(`stage1 dead binding ${mode}: desktop and mobile recover once, then send and configure`, withTwoDeviceSession(mode, async ({
+      desktop,
+      mobile,
+      native,
+      session,
+      frames,
+      restartWithDeadTerminalBinding,
+    }) => {
+      const startCountBefore = native.runtimeStartCount(session.sessionId)
+      const desktopReadyBefore = await desktop.harness.getLastReadyAt()
+      const mobileReadyBefore = await mobile.harness.getLastReadyAt()
+      const desktopFrameCountBefore = frames.desktop.length
+      const mobileFrameCountBefore = frames.mobile.length
+      const targetFor = (device: {
+        viewId: string
+        tabId: string
+        paneId: string
+      }): FreshAgentAttachRoundTarget => ({
+        sessionId: session.sessionId,
+        provider: session.provider,
+        sessionType: session.sessionType,
+        viewId: device.viewId,
+        tabId: device.tabId,
+        paneId: device.paneId,
+      })
+      const baselineFor = (
+        analysis: FreshAgentAttachRoundAnalysis,
+        baselineFrameCount: number,
+      ) => analysis.rounds.flatMap((round) => round.attachments)
+        .filter((attachment) => attachment.frameIndex < baselineFrameCount)
+      const desktopBaseline = baselineFor(
+        analyzeFreshAgentAttachRounds(frames.desktop, targetFor(desktop)),
+        desktopFrameCountBefore,
+      )
+      const mobileBaseline = baselineFor(
+        analyzeFreshAgentAttachRounds(frames.mobile, targetFor(mobile)),
+        mobileFrameCountBefore,
+      )
+      expect(desktopBaseline.length, 'desktop target pane had attached before server recovery').toBeGreaterThan(0)
+      expect(mobileBaseline.length, 'mobile target pane had attached before server recovery').toBeGreaterThan(0)
+      expect(desktopBaseline.some((tuple) => tuple.observedEpoch === 1
+        && tuple.observedGeneration === 1), 'desktop baseline attach carries the original owner fence').toBe(true)
+      expect(mobileBaseline.some((tuple) => tuple.observedEpoch === 1
+        && tuple.observedGeneration === 1), 'mobile baseline attach carries the original owner fence').toBe(true)
+
+      const expectRecoveryAttachRounds = async (
+        deviceName: 'desktop' | 'mobile',
+        device: { viewId: string; tabId: string; paneId: string },
+        deviceFrames: ReadonlyArray<Record<string, unknown>>,
+        baselineFrameCount: number,
+      ) => {
+        await expect.poll(() => {
+          const analysis = analyzeFreshAgentAttachRounds(deviceFrames, targetFor(device))
+          const recoveryRounds = analysis.rounds.filter((round) => round.authorizationFrameIndex >= baselineFrameCount)
+          const readyRounds = recoveryRounds.filter((round) => round.kind === 'ready')
+          const positiveReconcileRounds = recoveryRounds.filter((round) => round.kind === 'reconcile')
+          const bindingReconcileRounds = positiveReconcileRounds.filter((round) =>
+            round.targetVerdict === 'attach' || round.targetVerdict === 'respawn')
+          const duplicateAttachments = recoveryRounds.flatMap((round) => round.duplicateAttachments)
+          const recoveryAttachments = recoveryRounds.flatMap((round) => round.attachments)
+          const authoritativeByRound = bindingReconcileRounds.map((round) => ({
+            roundId: round.id,
+            verdict: round.targetVerdict,
+            count: round.attachments.filter((attachment) => !attachment.retryAfterSessionReserved
+              && attachment.observedEpoch === 2
+              && attachment.observedGeneration === 1).length,
+          }))
+          const missingAuthoritativeRounds = authoritativeByRound.filter((round) => round.count !== 1)
+          const bootstrapByRound = recoveryRounds.map((round) => ({
+            roundId: round.id,
+            verdict: round.targetVerdict,
+            count: round.attachments.filter((attachment) => !attachment.retryAfterSessionReserved
+              && attachment.observedEpoch === null
+              && attachment.observedGeneration === null).length,
+          }))
+          const bootstrapCount = bootstrapByRound.reduce((total, round) => total + round.count, 0)
+          const authoritativeCount = recoveryAttachments.filter((attachment) => !attachment.retryAfterSessionReserved
+            && attachment.observedEpoch === 2
+            && attachment.observedGeneration === 1).length
+          const unexpectedTuples = recoveryAttachments.filter((attachment) => !(
+            (attachment.observedEpoch === null && attachment.observedGeneration === null)
+            || (attachment.observedEpoch === 2 && attachment.observedGeneration === 1)
+          ))
+          const allSessionAttaches = analysis.rounds.flatMap((round) => round.attachments)
+          if (
+            readyRounds.length > 0
+            && positiveReconcileRounds.length > 0
+            && authoritativeCount > 0
+            && bindingReconcileRounds.length > 0
+            && duplicateAttachments.length === 0
+            && missingAuthoritativeRounds.length === 0
+            && unexpectedTuples.length === 0
+          ) return null
+          return {
+            device: deviceName,
+            intendedView: { viewId: device.viewId, tabId: device.tabId, paneId: device.paneId },
+            expectedBaselineFence: { observedEpoch: 1, observedGeneration: 1 },
+            expectedRecovery: 'one non-retry (2,1) attach in each positive target attach/respawn round; one null-to-fenced upgrade requires matching respawn create and committed owner; duplicate same-fence sends require SESSION_RESERVED',
+            observedRecoveryCounts: { bootstrapCount, authoritativeCount },
+            authoritativeByRound,
+            bootstrapByRound,
+            missingAuthoritativeRounds,
+            duplicateAttachments,
+            unexpectedRecoveryTuples: unexpectedTuples,
+            readyRounds: readyRounds.map((round) => ({
+              id: round.id,
+              bootId: round.bootId,
+              authorizationFrameIndex: round.authorizationFrameIndex,
+              attachments: round.attachments,
+            })),
+            allRecoveryRounds: recoveryRounds.map((round) => ({
+              id: round.id,
+              kind: round.kind,
+              bootId: round.bootId,
+              reconcileId: round.reconcileId,
+              targetVerdict: round.targetVerdict,
+              authorizationFrameIndex: round.authorizationFrameIndex,
+              attachments: round.attachments,
+              duplicateAttachments: round.duplicateAttachments,
+            })),
+            sessionAttachTuples: allSessionAttaches,
+            validReconcileRoundIds: analysis.validReconcileRoundIds,
+          }
+        }, {
+          timeout: 30_000,
+          message: deviceName + ' target view sends once in each authorized ready/reconcile round',
+        }).toBeNull()
+      }
+
+      await restartWithDeadTerminalBinding()
+      await Promise.all([
+        desktop.harness.waitForConnectionAfter(desktopReadyBefore, 60_000),
+        mobile.harness.waitForConnectionAfter(mobileReadyBefore, 60_000),
+      ])
+
+      await Promise.all([
+        expectRecoveryAttachRounds('desktop', desktop, frames.desktop, desktopFrameCountBefore),
+        expectRecoveryAttachRounds('mobile', mobile, frames.mobile, mobileFrameCountBefore),
+      ])
+      await expect.poll(() => native.runtimeStartCount(session.sessionId), {
+        timeout: 60_000,
+        message: 'both device attaches share one recovered native runtime',
+      }).toBe(startCountBefore + 1)
+
+      const prompt = 'stage1 shared held prompt'
+      const recoveredResponse = mode === 'freshcodex'
+        ? 'Native streaming fragment and final answer'
+        : mode === 'freshopencode'
+          ? `Fake OpenCode response: ${prompt}`
+          : 'Stage1 shared response'
+      await native.holdNextTurn(session.sessionId)
+      const pane = desktop.page.locator('[data-context="fresh-agent"]').last()
+      await pane.getByRole('textbox', { name: 'Chat message input' }).fill(prompt)
+      await pane.getByRole('button', { name: 'Send', exact: true }).click()
+      await native.waitForHeldTurn(prompt, session.sessionId)
+      await native.releaseTurn()
+      await expect(pane).toContainText(recoveredResponse, { timeout: 45_000 })
+      await expect(mobile.page.locator('[data-context="fresh-agent"]').last())
+        .toContainText(recoveredResponse, { timeout: 45_000 })
+
+      // A configure from the second device must still reach the one recovered
+      // runtime and converge its metadata back to both views.
+      await mobile.page.evaluate(({ provider, sessionType, sessionId }) => {
+        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+          type: 'freshAgent.configure',
+          requestId: 'stage1-dead-binding-configure',
+          provider,
+          sessionType,
+          sessionId,
+          settings: { effort: 'high' },
+        })
+      }, session)
+      for (const deviceFrames of [frames.desktop, frames.mobile]) {
+        await expect.poll(() => deviceFrames.some((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.event'
+          && frame.sessionId === session.sessionId
+          && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.metadata'
+          && (frame.event as Record<string, unknown> | undefined)?.effort === 'high'), {
+          timeout: 30_000,
+          message: 'the recovered session broadcasts configured metadata to both devices',
+        }).toBe(true)
+      }
+      // Attach reservation retries are bounded and keep their captured fence.
+      // Wait for target attach and SESSION_RESERVED traffic to stay quiet
+      // longer than the retry cadence, then re-run analysis to catch a late
+      // duplicate that arrived after the first recovery poll.
+      await Promise.all([
+        waitForAttachRoundQuiet(frames.desktop, targetFor(desktop)),
+        waitForAttachRoundQuiet(frames.mobile, targetFor(mobile)),
+      ])
+      await Promise.all([
+        expectRecoveryAttachRounds('desktop', desktop, frames.desktop, desktopFrameCountBefore),
+        expectRecoveryAttachRounds('mobile', mobile, frames.mobile, mobileFrameCountBefore),
+      ])
+      expect(native.runtimeStartCount(session.sessionId)).toBe(startCountBefore + 1)
+    }))
+  }
+
+  test('stage1 live terminal binding: desktop and mobile both refuse recovery without a second writer', withTwoDeviceSession('freshclaude', async ({
+    desktop,
+    mobile,
+    native,
+    frames,
+  }) => {
+    const sessionId = randomUUID()
+    const terminalRequestId = 'stage1-live-terminal-owner'
+    const terminalCreatesBefore = frames.desktop.filter((frame) => frame.direction === 'sent'
+      && frame.type === 'terminal.create').length
+    await desktop.page.evaluate(({ requestId, sessionId }) => {
+      window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        shell: 'system',
+        cwd: '/tmp',
+        sessionRef: { provider: 'claude', sessionId },
+      })
+    }, { requestId: terminalRequestId, sessionId })
+    await expect.poll(() => frames.desktop.some((frame) => frame.direction === 'received'
+      && frame.type === 'terminal.created'
+      && frame.requestId === terminalRequestId
+      && (frame.sessionRef as Record<string, unknown> | undefined)?.sessionId === sessionId), {
+      timeout: 30_000,
+      message: 'the fixture starts a real Claude terminal process for the recovery identity',
+    }).toBe(true)
+    expect(frames.desktop.filter((frame) => frame.direction === 'sent'
+      && frame.type === 'terminal.create').length).toBe(terminalCreatesBefore + 1)
+
+    const attach = (page: any) => page.evaluate((sessionId: string) => {
+      window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+        type: 'freshAgent.attach',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        sessionId,
+        cwd: '/tmp',
+        sessionRef: { provider: 'claude', sessionId },
+      })
+    }, sessionId)
+    await Promise.all([attach(desktop.page), attach(mobile.page)])
+
+    const reservedOnView = (deviceFrames: Array<Record<string, unknown>>) => deviceFrames.some((frame) => {
+      if (frame.direction !== 'received' || frame.type !== 'freshAgent.event' || frame.sessionId !== sessionId) return false
+      const event = frame.event as Record<string, unknown> | undefined
+      return event?.type === 'freshAgent.error' && event.code === 'SESSION_RESERVED'
+    })
+    await expect.poll(() => ({
+      desktop: reservedOnView(frames.desktop),
+      mobile: reservedOnView(frames.mobile),
+    }), {
+      timeout: 30_000,
+      message: 'each device receives the refusal while the terminal remains the live owner',
+    }).toEqual({ desktop: true, mobile: true })
+    expect(native.runtimeStartCount(sessionId)).toBe(0)
+  }))
 })

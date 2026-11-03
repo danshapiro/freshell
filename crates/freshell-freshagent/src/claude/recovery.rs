@@ -136,6 +136,7 @@ impl FreshClaudeState {
                 &mut lease,
                 &mut ticket,
                 None,
+                None,
             )
             .await;
         if let Some(mut remaining) = lease.take() {
@@ -371,8 +372,8 @@ impl FreshClaudeState {
                     provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
                     observed_epoch: None,
                     observed_generation: None,
-                    authoritative: false,
-                    settings: next.clone(),
+                    claim: None,
+                    settings: crate::identity_sink::SettingsUpdate::Replace(next.clone()),
                 })
                 .await
                 .map_err(|error| RuntimeResumeError::Unavailable {

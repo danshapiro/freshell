@@ -3105,6 +3105,117 @@ async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row()
     h.ws_state.registry.kill(&terminal_id);
 }
 
+/// A dead terminal's durable row is recoverable by a current Freshagent
+/// Starting claim after the liveness probe confirms its PTY has exited. The
+/// identity row must become Freshagent-shaped before the successful create
+/// answer, and the old terminal id must not remain as a live linkage.
+#[tokio::test]
+async fn a_current_freshagent_start_heals_a_dead_terminal_binding() {
+    let _guard = ENV_LOCK.lock().await;
+    let sidecar = ClaudeSimEnvironment::new();
+    let sid = uuid::Uuid::new_v4().to_string();
+    sidecar.seed_transcript_at(&sid, std::path::Path::new("/tmp"));
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger_and_claude(Some(&sidecar)).await;
+
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "dead-binding-terminal",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let terminal_created = await_frame(&mut h.ws, Duration::from_secs(20), |frame| {
+        frame["type"] == "terminal.created" && frame["requestId"] == "dead-binding-terminal"
+    })
+    .await;
+    let terminal_id = terminal_created["terminalId"]
+        .as_str()
+        .expect("terminal id")
+        .to_string();
+    let terminal_row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the terminal binding is durable");
+    assert_eq!(
+        terminal_row.state,
+        freshell_ws::pane_ledger::RowState::Bound
+    );
+    assert_eq!(terminal_row.pane_kind, None);
+    assert_eq!(
+        terminal_row.live_terminal_id.as_deref(),
+        Some(terminal_id.as_str())
+    );
+
+    // Kill only the terminal child created above. Its historical Bound row
+    // intentionally remains as the recovery candidate.
+    r24_natural_exit(&h.ws_state, "claude", &sid, &terminal_id).await;
+    let dead_row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the historical terminal row remains available");
+    assert_eq!(dead_row.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(
+        dead_row.live_terminal_id.as_deref(),
+        Some(terminal_id.as_str())
+    );
+
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.create",
+            "requestId": "dead-binding-recover",
+            "sessionType": "freshclaude",
+            "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut h.ws, Duration::from_secs(30), |frame| {
+        (frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed")
+            && frame["requestId"] == "dead-binding-recover"
+    })
+    .await;
+    assert_eq!(
+        created["type"], "freshAgent.created",
+        "the current Starting claim recovers the session after liveness proves the terminal dead: {created}"
+    );
+
+    let recovered = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the recovered identity row is durable before the reply");
+    assert_eq!(recovered.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(recovered.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(recovered.live_terminal_id, None);
+    assert!(recovered.owner_epoch.is_some() && recovered.owner_generation.is_some());
+    assert_eq!(
+        sidecar
+            .rows("boot")
+            .iter()
+            .filter(|row| row["sessionId"] == sid)
+            .count(),
+        1,
+        "one native resume created one writer"
+    );
+
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.kill",
+            "provider": "claude",
+            "sessionType": "freshclaude",
+            "sessionId": sid,
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |frame| {
+        frame["type"] == "freshAgent.killed" && frame["sessionId"] == sid
+    })
+    .await;
+}
+
 /// b8ke focused ep5 r3 F1 (e2e): a SUPERSEDED handoff's stale
 /// authoritative write is refused at the sink's ownership consult, END TO
 /// END. The first handoff commits Live{FreshAgent} and its target's
@@ -3242,6 +3353,10 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
     let row_before = pane_ledger
         .load_binding("claude", &sid)
         .expect("the row exists before the stale write");
+    let first_operation_id = row_before
+        .owner_operation_id
+        .clone()
+        .expect("the durable binding remembers the first handoff operation");
     let sink = LedgerSink::with_ownership(Arc::clone(&pane_ledger), h.ws_state.ownership.clone());
     let err = sink
         .record_binding(FreshAgentBindingUpsert {
@@ -3256,11 +3371,19 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: Some(epoch),
             observed_generation: Some(first_generation),
-            authoritative: true,
-            settings: freshell_freshagent::FreshAgentSettings {
-                model: Some("stale-superseded".into()),
-                ..Default::default()
-            },
+            claim: Some(freshell_freshagent::BindingClaim::handoff(
+                "claude",
+                &sid,
+                &first_operation_id,
+                epoch,
+                first_generation,
+            )),
+            settings: freshell_freshagent::SettingsUpdate::Replace(
+                freshell_freshagent::FreshAgentSettings {
+                    model: Some("stale-superseded".into()),
+                    ..Default::default()
+                },
+            ),
         })
         .await
         .expect_err("the superseded handoff's stale authoritative write is refused");
@@ -3370,6 +3493,10 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
     );
     let snap = h.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
     let (epoch, generation) = (snap.epoch, snap.generation);
+    let transition_operation_id = pane_ledger
+        .load_binding("claude", &sid)
+        .and_then(|row| row.owner_operation_id)
+        .expect("the binding stores the exact handoff operation id");
     assert!(matches!(
         snap.state,
         freshell_ownership::OwnershipState::Live { ref owner, .. }
@@ -3381,7 +3508,7 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
     //    the row the target's own write produced retires typed
     //    FailedTransition, and the durable fence is fed.
     let sink = LedgerSink::with_ownership(Arc::clone(&pane_ledger), h.ws_state.ownership.clone());
-    sink.repair_failed_transition("claude", &sid, epoch, generation)
+    sink.repair_failed_transition("claude", &sid, &transition_operation_id, epoch, generation)
         .await
         .expect("the cleanup's repair lands");
     let row = pane_ledger
@@ -3401,11 +3528,32 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
         "the durable fence is fed"
     );
 
-    // 4. THE FENCE (the validated-then-canceled ordering): a late
-    //    authoritative write carrying the SAME transition's pair — its
-    //    ownership consult STILL PASSES (the coordinator holds
-    //    Live{{FreshAgent}} at that generation) — is suppressed at the
-    //    ledger's tombstone consult, changing nothing.
+    // 4. THE FENCE (the validated-then-canceled ordering): enter a fresh
+    //    Handoff operation, durably repair it while its exact claim is
+    //    still current, then release a late write carrying that same claim.
+    //    The ownership consult passes; the ledger's durable fence suppresses
+    //    the mutation.
+    let late_operation_id = "late-orphaned-handoff";
+    let late_generation = match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("the merged test server wires the coordinator")
+        .begin_handoff(
+            "claude",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            late_operation_id,
+            None,
+            "test-late-binding-fence",
+            0,
+        ) {
+        freshell_ownership::BeginOutcome::Granted { generation } => generation,
+        other => panic!("the late-write handoff claim must be granted: {other:?}"),
+    };
+    sink.repair_failed_transition("claude", &sid, late_operation_id, epoch, late_generation)
+        .await
+        .expect("the exact late-write claim is durably fenced");
     let row_before = pane_ledger
         .load_binding("claude", &sid)
         .expect("the row before the late write");
@@ -3420,12 +3568,20 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
         supersedes: None,
         provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
         observed_epoch: Some(epoch),
-        observed_generation: Some(generation),
-        authoritative: true,
-        settings: freshell_freshagent::FreshAgentSettings {
-            model: Some("late-orphaned".into()),
-            ..Default::default()
-        },
+        observed_generation: Some(late_generation),
+        claim: Some(freshell_freshagent::BindingClaim::handoff(
+            "claude",
+            &sid,
+            late_operation_id,
+            epoch,
+            late_generation,
+        )),
+        settings: freshell_freshagent::SettingsUpdate::Replace(
+            freshell_freshagent::FreshAgentSettings {
+                model: Some("late-orphaned".into()),
+                ..Default::default()
+            },
+        ),
     })
     .await
     .expect("the suppressed late write answers Ok (suppression, not error)");
@@ -3510,7 +3666,6 @@ async fn an_ordinary_codex_cold_resume_with_recovered_settings_lands_end_to_end(
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
             now_ms: 1_000,
             plugins: None,
         })

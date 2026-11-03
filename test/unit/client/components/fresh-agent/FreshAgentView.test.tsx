@@ -14,7 +14,7 @@ import freshAgentLiveReducer from '@/store/freshAgentLiveSlice'
 import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import connectionReducer, { setBootId } from '@/store/connectionSlice'
+import connectionReducer, { setBootId, setStatus } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
@@ -754,7 +754,11 @@ describe('picker profile staging', () => {
       wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
       const store = createStore()
       // The app's real global fold runs before the mounted pane subscription.
-      client.onMessage((message) => { handleFreshAgentMessage(store.dispatch as AppDispatch, message, client) })
+      client.onDisconnect(() => store.dispatch(setStatus('disconnected')))
+      client.onMessage((message) => {
+        if (message.type === 'ready') store.dispatch(setStatus('ready'))
+        handleFreshAgentMessage(store.dispatch as AppDispatch, message, client)
+      })
       installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
       const harness = window.__FRESHELL_TEST_HARNESS__!
       harness.setSuppressAllFreshAgentNetworkEffects(true)
@@ -800,7 +804,10 @@ describe('picker profile staging', () => {
         if (reconnect) {
           MaterializingSocket.instances[0].onclose?.({ code: 4009, reason: 'restart' })
           const connectedAgain = client.connect()
-          await act(async () => { MaterializingSocket.instances[1].ready(); await connectedAgain })
+          await act(async () => {
+            MaterializingSocket.instances[1].ready()
+            await connectedAgain
+          })
           await act(async () => { await vi.advanceTimersByTimeAsync(RECONCILE_VERDICT_WAIT_MS) })
           expect(MaterializingSocket.instances[1].frames.filter(frame => frame.type === 'freshAgent.attach'))
             .toContainEqual(expect.objectContaining({ sessionId: nativeSessionId, sessionType: content.sessionType, provider: content.provider }))
@@ -4049,7 +4056,11 @@ describe('FreshAgentView', () => {
       expect(screen.getByText('hidden transcript')).toBeInTheDocument()
       await act(async () => { await vi.advanceTimersByTimeAsync(500) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
-      act(() => { reconnectHandler?.() })
+      act(() => {
+        store.dispatch(setStatus('disconnected'))
+        store.dispatch(setStatus('ready'))
+        reconnectHandler?.()
+      })
       // Still hidden: the reconnect defers the refresh to reveal — no fetch.
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
@@ -4161,7 +4172,11 @@ describe('FreshAgentView', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(500) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
 
-      act(() => { reconnectHandler?.() })
+      act(() => {
+        store.dispatch(setStatus('disconnected'))
+        store.dispatch(setStatus('ready'))
+        reconnectHandler?.()
+      })
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
 
@@ -4253,6 +4268,8 @@ describe('FreshAgentView', () => {
         }))
         const reconnect = async () => {
           await act(async () => {
+            store.dispatch(setStatus('disconnected'))
+            store.dispatch(setStatus('ready'))
             reconnectHandler?.()
             await Promise.resolve()
           })
@@ -4340,7 +4357,11 @@ describe('FreshAgentView', () => {
       )
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       await act(async () => { await vi.advanceTimersByTimeAsync(500) })
-      act(() => { reconnectHandler?.() })
+      act(() => {
+        store.dispatch(setStatus('disconnected'))
+        store.dispatch(setStatus('ready'))
+        reconnectHandler?.()
+      })
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       view.rerender(
         <Provider store={store}>
@@ -4511,7 +4532,11 @@ describe('FreshAgentView', () => {
       )
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       await act(async () => { await vi.advanceTimersByTimeAsync(500) })
-      act(() => { reconnectHandler?.() })
+      act(() => {
+        store.dispatch(setStatus('disconnected'))
+        store.dispatch(setStatus('ready'))
+        reconnectHandler?.()
+      })
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       view.rerender(
         <Provider store={store}>
@@ -4610,6 +4635,8 @@ describe('FreshAgentView', () => {
 
     wsMock.send.mockClear()
     act(() => {
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
       reconnectHandler?.()
     })
 
@@ -8447,7 +8474,11 @@ describe('FreshAgentView', () => {
 
     // An ambiguous transport reconnect is not permission for the client to
     // release another provider send. The server joins by logicalAttemptId.
-    act(() => reconnectHandlers.forEach((handler) => handler()))
+    act(() => {
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
+      reconnectHandlers.forEach((handler) => handler())
+    })
     await act(async () => { await Promise.resolve() })
     expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     wsMock.send.mockClear()
@@ -17668,6 +17699,276 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       observedEpoch: 1,
       observedGeneration: 9,
     })
+  })
+
+  it('waits through a ready replay of Starting, then attaches once when that owner becomes Live', async () => {
+    const reconnectHandlers: Array<() => void> = []
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandlers.push(handler)
+      return () => {}
+    })
+    const store = createStore()
+    const sid = 'thread-starting-peer-recovery'
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        sessionId: sid,
+        sessionRef: { provider: 'codex', sessionId: sid },
+      }),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+
+    // The reconnect ready replay reports the peer's current in-flight owner.
+    // Both the new-boot effect and the reconnect callback must respect it.
+    await act(async () => {
+      store.dispatch(setBootId('server-boot-starting-peer-recovery'))
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: sid,
+        epoch: 2,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'peer-recovery-operation',
+        transition: 'handoff-started',
+      }))
+      reconnectHandlers.forEach((handler) => handler())
+      await Promise.resolve()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+
+    // The same operation becomes authoritative at the exact same pair. This
+    // transition must wake the view and emit one fenced attach.
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: sid,
+      epoch: 2,
+      generation: 1,
+      ownerKind: 'fresh-agent',
+      operationId: 'peer-recovery-operation',
+      transition: 'handoff-committed',
+    })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      sessionId: sid,
+      observedEpoch: 2,
+      observedGeneration: 1,
+    })
+  })
+
+  it('coalesces duplicate no-fence ready producers but preserves transport and reconcile rounds', async () => {
+    const reconnectHandlers: Array<() => void> = []
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandlers.push(handler)
+      return () => {}
+    })
+    const store = createStore()
+    const sid = 'thread-coalesced-attach-rounds'
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        sessionId: sid,
+        sessionRef: { provider: 'codex', sessionId: sid },
+      }),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+
+    // The boot-id effect and the onReconnect callback observe the same ready
+    // round. They should produce one unfenced bootstrap frame, not two.
+    await act(async () => {
+      store.dispatch(setBootId('server-boot-coalesced-attach-rounds'))
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
+      reconnectHandlers.forEach((handler) => handler())
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      sessionId: sid,
+      viewId: expect.any(String),
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).not.toHaveProperty('observedEpoch')
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).not.toHaveProperty('observedGeneration')
+
+    // A same-server transport reconnect is a new ready round and still needs
+    // one attach, even though its server boot id and owner observation match.
+    await act(async () => {
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
+      reconnectHandlers.forEach((handler) => handler())
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    expect(sentFreshAgentMessages('freshAgent.attach')[1]).not.toHaveProperty('observedEpoch')
+
+    // A reconcile fold authorizes another attach round and captures the
+    // current exact owner pair, even on the same connection.
+    act(() => {
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: sid,
+        epoch: 2,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'recovered-owner',
+        transition: 'handoff-committed',
+      }))
+      store.dispatch(applyFreshAgentReconcileAttach({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        sessionRef: { provider: 'codex', sessionId: sid },
+        serverInstanceId: 'same-server',
+      }))
+    })
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(3))
+    expect(sentFreshAgentMessages('freshAgent.attach')[2]).toMatchObject({
+      sessionId: sid,
+      observedEpoch: 2,
+      observedGeneration: 1,
+    })
+  })
+
+  it('rearms a suppressed same-boot reconnect when Starting and Live fold before the next render', async () => {
+    const reconnectHandlers: Array<() => void> = []
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandlers.push(handler)
+      return () => {}
+    })
+    const store = createStore()
+    const sid = 'thread-batched-peer-recovery'
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionId: sid, sessionRef: { provider: 'codex', sessionId: sid },
+    }) }))
+    const owner = { type: 'session.runtimeOwner' as const, provider: 'codex', sessionId: sid,
+      epoch: 2, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'peer-recovery' }
+    store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-committed' }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+    await act(async () => {
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
+      store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-started' }))
+      reconnectHandlers.forEach((handler) => handler())
+      await Promise.resolve()
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      // The sender observed Starting, even when React's next committed render
+      // observes Live directly. Recovery cannot depend on rendering both states.
+      store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-committed' }))
+    })
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      observedEpoch: 2, observedGeneration: 1,
+    })
+  })
+
+  it('coalesces reconnect and boot attaches when reconcile folds before the next render', async () => {
+    const reconnectHandlers: Array<() => void> = []
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandlers.push(handler)
+      return () => {}
+    })
+    const store = createStore()
+    const sid = 'thread-batched-reconcile-attach'
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionId: sid, sessionRef: { provider: 'codex', sessionId: sid },
+    }) }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+    const reconcile = () => store.dispatch(applyFreshAgentReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1', sessionRef: { provider: 'codex', sessionId: sid },
+      serverInstanceId: 'recovered-server',
+    }))
+    await act(async () => {
+      store.dispatch(setStatus('disconnected'))
+      store.dispatch(setStatus('ready'))
+      store.dispatch(setBootId('boot-batched-reconcile'))
+      store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', provider: 'codex', sessionId: sid,
+        epoch: 2, generation: 1, ownerKind: 'fresh-agent', operationId: 'recovered-owner',
+        transition: 'handoff-committed' }))
+      reconnectHandlers.forEach((handler) => handler())
+      // Redux has the authorized round before React updates paneContentRef.
+      // The reconnect callback and ensuing boot effect must capture that same round.
+      reconcile()
+      await Promise.resolve()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      observedEpoch: 2, observedGeneration: 1,
+    })
+
+    // A later authoritative round with the same fence still needs its attach.
+    act(reconcile)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    expect(sentFreshAgentMessages('freshAgent.attach')[1]).toMatchObject({
+      observedEpoch: 2, observedGeneration: 1,
+    })
+  })
+
+  it('preserves the first authoritative fence after a respawn created reply attached without one', async () => {
+    const reconnectHandlers: Array<() => void> = []
+    const listeners = new Set<(message: any) => void>()
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandlers.push(handler)
+      return () => {}
+    })
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    })
+    const store = createStore()
+    const sid = 'thread-respawn-created-upgrade'
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionId: sid, sessionRef: { provider: 'codex', sessionId: sid },
+    }) }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    act(() => store.dispatch(resetFreshAgentPaneForReconcileCreate({
+      tabId: 'tab-1', paneId: 'pane-1', intent: 'respawn', sessionRef: { provider: 'codex', sessionId: sid },
+    })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+    wsMock.send.mockClear()
+    const content = getFreshAgentPaneContent(store)
+    act(() => [...listeners].forEach((listener) => listener({ type: 'freshAgent.created',
+      requestId: content.createRequestId, viewId: content.viewId ?? content.createRequestId,
+      provider: 'codex', sessionType: 'freshcodex', sessionId: sid,
+      sessionRef: { provider: 'codex', sessionId: sid } })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).not.toHaveProperty('observedEpoch')
+
+    await act(async () => {
+      store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', provider: 'codex', sessionId: sid,
+        epoch: 2, generation: 1, ownerKind: 'fresh-agent', operationId: 'respawn-owner',
+        transition: 'handoff-committed' }))
+      reconnectHandlers.forEach((handler) => handler())
+      await Promise.resolve()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2)
+    expect(sentFreshAgentMessages('freshAgent.attach')[1]).toMatchObject({ observedEpoch: 2, observedGeneration: 1 })
+    await act(async () => {
+      reconnectHandlers.forEach((handler) => handler())
+      await Promise.resolve()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2)
   })
 
   // b8ke ext r34 F2: the attach-here path CANONICALIZES at the write — a

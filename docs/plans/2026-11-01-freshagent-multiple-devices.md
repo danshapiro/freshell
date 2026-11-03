@@ -349,7 +349,7 @@ git commit -m "fix(freshagent): preserve shared sessions across view cancellatio
 - Produces: `BindingClaim` containing exact operation identity/epoch/generation and allowed Starting/Handoff/Live-Freshagent claim kind; `SettingsUpdate::{Keep,Replace(FreshAgentSettings)}`. Identity-only writes never imply a settings record.
 - Produces: binding-before-Live/answer invariant for every successful identity-establishing create/resume/adopt/fork/recovery, retaining separate semantics for post-acceptance settings refresh.
 
-- [ ] **Step 1: Add failing behavioral regressions**
+- [x] **Step 1: Add failing behavioral regressions**
 
 ```text
 Ledger + production sink tests: seed unstamped and stamped historical Bound
@@ -378,7 +378,7 @@ the test ledger fixture, opens on desktop+mobile and asserts one writer and
 successful later send/configure. A live-terminal twin refuses both views.
 ```
 
-- [ ] **Step 2: Red**
+- [x] **Step 2: Red**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server identity_sink"`
 
@@ -386,7 +386,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test cross_kin
 
 Expected FAIL: legitimate dead-binding resume remains terminal-shaped/unfenced or no-settings identity is omitted. Existing strict live-writer and stale-write tests remain green.
 
-- [ ] **Step 3: Apply production patch**
+- [x] **Step 3: Apply production patch**
 
 ```text
 FreshAgentBindingUpsert: replace handoff-only authoritative bool with explicit
@@ -426,7 +426,7 @@ the send was refused or retrying it. load_settings/was_recorded retain their
 settings-bearing semantics.
 ```
 
-- [ ] **Step 4: Green**
+- [x] **Step 4: Green**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server identity_sink"`
 
@@ -436,11 +436,11 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-freshagent --lib at
 
 Expected PASS with new identity-only assertions.
 
-- [ ] **Step 5: Refactor**
+- [x] **Step 5: Refactor**
 
 Centralize claim-to-upsert conversion and Keep/Replace mapping. Remove provider-specific guessed-default identity workarounds. Keep distinct establishment versus refresh call sites readable; do not make every write authoritative.
 
-- [ ] **Step 6: Impacted verification**
+- [x] **Step 6: Impacted verification**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ownership"`
 
@@ -450,7 +450,7 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-freshagent --lib se
 
 Run Step 2 commands, then `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts --grep 'stage1'`; expected PASS across close/switch/dead/live-binding cases and four modes. This is Stage 1's integrated gate.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-ownership/src/lib.rs crates/freshell-freshagent/src/identity_sink.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-freshagent/src/session_handoff/tests.rs crates/freshell-server/src/identity_sink.rs crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/tests/cross_kind_liveness.rs test/e2e-browser/helpers/fresh-agent-multiple-devices.ts test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts

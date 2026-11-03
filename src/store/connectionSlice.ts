@@ -7,6 +7,8 @@ export interface ConnectionState {
   lastError?: string
   lastErrorCode?: number
   lastReadyAt?: number
+  /** Monotonic id for each successful ready handshake, including same-ms reconnects. */
+  readySequence?: number
   serverInstanceId?: string
   bootId?: string
   serverRestarted?: boolean
@@ -24,6 +26,7 @@ export function isFatalConnectionErrorCode(code?: number): boolean {
 
 const initialState: ConnectionState = {
   status: 'disconnected',
+  readySequence: 0,
   platform: null,
   availableClis: {},
   featureFlags: {},
@@ -34,9 +37,13 @@ export const connectionSlice = createSlice({
   initialState,
   reducers: {
     setStatus: (state, action: PayloadAction<ConnectionStatus>) => {
+      const becameReady = action.payload === 'ready' && state.status !== 'ready'
       state.status = action.payload
       if (action.payload === 'ready') {
         state.lastReadyAt = Date.now()
+        // App's ready handler and connect() completion both report the
+        // same socket. Only a transition back to ready starts a new round.
+        if (becameReady) state.readySequence = (state.readySequence ?? 0) + 1
         state.lastErrorCode = undefined
         state.lastError = undefined
       }

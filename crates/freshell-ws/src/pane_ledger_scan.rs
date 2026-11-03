@@ -854,7 +854,7 @@ impl PaneLedger {
                 let dominant = index
                     .kill_tombstones
                     .get(key)
-                    .copied()
+                    .cloned()
                     .is_some_and(|entry| {
                         let killed_at = entry.at_ms;
                         classify_kill_tombstone(

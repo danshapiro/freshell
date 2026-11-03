@@ -189,6 +189,138 @@ impl GenesisUpdate {
     }
 }
 
+/// The exact owner transition that proved a fresh-agent binding write is
+/// allowed to replace a prior terminal row. `operation_id` names the
+/// `Starting`/`Handoff` ticket; for a settled `LiveFreshAgent` claim it names
+/// the live runtime's ownership id. The claim kind determines which
+/// coordinator state must still match when the durable write executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingClaimKind {
+    Starting,
+    Handoff,
+    LiveFreshAgent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingClaim {
+    pub provider: String,
+    pub session_id: String,
+    pub operation_id: String,
+    pub epoch: u64,
+    pub generation: u64,
+    pub kind: BindingClaimKind,
+}
+
+impl BindingClaim {
+    /// Capture the immutable identity of a current fresh-agent start or
+    /// handoff ticket. The durable sink still revalidates it at execution
+    /// time, so holding this value never grants ongoing authority by itself.
+    pub fn from_ticket(
+        ticket: &freshell_ownership::OperationTicket,
+        kind: BindingClaimKind,
+    ) -> Option<Self> {
+        if ticket.kind() != freshell_ownership::RuntimeOwnerKind::FreshAgent
+            || kind == BindingClaimKind::LiveFreshAgent
+        {
+            return None;
+        }
+        Some(Self {
+            provider: ticket.provider().to_string(),
+            session_id: ticket.session_id().to_string(),
+            operation_id: ticket.operation_id().to_string(),
+            epoch: ticket.epoch(),
+            generation: ticket.generation(),
+            kind,
+        })
+    }
+
+    /// A current settled owner can write only while its exact runtime
+    /// ownership id and fence pair remain live.
+    pub fn live_fresh_agent(
+        provider: &str,
+        session_id: &str,
+        ownership_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            operation_id: ownership_id.to_string(),
+            epoch,
+            generation,
+            kind: BindingClaimKind::LiveFreshAgent,
+        }
+    }
+
+    /// Snapshot the exact currently live fresh-agent owner. Callers use this
+    /// for adoption paths that reuse a runtime without owning a Starting
+    /// ticket; the sink revalidates the captured owner id and fence when the
+    /// durable write executes.
+    pub fn current_live_fresh_agent(
+        registry: &freshell_ownership::RuntimeOwnershipRegistry,
+        provider: &str,
+        session_id: &str,
+    ) -> Option<Self> {
+        let snapshot = registry.observe(provider, session_id);
+        let freshell_ownership::OwnershipState::Live {
+            owner, generation, ..
+        } = snapshot.state
+        else {
+            return None;
+        };
+        if owner.kind != freshell_ownership::RuntimeOwnerKind::FreshAgent
+            || owner.live_session_key.as_deref() != Some(session_id)
+        {
+            return None;
+        }
+        Some(Self::live_fresh_agent(
+            provider,
+            session_id,
+            owner.ownership_id.as_deref()?,
+            snapshot.epoch,
+            generation,
+        ))
+    }
+
+    /// Capture the handoff runner's immutable granted operation identity.
+    /// The durable sink still verifies that this precise handoff is current.
+    pub fn handoff(
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            epoch,
+            generation,
+            kind: BindingClaimKind::Handoff,
+        }
+    }
+}
+
+/// Whether an identity-establishing write carries a settings snapshot.
+/// `Keep` is a real no-settings operation: it preserves an existing settings
+/// snapshot and creates no defaults record when there is none.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsUpdate {
+    Keep,
+    Replace(FreshAgentSettings),
+}
+
+impl SettingsUpdate {
+    pub fn as_replacement(&self) -> Option<&FreshAgentSettings> {
+        match self {
+            Self::Keep => None,
+            Self::Replace(settings) => Some(settings),
+        }
+    }
+}
+
 /// A binding row's genesis, with the row's last write time: the revision
 /// floor of the snapshot a pending session serves (design §4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,9 +362,10 @@ impl RecordedGenesis {
     }
 }
 
-/// One fresh-agent identity event. Settings are a FULL snapshot (replace,
-/// not merge). `resolves_pending` names a pending marker (placeholder id)
-/// this binding supersedes.
+/// One fresh-agent identity event. `claim` is exact transition proof,
+/// revalidated by the production sink at the durable write boundary.
+/// `resolves_pending` names a pending marker (placeholder id) this binding
+/// supersedes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreshAgentBindingUpsert {
     pub provider: String,
@@ -281,19 +414,10 @@ pub struct FreshAgentBindingUpsert {
     /// newer owner's recovery row. `None` = legacy-unfenced (accepted).
     pub observed_epoch: Option<u64>,
     pub observed_generation: Option<u64>,
-    /// b8ke focused ep5 r2 F1: the HANDOFF RUNNER'S OWN authoritative
-    /// target binding — set ONLY where the pair is runner-supplied (the
-    /// r27-F2 under-ticket continuation shapes: the handoff's commit
-    /// context threads its own generation into the target's row write).
-    /// Over a terminal-bound row the ledger accepts an authoritative
-    /// PAIRED write over the row's UNSTAMPED shape (the normal
-    /// production terminal row — ordinary WS/REST/MCP terminal binding
-    /// writes stamp nothing), while every non-authoritative lane write
-    /// (the post-send refresh, the settings refresh, crash respawns)
-    /// still proves strictly-newer or refuses. NEVER set this on a lane
-    /// refresh.
-    pub authoritative: bool,
-    pub settings: FreshAgentSettings,
+    /// Exact start/handoff/live owner proof. Ordinary refreshes carry None;
+    /// the sink grants no terminal-row takeover from the pair alone.
+    pub claim: Option<BindingClaim>,
+    pub settings: SettingsUpdate,
     /// What this write does to the row's genesis (see [`GenesisUpdate`]).
     pub genesis: GenesisUpdate,
 }
@@ -536,6 +660,7 @@ pub trait PaneIdentitySink: Send + Sync {
         &self,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         epoch: u64,
         generation: u64,
     ) -> SinkWrite;
@@ -742,6 +867,314 @@ pub trait PaneIdentitySink: Send + Sync {
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
 
+type RuntimeProbe = Box<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
+>;
+type BindingCommit = Box<
+    dyn FnOnce(
+            &mut Option<freshell_ownership::OperationTicket>,
+        ) -> Result<(), freshell_ownership::CommitOutcome>
+        + Send
+        + Sync,
+>;
+
+struct MapHitRecovery {
+    runtime_present: RuntimeProbe,
+    write: Box<dyn Fn() -> SinkWrite + Send + Sync>,
+    commit: BindingCommit,
+    pending_write: Option<SinkWrite>,
+}
+
+/// Holds a Starting ticket while its identity write is in flight. If the
+/// caller future is canceled, Drop schedules the durable repair and keeps the
+/// coordinator claim until that repair lands. This closes the window where a
+/// spawn_blocking ledger write can outlive the request that started it.
+pub(crate) struct BindingWriteGuard {
+    ticket: Option<freshell_ownership::OperationTicket>,
+    claim: Option<BindingClaim>,
+    sink: Option<SharedPaneIdentitySink>,
+    binding_hold: Option<freshell_ownership::BindingWriteHold>,
+    armed: bool,
+    map_hit_recovery: Option<MapHitRecovery>,
+}
+
+impl BindingWriteGuard {
+    pub(crate) fn new(
+        ticket: Option<freshell_ownership::OperationTicket>,
+        claim: Option<BindingClaim>,
+        sink: Option<SharedPaneIdentitySink>,
+    ) -> Self {
+        let armed = ticket.is_some() && claim.is_some() && sink.is_some();
+        let binding_hold = armed
+            .then(|| {
+                ticket
+                    .as_ref()
+                    .and_then(|ticket| ticket.hold_binding_write())
+            })
+            .flatten();
+        Self {
+            ticket,
+            claim,
+            sink,
+            binding_hold,
+            armed,
+            map_hit_recovery: None,
+        }
+    }
+
+    /// A map-hit runtime predates this request. Keep its exact claim through
+    /// failure/cancellation and retry its binding before publishing Live. Do
+    /// not tombstone an operation that is still being retried. If that exact
+    /// runtime retires, fall through to durable repair before releasing it.
+    pub(crate) fn recover_map_hit<P, PF, W, C>(&mut self, probe: P, write: W, commit: C)
+    where
+        P: Fn() -> PF + Send + Sync + 'static,
+        PF: std::future::Future<Output = bool> + Send + 'static,
+        W: Fn() -> SinkWrite + Send + Sync + 'static,
+        C: FnOnce(
+                &mut Option<freshell_ownership::OperationTicket>,
+            ) -> Result<(), freshell_ownership::CommitOutcome>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.map_hit_recovery = Some(MapHitRecovery {
+            runtime_present: Box::new(move || Box::pin(probe())),
+            write: Box::new(write),
+            commit: Box::new(commit),
+            pending_write: None,
+        });
+    }
+
+    pub(crate) async fn write_map_hit(&mut self) -> std::io::Result<()> {
+        let recovery = self
+            .map_hit_recovery
+            .as_mut()
+            .expect("map-hit recovery present");
+        // The guard owns this future. Canceling the handler drops only its
+        // borrow; recovery continues the original blocking write to completion
+        // before any retry/Live publication can overtake it.
+        recovery.pending_write = Some((recovery.write)());
+        let result = recovery.pending_write.as_mut().unwrap().await;
+        recovery.pending_write.take();
+        result
+    }
+
+    pub(crate) async fn map_hit_runtime_present(&mut self) -> bool {
+        let probe = self
+            .map_hit_recovery
+            .as_ref()
+            .map(|recovery| (recovery.runtime_present)());
+        match probe {
+            Some(probe) => probe.await,
+            None => false,
+        }
+    }
+
+    pub(crate) async fn commit_map_hit(&mut self) -> Result<(), freshell_ownership::CommitOutcome> {
+        // Keep the callback in the guard across the probe's await so a
+        // canceled lookup still transfers the exact recovery to Drop.
+        if !self.map_hit_runtime_present().await {
+            return Err(freshell_ownership::CommitOutcome::ForeignOperation);
+        }
+        let recovery = self
+            .map_hit_recovery
+            .take()
+            .expect("map-hit recovery present");
+        (recovery.commit)(&mut self.ticket)
+    }
+
+    /// The binding write completed and the caller is moving on to commit or
+    /// an explicit failure path. Return the ticket to that caller.
+    pub(crate) fn finish(mut self) -> Option<freshell_ownership::OperationTicket> {
+        self.armed = false;
+        self.ticket.take()
+    }
+
+    pub(crate) fn ticket_mut(&mut self) -> &mut Option<freshell_ownership::OperationTicket> {
+        &mut self.ticket
+    }
+
+    pub(crate) fn ticket_ref(&self) -> &Option<freshell_ownership::OperationTicket> {
+        &self.ticket
+    }
+
+    /// A known write/commit failure can await repair before answering. On
+    /// error the guard stays armed; dropping it retries asynchronously and
+    /// retains the ticket if the retry also fails.
+    pub(crate) async fn repair_now(&mut self) -> bool {
+        if !self.armed {
+            return true;
+        }
+        if self.map_hit_recovery.is_some() {
+            // Drop transfers this existing runtime's claim to the retry
+            // task. Repair here would permanently fence the retry itself.
+            return false;
+        }
+        let (Some(claim), Some(sink)) = (self.claim.as_ref(), self.sink.as_ref()) else {
+            self.armed = false;
+            return true;
+        };
+        match sink
+            .repair_failed_transition(
+                &claim.provider,
+                &claim.session_id,
+                &claim.operation_id,
+                claim.epoch,
+                claim.generation,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.armed = false;
+                true
+            }
+            Err(error) => {
+                tracing::error!(target: "invariant",
+                    provider = %claim.provider, session_id = %claim.session_id,
+                    operation_id = %claim.operation_id, epoch = claim.epoch,
+                    generation = claim.generation, error = %error,
+                    "freshagent.binding_repair_failed: the owner key remains fenced"
+                );
+                false
+            }
+        }
+    }
+}
+
+struct RetainedRepairTicket {
+    ticket: Option<freshell_ownership::OperationTicket>,
+    binding_hold: Option<freshell_ownership::BindingWriteHold>,
+}
+
+impl RetainedRepairTicket {
+    fn release(&mut self) {
+        // Release the ticket before the watchdog hold, so there is no gap
+        // where the watchdog can take over a now-repaired Starting claim.
+        self.ticket.take();
+        self.binding_hold.take();
+    }
+}
+
+impl Drop for RetainedRepairTicket {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            // A repair task canceled by runtime shutdown must fail closed too.
+            std::mem::forget(ticket);
+        }
+        if let Some(hold) = self.binding_hold.take() {
+            std::mem::forget(hold);
+        }
+    }
+}
+
+impl Drop for BindingWriteGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Some(ticket), Some(claim), Some(sink)) =
+            (self.ticket.take(), self.claim.clone(), self.sink.clone())
+        else {
+            return;
+        };
+        let hold = RetainedRepairTicket {
+            ticket: Some(ticket),
+            binding_hold: self.binding_hold.take(),
+        };
+        let map_hit_recovery = self.map_hit_recovery.take();
+        let repair = async move {
+            let mut hold = hold;
+            let mut retry_delay = std::time::Duration::from_millis(250);
+            if let Some(mut recovery) = map_hit_recovery {
+                loop {
+                    if !(recovery.runtime_present)().await {
+                        break;
+                    }
+                    let write = recovery
+                        .pending_write
+                        .take()
+                        .unwrap_or_else(|| (recovery.write)());
+                    match write.await {
+                        Ok(()) => {
+                            if !(recovery.runtime_present)().await {
+                                break;
+                            }
+                            match (recovery.commit)(&mut hold.ticket) {
+                                Ok(()) => {
+                                    tracing::info!(target: "invariant",
+                                        provider = %claim.provider, session_id = %claim.session_id,
+                                        operation_id = %claim.operation_id,
+                                        "freshagent.map_hit_binding_recovered"
+                                    );
+                                    hold.release();
+                                    return;
+                                }
+                                Err(outcome) => {
+                                    tracing::warn!(target: "invariant",
+                                        provider = %claim.provider, session_id = %claim.session_id,
+                                        operation_id = %claim.operation_id, ?outcome,
+                                        "freshagent.map_hit_binding_commit_refused"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => tracing::error!(target: "invariant",
+                            provider = %claim.provider, session_id = %claim.session_id,
+                            operation_id = %claim.operation_id, error = %error,
+                            "freshagent.map_hit_binding_retry_failed: the exact runtime remains fenced"
+                        ),
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(30));
+                }
+            }
+            loop {
+                match sink
+                    .repair_failed_transition(
+                        &claim.provider,
+                        &claim.session_id,
+                        &claim.operation_id,
+                        claim.epoch,
+                        claim.generation,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        hold.release();
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "invariant",
+                            provider = %claim.provider, session_id = %claim.session_id,
+                            operation_id = %claim.operation_id, epoch = claim.epoch,
+                            generation = claim.generation, error = %error,
+                            "freshagent.binding_repair_failed_after_cancel: the owner key remains fenced; retrying"
+                        );
+                    }
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(repair);
+            }
+            Err(_) => {
+                // There is no executor left to repair through. Preserve the
+                // claim in memory rather than running its fail-on-drop path.
+                std::mem::forget(repair);
+            }
+        }
+    }
+}
+
 /// The alias-tombstone map shape (focused-ep5-r5 Finding 2): (provider,
 /// placeholder) -> [(durable, at_ms)]. Factored for readability (and the
 /// type-complexity lint) at the fake store below.
@@ -793,7 +1226,7 @@ pub(crate) struct FakeIdentitySink {
     /// order — `(provider, sessionId, epoch, generation)`. The runner's
     /// abort/failure-path tests assert the failed transition's cleanup
     /// fires the repair with the transition's OWN (epoch, generation).
-    pub repairs: std::sync::Mutex<Vec<(String, String, u64, u64)>>,
+    pub repairs: std::sync::Mutex<Vec<(String, String, String, u64, u64)>>,
     /// Focused-ep5-r1 Finding 2 (round-4 amended): the fake mirror of the
     /// ledger's kill tombstones, stamped by `kill_clock` — a deterministic
     /// monotone counter standing in for the real ledger's wall-clock
@@ -871,6 +1304,10 @@ pub(crate) struct FakeIdentitySink {
     /// kata b8ke Task 3 review M-1 test hook — see
     /// [`Self::arm_binding_stall`].
     binding_stall: std::sync::Mutex<Option<BindingStallGate>>,
+    /// Task 3 cancellation regression: holds one failed-transition repair
+    /// before its result so the test can prove the Starting ticket remains
+    /// active until durable repair succeeds.
+    repair_gate: std::sync::Mutex<Option<RepairGate>>,
     /// Focused-ep5-r5 Finding 2: the fake mirror of the ledger's durable
     /// alias tombstones — (provider, placeholder) -> [(durable, at_ms)],
     /// written by `record_alias_tombstone`, consulted by
@@ -1061,6 +1498,21 @@ struct BindingStallGate {
     release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
+/// Task 3 cancellation regression hook: an exact failed-transition repair
+/// parks before returning its durable result.
+#[cfg(test)]
+struct RepairGate {
+    key: (String, String),
+    entered_tx: tokio::sync::oneshot::Sender<()>,
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+pub(crate) struct RepairGateHandles {
+    pub entered: tokio::sync::oneshot::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+}
+
 /// kata b8ke Task 3 review M-1 test hook: the handles
 /// [`FakeIdentitySink::arm_binding_stall`] hands the test. `entered`
 /// fires when the stalled write's mutations LANDED (row recorded, answer
@@ -1073,6 +1525,17 @@ pub(crate) struct BindingStallHandles {
 
 #[cfg(test)]
 impl FakeIdentitySink {
+    pub(crate) fn arm_repair_gate(&self, provider: &str, session_id: &str) -> RepairGateHandles {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *self.repair_gate.lock().unwrap() = Some(RepairGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        RepairGateHandles { entered, release }
+    }
+
     #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10 tests)
     pub fn seed(&self, provider: &str, session_id: &str, s: FreshAgentSettings) {
         // A seed mirrors a real binding write: the row is Bound (the round-3
@@ -1108,8 +1571,8 @@ impl FakeIdentitySink {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: s,
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(s),
         });
     }
     /// Mark a key as previously recorded WITHOUT a recoverable snapshot —
@@ -1430,22 +1893,17 @@ impl FakeIdentitySink {
             .lock()
             .unwrap()
             .insert(key.clone(), FakeRowState::Bound);
-        // Task 3 keying (mirrors `PaneLedger::fresh_agent_settings_recorded`
-        // and the ledger sink's `load_settings` blank guard): settings are
-        // a FULL snapshot (replace), so a blank snapshot REPLACES any prior
-        // one — the key leaves `settings`/`recorded` again. A lineage-only
-        // write therefore still lands on the `bindings` log but never
-        // counts as a settings-bearing record.
-        let settings_bearing = upsert.settings != FreshAgentSettings::default();
-        if settings_bearing {
-            self.recorded.lock().unwrap().insert(key.clone());
-            self.settings
-                .lock()
-                .unwrap()
-                .insert(key, upsert.settings.clone());
-        } else {
-            self.recorded.lock().unwrap().remove(&key);
-            self.settings.lock().unwrap().remove(&key);
+        // Task 3 settings policy mirrors the ledger: Keep leaves both
+        // existing snapshots and absence untouched; Replace is a complete
+        // snapshot, with the blank snapshot clearing a prior record.
+        if let SettingsUpdate::Replace(settings) = &upsert.settings {
+            if settings != &FreshAgentSettings::default() {
+                self.recorded.lock().unwrap().insert(key.clone());
+                self.settings.lock().unwrap().insert(key, settings.clone());
+            } else {
+                self.recorded.lock().unwrap().remove(&key);
+                self.settings.lock().unwrap().remove(&key);
+            }
         }
         // Focused-ep1-r4 Finding 2 + delta-r2 Finding 2 + focused-ep4-r3
         // Findings 1+2: track the row's CURRENT provenance stamps with the
@@ -1747,13 +2205,46 @@ impl PaneIdentitySink for FakeIdentitySink {
         &self,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         epoch: u64,
         generation: u64,
     ) -> SinkWrite {
-        self.repairs
-            .lock()
-            .unwrap()
-            .push((provider.into(), session_id.into(), epoch, generation));
+        self.repairs.lock().unwrap().push((
+            provider.into(),
+            session_id.into(),
+            operation_id.into(),
+            epoch,
+            generation,
+        ));
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut slot = self.repair_gate.lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|gate| gate.key.0 == provider && gate.key.1 == session_id)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                let release = gate.release_rx.lock().unwrap().take();
+                let fail = self.fail_writes.load(std::sync::atomic::Ordering::SeqCst);
+                return Box::pin(async move {
+                    let _ = gate.entered_tx.send(());
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    if fail {
+                        Err(std::io::Error::other("fake write failure"))
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         self.write_result()
     }
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
@@ -2240,6 +2731,340 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn starting_ticket(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        session_id: &str,
+        operation_id: &str,
+    ) -> freshell_ownership::OperationTicket {
+        let generation = match registry.begin_start(
+            "codex",
+            session_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            operation_id,
+            None,
+            "binding-guard-test",
+            1,
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            outcome => panic!("the Starting ticket must be granted: {outcome:?}"),
+        };
+        freshell_ownership::OperationTicket::new(
+            Arc::clone(registry),
+            "codex",
+            session_id,
+            operation_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "binding-guard-test",
+        )
+    }
+
+    #[tokio::test]
+    async fn canceled_binding_guard_holds_starting_until_repair_succeeds() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let ticket = starting_ticket(&registry, "cancel-repair", "op-cancel-repair");
+        let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting)
+            .expect("fresh-agent ticket becomes an exact claim");
+        let sink = Arc::new(FakeIdentitySink::default());
+        let repair = sink.arm_repair_gate("codex", "cancel-repair");
+        let shared_sink: SharedPaneIdentitySink = sink.clone();
+
+        drop(BindingWriteGuard::new(
+            Some(ticket),
+            Some(claim),
+            Some(shared_sink),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), repair.entered)
+            .await
+            .expect("the canceled guard schedules repair")
+            .expect("repair entry signal is sent");
+        assert!(registry.recover_stale_starts(60_000, 30_000).is_empty(),
+            "the stale-start watchdog cannot release a canceled binding before its durable repair completes");
+        assert!(matches!(
+            registry.observe("codex", "cancel-repair").state,
+            freshell_ownership::OwnershipState::Starting {
+                ref operation_id,
+                ..
+            } if operation_id == "op-cancel-repair"
+        ));
+        assert!(matches!(
+            registry.begin_start(
+                "codex",
+                "cancel-repair",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "replacement-before-repair",
+                None,
+                "binding-guard-test",
+                2,
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        repair.release.send(()).expect("release durable repair");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe("codex", "cancel-repair").state,
+                    freshell_ownership::OwnershipState::Vacant
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful durable repair releases the Starting ticket");
+        assert!(matches!(
+            registry.begin_start(
+                "codex",
+                "cancel-repair",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "replacement-after-repair",
+                None,
+                "binding-guard-test",
+                3,
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn canceled_map_hit_retries_without_releasing_its_starting_claim() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let ticket = starting_ticket(&registry, "map-hit-retry", "op-map-hit-retry");
+        let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting).unwrap();
+        let sink = Arc::new(FakeIdentitySink::default());
+        sink.set_fail_writes(true);
+        let shared_sink: SharedPaneIdentitySink = sink.clone();
+        let mut guard = BindingWriteGuard::new(Some(ticket), Some(claim), Some(shared_sink));
+        let retry_sink = sink.clone();
+        let commit_registry = registry.clone();
+        guard.recover_map_hit(
+            || std::future::ready(true),
+            move || retry_sink.write_result(),
+            move |ticket| {
+                crate::ownership_lane::commit_lane_claim(
+                    &Some(commit_registry),
+                    &Default::default(),
+                    None,
+                    "codex",
+                    "map-hit-retry",
+                    ticket,
+                    "map-hit-retry",
+                    None,
+                )
+            },
+        );
+        assert!(
+            !guard.repair_now().await,
+            "a retryable claim must not be tombstoned"
+        );
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(sink.repairs.lock().unwrap().is_empty());
+        assert!(registry.recover_stale_starts(60_000, 30_000).is_empty());
+        assert!(matches!(
+            registry.begin_start(
+                "codex",
+                "map-hit-retry",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "second-writer",
+                None,
+                "test",
+                2,
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        sink.set_fail_writes(false);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe("codex", "map-hit-retry").state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the canceled request's exact claim recovers");
+        assert!(sink.repairs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canceled_map_hit_waits_for_its_original_write_before_publishing_live() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let ticket = starting_ticket(&registry, "pending-map-hit", "op-pending-map-hit");
+        let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting).unwrap();
+        let sink: SharedPaneIdentitySink = Arc::new(FakeIdentitySink::default());
+        let mut guard = BindingWriteGuard::new(Some(ticket), Some(claim), Some(sink));
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let wait = std::sync::Mutex::new(Some(wait));
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_writes = writes.clone();
+        let commit_registry = registry.clone();
+        guard.recover_map_hit(
+            || std::future::ready(true),
+            move || {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let wait = wait.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(wait) = wait {
+                        wait.await.unwrap();
+                    }
+                    Ok(())
+                })
+            },
+            move |ticket| {
+                crate::ownership_lane::commit_lane_claim(
+                    &Some(commit_registry),
+                    &Default::default(),
+                    None,
+                    "codex",
+                    "pending-map-hit",
+                    ticket,
+                    "pending-map-hit",
+                    None,
+                )
+            },
+        );
+        let mut writing = Box::pin(guard.write_map_hit());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(writing.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(writing);
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            observed_writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "recovery must continue the original write, not overtake it with a retry"
+        );
+        assert!(matches!(
+            registry.observe("codex", "pending-map-hit").state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe("codex", "pending-map-hit").state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(observed_writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn canceled_map_hit_repairs_before_releasing_a_retired_runtime() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let ticket = starting_ticket(&registry, "retired-map-hit", "op-retired-map-hit");
+        let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting).unwrap();
+        let sink = Arc::new(FakeIdentitySink::default());
+        let repair = sink.arm_repair_gate("codex", "retired-map-hit");
+        let shared_sink: SharedPaneIdentitySink = sink.clone();
+        let mut guard = BindingWriteGuard::new(Some(ticket), Some(claim), Some(shared_sink));
+        guard.recover_map_hit(
+            || std::future::ready(false),
+            || panic!("a retired runtime cannot be rebound"),
+            |_| panic!("a retired runtime cannot be published Live"),
+        );
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), repair.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(registry.recover_stale_starts(60_000, 30_000).is_empty());
+        assert!(matches!(
+            registry.observe("codex", "retired-map-hit").state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        repair.release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe("codex", "retired-map-hit").state,
+                    freshell_ownership::OwnershipState::Vacant
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verified retirement and durable repair release the claim");
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_canceled_repair_failures_keep_the_key_closed_until_retry_succeeds() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let ticket = starting_ticket(&registry, "repair-retries", "op-repair-retries");
+        let claim = BindingClaim::from_ticket(&ticket, BindingClaimKind::Starting)
+            .expect("fresh-agent ticket becomes an exact claim");
+        let sink = Arc::new(FakeIdentitySink::default());
+        sink.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let shared_sink: SharedPaneIdentitySink = sink.clone();
+        let mut guard = BindingWriteGuard::new(Some(ticket), Some(claim), Some(shared_sink));
+
+        assert!(
+            !guard.repair_now().await,
+            "the first repair failure keeps the guard armed"
+        );
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sink.repairs.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop retries the failed repair");
+        assert!(matches!(
+            registry.begin_start(
+                "codex",
+                "repair-retries",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "replacement-during-repair-failures",
+                None,
+                "binding-guard-test",
+                2,
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        sink.fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe("codex", "repair-retries").state,
+                    freshell_ownership::OwnershipState::Vacant
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retry releases the ticket only after repair succeeds");
+        assert!(sink.repairs.lock().unwrap().len() >= 3);
+    }
+
     #[tokio::test]
     async fn fake_sink_records_and_serves_settings() {
         let fake = Arc::new(FakeIdentitySink::default());
@@ -2259,8 +3084,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings {
                 collaboration_mode: None,
                 model: Some("m".into()),
                 sandbox: None,
@@ -2268,7 +3093,7 @@ mod tests {
                 effort: Some("low".into()),
                 cwd: Some("/w".into()),
                 plugins: None,
-            },
+            }),
         })
         .await
         .expect("binding write ok");
@@ -2305,8 +3130,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("binding write ok");
@@ -2353,8 +3178,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("binding write ok");
@@ -2498,8 +3323,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("binding write ok");
@@ -2529,8 +3354,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("conn-less refresh ok");
@@ -2550,8 +3375,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("partial refresh ok");
@@ -2591,8 +3416,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("out-of-order write ok");
@@ -2617,8 +3442,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("newer write ok");
@@ -2640,8 +3465,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("binding write ok");
@@ -2674,8 +3499,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("browser-stamped create write ok");
@@ -2694,8 +3519,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("headless rebind write ok");
@@ -2718,8 +3543,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("conn-less refresh ok");
@@ -2747,8 +3572,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         };
         fake.retire_closed("claude", "durable-m")
             .await
@@ -2861,8 +3686,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("write ok");
@@ -2898,8 +3723,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
         };
         // Arm + invoke + KILL + release: suppressed.
         let fake = Arc::new(FakeIdentitySink::default());
@@ -2936,7 +3761,7 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
+            claim: None,
             ..upsert()
         })
         .await

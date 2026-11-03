@@ -1398,6 +1398,7 @@ impl FreshClaudeState {
         tab_id: Option<&str>,
         pane_id: Option<&str>,
         generation: u64,
+        operation_id: &str,
     ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
         let Some(flavor) = session_type_from_flavor(session_type) else {
             return Err((
@@ -1455,6 +1456,19 @@ impl FreshClaudeState {
         // UNDER-TICKET: no lane claim (own_ticket None), so the registration
         // tail's commit is a no-op — the runner performs the one commit_live.
         let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        let Some(registry) = self.ownership.as_ref() else {
+            return Err((
+                "the ownership coordinator is unavailable for handoff resume".to_string(),
+                session_id.to_string(),
+            ));
+        };
+        let handoff_claim = crate::identity_sink::BindingClaim::handoff(
+            PROVIDER,
+            session_id,
+            operation_id,
+            registry.boot_epoch(),
+            generation,
+        );
         let outcome = self
             .resume_for_attach(
                 &msg,
@@ -1465,6 +1479,7 @@ impl FreshClaudeState {
                 &mut lease_guard,
                 &mut own_ticket,
                 Some(generation),
+                Some(handoff_claim),
             )
             .await;
         if let Some(mut g) = lease_guard.take() {
@@ -2096,69 +2111,14 @@ impl FreshClaudeState {
                     // the runtime kept running — acknowledging a live
                     // writer with an unowned key licensed a SECOND writer).
                     if self.has_live_session(sid).await {
-                        // The live runtime's identity: the session's map
-                        // key + its sidecar pid.
-                        own_ticket = Some(ticket);
-                        let map_key = self.resolve_session_key(sid).await;
-                        let adopted_pid = match map_key.as_ref() {
-                            Some(mk) => self
-                                .sessions
-                                .lock()
-                                .await
-                                .get(mk)
-                                .and_then(|sess| sess.child.id()),
-                            None => None,
-                        };
-                        let adopted_map_key = map_key.clone().unwrap_or_else(|| sid.to_string());
-                        match self.commit_lane_claim_at(
-                            &mut own_ticket,
-                            &adopted_map_key,
-                            adopted_pid,
-                        ) {
-                            Ok(()) => {
-                                self.broadcast(&ServerMessage::SessionRuntimeOwner(
-                                    SessionRuntimeOwner {
-                                        provider: PROVIDER.to_string(),
-                                        session_id: sid.to_string(),
-                                        epoch: self
-                                            .ownership
-                                            .as_ref()
-                                            .map(|r| r.boot_epoch())
-                                            .unwrap_or(0),
-                                        generation: self
-                                            .ownership
-                                            .as_ref()
-                                            .map(|r| r.observe(PROVIDER, sid).generation)
-                                            .unwrap_or(0),
-                                        owner_kind: "fresh-agent".into(),
-                                        previous_kind: None,
-                                        terminal_id: None,
-                                        operation_id: format!("adopt-{request_id}"),
-                                        transition: "handoff-committed".into(),
-                                        reason: None,
-                                        fenced: None,
-                                        alias_of: None,
-                                    },
-                                ));
-                            }
-                            Err(outcome) => {
-                                tracing::warn!(target: "freshell_freshagent::claude",
-                                    session_id = %sid, request_id = %request_id,
-                                    outcome = ?outcome,
-                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
-                                     moved on while the live-runtime adopt committed — the \
-                                     create is refused (never a live writer left unowned)"
-                                );
-                                return self.fail_create(
-                                    &request_id,
-                                    view_id.as_deref(),
-                                    "STALE_CLAIM",
-                                    "ownership moved on while adopting the live session; refresh and retry",
-                                );
-                            }
-                        }
                         return self
-                            .adopt_live_create(&request_id, view_id.as_deref(), sid, session_type)
+                            .adopt_live_create_with_starting_ticket(
+                                &request_id,
+                                view_id.as_deref(),
+                                sid,
+                                session_type,
+                                Some(ticket),
+                            )
                             .await;
                     }
                     own_ticket = Some(ticket);
@@ -2341,6 +2301,7 @@ impl FreshClaudeState {
                     }),
                     recorded_settings: Some(settings),
                     owning_generation: None,
+                    binding_claim: None,
                     provenance,
                     naming: Some(&msg),
                     partial_runtime_key: Some(launch_id.clone()),
@@ -2496,6 +2457,156 @@ impl FreshClaudeState {
         durable: &str,
         session_type: &str,
     ) -> ClaudeCreateOutcome {
+        self.adopt_live_create_with_starting_ticket(
+            request_id,
+            view_id,
+            durable,
+            session_type,
+            None,
+        )
+        .await
+    }
+
+    async fn adopt_live_create_with_starting_ticket(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+        durable: &str,
+        session_type: &str,
+        starting_ticket: Option<freshell_ownership::OperationTicket>,
+    ) -> ClaudeCreateOutcome {
+        let no_ticket: Option<freshell_ownership::OperationTicket> = None;
+        let mut write_guard = starting_ticket.map(|ticket| {
+            let claim = crate::identity_sink::BindingClaim::from_ticket(
+                &ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            );
+            let mut guard = crate::identity_sink::BindingWriteGuard::new(
+                Some(ticket),
+                claim.clone(),
+                self.identity_sink(),
+            );
+            // Establish this token under the held Starting claim, then
+            // compare the same sidecar on every retry. The recovery callback
+            // is installed before any await, including its first map lookup.
+            let runtime = Arc::new(std::sync::OnceLock::new());
+            let probe_runtime = runtime.clone();
+            let probe_state = self.clone();
+            let probe_id = durable.to_string();
+            let retry_state = self.clone();
+            let retry_id = durable.to_string();
+            let retry_type = session_type.to_string();
+            let commit_state = self.clone();
+            guard.recover_map_hit(
+                move || {
+                    let state = probe_state.clone();
+                    let id = probe_id.clone();
+                    let runtime = probe_runtime.clone();
+                    async move {
+                        let sessions = state.sessions.lock().await;
+                        let Some(key) = Self::session_key_in(&sessions, &id) else {
+                            return false;
+                        };
+                        let session = &sessions[&key];
+                        let expected = runtime.get_or_init(|| {
+                            (
+                                key.clone(),
+                                session.ownership_id.clone(),
+                                session.child.id(),
+                            )
+                        });
+                        expected.0 == key
+                            && expected.1 == session.ownership_id
+                            && expected.2 == session.child.id()
+                            && !expected
+                                .2
+                                .is_some_and(crate::ownership_lane::partial_pid_confirmed_dead)
+                    }
+                },
+                move || {
+                    let state = retry_state.clone();
+                    let id = retry_id.clone();
+                    let session_type = retry_type.clone();
+                    let claim = claim.clone();
+                    Box::pin(async move {
+                        state
+                            .record_established_binding(
+                                &id,
+                                &session_type,
+                                None,
+                                None,
+                                &None,
+                                claim.as_ref(),
+                                crate::identity_sink::SettingsUpdate::Keep,
+                            )
+                            .await
+                    })
+                },
+                move |ticket| {
+                    let Some((key, _, pid)) = runtime.get() else {
+                        return Err(freshell_ownership::CommitOutcome::ForeignOperation);
+                    };
+                    commit_state.commit_lane_claim_at(ticket, key, *pid)
+                },
+            );
+            guard
+        });
+        if let Some(guard) = write_guard.as_mut() {
+            if !guard.map_hit_runtime_present().await {
+                return self.fail_create(
+                    request_id,
+                    view_id,
+                    "STALE_CLAIM",
+                    "The session stopped while being adopted; refresh and retry.",
+                );
+            }
+        }
+        let binding_result = if let Some(guard) = write_guard.as_mut() {
+            guard.write_map_hit().await
+        } else {
+            self.record_established_binding(
+                durable,
+                session_type,
+                None,
+                None,
+                &no_ticket,
+                None,
+                crate::identity_sink::SettingsUpdate::Keep,
+            )
+            .await
+        };
+        if let Err(error) = binding_result {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %durable, error = %error,
+                "freshagent.claude.adopt_binding_failed: the identity could not be persisted"
+            );
+            if let Some(guard) = write_guard.as_mut() {
+                let _ = guard.repair_now().await;
+            }
+            return self.fail_create(
+                request_id,
+                view_id,
+                "LEDGER_WRITE_FAILED",
+                "The session's recovery record could not be persisted; refresh and retry.",
+            );
+        }
+
+        if let Some(mut guard) = write_guard {
+            if let Err(outcome) = guard.commit_map_hit().await {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %durable, request_id = %request_id, outcome = ?outcome,
+                    "fresh_agent_create_adopt_commit_stale: the coordinator moved while the identity write was in flight"
+                );
+                return self.fail_create(
+                    request_id,
+                    view_id,
+                    "STALE_CLAIM",
+                    "ownership moved on while adopting the live session; refresh and retry",
+                );
+            }
+            guard.finish();
+        }
+
         self.create_dedup
             .record_success(
                 request_id,
@@ -5217,6 +5328,7 @@ impl FreshClaudeState {
         // Under-ticket resumes bind recovery metadata at the handoff's
         // generation before the runner commits the replacement runtime.
         handoff_generation: Option<u64>,
+        handoff_claim: Option<crate::identity_sink::BindingClaim>,
     ) -> Result<(), ResumeClaudeError> {
         let durable = claim.durable.as_str();
         let claim_dead_state = claim.dead_state;
@@ -5328,6 +5440,7 @@ impl FreshClaudeState {
                 }),
                 recorded_settings: recovered,
                 owning_generation: handoff_generation,
+                binding_claim: handoff_claim,
                 // Conn-less lane (D8): attach-resume is not a create; the ledger
                 // merge keeps the row's existing stamps.
                 provenance: None,
@@ -9046,7 +9159,12 @@ pub(crate) mod tests {
             true
         );
         let bindings = fake.bindings.lock().unwrap();
-        let settings = &bindings.last().unwrap().settings;
+        let settings = bindings
+            .last()
+            .unwrap()
+            .settings
+            .as_replacement()
+            .expect("the accepted settings snapshot is a replacement");
         assert_eq!(settings.model.as_deref(), Some("sonnet"));
         assert_eq!(settings.effort.as_deref(), Some("max"));
         assert_eq!(settings.permission_mode.as_deref(), Some("plan"));
@@ -9093,11 +9211,25 @@ pub(crate) mod tests {
         assert_eq!(snapshot["status"], "idle");
         let bindings = fake.bindings.lock().unwrap();
         assert_eq!(
-            bindings.last().unwrap().settings.model.as_deref(),
+            bindings
+                .last()
+                .unwrap()
+                .settings
+                .as_replacement()
+                .expect("the accepted model snapshot is a replacement")
+                .model
+                .as_deref(),
             Some("sonnet")
         );
         assert_eq!(
-            bindings.last().unwrap().settings.effort.as_deref(),
+            bindings
+                .last()
+                .unwrap()
+                .settings
+                .as_replacement()
+                .expect("the accepted effort snapshot is a replacement")
+                .effort
+                .as_deref(),
             Some("high")
         );
     }
@@ -9149,6 +9281,8 @@ pub(crate) mod tests {
                 .last()
                 .unwrap()
                 .settings
+                .as_replacement()
+                .expect("the prior settings remain an explicit replacement")
                 .model
                 .as_deref(),
             Some("opus")
@@ -10816,8 +10950,8 @@ pub(crate) mod tests {
                 provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
                 observed_epoch: None,
                 observed_generation: None,
-                authoritative: false,
-                settings: Default::default(),
+                claim: None,
+                settings: crate::identity_sink::SettingsUpdate::Replace(Default::default()),
                 genesis: crate::identity_sink::GenesisUpdate::Keep,
             })
             .await
@@ -13336,8 +13470,10 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("lineage seed write");
@@ -15878,10 +16014,14 @@ pub(crate) mod tests {
             created["sessionId"].as_str().unwrap(),
             "keyed by the create-time UUID"
         );
-        assert_eq!(b.settings.model.as_deref(), Some("opus-x"));
-        assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
-        assert_eq!(b.settings.effort.as_deref(), Some("high"));
-        assert!(b.settings.cwd.is_some());
+        let settings = b
+            .settings
+            .as_replacement()
+            .expect("create settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("opus-x"));
+        assert_eq!(settings.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert!(settings.cwd.is_some());
     }
 
     /// G15: the create's plugins are part of the settings the session records
@@ -15904,7 +16044,10 @@ pub(crate) mod tests {
             await_claude_session_init_binding_row(&fake, created["sessionId"].as_str().unwrap())
                 .await;
         assert_eq!(
-            row.settings.plugins,
+            row.settings
+                .as_replacement()
+                .expect("create plugin settings are an explicit replacement")
+                .plugins,
             Some(vec!["/workspace/.claude/plugins/local".to_string()])
         );
 
@@ -15920,7 +16063,9 @@ pub(crate) mod tests {
                 .await;
         assert_eq!(
             row.settings,
-            crate::identity_sink::FreshAgentSettings::default(),
+            crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default()
+            ),
             "an empty plugin list records nothing"
         );
         drop(env);
@@ -15961,7 +16106,9 @@ pub(crate) mod tests {
         // verbatim) — the no-skip truth.
         assert_eq!(
             b.settings,
-            crate::identity_sink::FreshAgentSettings::default(),
+            crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default()
+            ),
             "blank settings recorded verbatim"
         );
         // ...but a lineage-only row is NOT a settings-bearing record: the
@@ -16275,7 +16422,7 @@ pub(crate) mod tests {
                 .expect("the never-recorded resume's lineage-only row (r27 F4)");
             assert_eq!(
                 row.settings,
-                crate::identity_sink::FreshAgentSettings::default(),
+                crate::identity_sink::SettingsUpdate::Keep,
                 "blank settings recorded verbatim — no invented values"
             );
         }
