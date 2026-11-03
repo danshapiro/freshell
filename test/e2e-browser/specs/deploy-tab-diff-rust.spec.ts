@@ -155,6 +155,15 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
         body: JSON.stringify({ mode: 'codex', name: 'work',
           sessionRef: { provider: 'codex', sessionId: SESSION_ID } }) })).json()
       expect(codex.data.terminalId).toBeTruthy()
+      // Resumed scoped sessions use their saved name, not the create-time
+      // layout hint. Exercise a real user rename before asserting permanence.
+      const renamed = await (await fetch(`${info.baseUrl}/api/tabs/${codex.data.tabId}`, {
+        method: 'PATCH', headers: auth,
+        body: JSON.stringify({ name: 'work', nameIntent: 'user',
+          expectedNameRef: { kind: 'session', provider: 'codex', sessionId: SESSION_ID } }),
+      })).json()
+      expect(renamed.status, JSON.stringify(renamed)).toBe('ok')
+      expect(renamed.data?.sessionName?.outcome?.applied, JSON.stringify(renamed)).toBe(true)
       const shell = await (await fetch(`${info.baseUrl}/api/tabs`, { method: 'POST', headers: auth,
         body: JSON.stringify({ mode: 'shell', name: 'sh' }) })).json()
       expect(shell.data.tabId).toBeTruthy()
@@ -204,7 +213,7 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       expect(bad.code).not.toBe(0)                         // exits non-zero
       expect(bad.out).toContain('TAB-DIFF DIVERGENCE')     // loud
       expect(bad.out).toMatch(/MISSING/)                   // names the category (closed codex pane)
-      expect(bad.out).toContain('tab=work')                // names the diverged tab (explicit REST name survives the restart — display precedence)
+      expect(bad.out).toContain('tab=work')                // names the diverged tab (explicit user name survives the restart — display precedence)
       expect(bad.out).toContain(codex.data.tabId)          // and names its stable tabKey identity (deviceId:tabId)
       // Remediation points the operator at the UI recovery flow (the operator
       // server-push restore machinery was deleted in the kata h9vt cleanup;

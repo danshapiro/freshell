@@ -142,6 +142,29 @@ wait "$runner_pid"`
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  // The pre-push hook already selected the exact Cargo test arguments. Keep
+  // this internal route narrow: it runs only that test command and reuses the
+  // standard strict sandbox command, temp ownership, resource caps, and guard.
+  if (argv[0] === '--pre-push-cargo-test') {
+    const cargoArgs = argv.slice(1)
+    const cargo = process.platform === 'win32' ? 'cargo.exe' : 'cargo'
+    if (process.env.FRESHELL_RUST_TEST_SANDBOX === '1') {
+      log('info', 'prepush_rust_test_sandbox_route_selected', {
+        mode: 'runtime-suite', cargoBuildJobs: SANDBOX_CARGO_BUILD_JOBS,
+        rustTestThreads: SANDBOX_RUST_TEST_THREADS, tokioWorkerThreads: SANDBOX_TOKIO_WORKER_THREADS,
+        forwardedArgumentCount: cargoArgs.length,
+      })
+      const { FRESHELL_SERVER_BIN: _hostBinary, ...env } = process.env
+      return runChild(
+        path.join(PROJECT_ROOT, 'scripts/sandbox-test.sh'),
+        ['--runtime-suite', sandboxCommand(argv)],
+        { ...env, FRESHELL_SANDBOX_OWNER_GUARD: '1' },
+        true,
+      )
+    }
+    return runChild(cargo, ['test', ...cargoArgs], process.env)
+  }
+
   if (process.env.FRESHELL_RUST_TEST_SANDBOX === '1') {
     log('info', 'rust_test_sandbox_route_selected', {
       mode: 'runtime-suite', cargoTargetDirectory: SANDBOX_TARGET_DIRECTORY, cargoBuildJobs: SANDBOX_CARGO_BUILD_JOBS,

@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { expect, it } from 'vitest'
 
-function fixture(mode: 'available' | 'missing' | 'foreign') {
+function fixture(mode: 'available' | 'missing' | 'foreign' | 'stale-policy') {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'codex-sandbox-cache-'))
   for (const file of [
     'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs',
@@ -24,7 +24,7 @@ function fixture(mode: 'available' | 'missing' | 'foreign') {
   writeFileSync(path.join(root, '.runtime-build/codex-contract/codex-policy.json'), policy.stdout)
   const image = `sha256:${'b'.repeat(64)}`
   writeFileSync(path.join(root, '.runtime-build/codex-contract/staged.json'), JSON.stringify({
-    image, uid: 1000, gid: 1000, nativeSandboxPolicy: { profileSha256: `sha256:${createHash('sha256').update(policy.stdout).digest('hex')}` },
+    image, uid: 1000, gid: 1000, nativeSandboxPolicy: { profileSha256: mode === 'stale-policy' ? `sha256:${'0'.repeat(64)}` : `sha256:${createHash('sha256').update(policy.stdout).digest('hex')}` },
   }))
   const canonical = spawnSync('bash', ['-c', 'pwd -P'], { cwd: root, encoding: 'utf8', timeout: 10_000 })
   expect(canonical.status, canonical.stderr).toBe(0)
@@ -55,16 +55,19 @@ else if (args[0] !== 'ps') process.exit(2);
   chmodSync(path.join(root, 'bin/docker'), 0o755)
   const receipt = path.join(root, 'docker.jsonl')
   return {
-    root, volume, labels,
-    run(wrapper = false) {
+    root, volume, labels, image,
+    run(wrapper = false, command = 'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe') {
       const result = spawnSync(wrapper ? 'bash' : process.execPath, wrapper
-        ? ['scripts/sandbox-test.sh', '--runtime-suite', 'node test/integration/providers/codex-cli-contract.mjs --scenario text-history --missing-policy-client-probe']
+        ? ['scripts/sandbox-test.sh', '--runtime-suite', command]
         : ['scripts/testing/prepare-codex-contract.mjs', '--verify-sandbox'], {
         cwd: root, encoding: 'utf8', timeout: 30_000,
         env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, FIXTURE_RECEIPT: receipt,
           TMPDIR: path.join(root, 'control'), FRESHELL_SANDBOX_OWNER_GUARD: '0' },
       })
-      if (!existsSync(receipt)) throw new Error(`Docker fixture was not reached: ${result.error?.message ?? ''}\n${result.stderr}`)
+      if (!existsSync(receipt)) {
+        if (mode !== 'stale-policy') throw new Error(`Docker fixture was not reached: ${result.error?.message ?? ''}\n${result.stderr}`)
+        return { ...result, calls: [] }
+      }
       return { ...result, calls: readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) }
     },
     cleanup() { rmSync(root, { recursive: true, force: true }) },
@@ -116,5 +119,48 @@ it('dispatches a verified native contract with both its seccomp policy and label
     for (const destination of ['/workspace/target', '/freshell-test-artifacts']) {
       expect(runtime).toContain(`type=volume,src=${f.volume},dst=${destination},${Object.entries(f.labels).map(([key, value]) => `volume-label=${key}=${value}`).join(',')}`)
     }
+  } finally { f.cleanup() }
+})
+
+const codexVitestSelector = 'pnpm run test:vitest run test/integration/providers/codex-cli-contract.test.ts --config config/vitest/vitest.config.ts'
+
+it('dispatches the exact Codex Vitest selector through its verified seccomp contract', () => {
+  const f = fixture('available')
+  try {
+    const result = f.run(true, codexVitestSelector)
+    expect(result.status, result.stderr).toBe(0)
+    const runs = result.calls.filter(args => args[0] === 'run')
+    expect(runs.filter(args => args.includes('--verify-prepared'))).toHaveLength(2)
+    const runtime = runs.find(args => args.includes('FRESHELL_SANDBOX_MODE=runtime-suite'))!
+    expect(runtime).toContain(f.image)
+    expect(runtime.at(-1)).toBe(codexVitestSelector)
+    expect(runtime).toContain(`seccomp=${f.root}/.runtime-build/codex-contract/codex-policy.json`)
+    expect(runtime).toContain('FRESHELL_CODEX_CONTRACT_POLICY=prepared')
+  } finally { f.cleanup() }
+})
+
+it('keeps a neighboring Codex Vitest selector on the default sandbox policy', () => {
+  const f = fixture('available')
+  const neighboringSelector = `${codexVitestSelector} --testNamePattern=approval`
+  try {
+    const result = f.run(true, neighboringSelector)
+    expect(result.status, result.stderr).toBe(0)
+    const runs = result.calls.filter(args => args[0] === 'run')
+    const runtime = runs.find(args => args.includes('FRESHELL_SANDBOX_MODE=runtime-suite'))!
+    expect(runtime).toContain('freshell-sandbox:latest')
+    expect(runtime.at(-1)).toBe(neighboringSelector)
+    expect(runtime.some(argument => argument.startsWith('seccomp='))).toBe(false)
+    expect(runtime).not.toContain('FRESHELL_CODEX_CONTRACT_POLICY=prepared')
+    expect(runs.some(args => args.includes('--verify-prepared'))).toBe(false)
+  } finally { f.cleanup() }
+})
+
+it('stops the exact Codex Vitest selector when stage verification fails', () => {
+  const f = fixture('stale-policy')
+  try {
+    const result = f.run(true, codexVitestSelector)
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('prepared Codex native policy is absent or stale')
+    expect(result.calls).toEqual([])
   } finally { f.cleanup() }
 })

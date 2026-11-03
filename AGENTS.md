@@ -335,6 +335,8 @@ Managed provider environment and recovery repair: [implementation plan](docs/pla
 Freshcodex completion: [implementation plan](docs/plans/2026-10-25-freshcodex-complete.md). Managed native runtime: [qualification and ownership](docs/development/codex-native-runtime.md).
 Google coding CLI support (Antigravity CLI and existing Gemini CLI compatibility): [implementation plan](docs/plans/2026-10-29-google-cli-first-class-support.md).
 
+Background pane viewport screenshots: [implementation plan](docs/plans/2026-11-01-viewport-screenshots.md).
+
 Fresh Agent compact panels: [implementation plan](docs/plans/2026-11-01-fresh-agent-compact-panels.md).
 
 Fresh Agent review polish (findings 7–12): [implementation plan](docs/plans/2026-11-01-fresh-agent-review-polish.md).

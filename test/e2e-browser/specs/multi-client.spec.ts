@@ -27,28 +27,39 @@ async function waitForReady(page: Page): Promise<void> {
 }
 
 async function ensureTerminalReady(page: Page): Promise<void> {
-  await page.waitForTimeout(500)
-  const xtermVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
-  if (!xtermVisible) {
-    const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-    for (const name of shellNames) {
-      try {
-        const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-        if (await button.isVisible().catch(() => false)) {
-          await button.click({ timeout: 5000 })
-          break
-        }
-      } catch {
-        continue
-      }
-    }
+  // Share the existing render window across the tab, picker, and xterm.
+  const deadline = Date.now() + 30_000
+  const remaining = () => Math.max(1, deadline - Date.now())
+  let tabId = ''
+  await expect.poll(async () => {
+    tabId = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState().tabs.activeTabId ?? '')
+    return tabId
+  }, { timeout: remaining() }).not.toBe('')
+  const content = page.locator(`[data-tab-content-id="${tabId}"]`)
+  const terminal = content.locator('.xterm').first()
+  const picker = content.getByRole('toolbar', { name: /pane type picker/i })
+  await expect.poll(async () => await terminal.isVisible() || await picker.isVisible(), {
+    timeout: remaining(),
+  }).toBe(true)
+  if (!(await terminal.isVisible())) {
+    await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+      .first().press('Enter', { timeout: Math.min(5_000, remaining()) })
   }
-
-  await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })
-  await page.waitForFunction(() => {
-    const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()
-    return buf !== null && buf !== undefined && buf.length > 0
-  }, { timeout: 20_000 })
+  await terminal.waitFor({ state: 'visible', timeout: remaining() })
+  await page.waitForFunction((id) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    const readTerminalId = (node: any): string | undefined => {
+      if (!node) return undefined
+      if (node.type === 'leaf' && node.content?.kind === 'terminal') return node.content.terminalId
+      for (const child of node.children ?? []) {
+        const found = readTerminalId(child)
+        if (found) return found
+      }
+      return undefined
+    }
+    const terminalId = readTerminalId(harness?.getState().panes.layouts[id])
+    return Boolean(terminalId && harness?.getTerminalBuffer(terminalId)?.length)
+  }, tabId, { timeout: 20_000 })
 }
 
 async function executeCommand(page: Page, command: string): Promise<void> {
@@ -798,15 +809,44 @@ test.describe('Multi-Client', () => {
     // transport-level reconnect must NOT re-claim (stuck markers would force
     // sinceSeq=0 replays that duplicate scrollback).
     await waitForTerminalText(page, '__MODE_SYNC_MARK__', terminalId!, 45_000)
-    await page.evaluate(() => { window.__FRESHELL_TEST_HARNESS__?.forceDisconnect() })
-    await waitForReady(page)
-    await page.waitForFunction((id) => {
-      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-      return sent.some((m: any) =>
-        m?.type === 'terminal.attach'
-        && m?.terminalId === id
-        && m?.surfaceReset !== true)
-    }, terminalId, { timeout: 45_000 })
+    // A same-server reconnect must supply its own ready and attach receipts;
+    // neither a cached ready state nor an earlier attach proves consumption.
+    const reconnectDeadline = Date.now() + 45_000
+    const reconnectRemaining = () => Math.max(1, reconnectDeadline - Date.now())
+    receivedFrames.clear()
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      harness?.clearSentWsMessages?.()
+      harness?.forceDisconnect()
+    })
+    await receivedFrames.waitForFrame(
+      (frame) => frame.type === 'ready',
+      'ready from the same-surface reconnect',
+      reconnectRemaining(),
+    )
+    let reconnectAttachRequestId: string | undefined
+    await expect.poll(async () => {
+      reconnectAttachRequestId = await page.evaluate((id) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (harness?.getWsReadyState() !== 'ready' || harness.getState().connection.status !== 'ready') return undefined
+        const sent = harness.getSentWsMessages?.() ?? []
+        const attach = [...sent].reverse().find((msg: any) =>
+          msg?.type === 'terminal.attach'
+          && msg?.terminalId === id
+          && msg?.surfaceReset !== true
+          && typeof msg?.attachRequestId === 'string'
+          && msg.attachRequestId.length > 0) as { attachRequestId: string } | undefined
+        return attach?.attachRequestId
+      }, terminalId)
+      return reconnectAttachRequestId
+    }, { timeout: reconnectRemaining() }).toBeTruthy()
+    await receivedFrames.waitForFrame(
+      (frame) => frame.type === 'terminal.attach.ready'
+        && frame.terminalId === terminalId
+        && frame.attachRequestId === reconnectAttachRequestId,
+      `attach.ready for same-surface reconnect ${reconnectAttachRequestId}`,
+      reconnectRemaining(),
+    )
 
     // Wheel over the pane must now forward SGR mouse reports on the wire.
     await page.evaluate(() => { window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.() })

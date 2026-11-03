@@ -15,16 +15,34 @@ if [ "${FRESHELL_PREPUSH:-1}" = "0" ]; then
   exit 0
 fi
 
-# git exports GIT_DIR/GIT_PREFIX (the pushing worktree's gitdir) into this
-# hook. If they leak into the lane processes, every test-side `git` child
-# resolves against the SHARED repository instead of the test's own tempdir:
-# a `git init` inside a freshell-server test re-initialized the main
-# checkout's config (observed writing core.bare=true and colliding on
-# config.lock), and test add/commit landed on the main HEAD. The hook's own
-# git calls use cwd discovery (equivalent in a worktree), so strip the
-# overrides before anything runs.
+# Git exports repository-selection variables into this hook. Strip those
+# before using cwd discovery, but retain the parent's command-scoped config
+# through one root lookup so its exact safe.directory trust remains available.
+unset PUSH_ROOT HOOK_DIR
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX \
-  GIT_CONFIG_PARAMETERS GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+  GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
+fail() {
+  echo "pre-push: FAILED — $1" >&2
+  echo "pre-push: fix and push again, or bypass with: git push --no-verify" >&2
+  exit 1
+}
+
+PUSH_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) \
+  || fail "cannot identify pushing worktree while Git hook trust is available"
+[ -d "$PUSH_ROOT" ] || fail "Git reported a missing pushing worktree"
+PUSH_ROOT=$(cd "$PUSH_ROOT" && pwd -P) \
+  || fail "cannot resolve the pushing worktree path"
+HOOK_DIR=$(cd "$(dirname "$0")" && pwd) \
+  || fail "cannot resolve the pre-push hook directory"
+
+# Git's command-line config is needed only for this hook's own Git queries.
+# Keep it out of Cargo, TypeScript and test child environments.
+unset GIT_CONFIG_PARAMETERS
+hook_git() {
+  git -c "safe.directory=$PUSH_ROOT" -C "$PUSH_ROOT" "$@"
+}
+cd "$PUSH_ROOT" || fail "cannot enter the verified pushing worktree"
 
 ZERO=0000000000000000000000000000000000000000
 changed=""
@@ -35,11 +53,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$ZERO" ] && continue
   if [ "$remote_sha" = "$ZERO" ]; then
     # New branch: diff against its merge base with origin/main.
-    base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || { full_gate=1; continue; }
+    base=$(hook_git merge-base "$local_sha" origin/main 2>/dev/null) || { full_gate=1; continue; }
   else
     base="$remote_sha"
   fi
-  chunk=$(git diff --name-only "$base" "$local_sha" 2>/dev/null) || full_gate=1
+  chunk=$(hook_git diff --name-only "$base" "$local_sha" 2>/dev/null) || full_gate=1
   if [ -n "$chunk" ]; then
     changed="${changed}${chunk}
 "
@@ -56,20 +74,19 @@ elif [ -n "$changed" ]; then
   printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|\.npmrc$|tsconfig' && run_ts=1
 fi
 
-# The plan script lives next to this hook (the main checkout's copy —
-# core.hooksPath points here, so even worktrees at older commits run the
-# current routing logic), while cargo itself runs in the pushing worktree.
-HOOK_DIR=$(cd "$(dirname "$0")" && pwd)
+# The plan script lives next to this hook (core.hooksPath may point at the
+# shared hook owner); Cargo and package-manager selection use the verified
+# pushing worktree.
 TSX=""
-if [ -x node_modules/.bin/tsx ]; then
-  TSX="node_modules/.bin/tsx"
+if [ -x "$PUSH_ROOT/node_modules/.bin/tsx" ]; then
+  TSX="$PUSH_ROOT/node_modules/.bin/tsx"
 elif [ -x "$HOOK_DIR/../../node_modules/.bin/tsx" ]; then
   TSX="$HOOK_DIR/../../node_modules/.bin/tsx"
 else
   # Fresh worktrees often lack node_modules; the owning checkout (the one
   # whose .git dir this worktree shares) has it. Derive the owning root
   # from the git common dir so worktree pushes still get the full gate.
-  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  common_dir=$(hook_git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   if [ -n "$common_dir" ] && [ -d "$common_dir" ]; then
     owning_root="${common_dir%/.git}"
     if [ "$owning_root" != "$common_dir" ] && [ -x "$owning_root/node_modules/.bin/tsx" ]; then
@@ -110,10 +127,18 @@ if [ "$run_rust" = 0 ] && [ "$run_ts" = 0 ]; then
   exit 0
 fi
 
-fail() {
-  echo "pre-push: FAILED — $1" >&2
-  echo "pre-push: fix and push again, or bypass with: git push --no-verify" >&2
-  exit 1
+run_selected_cargo_test() {
+  if [ "${FRESHELL_RUST_TEST_SANDBOX:-0}" = "1" ]; then
+    # The hook/planner may come from the shared hook owner, but both the
+    # launcher and sandbox wrapper must come from the pushing worktree.
+    local runner
+    runner="$PUSH_ROOT/scripts/testing/run-rust-tests.ts"
+    [ -f "$runner" ] || fail "pushing worktree is missing scripts/testing/run-rust-tests.ts"
+    [ -n "$TSX" ] || fail "sandboxed Rust tests require tsx to launch scripts/testing/run-rust-tests.ts"
+    "$TSX" "$runner" --pre-push-cargo-test "$@"
+  else
+    cargo test "$@"
+  fi
 }
 
 if [ "$run_rust" = 1 ]; then
@@ -143,14 +168,15 @@ if [ "$run_rust" = 1 ]; then
         ;;
       workspace)
         echo "pre-push: rust gate — cargo test --workspace --exclude freshell-tauri (the long one)" >&2
-        cargo test --workspace --exclude freshell-tauri --locked \
+        run_selected_cargo_test --workspace --exclude freshell-tauri --locked \
           || fail "cargo test --workspace --exclude freshell-tauri --locked"
         ;;
       packages)
-        pkgs_args=""
-        for p in $test_pkgs; do pkgs_args="$pkgs_args -p $p"; done
-        echo "pre-push: rust gate — targeted cargo test:$pkgs_args" >&2
-        cargo test --locked $pkgs_args || fail "cargo test$pkgs_args"
+        pkgs_args=()
+        for p in $test_pkgs; do pkgs_args+=(-p "$p"); done
+        echo "pre-push: rust gate — targeted cargo test --locked ${pkgs_args[*]}" >&2
+        run_selected_cargo_test --locked "${pkgs_args[@]}" \
+          || fail "cargo test --locked ${pkgs_args[*]}"
         ;;
       skip)
         ;;
@@ -169,7 +195,7 @@ if [ "$run_ts" = 1 ]; then
     # Manager selection comes from the PUSHING worktree (the hook's CWD),
     # never from the hook owner or npm_execpath: the shared hook runs
     # against npm-era and pnpm-era branches alike (plan 7.4).
-    mgr_out=$("$TSX" "$HOOK_DIR/prepush-manager.ts" "$(pwd)" 2>/dev/null) || mgr_out=""
+    mgr_out=$("$TSX" "$HOOK_DIR/prepush-manager.ts" "$PUSH_ROOT" 2>/dev/null) || mgr_out=""
     mgr_manager="" mgr_command="" mgr_args="" mgr_remediation=""
     while IFS='=' read -r key value; do
       case "$key" in

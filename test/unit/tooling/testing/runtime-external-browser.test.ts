@@ -523,6 +523,9 @@ describe('selected production owner registration', () => {
       { provider: 'opencode' as const, selected: true, retained: false },
     ])('launches the actual $provider consumer with only its selected external qualification profile ($selected/$retained)', async ({ provider, selected, retained }) => {
       const home = path.join(fixtureRepoRoot, 'launch-home')
+      // Native MCP configuration belongs to this fixture's temporary namespace.
+      const temporaryDirectory = path.join(fixtureRepoRoot, 'tmp')
+      await fsp.mkdir(temporaryDirectory, { mode: 0o700 })
       const argvFile = path.join(fixtureRepoRoot, 'launch-argv.json')
       const processesFile = path.join(fixtureRepoRoot, 'launch-processes.jsonl')
       const command = path.join(fixtureRepoRoot, 'profile-provider')
@@ -548,7 +551,8 @@ if (argv.includes('app-server')) {
         // Only runtime builds and Docker allocation below are outside this test.
         web = new RustServer({ homeDir: home, setupHome: options.setupHome, providerFreeFixture: true,
           stripEnvPrefixes: ['FRESHELL_RUNTIME_', 'FRESHELL_MANAGED_', 'NODE_OPTIONS'],
-          env: { CLAUDE_CMD: command, CODEX_CMD: command, OPENCODE_CMD: command, FRESHELL_BIND_HOST: '127.0.0.1' } })
+          env: { CLAUDE_CMD: command, CODEX_CMD: command, OPENCODE_CMD: command, FRESHELL_BIND_HOST: '127.0.0.1',
+            TMPDIR: temporaryDirectory, TMP: temporaryDirectory, TEMP: temporaryDirectory } })
         return web as any
       }, retained)
       const prepare = vi.spyOn(owner.runtime, 'prepare').mockResolvedValue(undefined)

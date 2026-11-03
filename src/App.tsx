@@ -98,6 +98,7 @@ import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { MachineChooser } from '@/components/MachineChooser'
 import { ManagedRuntimeNotices } from '@/components/ManagedRuntimeNotices'
+import { ScreenshotProgressToast } from '@/components/ScreenshotProgressToast'
 import VirtualDeckPanel from '@/components/VirtualDeckPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
@@ -2379,6 +2380,7 @@ export default function App() {
         className="h-full min-h-0 overflow-hidden flex flex-col bg-background text-foreground"
         data-context={ContextIds.Global}
       >
+      <ScreenshotProgressToast />
       {configFallback && (
         <div className="px-3 md:px-4 py-2 border-b border-destructive/30 bg-destructive/10 text-destructive text-xs">
           <div className="flex items-start gap-2">

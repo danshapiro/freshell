@@ -63,7 +63,7 @@ export function runtimeBuildRecipesForFiles(repoRoot: string, files: string[], e
 }
 
 function revision(repoRoot: string): string {
-  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim()
+  return execFileSync('git', ['rev-parse', 'HEAD'], { timeout: 30_000, killSignal: 'SIGKILL', cwd: repoRoot, encoding: 'utf8' }).trim()
 }
 
 function readManifest(repoRoot: string, env: NodeJS.ProcessEnv): BuildManifest | undefined {

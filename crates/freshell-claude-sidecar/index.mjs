@@ -150,8 +150,8 @@ import { randomBytes } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { nativeProfileDigest, nativeResourceDigest } from './native-profile-digest.mjs'
 import { createNativeSessionChannel, inspectNativeForkSource, nativeInputDigest } from './native-session-channel.mjs'
-import { waitForNativeCheckpointRelease } from './native-checkpoint-release.mjs'
 import { createNativeCheckpointStore } from './native-checkpoint-state.mjs'
+import { waitForNativeBatchCompletion, waitForNativeCheckpointRelease } from './native-checkpoint-admission.mjs'
 import { spawnObservedNative } from './native-process.mjs'
 import { configureSession, userMessageContent } from './session-settings.mjs'
 import { createFrameState, frameLogRecord, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
@@ -314,6 +314,9 @@ async function handleSdkMessage(sessionId, msg) {
       // (pinned CLI T16). Its next init identifies the conversation to follow.
       st.pendingConversationReset = true
       if (st.nativeChannel) {
+        st.nativePendingOperation?.cancel()
+        st.nativeAdmissionAbort?.abort()
+        st.nativeAdmissionAbort = new AbortController()
         st.nativeReady = false
         emit({ type: 'sdk.session.loading', sessionId,
           nativeBinding: { launch: st.launch, queryGeneration: st.queryGeneration } })
@@ -335,7 +338,7 @@ async function handleSdkMessage(sessionId, msg) {
           const previousNativeSessionId = st.cliSessionId
           const observation = await st.nativeChannel.waitReady(st.query,
             { clearFrom: previousNativeSessionId, clearTo: msg.session_id })
-          st.nativePendingOperation?.release(false)
+          st.nativePendingOperation?.invalidate()
           cancelPending(st, emit, sessionId, { resolveDeny: true })
           st.nativeContinuation = undefined
           st.parentFork = undefined
@@ -440,6 +443,8 @@ async function consumeStream(sessionId, sdkQuery) {
     // chain → unhandled rejection → crash under Node 22 throw-mode).
     if (st) cancelPending(st, emit, sessionId, { resolveDeny: false })
     if (st?.nativeChannel) {
+      if (!requested) st.nativeStreamEnded = true
+      st.nativePendingOperation?.retire()
       st.nativeReady = false
       emit({ type: 'sdk.session.closed', sessionId, nativeSessionId: st.cliSessionId, queryGeneration: st.queryGeneration,
         nativeBinding: { launch: st.launch, queryGeneration: st.queryGeneration }, reason: requested ? 'aborted' : 'stream_end' })
@@ -478,7 +483,7 @@ async function routeNativePermission({ session, sessionId, req, launch, generati
   let currentOptions = options
   if (session.nativeStore && req.resumeSessionId && !session.nativeContinuation) {
     const resumed = await waitForNativeCheckpointRelease(session,
-      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, sessionId, log)
+      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, nativeInputDigest, sessionId, log)
     if (resumed === false) return { behavior: 'deny', message: 'Original native checkpoint has no current fenced release' }
   }
   const record = session.nativeContinuation
@@ -596,6 +601,10 @@ async function handleCheckpointResume(req) {
 
 async function closeSession(sessionId, state, reason = 'aborted', failed = false) {
   if (sessions.get(sessionId) !== state) return
+  state.nativeTransportClosing = true
+  state.nativePendingOperation?.retire()
+  state.nativePendingOperation?.invalidate()
+  state.nativeAdmissionAbort?.abort()
   state.nativeReady = false
   state.inputStream?.end()
   cancelPending(state, emit, sessionId, { resolveDeny: false })
@@ -725,18 +734,14 @@ hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (in
           return {}
         }
         if (req.resumeSessionId && state.nativeStore) {
-          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal, sessionId, log)
+          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal,
+            nativeInputDigest, sessionId, log)
           if (resumed !== null) return resumed ? {} : deny('Original native checkpoint has no current fenced release')
         }
         // SDK control callbacks and the output iterator have independent
         // consumers. Wait briefly for the actual assistant batch; never infer
         // solo execution from the hook's one-tool view alone.
-        const deadline = Date.now() + 100
-        while (!state.nativeBatch?.complete && Date.now() < deadline
-          && state.queryGeneration === generation && !abort.signal.aborted) {
-          await new Promise((resolve) => setTimeout(resolve, 1))
-        }
-        if (state.queryGeneration !== generation || !state.nativeReady || abort.signal.aborted) {
+        if (!await waitForNativeBatchCompletion(state, generation, hookOptions?.signal)) {
           return deny('Current native query was replaced')
         }
         const solo = nativeSoloTool(state)
@@ -903,6 +908,9 @@ async function handleCreate(req) {
   const abort = new AbortController()
   const state = {
     abort,
+    nativeAdmissionAbort: new AbortController(),
+    nativeTransportClosing: false,
+    nativeStreamEnded: false,
     permissionMode: req.permissionMode,
     settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
     pendingConversationReset: false,
@@ -1119,6 +1127,8 @@ async function shutdown() {
   exiting = true
   const closed = []
   for (const [sessionId, st] of sessions) {
+    st.nativeTransportClosing = true
+    st.nativePendingOperation?.retire()
     // Teardown: emit the card-clearing frames but NEVER resolve parked promises
     // (LB-04 — transport closing; a late resolve is an unhandled rejection).
     cancelPending(st, emit, sessionId, { resolveDeny: false })

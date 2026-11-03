@@ -119,7 +119,7 @@ test.describe('Fresh Agent Mobile', () => {
           status: 'idle',
           summary: '',
           capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
-          settings: { model: 'opus[1m]', permissionMode: 'default', plugins: [] },
+          settings: { model: 'opus[1m]', effort: 'high', permissionMode: 'default', plugins: [] },
           tokenUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: 0 },
           pendingApprovals: [],
           pendingQuestions: [],
@@ -168,6 +168,7 @@ test.describe('Fresh Agent Mobile', () => {
             status: 'idle',
             initialCwd: '/home/user/code/freshell',
             model: 'opus[1m]',
+            effort: 'high',
             settingsDismissed: true,
           },
         },
@@ -211,7 +212,7 @@ test.describe('Fresh Agent Mobile', () => {
     await expect(meter).toBeVisible()
     await expect(meter).toHaveAttribute('aria-valuenow', '47')
 
-    // Chip collapses to the SHORT label at ≤520px.
+    // The model chip shortens at ≤520px while the explicitly seeded effort remains visible.
     await expect(paneRoot.getByText('Claude Opus 5 high', { exact: true })).toBeVisible()
     await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeHidden()
 

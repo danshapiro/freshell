@@ -3135,6 +3135,8 @@ mod tests {
             .or_insert(json!(true));
         let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
+        let boot_log = dir.path().join("native-boots.jsonl");
+        let startup_error_log = dir.path().join("native-startup-errors.jsonl");
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
             .canonicalize()
@@ -3163,10 +3165,18 @@ mod tests {
 import fs from 'node:fs'
 const stat = fs.readFileSync('/proc/self/stat', 'utf8').split(') ').pop().split(' ')
 fs.appendFileSync({}, JSON.stringify({{pid:process.pid,startTime:Number(stat[19]),ownershipId:process.env.FRESHELL_CODEX_SIDECAR_ID}})+'\n')
-await import({});
+try {{
+  await import({});
+}} catch (error) {{
+  try {{
+    fs.appendFileSync({}, JSON.stringify({{message:error?.message ?? String(error),stack:error?.stack ?? null}})+'\n')
+  }} catch {{}}
+  throw error
+}}
 "#,
-                serde_json::to_string(&dir.path().join("native-boots.jsonl")).unwrap(),
-                serde_json::to_string(&fixture).unwrap()
+                serde_json::to_string(&boot_log).unwrap(),
+                serde_json::to_string(&fixture).unwrap(),
+                serde_json::to_string(&startup_error_log).unwrap()
             ),
         )
         .unwrap();
@@ -3247,6 +3257,25 @@ await import({});
         let accepted_session = fixture.transport.provider_session_id().await;
         let native_proof = fixture.transport.native_identity_evidence().await;
         let boots = native_boots(&fixture);
+        let expected_native_start_refusal = result
+            .as_ref()
+            .is_err_and(|error| error.starts_with("CODEX_THREAD_START_FAILED:"));
+        if !expected_native_start_refusal || !log.exists() {
+            let startup_errors =
+                std::fs::read_to_string(fixture.dir.path().join("native-startup-errors.jsonl"))
+                    .unwrap_or_else(|error| format!("<startup diagnostics unavailable: {error}>"));
+            eprintln!(
+                "{}",
+                json!({
+                    "severity": "error",
+                    "event": "test.codex_native_startup_failure",
+                    "result": format!("{result:?}"),
+                    "boots": &boots,
+                    "startupErrors": startup_errors,
+                    "requestLogExists": log.exists()
+                })
+            );
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut native_writers_reaped = true;
         for boot in &boots {
@@ -7976,7 +8005,7 @@ export function query({ prompt, options }) {
         assert_eq!(
             consumed.len(),
             3,
-            "two explicit clears and one original input"
+            "two explicit clears and one original input; consumed rows: {consumed:#?}"
         );
         assert_eq!(consumed[2]["nativeSessionId"], CURRENT);
         assert_eq!(

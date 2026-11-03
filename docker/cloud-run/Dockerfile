@@ -39,10 +39,17 @@ COPY crates/ ./crates/
 COPY extensions/ ./extensions/
 COPY docker/runtime/provider-versions.json ./docker/runtime/provider-versions.json
 COPY docker/runtime/codex-native-sandbox.json ./docker/runtime/codex-native-sandbox.json
+COPY docker/cloud-run/cargo-fetch-retry.sh ./docker/cloud-run/cargo-fetch-retry.sh
+# Cargo 1.96's sparse-index retry classifier can miss curl receive errors
+# wrapped by its HTTP layer; upstream corrected that classification in
+# https://github.com/rust-lang/cargo/commit/963787c7591d9f59694de695e367dd0040ac070d.
+# Retry only the dependency fetch. Keep both compiles offline so source or
+# compiler failures are reported directly and never retried.
+RUN sh docker/cloud-run/cargo-fetch-retry.sh
 RUN rustc --version && cargo --version \
-    && FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
+    && FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked --offline
 # Compile the real-client requirement guard before entering native test lanes.
-RUN set -eu; cargo test --release -p freshell-codex --features native-policy-qualification --lib --no-run --locked \
+RUN set -eu; cargo test --release -p freshell-codex --features native-policy-qualification --lib --no-run --locked --offline \
     ; set -- target/release/deps/freshell_codex-* \
     ; count=0; for probe in "$@"; do \
          if [ -f "$probe" ] && [ -x "$probe" ]; then \

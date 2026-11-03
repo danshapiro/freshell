@@ -240,12 +240,6 @@ describe('browser selection non-vacuity', () => {
     expect(typeof server.stop).toBe('function')
     expect(() => server.info).toThrow('RustServer not started')
 
-    expect(LOCAL_ONLY_SPECS).toContainEqual({
-      spec: 'mcp-qa-smoke-rust.spec.ts',
-      classification: 'local-only-provider-binary',
-      selector: '--project=chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts',
-    })
-    expect(CLOUD_SKIP_SPECS).toContain('mcp-qa-smoke-rust.spec.ts')
     expect(CLOUD_SKIP_SPECS).not.toContain('server-build-mismatch-rust.spec.ts')
     expect(CLOUD_SKIP_SPECS).not.toContain('tabs-client-retire.spec.ts')
 
@@ -276,6 +270,20 @@ describe('browser selection non-vacuity', () => {
       expect(cloud.output, `cloud lane must not list excluded title: ${title.source}`).not.toMatch(title)
     }
   })
+
+  it('discovers the MCP QA smoke through the cloud Chromium selector', () => {
+    const spec = 'mcp-qa-smoke-rust.spec.ts'
+    const selected = listedProjects(cleanEnvironment(), cloudConfig, [
+      '--project=chromium',
+      `test/e2e-browser/specs/${spec}`,
+    ])
+
+    expect(selected.labels).toEqual(['chromium'])
+    expect(selected.tests).toBe(1)
+    expect(selected.files).toBe(1)
+    expect(listedSpecFiles(selected.output)).toEqual(new Set([spec]))
+    expect(selected.output).toContain('the retained MCP stdio binary drives an ephemeral Rust server across every pane mode')
+  }, 90_000)
 
   it('intersects mixed positional file selectors with cloud exclusions', () => {
     // Explicit positional file args are an INTERSECTION with testIgnore,

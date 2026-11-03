@@ -241,6 +241,12 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   let pnpmLockSha: string
   let pnpmWorkspaceSha: string
   let npmrcSha: string
+  let fakeCargoLog: string
+  let fakeSandboxLog: string
+  let fakeCargoMetadata: string
+  let fakePnpmLog: string
+  let fakeBinDir: string
+  let fakeSandboxRunner: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
     const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' })
@@ -274,11 +280,14 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
   beforeAll(() => {
     if (!fs.existsSync(realTsx)) throw new Error(`owning checkout tsx missing: ${realTsx}`)
-    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'prepush-routing-'))
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "prepush routing's-"))
+    expect(fixtureRoot).toContain("prepush routing's-")
     const stubDir = path.join(fixtureRoot, 'node_modules/.bin')
     fs.mkdirSync(stubDir, { recursive: true })
     fs.writeFileSync(path.join(stubDir, 'tsx'), `#!/bin/sh\nexec "${realTsx}" "$@"\n`)
     fs.chmodSync(path.join(stubDir, 'tsx'), 0o755)
+    fs.writeFileSync(path.join(stubDir, 'tsc'), '#!/usr/bin/env bash\nexit 0\n')
+    fs.chmodSync(path.join(stubDir, 'tsc'), 0o755)
     git(['init', '-q', '-b', 'main'], { cwd: fixtureRoot })
     writeFixture(
       path.join(fixtureRoot, 'Cargo.toml'),
@@ -342,6 +351,94 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
     writeFixture(path.join(fixtureRoot, '.npmrc'), 'verify-deps-before-run=false\n')
     npmrcSha = commit('npmrc change')
+
+    // The non-debug hook tests execute real dispatch with harmless recorders:
+    // fake Cargo provides metadata and records its argv/environment, while the
+    // fake sandbox executes the command produced by the real Rust runner.
+    // Keep these helpers uncommitted so they cannot affect the range under test.
+    writeFixture(path.join(fixtureRoot, 'package.json'), '{"type":"module"}\n')
+    const tsxPackage = path.resolve(import.meta.dirname, '../../../node_modules/tsx')
+    if (!fs.existsSync(tsxPackage)) throw new Error(`tsx package missing: ${tsxPackage}`)
+    fs.symlinkSync(tsxPackage, path.join(fixtureRoot, 'node_modules/tsx'), 'dir')
+    fs.mkdirSync(path.join(fixtureRoot, 'scripts/testing'), { recursive: true })
+    fs.copyFileSync(
+      path.resolve(import.meta.dirname, '../../../scripts/testing/run-rust-tests.ts'),
+      path.join(fixtureRoot, 'scripts/testing/run-rust-tests.ts'),
+    )
+
+    fakeBinDir = path.join(fixtureRoot, 'fake-bin')
+    fs.mkdirSync(fakeBinDir, { recursive: true })
+    fakeCargoLog = path.join(fixtureRoot, 'fake-cargo.jsonl')
+    fakePnpmLog = path.join(fixtureRoot, 'fake-pnpm.jsonl')
+    fakeSandboxLog = path.join(fixtureRoot, 'fake-sandbox.jsonl')
+    fakeCargoMetadata = path.join(fixtureRoot, 'fake-cargo-metadata.json')
+    fakeSandboxRunner = path.join(fixtureRoot, 'fake-sandbox-runner.mjs')
+    const manifestPath = (name: string) => path.join(fixtureRoot, `crates/${name}/Cargo.toml`)
+    writeFixture(
+      fakeCargoMetadata,
+      JSON.stringify({
+        workspace_members: Object.keys(fixtureDeps).map(manifestPath),
+        packages: Object.entries(fixtureDeps).map(([name, deps]) => ({
+          name,
+          manifest_path: manifestPath(name),
+          dependencies: deps.map((dependency) => ({ name: dependency })),
+        })),
+      }),
+    )
+    writeFixture(
+      path.join(fakeBinDir, 'cargo'),
+      [
+        '#!/usr/bin/env node',
+        'import fs from "node:fs"',
+        'import { spawnSync } from "node:child_process"',
+        'const args = process.argv.slice(2)',
+        'const event = { args, buildJobs: process.env.CARGO_BUILD_JOBS ?? null, testThreads: process.env.RUST_TEST_THREADS ?? null, tokioThreads: process.env.TOKIO_WORKER_THREADS ?? null, sandboxActive: process.env.SANDBOX_ACTIVE ?? null, sandboxMode: process.env.FRESHELL_SANDBOX_MODE ?? null, sandboxOptIn: process.env.FRESHELL_RUST_TEST_SANDBOX ?? null }',
+        'if (args[0] === "test") { const childEnv = { ...process.env, GIT_TEST_ASSUME_DIFFERENT_OWNER: "0" }; const childGit = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd(), env: childEnv, encoding: "utf8" }); event.childGitStatus = childGit.status; event.childGitRoot = childGit.status === 0 ? childGit.stdout.trim() : null; event.childGitError = childGit.status === 0 ? null : childGit.stderr.trim(); event.gitConfigParameters = process.env.GIT_CONFIG_PARAMETERS ?? null; event.gitDirectory = process.env.GIT_DIR ?? null; event.gitWorkTree = process.env.GIT_WORK_TREE ?? null; event.gitIndexFile = process.env.GIT_INDEX_FILE ?? null; event.gitCommonDirectory = process.env.GIT_COMMON_DIR ?? null; event.gitPrefix = process.env.GIT_PREFIX ?? null; event.gitObjectDirectory = process.env.GIT_OBJECT_DIRECTORY ?? null; event.gitAlternateObjectDirectories = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES ?? null }',
+        'fs.appendFileSync(process.env.FAKE_CARGO_LOG, JSON.stringify(event) + "\\n")',
+        'if (args[0] === "metadata") { process.stdout.write(fs.readFileSync(process.env.FAKE_CARGO_METADATA, "utf8")); process.exit(0) }',
+        'if (args[0] === "test") process.exit(Number(process.env.FAKE_CARGO_TEST_EXIT ?? 0))',
+      ].join('\n'),
+    )
+    fs.chmodSync(path.join(fakeBinDir, 'cargo'), 0o755)
+    writeFixture(
+      path.join(fakeBinDir, 'pnpm'),
+      [
+        '#!/usr/bin/env node',
+        'import fs from "node:fs"',
+        'fs.appendFileSync(process.env.FAKE_PNPM_LOG, JSON.stringify({args:process.argv.slice(2), cwd:process.cwd(), gitConfigParameters:process.env.GIT_CONFIG_PARAMETERS ?? null, gitDirectory:process.env.GIT_DIR ?? null}) + "\\n")',
+        'process.exit(Number(process.env.FAKE_PNPM_EXIT ?? 0))',
+      ].join('\n'),
+    )
+    fs.chmodSync(path.join(fakeBinDir, 'pnpm'), 0o755)
+    writeFixture(
+      fakeSandboxRunner,
+      [
+        'import fs from "node:fs"',
+        'import path from "node:path"',
+        'import { spawnSync } from "node:child_process"',
+        'const args = process.argv.slice(2)',
+        'fs.appendFileSync(process.env.FAKE_SANDBOX_LOG, JSON.stringify({args, ownerGuard:process.env.FRESHELL_SANDBOX_OWNER_GUARD ?? null}) + "\\n")',
+        'if (Number(process.env.FAKE_SANDBOX_EXIT ?? 0) !== 0) process.exit(Number(process.env.FAKE_SANDBOX_EXIT))',
+        'const fixtureRoot = process.cwd()',
+        'const artifacts = path.join(fixtureRoot, ".sandbox-artifacts")',
+        'fs.mkdirSync(artifacts, {recursive:true})',
+        'const runner = path.join(fixtureRoot, "scripts/testing/run-rust-tests.ts")',
+        String.raw`const shellQuote = (value) => "'" + value.replaceAll("'", "'\\''") + "'"`,
+        'const command = args[1]',
+        '  .replace("mktemp -d /freshell-test-artifacts/.freshell-rust-tests-XXXXXXXX", "mktemp -d " + shellQuote(path.join(artifacts, ".freshell-rust-tests-XXXXXXXX")))',
+        '  .replace("mktemp -d /freshell-test-artifacts/XXX", "mktemp -d " + shellQuote(path.join(artifacts, "XXX")))',
+        '  .replace("node --import tsx /workspace/scripts/testing/run-rust-tests.ts", "node --import tsx " + shellQuote(runner))',
+        'const result = spawnSync("bash", ["-c", command], {cwd:fixtureRoot, env:{...process.env, SANDBOX_ACTIVE:"1", FRESHELL_SANDBOX_MODE:"runtime-suite"}, encoding:"utf8"})',
+        'process.stdout.write(result.stdout ?? "")',
+        'process.stderr.write(result.stderr ?? "")',
+        'process.exit(result.status ?? 1)',
+      ].join('\n'),
+    )
+    writeFixture(
+      path.join(fixtureRoot, 'scripts/sandbox-test.sh'),
+      '#!/usr/bin/env bash\nexec node "$FAKE_SANDBOX_RUNNER" "$@"\n',
+    )
+    fs.chmodSync(path.join(fixtureRoot, 'scripts/sandbox-test.sh'), 0o755)
   })
 
   afterAll(() => {
@@ -352,10 +449,11 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     localSha: string,
     remoteSha: string,
     extraEnv: Record<string, string> = {},
+    debug = true,
   ): { status: number; stderr: string } {
     const res = spawnSync('bash', [hookPath], {
       input: `refs/heads/x ${localSha} refs/heads/x ${remoteSha}\n`,
-      env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: '1' },
+      env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: debug ? '1' : '0' },
       encoding: 'utf8',
       cwd: fixtureRoot,
       // A hung hook (e.g. a stub exec-loop) blocks the event loop, so no
@@ -372,6 +470,45 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       }`
     }
     return { status: res.status ?? -1, stderr }
+  }
+
+  function runInstrumentedHook(
+    localSha: string,
+    remoteSha: string,
+    extraEnv: Record<string, string> = {},
+  ): { status: number; stdout: string; stderr: string; cargoEvents: Array<Record<string, unknown>>; sandboxEvents: Array<Record<string, unknown>> } {
+    fs.writeFileSync(fakeCargoLog, '')
+    fs.writeFileSync(fakeSandboxLog, '')
+    const res = spawnSync('bash', [hookPath], {
+      input: `refs/heads/x ${localSha} refs/heads/x ${remoteSha}\n`,
+      env: (() => {
+        const env: NodeJS.ProcessEnv = {
+          ...process.env,
+          ...extraEnv,
+          PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+          FAKE_CARGO_LOG: fakeCargoLog,
+          FAKE_CARGO_METADATA: fakeCargoMetadata,
+          FAKE_SANDBOX_LOG: fakeSandboxLog,
+          FAKE_SANDBOX_RUNNER: fakeSandboxRunner,
+          FRESHELL_PREPUSH_DEBUG: '0',
+        }
+        if (!Object.hasOwn(extraEnv, 'FRESHELL_RUST_TEST_SANDBOX')) delete env.FRESHELL_RUST_TEST_SANDBOX
+        return env
+      })(),
+      encoding: 'utf8',
+      cwd: fixtureRoot,
+      timeout: 120_000,
+      killSignal: 'SIGKILL',
+    })
+    const events = (p: string): Array<Record<string, unknown>> =>
+      fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+    return {
+      status: res.status ?? -1,
+      stdout: res.stdout ?? '',
+      stderr: res.stderr ?? '',
+      cargoEvents: events(fakeCargoLog),
+      sandboxEvents: events(fakeSandboxLog),
+    }
   }
 
   it('skips all checks for a docs-only range', () => {
@@ -393,10 +530,92 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     // the hook's own routing git calls — and in non-debug mode the leaked
     // vars redirect every test-side git child at the SHARED repository
     // (observed: cargo-test children re-initialized the main checkout's
-    // config). The hook must resolve everything via cwd discovery instead.
+    // config). The hook must drop them before cwd discovery and before any lane runs.
     const out = runHook(rustSha, baseSha, { GIT_DIR: '/nonexistent-prepush-hook-env' })
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('test_mode=packages test_pkgs=freshell-freshagent freshell-server freshell-ws')
+  })
+
+  it('keeps command-scoped worktree trust for hook Git queries and strips it before test children', () => {
+    const remoteRoot = fs.mkdtempSync(path.join(os.tmpdir(), "prepush remote's-"))
+    try {
+      const remote = path.join(remoteRoot, 'origin.git')
+      const emptyHooks = path.join(remoteRoot, 'empty-hooks')
+      const ownershipSeamHooks = path.join(remoteRoot, 'ownership-seam-hooks')
+      fs.mkdirSync(emptyHooks)
+      fs.mkdirSync(ownershipSeamHooks)
+      git(['init', '--bare', '-q', remote], { cwd: fixtureRoot })
+      git(['-c', `core.hooksPath=${emptyHooks}`, 'push', remote, `${baseSha}:refs/heads/main`], { cwd: fixtureRoot })
+      git(['remote', 'add', 'origin', remote], { cwd: fixtureRoot })
+      git(['update-ref', 'refs/remotes/origin/main', baseSha], { cwd: fixtureRoot })
+      const hookWithOwnershipSeam = path.join(ownershipSeamHooks, 'pre-push')
+      fs.writeFileSync(hookWithOwnershipSeam, '#!/usr/bin/env bash\nexport GIT_TEST_ASSUME_DIFFERENT_OWNER=1\nexec bash "$PREPUSH_REAL_HOOK" "$@"\n')
+      fs.chmodSync(hookWithOwnershipSeam, 0o755)
+      fs.writeFileSync(fakeCargoLog, '')
+      fs.writeFileSync(fakePnpmLog, '')
+      fs.writeFileSync(fakeSandboxLog, '')
+
+      const pushThroughHook = (localSha: string, branch: string) => spawnSync('git', [
+        '-c', `safe.directory=${fixtureRoot}`,
+        '-c', `core.hooksPath=${ownershipSeamHooks}`,
+        '-C', fixtureRoot,
+        'push', 'origin', `${localSha}:refs/heads/${branch}`,
+      ], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+          FAKE_CARGO_LOG: fakeCargoLog,
+          FAKE_CARGO_METADATA: fakeCargoMetadata,
+          FAKE_PNPM_LOG: fakePnpmLog,
+          FAKE_SANDBOX_LOG: fakeSandboxLog,
+          FAKE_SANDBOX_RUNNER: fakeSandboxRunner,
+          PREPUSH_REAL_HOOK: hookPath,
+          FRESHELL_PREPUSH_DEBUG: '0',
+          FRESHELL_RUST_TEST_SANDBOX: '1',
+        },
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 120_000,
+        killSignal: 'SIGKILL',
+      })
+      const res = pushThroughHook(rustSha, 'prepush-trust-regression')
+      const cargoEvents = fs.readFileSync(fakeCargoLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+      const sandboxEvents = fs.readFileSync(fakeSandboxLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+
+      expect(res.status, res.stderr).toBe(0)
+      expect(res.stderr).toContain('targeted cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws')
+      expect(sandboxEvents).toHaveLength(1)
+      expect((sandboxEvents[0].args as string[])[0]).toBe('--runtime-suite')
+      expect(cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([{
+        args: ['test', '--locked', '-p', 'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'],
+        childGitStatus: 0,
+        childGitRoot: fixtureRoot,
+        childGitError: null,
+        gitConfigParameters: null,
+        gitDirectory: null,
+        gitWorkTree: null,
+        gitIndexFile: null,
+        gitCommonDirectory: null,
+        gitPrefix: null,
+        gitObjectDirectory: null,
+        gitAlternateObjectDirectories: null,
+      }])
+
+      fs.writeFileSync(fakeCargoLog, '')
+      fs.writeFileSync(fakePnpmLog, '')
+      fs.writeFileSync(fakeSandboxLog, '')
+      const typecheckPush = pushThroughHook(pnpmLockSha, 'prepush-typecheck-trust-regression')
+      const pnpmEvents = fs.readFileSync(fakePnpmLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+      expect(typecheckPush.status, typecheckPush.stderr).toBe(0)
+      expect(pnpmEvents).toMatchObject([{
+        args: ['run', '--silent', 'typecheck'],
+        cwd: fixtureRoot,
+        gitConfigParameters: null,
+        gitDirectory: null,
+      }])
+    } finally {
+      fs.rmSync(remoteRoot, { recursive: true, force: true })
+    }
   })
 
   it('skips the test lane for tauri-only changes (clippy parity)', () => {
@@ -411,6 +630,89 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('run_rust=1')
     expect(out.stderr).toContain('test_mode=workspace')
+  })
+
+  it('keeps direct Cargo execution when the sandbox opt-in is unset', () => {
+    const out = runInstrumentedHook(rustSha, baseSha, {
+      CARGO_BUILD_JOBS: '91',
+      RUST_TEST_THREADS: '92',
+      TOKIO_WORKER_THREADS: '93',
+    })
+    expect(out.status, out.stderr).toBe(0)
+    expect(out.sandboxEvents).toEqual([])
+    expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
+      {
+        args: ['test', '--locked', '-p', 'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'],
+        buildJobs: '91',
+        testThreads: '92',
+        tokioThreads: '93',
+        sandboxActive: null,
+      },
+    ])
+  })
+
+  it('dispatches the same selected package test through the sandbox with bounded runtime settings', () => {
+    const out = runInstrumentedHook(rustSha, baseSha, {
+      FRESHELL_RUST_TEST_SANDBOX: '1',
+      CARGO_BUILD_JOBS: '91',
+      RUST_TEST_THREADS: '92',
+      TOKIO_WORKER_THREADS: '93',
+    })
+    expect(out.status, out.stderr).toBe(0)
+    expect(out.sandboxEvents).toHaveLength(1)
+    expect(out.sandboxEvents[0]).toMatchObject({
+      args: ['--runtime-suite', expect.any(String)],
+      ownerGuard: '1',
+    })
+    expect(
+      out.cargoEvents
+        .filter((event) => ['fmt', 'clippy'].includes((event.args as string[])[0]))
+        .every((event) => event.sandboxActive === null),
+    ).toBe(true)
+    expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
+      {
+        args: ['test', '--locked', '-p', 'freshell-freshagent', '-p', 'freshell-server', '-p', 'freshell-ws'],
+        buildJobs: '3',
+        testThreads: '4',
+        tokioThreads: '2',
+        sandboxActive: '1',
+        sandboxMode: 'runtime-suite',
+        sandboxOptIn: '0',
+      },
+    ])
+  })
+
+  it('dispatches fixture changes as the exact workspace command through the sandbox', () => {
+    const out = runInstrumentedHook(fixtureSha, tauriSha, { FRESHELL_RUST_TEST_SANDBOX: '1' })
+    expect(out.status, out.stderr).toBe(0)
+    expect(out.sandboxEvents).toHaveLength(1)
+    expect(out.cargoEvents.filter((event) => (event.args as string[])[0] === 'test')).toMatchObject([
+      {
+        args: ['test', '--workspace', '--exclude', 'freshell-tauri', '--locked'],
+        buildJobs: '3',
+        testThreads: '4',
+        tokioThreads: '2',
+        sandboxActive: '1',
+      },
+    ])
+  })
+
+  it('does not start a sandbox for a selected skip plan', () => {
+    const out = runInstrumentedHook(tauriSha, docsSha, { FRESHELL_RUST_TEST_SANDBOX: '1' })
+    expect(out.status, out.stderr).toBe(0)
+    expect(out.sandboxEvents).toEqual([])
+    expect(out.cargoEvents.some((event) => (event.args as string[])[0] === 'test')).toBe(false)
+  })
+
+  it('fails the push when the sandbox wrapper fails without falling back to host Cargo', () => {
+    const out = runInstrumentedHook(rustSha, baseSha, {
+      FRESHELL_RUST_TEST_SANDBOX: '1',
+      FAKE_SANDBOX_EXIT: '23',
+    })
+    expect(out.status).toBe(1)
+    expect(out.sandboxEvents).toHaveLength(1)
+    expect(out.cargoEvents.some((event) => (event.args as string[])[0] === 'test')).toBe(false)
+    expect(out.stderr).toContain('pre-push: FAILED')
   })
 
   it('runs the rust gate for cargo-config changes', () => {

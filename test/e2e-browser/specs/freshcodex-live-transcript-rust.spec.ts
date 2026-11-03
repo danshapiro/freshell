@@ -444,11 +444,26 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
     await composer.fill(prompt)
     await composer.press('Enter')
     const firstTurn = pane.locator('[data-turn-role="user"]', { hasText: prompt })
+    const tabId = await harness.getActiveTabId()
+    const paneId = await pane.getAttribute('data-pane-id')
+    expect(tabId).toBeTruthy()
+    expect(paneId).toBeTruthy()
+    let checkpointOutcomes: any[] = []
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabId!)
+      const findPane = (node: any): any => node?.type === 'leaf'
+        ? (node.id === paneId ? node : undefined)
+        : node?.children?.map(findPane).find(Boolean)
+      checkpointOutcomes = findPane(layout)?.content?.checkpointOutcomes ?? []
+      return checkpointOutcomes.length
+    }, { timeout: 30_000, message: 'the first accepted turn has a settled checkpoint outcome' }).toBe(1)
+    expect(checkpointOutcomes[0].status, JSON.stringify(checkpointOutcomes)).toBe('available')
+    await expect(pane.getByText('Fixture turn', { exact: true })).toHaveCount(1, { timeout: 30_000 })
+    // Require the settled checkpoint's rewind action to be usable.
     await firstTurn.hover()
-    const rewind = firstTurn.getByRole('button', { name: 'Rewind code to here' })
+    const rewind = firstTurn.getByRole('button', { name: 'Rewind code to here', exact: true })
     await expect(rewind).toBeVisible({ timeout: 30_000 })
     await expect(rewind).toBeEnabled({ timeout: 30_000 })
-    await expect(pane.getByText('Fixture turn', { exact: true })).toHaveCount(1, { timeout: 30_000 })
     const command = "pwd; printf 'after command\\n' > state.txt; printf command-output-canary"
     const executed = page.waitForResponse(response => response.url().includes('/api/fresh-agent/exec') && response.request().method() === 'POST')
     await composer.fill(`!${command}`)
@@ -465,6 +480,13 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
     const forwarded = starts[1].params.input.find((item: any) => item.type === 'text').text
     expect(forwarded).toContain(`in ${cwd}. Output:`)
     expect(forwarded).toContain(`${cwd}\ncommand-output-canary`)
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabId!)
+      const findPane = (node: any): any => node?.type === 'leaf'
+        ? (node.id === paneId ? node : undefined)
+        : node?.children?.map(findPane).find(Boolean)
+      return findPane(layout)?.content?.status ?? null
+    }, { timeout: 30_000, message: 'the command turn settles before conversation undo' }).toBe('idle')
     await composer.fill('/undo')
     await composer.press('Enter')
     await expect(composer).toHaveValue(forwarded, { timeout: 30_000 })

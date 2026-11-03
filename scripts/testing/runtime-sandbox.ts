@@ -13,6 +13,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
   ManagedRuntimeNativeIdentityObservationSchema,
   type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 
+import { assertSubprocessCompleted, subprocessInterrupted, SYNC_BUILD_TIMEOUT_MS, SYNC_PROBE_TIMEOUT_MS } from './sync-subprocess.js'
 import { preparedRuntimeBinary, preparedRuntimeBuildProvenance } from './runtime-build-preflight.js'
 import { parseHelperCreateDelay } from './runtime-test-broker.js'
 
@@ -326,11 +327,11 @@ export function assertRunOwnedRuntimeImage(observed: unknown, context: RunOwnedR
 
 export function removeRunOwnedRuntimeImage(context: RunOwnedRuntimeImage, execute: typeof execFileSync = execFileSync): void {
   const tags = () => String(execute('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'],
-    { encoding: 'utf8' })).trim().split('\n')
+    { encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })).trim().split('\n')
   if (!tags().includes(context.tag)) return
-  const image: unknown = JSON.parse(String(execute('docker', ['image', 'inspect', context.tag], { encoding: 'utf8' })))
+  const image: unknown = JSON.parse(String(execute('docker', ['image', 'inspect', context.tag], { encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })))
   assertRunOwnedRuntimeImage(image, context)
-  execute('docker', ['image', 'rm', context.tag], { encoding: 'utf8' })
+  execute('docker', ['image', 'rm', context.tag], { encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
   if (tags().includes(context.tag)) throw new Error('exact owned runtime image tag remains after cleanup')
 }
 
@@ -348,10 +349,10 @@ export function buildRunOwnedRuntimeImage(
   execute('docker', ['build', '--pull=false', '--provenance=false', '--sbom=false',
     '--label', `${RUNTIME_IMAGE_LABELS.runId}=${runId}`, '--label', `${RUNTIME_IMAGE_LABELS.candidate}=${candidateSha}`,
     '--label', `${RUNTIME_IMAGE_LABELS.sourceState}=${source.sha}:${source.dirty ? 'dirty' : 'clean'}`,
-    '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: repoRoot, stdio: 'inherit' })
-  const digest = String(execute('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
+    '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: repoRoot, stdio: 'inherit', timeout: SYNC_BUILD_TIMEOUT_MS, killSignal: 'SIGKILL' })
+  const digest = String(execute('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })).trim()
   if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('run-owned runtime image has no pinned digest')
-  const addressed = String(execute('docker', ['image', 'inspect', digest, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
+  const addressed = String(execute('docker', ['image', 'inspect', digest, '--format', '{{.Id}}'], { encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })).trim()
   if (addressed !== digest) throw new Error('run-owned runtime image digest is not locally addressable')
   return { tag, digest }
 }
@@ -1778,15 +1779,26 @@ export async function readExactRuntimeHostFacts(
 }
 
 export async function settleOwnedRuntimeCleanup(
-  stopWeb: () => Promise<void>, cleanupRuntime: () => Promise<{ ok: boolean; errors: string[] }>,
+  stopWeb: () => Promise<void>,
+  cleanupRuntime: (priorErrors: readonly string[]) => Promise<{ ok: boolean; errors: string[] }>,
 ): Promise<{ ok: boolean; errors: string[] }> {
   const errors: string[] = []
-  try { await stopWeb() } catch (error) { errors.push(`web stop: ${error instanceof Error ? error.message : String(error)}`) }
+  const retainStopError = (error: unknown): void => {
+    if (error instanceof AggregateError && error.errors.length > 0) {
+      for (const nested of error.errors) retainStopError(nested)
+    } else {
+      errors.push(`web stop: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  try { await stopWeb() } catch (error) { retainStopError(error) }
   let runtimeOk = false
+  const priorErrors = [...errors]
   try {
-    const result = await cleanupRuntime()
+    // Runtime cleanup must retain its owned executables when web shutdown or
+    // host release is unconfirmed, and its receipt must include that failure.
+    const result = await cleanupRuntime(priorErrors)
     runtimeOk = result.ok
-    errors.push(...result.errors)
+    errors.push(...result.errors.filter(error => !priorErrors.includes(error)))
   } catch (error) {
     errors.push(`runtime cleanup: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -2649,8 +2661,8 @@ export class RuntimeHarness {
     if (remaining < 1) throw new Error('owned transfer lifecycle expired')
     return Math.min(policy.operationTimeoutMs, remaining)
   }
-  private async cleanupTransfer(): Promise<{ ok: boolean; errors: string[] }> {
-    const original = this.transferOwnedIds(), errors: string[] = []
+  private async cleanupTransfer(priorErrors: readonly string[] = []): Promise<{ ok: boolean; errors: string[] }> {
+    const original = this.transferOwnedIds(), errors = [...priorErrors]
     const deadline = Date.now() + this.transferPolicy!.cleanupTimeoutMs
     for (const id of original.containers) {
       try { this.transferDocker(['rm', '-f', id], true, deadline) } catch { errors.push('owned transfer container removal failed') }
@@ -2695,6 +2707,7 @@ export class RuntimeHarness {
   private readonly trackedSupervisorContainers = new Set<string>()
   private readonly trackedForeignContainers = new Set<string>()
   private readonly trackedVolumes = new Set<string>()
+  private readonly unsettledDockerRequests = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
   private ownedRuntimeImage: RunOwnedRuntimeImage | undefined
   private brokerStarted = false
@@ -3441,9 +3454,13 @@ export class RuntimeHarness {
     this.task007RegistryReaderSupervisors.delete(name)
   }
 
-  async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
-    if (this.transferPolicy) return this.cleanupTransfer()
-    const errors: string[] = []
+  async cleanup(priorErrors: readonly string[] = []): Promise<{ ok: boolean; errors: string[] }> {
+    const errors = [
+      ...priorErrors,
+      ...[...this.unsettledDockerRequests].map(resource =>
+        `Docker creation completion was not observed for ${resource}; ownership evidence retained`),
+    ]
+    if (this.transferPolicy) return this.cleanupTransfer(errors)
     await Promise.allSettled([...this.task007Children])
     const brokers = [this.broker, ...this.task007Brokers].filter((broker): broker is RestrictedDockerBroker => !!broker)
     const supervisorIds = [...this.trackedSupervisorContainers]
@@ -3561,8 +3578,9 @@ export class RuntimeHarness {
     } catch (error) { errors.push(`runtime absence: ${error instanceof Error ? error.message : String(error)}`) }
     const resourcesAbsent = knownResourcesAbsent && brokerSettlementComplete && initialProviderCleanupConfirmed
       && !brokerSettlementFailures.some(failure => failure.allocationUnknown)
+      && this.unsettledDockerRequests.size === 0 && priorErrors.length === 0
     let runtimeImageCleanup: { tag: string; digest?: string; removed?: boolean } | undefined
-    if (resourcesAbsent && this.ownedRuntimeImage) {
+    if (resourcesAbsent && errors.length === 0 && this.ownedRuntimeImage) {
       runtimeImageCleanup = { tag: this.ownedRuntimeImage.tag, digest: this.ownedRuntimeImage.digest }
       try {
         removeRunOwnedRuntimeImage(this.ownedRuntimeImage)
@@ -3577,7 +3595,7 @@ export class RuntimeHarness {
     // Build copies are unique to this run, so retries/concurrent gates never
     // overwrite an executable that another still-running container/process
     // has mapped. Remove them only after every receipt-owned runtime stopped.
-    if (resourcesAbsent) {
+    if (resourcesAbsent && errors.length === 0) {
       try { fs.rmSync(this.buildDir, { recursive: true, force: true }) } catch (error) { errors.push(`runtime build dir: ${String(error)}`) }
       try { fs.rmSync(this.nativeHistoryBuildDir, { recursive: true, force: true }) } catch (error) { errors.push(`native history build dir: ${String(error)}`) }
     }
@@ -3722,7 +3740,7 @@ export class RuntimeHarness {
     const controlSocket = path.join(controlDir, 'supervisor.sock')
     const volumeName = options.volumeName ?? `freshell-p${this.phase}-${this.runId.slice(0, 8)}-${scenarioId}`
     if (!this.trackedVolumes.has(volumeName)) {
-      docker(['volume', 'create', volumeName])
+      this.createOwnedDockerResource(['volume', 'create', volumeName], `volume ${volumeName}`)
       this.trackedVolumes.add(volumeName)
     }
     const binaryKind = options.binaryKind ?? 'test'
@@ -3806,7 +3824,7 @@ export class RuntimeHarness {
     }
     args.push('--test-run-id', this.runId)
     if (options.operatorHome) args.push('--operator-home', options.operatorHome)
-    const containerId = docker(args).trim()
+    const containerId = this.createOwnedDockerResource(args, `supervisor ${name}`).trim()
     if (!/^[0-9a-f]{64}$/.test(containerId)) throw new Error(`supervisor docker run returned invalid id: ${containerId}`)
     this.trackedSupervisorContainers.add(containerId)
     this.trackedContainers.add(containerId)
@@ -3873,7 +3891,9 @@ export class RuntimeHarness {
         if (!dockerIsRootless()) {
           const uid = process.getuid?.() ?? 1000
           const gid = process.getgid?.() ?? 1000
-          try { docker(['exec', instance.containerId, 'chown', `${uid}:${gid}`, instance.controlSocket]) } catch {}
+          try { docker(['exec', instance.containerId, 'chown', `${uid}:${gid}`, instance.controlSocket]) } catch (error) {
+            if (subprocessInterrupted(error)) throw error
+          }
         }
         try { return await this.adminOk(instance, { method: 'health' }) } catch (error) { lastError = error }
       }
@@ -4227,12 +4247,12 @@ export class RuntimeHarness {
   }
 
   startWebLifetimeSentinel(scenarioId: string): string {
-    const id = docker([
+    const id = this.createOwnedDockerResource([
       'run', '-d', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges', '--label', 'project=freshell',
       '--label', `com.freshell.runtime-test-run-id=${this.runId}`,
       this.imageRef, 'sleep', 'infinity',
-    ]).trim()
+    ], `web lifetime sentinel ${scenarioId}`).trim()
     if (!/^[0-9a-f]{64}$/.test(id)) throw new Error(`web lifetime sentinel returned invalid id: ${id}`)
     this.trackedContainers.add(id)
     this.recordLifecycle('web_lifetime_sentinel.started', { scenarioId, containerId: id })
@@ -4241,14 +4261,14 @@ export class RuntimeHarness {
 
   stopTrackedContainerExact(containerId: string): void {
     if (!this.isContainerRunning(containerId)) return
-    const result = spawnSync('docker', ['stop', '-t', '1', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['stop', '-t', '1', containerId])
     if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for tracked container ${containerId}`)
   }
 
   killTrackedContainerExact(containerId: string): void {
     if (!this.trackedContainers.has(containerId)) throw new Error(`refusing to kill untracked container ${containerId}`)
     if (!this.isContainerRunning(containerId)) return
-    const result = spawnSync('docker', ['kill', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['kill', containerId])
     if (result.status !== 0) throw new Error(result.stderr || `docker kill failed for tracked container ${containerId}`)
   }
 
@@ -4264,21 +4284,21 @@ export class RuntimeHarness {
 
   restartOwnedRuntimeExact(containerId: string): void {
     if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to restart non-receipt container ${containerId}`)
-    const result = spawnSync('docker', ['restart', '-t', '1', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['restart', '-t', '1', containerId])
     if (result.status !== 0) throw new Error(result.stderr || `docker restart failed for owned runtime ${containerId}`)
   }
 
   stopOwnedRuntimeExact(containerId: string): void {
     if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to stop non-receipt container ${containerId}`)
     if (!this.isContainerRunning(containerId)) return
-    const result = spawnSync('docker', ['stop', '-t', '1', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['stop', '-t', '1', containerId])
     if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for owned runtime ${containerId}`)
   }
 
   killOwnedRuntimeExact(containerId: string): void {
     if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to kill non-receipt container ${containerId}`)
     if (!this.isContainerRunning(containerId)) return
-    const result = spawnSync('docker', ['kill', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['kill', containerId])
     if (result.status !== 0) throw new Error(result.stderr || `docker kill failed for owned runtime ${containerId}`)
   }
 
@@ -4292,11 +4312,9 @@ export class RuntimeHarness {
     if (!this.isContainerRunning(containerId)) return
     // Runtime workers run as the provider UID. The rootless container host
     // has no CAP_KILL for that UID, so signal from the same user namespace.
-    const result = spawnSync('docker', [
+    const result = dockerResult([
       'exec', '--user', '65534:0', containerId, 'kill', `-${signal}`, String(pid),
-    ], {
-      encoding: 'utf8',
-    })
+    ])
     if (result.status !== 0) {
       throw new Error(result.stderr || `docker exec kill failed for owned runtime ${containerId} pid ${pid}`)
     }
@@ -4306,7 +4324,7 @@ export class RuntimeHarness {
     if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
       throw new Error(`refusing to exec non-owned container ${containerId}`)
     }
-    return execFileSync('docker', ['exec', containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    return execFileSync('docker', ['exec', containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
   }
 
   execOwnedContainerAsExact(containerId: string, user: string, command: string[]): string {
@@ -4314,7 +4332,7 @@ export class RuntimeHarness {
       throw new Error(`refusing to exec non-owned container ${containerId}`)
     }
     if (!/^\d+:\d+$/.test(user)) throw new Error(`invalid numeric docker exec user ${user}`)
-    return execFileSync('docker', ['exec', '--user', user, containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    return execFileSync('docker', ['exec', '--user', user, containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
   }
 
   execTransferProviderExact(containerId: string, command: string[]): string {
@@ -4328,7 +4346,7 @@ export class RuntimeHarness {
     if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
       throw new Error(`refusing to inspect non-owned container ${containerId}`)
     }
-    return execFileSync('docker', ['top', containerId, ...psArgs], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    return execFileSync('docker', ['top', containerId, ...psArgs], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
   }
 
   async waitForFile(filePath: string, timeoutMs = 8_000): Promise<void> {
@@ -4477,7 +4495,7 @@ export class RuntimeHarness {
   }
 
   isContainerRunning(containerId: string, requireObservation = false): boolean {
-    const result = spawnSync('docker', ['inspect', '--format', '{{.State.Running}}', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['inspect', '--format', '{{.State.Running}}', containerId])
     const running = result.stdout?.trim()
     if (requireObservation && (result.status !== 0 || !['true', 'false'].includes(running))) {
       throw new Error('exact container running-state inspection is unavailable or malformed')
@@ -4487,13 +4505,13 @@ export class RuntimeHarness {
   }
 
   containerLogs(containerId: string): string {
-    const result = spawnSync('docker', ['logs', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['logs', containerId])
     return `${result.stdout ?? ''}${result.stderr ?? ''}`.slice(-20_000)
   }
 
   stopSupervisorExact(instance: SupervisorInstance, requireObservation = false): void {
     if (this.isContainerRunning(instance.containerId, requireObservation)) {
-      const result = spawnSync('docker', ['stop', '-t', '2', instance.containerId], { encoding: 'utf8' })
+      const result = dockerResult(['stop', '-t', '2', instance.containerId])
       if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for ${instance.containerId}`)
     }
     if (requireObservation && this.isContainerRunning(instance.containerId, true)) {
@@ -4502,9 +4520,9 @@ export class RuntimeHarness {
   }
 
   removeContainerExact(containerId: string): void {
-    const inspect = spawnSync('docker', ['inspect', containerId], { encoding: 'utf8' })
+    const inspect = dockerResult(['inspect', containerId])
     if (inspect.status !== 0) return
-    const result = spawnSync('docker', ['rm', '-f', containerId], { encoding: 'utf8' })
+    const result = dockerResult(['rm', '-f', containerId])
     if (result.status !== 0) throw new Error(result.stderr || `docker rm failed for ${containerId}`)
     this.trackedContainers.delete(containerId)
     this.trackedSupervisorContainers.delete(containerId)
@@ -4515,7 +4533,7 @@ export class RuntimeHarness {
     const scenarioRoot = this.scenarioPath(options.scenarioId)
     fs.mkdirSync(scenarioRoot, { recursive: true })
     const name = `freshell-foreign-${this.runId.slice(0, 8)}-${randomUUID().slice(0, 8)}`
-    const id = docker([
+    const id = this.createOwnedDockerResource([
       'run', '-d', '--name', name, '--label', `com.freshell.runtime-test-run-id=${this.runId}`, '--network', 'none',
       '--label', 'com.freshell.managed=true',
       '--label', `com.freshell.installation-id=${options.installationId ?? `installation-${randomUUID()}`}`,
@@ -4524,7 +4542,7 @@ export class RuntimeHarness {
       '-e', `FRESHELL_CODEX_SIDECAR_ID=codex-sidecar-${randomUUID()}`,
       '-v', `${scenarioRoot}:${scenarioRoot}:rw`, '-w', scenarioRoot,
       this.imageRef, 'sleep', '600',
-    ]).trim()
+    ], `foreign sentinel ${name}`).trim()
     if (!/^[0-9a-f]{64}$/.test(id)) throw new Error(`foreign sentinel invalid id: ${id}`)
     this.trackedForeignContainers.add(id)
     this.trackedContainers.add(id)
@@ -4548,6 +4566,19 @@ export class RuntimeHarness {
     return execFileSync(command, args, { cwd: options.cwd ?? this.repoRoot, env: { ...process.env, ...options.env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 })
   }
 
+  private retainInterruptedDockerRequest(resource: string, error: unknown): void {
+    if (!subprocessInterrupted(error)) return
+    this.unsettledDockerRequests.add(resource)
+    this.recordLifecycle('docker.creation_unsettled', { resource })
+  }
+
+  private createOwnedDockerResource(args: string[], resource: string): string {
+    try { return docker(args) } catch (error) {
+      this.retainInterruptedDockerRequest(resource, error)
+      throw error
+    }
+  }
+
   private ensureRuntimeImage(): void {
     if (this.phase >= 2) {
       const selected = process.env.FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST
@@ -4569,17 +4600,22 @@ export class RuntimeHarness {
         return
       }
       this.ownedRuntimeImage = { tag: runOwnedRuntimeImageTag(this.runId, this.candidateSha), runId: this.runId, candidateSha: this.candidateSha }
-      const image = buildRunOwnedRuntimeImage(this.repoRoot, this.runId, this.candidateSha)
-      this.ownedRuntimeImage.digest = image.digest
-      this.imageRef = image.digest
-      this.recordLifecycle('runtime.owned_image_built', { tag: image.tag, digest: image.digest })
+      try {
+        const image = buildRunOwnedRuntimeImage(this.repoRoot, this.runId, this.candidateSha)
+        this.ownedRuntimeImage.digest = image.digest
+        this.imageRef = image.digest
+        this.recordLifecycle('runtime.owned_image_built', { tag: image.tag, digest: image.digest })
+      } catch (error) {
+        this.retainInterruptedDockerRequest(`runtime image ${this.ownedRuntimeImage.tag}`, error)
+        throw error
+      }
       return
     }
     const tag = PHASE1_RUNTIME_IMAGE_TAG
-    let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+    let inspect = dockerResult(['image', 'inspect', tag, '--format', '{{.Id}}'])
     if (inspect.status !== 0) {
-      docker(['pull', tag])
-      inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+      docker(['pull', tag], SYNC_BUILD_TIMEOUT_MS)
+      inspect = dockerResult(['image', 'inspect', tag, '--format', '{{.Id}}'])
     }
     this.imageRef = inspect.stdout.trim()
     if (!/^sha256:[0-9a-f]{64}$/.test(this.imageRef)) throw new Error(`runtime image is not pinned: ${this.imageRef}`)
@@ -4603,7 +4639,9 @@ export class RuntimeHarness {
     try {
       const common = git(this.repoRoot, ['rev-parse', '--git-common-dir']).trim()
       roots.add(fs.realpathSync(path.isAbsolute(common) ? common : path.join(this.repoRoot, common)))
-    } catch {}
+    } catch (error) {
+      if (subprocessInterrupted(error)) throw error
+    }
     return [...roots]
   }
 
@@ -4663,16 +4701,16 @@ export class RuntimeHarness {
     }
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
     const command = { program: mise, args: ['exec', 'rust@1.96.0', '--', 'cargo'] }
-    const hostMiseRustc = execFileSync(mise, ['exec', 'rust@1.96.0', '--', 'rustc', '--version'], { encoding: 'utf8' }).trim()
+    const hostMiseRustc = execFileSync(mise, ['exec', 'rust@1.96.0', '--', 'rustc', '--version'], { encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' }).trim()
     runtimeCargoBuildAndCopy(this.repoRoot, mise, ['exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], [
       { source: cargoArtifactPath(this.repoRoot, 'debug', 'freshell-supervisor'), target: this.testSupervisorBinary },
       { source: cargoArtifactPath(this.repoRoot, 'debug', 'freshell-session-host'), target: this.testHostBinary },
-    ])
+    ], process.env, SYNC_BUILD_TIMEOUT_MS)
 
     runtimeCargoBuildAndCopy(this.repoRoot, mise, ['exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], [
       { source: cargoArtifactPath(this.repoRoot, 'release', 'freshell-supervisor'), target: this.releaseSupervisorBinary },
       { source: cargoArtifactPath(this.repoRoot, 'release', 'freshell-session-host'), target: this.releaseHostBinary },
-    ])
+    ], process.env, SYNC_BUILD_TIMEOUT_MS)
     this.buildProvenance = { source: 'mise', command, hostMiseRustc }
   }
 
@@ -4755,7 +4793,8 @@ function dockerIsRootless(): boolean {
   try {
     const options = JSON.parse(docker(['info', '--format', '{{json .SecurityOptions}}'])) as string[]
     dockerRootlessCache = options.some((value) => /rootless/i.test(value))
-  } catch {
+  } catch (error) {
+    if (subprocessInterrupted(error)) throw error
     dockerRootlessCache = false
   }
   return dockerRootlessCache
@@ -4768,8 +4807,16 @@ export function dockerSocketPath(): string {
   return path.join('/run/user', String(process.getuid?.() ?? 1000), 'docker.sock')
 }
 
-function docker(args: string[]): string {
-  return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 })
+function dockerResult(args: string[]) {
+  const result = spawnSync('docker', args, {
+    encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL',
+  })
+  assertSubprocessCompleted(result, 'Docker client')
+  return result
+}
+
+function docker(args: string[], timeoutMs = SYNC_PROBE_TIMEOUT_MS): string {
+  return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' })
 }
 
 function cargoArtifactPath(repoRoot: string, profile: 'debug' | 'release', binary: string): string {
@@ -4779,7 +4826,7 @@ function cargoArtifactPath(repoRoot: string, profile: 'debug' | 'release', binar
 }
 
 function git(cwd: string, args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' })
+  return execFileSync('git', args, { cwd, encoding: 'utf8', timeout: SYNC_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })
 }
 
 /// Bound on one gate → supervisor control round trip.
@@ -6073,7 +6120,7 @@ export class ManagedRuntimeOwner {
     this.stopSettlement = (async () => {
       this.nativeCollectionsClosing = true
       await Promise.allSettled([...this.nativeCaptures])
-      const result = await settleOwnedRuntimeCleanup(() => this.stopWebAndReleaseHeldHosts(), () => this.runtime.cleanup())
+      const result = await settleOwnedRuntimeCleanup(() => this.stopWebAndReleaseHeldHosts(), errors => this.runtime.cleanup(errors))
       if (result.ok && this.syntheticSource) {
         try { await fsp.rm(this.syntheticSource.root, { recursive: true, force: true }) }
         catch { result.ok = false; result.errors.push('owned synthetic source cleanup failed') }
@@ -8325,7 +8372,7 @@ export class ManagedRuntimeOwner {
       'exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-server',
       '--features', features,
     ], [{ source: cargoArtifactPath(this.repoRoot, 'release', 'freshell-server'), target }],
-    { ...process.env, FRESHELL_BUILD_SOURCE_STATE: sourceState })
+    { ...process.env, FRESHELL_BUILD_SOURCE_STATE: sourceState }, SYNC_BUILD_TIMEOUT_MS)
     return target
   }
 
@@ -8342,7 +8389,7 @@ export class ManagedRuntimeOwner {
     runtimeCargoBuildAndCopy(this.repoRoot, mise, [
       'exec', 'rust@1.96.0', '--', 'cargo', 'build', '--locked', '--release', '-p', 'freshell-supervisor',
       '--features', 'provider-qualification',
-    ], [{ source: cargoArtifactPath(this.repoRoot, 'release', 'freshell-supervisor'), target }])
+    ], [{ source: cargoArtifactPath(this.repoRoot, 'release', 'freshell-supervisor'), target }], process.env, SYNC_BUILD_TIMEOUT_MS)
     return target
   }
 
