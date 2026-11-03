@@ -549,7 +549,9 @@ function localEchoLanded(
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
   const previousTurnKeys = options.previousTurnKeys ?? null
-  const canMatchText = Boolean(needle) && (
+  // An accepted native turn ID identifies this send even when another user
+  // submits identical text. Legacy receipts without an ID still match text.
+  const canMatchText = Boolean(needle) && !submittedTurnId && (
     options.allowTextMatch === true
     || pending?.legacyAccepted === true
     || !pending
@@ -557,7 +559,7 @@ function localEchoLanded(
   return turns.some((turn) => (
     turn.role === 'user'
     && (
-      (submittedTurnId ? getFreshAgentDisplayTurnKey(turn) === submittedTurnId : false)
+      (submittedTurnId ? getFreshAgentDisplayTurnKey(turn) === submittedTurnId || turn.nativeTurnId === submittedTurnId : false)
       || (turn as { requestId?: unknown }).requestId === echo.requestId
       || (
         canMatchText
@@ -3586,9 +3588,7 @@ export function FreshAgentView({
               ? mergeFreshAgentTranscriptProjection(snapshot, projection)
               : projection?.turns ?? []
             if (!localEchoLanded(turns, recoveredEcho, pending, {
-              // A known submitted ID distinguishes another client's identical
-              // text from this request. Legacy receipts can still match text.
-              allowTextMatch: !submittedTurnId, previousTurnKeys: new Set(boundary),
+              allowTextMatch: true, previousTurnKeys: new Set(boundary),
             })) setLocalEcho(recoveredEcho)
           }
         }
@@ -3610,9 +3610,10 @@ export function FreshAgentView({
           if (outgoingTurnRef.current?.requestId === message.requestId) {
             outgoingTurnRef.current.submittedTurnId = submittedTurnId
           }
-          if (!pending?.deliveryAmbiguous && echo?.requestId === message.requestId
-            && (!current.pendingLocalEcho || current.pendingLocalEcho.requestId === message.requestId)) {
-            setLocalEcho({ ...echo, submittedTurnId })
+          if (!pending?.deliveryAmbiguous && current.pendingLocalEcho?.requestId === message.requestId) {
+            // Redux may already have cleared the echo from a snapshot in the
+            // same batch, before the render ref has observed that clear.
+            setLocalEcho({ ...current.pendingLocalEcho, submittedTurnId })
           }
         } else {
           recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
