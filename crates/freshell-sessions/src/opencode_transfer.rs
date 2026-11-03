@@ -6147,6 +6147,116 @@ mod workspace_metadata_test_hooks {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn owned_pipe_meter_waits_for_a_held_child_to_exec_before_sampling() {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        fn pipe() -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+
+        struct OwnedChild(libc::pid_t);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let mut status = 0;
+                unsafe {
+                    // Only a still-unreaped child of this process may be killed.
+                    if libc::waitpid(self.0, &mut status, libc::WNOHANG) == 0 {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, &mut status, 0);
+                    }
+                }
+            }
+        }
+
+        let (gate_read, gate_write) = pipe();
+        let (stdin_read, stdin_write) = pipe();
+        let gate_write_fd = gate_write.as_raw_fd();
+        let stdin_write_fd = stdin_write.as_raw_fd();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (sampled_tx, sampled_rx) = mpsc::channel();
+        let meter = std::thread::spawn(move || {
+            // Prepare all strings before fork: the child uses only
+            // async-signal-safe libc calls until exec or _exit.
+            let shell = CString::new("/bin/sh").unwrap();
+            let option = CString::new("-c").unwrap();
+            let script = CString::new("IFS= read -r ignored || :").unwrap();
+            let argv = [
+                shell.as_ptr(),
+                option.as_ptr(),
+                script.as_ptr(),
+                std::ptr::null(),
+            ];
+            let gate_read_fd = gate_read.as_raw_fd();
+            let stdin_read_fd = stdin_read.as_raw_fd();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork the test-owned child");
+            if pid == 0 {
+                unsafe {
+                    libc::close(gate_write_fd);
+                    libc::close(stdin_write_fd);
+                    if libc::dup2(stdin_read_fd, libc::STDIN_FILENO) != libc::STDIN_FILENO {
+                        libc::_exit(125);
+                    }
+                    if stdin_read_fd != libc::STDIN_FILENO {
+                        libc::close(stdin_read_fd);
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(gate_read_fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        libc::_exit(126);
+                    }
+                    libc::close(gate_read_fd);
+                    libc::execv(shell.as_ptr(), argv.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
+            let child = OwnedChild(pid);
+            drop(gate_read);
+            drop(stdin_read);
+            started_tx.send(pid).expect("report test-owned child");
+            process_spawned(pid as u32);
+            let counts = STATE.with(|state| state.borrow().counts.clone());
+            sampled_tx.send(counts).expect("report completed sampling");
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            drop(child);
+        });
+
+        let pid = started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("test-owned child must start");
+        assert_eq!(
+            fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            std::env::current_exe().unwrap(),
+            "the child must still be held before exec"
+        );
+        assert!(
+            matches!(
+                sampled_rx.recv_timeout(Duration::from_millis(250)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the meter must not finish while the child is held before exec"
+        );
+
+        let mut gate = File::from(gate_write);
+        gate.write_all(b"x").expect("release the held child");
+        drop(gate);
+        let counts = sampled_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the meter must finish after the child execs");
+        assert_eq!(counts.get("all_spawn"), Some(&1));
+        assert_eq!(counts.get("os_workspace_peak"), Some(&1));
+        drop(stdin_write);
+        meter.join().expect("join the owned child and meter");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn owned_pipe_meter_counts_a_close_on_exec_duplicate_in_an_execed_child() {
         struct OwnedChild(Child);
         impl Drop for OwnedChild {
