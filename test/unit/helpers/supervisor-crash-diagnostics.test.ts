@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   classifySupervisorGdbFailure,
+  summarizeSupervisorGdbAttachFacts,
   summarizeSupervisorGdbFailureOutput,
   summarizeSupervisorGdbOutput,
 } from '../../helpers/supervisor-crash-diagnostics.js'
@@ -55,5 +56,78 @@ describe('supervisor crash diagnostic parsing', () => {
     expect(classifySupervisorGdbFailure('error while loading shared libraries')).toBe('missing-shared-library')
     expect(classifySupervisorGdbFailure('Could not attach to process')).toBe('attach-rejected')
     expect(classifySupervisorGdbFailure('')).toBe('empty-output')
+  })
+
+  it('reports the observer stage and bounded process facts without raw kernel values', () => {
+    const facts = summarizeSupervisorGdbAttachFacts({
+      stage: 'gdb_attach',
+      markers: { wrapperStarted: true, scriptStarted: true, attached: false, exited: false, exitCode: undefined },
+      container: { verified: true, running: true },
+      gdb: {
+        present: true,
+        identityMatches: true,
+        state: 'D (disk sleep)',
+        waitChannel: 'do_wait_for_common',
+        threads: 2,
+        capEff: '0000000000080000',
+        tracerPid: 0,
+      },
+      target: {
+        present: true,
+        identityMatches: true,
+        state: 't (tracing stop)',
+        waitChannel: 'ptrace_stop',
+        threads: 96,
+        capEff: '0000000000080000',
+        tracerPid: 12345,
+      },
+    })
+
+    expect(facts).toEqual({
+      stage: 'gdb_attach',
+      markers: { wrapperStarted: true, scriptStarted: true, attached: false, exited: false, exitStatus: 'unknown' },
+      container: { verified: true, running: true },
+      gdb: {
+        present: true, identityMatches: true, state: 'disk_sleep', waitClass: 'wait',
+        threadCount: '2_to_8', hasSysPtrace: true, tracerPresent: false,
+      },
+      target: {
+        present: true, identityMatches: true, state: 'tracing_stop', waitClass: 'ptrace',
+        threadCount: '33_to_128', hasSysPtrace: true, tracerPresent: true,
+      },
+    })
+    expect(JSON.stringify(facts)).not.toMatch(/do_wait_for_common|ptrace_stop|0000000000080000|12345|96/)
+  })
+
+  it('withholds process details when a recorded pid no longer matches the owned process', () => {
+    const facts = summarizeSupervisorGdbAttachFacts({
+      stage: 'gdb_script_start',
+      markers: { wrapperStarted: true, scriptStarted: false, attached: false, exited: false },
+      container: { verified: true, running: true },
+      gdb: {
+        present: true,
+        identityMatches: false,
+        state: 'R (running)',
+        waitChannel: '/private/kernel/secret',
+        threads: 12,
+        capEff: '0000000000080000',
+        tracerPid: 789,
+      },
+      target: {
+        present: true,
+        identityMatches: true,
+        state: 'S (sleeping)',
+        waitChannel: 'ep_poll',
+        threads: 4,
+        capEff: '0000000000000000',
+        tracerPid: 0,
+      },
+    })
+
+    expect(facts.gdb).toEqual({
+      present: true, identityMatches: false, state: 'unavailable', waitClass: 'unavailable',
+      threadCount: 'unavailable', hasSysPtrace: null, tracerPresent: null,
+    })
+    expect(JSON.stringify(facts)).not.toMatch(/private\/kernel|0000000000080000|0000000000000000|789|12/)
   })
 })

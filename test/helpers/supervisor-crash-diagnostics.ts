@@ -39,6 +39,53 @@ export type SafeGdbFailureSummary = {
   diagnosticLines: string[]
 }
 
+type ObserverWaitStage = 'gdb_wrapper_start' | 'gdb_script_start' | 'gdb_attach'
+type SafeProcessState = 'running' | 'sleeping' | 'disk_sleep' | 'stopped' | 'tracing_stop' | 'zombie' | 'idle' | 'other' | 'unavailable'
+type SafeWaitClass = 'ptrace' | 'wait' | 'poll' | 'futex' | 'sleep' | 'other' | 'unavailable'
+type SafeThreadCount = 'none' | 'one' | '2_to_8' | '9_to_32' | '33_to_128' | 'over_128' | 'unavailable'
+
+type RawProcessAttachFacts = {
+  present: boolean
+  identityMatches: boolean | null
+  state: string | null
+  waitChannel: string | null
+  threads: number | null
+  capEff: string | null
+  tracerPid: number | null
+}
+
+type RawSupervisorGdbAttachFacts = {
+  stage: ObserverWaitStage
+  markers: { wrapperStarted: boolean; scriptStarted: boolean; attached: boolean; exited: boolean; exitCode?: number }
+  container: { verified: boolean; running: boolean }
+  gdb: RawProcessAttachFacts
+  target: RawProcessAttachFacts
+}
+
+export type SafeSupervisorGdbAttachFacts = {
+  stage: ObserverWaitStage
+  markers: { wrapperStarted: boolean; scriptStarted: boolean; attached: boolean; exited: boolean; exitStatus: 'zero' | 'nonzero' | 'unknown' }
+  container: { verified: boolean; running: boolean }
+  gdb: {
+    present: boolean
+    identityMatches: boolean | null
+    state: SafeProcessState
+    waitClass: SafeWaitClass
+    threadCount: SafeThreadCount
+    hasSysPtrace: boolean | null
+    tracerPresent: boolean | null
+  }
+  target: {
+    present: boolean
+    identityMatches: boolean | null
+    state: SafeProcessState
+    waitClass: SafeWaitClass
+    threadCount: SafeThreadCount
+    hasSysPtrace: boolean | null
+    tracerPresent: boolean | null
+  }
+}
+
 export type SupervisorCrashDiagnosticHandle = {
   policy: { capAdd: string[]; defaultSeccomp: boolean; network: string; privileged: boolean; threadDbMatchesTarget: boolean }
   probes: {
@@ -208,6 +255,82 @@ function readPid(filePath: string): number | undefined {
   return Number.isSafeInteger(pid) && pid > 1 ? pid : undefined
 }
 
+function safeProcessState(value: string | null): SafeProcessState {
+  const state = value?.trim().match(/^[RSDTtZIX]/)?.[0]
+  switch (state) {
+    case 'R': return 'running'
+    case 'S': return 'sleeping'
+    case 'D': return 'disk_sleep'
+    case 'T': return 'stopped'
+    case 't': return 'tracing_stop'
+    case 'Z': return 'zombie'
+    case 'I': return 'idle'
+    case 'X': return 'other'
+    default: return 'unavailable'
+  }
+}
+
+function safeWaitClass(value: string | null): SafeWaitClass {
+  if (!value || value === '0') return 'unavailable'
+  const normalized = value.toLowerCase()
+  if (normalized.includes('ptrace')) return 'ptrace'
+  if (normalized.includes('wait')) return 'wait'
+  if (/poll|epoll|select/.test(normalized)) return 'poll'
+  if (normalized.includes('futex')) return 'futex'
+  if (/sleep|schedule/.test(normalized)) return 'sleep'
+  return 'other'
+}
+
+function safeThreadCount(value: number | null): SafeThreadCount {
+  if (!Number.isSafeInteger(value) || value! < 0) return 'unavailable'
+  if (value === 0) return 'none'
+  if (value === 1) return 'one'
+  if (value! <= 8) return '2_to_8'
+  if (value! <= 32) return '9_to_32'
+  if (value! <= 128) return '33_to_128'
+  return 'over_128'
+}
+
+function hasSysPtraceCapability(value: string | null): boolean | null {
+  if (!value || !/^[a-f0-9]+$/i.test(value)) return null
+  try {
+    return (BigInt(`0x${value}`) & (1n << 19n)) !== 0n
+  } catch {
+    return null
+  }
+}
+
+function safeProcessAttachFacts(facts: RawProcessAttachFacts) {
+  const trustworthy = facts.present && facts.identityMatches === true
+  return {
+    present: facts.present,
+    identityMatches: facts.identityMatches,
+    state: trustworthy ? safeProcessState(facts.state) : 'unavailable' as const,
+    waitClass: trustworthy ? safeWaitClass(facts.waitChannel) : 'unavailable' as const,
+    threadCount: trustworthy ? safeThreadCount(facts.threads) : 'unavailable' as const,
+    hasSysPtrace: trustworthy ? hasSysPtraceCapability(facts.capEff) : null,
+    tracerPresent: trustworthy && Number.isSafeInteger(facts.tracerPid) && facts.tracerPid! >= 0
+      ? facts.tracerPid! > 0
+      : null,
+  }
+}
+
+export function summarizeSupervisorGdbAttachFacts(facts: RawSupervisorGdbAttachFacts): SafeSupervisorGdbAttachFacts {
+  return {
+    stage: facts.stage,
+    markers: {
+      wrapperStarted: facts.markers.wrapperStarted,
+      scriptStarted: facts.markers.scriptStarted,
+      attached: facts.markers.attached,
+      exited: facts.markers.exited,
+      exitStatus: facts.markers.exitCode === undefined ? 'unknown' : facts.markers.exitCode === 0 ? 'zero' : 'nonzero',
+    },
+    container: { verified: facts.container.verified, running: facts.container.running },
+    gdb: safeProcessAttachFacts(facts.gdb),
+    target: safeProcessAttachFacts(facts.target),
+  }
+}
+
 export function classifySupervisorGdbFailure(...texts: string[]): string {
   const text = texts.join('\n')
   if (!text.trim()) return 'empty-output'
@@ -260,19 +383,26 @@ function gdbQuote(value: string): string {
   return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
 }
 
-async function waitForFile(filePath: string, timeoutMs: number, failStatusPath?: string, diagnosticPaths: string[] = []): Promise<void> {
-  const deadline = Date.now() + timeoutMs
+async function waitForFile(
+  filePath: string,
+  timeoutMs: number,
+  failStatusPath?: string,
+  diagnosticPaths: string[] = [],
+  markerName = 'GDB marker',
+  deadlineAt?: number,
+): Promise<void> {
+  const deadline = deadlineAt ?? Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (fs.existsSync(filePath)) return
     if (failStatusPath && fs.existsSync(failStatusPath)) {
       const exitCode = readStatus(failStatusPath)
       const category = classifySupervisorGdbFailure(...diagnosticPaths.map(file => readBoundedTail(file).text))
-      throw new Error(`GDB process exited before its attach marker (exit=${exitCode ?? 'unknown'}, output=${category})`)
+      throw new Error(`${markerName} process exited first (exit=${exitCode ?? 'unknown'}, output=${category})`)
     }
     await new Promise(resolve => setTimeout(resolve, 50))
   }
   const category = classifySupervisorGdbFailure(...diagnosticPaths.map(file => readBoundedTail(file).text))
-  throw new Error(`GDB attach marker timed out (output=${category})`)
+  throw new Error(`${markerName} timed out (output=${category})`)
 }
 
 function gdbProgram(loader: string, libDir: string, gdbPath: string, dataDir: string, scriptPath: string): string {
@@ -284,11 +414,13 @@ function gdbScript(options: {
   pid: number
   libDir: string
   logPath: string
+  scriptStartedPath?: string
   attachedPath: string
   capturedPath: string
   includeBacktrace: boolean
 }) {
   const lines = [
+    ...(options.scriptStartedPath ? ['shell touch ' + shellQuote(options.scriptStartedPath)] : []),
     'set pagination off',
     'set confirm off',
     'set print address off',
@@ -322,6 +454,93 @@ function gdbScript(options: {
     lines.push('echo FRESHELL_GDB_TARGET_EXITED\\n')
   }
   return lines.join('\n') + '\n'
+}
+
+function unavailableProcessAttachFacts(): RawProcessAttachFacts {
+  return {
+    present: false,
+    identityMatches: null,
+    state: null,
+    waitChannel: null,
+    threads: null,
+    capEff: null,
+    tracerPid: null,
+  }
+}
+
+function readObserverProcessAttachFacts(
+  runtime: RuntimeHarness,
+  containerId: string,
+  runId: string,
+  gdbPid: number | undefined,
+  gdbBin: string,
+  scriptPath: string,
+): { container: { verified: boolean; running: boolean }; gdb: RawProcessAttachFacts; target: RawProcessAttachFacts } {
+  let verified = false
+  let running = false
+  let gdb = unavailableProcessAttachFacts()
+  let target = unavailableProcessAttachFacts()
+  try {
+    const inspected = runtime.inspectContainer(containerId)
+    verified = inspected.Id === containerId
+      && inspected.Config?.Labels?.['com.freshell.runtime-test-run-id'] === runId
+    running = verified && Boolean(inspected.State?.Running)
+    if (!running) return { container: { verified, running }, gdb, target }
+
+    const processProbe = [
+      'import json, os, sys',
+      'gdb_pid = int(sys.argv[1])',
+      'expected_gdb = os.fsencode(sys.argv[2])',
+      'expected_script = os.fsencode(sys.argv[3])',
+      'def snapshot(pid, expected=None):',
+      '    result = {"present": False, "identityMatches": None, "state": None, "waitChannel": None, "threads": None, "capEff": None, "tracerPid": None}',
+      '    try:',
+      '        with open(f"/proc/{pid}/status", "r", encoding="ascii") as source:',
+      '            rows = source.read().splitlines()',
+      '    except OSError:',
+      '        return result',
+      '    result["present"] = True',
+      '    try:',
+      '        if expected is None:',
+      '            matches = os.path.basename(os.readlink(f"/proc/{pid}/exe")) == "freshell-supervisor-test"',
+      '        else:',
+      '            with open(f"/proc/{pid}/cmdline", "rb") as source:',
+      '                argv = source.read().split(b"\\0")',
+      '            matches = expected[0] in argv and expected[1] in argv',
+      '    except OSError:',
+      '        matches = False',
+      '    result["identityMatches"] = matches',
+      '    if not matches:',
+      '        return result',
+      '    fields = {}',
+      '    for row in rows:',
+      '        if ":" in row:',
+      '            key, value = row.split(":", 1)',
+      '            fields[key] = value.strip()',
+      '    result["state"] = fields.get("State")',
+      '    result["threads"] = int(fields["Threads"]) if fields.get("Threads", "").isdigit() else None',
+      '    result["capEff"] = fields.get("CapEff")',
+      '    result["tracerPid"] = int(fields["TracerPid"]) if fields.get("TracerPid", "").isdigit() else None',
+      '    try:',
+      '        with open(f"/proc/{pid}/wchan", "r", encoding="ascii") as source:',
+      '            result["waitChannel"] = source.read().strip()',
+      '    except OSError:',
+      '        pass',
+      '    return result',
+      'print(json.dumps({"gdb": snapshot(gdb_pid, (expected_gdb, expected_script)), "target": snapshot(1)}))',
+    ].join('\n')
+    const output = runtime.execOwnedContainerExact(containerId, [
+      'python3', '-I', '-c', processProbe,
+      String(gdbPid ?? -1), gdbBin, scriptPath,
+    ])
+    const parsed = JSON.parse(output) as { gdb?: RawProcessAttachFacts; target?: RawProcessAttachFacts }
+    if (parsed.gdb) gdb = parsed.gdb
+    if (parsed.target) target = parsed.target
+  } catch {
+    // A missing container or unreadable /proc facts are recorded as unavailable.
+    // The diagnostic failure remains the primary result.
+  }
+  return { container: { verified, running }, gdb, target }
 }
 
 function parseSummary(filePath: string, exitPath?: string): SafeGdbSummary {
@@ -382,7 +601,9 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
   const gdbBin = path.join(bundleRoot, 'bin', 'gdb')
   const captureRoot = path.join(rig.runtime.testRoot, 'supervisor-gdb-diagnostic')
   let cleanupObserver: (() => Promise<void>) | undefined
+  let collectObserverAttachFacts: ((stage: ObserverWaitStage) => SafeSupervisorGdbAttachFacts) | undefined
   let failureOutputPaths: string[] = []
+  let failureStage: ObserverWaitStage | undefined
   try {
     const { loader, libDir, dataDir } = copyExecutableDependencies(gdbPath, bundleRoot)
     fs.copyFileSync(hostThreadDbPath, path.join(libDir, 'libthread_db.so.1'))
@@ -407,19 +628,48 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
       logPath: path.join(captureRoot, 'supervisor.gdb.log'),
       launchOutputPath: path.join(captureRoot, 'supervisor.gdb.launch.log'),
       scriptPath: path.join(bundleRoot, 'supervisor.gdb'),
+      wrapperStartedPath: path.join(captureRoot, 'supervisor.gdb.wrapper-started'),
+      scriptStartedPath: path.join(captureRoot, 'supervisor.gdb.script-started'),
       attachedPath: path.join(captureRoot, 'supervisor.gdb.attached'),
       capturedPath: path.join(captureRoot, 'supervisor.gdb.captured'),
       pidPath: path.join(captureRoot, 'supervisor.gdb.pid'),
       exitPath: path.join(captureRoot, 'supervisor.gdb.exit'),
     }
+    for (const file of [observer.wrapperStartedPath, observer.scriptStartedPath, observer.attachedPath,
+      observer.capturedPath, observer.pidPath, observer.exitPath]) {
+      if (fs.existsSync(file)) fs.rmSync(file, { force: true })
+    }
     fs.writeFileSync(observer.scriptPath, gdbScript({
       pid: 1, libDir, logPath: observer.logPath, attachedPath: observer.attachedPath,
-      capturedPath: observer.capturedPath, includeBacktrace: true,
+      scriptStartedPath: observer.scriptStartedPath, capturedPath: observer.capturedPath, includeBacktrace: true,
     }), { mode: 0o600 })
     const observerCommand = gdbProgram(loader, libDir, gdbBin, dataDir, observer.scriptPath)
     createPrivateOutputFile(observer.launchOutputPath)
     let observerStopRequested = false
     let observerFinalized = false
+    collectObserverAttachFacts = (stage: ObserverWaitStage): SafeSupervisorGdbAttachFacts => {
+      const processFacts = readObserverProcessAttachFacts(
+        rig.runtime,
+        containerId,
+        rig.runtime.runId,
+        readPid(observer.pidPath),
+        gdbBin,
+        observer.scriptPath,
+      )
+      return summarizeSupervisorGdbAttachFacts({
+        stage,
+        markers: {
+          wrapperStarted: fs.existsSync(observer.wrapperStartedPath),
+          scriptStarted: fs.existsSync(observer.scriptStartedPath),
+          attached: fs.existsSync(observer.attachedPath),
+          exited: fs.existsSync(observer.exitPath),
+          exitCode: readStatus(observer.exitPath),
+        },
+        container: processFacts.container,
+        gdb: processFacts.gdb,
+        target: processFacts.target,
+      })
+    }
     const stopObserver = async (): Promise<void> => {
       if (fs.existsSync(observer.exitPath)) {
         observerFinalized = true
@@ -484,6 +734,7 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
     const observerWrapper = [
       'umask 077',
       'ulimit -c 0',
+      'printf started > ' + shellQuote(observer.wrapperStartedPath),
       observerCommand + ' > ' + shellQuote(observer.launchOutputPath) + ' 2>&1 &',
       'observer_pid=$!',
       'printf "%s\\n" "$observer_pid" > ' + shellQuote(observer.pidPath),
@@ -492,9 +743,19 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
       'printf "%s\\n" "$status" > ' + shellQuote(observer.exitPath),
       'exit "$status"',
     ].join('; ')
-    rig.runtime.startOwnedContainerDetachedExact(containerId, ['/bin/sh', '-c', observerWrapper])
     failureOutputPaths = [observer.logPath, observer.launchOutputPath]
-    await waitForFile(observer.attachedPath, 15_000, observer.exitPath, failureOutputPaths)
+    failureStage = 'gdb_wrapper_start'
+    rig.runtime.startOwnedContainerDetachedExact(containerId, ['/bin/sh', '-c', observerWrapper])
+    const observerDeadline = Date.now() + 15_000
+    await waitForFile(observer.wrapperStartedPath, 15_000, observer.exitPath, failureOutputPaths,
+      'GDB wrapper-start marker', observerDeadline)
+    failureStage = 'gdb_script_start'
+    await waitForFile(observer.scriptStartedPath, 15_000, observer.exitPath, failureOutputPaths,
+      'GDB script-start marker', observerDeadline)
+    failureStage = 'gdb_attach'
+    await waitForFile(observer.attachedPath, 15_000, observer.exitPath, failureOutputPaths,
+      'GDB attach marker', observerDeadline)
+    failureStage = undefined
 
     async function runProbe(mode: 'segv'): Promise<SupervisorCrashDiagnosticHandle['probes']['sigsegv']>
     async function runProbe(mode: 'term'): Promise<SupervisorCrashDiagnosticHandle['probes']['sigterm']>
@@ -609,6 +870,10 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
       },
     }
   } catch (error) {
+    let observerAttachFacts: SafeSupervisorGdbAttachFacts | undefined
+    if (failureStage && collectObserverAttachFacts) {
+      try { observerAttachFacts = collectObserverAttachFacts(failureStage) } catch { /* the GDB failure remains primary */ }
+    }
     try { await cleanupObserver?.() } catch { /* rig teardown owns any observer that could not be settled here */ }
     if (failureOutputPaths.length > 0) {
       const [logPath, launchOutputPath] = failureOutputPaths
@@ -618,6 +883,7 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
         rig.runtime.writeIncident('supervisor-gdb-diagnostic-startup-failure', {
           errorName: error instanceof Error ? error.name.replace(/[^A-Za-z0-9]/g, '').slice(0, 60) || 'Error' : 'Error',
           errorMessage: error instanceof Error ? redactGdbDiagnosticLine(error.message) : 'unknown failure',
+          ...(observerAttachFacts ? { observerAttachFacts } : {}),
           ...summarizeSupervisorGdbFailureOutput(log.text, launchOutput.text),
           logTruncated: log.truncated,
           launchOutputTruncated: launchOutput.truncated,
