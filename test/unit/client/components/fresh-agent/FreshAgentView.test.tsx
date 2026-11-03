@@ -2284,6 +2284,38 @@ describe('FreshAgentView', () => {
       },
     )
 
+    it('clears a send refusal when the pane switches to another conversation', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'send-scope-refused-a', sessionId: 'send-scope-refused-thread-a', status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => snapshot(sessionId))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: 'The first conversation prompt' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'The first send was refused.' }))
+      await waitFor(() => expect(screen.getByText('Message not sent: The first send was refused.')).toBeVisible())
+
+      const second = { ...first, createRequestId: 'send-scope-refused-b', sessionId: 'send-scope-refused-thread-b' }
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', second.sessionId, expect.anything(),
+      ))
+      expect(screen.queryByText('Message not sent: The first send was refused.')).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
     it('restores an uncertain send after rebinding the same conversation', async () => {
       const store = createStore()
       const first = {
