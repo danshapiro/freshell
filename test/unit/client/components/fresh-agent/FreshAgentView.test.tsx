@@ -2284,6 +2284,54 @@ describe('FreshAgentView', () => {
       },
     )
 
+    it.each(['refusal', 'uncertainty'] as const)(
+      'does not restore a previous conversation\'s %s during a same-batch conversation switch', async (kind) => {
+        const store = createStore()
+        const first = {
+          kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+          createRequestId: 'send-scope-batched-a', sessionId: 'send-scope-batched-thread-a',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-batched-thread-a' },
+          resumeSessionId: 'send-scope-batched-thread-a', status: 'idle' as const,
+        }
+        const second = {
+          ...first, createRequestId: 'send-scope-batched-b', sessionId: 'send-scope-batched-thread-b',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-batched-thread-b' },
+          resumeSessionId: 'send-scope-batched-thread-b',
+        }
+        apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+          status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+        }))
+        store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        await waitFor(() => expect(composer).toBeEnabled())
+
+        fireEvent.change(composer, { target: { value: 'Prompt from the previous conversation' } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+        const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+        expect(sent?.requestId).toBeTruthy()
+        const currentDraft = 'Keep this newer draft'
+        fireEvent.change(composer, { target: { value: currentDraft } })
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+
+        // Redux has switched the pane, but React has not rendered the new
+        // content before the old request's error is delivered.
+        act(() => {
+          store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second }))
+          listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+            message: kind === 'uncertainty'
+              ? 'CODEX_DELIVERY_AMBIGUOUS: response was lost'
+              : 'The previous conversation send was refused.' })
+        })
+
+        await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(second.sessionId))
+        await waitFor(() => expect(composer).toHaveValue(currentDraft))
+        expect(screen.queryByText(/The previous conversation send was refused/)).toBeNull()
+        expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
     it('clears a send refusal when the pane switches to another conversation', async () => {
       const store = createStore()
       const first = {
