@@ -2512,6 +2512,46 @@ describe('FreshAgentView', () => {
       }
     })
 
+    it.each([false, true])('does not revive a suppressed Codex notice when its retained warning clears (newer notice: %s)', async (withNewerNotice) => {
+      const queue = await setup('running')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const newerDiagnostic = 'A newer provider error needs attention.'
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: locator.sessionId, status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+
+      deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...running,
+        extensions: { codex: { unattributedProviderError: diagnostic } } })
+      const previousCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+
+      if (withNewerNotice) {
+        deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: newerDiagnostic })
+        await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(newerDiagnostic))
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(running)
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+      if (withNewerNotice) {
+        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(newerDiagnostic)
+      } else {
+        expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+      }
+    })
+
     it.each([
       ['clears', undefined],
       ['restores an earlier warning for', 'An earlier provider error.'],
