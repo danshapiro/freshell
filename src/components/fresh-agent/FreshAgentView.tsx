@@ -1310,7 +1310,7 @@ export function FreshAgentView({
     previousTurns: readonly FreshAgentTurn[]
   }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
-  // Transient, self-clearing banner for action feedback (rewind, shell errors).
+  // Action feedback and provider notices share a banner; errors need dismissal.
   const [notice, setNoticeState] = useState<{ text: string; level: 'info' | 'warning' | 'error'; prominent?: boolean } | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
   const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning') => {
@@ -5058,10 +5058,12 @@ export function FreshAgentView({
       setNoticeExpanded(false)
       return
     }
-    if (noticeExpanded || notice.text === deliveryNoticeRef.current?.text) return
-    const timer = window.setTimeout(() => setNotice(null), 6000)
+    if (notice.level === 'error' || noticeExpanded || notice.text === deliveryNoticeRef.current?.text) return
+    const timer = window.setTimeout(() => {
+      setNoticeState(current => current === notice ? null : current)
+    }, 6000)
     return () => window.clearTimeout(timer)
-  }, [notice, noticeExpanded, setNotice])
+  }, [notice, noticeExpanded])
 
   /** Core outgoing-message path shared by direct sends and queue flushes. */
   const sendUserText = useCallback((text: string) => {
@@ -5452,7 +5454,14 @@ export function FreshAgentView({
       ? 'Check the conversation before sending again. Delivery is uncertain.'
       : verboseNotice ? summarizeDiagnostic(notice.text) : notice?.text
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, compactSummary: notice.level === 'warning' ? 'Warning' : 'Error', level: notice.level, content: <p>{notice.text}</p>, onToggle: setNoticeExpanded }] : []),
+      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{
+        id: 'notice', summary: noticeSummary ?? notice.text,
+        compactSummary: notice.level === 'warning' ? 'Warning' : 'Error', level: notice.level,
+        content: notice.level === 'error'
+          ? <FreshAgentApprovalBanner text={notice.text} onDismiss={() => setNoticeState(current => current === notice ? null : current)} />
+          : <p>{notice.text}</p>,
+        onToggle: setNoticeExpanded,
+      }] : []),
     { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), compactSummary: 'Codex error', content: (pendingCodexError ? (
                 <FreshAgentApprovalBanner text={`Codex reported an error: ${pendingCodexError.message}`} />
               ) : null) },
