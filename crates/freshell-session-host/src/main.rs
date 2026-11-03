@@ -1801,6 +1801,37 @@ async fn grant_accepted_result(
     })
 }
 
+/// Composes the resumed fresh-agent launch from the stored soul-level resume
+/// spec and the grant's launch profile.
+///
+/// The resume branch's identity checks have already bound the two records to
+/// the same provider, store, session type, runtime variant, and native root,
+/// and identity (`native_session_id`) always comes from the stored spec. Turn
+/// settings (`model`, `effort`, `permission_mode`, `cwd`) come from the
+/// incarnation's folded launch profile whenever the profile governs them:
+/// a launch that already carries its committed native identity is an
+/// established incarnation's durable recovery profile — the record the
+/// recovery-profile fold keeps current ("the launch's folded settings ARE
+/// the recovery profile", `fresh_agent_configure` in
+/// crates/freshell-supervisor/src/service.rs) — so its fields stand as
+/// folded, including a present-but-`None` effort, which the registry
+/// persists for an intentional Default and which must not be resurrected
+/// from the older stored spec. The stored spec — frozen at its capture —
+/// fills those fields only when the folded profile structurally does not
+/// govern them: a first-ever resume whose launch carries no native identity
+/// yet also has no fresh-agent settings, and the stored spec is their only
+/// source.
+fn compose_resumed_fresh_agent_launch(launch: &mut FreshAgentLaunchSpec, resume: &ResumeSpec) {
+    let folded_profile_governs_settings = launch.native_session_id.is_some();
+    launch.native_session_id = Some(resume.provider_session.native_session_id.clone());
+    if !folded_profile_governs_settings {
+        launch.model = resume.model.clone();
+        launch.effort = resume.reasoning_effort.clone();
+        launch.permission_mode = resume.permission_mode.clone();
+        launch.cwd = resume.cwd.clone();
+    }
+}
+
 async fn grant_execution(
     state: &Arc<HostState>,
     request: GrantExecutionRequest,
@@ -2369,11 +2400,7 @@ async fn grant_execution_stages(
                         "fresh-agent resume identity does not match the persisted launch profile",
                     ));
                 }
-                launch.native_session_id = Some(resume.provider_session.native_session_id.clone());
-                launch.model = resume.model.clone();
-                launch.effort = resume.reasoning_effort.clone();
-                launch.permission_mode = resume.permission_mode.clone();
-                launch.cwd = resume.cwd.clone();
+                compose_resumed_fresh_agent_launch(&mut launch, resume);
             }
             let mut resolved_secrets = prepared_secrets.take().ok_or_else(|| {
                 RuntimeError::new(
@@ -12954,6 +12981,612 @@ mod tests {
         assert!(state.fresh_agent.lock().await.is_none());
         let actor = repaired.fresh_agent.lock().await.take().unwrap();
         actor.stop().await.unwrap();
+    }
+
+    struct ResumedLaunchRecordingEffects {
+        journal_dir: PathBuf,
+        composed: std::sync::Mutex<Option<FreshAgentLaunchSpec>>,
+    }
+
+    fn recording_transport() -> Arc<RpcFixtureTransport> {
+        Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(None),
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        })
+    }
+
+    fn resumed_launch_profile(launch: &FreshAgentLaunchSpec) -> FreshAgentProfile {
+        FreshAgentProfile {
+            naming_handle: launch.naming_handle.clone(),
+            collaboration_mode: launch.collaboration_mode.clone(),
+            provider: launch.provider.clone(),
+            runtime_variant: launch.runtime_variant.clone(),
+            cwd: launch.cwd.clone(),
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            permission_mode: launch.permission_mode.clone(),
+            sandbox: launch.sandbox.clone(),
+            provider_store_id: launch.provider_store_id.clone(),
+            native_session_id: launch.native_session_id.clone(),
+            plugins: launch.plugins.clone(),
+            model_selection: launch.model_selection.clone(),
+            session_ref: launch.session_ref.clone(),
+            provider_launch_context: launch.provider_launch_context.clone(),
+            provider_secret_references: launch.provider_secret_references.clone(),
+        }
+    }
+
+    fn overlay_json_fields(
+        base: serde_json::Value,
+        overrides: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut base = base;
+        if let (Some(object), Some(fields)) = (base.as_object_mut(), overrides.as_object()) {
+            for (key, field) in fields {
+                object.insert(key.clone(), field.clone());
+            }
+        }
+        base
+    }
+
+    fn codex_resume_grant_launch(overrides: serde_json::Value) -> FreshAgentLaunchSpec {
+        serde_json::from_value(overlay_json_fields(
+            serde_json::json!({
+                "sessionId": "grant-resume-session",
+                "provider": "codex",
+                "sessionType": "freshcodex",
+                "runtimeVariant": "codex-app-server",
+                "providerStoreId": "grant-resume-store",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": unsafe { libc::geteuid() },
+                "runAsGid": unsafe { libc::getegid() },
+            }),
+            overrides,
+        ))
+        .unwrap()
+    }
+
+    fn codex_resume_grant_spec(overrides: serde_json::Value) -> ResumeSpec {
+        serde_json::from_value(overlay_json_fields(
+            serde_json::json!({
+                "providerSession": {
+                    "provider": "codex",
+                    "providerStoreId": "grant-resume-store",
+                    "nativeSessionId": "fixture-native-thread",
+                },
+                "mode": "freshcodex",
+                "runtimeVariant": "codex-app-server",
+                "program": "freshell-session-host fresh-agent",
+                "resumeArgv": [],
+                "providerHome": "/home/freshell/provider",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "identityProvenance": "provider_observed",
+                "durablePosition": {},
+                "creationSeedRef": "grant-resume-seed",
+                "checkpointRevision": 0,
+                "allocationState": "verified_durable",
+                "evidenceRevision": 1,
+                "neverDispatched": false,
+            }),
+            overrides,
+        ))
+        .unwrap()
+    }
+
+    /// Seeds the durable actor journal an established incarnation leaves
+    /// behind, then folds one real `fresh_agent_configure` recovery-profile
+    /// update into it, exactly like the live settings path does.
+    async fn fold_recovery_settings_into_actor_journal(
+        journal: &Path,
+        captured_launch: &FreshAgentLaunchSpec,
+        settings: freshell_runtime_protocol::FreshAgentTurnSettings,
+    ) {
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            journal.to_path_buf(),
+            resumed_launch_profile(captured_launch),
+            recording_transport(),
+        )
+        .await
+        .unwrap();
+        actor
+            .configure(freshell_runtime_protocol::RequestId::new(), settings)
+            .await
+            .unwrap();
+        actor.stop().await.unwrap();
+    }
+
+    async fn dispatch_resumed_grant(
+        state: &Arc<HostState>,
+        effects: &ResumedLaunchRecordingEffects,
+        launch: FreshAgentLaunchSpec,
+        resume: ResumeSpec,
+    ) -> Result<HostResult, RuntimeError> {
+        dispatch_with_effects(
+            authenticated_host_envelope(
+                state,
+                HostCommand::GrantExecution {
+                    native_identity_launch: None,
+                    incarnation_id: state.incarnation_id.clone(),
+                    soul_id: SoulId::new(),
+                    host_boot_id: state.host_boot_id.clone(),
+                    control_epoch: 1,
+                    execution_generation: 1,
+                    grant_id: GrantId::new(),
+                    fixture: None,
+                    terminal: None,
+                    fresh_agent: Some(Box::new(launch)),
+                    resume_spec: Some(Box::new(resume)),
+                    dispatch_budget_ms: None,
+                    provider_path_inputs: Default::default(),
+                },
+            ),
+            state,
+            effects,
+        )
+        .await
+    }
+
+    fn composed_launch_of(effects: &ResumedLaunchRecordingEffects) -> FreshAgentLaunchSpec {
+        effects
+            .composed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the grant must open the fresh agent with the composed launch")
+    }
+
+    #[async_trait]
+    impl GrantExecutionEffects for ResumedLaunchRecordingEffects {
+        fn run_opencode_provider_helper(
+            &self,
+            _: &TerminalLaunchSpec,
+            _: &OpenCodeTransferDescriptor,
+            _: &Path,
+            _: &Path,
+            _: &str,
+            _: Option<&Path>,
+        ) -> Result<Vec<u8>, String> {
+            panic!("resumed fresh grant must not run a terminal helper")
+        }
+
+        async fn spawn_terminal_pty(
+            &self,
+            _: &Path,
+            _: &IncarnationId,
+            _: &TerminalLaunchSpec,
+            _: std::collections::BTreeMap<String, String>,
+            _: Option<providers::PreparedCodexLaunch>,
+            _: Option<String>,
+        ) -> Result<SpawnedTerminalPty, RuntimeError> {
+            panic!("resumed fresh grant must not spawn a PTY")
+        }
+
+        async fn open_fresh_agent(
+            &self,
+            _state_dir: &Path,
+            launch: FreshAgentLaunchSpec,
+        ) -> Result<
+            Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+            freshell_agent_runtime::host_actor::ActorError,
+        > {
+            *self.composed.lock().unwrap() = Some(launch.clone());
+            freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                self.journal_dir.clone(),
+                resumed_launch_profile(&launch),
+                recording_transport(),
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_resume_settings_folded_recovery_profile_wins_over_stale_stored_spec() {
+        if run_in_fresh_host_test_process(
+            "tests::grant_resume_settings_folded_recovery_profile_wins_over_stale_stored_spec",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let recovery_cwd = workspace.join("recovery-cwd");
+        std::fs::create_dir(&recovery_cwd).unwrap();
+        let journal = root.path().join("folded-actor-journal");
+
+        // The durable actor journal the crashed incarnation left behind: it
+        // holds the settings the stored spec was captured from, then a real
+        // `fresh_agent_configure` recovery-profile fold persisted the user's
+        // current settings into the durable profile.
+        let captured_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "folded-store",
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "permissionMode": "untrusted",
+            "nativeSessionId": "fixture-native-thread",
+        }));
+        fold_recovery_settings_into_actor_journal(
+            &journal,
+            &captured_launch,
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                collaboration_mode: Some("plan".into()),
+                cwd: Some(recovery_cwd.to_string_lossy().into_owned()),
+                model: None,
+                effort: Some(Some("xhigh".into())),
+                permission_mode: Some("never".into()),
+                sandbox: Some("read-only".into()),
+            },
+        )
+        .await;
+
+        // The replacement grant carries the incarnation's folded launch
+        // profile (the recovery settings the fold persisted) plus the
+        // soul-level stored resume spec, frozen at the earlier capture.
+        let folded_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "folded-store",
+            "cwd": recovery_cwd.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "effort": "xhigh",
+            "permissionMode": "never",
+            "sandbox": "read-only",
+            "collaborationMode": "plan",
+            "nativeSessionId": "fixture-native-thread",
+        }));
+        let stale_stored_spec = codex_resume_grant_spec(serde_json::json!({
+            "providerSession": {
+                "provider": "codex",
+                "providerStoreId": "folded-store",
+                "nativeSessionId": "fixture-native-thread",
+            },
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "permissionMode": "untrusted",
+        }));
+
+        let state = test_host_state();
+        let effects = ResumedLaunchRecordingEffects {
+            journal_dir: journal.clone(),
+            composed: std::sync::Mutex::new(None),
+        };
+        let accepted = dispatch_resumed_grant(&state, &effects, folded_launch, stale_stored_spec)
+            .await
+            .expect("the folded recovery profile must resume the established actor");
+        assert!(matches!(
+            accepted,
+            HostResult::GrantAccepted {
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        let composed = composed_launch_of(&effects);
+        assert_eq!(
+            composed.cwd,
+            recovery_cwd.to_string_lossy(),
+            "folded cwd must win over the stale stored spec: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.model.as_deref(),
+            Some("contract-model"),
+            "composed={composed:?}"
+        );
+        assert_eq!(
+            composed.effort.as_deref(),
+            Some("xhigh"),
+            "folded effort must win over the absent stored one: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.permission_mode.as_deref(),
+            Some("never"),
+            "folded permission mode must win over the stale stored one: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.native_session_id.as_deref(),
+            Some("fixture-native-thread"),
+            "native identity still comes from the stored spec: composed={composed:?}"
+        );
+        state
+            .fresh_agent
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .stop()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grant_resume_settings_divergent_profile_refusal_names_typed_mismatch_fields() {
+        if run_in_fresh_host_test_process(
+            "tests::grant_resume_settings_divergent_profile_refusal_names_typed_mismatch_fields",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let recovery_cwd = workspace.join("recovery-cwd");
+        let divergent_cwd = workspace.join("divergent-cwd");
+        std::fs::create_dir(&recovery_cwd).unwrap();
+        std::fs::create_dir(&divergent_cwd).unwrap();
+        let journal = root.path().join("folded-actor-journal");
+
+        let captured_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "folded-store",
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "permissionMode": "untrusted",
+            "nativeSessionId": "fixture-native-thread",
+        }));
+        fold_recovery_settings_into_actor_journal(
+            &journal,
+            &captured_launch,
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                collaboration_mode: Some("plan".into()),
+                cwd: Some(recovery_cwd.to_string_lossy().into_owned()),
+                model: None,
+                effort: Some(Some("xhigh".into())),
+                permission_mode: Some("never".into()),
+                sandbox: Some("read-only".into()),
+            },
+        )
+        .await;
+
+        // A folded profile that diverges from the durable journal must be
+        // refused with the typed, redacted mismatch naming exactly the
+        // settings fields — the gc1p incident signature.
+        let divergent_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "folded-store",
+            "cwd": divergent_cwd.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "effort": "low",
+            "permissionMode": "bypassPermissions",
+            "sandbox": "read-only",
+            "collaborationMode": "plan",
+            "nativeSessionId": "fixture-native-thread",
+        }));
+        let state = test_host_state();
+        let effects = ResumedLaunchRecordingEffects {
+            journal_dir: journal.clone(),
+            composed: std::sync::Mutex::new(None),
+        };
+        let error = dispatch_resumed_grant(
+            &state,
+            &effects,
+            divergent_launch,
+            codex_resume_grant_spec(serde_json::json!({
+                "providerSession": {
+                    "provider": "codex",
+                    "providerStoreId": "folded-store",
+                    "nativeSessionId": "fixture-native-thread",
+                },
+                "cwd": workspace.to_string_lossy(),
+                "workspacePath": workspace.to_string_lossy(),
+                "model": "contract-model",
+                "permissionMode": "untrusted",
+            })),
+        )
+        .await
+        .expect_err("a launch profile diverging from the durable actor journal must be refused");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        let diagnostic = error
+            .fresh_agent_open_failure
+            .expect("the open refusal must keep its typed fresh-agent diagnostic");
+        assert_eq!(
+            diagnostic.subtype,
+            freshell_runtime_protocol::FreshAgentOpenFailureSubtype::NativeIdentityMismatch
+        );
+        assert_eq!(
+            diagnostic.mismatched_fields,
+            freshell_runtime_protocol::FreshAgentIdentityMismatchFields(vec![
+                freshell_runtime_protocol::FreshAgentIdentityMismatchField::Cwd,
+                freshell_runtime_protocol::FreshAgentIdentityMismatchField::Effort,
+                freshell_runtime_protocol::FreshAgentIdentityMismatchField::PermissionMode,
+            ]),
+            "the typed mismatch must name exactly the diverged settings fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_resume_settings_cleared_effort_wins_over_stale_stored_effort() {
+        if run_in_fresh_host_test_process(
+            "tests::grant_resume_settings_cleared_effort_wins_over_stale_stored_effort",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let journal = root.path().join("cleared-actor-journal");
+
+        let captured_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "cleared-store",
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "effort": "xhigh",
+            "permissionMode": "never",
+            "nativeSessionId": "fixture-native-thread",
+        }));
+        fold_recovery_settings_into_actor_journal(
+            &journal,
+            &captured_launch,
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                collaboration_mode: None,
+                cwd: None,
+                model: None,
+                // The user's Default: an intentional clear, persisted as the
+                // folded profile's `None` effort.
+                effort: Some(None),
+                permission_mode: None,
+                sandbox: None,
+            },
+        )
+        .await;
+
+        let cleared_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "cleared-store",
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "permissionMode": "never",
+            "nativeSessionId": "fixture-native-thread",
+        }));
+        let stale_stored_spec = codex_resume_grant_spec(serde_json::json!({
+            "providerSession": {
+                "provider": "codex",
+                "providerStoreId": "cleared-store",
+                "nativeSessionId": "fixture-native-thread",
+            },
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "contract-model",
+            "reasoningEffort": "xhigh",
+            "permissionMode": "never",
+        }));
+
+        let state = test_host_state();
+        let effects = ResumedLaunchRecordingEffects {
+            journal_dir: journal.clone(),
+            composed: std::sync::Mutex::new(None),
+        };
+        let accepted = dispatch_resumed_grant(&state, &effects, cleared_launch, stale_stored_spec)
+            .await
+            .expect("the folded Default effort must resume the established actor");
+        assert!(matches!(
+            accepted,
+            HostResult::GrantAccepted {
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        let composed = composed_launch_of(&effects);
+        assert!(
+            composed.effort.is_none(),
+            "the intentionally cleared effort must stay cleared, not resurrect the stored one: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.cwd,
+            workspace.to_string_lossy(),
+            "composed={composed:?}"
+        );
+        assert_eq!(
+            composed.model.as_deref(),
+            Some("contract-model"),
+            "composed={composed:?}"
+        );
+        assert_eq!(
+            composed.permission_mode.as_deref(),
+            Some("never"),
+            "composed={composed:?}"
+        );
+        state
+            .fresh_agent
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .stop()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grant_resume_settings_absent_profile_fills_first_ever_resume_from_stored_spec() {
+        if run_in_fresh_host_test_process(
+            "tests::grant_resume_settings_absent_profile_fills_first_ever_resume_from_stored_spec",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let terminal_cwd = workspace.join("terminal-cwd");
+        std::fs::create_dir(&terminal_cwd).unwrap();
+
+        // A first-ever resume carries no folded profile at all: the launch
+        // has no settings and no native identity yet, so the stored spec is
+        // the only settings source.
+        let settingsless_launch = codex_resume_grant_launch(serde_json::json!({
+            "providerStoreId": "first-ever-store",
+            "cwd": workspace.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+        }));
+        let terminal_captured_spec = codex_resume_grant_spec(serde_json::json!({
+            "providerSession": {
+                "provider": "codex",
+                "providerStoreId": "first-ever-store",
+                "nativeSessionId": "fixture-native-thread",
+            },
+            "cwd": terminal_cwd.to_string_lossy(),
+            "workspacePath": workspace.to_string_lossy(),
+            "model": "terminal-model",
+            "reasoningEffort": "high",
+            "permissionMode": "workspace-write",
+        }));
+
+        let state = test_host_state();
+        let effects = ResumedLaunchRecordingEffects {
+            journal_dir: root.path().join("first-ever-actor-journal"),
+            composed: std::sync::Mutex::new(None),
+        };
+        let accepted = dispatch_resumed_grant(
+            &state,
+            &effects,
+            settingsless_launch,
+            terminal_captured_spec,
+        )
+        .await
+        .expect("a first-ever resume must keep filling from the stored spec");
+        assert!(matches!(
+            accepted,
+            HostResult::GrantAccepted {
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        let composed = composed_launch_of(&effects);
+        assert_eq!(
+            composed.cwd,
+            terminal_cwd.to_string_lossy(),
+            "stored cwd must fill the settings-less first-ever launch: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.model.as_deref(),
+            Some("terminal-model"),
+            "stored model must fill the settings-less first-ever launch: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.effort.as_deref(),
+            Some("high"),
+            "stored effort must fill the settings-less first-ever launch: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.permission_mode.as_deref(),
+            Some("workspace-write"),
+            "stored permission mode must fill the settings-less first-ever launch: composed={composed:?}"
+        );
+        assert_eq!(
+            composed.native_session_id.as_deref(),
+            Some("fixture-native-thread"),
+            "native identity comes from the stored spec: composed={composed:?}"
+        );
+        state
+            .fresh_agent
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .stop()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
