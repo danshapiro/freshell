@@ -534,13 +534,19 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     await assertUsefulSpace(page)
     await expect(composer).toHaveValue(draft)
 
+    // Error notices must remain available beyond the transient notice window.
+    await page.waitForTimeout(6_200)
+    await expect(providerError).toBeVisible()
     await hitAndClick(providerSummary)
     const providerDetails = providerError.locator('.fresh-agent-diagnostic-body')
-    await expect(providerDetails).toHaveText(providerMessage)
-    await providerDetails.scrollIntoViewIfNeeded()
-    await assertPainted(providerDetails)
+    const providerMessageText = providerDetails.getByText(providerMessage, { exact: true })
+    await expect(providerMessageText).toBeVisible()
+    await providerMessageText.scrollIntoViewIfNeeded()
+    await assertPainted(providerMessageText)
     await expect(composer).toHaveValue(draft)
-    await hitAndClick(providerSummary)
+    await hitAndClick(providerDetails.getByRole('button', { name: 'Dismiss', exact: true }))
+    await expect(providerError).toHaveCount(0)
+    await expect(otherError).toBeVisible()
 
     const requests = pane.getByRole('region', { name: 'Pending requests' })
     await hitAndClick(requests.getByRole('button', { name: 'Yes', exact: true }))
