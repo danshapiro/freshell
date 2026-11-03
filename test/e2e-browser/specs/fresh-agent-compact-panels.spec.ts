@@ -518,12 +518,12 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     const providerMessage = 'Selected model is at capacity. Please try a different model.'
     await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
       type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
-      event: { type: 'freshAgent.error', code: 'CODEX_PROVIDER_ERROR', message },
+      event: { type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message },
     }), providerMessage)
 
     const errors = pane.getByRole('region', { name: 'Agent errors' })
     await expect(errors.getByRole('img', { name: '2 errors' })).toHaveText('2')
-    const providerError = errors.locator('[data-agent-error="session"]')
+    const providerError = errors.locator('[data-agent-error="notice"]')
     const otherError = errors.locator('[data-agent-error="close"]')
     const providerSummary = providerError.locator('summary')
     const spaceGeometry = await logUsefulSpace(page)
@@ -535,8 +535,8 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     await expect(composer).toHaveValue(draft)
 
     await hitAndClick(providerSummary)
-    const providerDetails = providerError.locator('.fresh-agent-banner-text')
-    await expect(providerDetails).toHaveText(`Agent error: ${providerMessage}`)
+    const providerDetails = providerError.locator('.fresh-agent-diagnostic-body')
+    await expect(providerDetails).toHaveText(providerMessage)
     await providerDetails.scrollIntoViewIfNeeded()
     await assertPainted(providerDetails)
     await expect(composer).toHaveValue(draft)
