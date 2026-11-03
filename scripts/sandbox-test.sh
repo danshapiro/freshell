@@ -334,6 +334,42 @@ PY
       "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" "${removed}" >&2
   }
 
+  # The external browser caller owns preparation as well as the eventual
+  # execution process. If setup exits before its sandbox EXIT handler is
+  # installed, retain the caller's failure and settle only its run-scoped
+  # store. Successful handoff uses exec below, so this trap does not remove
+  # the store between preparation and execution.
+  p2_g01_cleanup_on_error() {
+    local result=$?
+    trap - EXIT
+    if [ "${result}" -ne 0 ] && [ -n "${P2_G01_CLEANUP_PHASE:-}" ]; then
+      if ! cleanup_p2_g01_pnpm_store "${P2_G01_CLEANUP_PHASE}"; then
+        result=1
+      fi
+    fi
+    exit "${result}"
+  }
+
+  p2_g01_preparation_signal() {
+    local result="$1"
+    if [ -z "${PREPARATION_PID:-}" ]; then
+      P2_G01_PENDING_SIGNAL="${result}"
+      return
+    fi
+    trap '' INT TERM HUP
+    kill -TERM "${PREPARATION_PID}" 2>/dev/null || true
+    wait "${PREPARATION_PID}" 2>/dev/null || true
+    exit "${result}"
+  }
+
+  if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+    P2_G01_CLEANUP_PHASE="${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-preparation}"
+    if [[ ! "${P2_G01_CLEANUP_PHASE}" =~ ^(preparation|execution)$ ]]; then
+      P2_G01_CLEANUP_PHASE="preparation"
+    fi
+    trap 'p2_g01_cleanup_on_error' EXIT
+  fi
+
   STRICT_SANDBOX=0
   if [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; then STRICT_SANDBOX=1; fi
 
@@ -383,6 +419,11 @@ PY
   # guard and completed settlement. Only the fixed preparation has networking.
   if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
+    PREPARATION_PID=""
+    P2_G01_PENDING_SIGNAL=""
+    trap 'p2_g01_preparation_signal 130' INT
+    trap 'p2_g01_preparation_signal 143' TERM
+    trap 'p2_g01_preparation_signal 129' HUP
     PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
@@ -395,16 +436,13 @@ PY
       "${PREPARATION_COMMAND}" &
     fi
     PREPARATION_PID=$!
-    trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
-    trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
-    trap 'kill -HUP "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 129' HUP
+    if [ -n "${P2_G01_PENDING_SIGNAL}" ]; then
+      p2_g01_preparation_signal "${P2_G01_PENDING_SIGNAL}"
+    fi
     PREPARATION_STATUS=0
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
     trap - INT TERM HUP
     if [ "${PREPARATION_STATUS}" -ne 0 ]; then
-      if [ "${EXTERNAL_BROWSER}" -eq 1 ] && ! cleanup_p2_g01_pnpm_store preparation; then
-        PREPARATION_STATUS=1
-      fi
       exit "${PREPARATION_STATUS}"
     fi
     CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}")

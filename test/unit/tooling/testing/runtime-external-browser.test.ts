@@ -33,6 +33,7 @@ import { captureTerminalOrdinaryTurnBaseline, reduceTerminalOrdinaryTurnFrames }
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
+import * as p2Sandbox from '../../../../scripts/testing/external-browser-sandbox.js'
 import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, stripRuntimeWebEnvironment, type ManagedRuntimeView, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import * as retainedDriver from '../../../../scripts/testing/task002-retained-fixture.js'
@@ -1030,6 +1031,19 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     expect(invocation.environment).not.toHaveProperty('GOOGLE_APPLICATION_CREDENTIALS')
     expect(() => runner.p2G01PlaywrightInvocation({ ...handoff, EXTRA: 'not-admitted' } as any, {}))
       .toThrow(/invalid.*external.*descriptor/i)
+  })
+  it('uses disposable tmpfs output paths only for the exact P2-G01 browser case', () => {
+    expect(p2Sandbox.p2G01PlaywrightArtifactPaths({
+      FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec,
+      FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+    })).toEqual({
+      outputDir: '/tmp/freshell-p2g01-artifacts/test-results',
+      htmlReportDir: '/tmp/freshell-p2g01-artifacts/html-report',
+    })
+    expect(p2Sandbox.p2G01PlaywrightArtifactPaths({
+      FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec,
+      FRESHELL_RUNTIME_EXTERNAL_GREP: `${p2G01Title}|another-case`,
+    })).toBeUndefined()
   })
   it.each([
     { spec: p2G01Spec },
