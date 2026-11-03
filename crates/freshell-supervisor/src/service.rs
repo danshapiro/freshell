@@ -189,6 +189,9 @@ type ProviderPathInputBindings = HashMap<
 >;
 pub(crate) type LiveResumeEvidenceKey = (String, String, Option<String>);
 
+#[cfg(test)]
+use crate::registry::OrdinaryStopTimings;
+
 #[derive(Clone)]
 pub struct Supervisor {
     pub(crate) registry: Registry,
@@ -209,6 +212,8 @@ pub struct Supervisor {
     /// Reply budgets for supervisor→session-host commands, read once.
     pub(crate) host_command_budgets: HostCommandBudgets,
     pub(crate) provider_callback_budgets: ProviderCallbackBudgets,
+    #[cfg(test)]
+    ordinary_stop_timings: Option<OrdinaryStopTimings>,
 }
 
 impl Supervisor {
@@ -270,11 +275,18 @@ impl Supervisor {
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
             host_command_budgets: HostCommandBudgets::from_env(),
             provider_callback_budgets: ProviderCallbackBudgets::default(),
+            #[cfg(test)]
+            ordinary_stop_timings: None,
         })
     }
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    #[cfg(test)]
+    fn note_ordinary_stop_time(&self, stage: &'static str) {
+        crate::registry::note_ordinary_stop_time(&self.ordinary_stop_timings, stage);
     }
 
     pub(crate) async fn lifecycle_lock(&self, soul_id: &SoulId) -> Arc<Mutex<()>> {
@@ -4580,7 +4592,14 @@ impl Supervisor {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let outcome = self.finish_stop_handle(&handle).await?;
+        #[cfg(test)]
+        self.note_ordinary_stop_time("final_view_started");
         let view = find_view(&self.registry, handle.incarnation_id()).await?;
+        #[cfg(test)]
+        self.note_ordinary_stop_time("final_view_finished");
+        drop(_lifecycle_guard);
+        #[cfg(test)]
+        self.note_ordinary_stop_time("lifecycle_guard_released");
         Ok((outcome, view))
     }
 
@@ -4592,6 +4611,10 @@ impl Supervisor {
         reason: &str,
     ) {
         let fence = handle.stop_fence().ok();
+        #[cfg(test)]
+        if event == "supervisor.stop_outcome" {
+            self.note_ordinary_stop_time("outcome_log_started");
+        }
         append_event(
             &self.config.lifecycle_log,
             event,
@@ -4602,6 +4625,10 @@ impl Supervisor {
                 "controlEpoch":self.registry.control_epoch(), "reason":reason,
             }),
         );
+        #[cfg(test)]
+        if event == "supervisor.stop_outcome" {
+            self.note_ordinary_stop_time("outcome_log_finished");
+        }
     }
 
     /// The caller owns the lifecycle lock. This continues the captured Stop;
@@ -4638,10 +4665,14 @@ impl Supervisor {
             }
             // The same transaction persists the typed outcome, releases the
             // writer, and records the exact pending revoke before external IO.
+            #[cfg(test)]
+            self.note_ordinary_stop_time("outcome_transaction_started");
             self.registry
                 .record_ordinary_stop_outcome(handle, outcome)
                 .await
                 .map_err(map_registry)?;
+            #[cfg(test)]
+            self.note_ordinary_stop_time("outcome_transaction_finished");
             stop_crash_boundary("ordinary_stop_after_outcome");
             outcome
         };
@@ -4714,10 +4745,21 @@ impl Supervisor {
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
-        match self
-            .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
-            .await
+        let deadline = Instant::now() + Duration::from_secs(3);
+        #[cfg(test)]
         {
+            self.note_ordinary_stop_time("initial_inspection_started");
+            if let Some(timings) = &self.ordinary_stop_timings {
+                timings
+                    .lock()
+                    .unwrap()
+                    .push(("initial_inspection_deadline", deadline.into_std()));
+            }
+        }
+        let inspection = self.verify_empty_before_classified(handle, deadline).await;
+        #[cfg(test)]
+        self.note_ordinary_stop_time("initial_inspection_returned");
+        match inspection {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
             Err(error) => {
@@ -4848,6 +4890,8 @@ impl Supervisor {
         status: Option<u16>,
     ) {
         let fence = handle.stop_fence().ok();
+        #[cfg(test)]
+        self.note_ordinary_stop_time("stage_log_started");
         append_event(
             &self.config.lifecycle_log,
             "supervisor.stop_stage_failed",
@@ -4858,6 +4902,8 @@ impl Supervisor {
                 "errorCode":code, "httpStatus":status,
             }),
         );
+        #[cfg(test)]
+        self.note_ordinary_stop_time("stage_log_finished");
     }
 
     fn stop_runtime_stage_failed(
@@ -12238,6 +12284,25 @@ mod interrupted_transaction_tests {
         true
     }
 
+    fn ordinary_stop_timing_snapshot(
+        timings: &OrdinaryStopTimings,
+        accepted_at: Option<std::time::Instant>,
+    ) -> Vec<serde_json::Value> {
+        timings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(stage, at)| {
+                let elapsed = accepted_at.map(|accepted| {
+                    at.checked_duration_since(accepted)
+                        .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+                        .unwrap_or_else(|| -accepted.duration_since(*at).as_secs_f64() * 1000.0)
+                });
+                serde_json::json!({"stage":stage, "elapsedMs":elapsed})
+            })
+            .collect()
+    }
+
     async fn complete_ordinary_stop_docker_silence() {
         let mut failures = Vec::new();
         for point in [
@@ -12250,6 +12315,9 @@ mod interrupted_transaction_tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut supervisor = open(dir.path());
+            let stop_timings = Arc::new(StdMutex::new(Vec::with_capacity(128)));
+            supervisor.ordinary_stop_timings = Some(stop_timings.clone());
+            supervisor.registry.ordinary_stop_timings = Some(stop_timings.clone());
             let id = seed(&supervisor, dir.path(), false).await;
             let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
             fixture.state.lock().unwrap().silence = Some(point);
@@ -12258,7 +12326,11 @@ mod interrupted_transaction_tests {
             let mut stopping = {
                 let supervisor = supervisor.clone();
                 let id = id.clone();
-                tokio::spawn(async move { supervisor.stop(id, Some(1)).await })
+                tokio::spawn(async move {
+                    let result = supervisor.stop(id, Some(1)).await;
+                    supervisor.note_ordinary_stop_time("stop_returned");
+                    result
+                })
             };
             // Measure the backend budget from an actual accepted inspection.
             // Parallel suite setup can queue SQLite intent commits before any
@@ -12277,8 +12349,16 @@ mod interrupted_transaction_tests {
             })
             .await
             .unwrap();
+            let acceptance_wait_exited = std::time::Instant::now();
             let limit = Duration::from_secs(if point.starts_with("force_") { 7 } else { 4 });
-            let result = tokio::time::timeout(limit, &mut stopping).await;
+            let result_deadline = Instant::now() + limit;
+            {
+                let mut timings = stop_timings.lock().unwrap();
+                timings.push(("acceptance_wait_exited", acceptance_wait_exited));
+                timings.push(("result_deadline", result_deadline.into_std()));
+            }
+            let result = tokio::time::timeout_at(result_deadline, &mut stopping).await;
+            supervisor.note_ordinary_stop_time("result_sampled");
             if result.is_err() {
                 // The timeout does not own/cancel the foreground Stop. Prove
                 // that it is still the old lock holder, then reap our task.
@@ -12346,6 +12426,7 @@ mod interrupted_transaction_tests {
                     }
                     Err(_) => serde_json::json!({"status":"unknown","reason":"read_timeout"}),
                 };
+                let timings = ordinary_stop_timing_snapshot(&stop_timings, accepted_at);
                 stopping.abort();
                 let _ = stopping.await;
                 close(fixture_host).await;
@@ -12361,6 +12442,7 @@ mod interrupted_transaction_tests {
                         "severity":"error", "event":"test.ordinary_stop.failure_stage",
                         "soulId":id, "phase":point, "resultDeadlineMs":limit.as_millis(),
                         "registryReadDeadlineMs":100, "transport":transport, "registry":registry,
+                        "timings":timings,
                     })
                 );
                 failures.push(format!(
@@ -12369,6 +12451,14 @@ mod interrupted_transaction_tests {
                 continue;
             }
             let (outcome, view) = result.unwrap().unwrap().unwrap();
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "severity":"debug", "event":"test.ordinary_stop.timings", "phase":point,
+                    "timings":ordinary_stop_timing_snapshot(&stop_timings,
+                        fixture.state.lock().unwrap().first_inspection_at),
+                })
+            );
             let expected = if point == "error_observation" {
                 StopOutcome::TerminationUnconfirmed
             } else {
