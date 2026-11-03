@@ -937,6 +937,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+type PaneNotice = {
+  text: string
+  level: 'info' | 'warning' | 'error'
+  prominent?: boolean
+  sourceSessionKey?: string
+  sourceCanonicalSessionKey?: string
+  codexProviderError?: boolean
+}
+
+type PaneNoticeSource = {
+  sessionKey: string
+  canonicalSessionKey?: string
+  codexProviderError?: boolean
+}
+
+function scopePaneNotice(notice: PaneNotice | null, liveSessionKey?: string, savedSessionKey?: string): PaneNotice | null {
+  if (!notice?.sourceSessionKey) return notice
+  if (notice.sourceSessionKey === liveSessionKey) {
+    return !notice.sourceCanonicalSessionKey && savedSessionKey
+      ? { ...notice, sourceCanonicalSessionKey: savedSessionKey }
+      : notice
+  }
+  const sameSavedConversation = savedSessionKey
+    && (savedSessionKey === notice.sourceSessionKey || savedSessionKey === notice.sourceCanonicalSessionKey)
+  if (sameSavedConversation) return liveSessionKey ? { ...notice, sourceSessionKey: liveSessionKey } : notice
+  return null
+}
+
 type CodexPendingProviderError = { turnId: string; message: string }
 const CODEX_FAILURE_WITHOUT_MESSAGE = 'Codex failed without an error message.'
 
@@ -1311,23 +1339,19 @@ export function FreshAgentView({
     previousTurns: readonly FreshAgentTurn[]
   }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
-  // Action feedback and provider notices share a banner; errors need dismissal.
-  const [notice, setNoticeState] = useState<{
-    text: string
-    level: 'info' | 'warning' | 'error'
-    prominent?: boolean
-    sourceSessionKey?: string
-    sourceCanonicalSessionKey?: string
-    codexProviderError?: boolean
-  } | null>(null)
+  // Keep errors separate so later feedback cannot hide an unread failure.
+  const [notice, setNoticeState] = useState<PaneNotice | null>(null)
+  const [errorNotice, setErrorNoticeState] = useState<PaneNotice | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
-  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', source?: {
-    sessionKey: string
-    canonicalSessionKey?: string
-    codexProviderError?: boolean
-  }) => {
-    setNoticeState(current => {
-      if (text === null) return null
+  const [errorNoticeExpanded, setErrorNoticeExpanded] = useState(false)
+  const setNotice = useCallback((text: string | null, level: PaneNotice['level'] = 'warning', source?: PaneNoticeSource) => {
+    if (text === null) {
+      setNoticeState(null)
+      setErrorNoticeState(null)
+      return
+    }
+    const setSlot = level === 'error' ? setErrorNoticeState : setNoticeState
+    setSlot(current => {
       if (current?.text === text && current.level === level && current.sourceSessionKey === source?.sessionKey
         && current.sourceCanonicalSessionKey === source?.canonicalSessionKey
         && Boolean(current.codexProviderError) === Boolean(source?.codexProviderError)) return current
@@ -3359,9 +3383,11 @@ export function FreshAgentView({
           sessionId: sessionRef.provider === message.provider ? sessionRef.sessionId : message.sessionId,
           sessionType: message.sessionType, provider: message.provider,
         })
-        setNoticeState(notice => notice?.sourceSessionKey === previousNoticeSessionKey
+        const rekeyNotice = (notice: PaneNotice | null) => notice?.sourceSessionKey === previousNoticeSessionKey
           ? { ...notice, sourceSessionKey: nextNoticeSessionKey, sourceCanonicalSessionKey: canonicalNoticeSessionKey }
-          : notice)
+          : notice
+        setNoticeState(rekeyNotice)
+        setErrorNoticeState(rekeyNotice)
         const nextContent = {
           ...current,
           sessionId: message.sessionId,
@@ -4892,24 +4918,9 @@ export function FreshAgentView({
     } : undefined)
   }, [liveNotice, liveSessionKey, paneContent.provider, savedNoticeSessionKey, setNotice])
   useLayoutEffect(() => {
-    if (!notice?.sourceSessionKey) return
-    if (notice.sourceSessionKey === liveSessionKey) {
-      // A canonical identity may be learned after the live notice arrived.
-      if (!notice.sourceCanonicalSessionKey && savedNoticeSessionKey) {
-        setNoticeState(current => current === notice ? { ...current, sourceCanonicalSessionKey: savedNoticeSessionKey } : current)
-      }
-      return
-    }
-    const sameSavedConversation = savedNoticeSessionKey
-      && (savedNoticeSessionKey === notice.sourceSessionKey || savedNoticeSessionKey === notice.sourceCanonicalSessionKey)
-    if (sameSavedConversation) {
-      if (liveSessionKey) {
-        setNoticeState(current => current === notice ? { ...current, sourceSessionKey: liveSessionKey } : current)
-      }
-      return
-    }
-    setNoticeState(current => current === notice ? null : current)
-  }, [notice, liveSessionKey, savedNoticeSessionKey])
+    setNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
+    setErrorNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
+  }, [notice, errorNotice, liveSessionKey, savedNoticeSessionKey])
   const rawUnattributedCodexError = paneContent.provider === 'codex'
     ? snapshot?.extensions?.codex?.unattributedProviderError : undefined
   const unattributedCodexError = codexDiagnostic?.identity === snapshotHydrationIdentity
@@ -4917,9 +4928,13 @@ export function FreshAgentView({
     : typeof rawUnattributedCodexError === 'string' && rawUnattributedCodexError.trim()
       ? rawUnattributedCodexError : undefined
   useEffect(() => {
-    if (!notice?.codexProviderError || notice.sourceSessionKey !== liveSessionKey || notice.text !== unattributedCodexError) return
-    setNoticeState(current => current === notice ? null : current)
-  }, [notice, liveSessionKey, unattributedCodexError])
+    if (notice?.codexProviderError && notice.sourceSessionKey === liveSessionKey && notice.text === unattributedCodexError) {
+      setNoticeState(current => current === notice ? null : current)
+    }
+    if (errorNotice?.codexProviderError && errorNotice.sourceSessionKey === liveSessionKey && errorNotice.text === unattributedCodexError) {
+      setErrorNoticeState(current => current === errorNotice ? null : current)
+    }
+  }, [notice, errorNotice, liveSessionKey, unattributedCodexError])
   const pendingCodexError = codexPendingDiagnostic?.identity === snapshotHydrationIdentity
     ? codexPendingDiagnostic.error
     : paneContent.provider === 'codex' ? readCodexPendingProviderError(snapshot?.extensions?.codex?.pendingProviderError) : null
@@ -5134,6 +5149,10 @@ export function FreshAgentView({
     }, 6000)
     return () => window.clearTimeout(timer)
   }, [notice, noticeExpanded])
+
+  useEffect(() => {
+    if (!errorNotice) setErrorNoticeExpanded(false)
+  }, [errorNotice])
 
   /** Core outgoing-message path shared by direct sends and queue flushes. */
   const sendUserText = useCallback((text: string) => {
@@ -5523,9 +5542,11 @@ export function FreshAgentView({
     const noticeSummary = uncertainDelivery
       ? 'Check the conversation before sending again. Delivery is uncertain.'
       : verboseNotice ? summarizeDiagnostic(notice.text) : notice?.text
+    const displayedTransientError = notice && notice.level !== 'info' && notice.text !== unattributedCodexError
+    const verboseErrorNotice = errorNotice && isVerboseDiagnostic(errorNotice.text)
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{
-        id: 'notice', summary: noticeSummary ?? notice.text,
+      ...(displayedTransientError ? [{
+        id: 'notice', renderKey: 'transient-notice', summary: noticeSummary ?? notice.text,
         compactSummary: notice.level === 'warning' ? 'Warning' : 'Error', level: notice.level,
         content: verboseNotice || uncertainDelivery || noticeExpanded
           ? notice.level === 'error'
@@ -5533,6 +5554,15 @@ export function FreshAgentView({
             : <p>{notice.text}</p>
           : null,
         onToggle: setNoticeExpanded,
+      }] : []),
+      ...(errorNotice && errorNotice.text !== unattributedCodexError ? [{
+        id: displayedTransientError ? 'provider-error' : 'notice', renderKey: 'persistent-error-notice',
+        summary: verboseErrorNotice ? summarizeDiagnostic(errorNotice.text) : errorNotice.text,
+        compactSummary: 'Error', level: 'error' as const,
+        content: verboseErrorNotice || errorNoticeExpanded
+          ? <FreshAgentApprovalBanner text={errorNotice.text} announce={false} onDismiss={() => setErrorNoticeState(current => current === errorNotice ? null : current)} />
+          : null,
+        onToggle: setErrorNoticeExpanded,
       }] : []),
     { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), compactSummary: 'Codex error', content: (pendingCodexError ? (
                 <FreshAgentApprovalBanner text={`Codex reported an error: ${pendingCodexError.message}`} />
@@ -5719,7 +5749,7 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null) },
-    ].filter(entry => entry.id === 'notice' || Boolean(entry.content))
+    ].filter(entry => entry.id === 'notice' || entry.id === 'provider-error' || Boolean(entry.content))
     const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
       provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
       ...(runtimeOwnerEpoch !== undefined && runtimeOwnerGeneration !== undefined ? { observedEpoch: runtimeOwnerEpoch, observedGeneration: runtimeOwnerGeneration } : {}),
@@ -6092,6 +6122,8 @@ export function FreshAgentView({
     handleModelCatalogUnavailable,
     notice,
     noticeExpanded,
+    errorNotice,
+    errorNoticeExpanded,
     setNotice,
     ownerDivergence,
     attachTerminalOwnerHere,

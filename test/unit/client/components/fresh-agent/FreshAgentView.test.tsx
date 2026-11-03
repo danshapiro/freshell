@@ -2109,7 +2109,12 @@ describe('FreshAgentView', () => {
         }))
         if (order === 'error-first') {
           deliverError()
+          const openError = screen.getByRole('alert', { name: diagnostic }).closest('details')!
+          fireEvent.click(openError.querySelector('summary')!)
+          fireEvent(openError, new Event('toggle', { bubbles: true }))
+          await within(openError).findByRole('button', { name: 'Dismiss', exact: true })
           deliverUncertainty()
+          expect(openError).toHaveAttribute('open')
         } else {
           deliverUncertainty()
           deliverError()
@@ -2123,8 +2128,10 @@ describe('FreshAgentView', () => {
         expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
 
         const errorDetails = providerError.closest('details')!
-        fireEvent.click(errorDetails.querySelector('summary')!)
-        fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+        if (!errorDetails.hasAttribute('open')) {
+          fireEvent.click(errorDetails.querySelector('summary')!)
+          fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+        }
         const dismiss = await within(errorDetails).findByRole('button', { name: 'Dismiss', exact: true })
         fireEvent.click(dismiss)
         expect(screen.queryByRole('alert', { name: diagnostic })).toBeNull()
