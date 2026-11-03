@@ -2098,6 +2098,58 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(notice()).toBeNull())
     })
 
+    it('does not revive a duplicate Codex notice after a same-session rebind', async () => {
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'duplicate-create', sessionId: 'duplicate-thread', status: 'idle' as const,
+      }
+      const snapshot = {
+        status: 'idle' as const, threadId: content.sessionId,
+        capabilities: { send: true, interrupt: true }, turns: [],
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', content.sessionId, expect.anything(),
+      ))
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId: content.sessionId, sessionType: content.sessionType, provider: content.provider,
+          event: { sessionId: content.sessionId, ...event },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        listener(message)
+      })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
+
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: { ...content, createRequestId: 'duplicate-rebind' },
+      })))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot,
+        extensions: { codex: { unattributedProviderError: diagnostic } } })
+      const previousCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+    })
+
     it('keeps queued work when the provider exits', async () => {
       const queue = await setup()
       queue.send('Keep this follow-up')
