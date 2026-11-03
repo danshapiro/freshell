@@ -2,7 +2,8 @@
 //! sidecar refused is taken back (C16).
 //!
 //! [`FreshClaudeState::handle_send`] answers every send on the WS bus
-//! (`freshAgent.send.accepted`, or a request `error`) and also returns the answer
+//! (`freshAgent.send.accepted`, a request `error`, or an uncertainty event) and
+//! also returns the answer
 //! as a [`ClaudeSendOutcome`], so an in-process caller (the REST/MCP agent API) can
 //! act on it without reading the bus. A refusal's request error is sent by
 //! [`FreshClaudeState::refuse_send`], which builds the outcome from the same code
@@ -27,6 +28,11 @@ pub enum ClaudeSendOutcome {
         /// The exact runtime that accepted this send; an old end after recovery
         /// must never settle a send belonging to its replacement.
         ownership_id: String,
+    },
+    /// The line may have reached the sidecar; replaying it could duplicate it.
+    Ambiguous {
+        message: String,
+        submitted_turn_id: String,
     },
     /// The message was not sent; the sender got a request error with this code.
     Refused {

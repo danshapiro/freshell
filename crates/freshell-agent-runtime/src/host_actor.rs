@@ -233,6 +233,9 @@ pub struct DispatchFailure {
     /// True when the request crossed the transport's acceptance boundary or
     /// the transport cannot prove that it did not.
     pub acceptance_ambiguous: bool,
+    /// Only an already-published, request-correlated provider receipt may be
+    /// copied here. `message` itself is not safe for a control response.
+    pub provider_diagnostic: Option<freshell_runtime_protocol::FreshAgentSendDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +353,14 @@ pub trait FreshAgentTransport: Send + Sync {
         decision_id: &str,
         decision: Value,
     ) -> Result<(), DispatchFailure>;
+    async fn resolve_permission_with_attempt_id(
+        &self,
+        decision_id: &str,
+        decision: Value,
+        _operation_attempt_id: Option<&str>,
+    ) -> Result<(), DispatchFailure> {
+        self.resolve_permission(decision_id, decision).await
+    }
     /// Branch the provider-native conversation inside this owned soul. Providers
     /// without a native fork surface return a deterministic unsupported error.
     async fn fork(
@@ -359,11 +370,17 @@ pub trait FreshAgentTransport: Send + Sync {
         _input: Option<Value>,
     ) -> Result<ForkTransition, DispatchFailure> {
         Err(DispatchFailure {
+            provider_diagnostic: None,
             message: "provider-native conversation fork is unsupported".into(),
             acceptance_ambiguous: false,
         })
     }
     async fn interrupt(&self) -> Result<(), String>;
+    /// Preserve the public request id when a provider can publish a receipt.
+    /// Existing transports may continue handling uncorrelated Stop requests.
+    async fn interrupt_with_request_id(&self, _request_id: Option<&str>) -> Result<(), String> {
+        self.interrupt().await
+    }
     async fn supports_operation(&self, _operation: &FreshAgentOperation) -> Result<bool, String> {
         Ok(false)
     }
@@ -434,6 +451,10 @@ pub enum ActorError {
     RequestConflict,
     #[error("command dispatch is ambiguous and will not be replayed")]
     AmbiguousDispatch,
+    #[error("provider published a send diagnostic")]
+    ProviderSendDiagnostic(freshell_runtime_protocol::FreshAgentSendDiagnostic),
+    #[error("provider refused the input")]
+    SendRefused,
     #[error("provider does not support this operation")]
     UnsupportedOperation,
     #[error("fresh-agent provider start failed (startup diagnostic: {diagnostic})")]
@@ -558,12 +579,16 @@ struct PersistedDecision {
     payload: Value,
     state: DecisionState,
     response_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedActorState {
     schema_version: u32,
+    #[serde(default = "new_actor_journal_id")]
+    journal_id: String,
     profile: FreshAgentProfile,
     #[serde(default)]
     initialization_state: Option<CommandState>,
@@ -583,6 +608,7 @@ impl PersistedActorState {
     fn new(profile: FreshAgentProfile) -> Self {
         Self {
             schema_version: 1,
+            journal_id: new_actor_journal_id(),
             profile,
             initialization_state: None,
             commands: BTreeMap::new(),
@@ -845,13 +871,27 @@ impl FreshAgentHostActor {
                         loaded.profile.provider,
                         FreshProvider::Claude | FreshProvider::Kilroy
                     );
-                for decision in loaded.decisions.values_mut() {
+                let mut interrupted_attempts = Vec::new();
+                for (decision_id, decision) in &mut loaded.decisions {
                     if matches!(decision.state, DecisionState::Dispatching) {
                         decision.state = DecisionState::Ambiguous;
+                        if let Some(attempt_id) = decision.operation_attempt_id.as_ref() {
+                            interrupted_attempts.push((decision_id.clone(), attempt_id.clone()));
+                        }
                     } else if claude_replacement && matches!(decision.state, DecisionState::Pending)
                     {
                         decision.state = DecisionState::Interrupted;
                     }
+                }
+                for (decision_id, attempt_id) in interrupted_attempts {
+                    let event = control_attempt_event(
+                        &loaded.profile,
+                        &decision_id,
+                        &attempt_id,
+                        true,
+                        None,
+                    );
+                    push_event_bounded(&mut loaded, event, event_byte_cap, event_count_cap)?;
                 }
                 (loaded, false)
             }
@@ -1324,10 +1364,19 @@ impl FreshAgentHostActor {
                     self.event_count_cap,
                 )?;
                 write_state(&self.state_dir, &state)?;
+                if let Some(diagnostic) = failure.provider_diagnostic {
+                    let diagnostic_is_ambiguous = matches!(
+                        diagnostic.outcome,
+                        freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous
+                    );
+                    if diagnostic_is_ambiguous == failure.acceptance_ambiguous {
+                        return Err(ActorError::ProviderSendDiagnostic(diagnostic));
+                    }
+                }
                 if failure.acceptance_ambiguous {
                     Err(ActorError::AmbiguousDispatch)
                 } else {
-                    Err(ActorError::Transport(failure.message))
+                    Err(ActorError::SendRefused)
                 }
             }
         }
@@ -1916,23 +1965,49 @@ impl FreshAgentHostActor {
                 .await;
         }
         let mut state = self.state.lock().await;
-        if let AgentEvent::Provider { payload } = &event {
-            let native = payload.get("event").unwrap_or(payload);
+        if let AgentEvent::Provider { payload } = &mut event {
+            let native = if payload.get("event").is_some() {
+                &mut payload["event"]
+            } else {
+                payload
+            };
+            let kind = native
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let request_id = native
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             if matches!(
-                native.get("type").and_then(Value::as_str),
-                Some("freshAgent.permission.cancelled" | "freshAgent.question.cancelled")
+                kind.as_deref(),
+                Some(
+                    "freshAgent.permission.cancelled"
+                        | "freshAgent.question.cancelled"
+                        | "freshAgent.elicitation.cancelled"
+                )
             ) {
-                if let Some(decision) = native
-                    .get("requestId")
-                    .and_then(Value::as_str)
+                let attempt_id = request_id
+                    .as_deref()
                     .and_then(|request| state.decisions.get_mut(request))
-                {
-                    if matches!(
-                        decision.state,
-                        DecisionState::Pending | DecisionState::Dispatching
-                    ) {
-                        decision.state = DecisionState::Interrupted;
-                    }
+                    .and_then(|decision| {
+                        if matches!(
+                            kind.as_deref(),
+                            Some(
+                                "freshAgent.permission.cancelled" | "freshAgent.question.cancelled"
+                            )
+                        ) && matches!(
+                            decision.state,
+                            DecisionState::Pending | DecisionState::Dispatching
+                        ) {
+                            decision.state = DecisionState::Interrupted;
+                        }
+                        decision.operation_attempt_id.clone()
+                    });
+                native["operationJournalId"] = serde_json::json!(state.journal_id);
+                native["operationJournalSequence"] = serde_json::json!(state.next_sequence);
+                if let Some(attempt_id) = attempt_id {
+                    native["operationAttemptId"] = serde_json::json!(attempt_id);
                 }
             }
         }
@@ -2006,6 +2081,7 @@ impl FreshAgentHostActor {
                 existing.payload = payload.clone();
                 existing.state = DecisionState::Pending;
                 existing.response_digest = None;
+                existing.operation_attempt_id = None;
                 let sequence = push_event_bounded(
                     &mut state,
                     AgentEvent::PermissionRequested {
@@ -2065,6 +2141,7 @@ impl FreshAgentHostActor {
                 payload: payload.clone(),
                 state: DecisionState::Pending,
                 response_digest: None,
+                operation_attempt_id: None,
             },
         );
         let sequence = push_event_bounded(
@@ -2140,6 +2217,16 @@ impl FreshAgentHostActor {
         decision_id: &str,
         decision: Value,
     ) -> Result<(), ActorError> {
+        self.resolve_permission_with_attempt_id(decision_id, decision, None)
+            .await
+    }
+
+    pub async fn resolve_permission_with_attempt_id(
+        &self,
+        decision_id: &str,
+        decision: Value,
+        operation_attempt_id: Option<&str>,
+    ) -> Result<(), ActorError> {
         if !self.state.lock().await.decisions.contains_key(decision_id) {
             self.record_retained_permission(decision_id).await?;
         }
@@ -2165,12 +2252,23 @@ impl FreshAgentHostActor {
             }
             pending.state = DecisionState::Dispatching;
             pending.response_digest = Some(response_digest);
+            pending.operation_attempt_id = operation_attempt_id.map(str::to_owned);
             self.prepare_claude_effect(&mut state, false).await?;
+            if let Some(attempt_id) = operation_attempt_id {
+                let event = control_attempt_event(
+                    &state.profile,
+                    decision_id,
+                    attempt_id,
+                    false,
+                    Some((&state.journal_id, state.next_sequence)),
+                );
+                push_event_bounded(&mut state, event, self.event_byte_cap, self.event_count_cap)?;
+            }
             write_state(&self.state_dir, &state)?;
         }
         let result = self
             .transport
-            .resolve_permission(decision_id, decision)
+            .resolve_permission_with_attempt_id(decision_id, decision, operation_attempt_id)
             .await;
         let mut state = self.state.lock().await;
         let pending = state
@@ -2199,6 +2297,23 @@ impl FreshAgentHostActor {
                 } else {
                     DecisionState::Pending
                 };
+                if failure.acceptance_ambiguous {
+                    if let Some(attempt_id) = operation_attempt_id {
+                        let event = control_attempt_event(
+                            &state.profile,
+                            decision_id,
+                            attempt_id,
+                            true,
+                            None,
+                        );
+                        push_event_bounded(
+                            &mut state,
+                            event,
+                            self.event_byte_cap,
+                            self.event_count_cap,
+                        )?;
+                    }
+                }
                 write_state(&self.state_dir, &state)?;
                 if failure.acceptance_ambiguous {
                     Err(ActorError::AmbiguousDispatch)
@@ -2213,20 +2328,40 @@ impl FreshAgentHostActor {
         let mut batch = {
             let state = self.state.lock().await;
             let max_events = max_events.clamp(1, self.event_count_cap);
+            let mut events: Vec<JournalEvent> = state.events.iter()
+                .filter(|event| event.sequence > after)
+                .filter(|event| !matches!(&event.event, AgentEvent::Started {native_session_id}
+                    if state.profile.native_session_id.as_deref() != Some(native_session_id.as_str())))
+                .take(max_events).cloned().collect();
+            for entry in &mut events {
+                let pending = match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.operation.started" =>
+                    {
+                        let event = &payload["event"];
+                        event["requestId"]
+                            .as_str()
+                            .and_then(|id| state.decisions.get(id))
+                            .is_some_and(|decision| {
+                                matches!(decision.state, DecisionState::Dispatching)
+                                    && decision.operation_attempt_id.as_deref()
+                                        == event["operationAttemptId"].as_str()
+                            })
+                    }
+                    _ => false,
+                };
+                if pending {
+                    if let AgentEvent::Provider { payload } = &mut entry.event {
+                        payload["event"]["operationPending"] = serde_json::json!(true);
+                    }
+                }
+            }
             EventBatch {
                 retained_state: None,
                 retained_from: state.retained_from,
                 head: state.next_sequence.saturating_sub(1),
                 reset_required: after.saturating_add(1) < state.retained_from,
-                events: state
-                    .events
-                    .iter()
-                    .filter(|event| event.sequence > after)
-                    .filter(|event| !matches!(&event.event, AgentEvent::Started {native_session_id}
-                        if state.profile.native_session_id.as_deref() != Some(native_session_id.as_str())))
-                    .take(max_events)
-                    .cloned()
-                    .collect(),
+                events,
             }
         };
         if after == 0 || batch.reset_required || batch.events.iter().any(|entry|
@@ -2243,8 +2378,15 @@ impl FreshAgentHostActor {
     }
 
     pub async fn interrupt(&self) -> Result<(), ActorError> {
+        self.interrupt_with_request_id(None).await
+    }
+
+    pub async fn interrupt_with_request_id(
+        &self,
+        request_id: Option<&str>,
+    ) -> Result<(), ActorError> {
         self.transport
-            .interrupt()
+            .interrupt_with_request_id(request_id)
             .await
             .map_err(ActorError::Transport)?;
         self.record_event(AgentEvent::Interrupted).await?;
@@ -2262,6 +2404,45 @@ impl FreshAgentHostActor {
             .stop()
             .await
             .map_err(ActorError::Transport)
+    }
+}
+
+fn new_actor_journal_id() -> String {
+    RequestId::new().as_str().to_owned()
+}
+
+fn control_attempt_event(
+    profile: &FreshAgentProfile,
+    decision_id: &str,
+    attempt_id: &str,
+    uncertain: bool,
+    journal: Option<(&str, u64)>,
+) -> AgentEvent {
+    let (provider, session_type) = match &profile.provider {
+        FreshProvider::Claude => ("claude", "freshclaude"),
+        FreshProvider::Kilroy => ("claude", "kilroy"),
+        FreshProvider::Codex => ("codex", "freshcodex"),
+        FreshProvider::Opencode => ("opencode", "freshopencode"),
+    };
+    let mut event = serde_json::json!({
+        "type":if uncertain {"freshAgent.operation.error"} else {"freshAgent.operation.started"},
+        "requestId":decision_id, "operationAttemptId":attempt_id, "operationReceipt":true,
+    });
+    if uncertain {
+        event["code"] = serde_json::json!("COMMAND_AMBIGUOUS");
+        event["message"] = serde_json::json!("Sending the answer could not be confirmed. Check the conversation before trying again.");
+        event["operationFallback"] = serde_json::json!(true);
+        event["operationOutcomeUncertain"] = serde_json::json!(true);
+    }
+    if let Some((journal_id, sequence)) = journal {
+        event["operationJournalId"] = serde_json::json!(journal_id);
+        event["operationJournalSequence"] = serde_json::json!(sequence);
+    }
+    AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":provider, "sessionType":session_type,
+            "sessionId":profile.native_session_id.as_deref().unwrap_or_default(), "event":event,
+        }),
     }
 }
 

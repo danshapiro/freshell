@@ -18,7 +18,7 @@ import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
-import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
@@ -1970,7 +1970,8 @@ describe('FreshAgentView', () => {
     await expectRenderedText('Saved conversation remains here')
     expect(screen.queryByText(/Close failed/)).toBeNull()
     await act(async () => { await store.dispatch(closeTab('tab-1')) })
-    fireEvent.click(await screen.findByText('Close failed', { exact: true }))
+    const closeSummary = await screen.findByText('The pane could not be closed, so it was left open. Try again. — Close failed', { exact: true })
+    fireEvent.click(closeSummary)
     const notice = await screen.findByText('Close failed: The pane could not be closed, so it was left open. Try again.')
     expect(notice.closest('[role="alert"]')).toBeInTheDocument()
     expect(document.querySelector('[data-agent-error="session"]')).toBeNull()
@@ -1984,7 +1985,7 @@ describe('FreshAgentView', () => {
   })
 
   describe('outgoing message queue', () => {
-    async function setup(status = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
+    async function setup(status: 'running' | 'idle' = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
       const store = createStore()
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
         status, capabilities: { send: canSend, interrupt: true }, turns: [],
@@ -1992,27 +1993,1549 @@ describe('FreshAgentView', () => {
       const content = {
         kind: 'fresh-agent' as const, sessionType: provider === 'claude' ? 'freshclaude' as const : 'freshcodex' as const,
         provider, createRequestId: 'queue-create',
-        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status: status as 'running' | 'idle',
+        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status,
       }
-      const view = (nextStatus: string) => (
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(
         <Provider store={store}>
-          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{ ...content, status: nextStatus as 'idle' }} />
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
         </Provider>
       )
-      const rendered = render(view(status))
       await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
       const send = (text: string) => {
         fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
         fireEvent.click(screen.getByRole('button', { name: 'Send' }))
       }
-      return { send, store, status: (nextStatus: string) => {
-        act(() => store.dispatch(setSessionStatus({
-          sessionId: content.sessionId, sessionType: content.sessionType, provider,
-          status: nextStatus as 'idle',
-        })))
-        rendered.rerender(view(nextStatus))
+      return { send, store, status: (nextStatus: 'running' | 'idle' | 'exited') => {
+        act(() => {
+          store.dispatch(setSessionStatus({
+            sessionId: content.sessionId, sessionType: content.sessionType, provider, status: nextStatus,
+          }))
+          store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: nextStatus } }))
+        })
       } }
     }
+
+    it('keeps a Codex provider error until dismissed while routine notices still expire', async () => {
+      const queue = await setup('idle')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      const errorMessage = 'Selected model is at capacity. Please try a different model.'
+      const errorNotice = () => document.querySelector('[data-agent-error="notice"]')
+
+      vi.useFakeTimers()
+      try {
+        deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: errorMessage })
+        expect(errorNotice()?.querySelector('summary')).toHaveAccessibleName(errorMessage)
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+
+        const notice = errorNotice()
+        expect(notice).toBeInTheDocument()
+        await act(async () => {
+          fireEvent.click(notice!.querySelector('summary')!)
+          expect(notice).toHaveAttribute('open')
+          fireEvent(notice!, new Event('toggle', { bubbles: true }))
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        const details = notice!.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
+        expect(within(details).getByText(errorMessage, { exact: true })).toBeVisible()
+        fireEvent.click(within(details).getByRole('button', { name: 'Dismiss', exact: true }))
+        expect(errorNotice()).toBeNull()
+
+        deliver({ type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message: 'Settings saved' })
+        expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Settings saved')
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+        expect(screen.queryByRole('status', { name: 'Agent notices' })).toBeNull()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it.each([
+      ['info', 'error-first'],
+      ['info', 'feedback-first'],
+      ['warning', 'error-first'],
+      ['warning', 'feedback-first'],
+    ] as const)('preserves a provider error and %s notice delivered in one batch (%s)', async (level, order) => {
+      const queue = await setup('idle')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const feedback = 'The provider sent additional feedback.'
+      const deliver = (event: Record<string, unknown>) => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      }
+      const deliverError = () => deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      const deliverFeedback = () => deliver({ type: 'freshAgent.notice', level, code: 'FOLLOWUP_NOTICE', message: feedback })
+
+      act(() => {
+        if (order === 'error-first') {
+          deliverError()
+          deliverFeedback()
+        } else {
+          deliverFeedback()
+          deliverError()
+        }
+      })
+
+      await waitFor(() => expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible())
+      if (level === 'info') {
+        expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent(feedback)
+      } else {
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(feedback)
+      }
+    })
+
+    it('keeps a provider error while an informational notice appears and expires', async () => {
+      const queue = await setup('idle')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Keep this unsent draft' } })
+      deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible()
+
+      vi.useFakeTimers()
+      try {
+        deliver({ type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message: 'Settings saved' })
+        expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Settings saved')
+        expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible()
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+        expect(screen.queryByRole('status', { name: 'Agent notices' })).toBeNull()
+        expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible()
+        expect(composer).toHaveValue('Keep this unsent draft')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it.each(['error-first', 'warning-first'] as const)(
+      'keeps a provider error and uncertain delivery independently visible (%s)', async (order) => {
+        const queue = await setup('idle')
+        const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        const diagnostic = 'Selected model is at capacity. Please try a different model.'
+        const original = 'Keep the original uncertain prompt'
+        queue.send(original)
+        const [sent] = sentFreshAgentMessages('freshAgent.send')
+        expect(sent?.requestId).toBeTruthy()
+        const deliverError = () => act(() => {
+          const message = { type: 'freshAgent.event', ...locator, event: {
+            type: 'freshAgent.notice', sessionId: locator.sessionId, level: 'error',
+            code: 'CODEX_PROVIDER_ERROR', message: diagnostic,
+          } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        })
+        const deliverUncertainty = () => act(() => listener({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: sent.requestId,
+          message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+        }))
+        if (order === 'error-first') {
+          deliverError()
+          const openError = screen.getByRole('alert', { name: diagnostic }).closest('details')!
+          fireEvent.click(openError.querySelector('summary')!)
+          fireEvent(openError, new Event('toggle', { bubbles: true }))
+          await within(openError).findByRole('button', { name: 'Dismiss', exact: true })
+          deliverUncertainty()
+          expect(openError).toHaveAttribute('open')
+        } else {
+          deliverUncertainty()
+          deliverError()
+        }
+
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        await waitFor(() => expect(composer).toHaveValue(original))
+        const providerError = screen.getByRole('alert', { name: diagnostic })
+        expect(providerError).toBeVisible()
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+        const errorDetails = providerError.closest('details')!
+        if (!errorDetails.hasAttribute('open')) {
+          fireEvent.click(errorDetails.querySelector('summary')!)
+          fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+        }
+        const dismiss = await within(errorDetails).findByRole('button', { name: 'Dismiss', exact: true })
+        fireEvent.click(dismiss)
+        expect(screen.queryByRole('alert', { name: diagnostic })).toBeNull()
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+
+        act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+          requestId: sent.requestId, submittedTurnId: 'accepted-uncertain-turn' }))
+        await waitFor(() => expect(screen.queryByRole('alert', { name: 'Agent warning' })).toBeNull())
+        expect(composer).toHaveValue(original)
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it.each(['info', 'warning'] as const)(
+      'keeps uncertain delivery visible after a later %s notice', async (level) => {
+        const queue = await setup('idle')
+        const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        const original = 'Keep this uncertain prompt'
+        queue.send(original)
+        const [sent] = sentFreshAgentMessages('freshAgent.send')
+        expect(sent?.requestId).toBeTruthy()
+        act(() => listener({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: sent.requestId,
+          message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+        }))
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        await waitFor(() => expect(composer).toHaveValue(original))
+        const uncertainty = 'Check the conversation before sending again. Delivery is uncertain.'
+        const warningTexts = () => screen.queryAllByRole('alert', { name: 'Agent warning' }).map(alert => alert.textContent)
+        expect(warningTexts()).toContain(uncertainty)
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+        vi.useFakeTimers()
+        try {
+          act(() => {
+            const message = {
+              type: 'freshAgent.event', ...locator,
+              event: { type: 'freshAgent.notice', sessionId: locator.sessionId, level,
+                code: 'FOLLOWUP_NOTICE', message: 'Later provider feedback' },
+            }
+            handleFreshAgentMessage(queue.store.dispatch, message)
+            listener(message)
+          })
+          expect(warningTexts()).toContain(uncertainty)
+          if (level === 'info') {
+            expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Later provider feedback')
+          } else {
+            expect(warningTexts()).toContain('Later provider feedback')
+          }
+          await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+          expect(warningTexts()).toContain(uncertainty)
+          expect(composer).toHaveValue(original)
+          expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        } finally {
+          vi.useRealTimers()
+        }
+
+        act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+          requestId: sent.requestId, submittedTurnId: 'accepted-uncertain-turn' }))
+        await waitFor(() => expect(warningTexts()).not.toContain(uncertainty))
+        expect(composer).toHaveValue(original)
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it.each(['refusal', 'uncertainty'] as const)(
+      'does not restore a previous conversation\'s %s into the current conversation', async (kind) => {
+        const store = createStore()
+        const first = {
+          kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+          createRequestId: 'send-scope-create-a', sessionId: 'send-scope-thread-a',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-thread-a' },
+          resumeSessionId: 'send-scope-thread-a', status: 'idle' as const,
+        }
+        const snapshot = (threadId: string) => ({
+          status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+        })
+        apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => snapshot(sessionId))
+        store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+
+        const sourcePrompt = 'Only belongs to the first conversation'
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: sourcePrompt } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+        const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+        expect(sent?.requestId).toBeTruthy()
+
+        const second = {
+          ...first, createRequestId: 'send-scope-create-b', sessionId: 'send-scope-thread-b',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-thread-b' },
+          resumeSessionId: 'send-scope-thread-b',
+        }
+        act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+          'freshcodex', 'codex', second.sessionId, expect.anything(),
+        ))
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        const currentDraft = 'Only belongs to the second conversation'
+        fireEvent.change(composer, { target: { value: currentDraft } })
+
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        act(() => listener({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+          message: kind === 'uncertainty' ? 'CODEX_DELIVERY_AMBIGUOUS: response was lost' : 'The first send was refused.',
+        }))
+
+        expect(composer).toHaveValue(currentDraft)
+        expect(screen.queryByText(/Check the conversation before sending again/)).toBeNull()
+        expect(screen.queryByText(/Message not sent: The first send was refused/)).toBeNull()
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it.each(['refusal', 'uncertainty'] as const)(
+      'does not restore a previous conversation\'s %s during a same-batch conversation switch', async (kind) => {
+        const store = createStore()
+        const first = {
+          kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+          createRequestId: 'send-scope-batched-a', sessionId: 'send-scope-batched-thread-a',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-batched-thread-a' },
+          resumeSessionId: 'send-scope-batched-thread-a', status: 'idle' as const,
+        }
+        const second = {
+          ...first, createRequestId: 'send-scope-batched-b', sessionId: 'send-scope-batched-thread-b',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-batched-thread-b' },
+          resumeSessionId: 'send-scope-batched-thread-b',
+        }
+        apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+          status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+        }))
+        store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        await waitFor(() => expect(composer).toBeEnabled())
+
+        fireEvent.change(composer, { target: { value: 'Prompt from the previous conversation' } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+        const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+        expect(sent?.requestId).toBeTruthy()
+        const currentDraft = 'Keep this newer draft'
+        fireEvent.change(composer, { target: { value: currentDraft } })
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+
+        // Redux has switched the pane, but React has not rendered the new
+        // content before the old request's error is delivered.
+        act(() => {
+          store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second }))
+          listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+            message: kind === 'uncertainty'
+              ? 'CODEX_DELIVERY_AMBIGUOUS: response was lost'
+              : 'The previous conversation send was refused.' })
+        })
+
+        await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(second.sessionId))
+        await waitFor(() => expect(composer).toHaveValue(currentDraft))
+        expect(screen.queryByText(/The previous conversation send was refused/)).toBeNull()
+        expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it('does not adopt a previous conversation acceptance during a same-batch conversation switch', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'accepted-scope-a', sessionId: 'accepted-scope-thread-a',
+        sessionRef: { provider: 'codex' as const, sessionId: 'accepted-scope-thread-a' },
+        resumeSessionId: 'accepted-scope-thread-a', status: 'idle' as const,
+      }
+      const second = {
+        ...first, createRequestId: 'accepted-scope-b', sessionId: 'accepted-scope-thread-b',
+        sessionRef: { provider: 'codex' as const, sessionId: 'accepted-scope-thread-b' },
+        resumeSessionId: 'accepted-scope-thread-b',
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: 'Prompt from conversation A' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      fireEvent.change(composer, { target: { value: 'Keep the conversation B draft' } })
+
+      act(() => {
+        store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second }))
+        listener({ type: 'freshAgent.send.accepted', sessionId: first.sessionId,
+          sessionType: first.sessionType, provider: first.provider,
+          requestId: sent!.requestId, submittedTurnId: 'late-accepted-a' })
+      })
+
+      expect(getFreshAgentPaneContent(store).sessionId).toBe(second.sessionId)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      expect(composer).toHaveValue('Keep the conversation B draft')
+      expect(screen.queryByText('Message accepted. Your restored draft was kept.')).toBeNull()
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('accepts an uncertain send when its conversation materializes in the same batch', async () => {
+      const store = createStore()
+      const placeholder = 'freshopencode-late-accepted-placeholder'
+      const durable = 'ses_late_accepted_materialized'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'accepted-scope-materialize', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const sourcePrompt = 'Keep the materializing conversation prompt'
+      fireEvent.change(composer, { target: { value: sourcePrompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+
+      act(() => {
+        const materialized = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, materialized)
+        listener(materialized)
+        listener({ type: 'freshAgent.send.accepted', sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          requestId: sent!.requestId, submittedTurnId: 'materialized-accepted-turn' })
+      })
+
+      expect(getFreshAgentPaneContent(store).sessionId).toBe(durable)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, text: sourcePrompt, submittedTurnId: 'materialized-accepted-turn',
+      })
+      expect(composer).toHaveValue(sourcePrompt)
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      const acceptedSummary = screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary')
+      expect(acceptedSummary).toBeVisible()
+      expect(acceptedSummary).toHaveTextContent('Message accepted. Your restored draft was kept.')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it.each(['idle', 'running', 'settled'] as const)(
+      'does not duplicate a landed prompt when acceptance follows materialization with a %s snapshot', async (landedStatus) => {
+      const store = createStore()
+      const placeholder = 'freshopencode-landed-acceptance-placeholder'
+      const durable = 'ses_landed_acceptance_materialized'
+      const prompt = 'This prompt has already landed'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'landed-acceptance-materialize', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      let landed = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: landed && landedStatus === 'running' ? 'running' : 'idle', threadId: sessionId,
+        sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
+        turns: landed ? [{ id: 'landed-turn', turnId: 'landed-turn', role: 'user',
+          items: [{ id: 'landed-text', kind: 'text', text: prompt }] }] : [],
+        extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
+
+      if (landedStatus === 'settled') {
+        // Retire the outgoing ref before the delayed receipt while retaining
+        // the original request and its send boundary.
+        const locator = { sessionId: placeholder, sessionType: first.sessionType, provider: first.provider }
+        act(() => {
+          store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+          store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'running' } }))
+        })
+        act(() => {
+          store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+          store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'idle' } }))
+        })
+      }
+
+      landed = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => {
+        const rows = screen.getAllByRole('article', { name: 'You transcript turn' })
+        expect(rows).toHaveLength(1)
+        expect(within(rows[0]).getByText(prompt)).toBeVisible()
+      })
+      if (landedStatus === 'running') {
+        expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      }
+      act(() => {
+        const materialized = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, materialized)
+        listener(materialized)
+        listener({ type: 'freshAgent.send.accepted', sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          requestId: sent!.requestId, submittedTurnId: 'landed-turn' })
+      })
+
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      const acceptedSummary = screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary')
+      expect(acceptedSummary).toBeVisible()
+      expect(acceptedSummary).toHaveTextContent('Message accepted. Your restored draft was kept.')
+      expect(composer).toHaveValue(prompt)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it('keeps the accepted echo when only a different same-text turn has landed', async () => {
+      const store = createStore()
+      const sessionId = 'ses_same_text_different_turn'
+      const prompt = 'A prompt another client also sent'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'same-text-acceptance', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'opencode' as const, sessionId }, status: 'idle' as const,
+      }
+      let otherTurnLanded = false
+      let ourTurnLanded = false
+      let holdRefresh = false
+      let heldRefreshStarted = false
+      const snapshot = (requestedSessionId: string, afterAcceptance = false) => ({
+        status: 'idle', threadId: requestedSessionId,
+        sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
+        turns: [
+          ...(otherTurnLanded ? [{ id: 'other-turn', turnId: 'other-turn', role: 'user',
+            items: [{ id: 'other-text', kind: 'text', text: prompt }] }] : []),
+          ...(afterAcceptance ? [{ id: 'other-answer', turnId: 'other-answer', role: 'assistant',
+            items: [{ id: 'other-answer-text', kind: 'text', text: 'Snapshot refreshed after acceptance' }] }] : []),
+          ...(ourTurnLanded ? [{ id: 'our-accepted-turn', turnId: 'our-accepted-turn', role: 'user',
+            items: [{ id: 'our-text', kind: 'text', text: prompt }] }] : []),
+        ],
+        extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+      })
+      const heldRefresh = createDeferred<ReturnType<typeof snapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, requestedSessionId) => {
+        if (holdRefresh) {
+          heldRefreshStarted = true
+          return heldRefresh.promise
+        }
+        return snapshot(requestedSessionId)
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
+
+      otherTurnLanded = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => {
+        const rows = screen.getAllByRole('article', { name: 'You transcript turn' })
+        expect(rows).toHaveLength(1)
+        expect(within(rows[0]).getByText(prompt)).toBeVisible()
+      })
+      holdRefresh = true
+      act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
+        sessionType: content.sessionType, provider: content.provider,
+        requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn' }))
+
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn', text: prompt,
+      })
+      expect(composer).toHaveValue(prompt)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+      // Acceptance itself schedules a refresh. A different turn with the
+      // same text must not clear the accepted echo during that read either.
+      await waitFor(() => expect(heldRefreshStarted).toBe(true))
+      holdRefresh = false
+      await act(async () => { heldRefresh.resolve(snapshot(sessionId, true)) })
+      await screen.findByText('Snapshot refreshed after acceptance')
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn', text: prompt,
+      })
+
+      ourTurnLanded = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
+    })
+
+    it('recognizes a landed split Codex user row by its native turn ID on delayed acceptance', async () => {
+      const store = createStore()
+      const sessionId = 'codex-split-landed-acceptance'
+      const prompt = 'The Codex prompt already landed'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'codex-split-landed-create', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'codex' as const, sessionId }, status: 'idle' as const,
+      }
+      let landed = false
+      let holdIdleRead = false
+      let idleReadStarted = false
+      const snapshot = (status: 'idle' | 'running') => ({
+        status, threadId: sessionId, sessionType: content.sessionType, provider: content.provider,
+        capabilities: { send: true, interrupt: true },
+        turns: landed ? [
+          { id: 'codex-native-turn:row-0', turnId: 'codex-native-turn:row-0', nativeTurnId: 'codex-native-turn',
+            role: 'user', items: [{ id: 'codex-user', kind: 'text', text: prompt }] },
+          { id: 'codex-native-turn:row-1', turnId: 'codex-native-turn:row-1', role: 'assistant',
+            items: [{ id: 'codex-answer', kind: 'text', text: 'Codex is responding' }] },
+        ] : [],
+      })
+      const idleRead = createDeferred<ReturnType<typeof snapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        if (holdIdleRead) {
+          idleReadStarted = true
+          return idleRead.promise
+        }
+        return snapshot(landed ? 'running' : 'idle')
+      })
+      store.dispatch(sessionInit({ sessionId, sessionType: content.sessionType, provider: content.provider }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
+
+      landed = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await screen.findByText('Codex is responding')
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+
+      holdIdleRead = true
+      act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
+        sessionType: content.sessionType, provider: content.provider,
+        requestId: sent!.requestId, submittedTurnId: 'codex-native-turn' }))
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
+
+      // A phantom persisted echo would block this authoritative idle read
+      // from releasing the queued follow-up for the same session.
+      fireEvent.change(composer, { target: { value: 'A queued follow-up' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      await waitFor(() => expect(idleReadStarted).toBe(true))
+      holdIdleRead = false
+      await act(async () => { idleRead.resolve(snapshot('idle')) })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'A queued follow-up' })
+    })
+
+    async function setupCodexSharedTurnSteer(earlierText: string, prompt: string) {
+      const store = createStore()
+      const sessionId = 'codex-shared-native-turn'
+      const nativeTurnId = 'shared-turn'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'codex-shared-turn-create', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'codex' as const, sessionId }, status: 'idle' as const,
+      }
+      const userRow = (id: string, text: string, nativeId?: string) => ({
+        id, turnId: id, role: 'user' as const, ...(nativeId ? { nativeTurnId: nativeId } : {}),
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      const assistantRow = (id: string, text: string) => ({
+        id, turnId: id, role: 'assistant' as const,
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      type Row = ReturnType<typeof userRow> | ReturnType<typeof assistantRow>
+      let status: 'idle' | 'running' = 'idle'
+      let rows: Row[] = [userRow(nativeTurnId, earlierText, nativeTurnId)]
+      let revision = 0
+      const snapshot = () => ({
+        status, threadId: sessionId, sessionType: content.sessionType, provider: content.provider,
+        revision: ++revision, capabilities: { send: true, interrupt: true }, turns: rows,
+      })
+      const acceptanceRead = createDeferred<ReturnType<typeof snapshot>>()
+      let holdAcceptanceRead = false
+      let acceptanceReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        if (holdAcceptanceRead) {
+          acceptanceReadStarted = true
+          return acceptanceRead.promise
+        }
+        return snapshot()
+      })
+      store.dispatch(sessionInit({ sessionId, sessionType: content.sessionType, provider: content.provider }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      await screen.findByText(earlierText)
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+
+      return {
+        store, composer, sent: sent!, userRow, assistantRow,
+        accept() {
+          holdAcceptanceRead = true
+          act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
+            sessionType: content.sessionType, provider: content.provider,
+            requestId: sent!.requestId, submittedTurnId: nativeTurnId }))
+        },
+        async releaseAcceptedRead(nextStatus: 'idle' | 'running', nextRows: Row[]) {
+          await waitFor(() => expect(acceptanceReadStarted).toBe(true))
+          status = nextStatus
+          rows = nextRows
+          holdAcceptanceRead = false
+          await act(async () => { acceptanceRead.resolve(snapshot()) })
+        },
+        async refresh(nextStatus: 'idle' | 'running', nextRows: Row[], marker: string) {
+          status = nextStatus
+          rows = nextRows
+          act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+          await screen.findByText(marker)
+        },
+      }
+    }
+
+    it('keeps a steered echo visible when an earlier matching row shares its native turn ID', async () => {
+      const prompt = 'Same wording in two sends'
+      const steer = await setupCodexSharedTurnSteer(prompt, prompt)
+      const expectEcho = () => {
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+          requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+        })
+        const users = screen.getAllByRole('article', { name: 'You transcript turn' })
+        expect(users).toHaveLength(2)
+        expect(within(users[0]).getByText(prompt)).toBeVisible()
+        expect(within(users[1]).getByText(prompt)).toBeVisible()
+      }
+      steer.accept()
+      expectEcho()
+      // A one-row Codex turn is keyed by the native ID. Once assistant output
+      // lands, its original user row is re-keyed to :row-0, not a new input.
+      await steer.releaseAcceptedRead('running', [
+        steer.userRow('shared-turn:row-0', prompt, 'shared-turn'),
+        steer.assistantRow('shared-turn:row-1', 'Earlier turn is running'),
+      ])
+      await screen.findByText('Earlier turn is running')
+      expectEcho()
+    })
+
+    it('settles a uniquely matching steered row at authoritative idle and releases queued work', async () => {
+      const prompt = 'Add this steered context'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const runningRows = [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', 'The shared turn is running'),
+        steer.userRow('shared-turn:row-2', prompt),
+      ]
+      await steer.releaseAcceptedRead('running', runningRows)
+      await screen.findByText('The shared turn is running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      fireEvent.change(steer.composer, { target: { value: 'Follow up after steering' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      await steer.refresh('idle', [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', 'The shared turn completed'),
+        steer.userRow('shared-turn:row-2', prompt),
+      ], 'The shared turn completed')
+      // The current idle snapshot is sufficient evidence. Do not let the
+      // unrelated stale-echo retry budget make this assertion pass later.
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2), { timeout: 10_000 })
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow up after steering' })
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+    })
+
+    it('keeps an ambiguous steered echo when multiple new user rows have the same text', async () => {
+      const prompt = 'Same steered message from two clients'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        steer.userRow('shared-turn:row-2', prompt),
+        steer.assistantRow('shared-turn:row-3', 'Intervening response'),
+        steer.userRow('shared-turn:row-4', prompt),
+      ]
+      await steer.releaseAcceptedRead('running', rows('Two matching sends are running'))
+      await screen.findByText('Two matching sends are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+
+      // Repeated current idle reads must not turn multiple possible matches
+      // into a claim that either particular row belongs to this request.
+      for (let read = 0; read <= IDLE_INCOMPLETE_MAX_RETRIES; read++) {
+        const marker = `Ambiguous completed read ${read}`
+        await steer.refresh('idle', rows(marker), marker)
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+          requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+        })
+      }
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
+    })
+
+    it('keeps an ambiguous steered echo when an idle status update races a snapshot', async () => {
+      const prompt = 'Two clients sent this steered message'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      const locator = { sessionId: 'codex-shared-native-turn', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        steer.userRow('shared-turn:row-2', prompt),
+        steer.assistantRow('shared-turn:row-3', 'Intervening response'),
+        steer.userRow('shared-turn:row-4', prompt),
+      ]
+      steer.accept()
+      await steer.releaseAcceptedRead('running', rows('Shared turn before idle'))
+      await screen.findByText('Shared turn before idle')
+      act(() => steer.store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+      for (let read = 0; read < IDLE_INCOMPLETE_MAX_RETRIES; read++) {
+        const marker = `Ambiguous stable idle ${read}`
+        await steer.refresh('idle', rows(marker), marker)
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      }
+
+      const heldRead = createDeferred<unknown>()
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        heldReadStarted = true
+        return heldRead.promise
+      })
+      act(() => steer.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      const sessionKey = 'freshcodex:codex:codex-shared-native-turn'
+      const before = steer.store.getState().freshAgent.sessions[sessionKey]
+      expect(before.status).toBe('idle')
+      act(() => steer.store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+      expect(steer.store.getState().freshAgent.sessions[sessionKey].statusVersion).toBe((before.statusVersion ?? 0) + 1)
+      await act(async () => heldRead.resolve({
+        status: 'idle', threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision: 10_000, capabilities: { send: true, interrupt: true },
+        turns: rows('Ambiguous snapshot after repeated idle status'),
+      }))
+      await screen.findByText('Ambiguous snapshot after repeated idle status')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
+    })
+
+    it('keeps a steered echo visible beside an earlier row from the live projection', async () => {
+      const store = createStore()
+      const locator = { sessionId: 'codex-projection-boundary', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const projectionId = 'live-boundary-source'
+      const initial = FreshAgentSnapshotSchema.parse({
+        threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision: 1, status: 'idle', capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, turns: [],
+        extensions: { codex: { projection: { id: projectionId, historyGeneration: 0, eventRevision: 0,
+          eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: {}, turnOutputStates: {} } } },
+      })
+      const heldRead = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(initial).mockReturnValue(heldRead.promise)
+      store.dispatch(sessionInit(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'projection-boundary-create', status: 'idle',
+        resumeSessionId: locator.sessionId, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const earlierText = 'Earlier user message already visible live'
+      const patch = { type: 'freshAgent.event', ...locator, event: {
+        type: 'freshAgent.transcript.patch', sessionId: locator.sessionId, projectionId, historyGeneration: 0, afterRevision: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'shared-turn', revision: 1, turns: [{
+          id: 'shared-turn', turnId: 'shared-turn', nativeTurnId: 'shared-turn', role: 'user', summary: earlierText,
+          items: [{ id: 'earlier-user-text', kind: 'text', text: earlierText }],
+        }] }],
+      } }
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, patch)
+        listener(patch)
+      })
+      await screen.findByText(earlierText)
+      expect(store.getState().freshAgentLive.bySession['freshcodex:codex:codex-projection-boundary'].projection?.turns).toHaveLength(1)
+      const prompt = 'The new steered message'
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+        requestId: sent!.requestId, submittedTurnId: 'shared-turn' }))
+      const users = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(users).toHaveLength(2)
+      expect(within(users[0]).getByText(earlierText)).toBeVisible()
+      expect(within(users[1]).getByText(prompt)).toBeVisible()
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, submittedTurnId: 'shared-turn', previousTurnKeys: ['shared-turn'],
+      })
+    })
+
+    async function setupSteeringWithNewerLiveProjection(includeSecondMatch: boolean) {
+      const store = createStore()
+      const locator = { sessionId: 'codex-newer-live-steer', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const projectionId = 'newer-live-steer-source'
+      const prompt = 'Shared steered context'
+      const userRow = (id: string, text: string, nativeId?: string) => ({
+        id, turnId: id, role: 'user' as const, summary: text, ...(nativeId ? { nativeTurnId: nativeId } : {}),
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      const assistantRow = (id: string, text: string) => ({
+        id, turnId: id, role: 'assistant' as const, summary: text,
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      const projection = (eventRevision: number, turnRows: Record<string, string[]>) => ({
+        id: projectionId, historyGeneration: 0, eventRevision, eventOwnedTurnIds: [],
+        nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows, turnOutputStates: {},
+      })
+      const initial = FreshAgentSnapshotSchema.parse({
+        threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision: 1, status: 'idle', capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        turns: [userRow('shared-turn', 'Earlier request', 'shared-turn')],
+        extensions: { codex: { projection: projection(0, { 'shared-turn': ['shared-turn'] }) } },
+      })
+      const heldRead = createDeferred<unknown>()
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(initial).mockImplementation(async () => {
+        heldReadStarted = true
+        return heldRead.promise
+      })
+      store.dispatch(sessionInit(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'newer-live-steer-create', status: 'idle',
+        resumeSessionId: locator.sessionId, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      await screen.findByText('Earlier request')
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+      fireEvent.change(composer, { target: { value: 'Follow up after the active turn' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+        requestId: sent!.requestId, submittedTurnId: 'shared-turn' }))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      const sessionKey = 'freshcodex:codex:codex-newer-live-steer'
+      const statusVersion = store.getState().freshAgent.sessions[sessionKey].statusVersion
+      const liveRows = [
+        userRow('shared-turn:row-0', 'Earlier request'),
+        assistantRow('shared-turn:row-1', 'Earlier response'),
+        userRow('shared-turn:row-2', prompt),
+        assistantRow('shared-turn:row-3', 'Newer live turn activity'),
+        ...(includeSecondMatch ? [userRow('shared-turn:row-4', prompt)] : []),
+      ]
+      const patch = { type: 'freshAgent.event', ...locator, event: {
+        type: 'freshAgent.transcript.patch', sessionId: locator.sessionId, projectionId, historyGeneration: 0, afterRevision: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'shared-turn', revision: 2, turns: liveRows }],
+      } }
+      act(() => { handleFreshAgentMessage(store.dispatch, patch); listener(patch) })
+      await screen.findByText('Newer live turn activity')
+      expect(store.getState().freshAgent.sessions[sessionKey].statusVersion).toBe(statusVersion)
+      expect(store.getState().freshAgentLive.bySession[sessionKey].projection?.eventRevision).toBe(2)
+      const olderIdle = FreshAgentSnapshotSchema.parse({
+        ...initial, revision: 2, status: 'idle',
+        turns: [userRow('shared-turn:row-0', 'Earlier request'), assistantRow('shared-turn:row-1', 'Earlier response'),
+          userRow('shared-turn:row-2', prompt), assistantRow('snapshot-marker', 'Older idle snapshot applied')],
+        extensions: { codex: { projection: projection(1, {
+          'shared-turn': ['shared-turn:row-0', 'shared-turn:row-1', 'shared-turn:row-2'],
+          'snapshot-marker': ['snapshot-marker'],
+        }) } },
+      })
+      return { store, sent: sent!, prompt, async applyOlderIdle() {
+        await act(async () => heldRead.resolve(olderIdle))
+        await screen.findByText('Older idle snapshot applied')
+      } }
+    }
+
+    it('keeps an ambiguous echo when a newer live projection adds a second matching row', async () => {
+      const steer = await setupSteeringWithNewerLiveProjection(true)
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      const before = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(before).toHaveLength(4)
+      expect(within(before[1]).getByText(steer.prompt)).toBeVisible()
+      expect(within(before[2]).getByText(steer.prompt)).toBeVisible()
+      await steer.applyOlderIdle()
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: steer.prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('does not settle steering from an older idle snapshot after newer live activity', async () => {
+      const steer = await setupSteeringWithNewerLiveProjection(false)
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      await steer.applyOlderIdle()
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: steer.prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('settles the full matching steered prompt when another new prompt shares its first 80 characters', async () => {
+      const prefix = 'Shared request template '.repeat(5)
+      expect(prefix.length).toBeGreaterThan(80)
+      const prompt = `${prefix}Choose the first option`
+      const otherPrompt = `${prefix}Choose the second option`
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        steer.userRow('shared-turn:row-2', prompt),
+        steer.assistantRow('shared-turn:row-3', 'Intervening response'),
+        steer.userRow('shared-turn:row-4', otherPrompt),
+      ]
+      await steer.releaseAcceptedRead('running', rows('Distinct shared-prefix prompts are running'))
+      await screen.findByText('Distinct shared-prefix prompts are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      await steer.refresh('idle', rows('Distinct shared-prefix prompts completed'), 'Distinct shared-prefix prompts completed')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+    })
+
+    it('settles a steered prompt when its exact text item shares a user row with a different input', async () => {
+      const prompt = 'The first steered input'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        { ...steer.userRow('shared-turn:row-2', prompt), items: [
+          { id: 'first-steered-item', kind: 'text' as const, text: prompt },
+          { id: 'second-steered-item', kind: 'text' as const, text: 'A different steered input' },
+        ] },
+      ]
+      await steer.releaseAcceptedRead('running', rows('Grouped inputs are running'))
+      await screen.findByText('Grouped inputs are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      fireEvent.change(steer.composer, { target: { value: 'Follow up after grouped inputs' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      await steer.refresh('idle', rows('Grouped inputs completed'), 'Grouped inputs completed')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2), { timeout: 10_000 })
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow up after grouped inputs' })
+    })
+
+    it('keeps an ambiguous steered echo when one user row has two identical matching inputs', async () => {
+      const prompt = 'Identical steered input from two clients'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        { ...steer.userRow('shared-turn:row-2', prompt), items: [
+          { id: 'first-identical-input', kind: 'text' as const, text: prompt },
+          { id: 'second-identical-input', kind: 'text' as const, text: prompt },
+        ] },
+      ]
+      await steer.releaseAcceptedRead('running', rows('Identical grouped inputs are running'))
+      await screen.findByText('Identical grouped inputs are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      for (let read = 0; read <= IDLE_INCOMPLETE_MAX_RETRIES; read++) {
+        const marker = `Identical grouped inputs completed ${read}`
+        await steer.refresh('idle', rows(marker), marker)
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+          requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+        })
+      }
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+    })
+
+    it('releases a hidden queued follow-up when a current idle snapshot replaces the old projection', async () => {
+      const store = createStore()
+      const locator = { sessionId: 'codex-replaced-projection', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const snapshot = (projectionId: string, status: 'idle' | 'running', revision: number) => FreshAgentSnapshotSchema.parse({
+        threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision, status, capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        turns: [{ id: 'earlier-turn', turnId: 'earlier-turn', role: 'assistant', summary: 'Earlier response',
+          items: [{ id: 'earlier-text', kind: 'text', text: 'Earlier response' }] }],
+        extensions: { codex: { projection: { id: projectionId, historyGeneration: 0, eventRevision: 0,
+          eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: ['earlier-turn'],
+          turnRows: { 'earlier-turn': ['earlier-turn'] }, turnOutputStates: {} } } },
+      })
+      const heldRead = createDeferred<ReturnType<typeof snapshot>>()
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(snapshot('old-projection', 'running', 1))
+        .mockImplementation(async () => { heldReadStarted = true; return heldRead.promise })
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'replaced-projection-create', status: 'running',
+        resumeSessionId: locator.sessionId, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      } }))
+      const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await screen.findByText('Earlier response')
+      const sessionKey = 'freshcodex:codex:codex-replaced-projection'
+      expect(store.getState().freshAgentLive.bySession[sessionKey].projection?.id).toBe('old-projection')
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Queued across projection replacement' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      await act(async () => heldRead.resolve(snapshot('new-projection', 'idle', 2)))
+      await waitFor(() => expect(store.getState().freshAgentLive.bySession[sessionKey].projection?.id).toBe('new-projection'))
+      expect(store.getState().freshAgent.sessions[sessionKey].status).toBe('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'Queued across projection replacement' })
+    })
+
+    it.each([
+      { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
+      { label: 'ordinary acceptance arrives in the same batch as a landed snapshot', ambiguous: false },
+    ])('does not resurrect a landed echo when $label', async ({ ambiguous }) => {
+      const store = createStore()
+      const sessionId = 'ses_landed_batched_receipts'
+      const prompt = 'The prompt already saved before both receipts'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'landed-batched-receipts', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'opencode' as const, sessionId }, status: 'idle' as const,
+      }
+      const snapshot = (landed: boolean) => ({
+        status: landed ? 'running' : 'idle', threadId: sessionId,
+        sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
+        turns: landed ? [{ id: 'landed-batched-turn', turnId: 'landed-batched-turn', role: 'user',
+          items: [{ id: 'landed-batched-text', kind: 'text', text: prompt }] }] : [],
+        extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+      })
+      const landedRead = createDeferred<ReturnType<typeof snapshot>>()
+      let holdRead = false
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        if (holdRead) {
+          heldReadStarted = true
+          return landedRead.promise
+        }
+        return snapshot(false)
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho?.requestId).toBe(sent!.requestId)
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+
+      holdRead = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      await act(async () => {
+        landedRead.resolve(snapshot(true))
+        for (let step = 0; step < 30 && getFreshAgentPaneContent(store).pendingLocalEcho; step++) {
+          await Promise.resolve()
+        }
+        expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+        if (ambiguous) listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+          message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' })
+        listener({ type: 'freshAgent.send.accepted', sessionId,
+          sessionType: content.sessionType, provider: content.provider,
+          requestId: sent!.requestId, submittedTurnId: 'landed-batched-turn' })
+      })
+
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      const rows = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(rows).toHaveLength(1)
+      expect(within(rows[0]).getByText(prompt)).toBeVisible()
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      expect(composer).toHaveValue(ambiguous ? prompt : '')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('clears a send refusal when the pane switches to another conversation', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'send-scope-refused-a', sessionId: 'send-scope-refused-thread-a', status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => snapshot(sessionId))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: 'The first conversation prompt' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'The first send was refused.' }))
+      await waitFor(() => expect(screen.getByText('Message not sent: The first send was refused.')).toBeVisible())
+
+      const second = { ...first, createRequestId: 'send-scope-refused-b', sessionId: 'send-scope-refused-thread-b' }
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', second.sessionId, expect.anything(),
+      ))
+      expect(screen.queryByText('Message not sent: The first send was refused.')).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('restores an uncertain send after rebinding the same conversation', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'send-scope-rebind-a', sessionId: 'send-scope-same-thread', status: 'idle' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle', threadId: first.sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const sourcePrompt = 'Keep the same-conversation prompt'
+      fireEvent.change(composer, { target: { value: sourcePrompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: { ...first, createRequestId: 'send-scope-rebind-b' },
+      })))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({
+        type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+      }))
+
+      await waitFor(() => expect(composer).toHaveValue(sourcePrompt))
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it.each(['same batch', 'after render'] as const)(
+      'restores an uncertain send after the same conversation materializes (%s)', async (timing) => {
+      const store = createStore()
+      const placeholder = 'freshopencode-send-scope-placeholder'
+      const durable = 'ses_send_scope_materialized'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'send-scope-materialize', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => snapshot(sessionId))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const sourcePrompt = 'Keep the materialized conversation prompt'
+      fireEvent.change(composer, { target: { value: sourcePrompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+
+      let listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const failure = {
+        type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost',
+      }
+      act(() => {
+        const message = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+        if (timing === 'same batch') listener(failure)
+      })
+      await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(durable))
+      if (timing === 'after render') {
+        listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        act(() => listener(failure))
+      }
+
+      await waitFor(() => expect(composer).toHaveValue(sourcePrompt))
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'notice-create-a', sessionId: 'notice-thread-a', status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(first.sessionId))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', first.sessionId, expect.anything(),
+      ))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId: first.sessionId, sessionType: first.sessionType, provider: first.provider,
+          event: { type: 'freshAgent.notice', sessionId: first.sessionId, level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      const notice = () => document.querySelector('[data-agent-error="notice"] summary')
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      // A new attachment attempt for the same conversation keeps its error.
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: { ...first, createRequestId: 'notice-rebind-a' },
+      })))
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      // A different conversation in the same mounted pane must not inherit it.
+      const second = { ...first, createRequestId: 'notice-create-b', sessionId: 'notice-thread-b' }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(second.sessionId))
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', second.sessionId, expect.anything(),
+      ))
+      await waitFor(() => expect(notice()).toBeNull())
+    })
+
+    it('keeps a provider error when an OpenCode placeholder materializes to a durable session', async () => {
+      const store = createStore()
+      const placeholder = 'freshopencode-notice-materialize-create'
+      const durable = 'ses_notice_materialized'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'notice-materialize-create', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(placeholder))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshopencode', 'opencode', placeholder, expect.anything(),
+      ))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'The provider reported a capacity error.'
+      act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId: placeholder, sessionType: first.sessionType, provider: first.provider,
+          event: { type: 'freshAgent.notice', sessionId: placeholder, level: 'error', code: 'PROVIDER_ERROR', message: diagnostic },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      const notice = () => document.querySelector('[data-agent-error="notice"] summary')
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(durable))
+      act(() => {
+        const message = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(durable))
+      expect(getFreshAgentPaneContent(store).createRequestId).toBe(first.createRequestId)
+      expect(notice()).toHaveTextContent(diagnostic)
+    })
+
+    it.each([
+      [false, 'notice-gap-thread-a', 'clears the old notice when no saved conversation remains'],
+      [true, 'notice-gap-thread-a', 'retains the notice when the saved conversation is reconnecting'],
+      [true, 'notice-gap-durable-a', 'retains the notice when the saved conversation uses a different ID'],
+    ] as const)('%s: %s: %s while the active session ID is absent', async (keepSavedIdentity, savedSessionId) => {
+      const store = createStore()
+      const sessionId = 'notice-gap-thread-a'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'notice-gap-create-a', sessionId, resumeSessionId: savedSessionId,
+        sessionRef: { provider: 'codex' as const, sessionId: savedSessionId }, status: 'idle' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', sessionId, expect.anything(),
+      ))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId, sessionType: first.sessionType, provider: first.provider,
+          event: { type: 'freshAgent.notice', sessionId, level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      const notice = () => document.querySelector('[data-agent-error="notice"] summary')
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...first, sessionId: undefined, createRequestId: 'notice-gap-next-attempt',
+          status: keepSavedIdentity ? 'creating' : 'idle',
+          resumeSessionId: keepSavedIdentity ? first.resumeSessionId : undefined,
+          sessionRef: keepSavedIdentity ? first.sessionRef : undefined,
+        },
+      })))
+      if (keepSavedIdentity) {
+        await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+        const newLiveId = 'notice-gap-rebound-live-handle'
+        apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+          status: 'idle', threadId: newLiveId, capabilities: { send: true, interrupt: true }, turns: [],
+        })
+        act(() => store.dispatch(updatePaneContent({
+          tabId: 'tab-1', paneId: 'pane-1', content: {
+            ...first, sessionId: newLiveId, createRequestId: 'notice-gap-rebound', status: 'idle',
+          },
+        })))
+        await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+      } else {
+        await waitFor(() => expect(notice()).toBeNull())
+      }
+    })
+
+    it('does not revive a duplicate Codex notice after a same-session rebind', async () => {
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'duplicate-create', sessionId: 'duplicate-thread', status: 'idle' as const,
+      }
+      const snapshot = {
+        status: 'idle' as const, threadId: content.sessionId,
+        capabilities: { send: true, interrupt: true }, turns: [],
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', content.sessionId, expect.anything(),
+      ))
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId: content.sessionId, sessionType: content.sessionType, provider: content.provider,
+          event: { sessionId: content.sessionId, ...event },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        listener(message)
+      })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
+
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: { ...content, createRequestId: 'duplicate-rebind' },
+      })))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot,
+        extensions: { codex: { unattributedProviderError: diagnostic } } })
+      const previousCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+    })
 
     it('keeps queued work when the provider exits', async () => {
       const queue = await setup()
@@ -2020,6 +3543,343 @@ describe('FreshAgentView', () => {
       queue.status('exited')
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps a Codex follow-up queued while a notification drain is pending', async () => {
+      const queue = await setup('running')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      queue.send('Follow up after the current turn')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      const warning = 'Codex exited while its response is still being processed. Try again shortly.'
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_NOTIFICATION_DRAIN_PENDING', message: warning })
+      await act(async () => {})
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(warning)
+      expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      deliver({ type: 'freshAgent.turn.complete', at: 100, outcome: 'completed' })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      deliver({ type: 'freshAgent.session.snapshot', latestTurnId: null, timelineSessionId: locator.sessionId, status: 'idle' })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ ...locator, text: 'Follow up after the current turn' })
+    })
+
+    it('shows a new operation error while a legacy follower ignores it and queued work waits', async () => {
+      const queue = await setup('running')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const legacyStore = createStore()
+      handleFreshAgentMessage(legacyStore.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.status', status: 'running' } })
+      // The released receiver handles freshAgent.error, but ignores unknown
+      // nested event types and does not pass their additive fields to Redux.
+      const receiveLegacy = (event: Record<string, unknown>) => {
+        if (event.type === 'freshAgent.error') {
+          legacyStore.dispatch(sessionError({ ...locator, code: event.code as string, message: event.message as string }))
+        }
+      }
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+        receiveLegacy(message.event)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      queue.send('Follow up after the Stop request')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      deliver({ type: 'freshAgent.operation.error', requestId: 'stop-1', operationReceipt: true,
+        code: 'SESSION_NOT_FOUND', message: 'The Stop request could not find the session.' })
+
+      expect(document.querySelector('[data-agent-error="session"] summary')).toHaveTextContent('The Stop request could not find the session.')
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(legacyStore.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('button', { name: /stop/i })).toBeEnabled()
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      // Verify that the legacy receiver would treat the old error shape as
+      // terminal; the distinct subtype is what protects the follower.
+      act(() => receiveLegacy({ type: 'freshAgent.error', code: 'STOP_FAILED', message: 'Stop failed.' }))
+      expect(legacyStore.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('idle')
+      deliver({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle' })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ ...locator, text: 'Follow up after the Stop request' })
+    })
+
+    it('keeps an active-turn provider diagnostic visible while its snapshot is delayed', async () => {
+      const queue = await setup('running')
+      queue.send('Follow up after this turn')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      const held = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(() => held.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      deliver({ type: 'freshAgent.retry', attempt: 1, error: 'Retrying temporary error' })
+      expect(document.querySelector('[data-agent-error="codex-pending"]')).toBeNull()
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      vi.useFakeTimers()
+      try {
+        deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', turnId: 'active-turn', message: diagnostic })
+        await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
+        expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
+        expect(screen.queryByText(/delivery (?:is )?uncertain/i)).toBeNull()
+        expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+        expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      } finally {
+        held.resolve({ sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+          capabilities: { send: false, interrupt: true }, turns: [],
+          extensions: { codex: { pendingProviderError: { turnId: 'active-turn', message: diagnostic } } } })
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+        vi.useRealTimers()
+      }
+    })
+
+    it.each(['completed', 'failed'] as const)('replaces a pending provider diagnostic when the known turn %s', async (outcome) => {
+      const queue = await setup('running')
+      queue.send('Follow up after this turn')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...running,
+        extensions: { codex: { pendingProviderError: { turnId: 'active-turn', message: diagnostic } } } })
+      const previousCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', turnId: 'active-turn', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
+      await act(async () => {})
+      expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
+
+      const finalDiagnostic = 'The provider supplied a more specific failure.'
+      const answer = { id: 'active-turn', turnId: 'active-turn', role: 'assistant', summary: '',
+        items: [{ id: 'answer', kind: 'text', text: 'The active turn ended.' }],
+        ...(outcome === 'failed' ? { error: { name: 'CodexError', message: finalDiagnostic } } : {}) }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...running, turns: [answer] })
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', turnId: 'active-turn', outcome: outcome === 'failed' ? 'failed' : 'other', message: 'The provider warning was cleared.' })
+      expect(await screen.findByText('The active turn ended.')).toBeInTheDocument()
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-pending"]')).toBeNull())
+      if (outcome === 'failed') expect(screen.getByTestId('fresh-agent-turn-error')).toHaveTextContent(finalDiagnostic)
+      else expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    })
+
+    it('refreshes a cleared active-turn diagnostic after an older snapshot finishes', async () => {
+      const queue = await setup('running')
+      queue.send('Follow up after this turn')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      apiMock.getFreshAgentThreadSnapshot.mockReset()
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      const older = createDeferred<typeof running & { extensions: { codex: { pendingProviderError: { turnId: string; message: string } } } }>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => older.promise).mockResolvedValue(running)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', turnId: 'active-turn', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', turnId: 'older-turn', outcome: 'other', message: 'The provider warning was cleared.' })
+      expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', turnId: 'active-turn', outcome: 'other', message: 'The provider warning was cleared.' })
+      expect(document.querySelector('[data-agent-error="codex-pending"]')).toBeNull()
+      await act(async () => older.resolve({ ...running, extensions: { codex: { pendingProviderError: { turnId: 'active-turn', message: diagnostic } } } }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-pending"]')).toBeNull())
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    })
+
+    it('keeps a pending failure visible while the failed turn is still unavailable', async () => {
+      const queue = await setup('running')
+      queue.send('Follow up after this turn')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      apiMock.getFreshAgentThreadSnapshot.mockReset()
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      const older = createDeferred<typeof running & { extensions: { codex: { pendingProviderError: { turnId: string; message: string } } } }>()
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const failed = { ...running, turns: [{ id: 'active-turn', turnId: 'active-turn', role: 'assistant', summary: '',
+        items: [], error: { name: 'CodexError', message: diagnostic } }] }
+      const genericFailure = { ...failed, turns: [{ ...failed.turns[0],
+        error: { name: 'CodexError', message: 'Codex failed without an error message.' } }] }
+      const failedRead = createDeferred<typeof failed>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => older.promise).mockResolvedValueOnce(running)
+        .mockResolvedValueOnce(genericFailure).mockImplementationOnce(() => failedRead.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', turnId: 'active-turn', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', turnId: 'active-turn', outcome: 'failed', message: 'The provider warning was cleared.' })
+      expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
+      expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+      await act(async () => older.resolve({ ...running, extensions: { codex: { pendingProviderError: { turnId: 'active-turn', message: diagnostic } } } }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      await act(async () => {})
+      expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
+      deliver({ type: 'freshAgent.session.snapshot', status: 'running' })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3))
+      await waitFor(() => expect(screen.getByTestId('fresh-agent-turn-error')).toHaveTextContent('Codex failed without an error message.'))
+      expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
+      deliver({ type: 'freshAgent.session.snapshot', status: 'running' })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(4))
+      await act(async () => failedRead.resolve(failed))
+      await waitFor(() => expect(screen.getByTestId('fresh-agent-turn-error')).toHaveTextContent(diagnostic))
+      expect(document.querySelector('[data-agent-error="codex-pending"]')).toBeNull()
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    })
+
+    it('shows a known-turn provider diagnostic after a late attach and remount', async () => {
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionType: 'freshcodex', provider: 'codex', threadId: 'late-pending-diagnostic', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [],
+        extensions: { codex: { pendingProviderError: { turnId: 'active-turn', message: diagnostic } } },
+      })
+      const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const,
+        provider: 'codex' as const, createRequestId: 'late-pending-create',
+        sessionId: 'late-pending-diagnostic', status: 'running' as const }
+      const mount = () => render(<Provider store={createStore()}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+      </Provider>)
+      const first = mount()
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic))
+      expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+      first.unmount()
+      mount()
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic))
+      expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    })
+
+    it('updates the pending diagnostic in every pane attached to the session', async () => {
+      const store = createStore()
+      const handlers = new Set<(message: unknown) => void>()
+      wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => handlers.delete(handler) })
+      const snapshot = { sessionType: 'freshcodex', provider: 'codex', threadId: 'shared-pending', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+      const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        sessionId: 'shared-pending', status: 'running' as const }
+      render(<Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{ ...content, createRequestId: 'shared-one' }} />
+        <FreshAgentView tabId="tab-1" paneId="pane-2" paneContent={{ ...content, createRequestId: 'shared-two' }} />
+      </Provider>)
+      await waitFor(() => expect(handlers.size).toBe(2))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      const held = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', sessionId: content.sessionId, sessionType: content.sessionType,
+          provider: content.provider, event: { sessionId: content.sessionId, ...event } }
+        handleFreshAgentMessage(store.dispatch, message)
+        for (const handler of handlers) handler(message)
+      })
+      try {
+        deliver({ type: 'freshAgent.status', status: 'running' })
+        deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR',
+          turnId: 'shared-turn', message: 'Provider diagnostic visible in both panes.' })
+        expect(document.querySelectorAll('[data-agent-error="codex-pending"]')).toHaveLength(2)
+        deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED',
+          turnId: 'shared-turn', outcome: 'other', message: 'The provider warning was cleared.' })
+        expect(document.querySelectorAll('[data-agent-error="codex-pending"]')).toHaveLength(0)
+        expect(store.getState().freshAgent.sessions['freshcodex:codex:shared-pending'].status).toBe('running')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      } finally {
+        held.resolve(snapshot)
+        await act(async () => {})
+      }
+    })
+
+    it.each([
+      ['active-turn', 'codex-pending', 'CODEX_PENDING_PROVIDER_ERROR'],
+      ['unattributed', 'codex-unattributed', 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'],
+    ])('shows retained %s diagnostics while protecting a newer live notice', async (_kind, errorId, noticeCode) => {
+      const queue = await setup('running')
+      queue.send('Follow up after this turn')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      const held = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      const oldMessage = 'The first provider error.'
+      const retained = { ...FreshAgentSnapshotSchema.parse(savedCodexNativeHistory), threadId: locator.sessionId,
+        sessionId: locator.sessionId, status: 'running', turns: [],
+        extensions: { codex: { ...(noticeCode === 'CODEX_PENDING_PROVIDER_ERROR'
+          ? { pendingProviderError: { turnId: 'active-turn', message: oldMessage } }
+          : { unattributedProviderError: oldMessage }), projection: {
+          id: 'pending-source', historyGeneration: 0, eventRevision: 10, eventOwnedTurnIds: [], nativePreviewTurnIds: [],
+          nativeFinalTurnIds: [], turnRows: {}, turnOutputStates: {}, settledTurnIds: [],
+        } } } }
+      const reset = { type: 'freshAgent.host.backpressure', retainedState: { source: { projectionId: 'pending-source',
+        ownerEpoch: 0, ownerGeneration: 0, soulId: 'soul', incarnationId: 'incarnation', hostBootId: 'host' },
+      snapshot: retained, pendingControls: [], attentionMarks: [] } }
+      try {
+        deliver(reset)
+        await waitFor(() => expect(document.querySelector(`[data-agent-error="${errorId}"] summary`)).toHaveTextContent(oldMessage))
+        const newerMessage = 'A newer provider error.'
+        deliver({ type: 'freshAgent.notice', level: 'warning', code: noticeCode, turnId: 'active-turn', message: newerMessage })
+        deliver(reset)
+        expect(document.querySelector(`[data-agent-error="${errorId}"] summary`)).toHaveTextContent(newerMessage)
+        expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      } finally {
+        held.resolve(retained)
+        await act(async () => {})
+      }
     })
 
     it('sends queued messages one turn at a time', async () => {
@@ -2068,6 +3928,359 @@ describe('FreshAgentView', () => {
       queue.status('idle')
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Later queued input' })
+    })
+
+    it('retains an unattributed provider error without settling an ambiguous send', async () => {
+      const queue = await setup('idle')
+      queue.send('Original uncertain input')
+      queue.send('Later queued input')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'idle',
+        capabilities: { send: true, interrupt: true }, turns: [],
+        extensions: { codex: { unattributedProviderError: diagnostic } },
+      })
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.notice',
+          sessionId: locator.sessionId, level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain'))
+    })
+
+    it('keeps the provider diagnostic and delivery warning while its snapshot is delayed', async () => {
+      const queue = await setup('idle')
+      queue.send('Original uncertain input')
+      queue.send('Later queued input')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+
+      const held = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(() => held.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      vi.useFakeTimers()
+      try {
+        act(() => {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.notice', sessionId: locator.sessionId,
+            level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        })
+        await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
+        expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic)
+        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain')
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      } finally {
+        held.resolve({ sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'idle',
+          capabilities: { send: true, interrupt: true }, turns: [],
+          extensions: { codex: { unattributedProviderError: diagnostic } } })
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+        vi.useRealTimers()
+      }
+    })
+
+    it.each([
+      [false, 'CODEX_PROVIDER_ERROR'],
+      [true, 'CODEX_PROVIDER_ERROR'],
+      [false, 'OTHER_PROVIDER_ERROR'],
+    ])('does not revive a suppressed Codex notice when its retained warning clears (newer notice: %s; original source: %s)', async (withNewerNotice, originalCode) => {
+      const queue = await setup('running')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const newerDiagnostic = 'A newer provider error needs attention.'
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: locator.sessionId, status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+
+      deliver({ type: 'freshAgent.notice', level: 'error', code: originalCode, message: diagnostic })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...running,
+        extensions: { codex: { unattributedProviderError: diagnostic } } })
+      const previousCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+
+      if (withNewerNotice) {
+        deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: newerDiagnostic })
+        await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(newerDiagnostic))
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(running)
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' })
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+      if (withNewerNotice) {
+        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(newerDiagnostic)
+      } else if (originalCode !== 'CODEX_PROVIDER_ERROR') {
+        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic)
+      } else {
+        expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+      }
+    })
+
+    it.each([
+      ['clears', undefined],
+      ['restores an earlier warning for', 'An earlier provider error.'],
+    ])('%s an unattributed warning after another pane accepts a send without settling local queued input', async (_description, restoredDiagnostic) => {
+      const queue = await setup('idle')
+      queue.send('Original uncertain input')
+      queue.send('Later queued input')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...running,
+        extensions: { codex: { unattributedProviderError: diagnostic } } })
+      const previousCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
+      await act(async () => {})
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain'))
+
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: 'a-different-pane-request', submittedTurnId: 'other-pane-turn' }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(restoredDiagnostic
+        ? { ...running, extensions: { codex: { unattributedProviderError: restoredDiagnostic } } }
+        : running)
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' })
+      if (restoredDiagnostic) {
+        await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(restoredDiagnostic))
+      } else {
+        await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+      }
+      expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain')
+      expect(screen.queryByText('The provider warning was cleared.')).toBeNull()
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('refreshes after a warning is cleared while its older snapshot is still in flight', async () => {
+      const queue = await setup('running')
+      queue.send('Follow up after the running turn')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      apiMock.getFreshAgentThreadSnapshot.mockReset()
+      const running = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [] }
+      const older = createDeferred<typeof running & { extensions: { codex: { unattributedProviderError: string } } }>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => older.promise).mockResolvedValue(running)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      deliver({ type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' })
+      await act(async () => {})
+      await act(async () => older.resolve({ ...running, extensions: { codex: { unattributedProviderError: diagnostic } } }))
+
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+      expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
+      expect(screen.queryByText('The provider warning was cleared.')).toBeNull()
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    })
+
+    it.each([
+      ['unattributed', 'codex-unattributed', 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', 'unattributedProviderError', 'unattributedProviderErrorAuthoritative'],
+      ['active-turn', 'codex-pending', 'CODEX_PENDING_PROVIDER_ERROR', 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', 'pendingProviderError', 'pendingProviderErrorAuthoritative'],
+    ])('preserves or updates only the %s warning according to history-only diagnostic authority', async (kind, errorId, noticeCode, clearCode, errorField, authorityField) => {
+      const queue = await setup('running')
+      queue.send('Keep this follow-up queued')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.status', status: 'running' })
+      const turn = (text: string) => ({ id: 'answer', turnId: 'answer', role: 'assistant', summary: text,
+        items: [{ id: 'answer-text', kind: 'text', text }] })
+      const live = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'running',
+        capabilities: { send: false, interrupt: true }, turns: [turn('Live snapshot confirmed')] }
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const diagnosticValue = (message: string) => kind === 'active-turn' ? { turnId: 'active-turn', message } : message
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live,
+        extensions: { codex: { statusFromLiveState: true, [errorField]: diagnosticValue(diagnostic) } } })
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: noticeCode, turnId: 'active-turn', message: diagnostic })
+      expect(await screen.findByText('Live snapshot confirmed')).toBeInTheDocument()
+      expect(document.querySelector(`[data-agent-error="${errorId}"] summary`)).toHaveTextContent(diagnostic)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, status: 'idle', turns: [turn('Saved history fallback loaded')],
+        extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true } } })
+      deliver({ type: 'freshAgent.session.snapshot', status: 'running' })
+      expect(await screen.findByText('Saved history fallback loaded')).toBeInTheDocument()
+      expect(document.querySelector(`[data-agent-error="${errorId}"] summary`)).toHaveTextContent(diagnostic)
+
+      const replacement = 'A different retained provider warning.'
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, status: 'idle', turns: [turn('Authoritative replacement loaded')],
+        extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true,
+          [authorityField]: true, [errorField]: diagnosticValue(replacement) } } })
+      deliver({ type: 'freshAgent.session.snapshot', status: 'running' })
+      expect(await screen.findByText('Authoritative replacement loaded')).toBeInTheDocument()
+      expect(document.querySelector(`[data-agent-error="${errorId}"] summary`)).toHaveTextContent(replacement)
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, status: 'idle', turns: [turn('Authoritative clear loaded')],
+        extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true, [authorityField]: true } } })
+      deliver({ type: 'freshAgent.notice', level: 'info', code: clearCode, turnId: 'active-turn', message: 'The provider warning was cleared.' })
+      expect(await screen.findByText('Authoritative clear loaded')).toBeInTheDocument()
+      expect(document.querySelector(`[data-agent-error="${errorId}"]`)).toBeNull()
+      expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, status: 'idle', turns: [turn('Older history loaded after clear')],
+        extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true, [errorField]: diagnosticValue(diagnostic) } } })
+      deliver({ type: 'freshAgent.session.snapshot', status: 'running' })
+      expect(await screen.findByText('Older history loaded after clear')).toBeInTheDocument()
+      expect(document.querySelector(`[data-agent-error="${errorId}"]`)).toBeNull()
+    })
+
+    it('preserves an expanded live warning across an older snapshot, then clears it after a later send is accepted', async () => {
+      const queue = await setup('idle')
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await act(async () => {})
+      apiMock.getFreshAgentThreadSnapshot.mockReset()
+      const snapshot = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'idle',
+        capabilities: { send: true, interrupt: true }, turns: [] }
+      const oldSnapshot = createDeferred<typeof snapshot>()
+      const diagnosticSnapshot = createDeferred<typeof snapshot & { extensions: { codex: { unattributedProviderError: string } } }>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => oldSnapshot.promise)
+        .mockImplementationOnce(() => diagnosticSnapshot.promise).mockResolvedValue(snapshot)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      deliver({ type: 'freshAgent.session.snapshot', status: 'idle' })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic })
+      const warning = document.querySelector('[data-agent-error="codex-unattributed"]') as HTMLDetailsElement
+      expect(warning.querySelector('summary')).toHaveTextContent(diagnostic)
+      fireEvent.click(warning.querySelector('summary')!)
+      expect(warning).toHaveAttribute('open')
+
+      await act(async () => oldSnapshot.resolve(snapshot))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic)
+
+      queue.send('Accepted new input')
+      const request = sentFreshAgentMessages('freshAgent.send')[0]
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: request.requestId, submittedTurnId: 'new-turn' }))
+      await act(async () => diagnosticSnapshot.resolve({ ...snapshot, extensions: { codex: { unattributedProviderError: diagnostic } } }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
+    })
+
+    it.each([
+      ['live', {}],
+      ['history-only with diagnostic authority', { ownerKind: 'vacant', nativeHistoryAvailable: true, unattributedProviderErrorAuthoritative: true }],
+    ])('shows a retained unattributed Codex error after a late attach and remount from %s', async (_source, sourceFields) => {
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionType: 'freshcodex', provider: 'codex', threadId: 'late-diagnostic', status: 'idle',
+        capabilities: { send: true, interrupt: true },
+        turns: [{ id: 'old', turnId: 'old', role: 'assistant', summary: 'Earlier answer',
+          items: [{ id: 'old-text', kind: 'text', text: 'Earlier answer' }] }],
+        extensions: { codex: { ...sourceFields, unattributedProviderError: diagnostic } },
+      })
+      const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const,
+        provider: 'codex' as const, createRequestId: 'late-diagnostic-create',
+        sessionId: 'late-diagnostic', status: 'idle' as const }
+      const mount = () => render(<Provider store={createStore()}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+      </Provider>)
+
+      const first = mount()
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(screen.getByText('Earlier answer')).toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+      first.unmount()
+
+      mount()
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+      expect(screen.getByText('Earlier answer')).toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    })
+
+    it('clears the retained unattributed error when a later accepted send refreshes the snapshot', async () => {
+      const queue = await setup('idle')
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const snapshot = { sessionType: 'freshcodex', provider: 'codex', threadId: 'queue-session', status: 'idle',
+        capabilities: { send: true, interrupt: true }, turns: [] }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...snapshot,
+        extensions: { codex: { unattributedProviderError: diagnostic } } })
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.notice',
+        sessionId: locator.sessionId, level: 'warning', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR', message: diagnostic } }))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
+
+      queue.send('Try again')
+      const request = sentFreshAgentMessages('freshAgent.send')[0]
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: request.requestId, submittedTurnId: 'new-turn' }))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
     })
 
     it('advances after a fast interrupted turn whose status updates share one render', async () => {
@@ -2235,6 +4448,118 @@ describe('FreshAgentView', () => {
       queue.status('idle')
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: expect.stringContaining('/workspace') }))
     })
+  })
+
+  it('shows an unmatched answer warning even after a hidden attach reservation', async () => {
+    const store = createStore()
+    const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      ...locator, status: 'running', capabilities: { send: true, interrupt: true, questions: true },
+      pendingQuestions: [{ requestId: 'question-1', questions: [{ header: 'Next', question: 'Continue?',
+        options: [{ label: 'Yes', description: 'Proceed' }], multiSelect: false }] }], turns: [],
+    })
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'req-answer-reservation', status: 'connected',
+    }} /></Provider>)
+    await screen.findByRole('button', { name: 'Yes' })
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.status', status: 'running' } })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.operation.started',
+        requestId: 'question-1', operationAttemptId: 'attempt-1' } })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.error',
+        code: 'SESSION_RESERVED', message: 'Attach is reserved.' } })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { type: 'freshAgent.error',
+        requestId: 'question-1', operationAttemptId: 'attempt-2', operationReceipt: true,
+        operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+        message: 'The answer could not be confirmed.' } })
+    })
+    expect(screen.getByText(/Another answer attempt: The answer could not be confirmed\..*Agent error/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument()
+    expect(store.getState().freshAgent.sessions[`freshclaude:claude:${CLAUDE_THREAD_ID}`].status).toBe('running')
+  })
+
+  it('starts a new answer without associating an older refusal with its uncertain outcome', async () => {
+    const store = createStore()
+    const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      ...locator,
+      status: 'running',
+      capabilities: { send: true, interrupt: true, questions: true },
+      pendingQuestions: [{ requestId: 'question-1', questions: [{
+        header: 'Next', question: 'Continue?', options: [{ label: 'Yes', description: 'Proceed' }], multiSelect: false,
+      }] }],
+      turns: [],
+    })
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'req-answer-retry', status: 'connected',
+    }} /></Provider>)
+    await screen.findByRole('button', { name: 'Yes' })
+
+    const earlier = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The earlier answer was rejected.' }
+    act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: earlier }))
+    expect(screen.getByText(/The earlier answer was rejected\..*Agent error/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(sentFreshAgentMessages('freshAgent.question.respond').at(-1)).toMatchObject({ requestId: 'question-1' })
+
+    const fallback = { type: 'freshAgent.error', requestId: 'question-1', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+      message: 'Sending the answer could not be confirmed.' }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: fallback })
+      handleFreshAgentMessage(store.dispatch, { ...outer, event: { ...earlier, operationReceiptReplay: true } })
+    })
+    const key = `freshclaude:claude:${CLAUDE_THREAD_ID}`
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(fallback.message)
+    expect(screen.getByText(/Sending the answer could not be confirmed\..*Agent error/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument()
+
+    // Another attempt must keep the unresolved delivery warning, while
+    // removing the earlier attempt's provider-specific cause.
+    const later = { ...earlier, message: 'The later answer was rejected.' }
+    act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: later }))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(`${later.message} ${fallback.message}`)
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(fallback.message)
+
+    // Answering this question must not dismiss an unrelated operation error.
+    const unrelated = { ...earlier, requestId: 'question-2', message: 'Another request failed.' }
+    act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: unrelated }))
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe(unrelated.message)
+  })
+
+  it('clears the matching prior refusal when retrying an approval or elicitation', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'thread-retry-controls', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const outer = { type: 'freshAgent.event' as const, ...locator }
+    const key = 'freshcodex:codex:thread-retry-controls'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      ...locator,
+      status: 'running',
+      capabilities: { send: true, interrupt: true, approvals: true },
+      pendingApprovals: [{ requestId: 'approval-1', toolName: 'Bash', input: { command: 'echo ok' } }],
+      pendingElicitations: [{ requestId: 'elicitation-1', mode: 'form', serverName: 'MCP tool', message: 'Continue?', fields: [] }],
+      turns: [],
+    })
+    render(<Provider store={store}><FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{
+      kind: 'fresh-agent', ...locator, createRequestId: 'req-control-retry', status: 'connected',
+    }} /></Provider>)
+    await screen.findByRole('button', { name: /allow tool use/i })
+    const fail = (requestId: string) => act(() => handleFreshAgentMessage(store.dispatch, { ...outer, event: {
+      type: 'freshAgent.error', requestId, operationReceipt: true, code: 'CONTROL_FAILED', message: `Prior failure: ${requestId}`,
+    } }))
+    fail('approval-1')
+    fireEvent.click(screen.getByRole('button', { name: /allow tool use/i }))
+    expect(sentFreshAgentMessages('freshAgent.approval.respond').at(-1)).toMatchObject({ requestId: 'approval-1' })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+
+    fail('elicitation-1')
+    fireEvent.click(screen.getByRole('button', { name: 'Decline' }))
+    expect(sentFreshAgentMessages('freshAgent.elicitation.respond').at(-1)).toMatchObject({ requestId: 'elicitation-1' })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
   })
 
   it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
@@ -2890,14 +5215,59 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
 
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.interrupt',
+      requestId: expect.any(String),
       sessionId: 'ses_stop_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/route-aware',
     })
+    const stops = sentFreshAgentMessages('freshAgent.interrupt')
+    expect(stops).toHaveLength(2)
+    expect(stops[0].requestId).not.toBe(stops[1].requestId)
+  })
+
+  it.each([true, false])('keeps the Stop provider receipt and fallback in either order (fallback first: %s)', async (fallbackFirst) => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionId: 'ses_stop_receipt', sessionType: 'freshopencode' as const, provider: 'opencode' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...locator, threadId: locator.sessionId, status: 'running',
+      capabilities: { send: false, interrupt: true }, turns: [] })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'stop-receipt-pane', status: 'running',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+    const requestId = sentFreshAgentMessages('freshAgent.interrupt').at(-1)?.requestId
+    expect(requestId).toEqual(expect.any(String))
+    const provider = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.operation.error', sessionId: locator.sessionId,
+      requestId, operationReceipt: true, code: 'OPENCODE_INTERRUPT_FAILED', message: 'Provider could not stop this turn.' } }
+    const fallback = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.error', sessionId: locator.sessionId,
+      requestId, operationReceipt: true, operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+      message: 'Stopping the agent could not be confirmed. Check the conversation before trying again.' } }
+    for (const message of fallbackFirst ? [fallback, provider] : [provider, fallback]) {
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, message)
+        for (const handler of [...handlers]) handler(message)
+      })
+    }
+    const summary = document.querySelector('[data-agent-error="session"] summary')
+    expect(summary).toHaveTextContent('Provider could not stop this turn.')
+    expect(summary).toHaveTextContent('Stopping the agent could not be confirmed.')
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_stop_receipt'].status).toBe('running')
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+
+    // Older servers can still send the uncorrelated session-error shape.
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.error', sessionId: locator.sessionId, code: 'LEGACY_ERROR', message: 'Older server error',
+    } }))
+    expect(document.querySelector('[data-agent-error="session"] summary')).toHaveTextContent('Older server error')
   })
 
   it('marks the fresh-agent body with pane and session flavor context metadata', async () => {
@@ -3950,7 +6320,7 @@ describe('FreshAgentView', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       const baseline = sentFreshAgentMessages('freshAgent.attach').length
-      expect(screen.getByText(/still running on the server/i)).toBeInTheDocument()
+      expect(document.querySelector('[data-agent-error="load"] summary')).toHaveTextContent(/still running on the server/i)
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
       expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(baseline) // one recovery total, not per fetch (LB-03)
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeLessThanOrEqual(3) // mount + recovery only — no loop
@@ -6027,6 +8397,66 @@ describe('FreshAgentView', () => {
       const rewindButton = await within(mcpRow).findByRole('button', { name: 'Rewind unavailable for this message' })
       expect(rewindButton).toBeDisabled()
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
+    })
+
+    it('does not show a previous conversation send as a checkpoint being saved in a different conversation', async () => {
+      const firstSessionId = 'thread-rewind-prior-send'
+      const secondSessionId = 'thread-rewind-other-busy'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      const first = {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+        createRequestId: 'req-rewind-prior-send',
+        sessionId: firstSessionId,
+        sessionRef: { provider: 'codex' as const, sessionId: firstSessionId },
+        resumeSessionId: firstSessionId,
+        status: 'idle' as const,
+      }
+      const second = {
+        ...first,
+        createRequestId: 'req-rewind-other-busy',
+        sessionId: secondSessionId,
+        sessionRef: { provider: 'codex' as const, sessionId: secondSessionId },
+        resumeSessionId: secondSessionId,
+        status: 'running' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: sessionId === firstSessionId ? 'idle' : 'running',
+        threadId: sessionId,
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: sessionId === firstSessionId ? [] : [unboundModernUserTurn('msg_other', 'Other conversation prompt')],
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      wsMock.send.mockClear()
+      fireEvent.change(composer, { target: { value: 'Unresolved previous conversation prompt' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send')[0]
+      expect(sent?.requestId).toBeTruthy()
+
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', secondSessionId, expect.anything(),
+      ))
+      await screen.findByText('Other conversation prompt')
+      emitSessionSnapshotStatus(store, onMessage, secondSessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      act(() => onMessage?.({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'The previous conversation send was refused.' }))
+
+      const otherRow = screen.getByText('Other conversation prompt').closest('article')!
+      expect(within(otherRow).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(otherRow).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(otherRow).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
     })
 
     it('a settled-unavailable capture makes no rewind claim mid-turn, and the honest unavailable verdict returns at settle', async () => {
@@ -13291,7 +15721,7 @@ describe('FreshAgentView', () => {
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText(/Saved Claude transcript could not be read/)).toBeInTheDocument()
+    await waitFor(() => expect(document.querySelector('[data-agent-error="load"] summary')).toHaveTextContent('Saved Claude transcript could not be read'))
     expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
     expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
     const layout = store.getState().panes.layouts['tab-1']
@@ -13314,7 +15744,7 @@ describe('FreshAgentView', () => {
       recoverySummary: { desiredState: 'running', recoveryState, reason: 'provider_unavailable', durabilityState: 'resume_captured', allocationState: 'verified_durable' },
     } }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText(/Saved history is temporarily unavailable/)).toBeInTheDocument()
+    await waitFor(() => expect(document.querySelector('[data-agent-error="load"] summary')).toHaveTextContent('Saved history is temporarily unavailable'))
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     const layout = store.getState().panes.layouts['tab-1']
@@ -13749,7 +16179,7 @@ describe('FreshAgentView', () => {
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
-    expect(await screen.findByText(/Cleanup could not be confirmed/)).toBeInTheDocument()
+    await waitFor(() => expect(document.querySelector('[data-agent-error="load"] summary')).toHaveTextContent('Cleanup could not be confirmed'))
     expect(getFreshAgentPaneContent(store)).toMatchObject({ ...content, soulIntentRevision: 18 })
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
     await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenNthCalledWith(2, 'running-fresh-soul', 18))
@@ -14321,7 +16751,7 @@ describe('FreshAgentView', () => {
     )
 
     expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Conversation could not load', { exact: true }))
+    fireEvent.click(screen.getByText('Stale restore revision — Conversation could not load', { exact: true }))
     expect(screen.getByText('Stale restore revision')).toBeVisible()
   })
 
@@ -16057,6 +18487,45 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
     })
 
     expect(screen.getByText(serverCopy)).toBeInTheDocument()
+  })
+
+  it.each([
+    ['freshAgent.error', true], ['freshAgent.error', false],
+    ['freshAgent.operation.error', true], ['freshAgent.operation.error', false],
+  ])('keeps the %s rollback cause and uncertainty in either receipt order (fallback first: %s)', async (providerType, fallbackFirst) => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const requestId = String(sentFreshAgentMessages('freshAgent.undo').at(-1)?.requestId)
+    const outer = { type: 'freshAgent.event', sessionId: 'ses_rollback', sessionType: 'freshopencode', provider: 'opencode' }
+    const fallback = { type: 'freshAgent.error', requestId, rollback: true, operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS', message: 'Undo could not be confirmed.' }
+    const native = { type: providerType, requestId, rollback: true, operationReceipt: true,
+      code: 'REDO_UNAVAILABLE', message: 'The provider cannot undo this turn.' }
+    const unrelated = { ...outer, event: { ...native, requestId: 'other-pane-request', message: 'Other pane rollback failure.' } }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, unrelated as never)
+      onMessage?.(unrelated)
+    })
+    expect(screen.queryByText('Other pane rollback failure.')).toBeNull()
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_rollback']?.lastError).toBeUndefined()
+    for (const event of fallbackFirst ? [fallback, native] : [native, fallback]) act(() => {
+      const message = { ...outer, event }
+      handleFreshAgentMessage(store.dispatch, message as never)
+      onMessage?.(message)
+    })
+    expect(screen.getByText(/The provider cannot undo this turn/)).toHaveTextContent('Undo could not be confirmed.')
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_rollback']?.lastError).toBeUndefined()
   })
 
   it('a re-delivered rolledBack ack with the SAME requestId NEVER re-refills the composer (consume-once per requestId)', async () => {
@@ -18003,8 +20472,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       </Provider>,
     )
 
-    const banner = (await screen.findByText('Reopen failed', { exact: true })).closest('details') as HTMLElement
-    fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
+    const banner = (await screen.findByText(/ — Reopen failed$/)).closest('details') as HTMLElement
+    fireEvent.click(within(banner).getByText(/ — Reopen failed$/))
     expect(banner).toHaveTextContent(/target runtime failed to start/i)
     const retry = within(banner).getByRole('button', { name: /retry reopening/i })
 
@@ -18048,8 +20517,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       </Provider>,
     )
 
-    const banner = (await screen.findByText('Reopen failed', { exact: true })).closest('details') as HTMLElement
-    fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
+    const banner = (await screen.findByText(/ — Reopen failed$/)).closest('details') as HTMLElement
+    fireEvent.click(within(banner).getByText(/ — Reopen failed$/))
     const retry = within(banner).getByRole('button', { name: /retry reopening/i })
 
     // The retry's handoff fails again — the pane stays; only the body is
@@ -18117,11 +20586,11 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
 
       const banner = document.querySelector('[data-agent-error="handoff"]') as HTMLElement
-      fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
+      fireEvent.click(within(banner).getByText(/ — Reopen failed$/))
       const retry = within(banner).getByRole('button', { name: /retry reopening/i })
       fireEvent.click(retry)
 
-      fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
+      fireEvent.click(within(banner).getByText(/ — Reopen failed$/))
       expect(retry).not.toBeVisible()
       // Synchronous: nothing sent on click itself (never a tight loop).
       expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
@@ -18188,8 +20657,8 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
         </Provider>,
       )
 
-      const banner = (await screen.findByText('Reopen failed', { exact: true })).closest('details') as HTMLElement
-    fireEvent.click(within(banner).getByText('Reopen failed', { exact: true }))
+      const banner = (await screen.findByText(/ — Reopen failed$/)).closest('details') as HTMLElement
+      fireEvent.click(within(banner).getByText(/ — Reopen failed$/))
       expect(banner).toHaveTextContent(new RegExp(failure.message, 'i'))
       const retry = within(banner).getByRole('button', { name: /retry reopening/i })
 
@@ -19144,6 +21613,528 @@ describe('task delegation open-session link (freshopencode tui parity)', () => {
 })
 
 describe('task6 hosted recovery in the mounted view', () => {
+  it('shows a reserved compact receipt without retrying an attach or ending the running turn', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionType: 'freshopencode' as const, provider: 'opencode' as const, sessionId: 'ses_reserved_compact' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...locator, threadId: locator.sessionId, status: 'running',
+      capabilities: { send: false, interrupt: true }, turns: [],
+      extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } } })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+    const content = (suffix: string): FreshAgentPaneContent => ({ kind: 'fresh-agent', ...locator,
+      sessionRef: { provider: 'opencode', sessionId: locator.sessionId }, createRequestId: `compact-reserved-${suffix}`,
+      status: 'running', soulId: 'compact-reserved-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: content('first') }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: content('second'), activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const current = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (current?.kind !== 'fresh-agent') throw new Error(`Missing pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={current} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="Compact requester"><Pane paneId="pane-1" /></section>
+      <section aria-label="Other conversation pane"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const requester = within(screen.getByRole('region', { name: 'Compact requester' }))
+    await waitFor(() => {
+      expect(requester.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+      expect(handlers.size).toBe(2)
+    })
+    fireEvent.change(requester.getByRole('textbox', { name: 'Chat message input' }), { target: { value: '/compact' } })
+    fireEvent.click(requester.getByRole('button', { name: 'Send', exact: true }))
+    const requestId = sentFreshAgentMessages('freshAgent.compact').at(-1)?.requestId
+    expect(requestId).toEqual(expect.any(String))
+    wsMock.send.mockClear()
+    const reason = 'The conversation is reserved for a handoff.'
+    const receipt = { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.error', sessionId: locator.sessionId, code: 'SESSION_RESERVED', message: reason,
+      requestId, operationReceipt: true,
+    } }
+    const legacy = { type: 'freshAgent.event', ...locator, event: {
+      type: 'freshAgent.error', sessionId: locator.sessionId, code: 'SESSION_RESERVED', message: reason,
+    } }
+    const deliver = (message: typeof receipt | typeof legacy) => act(() => {
+      handleFreshAgentMessage(store.dispatch, message)
+      for (const handler of [...handlers]) handler(message)
+    })
+    vi.useFakeTimers()
+    try {
+      deliver(receipt)
+      expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_reserved_compact'].status).toBe('running')
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      const errors = document.querySelectorAll('[data-agent-error="session"] summary')
+      expect(errors).toHaveLength(2)
+      for (const error of errors) expect(error).toHaveTextContent(reason)
+
+      // A genuine legacy attach reservation remains hidden and redrives the
+      // same attachments; compact receipts must not be mistaken for it.
+      deliver(legacy)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach').map((frame) => frame.paneId).sort()).toEqual(['pane-1', 'pane-2'])
+      expect(document.querySelectorAll('[data-agent-error="session"]')).toHaveLength(0)
+      expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_reserved_compact'].status).toBe('running')
+    } finally {
+      vi.useRealTimers()
+      cleanup()
+    }
+  })
+
+  it('keeps a request-scoped reserved send from reattaching either pane and retains legacy reattachment', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: 'shared-reserved-thread' }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } } })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    const content = (suffix: string): FreshAgentPaneContent => ({ kind: 'fresh-agent', ...locator,
+      sessionRef: { provider: 'codex', sessionId: locator.sessionId }, createRequestId: `reserved-pane-${suffix}`,
+      status: 'idle', soulId: 'shared-reserved-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: content('first') }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: content('second'), activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const current = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (current?.kind !== 'fresh-agent') throw new Error(`Missing pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={current} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="Refused sender"><Pane paneId="pane-1" /></section>
+      <section aria-label="Other sender"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const owner = within(screen.getByRole('region', { name: 'Refused sender' }))
+    const other = within(screen.getByRole('region', { name: 'Other sender' }))
+    const ownerComposer = owner.getByRole('textbox', { name: 'Chat message input' })
+    const otherComposer = other.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => {
+      expect(ownerComposer).toBeEnabled()
+      expect(otherComposer).toBeEnabled()
+      expect(handlers.size).toBe(2)
+    })
+    const send = (pane: typeof owner, composer: HTMLElement, text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(pane.getByRole('button', { name: 'Send', exact: true }))
+    }
+    send(owner, ownerComposer, 'Refused message')
+    send(other, otherComposer, 'Other pending message')
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    const [owned, unrelated] = sentFreshAgentMessages('freshAgent.send')
+    fireEvent.change(ownerComposer, { target: { value: 'Owner newer draft' } })
+    fireEvent.change(otherComposer, { target: { value: 'Other newer draft' } })
+    const otherBefore = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')
+    expect(otherBefore).toMatchObject({ pendingLocalEcho: { requestId: unrelated.requestId } })
+    const reason = 'Another resume for this session is in flight'
+    const refusal = { type: 'error', code: 'INTERNAL_ERROR', requestId: owned.requestId,
+      message: `SESSION_RESERVED: ${reason}` }
+    const legacy = { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', sessionId: locator.sessionId, code: 'SESSION_RESERVED', message: reason } }
+    wsMock.send.mockClear()
+    vi.useFakeTimers()
+    try {
+      act(() => { for (const handler of [...handlers]) handler(refusal) })
+      expect(ownerComposer).toHaveValue('Refused message\nOwner newer draft')
+      expect(owner.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Message not sent: ${reason}`)
+      expect(otherComposer).toHaveValue('Other newer draft')
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(otherBefore)
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+      // Legacy sends with no request ID still publish the existing
+      // session-scoped event and drive the established attachment retry.
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, legacy)
+        for (const handler of [...handlers]) handler(legacy)
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+      expect(sentFreshAgentMessages('freshAgent.attach').map((frame) => frame.paneId).sort()).toEqual(['pane-1', 'pane-2'])
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(otherComposer).toHaveValue('Other newer draft')
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(otherBefore)
+    } finally {
+      vi.useRealTimers()
+      cleanup()
+    }
+  })
+
+  it('preserves an earlier pane\'s uncertain send when another pane is definitely refused', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: 'shared-uncertain-thread' }
+    const snapshot = { ...locator, threadId: locator.sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } } }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    const content = (suffix: string): FreshAgentPaneContent => ({
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      createRequestId: `uncertain-pane-${suffix}`, status: 'idle', soulId: 'shared-uncertain-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    })
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: content('first') }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: content('second'), activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const current = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (current?.kind !== 'fresh-agent') throw new Error(`Missing pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={current} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="Earlier send pane"><Pane paneId="pane-1" /></section>
+      <section aria-label="Later send pane"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const earlier = within(screen.getByRole('region', { name: 'Earlier send pane' }))
+    const later = within(screen.getByRole('region', { name: 'Later send pane' }))
+    const earlierComposer = earlier.getByRole('textbox', { name: 'Chat message input' })
+    const laterComposer = later.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => {
+      expect(earlierComposer).toBeEnabled()
+      expect(laterComposer).toBeEnabled()
+      expect(handlers.size).toBe(2)
+    })
+    const heldSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldSnapshot.promise)
+    const send = (pane: typeof earlier, composer: HTMLElement, text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(pane.getByRole('button', { name: 'Send', exact: true }))
+    }
+    const deliver = (message: Record<string, unknown>) => act(() => { for (const handler of [...handlers]) handler(message) })
+    try {
+      send(earlier, earlierComposer, 'Earlier request')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      const earlierId = sentFreshAgentMessages('freshAgent.send')[0].requestId
+      send(earlier, earlierComposer, 'Earlier queued follow-up')
+      fireEvent.change(earlierComposer, { target: { value: 'Earlier newer draft' } })
+      deliver({ type: 'error', code: 'INTERNAL_ERROR', requestId: earlierId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost' })
+      expect(earlierComposer).toHaveValue('Earlier request\nEarlier newer draft')
+      const earlierWarning = earlier.getByRole('alert', { name: 'Agent warning' })
+      expect(earlierWarning).toHaveTextContent('Delivery is uncertain')
+      const earlierSummary = earlierWarning.closest('summary')!
+      fireEvent.click(earlierSummary)
+      const earlierDiagnostic = `Delivery uncertain (${earlierId}): native response was lost. Check the conversation before sending again.`
+      expect(within(earlierSummary.closest('details')!).getByText(earlierDiagnostic)).toBeVisible()
+      expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      send(later, laterComposer, 'Later request')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      const laterId = sentFreshAgentMessages('freshAgent.send')[1].requestId
+      expect(laterId).not.toBe(earlierId)
+      fireEvent.change(laterComposer, { target: { value: 'Later newer draft' } })
+      const refusal = { type: 'error', code: 'INTERNAL_ERROR', requestId: laterId,
+        message: 'CODEX_PREVIOUS_DELIVERY_AMBIGUOUS: Earlier input has unresolved native delivery; recover or inspect the conversation before sending again' }
+      // The native receipt and hosted response may both report this refusal.
+      act(() => { for (const handler of [...handlers]) handler(refusal); for (const handler of [...handlers]) handler(refusal) })
+      expect(laterComposer).toHaveValue('Later request\nLater newer draft')
+      expect(later.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(
+        'Message not sent: Earlier input has unresolved native delivery; recover or inspect the conversation before sending again',
+      )
+      expect(earlierComposer).toHaveValue('Earlier request\nEarlier newer draft')
+      expect(earlier.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+      expect(within(earlierSummary.closest('details')!).getByText(earlierDiagnostic)).toBeVisible()
+      expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      // A repeated idle status is not evidence that the earlier input settled.
+      act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+      expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+    } finally {
+      cleanup()
+      await act(async () => heldSnapshot.resolve(snapshot))
+    }
+  })
+
+  it.each([
+    ['freshcodex', 'codex', 'refusal', 'CODEX_TURN_START_FAILED: native input refused'],
+    ['freshcodex', 'codex', 'uncertain delivery', 'CODEX_DELIVERY_AMBIGUOUS: native response was lost'],
+    ['freshclaude', 'claude', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost'],
+    ['freshopencode', 'opencode', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost'],
+    ['freshclaude', 'claude', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost', true],
+    ['freshopencode', 'opencode', 'uncertain delivery', 'FRESH_AGENT_DELIVERY_AMBIGUOUS: native response was lost', true],
+  ] as const)('scopes a hosted %s send %s %s to its initiating pane and preserves queued work (nested: %s)', async (sessionType, provider, outcome, message, nested = false) => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.add(handler)
+      return () => { handlers.delete(handler) }
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+      sessionType, provider, threadId: sessionId, status: 'idle',
+      capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { [provider]: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    }))
+    const sessionId = (suffix: string) => provider === 'claude'
+      ? `550e8400-e29b-41d4-a716-44665544000${suffix === 'first' ? '1' : '2'}`
+      : provider === 'opencode' ? `ses_hosted_${suffix}` : `hosted-${suffix}`
+    const paneContent = (suffix: string): FreshAgentPaneContent => ({
+      kind: 'fresh-agent', sessionType, provider,
+      sessionId: sessionId(suffix), sessionRef: { provider, sessionId: sessionId(suffix) },
+      createRequestId: `hosted-create-${suffix}`, status: 'idle',
+      soulId: `hosted-soul-${suffix}`, soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    })
+    const first = paneContent('first')
+    const second = paneContent('second')
+    for (const content of [first, second]) {
+      const locator = { sessionId: content.sessionId!, sessionType: content.sessionType, provider: content.provider }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+    store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: second, activate: false }))
+    function Pane({ paneId }: { paneId: string }) {
+      const content = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], paneId))
+      if (content?.kind !== 'fresh-agent') throw new Error(`Missing hosted pane ${paneId}`)
+      return <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={content} />
+    }
+    render(<Provider store={store}>
+      <section aria-label="First hosted pane"><Pane paneId="pane-1" /></section>
+      <section aria-label="Second hosted pane"><Pane paneId="pane-2" /></section>
+    </Provider>)
+    const firstPane = within(screen.getByRole('region', { name: 'First hosted pane' }))
+    const secondPane = within(screen.getByRole('region', { name: 'Second hosted pane' }))
+    const firstComposer = firstPane.getByRole('textbox', { name: 'Chat message input' })
+    const secondComposer = secondPane.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => {
+      expect(firstComposer).toBeEnabled()
+      expect(secondComposer).toBeEnabled()
+      expect(handlers.size).toBe(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.map((call) => call[2]))
+        .toEqual(expect.arrayContaining([first.sessionId, second.sessionId]))
+    })
+    // Keep any recovery read pending so it cannot decide the uncertain send.
+    const heldSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldSnapshot.promise)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    const send = (pane: typeof firstPane, composer: HTMLElement, text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(pane.getByRole('button', { name: 'Send', exact: true }))
+    }
+    const status = (content: FreshAgentPaneContent, next: 'running' | 'idle') => {
+      store.dispatch(setSessionStatus({ sessionId: content.sessionId!, sessionType: content.sessionType,
+        provider: content.provider, status: next }))
+    }
+    try {
+      send(firstPane, firstComposer, 'First pane original')
+      send(secondPane, secondComposer, 'Second pane original')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      const [firstSend, secondSend] = sentFreshAgentMessages('freshAgent.send')
+      expect(firstSend).toMatchObject({ sessionId: first.sessionId, text: 'First pane original' })
+      expect(secondSend).toMatchObject({ sessionId: second.sessionId, text: 'Second pane original' })
+      expect(firstSend.requestId).not.toBe(secondSend.requestId)
+      // A definite refusal may arrive while another turn is still running.
+      // For uncertain delivery, leave the first session idle to prove that
+      // the pending send itself holds its queue until lifecycle evidence.
+      act(() => {
+        if (outcome === 'refusal') status(first, 'running')
+        status(second, 'running')
+      })
+      send(firstPane, firstComposer, 'First pane follow-up')
+      send(secondPane, secondComposer, 'Second pane follow-up')
+      fireEvent.change(firstComposer, { target: { value: 'First pane newer draft' } })
+      fireEvent.change(secondComposer, { target: { value: 'Second pane newer draft' } })
+      fireEvent.click(firstPane.getByRole('button', { name: 'Show queued messages' }))
+      fireEvent.click(secondPane.getByRole('button', { name: 'Show queued messages' }))
+      expect(firstPane.getByText('First pane follow-up')).toBeVisible()
+      expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
+      if (provider === 'opencode') expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1'))
+        .toMatchObject({ status: 'running' })
+      const secondBefore = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')
+      expect(secondBefore).toMatchObject({ pendingLocalEcho: { requestId: secondSend.requestId, text: 'Second pane original' } })
+
+      const error = nested ? { type: 'freshAgent.event', sessionId: first.sessionId, sessionType, provider,
+        event: { type: 'freshAgent.send.uncertain', sessionId: first.sessionId, requestId: firstSend.requestId, message } }
+        : { type: 'error', code: 'INTERNAL_ERROR', requestId: firstSend.requestId, message,
+          timestamp: '2026-10-26T00:00:00.000Z' }
+      if (nested) {
+        // The released receiver has no branch for this new nested type. It
+        // must leave its running session alone rather than infer refusal.
+        const legacyStore = createStore()
+        const legacyLocator = { sessionId: first.sessionId!, sessionType, provider }
+        legacyStore.dispatch(sessionInit(legacyLocator))
+        legacyStore.dispatch(setSessionStatus({ ...legacyLocator, status: 'running' }))
+        expect(handleFreshAgentMessage(legacyStore.dispatch, error as never)).toBe(false)
+        expect(legacyStore.getState().freshAgent.sessions[`${sessionType}:${provider}:${first.sessionId}`].status).toBe('running')
+        const foreign = { type: 'freshAgent.event', sessionId: second.sessionId, sessionType, provider,
+          event: { type: 'freshAgent.send.uncertain', sessionId: second.sessionId, requestId: firstSend.requestId, message } }
+        act(() => { for (const handler of [...handlers]) handler(foreign) })
+        expect(firstComposer).toHaveValue('First pane newer draft')
+        expect(secondComposer).toHaveValue('Second pane newer draft')
+        const mismatchedInner = { type: 'freshAgent.event', sessionId: first.sessionId, sessionType, provider,
+          event: { type: 'freshAgent.send.uncertain', sessionId: second.sessionId, requestId: firstSend.requestId, message } }
+        act(() => { for (const handler of [...handlers]) handler(mismatchedInner) })
+        expect(firstComposer).toHaveValue('First pane newer draft')
+        expect(firstPane.queryByRole('alert', { name: 'Agent warning' })).not.toBeInTheDocument()
+      }
+      act(() => { for (const handler of [...handlers]) handler(error) })
+      await waitFor(() => expect(firstComposer).toHaveValue('First pane original\nFirst pane newer draft'))
+      const firstWarning = firstPane.getByRole('alert', { name: 'Agent warning' })
+      expect(firstWarning).toHaveTextContent(outcome === 'refusal'
+        ? 'Message not sent: native input refused'
+        : 'Delivery is uncertain')
+      if (outcome === 'uncertain delivery') {
+        const summary = firstWarning.closest('summary')!
+        fireEvent.click(summary)
+        expect(within(summary.closest('details')!).getByText(
+          `Delivery uncertain (${firstSend.requestId}): native response was lost. Check the conversation before sending again.`,
+        )).toBeVisible()
+      }
+      expect(firstPane.getByText('First pane follow-up')).toBeVisible()
+      expect(secondComposer).toHaveValue('Second pane newer draft')
+      expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
+      expect(secondPane.queryByRole('alert', { name: 'Agent warning' })).not.toBeInTheDocument()
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(secondBefore)
+      if (provider === 'opencode') expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1'))
+        .toMatchObject({ status: 'running' })
+      expect(store.getState().freshAgent.sessions[`${sessionType}:${provider}:${second.sessionId}`].status).toBe('running')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+
+      // A duplicate must not restore the draft twice or replay either queue.
+      act(() => { for (const handler of [...handlers]) handler(error) })
+      expect(firstComposer).toHaveValue('First pane original\nFirst pane newer draft')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+
+      if (outcome === 'uncertain delivery') {
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.some((call) => call[2] === first.sessionId)).toBe(true))
+        // An idle report without a prior busy turn does not settle an
+        // uncertain send or let the follow-up overtake it.
+        act(() => status(first, 'idle'))
+        expect(firstPane.getByText('First pane follow-up')).toBeVisible()
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+        act(() => status(first, 'running'))
+      }
+      // The first queue resumes only after its actual running turn becomes idle.
+      act(() => status(first, 'idle'))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(3))
+      expect(sentFreshAgentMessages('freshAgent.send')[2]).toMatchObject({
+        sessionId: first.sessionId, text: 'First pane follow-up',
+      })
+      expect(secondComposer).toHaveValue('Second pane newer draft')
+      expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
+      expect(findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-2')).toEqual(secondBefore)
+    } finally {
+      cleanup()
+      await act(async () => heldSnapshot.resolve({ status: 'running', capabilities: { send: true, interrupt: true }, turns: [] }))
+    }
+  })
+
+  it.each(([
+    ['freshcodex', 'codex', 'CODEX_DELIVERY_AMBIGUOUS'],
+    ['freshclaude', 'claude', 'FRESH_AGENT_DELIVERY_AMBIGUOUS'],
+    ['freshopencode', 'opencode', 'FRESH_AGENT_DELIVERY_AMBIGUOUS'],
+  ] as const).flatMap((provider) => (['fallback then refusal', 'refusal then fallback', 'fallback then acceptance', 'acceptance then fallback',
+    'batched fallback and legacy acceptance'] as const)
+    .map((order) => [...provider, order] as const)))('resolves a hosted %s / %s receipt (%s; %s)', async (sessionType, provider, ambiguityCode, order) => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const sessionId = provider === 'claude' ? '550e8400-e29b-41d4-a716-446655440003'
+      : provider === 'opencode' ? 'ses_hosted_receipt' : 'hosted-receipt'
+    const locator = { sessionId, sessionType, provider }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...locator, threadId: sessionId, status: 'idle', capabilities: { send: true, interrupt: true }, turns: [],
+      extensions: { [provider]: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+    })
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider, sessionId }, createRequestId: 'hosted-receipt-create',
+      status: 'idle', soulId: 'hosted-receipt-soul', soulIntentRevision: 1,
+      recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).toBeEnabled())
+    const heldSnapshot = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(heldSnapshot.promise)
+    const send = (text: string) => {
+      fireEvent.change(composer, { target: { value: text } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+    }
+    const broadcast = (message: Record<string, unknown>) => { for (const handler of [...handlers]) handler(message) }
+    const deliver = (message: Record<string, unknown>) => act(() => broadcast(message))
+    try {
+      send('Original hosted request')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      const requestId = sentFreshAgentMessages('freshAgent.send')[0].requestId
+      send('Queued hosted follow-up')
+      fireEvent.change(composer, { target: { value: 'Newer draft' } })
+      const ambiguityMessage = `${ambiguityCode}: host response was lost`
+      const fallback = provider === 'codex'
+        ? { type: 'error', code: 'INTERNAL_ERROR', requestId, message: ambiguityMessage }
+        : { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.send.uncertain', sessionId,
+          requestId, message: ambiguityMessage } }
+      const refusal = { type: 'error', code: 'INTERNAL_ERROR', requestId,
+        message: 'NATIVE_INPUT_REFUSED: provider refused the message' }
+      const acceptance = { type: 'freshAgent.send.accepted', ...locator, requestId, submittedTurnId: 'accepted-native-turn' }
+      const concrete = order.includes('refusal') ? refusal : acceptance
+      const batched = order.startsWith('batched')
+      const fallbackFirst = order.startsWith('fallback') || batched
+
+      if (batched) {
+        act(() => { broadcast(fallback); broadcast({ ...acceptance, submittedTurnId: undefined }) })
+        deliver(fallback)
+      } else if (fallbackFirst) {
+        deliver(fallback)
+        await waitFor(() => expect(composer).toHaveValue('Original hosted request\nNewer draft'))
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+        // Edits made after the fallback must survive a later concrete receipt.
+        fireEvent.change(composer, { target: { value: 'Original hosted request\nNewer draft, edited' } })
+        deliver(concrete)
+      } else {
+        deliver(concrete)
+        deliver(fallback)
+      }
+
+      if (order.includes('refusal')) {
+        await waitFor(() => expect(composer).toHaveValue(fallbackFirst
+          ? 'Original hosted request\nNewer draft, edited'
+          : 'Original hosted request\nNewer draft'))
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Message not sent: provider refused the message')
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued hosted follow-up' })
+      } else {
+        expect(composer).toHaveValue(batched ? 'Original hosted request\nNewer draft'
+          : fallbackFirst ? 'Original hosted request\nNewer draft, edited' : 'Newer draft')
+        expect(screen.queryByText(/Delivery is uncertain/)).not.toBeInTheDocument()
+        if (fallbackFirst) expect(screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary'))
+          .toHaveTextContent('Message accepted. Your restored draft was kept.')
+        if (fallbackFirst) expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+          requestId, text: 'Original hosted request', ...(batched ? {} : { submittedTurnId: 'accepted-native-turn' }),
+        })
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        // Acceptance records the receipt but the queue must wait for the turn.
+        act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+        act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+        expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Queued hosted follow-up' })
+      }
+    } finally {
+      cleanup()
+      await act(async () => heldSnapshot.resolve({ status: 'running', capabilities: { send: true, interrupt: true }, turns: [] }))
+    }
+  })
+
   it.each(['accepted', 'refused', 'ambiguous'] as const)('keeps per-request async answer %s visible after retained recovery', async (outcome) => {
     const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
     const snapshot = {...native,status:'idle',capabilities:{...native.capabilities,send:true,interrupt:true},extensions:{codex:{ownerKind:'fresh-agent',statusFromLiveState:true}},turns:[{id:'async-turn',turnId:'async-turn',role:'assistant',summary:'',items:[{id:'async-answer',kind:'text',text:'Work can continue.',extensions:{codex:{itemId:'async-answer',delivery:'async',questions:[{id:'where',title:'Where?',options:['Staging']}]}}}]}]}

@@ -934,7 +934,8 @@ async fn retained_codex_recovery_does_not_admit_native_controls() {
         .fresh_agent_resolve(
             fixture.soul.clone(),
             "unobserved-control".into(),
-            serde_json::json!({"behavior":"allow"})
+            serde_json::json!({"behavior":"allow"}),
+            None,
         )
         .await
         .is_err());

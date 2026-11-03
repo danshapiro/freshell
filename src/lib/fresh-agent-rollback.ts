@@ -119,11 +119,12 @@ export function asRollbackAck(event: unknown): RollbackAck | null {
 }
 
 /**
- * Rollback refusals ride freshAgent.error with `{rollback: true}` so they route
- * to the initiating pane's notice banner instead of the pane error surface.
+ * Rollback refusals carry `{rollback: true}` so they route to the initiating
+ * pane's notice banner instead of the pane error surface. Older providers use
+ * freshAgent.error; new hosted receipts use freshAgent.operation.error.
  */
 export function isRollbackErrorEvent(event: unknown): boolean {
   if (!event || typeof event !== 'object') return false
   const record = event as Record<string, unknown>
-  return record.type === 'freshAgent.error' && record.rollback === true
+  return (record.type === 'freshAgent.error' || record.type === 'freshAgent.operation.error') && record.rollback === true
 }

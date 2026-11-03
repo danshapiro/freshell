@@ -8,6 +8,8 @@ import { expect, it } from 'vitest'
 
 function fixture(mode: 'available' | 'missing' | 'foreign' | 'stale-policy') {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'codex-sandbox-cache-'))
+  const gitInit = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8', timeout: 10_000 })
+  expect(gitInit.status, gitInit.stderr).toBe(0)
   for (const file of [
     'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs',
     'test/integration/providers/codex-local-provider.mjs',

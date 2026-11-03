@@ -1,6 +1,7 @@
 //! REST/MCP ingress backed exclusively by the durable fresh-agent host.
 
 use super::*;
+use freshell_freshagent::rest_lane::RestLaneErrorCorrelation;
 
 #[async_trait::async_trait]
 impl FreshAgentRestLane for HostedFreshAgentProxy {
@@ -196,6 +197,35 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 )
             }
         };
+        // Native history cannot carry an unassigned live provider diagnostic.
+        // This is an optional enrichment: a missing or stalled retained read
+        // must not prevent the owned saved history from being displayed.
+        let retained_codex = if history_only
+            && runtime_provider == FreshProvider::Codex
+            && view.host_boot_id.is_some()
+        {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.client
+                    .fresh_agent_retained_state(view.soul_id.clone(), 1_500),
+            )
+            .await
+            {
+                Ok(Ok(retained)) => retained,
+                Ok(Err(error)) => {
+                    tracing::warn!(provider = "codex", soul_id = %view.soul_id,
+                        code = ?error.runtime_code(), "fresh_agent.hosted_retained_diagnostic_unavailable");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(provider = "codex", soul_id = %view.soul_id,
+                        "fresh_agent.hosted_retained_diagnostic_timeout");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // A reply cannot cross a native identity, owner incarnation or source change.
         let current = self
             .client
@@ -252,6 +282,19 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 serde_json::json!(true);
             snapshot["extensions"][&request.provider]["statusFromLiveState"] =
                 serde_json::json!(false);
+            if runtime_provider == FreshProvider::Codex {
+                if let Some(codex) = snapshot["extensions"]["codex"].as_object_mut() {
+                    // Saved native history has no authority over a retained
+                    // session diagnostic, including its absence.
+                    codex.remove("unattributedProviderError");
+                    codex.remove("unattributedProviderErrorAuthoritative");
+                    codex.remove("pendingProviderError");
+                    codex.remove("pendingProviderErrorAuthoritative");
+                }
+            }
+            if let Some(retained) = retained_codex.as_ref() {
+                overlay_retained_codex_diagnostic(&mut snapshot, retained, view, latest);
+            }
         }
         freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
             &mut snapshot,
@@ -357,7 +400,7 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
 
     async fn send_agent(
         &self,
-        request: RestLaneSend,
+        mut request: RestLaneSend,
     ) -> Result<RestLaneSendResult, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
@@ -370,20 +413,103 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             .fresh_agent_events(soul.clone(), 0, 1)
             .await
             .map_err(|_| ())?;
-        let request_id = RequestId::parse(request.request_id).map_err(|_| ())?;
-        self.client
-            .fresh_agent_send(request_id, soul.clone(), request.text, None, None)
-            .await
-            .map_err(|_| ())?;
-        let completed = wait_for_completion(
+        let request_id = RequestId::parse(request.request_id.clone()).map_err(|_| ())?;
+        let text = std::mem::take(&mut request.text);
+        let dispatch = self
+            .client
+            .fresh_agent_send(request_id, soul.clone(), text, None, None)
+            .await;
+        // The supervisor uses Completed for a previously accepted request.
+        // Its matching settlement can predate this HTTP request's first read.
+        let replayed = matches!(&dispatch, Ok(CommandState::Completed));
+        match classify_hosted_send(provider, dispatch) {
+            HostedSendOutcome::Accepted => {}
+            HostedSendOutcome::Refused(message) => {
+                tracing::warn!(provider=?provider, session_id=%request.session_id,
+                    request_id=%request.request_id, "freshagent.hosted_rest.send_refused");
+                return Err(hosted_rest_send_error(&request, message, false));
+            }
+            HostedSendOutcome::Ambiguous(message) => {
+                tracing::warn!(provider=?provider, session_id=%request.session_id,
+                    request_id=%request.request_id, "freshagent.hosted_rest.send_ambiguous");
+                return Err(hosted_rest_send_error(&request, message, true));
+            }
+        }
+        let completion = wait_for_completion(
             &self.client,
             soul,
-            before.head,
+            if replayed { 0 } else { before.head },
+            &request.request_id,
             Duration::from_millis(request.timeout_ms),
         )
         .await;
+        if let Some(status @ (HostedTurnStatus::Refused | HostedTurnStatus::Ambiguous)) =
+            completion.status
+        {
+            let diagnostic = completion
+                .error
+                .unwrap_or_else(|| "The provider did not accept this message.".to_string());
+            return Err(hosted_rest_send_error(
+                &request,
+                diagnostic,
+                status == HostedTurnStatus::Ambiguous,
+            ));
+        }
+        if let Some(
+            status @ (HostedTurnStatus::Failed
+            | HostedTurnStatus::Interrupted
+            | HostedTurnStatus::Exited),
+        ) = completion.status
+        {
+            let (code, message) = match status {
+                HostedTurnStatus::Failed => (
+                    if provider == AgentProvider::Codex {
+                        "CODEX_TURN_FAILED"
+                    } else {
+                        "FRESH_AGENT_TURN_FAILED"
+                    },
+                    completion
+                        .error
+                        .unwrap_or_else(|| "the submitted turn failed".to_string()),
+                ),
+                HostedTurnStatus::Interrupted => (
+                    if provider == AgentProvider::Codex {
+                        "CODEX_TURN_INTERRUPTED"
+                    } else {
+                        "FRESH_AGENT_TURN_INTERRUPTED"
+                    },
+                    "the submitted turn was interrupted".to_string(),
+                ),
+                HostedTurnStatus::Exited => (
+                    "FRESH_AGENT_SESSION_ENDED",
+                    completion.error.unwrap_or_else(|| {
+                        "the hosted session ended before the submitted turn completed".to_string()
+                    }),
+                ),
+                HostedTurnStatus::Completed
+                | HostedTurnStatus::Refused
+                | HostedTurnStatus::Ambiguous => unreachable!(),
+            };
+            let mut error = RestLaneError::new(RestLaneErrorKind::Conflict, code, message);
+            error.retryable = Some(false);
+            tracing::warn!(provider=?provider, session_id=%request.session_id,
+                request_id=%request.request_id, native_turn_id=?completion.turn_id,
+                outcome=?status, "freshagent.hosted_rest.turn_failed");
+            error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+                session_id: Some(request.session_id),
+                request_id: Some(request.request_id),
+                submitted_turn_id: completion.turn_id,
+                ..Default::default()
+            }));
+            return Err(error);
+        }
+        let completed = completion.status == Some(HostedTurnStatus::Completed);
+        tracing::info!(provider=?provider, session_id=%request.session_id,
+            request_id=%request.request_id, native_turn_id=?completion.turn_id,
+            completed, "freshagent.hosted_rest.send_observed");
         Ok(RestLaneSendResult {
             session_id: request.session_id,
+            submitted_turn_id: completion.turn_id,
             completed,
             ..Default::default()
         })
@@ -493,6 +619,239 @@ impl freshell_freshagent::model_capabilities::ModelCatalogProbe for HostedCodexC
     }
 }
 
+fn overlay_retained_codex_diagnostic(
+    snapshot: &mut serde_json::Value,
+    retained: &serde_json::Value,
+    before: &freshell_runtime_protocol::RuntimeView,
+    after: &freshell_runtime_protocol::RuntimeView,
+) {
+    if !retained_batch_matches_source(Some(before), Some(after), Some(retained)) {
+        return;
+    }
+    let projection_id = retained["source"]["projectionId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty());
+    if projection_id.is_none()
+        || retained["snapshot"]["extensions"]["codex"]["projection"]["id"].as_str() != projection_id
+    {
+        return;
+    }
+    merge_retained_codex_failures(snapshot, &retained["snapshot"]);
+    let source = &retained["snapshot"]["extensions"]["codex"];
+    let message = match source.get("unattributedProviderError") {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(message)) if !message.trim().is_empty() => {
+            Some(Some(serde_json::json!(message)))
+        }
+        _ => None,
+    };
+    let pending = match source.get("pendingProviderError") {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(value) => match (value["turnId"].as_str(), value["message"].as_str()) {
+            (Some(turn_id), Some(message))
+                if !turn_id.trim().is_empty() && !message.trim().is_empty() =>
+            {
+                Some(Some(
+                    serde_json::json!({"turnId":turn_id,"message":message}),
+                ))
+            }
+            _ => None,
+        },
+    };
+    let Some(codex) = snapshot["extensions"]["codex"].as_object_mut() else {
+        return;
+    };
+    if let Some(message) = message {
+        codex.remove("unattributedProviderError");
+        if let Some(message) = message {
+            codex.insert("unattributedProviderError".into(), message);
+        }
+        codex.insert("unattributedProviderErrorAuthoritative".into(), true.into());
+    }
+    if let Some(pending) = pending {
+        codex.remove("pendingProviderError");
+        if let Some(pending) = pending {
+            codex.insert("pendingProviderError".into(), pending);
+        }
+        codex.insert("pendingProviderErrorAuthoritative".into(), true.into());
+    }
+}
+
+// A provider can exit before native history records a failed turn. Preserve
+// the saved history and add only settled, event-owned error rows from the
+// validated retained projection; retained prompts and partial output are not
+// authoritative saved history.
+fn merge_retained_codex_failures(snapshot: &mut serde_json::Value, retained: &serde_json::Value) {
+    use serde_json::Value;
+
+    let projection = &retained["extensions"]["codex"]["projection"];
+    let (Some(event_owned), Some(settled), Some(turn_rows), Some(retained_turns), Some(saved)) = (
+        projection["eventOwnedTurnIds"].as_array(),
+        projection["settledTurnIds"].as_array(),
+        projection["turnRows"].as_object(),
+        retained["turns"].as_array(),
+        snapshot["turns"].as_array_mut(),
+    ) else {
+        return;
+    };
+    let row_owners: HashMap<&str, &str> = turn_rows
+        .iter()
+        .flat_map(|(native_id, rows)| {
+            rows.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(move |row| row.as_str().map(|row_id| (row_id, native_id.as_str())))
+        })
+        .collect();
+
+    for native_id in event_owned.iter().filter_map(Value::as_str) {
+        if native_id.trim().is_empty() || !settled.iter().any(|id| id.as_str() == Some(native_id)) {
+            continue;
+        }
+        let Some(row_ids) = turn_rows.get(native_id).and_then(Value::as_array) else {
+            continue;
+        };
+        for row in retained_turns {
+            let Some(row_id) = row["turnId"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let Some(message) = row["error"]["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+            else {
+                continue;
+            };
+            if row["id"].as_str() != Some(row_id)
+                || row["role"] != "assistant"
+                || row["error"]["name"] != "CodexError"
+                || row["items"]
+                    .as_array()
+                    .is_none_or(|items| !items.is_empty())
+                || row["nativeTurnId"]
+                    .as_str()
+                    .is_some_and(|id| id != native_id)
+                || !codex_row_belongs_to_turn(row, native_id)
+                || !row_ids.iter().any(|id| id.as_str() == Some(row_id))
+            {
+                continue;
+            }
+
+            // A completed native snapshot may have synthesized an empty
+            // response before the retained failure was received. It is not
+            // provider output and would otherwise contradict the failure.
+            saved.retain(|saved_row| !is_codex_empty_response(saved_row, native_id));
+            if saved.iter().any(|saved_row| {
+                codex_row_belongs_to_turn(saved_row, native_id)
+                    && saved_row["role"] == "assistant"
+                    && saved_row["error"]["name"] == "CodexError"
+                    && saved_row["error"]["message"].as_str() == Some(message)
+            }) {
+                continue;
+            }
+
+            let occupied = |id: &str| {
+                saved.iter().any(|turn| {
+                    turn["id"].as_str() == Some(id) || turn["turnId"].as_str() == Some(id)
+                })
+            };
+            let display_id = if !occupied(row_id) {
+                row_id.to_owned()
+            } else {
+                (0usize..)
+                    .map(|index| format!("{native_id}:row-{index}"))
+                    .find(|candidate| !occupied(candidate))
+                    .expect("a free display ID exists")
+            };
+            let last_matching = saved
+                .iter()
+                .rposition(|turn| codex_row_belongs_to_turn(turn, native_id));
+            // When none of this turn was saved, its next retained native
+            // turn can still anchor it ahead of later saved history. Match by
+            // native turn rather than display-row ID: the saved and retained
+            // representations can have different numbers of rows.
+            let insert_at = last_matching.map(|index| index + 1).or_else(|| {
+                let last_retained = retained_turns.iter().rposition(|turn| {
+                    turn["turnId"]
+                        .as_str()
+                        .and_then(|id| row_owners.get(id))
+                        .copied()
+                        == Some(native_id)
+                })?;
+                retained_turns
+                    .iter()
+                    .skip(last_retained + 1)
+                    .find_map(|turn| {
+                        let next_native = turn["turnId"]
+                            .as_str()
+                            .and_then(|id| row_owners.get(id))
+                            .copied()?;
+                        if next_native == native_id {
+                            return None;
+                        }
+                        saved
+                            .iter()
+                            .position(|row| codex_row_belongs_to_turn(row, next_native))
+                    })
+            });
+            let ordinal = last_matching
+                .and_then(|index| saved[index]["ordinal"].as_u64())
+                .or_else(|| row["ordinal"].as_u64())
+                .or_else(|| {
+                    saved
+                        .iter()
+                        .filter_map(|turn| turn["ordinal"].as_u64())
+                        .max()
+                        .map(|ordinal| ordinal.saturating_add(1))
+                })
+                .unwrap_or(0);
+            let failure = serde_json::json!({
+                "id": display_id,
+                "turnId": display_id,
+                "ordinal": ordinal,
+                "source": "live",
+                "role": "assistant",
+                "summary": "",
+                "items": [],
+                "error": {"name":"CodexError", "message":message},
+                "outputState": {"provenance":"retained", "diagnostic":"unsaved", "refreshPending":false},
+            });
+            saved.insert(insert_at.unwrap_or(saved.len()), failure);
+        }
+    }
+}
+
+fn codex_row_belongs_to_turn(row: &serde_json::Value, native_id: &str) -> bool {
+    if row["nativeTurnId"].as_str() == Some(native_id) {
+        return true;
+    }
+    let Some(id) = row["turnId"].as_str() else {
+        return false;
+    };
+    id == native_id
+        || id
+            .strip_prefix(native_id)
+            .and_then(|suffix| suffix.strip_prefix(":row-"))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|digit| digit.is_ascii_digit())
+            })
+}
+
+fn is_codex_empty_response(row: &serde_json::Value, native_id: &str) -> bool {
+    if !codex_row_belongs_to_turn(row, native_id)
+        || row["role"] != "assistant"
+        || !row["error"].is_null()
+    {
+        return false;
+    }
+    let Some([item]) = row["items"].as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    let item_id = format!("{native_id}:empty-response");
+    item["id"].as_str() == Some(item_id.as_str())
+        && item["kind"] == "text"
+        && item["text"].as_str() == Some(freshell_freshagent::codex::CODEX_EMPTY_RESPONSE_TEXT)
+}
+
 pub(super) fn same_snapshot_source(
     before: &freshell_runtime_protocol::RuntimeView,
     after: &freshell_runtime_protocol::RuntimeView,
@@ -509,41 +868,255 @@ pub(super) fn same_snapshot_source(
         && before.desired_state == after.desired_state
 }
 
+fn hosted_rest_send_error(
+    request: &RestLaneSend,
+    diagnostic: String,
+    ambiguous: bool,
+) -> RestLaneError {
+    // Only the typed, already-public provider diagnostic reaches this helper.
+    // Opaque host or transport errors were replaced by classify_hosted_send.
+    let (code, message) = diagnostic
+        .split_once(": ")
+        .filter(|(code, _)| {
+            !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or(("FRESH_AGENT_SEND_REFUSED", diagnostic.as_str()));
+    let kind = match code {
+        _ if ambiguous => RestLaneErrorKind::Conflict,
+        "SESSION_RESERVED" | "STALE_CLAIM" | "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS" => {
+            RestLaneErrorKind::Conflict
+        }
+        "SESSION_NOT_FOUND" => RestLaneErrorKind::NotFound,
+        code if code.starts_with("INVALID_") => RestLaneErrorKind::BadRequest,
+        _ => RestLaneErrorKind::Unavailable,
+    };
+    let mut error = RestLaneError::new(kind, code, message);
+    if ambiguous || code == "CODEX_PREVIOUS_DELIVERY_AMBIGUOUS" {
+        error.retryable = Some(false);
+    }
+    error.correlation = Some(Box::new(RestLaneErrorCorrelation {
+        session_id: Some(request.session_id.clone()),
+        request_id: Some(request.request_id.clone()),
+        ..Default::default()
+    }));
+    error
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedTurnStatus {
+    Completed,
+    Failed,
+    Interrupted,
+    Exited,
+    Refused,
+    Ambiguous,
+}
+
+#[derive(Default)]
+struct ObservedHostedTurn {
+    status: Option<HostedTurnStatus>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct HostedTurnObservation {
+    accepted_turn: Option<String>,
+    turns: HashMap<String, ObservedHostedTurn>,
+    request_settlement: Option<ObservedHostedTurn>,
+    refusal: Option<String>,
+    uncertainty: Option<String>,
+}
+
+struct HostedTurnCompletion {
+    turn_id: Option<String>,
+    status: Option<HostedTurnStatus>,
+    error: Option<String>,
+}
+
+impl HostedTurnObservation {
+    fn observe(&mut self, event: &AgentEvent, request_id: &str) {
+        let AgentEvent::Provider { payload } = event else {
+            return;
+        };
+        if payload["type"] == "error" && payload["requestId"] == request_id {
+            if let Some(message) = payload["message"]
+                .as_str()
+                .filter(|message| !message.is_empty())
+            {
+                if message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+                    || message.starts_with("FRESH_AGENT_DELIVERY_AMBIGUOUS:")
+                {
+                    self.uncertainty = Some(message.to_string());
+                    self.refusal = None;
+                } else {
+                    self.refusal = Some(message.to_string());
+                    self.uncertainty = None;
+                }
+            }
+            return;
+        }
+        if payload["type"] == "freshAgent.send.accepted" && payload["requestId"] == request_id {
+            if let Some(turn_id) = payload["submittedTurnId"]
+                .as_str()
+                .filter(|turn_id| !turn_id.is_empty())
+            {
+                self.accepted_turn = Some(turn_id.to_owned());
+            }
+        }
+        let event = payload.get("event").unwrap_or(payload);
+        if event["type"] == "freshAgent.send.uncertain" && event["requestId"] == request_id {
+            let message = event["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("Delivery could not be confirmed.");
+            self.uncertainty = Some(
+                if message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+                    || message.starts_with("FRESH_AGENT_DELIVERY_AMBIGUOUS:")
+                {
+                    message.to_string()
+                } else {
+                    format!("FRESH_AGENT_DELIVERY_AMBIGUOUS: {message}")
+                },
+            );
+            self.refusal = None;
+            return;
+        }
+        if event["type"] == "freshAgent.turn.settled"
+            && event["requestIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == request_id))
+        {
+            let status = match event["outcome"].as_str() {
+                Some("completed") => Some(HostedTurnStatus::Completed),
+                Some("failed") => Some(HostedTurnStatus::Failed),
+                Some("interrupted") => Some(HostedTurnStatus::Interrupted),
+                Some("exited") => Some(HostedTurnStatus::Exited),
+                _ => None,
+            };
+            if let Some(status) = status {
+                if status == HostedTurnStatus::Completed {
+                    // An exact successful settlement proves the send arrived.
+                    self.uncertainty = None;
+                }
+                self.refusal = None;
+                self.request_settlement = Some(ObservedHostedTurn {
+                    status: Some(status),
+                    error: event["message"]
+                        .as_str()
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_owned),
+                });
+            }
+            return;
+        }
+        if event["type"] != "freshAgent.transcript.patch" {
+            return;
+        }
+        for operation in event["ops"].as_array().into_iter().flatten() {
+            let Some(id) = operation["nativeTurnId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let turn = self.turns.entry(id.to_owned()).or_default();
+            match operation["op"].as_str() {
+                Some("resetTurn") => {
+                    let error = operation["turns"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|row| {
+                            row["error"]["message"]
+                                .as_str()
+                                .filter(|message| !message.trim().is_empty())
+                                .map(str::to_owned)
+                        });
+                    if let Some(error) = error {
+                        turn.error = Some(error);
+                        if operation["correctSettled"] == true {
+                            turn.status = Some(HostedTurnStatus::Failed);
+                        }
+                    }
+                }
+                Some("settleTurn") => match operation["status"].as_str() {
+                    Some("failed") => turn.status = Some(HostedTurnStatus::Failed),
+                    Some("interrupted") if turn.status != Some(HostedTurnStatus::Failed) => {
+                        turn.status = Some(HostedTurnStatus::Interrupted);
+                    }
+                    Some("completed") if turn.status.is_none() => {
+                        turn.status = Some(HostedTurnStatus::Completed);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn is_settled(&self) -> bool {
+        self.uncertainty.is_some()
+            || self.refusal.is_some()
+            || self.request_settlement.is_some()
+            || self
+                .accepted_turn
+                .as_ref()
+                .and_then(|turn_id| self.turns.get(turn_id))
+                .is_some_and(|turn| turn.status.is_some())
+    }
+
+    fn finish(mut self) -> HostedTurnCompletion {
+        let turn = self
+            .accepted_turn
+            .as_ref()
+            .and_then(|turn_id| self.turns.remove(turn_id))
+            .unwrap_or_default();
+        let (status, error) = if let Some(message) = self.uncertainty {
+            (Some(HostedTurnStatus::Ambiguous), Some(message))
+        } else if let Some(settlement) = self.request_settlement {
+            (settlement.status, settlement.error)
+        } else if turn.status.is_some() {
+            (turn.status, turn.error)
+        } else if let Some(message) = self.refusal {
+            (Some(HostedTurnStatus::Refused), Some(message))
+        } else {
+            (None, None)
+        };
+        HostedTurnCompletion {
+            turn_id: self.accepted_turn,
+            status,
+            error,
+        }
+    }
+}
+
 async fn wait_for_completion(
     client: &RuntimeClient,
     soul: SoulId,
     mut cursor: u64,
+    request_id: &str,
     budget: Duration,
-) -> bool {
+) -> HostedTurnCompletion {
     let deadline = tokio::time::Instant::now() + budget;
+    let mut observed = HostedTurnObservation::default();
     loop {
         let Ok(batch) = client.fresh_agent_events(soul.clone(), cursor, 128).await else {
-            return false;
+            return observed.finish();
         };
         for entry in batch.events {
             cursor = cursor.max(entry.sequence);
-            if provider_event_completes_turn(&entry.event) {
-                return true;
-            }
+            observed.observe(&entry.event, request_id);
+        }
+        if observed.is_settled() {
+            return observed.finish();
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return false;
+            return observed.finish();
         }
         tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
     }
-}
-
-pub(super) fn provider_event_completes_turn(event: &AgentEvent) -> bool {
-    let AgentEvent::Provider { payload } = event else {
-        return false;
-    };
-    let event = payload.get("event").unwrap_or(payload);
-    let event_type = event
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    event_type == "freshAgent.turn.complete"
-        || (event_type == "freshAgent.status"
-            && event.get("status").and_then(serde_json::Value::as_str) == Some("idle"))
 }

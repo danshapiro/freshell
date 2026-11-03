@@ -1,6 +1,6 @@
 import { defineConfig } from '@playwright/test'
 import baseConfig from './playwright.config.js'
-import { LOCAL_ONLY_SPECS, managedExternal } from './playwright.config.js'
+import { LOCAL_ONLY_SPECS, managedExternal, managedExternalP2G01Artifacts } from './playwright.config.js'
 import { fileURLToPath } from 'node:url'
 
 // Cloud Run Playwright config.
@@ -40,13 +40,6 @@ export const CLOUD_SKIP_SPECS = [
   'freshopencode-db-history.spec.ts',
   'freshopencode-restart-recovery.spec.ts',
   'freshopencode-first-send-reload-repro.spec.ts',
-  // Same provider-lifecycle-timing class as its model above, plus a
-  // backoff-guarded daemon respawn window: 2-CPU/2-worker cloud contention
-  // cannot guarantee daemon-death + re-warm timing. Cloud PR coverage for
-  // the incident class is carried by the cloud-legal
-  // freshopencode-snapshot-409-recovery.spec.ts; this spec is the local-lane
-  // end-to-end proof.
-  'freshopencode-daemon-death-selfheal.spec.ts',
   'opencode-restart-recovery.spec.ts',
   'opencode-terminal-restore-rust.spec.ts',
   // Requires codex binary
@@ -110,7 +103,8 @@ export default defineConfig({
   },
   reporter: [
     ['line'],
-    ['html', { open: 'never' }],
+    ['html', { open: 'never', ...(managedExternalP2G01Artifacts
+      ? { outputFolder: managedExternalP2G01Artifacts.htmlReportDir } : {}) }],
     ...(managedExternal ? [[fileURLToPath(new URL('../../scripts/testing/runtime-external-browser.ts', import.meta.url))] as const] : []),
     ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }] as const] : []),
   ],

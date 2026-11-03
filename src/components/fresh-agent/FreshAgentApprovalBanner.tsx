@@ -5,11 +5,16 @@ import { X } from 'lucide-react'
  * full message, and an optional `onDismiss` renders the X that clears the
  * owning error state — persistent error banners are dismissable, but
  * transient informational banners (e.g. "Restoring session...") omit it.
+ * Set `announce` to false when an enclosing summary already announces it.
  */
-export function FreshAgentApprovalBanner({ text, onDismiss }: { text: string; onDismiss?: () => void }) {
+export function FreshAgentApprovalBanner({ text, onDismiss, announce = true }: {
+  text: string
+  onDismiss?: () => void
+  announce?: boolean
+}) {
   return (
     <div
-      role="alert"
+      role={announce ? 'alert' : undefined}
       className="fresh-agent-banner flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
     >
       <span className="fresh-agent-banner-text min-w-0">{text}</span>

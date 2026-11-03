@@ -453,8 +453,9 @@ impl ClaudeRig {
         )
     }
 
-    /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`,
-    /// `can_use_tool`, `control`, `emission`); see `test/fixtures/claude-cli-sim/query.mjs`.
+    /// The simulator's ledger rows of one kind (`query`, `boot`, `cold`,
+    /// `prompt`, `can_use_tool`, `control`, `emission`); see
+    /// `test/fixtures/claude-cli-sim/query.mjs`.
     pub fn ledger_rows(&self, kind: &str) -> Vec<Value> {
         assert_eq!(
             self.kind,

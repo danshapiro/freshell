@@ -414,24 +414,48 @@ describe('provider notices (transcript-live D6)', () => {
     },
   )
 
-  it('keeps a replacement diagnostic while its same reading surface stays open, then gives full close grace', async () => {
+  it('keeps warning and error reading surfaces independent until expiry or dismissal', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()
     await mount(store)
     deliver(store, { type: 'freshAgent.notice', level: 'warning', code: 'FIRST', message: 'First warning' })
-    const details = screen.getByRole('alert', { name: 'Agent warning' }).closest('details')!
-    details.open = true
-    fireEvent(details, new Event('toggle', { bubbles: true }))
+    const warningDetails = screen.getByRole('alert', { name: 'Agent warning' }).closest('details')!
+    warningDetails.open = true
+    fireEvent(warningDetails, new Event('toggle', { bubbles: true }))
     await advance(0)
     deliver(store, { type: 'freshAgent.notice', level: 'error', code: 'NEXT', message: 'Replacement error' })
+    const errorDetails = screen.getByRole('alert', { name: 'Replacement error' }).closest('details')!
+    expect(errorDetails).not.toBe(warningDetails)
+    expect(warningDetails).toHaveAttribute('open')
+    errorDetails.open = true
+    fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
     await advance(10_000)
-    expect(screen.getByRole('alert')).toHaveTextContent('Replacement error')
-    details.open = false
-    fireEvent(details, new Event('toggle', { bubbles: true }))
+    expect(warningDetails.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent('First warning')
+    expect(errorDetails.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent('Replacement error')
+    errorDetails.open = false
+    fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
     await advance(5_999)
-    expect(screen.getByRole('alert')).toHaveTextContent('Replacement error')
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    expect(screen.getByRole('alert', { name: 'Replacement error' })).toHaveTextContent('Replacement error')
     await advance(2)
-    expect(screen.queryByText('Replacement error')).toBeNull()
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    expect(screen.getByRole('alert', { name: 'Replacement error' })).toHaveTextContent('Replacement error')
+    errorDetails.open = true
+    fireEvent(errorDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    expect(errorDetails.querySelector('.fresh-agent-diagnostic-body')).toHaveTextContent('Replacement error')
+    fireEvent.click(within(errorDetails).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('alert', { name: 'Replacement error' })).toBeNull()
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    warningDetails.open = false
+    fireEvent(warningDetails, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    await advance(5_999)
+    expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('First warning')
+    await advance(2)
+    expect(screen.queryByRole('alert', { name: 'Agent warning' })).toBeNull()
   })
 
   it('does not revive the open state of a removed routine disclosure', async () => {
@@ -468,7 +492,7 @@ describe('provider notices (transcript-live D6)', () => {
     expect(screen.queryByText('New settings saved')).toBeNull()
   })
 
-  it('keeps expanded provider diagnostics until the user finishes reading', async () => {
+  it('keeps provider errors after reading until the user dismisses them', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()
     await mount(store)
@@ -483,6 +507,12 @@ describe('provider notices (transcript-live D6)', () => {
     fireEvent.click(summary)
     await advance(0)
     await advance(6_001)
+    expect(summary).toBeVisible()
+    expect(summary).toHaveTextContent(message.slice(0, 160))
+    fireEvent.click(summary)
+    await advance(0)
+    expect(screen.getByText(message.trim())).toBeVisible()
+    fireEvent.click(within(summary.closest('details')!).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(message.trim())).not.toBeInTheDocument()
   })
 

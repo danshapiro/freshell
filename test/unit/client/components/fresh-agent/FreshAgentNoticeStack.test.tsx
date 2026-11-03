@@ -14,6 +14,11 @@ it('groups routine notices and preserves recovery behind an error summary', asyn
  await user.click(screen.getByText('Conversation could not load'))
  expect(button).toBeVisible(); await user.click(button); expect(retry).toHaveBeenCalledOnce()
 })
+it('shows an actionable create failure and retry without requiring disclosure expansion', () => {
+ render(<FreshAgentNoticeStack notices={[]} errors={[{id:'create',summary:'Agent could not start',initiallyExpanded:true,content:<><p>Host coding-agent starts are temporarily paused for maintenance.</p><button>Retry</button></>}]} />)
+ expect(screen.getByText('Host coding-agent starts are temporarily paused for maintenance.')).toBeVisible()
+ expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible()
+})
 it('keeps reconciliation and owner transition visible with nonempty expandable details', async () => {
  const user = userEvent.setup()
  render(<FreshAgentNoticeStack notices={[{id:'reconciliation',text:'Session corrected',prominent:true},{id:'transition',text:'Reopening elsewhere',prominent:true}]} errors={[]} />)
@@ -97,11 +102,13 @@ it('reports the already-open routine surface when a transient joins, then clears
 
 it('clears a removed diagnostic surface and derives named severity counts after updates', () => {
  const onOpen = vi.fn()
- const first = { id: 'notice', summary: 'Provider warning', level: 'warning' as const, content: <p>Original details</p>, onToggle: onOpen }
+ const first = { id: 'notice', summary: 'Provider warning', compactSummary: 'Warning', level: 'warning' as const, content: <p>Original details</p>, onToggle: onOpen }
  const { rerender } = render(<FreshAgentNoticeStack notices={[]} errors={[first, { id: 'create', summary: 'Agent could not start', content: null }]} />)
  const count = screen.getByRole('img', { name: '1 error, 1 warning' })
  expect(count).toHaveTextContent('2')
- const details = screen.getByRole('alert', { name: 'Agent warning' }).closest('details')!
+ const warning = screen.getByRole('alert', { name: 'Agent warning' })
+ expect(warning).toHaveTextContent(/^Provider warning$/)
+ const details = warning.closest('details')!
  details.open = true
  fireEvent(details, new Event('toggle', { bubbles: true }))
  expect(onOpen).toHaveBeenLastCalledWith(true)

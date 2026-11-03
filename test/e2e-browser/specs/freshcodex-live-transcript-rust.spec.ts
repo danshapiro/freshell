@@ -29,6 +29,94 @@ await import(${JSON.stringify(source)})
   await fs.chmod(file, 0o755)
 }
 
+for (const lifecycleFirst of [false, true]) test(`Freshcodex keeps the provider failure visible live and after reload${lifecycleFirst ? ' when status arrives first' : ''}`, async ({ browser }) => {
+  test.setTimeout(180_000)
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshcodex-error-'))
+  const wrapper = path.join(root, 'codex.mjs')
+  const providerMessage = 'Selected model is at capacity. Please try a different model.'
+  await installNativeWrapper(wrapper)
+  const server = new RustServer({ env: {
+    CODEX_CMD: wrapper,
+    FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+      recordTurns: true,
+      terminalItemsView: 'notLoaded',
+      turnFailure: { message: providerMessage, codexErrorInfo: 'serverOverloaded' },
+      failureLifecycleFirst: lifecycleFirst,
+    }),
+  }, setupHome: async (home) => {
+    await fs.mkdir(path.join(home, '.freshell'), { recursive: true })
+    await fs.writeFile(path.join(home, '.freshell/config.json'), JSON.stringify({ version: 1, settings: {
+      freshAgent: { enabled: true }, codingCli: { enabledProviders: ['codex'] },
+    } }))
+  } })
+  let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
+  let releaseHistory = () => {}
+  try {
+    const info = await server.start()
+    const owned = await createFreshE2ePage(browser, info)
+    context = owned.context
+    const page = owned.page
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve })
+    let holdHistory = false
+    let heldHistoryReads = 0
+    // Install the gate before opening the pane, so a request already in
+    // flight when the turn starts cannot supply the failure to the browser.
+    await page.route('**/api/fresh-agent/threads/**', async (route) => {
+      try {
+        const response = await route.fetch()
+        if (holdHistory) {
+          heldHistoryReads += 1
+          await historyGate
+        }
+        await route.fulfill({ response })
+      } catch {
+        // The page may close while an intentionally held request is pending.
+      }
+    })
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'connection/setAvailableClis', payload: { claude: false, codex: true } }))
+    const picker = await openPanePicker(page)
+    await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+    const directory = page.getByRole('combobox', { name: 'Starting directory for Freshcodex' })
+    await directory.fill(root)
+    await directory.press('Enter')
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled({ timeout: 30_000 })
+
+    // A failed completion must render before a history refresh can supply it.
+    holdHistory = true
+    await composer.fill('Continue this conversation')
+    await composer.press('Enter')
+    const error = pane.getByTestId('fresh-agent-turn-error')
+    await expect(error).toBeVisible({ timeout: 30_000 })
+    await expect.poll(() => heldHistoryReads, { timeout: 30_000 }).toBeGreaterThan(0)
+    await expect(error).toContainText(providerMessage)
+    await expect(pane.getByText('Codex completed this turn without recording an assistant response.')).toHaveCount(0)
+    await page.waitForTimeout(6_200)
+    await expect(error).toContainText(providerMessage)
+
+    holdHistory = false
+    releaseHistory()
+    await page.unroute('**/api/fresh-agent/threads/**')
+    await page.reload()
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    await expect(error).toBeVisible({ timeout: 30_000 })
+    await expect(error).toContainText(providerMessage)
+    await expect(pane.getByText('Codex completed this turn without recording an assistant response.')).toHaveCount(0)
+  } finally {
+    releaseHistory()
+    await context?.close().catch(() => {})
+    await server.stop()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 for (const terminalItemsView of ['summary', 'notLoaded']) test(`Freshcodex shows native text and command progress before ${terminalItemsView} completion, isolates hidden panes, then restores one saved answer`, async ({ browser }) => {
   test.setTimeout(180_000)
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshcodex-live-'))

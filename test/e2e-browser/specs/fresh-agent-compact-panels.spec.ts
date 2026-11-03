@@ -1,5 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import { test, expect, createFreshE2ePage } from '../helpers/fixtures.js'
+import { CLOUD_LANE_GOTO_BOUND_MS, CLOUD_LANE_HARNESS_WAIT_BOUND_MS, TestHarness, isCloudLaneWindowConfigured, selectShellFromPicker } from '../helpers/test-harness.js'
+import { CompactPanelScreenshotRetention } from '../helpers/compact-panel-screenshot-retention.js'
 import { FreshAgentSnapshotSchema } from '../../../shared/fresh-agent-contract.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -53,21 +55,41 @@ function freshAgentSnapshot(sessionType: string, provider: string, threadId: str
   }
 }
 
+type SnapshotRead = {
+  sessionType: string
+  provider: string
+  threadId: string
+  trigger: string | null
+  revision: number
+  turnIds: string[]
+  ownerKind: unknown
+  nativeHistoryAvailable: boolean
+  unattributedError: unknown
+  unattributedErrorAuthoritative: boolean
+}
+
 /** Serve schema-validated snapshots and expose request hits as a setup gate. */
-async function routeThreads(page: Page, overrides?: Record<string, unknown> | (() => Record<string, unknown>)): Promise<() => number> {
+async function routeThreads(page: Page, overrides?: Record<string, unknown> | (() => Record<string, unknown>), recordRead?: (read: SnapshotRead) => void): Promise<() => number> {
   let hits = 0
   await page.route('**/api/fresh-agent/threads/**', async (route) => {
     const url = new URL(route.request().url())
     const [, sessionType = 'freshopencode', provider = 'opencode', threadId = 'ses_e2e'] =
       url.pathname.match(/\/api\/fresh-agent\/threads\/([^/]+)\/([^/]+)\/([^/?]+)/) ?? []
+    const snapshot = FreshAgentSnapshotSchema.parse({
+      ...freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId)),
+      ...(typeof overrides === 'function' ? overrides() : overrides ?? {}),
+    })
     hits += 1
+    recordRead?.({ sessionType, provider, threadId: snapshot.threadId, trigger: url.searchParams.get('trigger'),
+      revision: snapshot.revision, turnIds: snapshot.turns.map(turn => turn.turnId),
+      ownerKind: snapshot.extensions?.codex?.ownerKind,
+      nativeHistoryAvailable: snapshot.extensions?.codex?.nativeHistoryAvailable === true,
+      unattributedError: snapshot.extensions?.codex?.unattributedProviderError,
+      unattributedErrorAuthoritative: snapshot.extensions?.codex?.unattributedProviderErrorAuthoritative === true })
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(FreshAgentSnapshotSchema.parse({
-        ...freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId)),
-        ...(typeof overrides === 'function' ? overrides() : overrides ?? {}),
-      })),
+      body: JSON.stringify(snapshot),
     })
   })
   return () => hits
@@ -121,7 +143,11 @@ function latestUserTurn() {
   return { id: 'user-1', turnId: 'user-1', role: 'user', summary: '', items: [{ id: 'message-1', kind: 'text', text: 'Latest prompt must remain readable' }] }
 }
 
-async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: (changes: Record<string, unknown>) => Promise<void> }> {
+async function seedCompactPane(page: Page, variant: Variant): Promise<{
+  update: (changes: Record<string, unknown>) => Promise<void>
+  setSnapshot: (changes: Record<string, unknown>) => void
+  snapshotReads: () => SnapshotRead[]
+}> {
   await enableFreshClientsAndOpencode(page)
   await routeFileApis(page, '/tmp')
   await page.route('**/api/fresh-agent/model-capabilities/**', route => {
@@ -140,7 +166,8 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: 
     turns: [latestUserTurn()],
     ...variant.snapshot,
   }
-  const hits = await routeThreads(page, () => current)
+  const reads: SnapshotRead[] = []
+  const hits = await routeThreads(page, () => current, read => reads.push(read))
   await page.route('**/api/fresh-agent/diff**', route => route.fulfill({ json: { diff: patch } }))
   await createFreshopencodePane(page, '/tmp')
   await page.evaluate(v => {
@@ -159,6 +186,15 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: 
   }, variant)
   await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-session-id', `compact-${variant.sessionType}`)
   await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-style', variant.style)
+  // Startup failures now open by default. This synthetic diagnostic exercises
+  // the compact, closed layout after the user collapses its details.
+  const createFailure = page.locator('[data-agent-error="create"]')
+  await expect(createFailure).toHaveAttribute('open', '')
+  const createFailureDetails = createFailure.locator('.fresh-agent-diagnostic-body')
+  await expect(createFailureDetails).toBeVisible()
+  await expect(createFailureDetails).toContainText('Detailed create diagnostic')
+  await createFailure.locator('summary').click()
+  await expect(createFailure).not.toHaveAttribute('open', '')
   if (variant.theme === 'dark') await expect(page.locator('html')).toHaveClass(/\bdark\b/)
   else await expect(page.locator('html')).not.toHaveClass(/\bdark\b/)
   await expect.poll(() => page.evaluate(() => Number(getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')))).toBe(variant.scale ?? 1)
@@ -171,9 +207,12 @@ async function seedCompactPane(page: Page, variant: Variant): Promise<{ update: 
     if (variant.provider === 'opencode') await expect(page.getByRole('button', { name: /^Diffs:/ })).toHaveCount(0)
     else await expect(page.getByRole('button', { name: 'Diffs: 30 changed files' })).toBeVisible()
   }
-  return { update: async changes => {
-    const previousHits = hits()
+  const setSnapshot = (changes: Record<string, unknown>) => {
     current = { ...current, ...changes, revision: Number(current.revision ?? 1) + 1 }
+  }
+  return { setSnapshot, snapshotReads: () => [...reads], update: async changes => {
+    const previousHits = hits()
+    setSnapshot(changes)
     const status = FreshAgentSnapshotSchema.parse({
       ...freshAgentSnapshot(variant.sessionType, variant.provider, `compact-${variant.sessionType}`),
       ...current,
@@ -288,29 +327,15 @@ async function assertUsefulSpace(page: Page): Promise<void> {
   assertUsefulSpaceSnapshot(await captureUsefulSpace(page))
 }
 
-const emittedScreenshotPaths = new Set<string>()
+const screenshotRetention = new CompactPanelScreenshotRetention()
 
 async function saveScreenshot(page: Page, path: string): Promise<boolean> {
   const bytes = await page.screenshot({ path })
-  // Cloud Run has no persistent filesystem artifact export. Retain the four
-  // existing review images, representative geometry failures, and both
-  // approved nested tiny-pane captures; avoid streaming every failed matrix
-  // cell into the logs.
-  const reviewImages = [
-    'compact-freshclaude-desktop',
-    'compact-serif-light-split',
-    'compact-mono-light-narrow',
-    'compact-phone-dark',
-    'compact-geometry-failure-painted-freshclaude-metadata-diagnostics-and-request-decisions-share-560x320',
-    'compact-geometry-failure-painted-ambiguous-Codex-delivery-keeps-the-original-prompt-and-instruction-at-390x700',
-    'compact-geometry-failure-painted-WebFetch-compact-approval-JSON-wraps-fully-at-390px',
-    'compact-geometry-failure-composer-270px-empty-compact-pane-keeps-the-complete-composer-visible-without-scrolling',
-    'compact-tiny-200px',
-    'compact-tiny-120px',
-  ]
-  if (emittedScreenshotPaths.has(path)) return true
-  if (!reviewImages.some(name => path.includes(name))) return false
-  emittedScreenshotPaths.add(path)
+  // Cloud Run has no persistent filesystem artifact export. Keep the named
+  // review images and a bounded sample of other geometry failures in logs.
+  const decision = await screenshotRetention.decide(path, test.info().project.outputDir)
+  if (decision === 'already-emitted') return true
+  if (decision === 'skip') return false
   const base64 = bytes.toString('base64')
   for (let offset = 0; offset < base64.length; offset += 12000) console.log(JSON.stringify({ event: 'compact_panel_screenshot', severity: 'INFO', path, offset, data: base64.slice(offset, offset + 12000) }))
   return true
@@ -361,6 +386,170 @@ async function hitAndClick(control: Locator): Promise<void> {
   if (!probe.hit) await saveScreenshot(control.page(), `test-results/compact-geometry-failure-hit-${test.info().title.replace(/[^a-z0-9]+/gi, '-')}.png`)
   expect(probe.hit, JSON.stringify(probe)).toBe(true)
   await control.click()
+}
+
+for (const size of [
+  { width: 390, height: 700 }, { width: 390, height: 320 },
+  { width: 450, height: 700 }, { width: 450, height: 320 },
+  { width: 451, height: 700 }, { width: 451, height: 320 },
+  { width: 560, height: 320 }, { width: 1100, height: 700 },
+]) {
+  test(`provider error cause stays readable with pending controls at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width <= 451) await page.setViewportSize({ width: size.width, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light' })
+    await page.evaluate(() => {
+      const h = window.__FRESHELL_TEST_HARNESS__!
+      const state = h.getState()
+      const tabId = state.tabs.activeTabId!
+      h.dispatch({ type: 'settings/updateSettingsLocal', payload: { sidebar: { collapsed: true } } })
+      h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: state.panes.activePane[tabId], updates: { createError: undefined } } })
+    })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+    await expect(page.locator('.fresh-agent-errors')).toHaveCount(0)
+    const unmodifiedColumns = await page.locator('.fresh-agent-top-stack').evaluate(node => ({
+      notice: node.querySelector('.fresh-agent-notices')!.getBoundingClientRect().width,
+      diff: node.querySelector('.fresh-agent-diff-panel')!.getBoundingClientRect().width,
+    }))
+    expect(unmodifiedColumns.notice).toBeGreaterThan(0)
+    expect(unmodifiedColumns.diff).toBeGreaterThan(0)
+    await page.evaluate(() => {
+      const h = window.__FRESHELL_TEST_HARNESS__!
+      h.receiveWsMessage?.({
+        type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+        event: { type: 'freshAgent.error', code: 'CODEX_PROVIDER_ERROR', message: 'Selected model is at capacity. Please try a different model.' },
+      })
+    })
+
+    const summary = page.locator('[data-agent-error="session"] summary')
+    await expect(summary).toBeVisible()
+    await expect(summary).toContainText('Selected model is at capacity')
+    const cause = await summary.evaluate(element => {
+      const text = element.querySelector('[role="alert"]')?.firstChild
+      const needle = 'Selected model is at capacity'
+      if (!(text instanceof Text)) return { readable: false, reason: 'missing summary text' }
+      const start = text.data.indexOf(needle)
+      if (start < 0) return { readable: false, reason: 'missing provider cause' }
+      const range = document.createRange()
+      range.setStart(text, start)
+      range.setEnd(text, start + needle.length)
+      const rects = Array.from(range.getClientRects())
+      const clips: DOMRect[] = []
+      for (let ancestor: Element | null = element; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor)
+        if (/(auto|hidden|scroll|clip)/.test(style.overflowX) || /(auto|hidden|scroll|clip)/.test(style.overflowY)) {
+          clips.push(ancestor.getBoundingClientRect())
+        }
+      }
+      const readable = rects.length > 0 && rects.every(rect => rect.width > 0 && rect.height > 0
+        && rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0 && rect.bottom <= window.innerHeight
+        && clips.every(clip => rect.left >= clip.left - 1 && rect.right <= clip.right + 1 && rect.top >= clip.top - 3 && rect.bottom <= clip.bottom + 3))
+      return { readable, rects: rects.map(({ x, y, width, height }) => ({ x, y, width, height })),
+        clips: clips.map(({ x, y, width, height }) => ({ x, y, width, height })) }
+    })
+    expect(cause.readable, JSON.stringify(cause)).toBe(true)
+    await expect(page.getByRole('status', { name: '3 pending requests' })).toBeVisible()
+    if (size.width === 390 && size.height === 320) {
+      const count = await page.locator('.fresh-agent-request-count').evaluate(element => {
+        const style = getComputedStyle(element, '::after')
+        const text = style.content.slice(1, -1)
+        const canvas = document.createElement('canvas')
+        const context = canvas.getContext('2d')!
+        context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+        return { text, needed: context.measureText(text).width, available: element.getBoundingClientRect().width }
+      })
+      expect(count.text).toBe('3 pending')
+      expect(count.needed).toBeLessThanOrEqual(count.available)
+    }
+    await expect(page.getByRole('status', { name: 'Agent notices' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Diffs: 30 changed files' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Yes', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Allow tool use' })).toBeVisible()
+    await assertUsefulSpace(page)
+    const notice = page.getByRole('status', { name: 'Agent notices' }).locator('summary')
+    await hitAndClick(notice)
+    await expect(notice.locator('..')).toHaveAttribute('open')
+    await hitAndClick(notice)
+    await hitAndClick(page.getByRole('button', { name: 'Diffs: 30 changed files' }))
+    const changes = page.getByRole('dialog', { name: 'Changes' })
+    await expect(changes).toBeVisible()
+    await changes.getByRole('button', { name: 'Close', exact: true }).click()
+    await hitAndClick(summary)
+    await hitAndClick(page.locator('[data-agent-error="session"]').getByRole('button', { name: 'Dismiss' }))
+    await expect(page.locator('.fresh-agent-errors')).toHaveCount(0)
+    const restoredColumns = await page.locator('.fresh-agent-top-stack').evaluate(node => ({
+      notice: node.querySelector('.fresh-agent-notices')!.getBoundingClientRect().width,
+      diff: node.querySelector('.fresh-agent-diff-panel')!.getBoundingClientRect().width,
+    }))
+    expect(restoredColumns.notice).toBeCloseTo(unmodifiedColumns.notice, 0)
+    expect(restoredColumns.diff).toBeCloseTo(unmodifiedColumns.diff, 0)
+    await hitAndClick(page.getByRole('button', { name: 'Yes', exact: true }))
+    await hitAndClick(page.getByRole('button', { name: 'Allow tool use' }))
+  })
+}
+
+for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
+  test(`compact Codex capacity error stays reachable beside another error at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', populated: true, style: 'sans', theme: 'light' })
+    await page.evaluate(() => {
+      const h = window.__FRESHELL_TEST_HARNESS__!
+      const state = h.getState()
+      const tabId = state.tabs.activeTabId!
+      h.dispatch({ type: 'settings/updateSettingsLocal', payload: { sidebar: { collapsed: true } } })
+      h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: state.panes.activePane[tabId],
+        updates: { createError: undefined, closeError: 'Second actionable diagnostic' } } })
+    })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+
+    const pane = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
+    const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+    const draft = 'Keep this unsent draft while checking the provider error'
+    await composer.fill(draft)
+    const providerMessage = 'Selected model is at capacity. Please try a different model.'
+    await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message },
+    }), providerMessage)
+
+    const errors = pane.getByRole('region', { name: 'Agent errors' })
+    await expect(errors.getByRole('img', { name: '2 errors' })).toHaveText('2')
+    const providerError = errors.locator('[data-agent-error="notice"]')
+    const otherError = errors.locator('[data-agent-error="close"]')
+    const providerSummary = providerError.locator('summary')
+    const spaceGeometry = await logUsefulSpace(page)
+    await assertPaintedTogether([
+      providerSummary.getByRole('alert'),
+      otherError.locator('summary').getByRole('alert'),
+    ], spaceGeometry)
+    await assertUsefulSpace(page)
+    await expect(composer).toHaveValue(draft)
+
+    // Error notices must remain available beyond the transient notice window.
+    await page.waitForTimeout(6_200)
+    await expect(providerError).toBeVisible()
+    await hitAndClick(providerSummary)
+    const providerDetails = providerError.locator('.fresh-agent-diagnostic-body')
+    const providerMessageText = providerDetails.getByText(providerMessage, { exact: true })
+    await expect(providerMessageText).toBeVisible()
+    await providerMessageText.scrollIntoViewIfNeeded()
+    await assertPainted(providerMessageText)
+    await expect(composer).toHaveValue(draft)
+    await hitAndClick(providerDetails.getByRole('button', { name: 'Dismiss', exact: true }))
+    await expect(providerError).toHaveCount(0)
+    await expect(otherError).toBeVisible()
+
+    const requests = pane.getByRole('region', { name: 'Pending requests' })
+    await hitAndClick(requests.getByRole('button', { name: 'Yes', exact: true }))
+    await hitAndClick(requests.getByRole('button', { name: 'Allow tool use', exact: true }))
+    await expect(composer).toHaveValue(draft)
+    await assertUsefulSpace(page)
+  })
 }
 
 async function measurePainted(control: Locator) {
@@ -780,8 +969,20 @@ for (const height of [200, 120]) test(`nested ${height}px panes retain requests 
   const name = stack.getByRole('textbox', {name:'Name'})
   await hitAndClick(name); await name.fill('Dan')
   await hitAndClick(stack.getByRole('button', {name:'Continue',exact:true}))
-  await hitAndClick(stack.locator('[data-agent-error="create"] summary'))
-  await hitAndClick(stack.getByRole('button', {name:'Dismiss',exact:true}))
+  const createError = stack.locator('[data-agent-error="create"]')
+  const createSummary = createError.locator('summary')
+  await expect(createSummary).toContainText('Detailed create diagnostic')
+  if (!await createError.evaluate(element => (element as HTMLDetailsElement).open)) {
+    await hitAndClick(createSummary)
+  }
+  await expect(createError).toHaveAttribute('open', '')
+  const createDetails = createError.locator('.fresh-agent-diagnostic-body')
+  await expect(createDetails).toContainText('Detailed create diagnostic')
+  const dismissCreateError = createDetails.getByRole('button', {name:'Dismiss',exact:true})
+  await dismissCreateError.scrollIntoViewIfNeeded()
+  await expect(dismissCreateError).toBeVisible()
+  await hitAndClick(dismissCreateError)
+  await expect(createError).toHaveCount(0)
   await hitAndClick(stack.getByRole('button', {name:'Diffs: 30 changed files'}))
   await expect(page.getByRole('dialog', {name:'Changes'})).toBeVisible()
   await page.keyboard.press('Escape')
@@ -1361,6 +1562,402 @@ test('Codex multi-turn projection keeps all session files across native patch ch
   await assertSessionRows()
 })
 
+test('retained unattributed Codex errors remain visible after a browser reload', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const message = 'Selected model is at capacity. Please try a different model.'
+  const state = await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light',
+    snapshot: { extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent', unattributedProviderError: message } } } })
+  const error = page.locator('[data-agent-error="codex-unattributed"]')
+  await expect(error.locator('summary')).toContainText(message)
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+
+  // A canonical saved session reference lets the normal pane restore path
+  // re-read the retained snapshot after the document is recreated.
+  const sessionId = '6eaf5e4c-708e-4aba-a7c0-2926e061f925'
+  await page.evaluate(id => {
+    const h = window.__FRESHELL_TEST_HARNESS__!; const s = h.getState(); const tabId = s.tabs.activeTabId!; const paneId = s.panes.activePane[tabId]
+    const content = (s.panes.layouts[tabId] as { content: Record<string, unknown> }).content
+    h.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content: { ...content, sessionId: id, sessionRef: { provider: 'codex', sessionId: id }, resumeSessionId: id } } })
+  }, sessionId)
+  await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-session-id', sessionId)
+  await expect.poll(() => page.evaluate(id => Object.keys(localStorage).some(key => key.startsWith('freshell.layout.v3.') && localStorage.getItem(key)?.includes(id)), sessionId)).toBe(true)
+  await page.addInitScript(() => {
+    ;(window as typeof window & { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = true
+  })
+  // The snapshots model a live Codex session, but its synthetic UUID does not
+  // exist on the fixture server. Model the matching live reconcile verdict too,
+  // leaving every other pane and WebSocket frame on the real server path.
+  const requests = new Map<string, string>()
+  const reconciled: Array<{ reconcileId: string; paneKey: string; originalVerdict: string }> = []
+  await page.routeWebSocket('**/ws', client => {
+    const server = client.connectToServer()
+    client.onMessage(data => {
+      try {
+        const frame = JSON.parse(String(data)) as { type?: string; reconcileId?: string;
+          panes?: Array<{ paneKey: string; kind?: string; sessionRef?: { provider?: string; sessionId?: string } }> }
+        const pane = frame.panes?.find(entry => entry.kind === 'fresh-agent'
+          && entry.sessionRef?.provider === 'codex' && entry.sessionRef.sessionId === sessionId)
+        if (frame.type === 'pane.reconcile.request' && frame.reconcileId && pane) requests.set(frame.reconcileId, pane.paneKey)
+      } catch {
+        // Non-JSON frames still pass through to the server.
+      }
+      server.send(data)
+    })
+    server.onMessage(data => {
+      let outgoing = data
+      try {
+        const frame = JSON.parse(String(data)) as { type?: string; reconcileId?: string;
+          verdicts?: Array<{ paneKey: string; verdict: string }> }
+        const paneKey = frame.reconcileId ? requests.get(frame.reconcileId) : undefined
+        const original = frame.verdicts?.find(verdict => verdict.paneKey === paneKey)
+        if (frame.type === 'pane.reconcile.result' && frame.reconcileId && paneKey && original) {
+          reconciled.push({ reconcileId: frame.reconcileId, paneKey, originalVerdict: original.verdict })
+          frame.verdicts = frame.verdicts!.map(verdict => verdict.paneKey === paneKey
+            ? { paneKey, verdict: 'attach', sessionRef: { provider: 'codex', sessionId } } : verdict)
+          outgoing = JSON.stringify(frame)
+        }
+      } catch {
+        // Non-JSON frames still pass through to the browser.
+      }
+      client.send(outgoing)
+    })
+    client.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
+    server.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
+  })
+  await page.reload()
+  await expect(error.locator('summary')).toContainText(message, { timeout: 30_000 })
+  await expect.poll(() => reconciled.length, { message: 'the restored synthetic pane must receive its matching live reconcile verdict' }).toBeGreaterThan(0)
+  expect(requests.get(reconciled[0].reconcileId)).toBe(reconciled[0].paneKey)
+  await expect.poll(() => page.evaluate(({ reconcileId, paneKey, sessionId }) => (
+    (window.__FRESHELL_TEST_HARNESS__!.getReceivedWsMessages?.() ?? []).some(entry => {
+      const frame = entry as { type?: string; reconcileId?: string;
+        verdicts?: Array<{ paneKey?: string; verdict?: string; sessionRef?: { provider?: string; sessionId?: string } }> }
+      return frame.type === 'pane.reconcile.result' && frame.reconcileId === reconcileId
+        && frame.verdicts?.some(verdict => verdict.paneKey === paneKey && verdict.verdict === 'attach'
+          && verdict.sessionRef?.provider === 'codex' && verdict.sessionRef.sessionId === sessionId)
+    })
+  ), { reconcileId: reconciled[0].reconcileId, paneKey: reconciled[0].paneKey, sessionId }),
+  { message: 'the browser must apply the live reconcile result for the restored session' }).toBe(true)
+  await expect(page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)')).toHaveAttribute('data-session-id', sessionId)
+  await hitAndClick(error.locator('summary'))
+  await expect(error).toContainText('the associated turn could not be confirmed')
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+
+  const savedHistory = { id: 'saved-answer', turnId: 'saved-answer', role: 'assistant', summary: 'Saved history is still available',
+    items: [{ id: 'saved-answer-text', kind: 'text', text: 'Saved history is still available' }] }
+  const readsBeforeHistory = state.snapshotReads().length
+  state.setSnapshot({ turns: [latestUserTurn(), savedHistory],
+    extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true } } })
+  await page.evaluate(id => {
+    const receive = window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage
+    if (!receive) throw new Error('The test harness cannot deliver a FreshAgent event')
+    receive({ type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: 2 } })
+  }, sessionId)
+  await expect.poll(() => state.snapshotReads().slice(readsBeforeHistory).some(read => read.threadId === sessionId
+    && read.trigger === 'event' && read.revision === 2 && read.ownerKind === 'vacant'
+    && read.nativeHistoryAvailable && read.turnIds.join(',') === 'user-1,saved-answer'
+    && read.unattributedError === undefined && !read.unattributedErrorAuthoritative),
+  { message: 'the event must fetch the saved-only history for the restored session' }).toBe(true)
+  await expect(page.getByText('Saved history is still available', { exact: true })).toBeVisible()
+  await expect(error.locator('summary')).toBeVisible()
+  await expect(error.locator('summary')).toContainText(message)
+
+  const readsBeforeClear = state.snapshotReads().length
+  state.setSnapshot({ extensions: { codex: { ownerKind: 'vacant', nativeHistoryAvailable: true, unattributedProviderErrorAuthoritative: true } } })
+  await page.evaluate(id => {
+    const receive = window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage
+    if (!receive) throw new Error('The test harness cannot deliver a FreshAgent event')
+    receive({ type: 'freshAgent.event', sessionId: id, sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.notice', level: 'info', code: 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED', message: 'The provider warning was cleared.' } })
+  }, sessionId)
+  await expect.poll(() => state.snapshotReads().slice(readsBeforeClear).some(read => read.threadId === sessionId
+    && read.trigger === 'event' && read.revision === 3 && read.ownerKind === 'vacant'
+    && read.nativeHistoryAvailable && read.turnIds.join(',') === 'user-1,saved-answer'
+    && read.unattributedError === undefined && read.unattributedErrorAuthoritative),
+  { message: 'the clear notice must fetch the authoritative saved-only diagnostic state' }).toBe(true)
+  await expect(error).toHaveCount(0)
+  await expect(page.getByText('The provider warning was cleared.', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Saved history is still available', { exact: true })).toBeVisible()
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+})
+
+test('a pending Codex error stays visible until the failed turn is shown', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const message = 'Selected model is at capacity. Please try a different model.'
+  const turnId = 'pending-capacity-turn'
+  const state = await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light',
+    snapshot: { extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent', pendingProviderError: { turnId, message } } } } })
+  const pending = page.locator('[data-agent-error="codex-pending"]')
+  await expect(pending.locator('summary')).toContainText(message)
+  await expect(page.getByTestId('fresh-agent-turn-error')).toHaveCount(0)
+
+  state.setSnapshot({ turns: [latestUserTurn(), { id: turnId, turnId, role: 'assistant', summary: '', items: [],
+    error: { name: 'CodexError', message } }],
+  extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent' } } })
+  await page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+    event: { type: 'freshAgent.notice', level: 'info', code: 'CODEX_PENDING_PROVIDER_ERROR_CLEARED', turnId: id, outcome: 'failed', message: 'The provider warning was cleared.' },
+  }), turnId)
+  await expect(pending).toHaveCount(0)
+  await expect(page.getByTestId('fresh-agent-turn-error')).toContainText(message)
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
+test('two browsers keep repeated answer errors scoped to their attempts', async ({ freshellPage, page, terminal, browser, serverInfo }) => {
+  test.setTimeout(180_000)
+  void freshellPage
+  await terminal.waitForTerminal()
+  // Separate contexts have independent Redux stores and machines. Both panes
+  // observe the same simulated managed session through the normal UI/WS path.
+  const peer = await createFreshE2ePage(browser, serverInfo)
+  const peerHarness = new TestHarness(peer.page)
+  try {
+    await peer.page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`, { timeout: CLOUD_LANE_GOTO_BOUND_MS })
+    await peerHarness.waitForHarness(CLOUD_LANE_HARNESS_WAIT_BOUND_MS)
+    await peerHarness.waitForConnection(undefined, { selfHealReload: isCloudLaneWindowConfigured() })
+    await selectShellFromPicker(peer.page)
+    const variant = { sessionType: 'freshcodex', provider: 'codex', style: 'sans' as const, theme: 'light' as const,
+      snapshot: { status: 'running', pendingApprovals: [], pendingElicitations: [] } }
+    const firstState = await seedCompactPane(page, variant)
+    const peerState = await seedCompactPane(peer.page, variant)
+    await firstState.update({ status: 'running' })
+    await peerState.update({ status: 'running' })
+    const pages = [page, peer.page]
+    const sessionId = 'compact-freshcodex'
+    const requestId = 'question-1'
+    const replies = async (target: Page) => target.evaluate(() =>
+      (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+        ?.filter(frame => frame.type === 'freshAgent.question.respond') ?? [])
+    const broadcast = async (event: Record<string, unknown>) => {
+      await Promise.all(pages.map(target => target.evaluate(value => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+        type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex', sessionId: 'compact-freshcodex', event: value,
+      }), event)))
+    }
+    const showOnBoth = async (message: string) => {
+      for (const target of pages) await expect(target.locator('[data-agent-error="session"] summary')).toContainText(message)
+    }
+    const absentOnBoth = async (message: string) => {
+      for (const target of pages) await expect.poll(async () =>
+        (await target.locator('[data-agent-error="session"]').allTextContents()).join(' ')).not.toContain(message)
+    }
+    for (const target of pages) {
+      await target.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+      await expect(target.getByRole('region', { name: 'Question from Codex' }).getByRole('button', { name: 'Yes', exact: true })).toBeEnabled()
+      await expect(target.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+    }
+
+    const answer = async (count: number) => {
+      await page.getByRole('region', { name: 'Question from Codex' }).getByRole('button', { name: 'Yes', exact: true }).click()
+      await expect.poll(async () => (await replies(page)).length).toBe(count)
+      expect((await replies(page)).at(-1)).toMatchObject({ sessionId, requestId, answers: { 'Continue?': 'Yes' } })
+      expect(await replies(peer.page)).toEqual([])
+    }
+    const started = (operationAttemptId: string, operationJournalSequence: number) => ({
+      type: 'freshAgent.operation.started', requestId, operationAttemptId,
+      operationJournalId: 'answer-journal', operationJournalSequence,
+    })
+    const firstRefusal = { type: 'freshAgent.error', requestId, operationAttemptId: 'answer-attempt-1', operationReceipt: true,
+      code: 'INVALID_ANSWER', message: 'The first answer was rejected.' }
+    await answer(1)
+    await broadcast(started('answer-attempt-1', 1))
+    await broadcast(firstRefusal)
+    await showOnBoth(firstRefusal.message)
+
+    await answer(2)
+    // Only the initiating store has seen the click until this start reaches
+    // both clients. The observer must stop associating the old provider error
+    // with the new attempt as soon as it sees the broadcast.
+    await expect(peer.page.locator('[data-agent-error="session"] summary')).toContainText(firstRefusal.message)
+    await broadcast(started('answer-attempt-2', 2))
+    await absentOnBoth(firstRefusal.message)
+    const uncertain = { type: 'freshAgent.error', requestId, operationAttemptId: 'answer-attempt-2', operationReceipt: true,
+      operationFallback: true, operationOutcomeUncertain: true, code: 'COMMAND_AMBIGUOUS',
+      message: 'Sending the answer could not be confirmed.' }
+    await broadcast(uncertain)
+    await showOnBoth(uncertain.message)
+    await absentOnBoth(firstRefusal.message)
+
+    // An old host receipt can arrive late or be replayed after attachment;
+    // neither may replace the current attempt's result in either store.
+    const late = { ...firstRefusal, message: 'A delayed first-attempt receipt.' }
+    await broadcast(late)
+    await broadcast({ ...late, operationReceiptReplay: true })
+    await showOnBoth(uncertain.message)
+    await absentOnBoth(late.message)
+
+    await answer(3)
+    await broadcast(started('answer-attempt-3', 3))
+    const definite = { type: 'freshAgent.error', requestId, operationAttemptId: 'answer-attempt-3', operationReceipt: true,
+      operationFallback: true, code: 'IMPLEMENTATION_UNAVAILABLE', message: 'The latest answer could not be sent.' }
+    await broadcast(definite)
+    await showOnBoth(definite.message)
+    await showOnBoth('Earlier attempt:')
+    await showOnBoth(uncertain.message)
+    await broadcast(late)
+    await showOnBoth(definite.message)
+    await showOnBoth(uncertain.message)
+    await absentOnBoth(firstRefusal.message)
+    await absentOnBoth(late.message)
+    for (const target of pages) {
+      await expect(target.getByRole('region', { name: 'Question from Codex' })).toBeVisible()
+      await expect(target.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+    }
+    expect(await replies(peer.page)).toEqual([])
+
+    // Client coverage of a replayed in-progress answer. The real managed
+    // attach and journal replay are covered by the gateway tests.
+    const pendingMessage = 'The answer is still being processed. Its outcome is not yet confirmed.'
+    await broadcast({ ...started('answer-attempt-4', 4), operationAttemptReplay: true, operationPending: true })
+    await showOnBoth(pendingMessage)
+    firstState.setSnapshot({ pendingQuestions: [] })
+    peerState.setSnapshot({ pendingQuestions: [] })
+    await broadcast({ type: 'freshAgent.question.cancelled', requestId })
+    await absentOnBoth(pendingMessage)
+    for (const target of pages) {
+      await expect(target.getByRole('region', { name: 'Question from Codex' })).toHaveCount(0)
+      await expect(target.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+    }
+  } finally {
+    await peerHarness.killAllTerminals(serverInfo)
+    await peer.context.close()
+  }
+})
+
+for (const fallbackFirst of [true, false]) test(`managed control keeps the provider cause and uncertain outcome with pending requests (fallback first: ${fallbackFirst})`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light' })
+  await state.update({ status: 'running' })
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+  const fallback = { type: 'freshAgent.error', requestId: 'question-1', code: 'COMMAND_AMBIGUOUS', operationReceipt: true,
+    operationFallback: true, operationOutcomeUncertain: true, message: 'Sending the answer could not be confirmed.' }
+  const native = { type: 'freshAgent.error', requestId: 'question-1', code: 'INVALID_ANSWER', operationReceipt: true,
+    message: 'Choose an offered answer.' }
+  await page.evaluate(events => {
+    for (const event of events) window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex', sessionId: 'compact-freshcodex', event,
+    })
+  }, fallbackFirst ? [fallback, native] : [native, fallback])
+  const error = page.locator('[data-agent-error="session"] summary')
+  await expect(error).toContainText('Choose an offered answer.')
+  await expect(error).toContainText('Sending the answer could not be confirmed.')
+  await expect(page.getByRole('status', { name: '3 pending requests' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Yes', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+})
+
+test('a reserved OpenCode compact reports its cause without retrying an attachment', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType: 'freshopencode', provider: 'opencode', style: 'sans', theme: 'light' })
+  await state.update({ status: 'running' })
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+  const composer = page.getByRole('textbox', { name: 'Chat message input' })
+  await composer.fill('/compact')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.compact').length ?? 0)).toBe(1)
+  const requestId = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>>)
+    .find(frame => frame.type === 'freshAgent.compact')?.requestId)
+  expect(requestId).toEqual(expect.any(String))
+  await page.evaluate(id => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    harness.clearSentWsMessages?.()
+    harness.receiveWsMessage?.({ type: 'freshAgent.event', sessionType: 'freshopencode', provider: 'opencode', sessionId: 'compact-freshopencode',
+      event: { type: 'freshAgent.error', code: 'SESSION_RESERVED', requestId: id as string, operationReceipt: true,
+        message: 'The conversation is reserved for a handoff.' } })
+  }, requestId)
+  await expect(page.locator('[data-agent-error="session"] summary')).toContainText('The conversation is reserved for a handoff.')
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled()
+  // The attach-only redrive fires after one second; observe past that window.
+  await page.waitForTimeout(1_250)
+  const sent = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+  expect(sent?.filter(frame => frame.type === 'freshAgent.attach' || frame.type === 'pane.reconcile.request') ?? []).toEqual([])
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
+for (const fallbackFirst of [true, false]) test(`OpenCode Stop shows its provider error and uncertainty (fallback first: ${fallbackFirst})`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType: 'freshopencode', provider: 'opencode', style: 'sans', theme: 'light' })
+  await state.update({ status: 'running' })
+  const stop = page.getByRole('button', { name: 'Stop', exact: true })
+  await expect(stop).toBeEnabled()
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+  await stop.click()
+  await expect.poll(() => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.interrupt').length ?? 0)).toBe(1)
+  const requestId = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>>)
+    .find(frame => frame.type === 'freshAgent.interrupt')?.requestId)
+  expect(requestId).toEqual(expect.any(String))
+  const provider = { type: 'freshAgent.operation.error', requestId, code: 'OPENCODE_INTERRUPT_FAILED', operationReceipt: true,
+    operationOutcomeUncertain: true, message: 'The connection to OpenCode failed while stopping the turn.' }
+  const fallback = { type: 'freshAgent.error', requestId, code: 'COMMAND_AMBIGUOUS', operationReceipt: true,
+    operationFallback: true, operationOutcomeUncertain: true, message: 'Stopping the agent could not be confirmed.' }
+  await page.evaluate(events => {
+    for (const event of events) window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionType: 'freshopencode', provider: 'opencode', sessionId: 'compact-freshopencode', event,
+    })
+  }, fallbackFirst ? [fallback, provider] : [provider, fallback])
+  const error = page.locator('[data-agent-error="session"] summary')
+  await expect(error).toContainText('The connection to OpenCode failed while stopping the turn.')
+  await expect(error).toContainText('could not be confirmed')
+  await expect(stop).toBeEnabled()
+  await expect(page.getByText('Latest prompt must remain readable', { exact: true })).toBeVisible()
+})
+
+for (const { sessionType, provider } of [
+  { sessionType: 'freshclaude', provider: 'claude' },
+  { sessionType: 'freshopencode', provider: 'opencode' },
+]) test(`${provider} uncertain delivery keeps the draft and follow-up without resending`, async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const state = await seedCompactPane(page, { sessionType, provider, style: 'sans', theme: 'light' })
+  const composer = page.getByRole('textbox', { name: 'Chat message input' })
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+  await composer.fill('The original request')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.send').length ?? 0)).toBe(1)
+  const requestId = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>>)
+    .find(frame => frame.type === 'freshAgent.send')?.requestId)
+  expect(requestId).toEqual(expect.any(String))
+  await composer.fill('The queued follow-up')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await page.getByRole('button', { name: 'Show queued messages' }).click()
+  await expect(page.getByText('The queued follow-up', { exact: true })).toBeVisible()
+  await composer.fill('A newer draft')
+  await page.evaluate(({ sessionType, provider, requestId }) => {
+    const sessionId = `compact-${sessionType}`
+    window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionType, provider, sessionId,
+      event: { type: 'freshAgent.send.uncertain', sessionId, requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: The provider could not confirm delivery.' },
+    })
+  }, { sessionType, provider, requestId })
+  await expect(page.getByRole('alert', { name: 'Agent warning' })).toContainText('Delivery is uncertain')
+  const warningSummary = page.locator('[data-agent-error="notice"] summary')
+  await hitAndClick(warningSummary)
+  await expect(warningSummary.locator('..').locator('.fresh-agent-diagnostic-body'))
+    .toContainText(`Delivery uncertain (${requestId}): The provider could not confirm delivery.`)
+  await hitAndClick(warningSummary)
+  await expect(composer).toHaveValue('The original request\nA newer draft')
+  await expect(page.getByText('The queued follow-up', { exact: true })).toBeVisible()
+  await state.update({ status: 'idle' })
+  await expect(page.getByText('The queued follow-up', { exact: true })).toBeVisible()
+  const sends = await page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.send') ?? [])
+  expect(sends).toHaveLength(1)
+  expect(sends[0]).toMatchObject({ requestId, sessionId: `compact-${sessionType}`, text: 'The original request' })
+})
+
 test('routed OpenCode daemon loss exposes diagnostic and keeps the conversation recoverable', async ({ freshellPage, page, terminal }) => {
   void freshellPage
   await terminal.waitForTerminal()
@@ -1372,8 +1969,8 @@ test('routed OpenCode daemon loss exposes diagnostic and keeps the conversation 
     event: { type: 'freshAgent.error', code: 'OPENCODE_DAEMON_LOST', message: 'The opencode serve daemon was lost unexpectedly' },
   }))
   const error = page.locator('[data-agent-error="session"]')
-  await expect(error.getByRole('alert')).toHaveText('Agent error')
-  await expect(error.getByText('Agent error: The opencode serve daemon was lost unexpectedly', { exact: true })).toBeHidden()
+  await expect(error.locator('summary')).toContainText('The opencode serve daemon was lost unexpectedly')
+  await expect(error.locator('.fresh-agent-diagnostic-body')).toBeHidden()
   await hitAndClick(error.locator('summary'))
   await expect(error).toContainText('The opencode serve daemon was lost unexpectedly')
   await state.update({ status: 'idle' })
@@ -1444,7 +2041,7 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
     }))
     const stack = page.getByRole('group', { name: 'Agent requests and status' })
     await stack.getByText('Notice details', {exact: true}).click()
-    await stack.getByText('Agent could not start', {exact: true}).click()
+    await stack.locator('[data-agent-error="create"] summary').click()
     const body = stack.locator('[data-agent-error="create"] .fresh-agent-diagnostic-body')
     await body.scrollIntoViewIfNeeded()
     const geometry = await body.evaluate(el => {
@@ -1519,6 +2116,63 @@ for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
   })
 }
 
+test('a provider error and uncertain delivery remain independently reachable', async ({ freshellPage, page, terminal }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  await seedCompactPane(page, {
+    sessionType: 'freshcodex', provider: 'codex', style: 'sans', theme: 'light',
+    snapshot: { pendingApprovals: [], pendingQuestions: [], pendingElicitations: [] },
+  })
+  await fitRoot(page, { width: 800, height: 900 })
+  await page.evaluate(() => {
+    const h = window.__FRESHELL_TEST_HARNESS__!
+    const state = h.getState()
+    const tabId = state.tabs.activeTabId!
+    h.dispatch({ type: 'panes/mergePaneContent', payload: {
+      tabId, paneId: state.panes.activePane[tabId], updates: { createError: undefined, reconcileNotice: undefined },
+    } })
+  })
+  const pane = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
+  const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+  const prompt = 'Keep this original uncertain prompt'
+  await composer.fill(prompt)
+  await hitAndClick(pane.getByRole('button', { name: 'Send', exact: true }))
+  const sends = async () => page.evaluate(() => (window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() as Array<Record<string, unknown>> | undefined)
+    ?.filter(frame => frame.type === 'freshAgent.send') ?? [])
+  await expect.poll(sends).toHaveLength(1)
+  const [sent] = await sends()
+  expect(sent.requestId).toEqual(expect.any(String))
+  const requestId = sent.requestId as string
+
+  const diagnostic = 'Selected model is at capacity. Please try a different model.'
+  await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+    event: { type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message },
+  }), diagnostic)
+  await expect(pane.getByRole('alert', { name: diagnostic })).toBeVisible()
+  await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+    type: 'error', code: 'INTERNAL_ERROR', requestId,
+    message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+  }), requestId)
+
+  const providerAlert = pane.getByRole('alert', { name: diagnostic })
+  const warning = pane.getByRole('alert', { name: 'Agent warning' })
+  await expect(providerAlert).toBeVisible()
+  await expect(warning).toContainText('Delivery is uncertain')
+  await expect(composer).toHaveValue(prompt)
+  expect(await sends()).toHaveLength(1)
+
+  const providerSummary = providerAlert.locator('..')
+  await hitAndClick(providerSummary)
+  await expect(providerSummary.locator('..').locator('.fresh-agent-diagnostic-body').getByText(diagnostic, { exact: true })).toBeVisible()
+  await hitAndClick(providerSummary)
+  const warningSummary = warning.locator('..')
+  await hitAndClick(warningSummary)
+  await expect(warningSummary.locator('..').locator('.fresh-agent-diagnostic-body')).toContainText('response was lost')
+  await expect(composer).toHaveValue(prompt)
+  expect(await sends()).toHaveLength(1)
+})
+
 test('Changes closes on programmatic and keyboard tab switches', async ({ freshellPage, page, terminal }) => {
   void freshellPage
   await terminal.waitForTerminal()
@@ -1559,10 +2213,10 @@ test('short panes keep warning summary text readable', async ({ freshellPage, pa
     const range = document.createRange(); range.selectNodeContents(el)
     const rects = [...range.getClientRects()]
     const parent = el.closest('.fresh-agent-errors')!.getBoundingClientRect()
-    return { textRects: rects.length, fullyVisible: rects.every(rect => rect.top >= parent.top && rect.bottom <= parent.bottom && rect.left >= parent.left && rect.right <= parent.right) }
+    return { textRects: rects.length, fullyVisible: rects.every(rect => rect.top >= parent.top && rect.bottom <= parent.bottom && rect.left >= parent.left && rect.right <= parent.right), rects: rects.map(({ x, y, width, height }) => ({ x, y, width, height })), parent: { x: parent.x, y: parent.y, width: parent.width, height: parent.height } }
   })
   expect(geometry.textRects).toBeGreaterThan(0)
-  expect(geometry.fullyVisible).toBe(true)
+  expect(geometry.fullyVisible, JSON.stringify(geometry)).toBe(true)
   await assertUsefulSpace(page)
 })
 
