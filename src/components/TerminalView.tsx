@@ -428,11 +428,15 @@ const DEAD_SESSION_BUFFER_NOTICES = {
     "[This pane's saved session no longer exists on disk - close this pane or start a new one]",
   respawnExhausted:
     "[This pane's saved session could not be resumed - close this pane or start a new one]",
-  // Unreadable-store line (auto-restore-warming delta fix, finding 1): the
-  // session is PRESERVED and recovery is a reconnect retry — the copy must
-  // never read as a loss. Plain and honest, no jargon.
+  // Unreadable-store line (auto-restore-warming delta fix, finding 1;
+  // focused review round 3, finding 2): the copy claims ONLY what the
+  // verdict proves — the session IDENTITY is preserved; the saved
+  // conversation itself may be lost if the store is damaged (the verdict
+  // proves the record reference survived, never that the store content
+  // did). Recovery is a reconnect retry once the store is readable.
+  // Plain and honest, no jargon, no unproven safety claim.
   storeUnreadable:
-    "[This pane's saved session store could not be read - the session is preserved; reconnect to retry once the store is readable]",
+    "[This pane's saved session store could not be read - the session identity is preserved, but its saved conversation may be lost; reconnect to retry once the store is readable]",
 } as const
 
 /** Buffer-line variant for a durable restore-notice mint (category match). */

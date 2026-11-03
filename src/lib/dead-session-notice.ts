@@ -58,16 +58,20 @@ export function isDeadSessionReconcileNotice(notice: string | undefined): boolea
 }
 
 /**
- * Unreadable-store notice copy (auto-restore-warming delta fix, finding 1):
- * the terminal-pane sibling of the dead-copy mint. A pane whose verdict is
- * error{session_store_unreadable} (the index PUBLISHED but this identity's
- * store could not be read) gets ONE in-buffer explanation line through the
- * SAME no-modal machinery — visible with no user interaction, cleared with
- * the latch by the recovery folds. Plain and honest: names the unreadable
- * store, says the session is preserved, says how recovery happens.
+ * Unreadable-store notice copy (auto-restore-warming delta fix, finding 1;
+ * focused review round 3, finding 2): the terminal-pane sibling of the
+ * dead-copy mint. A pane whose verdict is error{session_store_unreadable}
+ * (the index PUBLISHED but this identity's store could not be read) gets
+ * ONE in-buffer explanation line through the SAME no-modal machinery —
+ * visible with no user interaction, cleared with the latch by the
+ * recovery folds. Plain and honest: names the unreadable store, claims
+ * ONLY what the verdict proves (the session IDENTITY is preserved — the
+ * saved conversation itself may be lost if the store is damaged; never
+ * an unproven blanket preservation claim), and says how recovery happens
+ * (a reconnect retries once the store is readable).
  */
 export const SESSION_STORE_UNREADABLE_RECONCILE_NOTICE =
-  'Saved session store could not be read - the session was preserved; reconnecting will retry once the store is readable.'
+  'Saved session store could not be read - the session identity is preserved, but its saved conversation may be lost. Reconnecting will retry once the store is readable.'
 
 export function isSessionStoreUnreadableReconcileNotice(notice: string | undefined): boolean {
   return notice === SESSION_STORE_UNREADABLE_RECONCILE_NOTICE

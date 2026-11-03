@@ -1110,12 +1110,19 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       // terminalId (exited), so the pane-scoped key is the
       // renderer-independent path. Soft row-wrapping is already
       // logical-line-joined by the buffer text accessor, so the exact
-      // phrase matches.
+      // phrase matches. The pinned phrases hold the copy to its honest
+      // claims (focused review round 3, finding 2): the session IDENTITY
+      // is preserved, the saved conversation only MAY be lost, and the
+      // reconnect retry door stays open — never an unproven blanket
+      // "the session is preserved" safety claim.
       await expect
         .poll(async () => (await harness.getPaneTerminalBuffer(opencodeLeaf.id)) ?? '', {
           timeout: 30_000,
         })
-        .toContain('saved session store could not be read')
+        .toContain('the session identity is preserved, but its saved conversation may be lost')
+      const noticeBuffer = (await harness.getPaneTerminalBuffer(opencodeLeaf.id)) ?? ''
+      expect(noticeBuffer).toContain('saved session store could not be read')
+      expect(noticeBuffer).toContain('reconnect to retry once the store is readable')
 
       // 8. The banner cleared itself at the fold (warming === 0 — the
       //    pane resolved, honestly to an error) — the RED door: without

@@ -17888,8 +17888,12 @@ describe('unreadable-store notice line (session_store_unreadable, no-modal contr
   const PANE_ID = 'pane-unreadable-notice'
   const TERMINAL_ID = 'term-unreadable-notice'
   const PANE_KEY = `${TAB_ID}:${PANE_ID}`
+  // Focused review round 3, finding 2: the copy claims only what the
+  // verdict proves — the session IDENTITY is preserved; the saved
+  // conversation itself may be lost — and keeps the retry door open. It
+  // never asserts the conversation is safe.
   const NOTICE_LINE =
-    "[This pane's saved session store could not be read - the session is preserved; reconnect to retry once the store is readable]"
+    "[This pane's saved session store could not be read - the session identity is preserved, but its saved conversation may be lost; reconnect to retry once the store is readable]"
   const FRAMED_NOTICE = `\r\n${NOTICE_LINE}\r\n`
 
   function setupUnreadableNoticePane(
