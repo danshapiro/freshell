@@ -2051,6 +2051,25 @@ impl Registry {
         .await
     }
 
+    /// The outer option identifies a blocked soul with no journal entry for
+    /// this request. The inner option is its available recovery reason.
+    pub(crate) async fn blocked_unadmitted_input_reason(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+    ) -> Result<Option<Option<String>>, RegistryError> {
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT s.recovery_reason FROM souls s WHERE s.soul_id=?1 AND s.desired_state='running' AND s.recovery_state='blocked' AND NOT EXISTS (SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id AND c.request_id=?2)",
+                params![soul_id.as_str(), request_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+    }
+
     /// Folds a send's turn settings into the soul's recovery launch spec.
     pub async fn update_fresh_agent_settings(
         &self,
