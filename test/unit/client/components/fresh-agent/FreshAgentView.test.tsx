@@ -2037,6 +2037,8 @@ describe('FreshAgentView', () => {
         expect(notice).toBeInTheDocument()
         await act(async () => {
           fireEvent.click(notice!.querySelector('summary')!)
+          expect(notice).toHaveAttribute('open')
+          fireEvent(notice!, new Event('toggle', { bubbles: true }))
           await vi.advanceTimersByTimeAsync(0)
         })
         const details = notice!.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
