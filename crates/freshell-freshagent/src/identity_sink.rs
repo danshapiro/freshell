@@ -887,8 +887,9 @@ struct MapHitRecovery {
 
 /// Holds a Starting ticket while its identity write is in flight. If the
 /// caller future is canceled, Drop schedules the durable repair and keeps the
-/// coordinator claim until that repair lands. This closes the window where a
-/// spawn_blocking ledger write can outlive the request that started it.
+/// coordinator claim until provider settlement and repair both finish. This
+/// prevents an orphaned native writer or a late spawn_blocking ledger write
+/// from surviving a released startup claim.
 pub(crate) struct BindingWriteGuard {
     ticket: Option<freshell_ownership::OperationTicket>,
     claim: Option<BindingClaim>,
@@ -896,6 +897,7 @@ pub(crate) struct BindingWriteGuard {
     binding_hold: Option<freshell_ownership::BindingWriteHold>,
     armed: bool,
     map_hit_recovery: Option<MapHitRecovery>,
+    startup_cleanup: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
 
 impl BindingWriteGuard {
@@ -919,6 +921,7 @@ impl BindingWriteGuard {
             binding_hold,
             armed,
             map_hit_recovery: None,
+            startup_cleanup: None,
         }
     }
 
@@ -944,6 +947,31 @@ impl BindingWriteGuard {
             commit: Box::new(commit),
             pending_write: None,
         });
+    }
+
+    /// The provider owns exact-runtime teardown, including death confirmation.
+    /// Keep its future inside the guard so canceling explicit repair resumes
+    /// the same cleanup in Drop rather than abandoning a removed runtime.
+    pub(crate) fn settle_startup_before_repair<F>(&mut self, cleanup: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.startup_cleanup = Some(Box::pin(cleanup));
+    }
+
+    pub(crate) fn set_map_hit_write<W>(&mut self, write: W)
+    where
+        W: Fn() -> SinkWrite + Send + Sync + 'static,
+    {
+        let recovery = self
+            .map_hit_recovery
+            .as_mut()
+            .expect("map-hit recovery present");
+        assert!(
+            recovery.pending_write.is_none(),
+            "cannot replace an in-flight write"
+        );
+        recovery.write = Box::new(write);
     }
 
     pub(crate) async fn write_map_hit(&mut self) -> std::io::Result<()> {
@@ -981,7 +1009,12 @@ impl BindingWriteGuard {
             .map_hit_recovery
             .take()
             .expect("map-hit recovery present");
-        (recovery.commit)(&mut self.ticket)
+        (recovery.commit)(&mut self.ticket)?;
+        // Successful publication transfers ownership to the Live runtime.
+        // The caller cannot accidentally repair that operation on scope exit.
+        self.armed = false;
+        self.binding_hold.take();
+        Ok(())
     }
 
     /// The binding write completed and the caller is moving on to commit or
@@ -1010,6 +1043,10 @@ impl BindingWriteGuard {
             // Drop transfers this existing runtime's claim to the retry
             // task. Repair here would permanently fence the retry itself.
             return false;
+        }
+        if let Some(cleanup) = self.startup_cleanup.as_mut() {
+            cleanup.await;
+            self.startup_cleanup.take();
         }
         let (Some(claim), Some(sink)) = (self.claim.as_ref(), self.sink.as_ref()) else {
             self.armed = false;
@@ -1083,8 +1120,12 @@ impl Drop for BindingWriteGuard {
             binding_hold: self.binding_hold.take(),
         };
         let map_hit_recovery = self.map_hit_recovery.take();
+        let startup_cleanup = self.startup_cleanup.take();
         let repair = async move {
             let mut hold = hold;
+            if let Some(cleanup) = startup_cleanup {
+                cleanup.await;
+            }
             let mut retry_delay = std::time::Duration::from_millis(250);
             if let Some(mut recovery) = map_hit_recovery {
                 loop {

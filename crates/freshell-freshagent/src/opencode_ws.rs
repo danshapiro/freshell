@@ -2082,7 +2082,7 @@ impl FreshOpencodeState {
                     pre_await_generation?,
                 ))
             });
-        let mut map_hit_starting_ticket = None;
+        let mut map_hit_binding_guard = None;
         // b8ke ext r15 F1: the request fence is parsed BEFORE ANY
         // ownership mutation — the map-hit/Vacant compatibility claim
         // below carries it, and a half-sent (or stale) pair must refuse
@@ -2152,7 +2152,32 @@ impl FreshOpencodeState {
                                 );
                                 return;
                             };
-                            map_hit_starting_ticket = Some(ticket);
+                            let claim = binding_claim_for_adopt.clone().expect("Starting claim");
+                            // Protect the incumbent before the first session-lock await.
+                            // Cancellation at any preparation step can finish identity-only
+                            // adoption; explicit settings replace this write once prepared.
+                            let upsert = crate::identity_sink::FreshAgentBindingUpsert {
+                                genesis: crate::identity_sink::GenesisUpdate::Keep,
+                                provider: PROVIDER.into(),
+                                session_id: durable_id.clone(),
+                                mode: SESSION_TYPE.into(),
+                                create_request_id: None,
+                                resolves_pending: None,
+                                supersedes: None,
+                                name_transition: None,
+                                provenance: provenance.clone().into(),
+                                observed_epoch: Some(claim.epoch),
+                                observed_generation: Some(claim.generation),
+                                claim: Some(claim.clone()),
+                                settings: crate::identity_sink::SettingsUpdate::Keep,
+                            };
+                            map_hit_binding_guard = Some(self.map_hit_binding_guard(
+                                ticket,
+                                claim,
+                                &durable_id,
+                                existing.as_ref().expect("map hit").clone(),
+                                upsert,
+                            ));
                         }
                         crate::ownership_lane::LaneClaim::Unwired
                         | crate::ownership_lane::LaneClaim::Adopt => {}
@@ -2464,26 +2489,15 @@ impl FreshOpencodeState {
                 claim: binding_claim_for_adopt.clone(),
                 settings: settings_update,
             };
-            let mut binding_guard = if let Some(ticket) = map_hit_starting_ticket.take() {
-                let Some(claim) = binding_claim_for_adopt.clone() else {
-                    self.fail_create(
-                        &request_id,
-                        view_id,
-                        "SESSION_RESERVED",
-                        "A lifecycle operation owns this session; retry after it settles",
-                    );
-                    return;
-                };
-                Some(self.map_hit_binding_guard(
-                    ticket,
-                    claim,
-                    &durable_id,
-                    session_arc.clone(),
-                    upsert.clone(),
-                ))
-            } else {
-                None
-            };
+            let mut binding_guard = map_hit_binding_guard.take();
+            if let Some(guard) = binding_guard.as_mut() {
+                let sink = self.identity_sink();
+                let upsert = upsert.clone();
+                guard.set_map_hit_write(move || match sink.as_ref() {
+                    Some(sink) => sink.record_binding(upsert.clone()),
+                    None => Box::pin(std::future::ready(Ok(()))),
+                });
+            }
             if let Some(guard) = binding_guard.as_mut() {
                 if !guard.map_hit_runtime_present().await {
                     self.fail_create(
@@ -16857,6 +16871,60 @@ mod tests {
             freshell_ownership::OwnershipState::Vacant
         ));
         generation
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_map_hit_before_session_lock_keeps_incumbent_owned() {
+        // FIFO lock waiters deterministically park the handler at each of its
+        // three preparation locks: read prior state, apply edits, read binding.
+        for lock_number in 1..=3 {
+            let id = "ses_cancel_before_session_lock";
+            let (st, _rx, registry) = fenced_state_with_map_row(id).await;
+            let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+            st.set_identity_sink(identity.clone());
+            let incumbent = st.sessions.lock().await.get(id).unwrap().clone();
+            let mut held = Some(incumbent.lock().await);
+            let msg = create_msg("cancel-before-session-lock");
+            let mut request = Box::pin(st.handle_create_resume(
+                "cancel-before-session-lock".into(),
+                id.into(),
+                &msg,
+                None,
+            ));
+            assert!(futures_util::poll!(&mut request).is_pending());
+            for _ in 1..lock_number {
+                let mut next = Box::pin(incumbent.lock());
+                assert!(futures_util::poll!(&mut next).is_pending());
+                drop(held.take());
+                assert!(futures_util::poll!(&mut request).is_pending());
+                held = Some(next.await);
+            }
+            drop(request);
+            assert!(
+                matches!(
+                    registry.observe(PROVIDER, id).state,
+                    freshell_ownership::OwnershipState::Starting { .. }
+                ),
+                "canceling at preparation lock {lock_number} cannot release the incumbent's claim"
+            );
+            assert!(!held.as_ref().unwrap().killed.load(Ordering::SeqCst));
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(
+                    registry.observe(PROVIDER, id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the exact incumbent is adopted after the lock releases");
+            assert!(Arc::ptr_eq(
+                st.sessions.lock().await.get(id).unwrap(),
+                &incumbent
+            ));
+            assert!(identity.repairs.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
