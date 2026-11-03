@@ -216,9 +216,11 @@ Retain --rm and corroborate published full CID after ordinary auto-removal befor
 
 - [x] **Step 3: Run exact final-source cold supported-toolchain Clippy**
 
+The completed historical cold measurement below used a directly created task container. The current follow-up must also run this payload through the actual unmodified launcher and canonical image; the historical direct-container result remains separately attributed sizing evidence, not a substitute for that launcher run or its review.
+
 Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it. A later follow-up may reuse the recorded result only after proving that the workload and complete compiled input closure are unchanged; if that proof fails, repeat the cold payload on the corrected source, preserving exact source attribution.
 
-Use fresh exact-owned target, registry and Git caches. Prove the effective target empty before compiler release and rule out inherited target/compiler-cache redirection. Network/toolchain preparation may not precompile the graph. Record image ABI/UID/tools, source and actual supported toolchain.
+Use fresh exact-owned target, registry and Git caches. Before invoking the launcher, establish that its actual target volume is empty and rule out inherited target/compiler-cache redirection; bind the running container to that volume. Network/toolchain preparation may not precompile the graph. Record image ABI/UID/tools, source and actual supported toolchain.
 
 Preserve the identified payload exactly:
 
@@ -228,15 +230,15 @@ rustup toolchain install 1.96.0 --profile minimal --component clippy && cargo +1
 
 Leave CARGO_BUILD_JOBS absent for this native-default measurement, with no deliberate project/CLI jobs setting or inherited external jobserver. Do not add --locked, alter package/targets/flags, edit unrelated source, use old source, or warm the target to obtain a favorable outcome.
 
-A separately pinned public Rust-only image may run this graph if its exact digest/ABI/tools/UID/toolchain/controls are attributed; the canonical current-source launcher remains independently proven in Step 2. Set actual CPUs 2, RAM 8589934592, total RAM-plus-swap 17179869184 and PIDs 512. Expected cgroup swap allowance is 8589934592, distinct from physical swap availability/use.
+Use the canonical current-source launcher and image for this follow-up. Attribute its image digest and floating Rust separately from the explicitly pinned payload. Set actual CPUs 2, RAM 8589934592, total RAM-plus-swap 17179869184 and PIDs 512. Expected cgroup swap allowance is 8589934592, distinct from physical swap availability/use.
 
-Before rustup/compiler initialization, hold the exact finite acceptance container behind a barrier. Record CID/guest PID/cgroup/UID map, rootless/systemd lineage, numeric own/ancestor controls, empty target and default scheduling inputs. Release only after the finite sampler, deadlines, service sentinel and export path are ready. Never mutate source/build scripts to manufacture jobs evidence.
+Before launching, qualify the guest, source, target, scheduling inputs, deadlines, service sentinel and export path. Bind the real launcher's published full CID to the guest PID/cgroup/UID map and rootless/systemd lineage; capture its own effective-limit receipt, emitted before the caller, and the relevant ancestor controls. Use a simple external sampler without changing the launcher, image, Docker command, process tree or ordinary --rm lifecycle. Never mutate source/build scripts to manufacture jobs evidence. Keep the existing 6 GiB inner-memory stop, three consecutive full-pressure samples above 10% stop and all recorded host, deadline and ownership guards.
 
-Sample memory.current/peak/events, swap.current, memory.pressure, CPU quota/stat and PID counts/events each second, with final samples after child exit. Obtain NUM_JOBS=2 from an actual unchanged graph build-script child, not just the launcher environment or separate tiny smoke. Preserve elapsed time, exact child/Docker/launcher status and original workload errors. Keep the task-only container alive briefly after the child solely to export final evidence, then remove by exact CID; this does not change production --rm.
+Sample memory.current/peak/events, swap.current, memory.pressure, CPU quota/stat and PID counts/events approximately each second while the bound cgroup exists. Record the first and last successful sample, gaps and any unobserved tail after the last reading; the observed peak is not a proven full-run maximum when that tail exists. Do not hold the container or add a trap solely to obtain a post-child sample. Obtain NUM_JOBS=2 from an actual unchanged graph build-script child, not just the launcher environment or separate tiny smoke. Preserve elapsed time, actual Docker/launcher and cleanup statuses, original workload errors and any independently observed child status; leave an unobserved child status unknown.
 
 Judge observed outcomes separately:
 
-1. Complete exact graph within useful measured headroom, low pressure, no OOM/escaped limits/service loss: evidence supports successful Clippy and safety of the observed full graph.
+1. Complete exact graph under the enforced cap, with useful observed headroom, low sampled pressure, no evidenced OOM/escaped limits/service loss: evidence supports successful Clippy and the measured portion of that run. State any unobserved tail and separately attribute the earlier direct-container sizing evidence.
 2. Attributable compile/lint/workload failure inside its own sandbox with useful diagnostics, actual jobs/controls/resource data and healthy unrelated services: may satisfy criterion 5's contained-failure alternative. Explicitly report failed workload and graph portion run; do not claim successful full Clippy or complete-graph peak safety. Do not repair unrelated Rust solely for exit 0.
 3. Directly evidenced sandbox-local resource failure with preserved unrelated services: judge containment independently from whether two jobs is supported as the measured safe default. Never infer OOM from 137 or call the failed graph successful.
 4. Setup/download failure before Clippy, missing actual jobs, misattributed/unreadable controls, lost evidence/export or driver protective intervention: failed/incomplete attempt, not automatic product containment. Resolve within scope or report unmet acceptance.
@@ -246,7 +248,7 @@ The coordinator and independent review decide whether the actual evidence delive
 
 - [x] **Step 4: Export, clean exact resources and obtain independent review**
 
-Export commands/statuses, source/image/toolchain manifests, actual jobs, receipts, one-second/final kernel samples, complete workload logs, expected-negative cases and failed attempts before deleting temporary source/dependencies/disks. Keep necessary review evidence, not workspace/dependency copies.
+Export commands/statuses, source/image/toolchain manifests, actual jobs, receipts, observed kernel samples and any sampling gaps or tail, complete workload logs, expected-negative cases and failed attempts before deleting temporary source/dependencies/disks. Keep necessary review evidence, not workspace/dependency copies.
 
 Verify recorded containers/volumes are absent and unreferenced; QEMU/outer/sampler/sentinel processes ended; owned keys/disks/seed/temp inputs removed. Verify PID birth identity/cwd/argv before stopping an exact task process. Never broad-kill, delete another task's resource/shared cache, or treat inspection failure as absence. Keep the feature branch/worktree for review.
 
@@ -318,7 +320,9 @@ memory pressure and OOM event deltas were zero, and every unrelated-service
 health check passed. This supports the observed requested graph; it does not
 prove unexercised swap/oomd failure paths or future workloads. The canonical
 image's floating Cargo/Rust 1.99.1 is separately attributed from the pinned
-payload's 1.96.0.
+payload's 1.96.0. This cold payload ran in a directly created task container,
+not through `scripts/sandbox-test.sh`; the actual-launcher cold run for the
+current follow-up is still required.
 
 Evidence and failed setup-attempt dispositions are retained under
 `/home/dan/code/freshell/.worktrees/.the-usual-logs/mdmw-sandbox-budget/acceptance/attempt-001/`.
