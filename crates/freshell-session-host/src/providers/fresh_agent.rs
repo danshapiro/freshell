@@ -7844,6 +7844,7 @@ export function query({ prompt, options }) {
             "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
             "FRESHELL_NATIVE_IDENTITY_LAUNCH",
             "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION",
             "FRESHELL_SIDECAR_TEST_NATIVE_CLEAR",
             "FRESHELL_SIDECAR_TEST_TRANSCRIPT",
             "FRESHELL_SIDECAR_TEST_NATIVE_INPUT_LOG",
@@ -7893,6 +7894,7 @@ export function query({ prompt, options }) {
         }
         std::env::set_var("FRESHELL_SIDECAR_TEST_CHECKPOINT", "1");
         std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_CLEAR", "1");
+        std::env::set_var("FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION", "1");
         let launch: freshell_runtime_protocol::NativeIdentityLaunch =
             serde_json::from_value(json!({
                 "incarnationId":"owned-clear-backlog", "launchNonce":"owned-clear-backlog-nonce",

@@ -129,6 +129,10 @@ export function query({ prompt, options }) {
           continue
         }
         process.stdout.write(JSON.stringify({ type: message.eager ? 'probe.native-eager-operation' : 'probe.native-input' }) + '\n')
+        if (process.env.FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION === '1') {
+          yield { type: 'result', subtype: 'success', session_id: nativeRoot, is_error: false, stop_reason: 'end_turn' }
+          continue
+        }
         const input = { command: 'fixture owned harmless counter' }
         const toolUseID = 'toolu_original1'
         const assistant = { type: 'assistant', sessionId: nativeRoot, session_id: nativeRoot,

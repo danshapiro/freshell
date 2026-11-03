@@ -90,6 +90,7 @@ describe('production native continuation lifecycle', () => {
       expect(resumed).toMatchObject({ cliSessionId: clearedRoot, nativeIdentityEvidence: {
         source: 'resume', previousNativeSessionId: firstClearedRoot, launch,
       } })
+      await expect(readFile(join(worker.home, 'effect-count'))).rejects.toMatchObject({ code: 'ENOENT' })
       worker.send({ type: 'permission.respond', sessionId, requestId: card.requestId,
         decision: { behavior: 'allow', updatedInput: card.tool.input } })
       expect(await worker.wait('sdk.tool.result', nextAt)).toMatchObject({ nativeSessionId: clearedRoot, content: [{ is_error: false }] })
@@ -97,6 +98,38 @@ describe('production native continuation lifecycle', () => {
       expect(await readFile(join(worker.home, 'effect-count'), 'utf8')).toBe('1\n')
       expect(worker.frames.some(frame => frame.type === 'sdk.send.rejected' || frame.type === 'sdk.error' || frame.type === 'sdk.session.closed')).toBe(false)
     } finally { expect(await worker.close(), JSON.stringify(worker.frames) + worker.stderr()).toBe(0) }
+  })
+
+  it('with FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION a plain input logs exactly one row and never continues a deferred tool', async () => {
+    const inputLogHome = await mkdtemp(join(tmpdir(), 'native-input-log-'))
+    const inputLog = join(inputLogHome, 'native-inputs.jsonl')
+    const worker = await sidecar({
+      FRESHELL_SIDECAR_TEST_INPUT_WITHOUT_TOOL_CONTINUATION: '1',
+      FRESHELL_SIDECAR_TEST_NATIVE_INPUT_LOG: inputLog,
+    })
+    await writeFile(join(worker.home, nativeSessionId + '.jsonl'), JSON.stringify({ type: 'system', sessionId: nativeSessionId }) + '\n')
+    try {
+      worker.send({ type: 'create', requestId: 'owned-create', cwd: worker.home, resumeSessionId: nativeSessionId })
+      const { sessionId } = await worker.wait('created')
+      await worker.wait('sdk.session.init')
+      worker.send({ type: 'send', sessionId, text: 'original pending native operation' })
+      await worker.wait('sdk.result')
+      const rows = (await readFile(inputLog, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        text: [{ type: 'text', text: 'original pending native operation' }],
+        nativeSessionId,
+      })
+      expect('uuid' in rows[0]).toBe(true)
+      expect(worker.frames.some(frame => frame.type === 'sdk.session.loading')).toBe(false)
+      expect(worker.frames.some(frame => frame.type === 'sdk.permission.request')).toBe(false)
+      expect(worker.frames.filter(frame => frame.type === 'probe.native-options')).toHaveLength(1)
+      await expect(readFile(join(worker.home, 'effect-count'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await worker.close(), JSON.stringify(worker.frames) + worker.stderr()).toBe(0)
+    } finally {
+      await worker.close()
+      await rm(inputLogHome, { recursive: true, force: true })
+    }
   })
 
   it.each(['queued-send', 'partial-setting-failure'])('keeps actual settings coherent at configuration boundaries: %s', async scenario => {
