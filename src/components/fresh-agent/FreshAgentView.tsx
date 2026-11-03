@@ -3516,18 +3516,34 @@ export function FreshAgentView({
         message.type === 'freshAgent.send.accepted'
         && typeof message.requestId === 'string'
       ) {
-        const current = paneContentRef.current
+        // The pane may have switched in Redux before React refreshes its ref.
+        // Match the receipt and its request against the pane that owns it now.
+        const root = appStore.getState().panes.layouts[tabId]
+        const latest = root ? findPaneContent(root, paneId) : null
+        if (latest?.kind !== 'fresh-agent') return
+        const current = latest
         const echo = localEchoRef.current
-        const ownsRequest = pendingSendMetadataRef.current.has(message.requestId)
-          || echo?.requestId === message.requestId
-        if (!ownsRequest
+        const originalPending = pendingSendMetadataRef.current.get(message.requestId)
+        const currentScope = paneSessionScope(current)
+        const persistedEchoMatches = current.pendingLocalEcho?.requestId === message.requestId
+        const pending = originalPending?.sourceSessionKey
+          ? scopeToPaneSession(originalPending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)
+          : originalPending && persistedEchoMatches ? { ...originalPending, ...currentScope } : null
+        if ((originalPending?.sourceSessionKey && !pending)
+          || (!pending && !persistedEchoMatches)
           || !locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())) {
           return
+        }
+        if (pending && pending !== originalPending) {
+          pendingSendMetadataRef.current.set(message.requestId, pending)
+        } else if (!pending && persistedEchoMatches) {
+          // A restored echo can outlive the in-memory metadata. Seed its
+          // replacement from the current pane, not a stale render ref.
+          pendingSendMetadataRef.current.set(message.requestId, currentScope)
         }
         const submittedTurnId = typeof message.submittedTurnId === 'string'
           ? message.submittedTurnId
           : undefined
-        const pending = pendingSendMetadataRef.current.get(message.requestId)
         if (pending?.deliveryAmbiguous) {
           // The send was restored as a draft while its outcome was unknown.
           // Keep any edits, but replace the uncertainty when this exact send
@@ -3539,7 +3555,7 @@ export function FreshAgentView({
             setDeliveryNoticeState(null)
             setNoticeState(currentNotice => currentNotice?.level === 'warning'
               ? currentNotice
-              : { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true })
+              : { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true, ...currentScope })
           }
           const outgoing = outgoingTurnRef.current
           if ((!echo || echo.requestId === message.requestId) && outgoing?.requestId === message.requestId) {
