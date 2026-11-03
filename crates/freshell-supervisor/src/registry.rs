@@ -22,7 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -1149,6 +1149,9 @@ impl Registry {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            if let Some(spec) = input.fresh_agent.as_ref().filter(|spec| spec.provider == FreshProvider::Codex) {
+                ensure_codex_presentation_available(&tx, &input.soul_id, &spec.session_id)?;
+            }
             let terminal_id = input.terminal.as_ref().map(|t| t.terminal_id.as_str());
             let fixture_kind = input.fixture.map(fixture_kind_name);
             tx.execute(
@@ -2202,6 +2205,67 @@ impl Registry {
         .await
     }
 
+    pub async fn claim_codex_presentation(
+        &self,
+        request: freshell_runtime_protocol::FreshAgentPresentationClaimRequest,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            struct CurrentOwner {
+                provider: String,
+                native: Option<String>,
+                desired: String,
+                intent: u64,
+                identity: u64,
+                launch: String,
+                spec: Option<String>,
+                execution_generation: u64,
+                host_boot_id: Option<String>,
+            }
+            let current = tx.query_row(
+                "SELECT s.provider,s.native_session_id,s.desired_state,s.intent_revision,s.identity_revision,i.launch_state,i.fresh_agent_spec,i.execution_generation,i.host_boot_id FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id WHERE s.soul_id=?1 AND i.incarnation_id=?2",
+                params![request.soul_id.as_str(), request.incarnation_id.as_str()],
+                |row| Ok(CurrentOwner {
+                    provider:row.get(0)?, native:row.get(1)?, desired:row.get(2)?,
+                    intent:row.get(3)?, identity:row.get(4)?, launch:row.get(5)?,
+                    spec:row.get(6)?, execution_generation:row.get(7)?, host_boot_id:row.get(8)?,
+                }),
+            ).optional()?;
+            let Some(current) = current else {
+                return Err(RegistryError::NativeIdentityConflict);
+            };
+            let spec: FreshAgentLaunchSpec = serde_json::from_str(
+                current.spec.as_deref().ok_or(RegistryError::NativeIdentityConflict)?,
+            ).map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            if current.provider != "codex" || spec.provider != FreshProvider::Codex
+                || spec.session_type != "freshcodex" || current.desired != "running" || current.launch != "running"
+                || current.native.as_deref() != Some(request.native_session_id.as_str())
+                || current.intent != request.intent_revision || current.identity != request.identity_revision
+                || current.execution_generation != request.execution_generation
+                || current.host_boot_id.as_deref() != request.host_boot_id.as_ref().map(HostBootId::as_str)
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let writer_current: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_claims w JOIN souls s ON s.soul_id=w.soul_id WHERE w.soul_id=?1 AND w.incarnation_id=?2 AND w.provider='codex' AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
+                params![request.soul_id.as_str(), request.incarnation_id.as_str(), request.native_session_id],
+                |row| row.get(0),
+            )?;
+            if !writer_current {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            ensure_codex_presentation_available(&tx, &request.soul_id, &request.native_session_id)?;
+            if spec.session_id != request.native_session_id {
+                tx.execute(
+                    "INSERT OR IGNORE INTO codex_presentations (presentation_id,soul_id) VALUES (?1,?2)",
+                    params![request.native_session_id, request.soul_id.as_str()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     pub async fn record_native_session(
         &self,
         soul_id: SoulId,
@@ -2636,6 +2700,10 @@ impl Registry {
                 (Some(spec), _) if spec.native_session_id.as_deref() == Some(expected_parent.as_str()) => {},
                 (None, Some(spec)) if matches!(provider.as_str(), "claude" | "opencode") && spec.mode == provider => {},
                 _ => return Err(RegistryError::NativeIdentityConflict),
+            }
+            if provider == "codex" && !preserve_presentation {
+                ensure_codex_presentation_available(&tx, &soul_id, &child_session_id)?;
+                tx.execute("DELETE FROM codex_presentations WHERE soul_id=?1", params![soul_id.as_str()])?;
             }
             if let Some(pending)=&pending_naming_handle {
                 let spec=fresh_spec.as_mut().ok_or(RegistryError::NativeIdentityConflict)?;
@@ -4958,6 +5026,62 @@ fn settle_recovery_retry_tx(
     Ok(())
 }
 
+fn create_codex_presentation_schema(conn: &Connection) -> Result<(), RegistryError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS codex_presentations (
+            presentation_id TEXT PRIMARY KEY,
+            soul_id TEXT NOT NULL REFERENCES souls(soul_id)
+        );
+        CREATE INDEX IF NOT EXISTS codex_presentations_soul ON codex_presentations(soul_id);
+        CREATE TRIGGER IF NOT EXISTS codex_presentations_inventory_insert AFTER INSERT ON codex_presentations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER IF NOT EXISTS codex_presentations_inventory_delete AFTER DELETE ON codex_presentations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;",
+    )?;
+    Ok(())
+}
+
+// Native ancestry is not presentation ownership. Check both explicitly claimed
+// aliases and canonical launch IDs, including stopped owners, in the same
+// transaction as the new claim or launch.
+fn ensure_codex_presentation_available(
+    conn: &Connection,
+    soul: &SoulId,
+    presentation: &str,
+) -> Result<(), RegistryError> {
+    let claimed: Option<String> = conn
+        .query_row(
+            "SELECT soul_id FROM codex_presentations WHERE presentation_id=?1",
+            params![presentation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if claimed
+        .as_deref()
+        .is_some_and(|owner| owner != soul.as_str())
+    {
+        return Err(RegistryError::NativeIdentityConflict);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT i.soul_id,i.fresh_agent_spec FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE s.provider='codex' AND i.soul_id<>?1 ORDER BY (i.launch_state IN ({ACTIVE_STATES})) DESC,i.created_at DESC,i.rowid DESC"
+    ))?;
+    let mut rows = stmt.query(params![soul.as_str()])?;
+    let mut seen = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        let owner: String = row.get(0)?;
+        if !seen.insert(owner) {
+            continue;
+        }
+        let encoded: Option<String> = row.get(1)?;
+        if let Some(encoded) = encoded {
+            let spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
+                .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            if spec.provider == FreshProvider::Codex && spec.session_id == presentation {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn create_schema(
     conn: &mut Connection,
     installation_id: InstallationId,
@@ -5276,6 +5400,7 @@ fn create_schema(
     input_reservation::create_table(&tx)?;
     create_recovery_retry_schema(&tx)?;
     create_ordinary_stop_schema(&tx)?;
+    create_codex_presentation_schema(&tx)?;
     tx.execute("INSERT INTO installation (singleton,installation_id,schema_version,control_epoch,inventory_revision,initial_scan_state) VALUES (1,?1,?2,0,0,'pending')", params![installation_id.as_str(), SCHEMA_VERSION])?;
     tx.execute(
         "INSERT INTO rollout_state (singleton,mode,updated_at) VALUES (1,'legacy',?1)",
@@ -5780,6 +5905,13 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.execute_batch("UPDATE installation SET schema_version=19,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
         tx.commit()?;
         schema = 19;
+    }
+    if schema == 19 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        create_codex_presentation_schema(&tx)?;
+        tx.execute_batch("UPDATE installation SET schema_version=20,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 20;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -6768,8 +6900,21 @@ fn load_recovery_context(
 }
 
 pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> {
+    let mut presentations: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT soul_id,presentation_id FROM codex_presentations ORDER BY presentation_id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            presentations
+                .entry(row.get(0)?)
+                .or_default()
+                .push(row.get(1)?);
+        }
+    }
     let mut stmt = conn.prepare(
-        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id,i.fresh_agent_spec,s.creation_seed_ref FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
+        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id,i.fresh_agent_spec,s.creation_seed_ref,s.identity_revision FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.rowid",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -6826,6 +6971,10 @@ pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, Regi
             fresh_agent_session_id: fresh_agent_spec
                 .as_ref()
                 .map(|spec| spec.session_id.clone()),
+            fresh_agent_presentation_ids: presentations
+                .get(&row.get::<_, String>(0)?)
+                .cloned()
+                .unwrap_or_default(),
             fresh_agent_create_request_id: if fresh_agent_spec.is_some() {
                 Some(row.get(28)?)
             } else {
@@ -6862,6 +7011,7 @@ pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, Regi
                 .transpose()
                 .map_err(|_| RegistryError::Integrity("invalid recovery attempt id".into()))?,
             evidence_revision: row.get(21)?,
+            identity_revision: row.get(29)?,
             successful_recoveries_in_window: row.get(22)?,
         });
     }
@@ -9092,6 +9242,288 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::to_value(fresh).unwrap()["freshAgentCreateRequestId"],
             "seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_presentation_migration_preserves_existing_canonical_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        materialize_fresh_runtime(&registry, soul.clone(), workspace.path()).await;
+        drop(registry);
+        // Model a v19 registry, before presentation claims existed.
+        let conn = open_connection(&dir.path().join("runtime.sqlite3")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE codex_presentations; UPDATE installation SET schema_version=19;",
+        )
+        .unwrap();
+        drop(conn);
+        let reopened = Registry::open(dir.path(), None).unwrap();
+        let view = reopened
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == soul)
+            .unwrap();
+        assert_eq!(
+            view.fresh_agent_session_id.as_deref(),
+            Some("fresh-session")
+        );
+        assert!(view.fresh_agent_presentation_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_presentations_follow_their_public_owner_across_replacement_restart_and_fork() {
+        use freshell_runtime_protocol::FreshAgentPresentationClaimRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let original = SoulId::new();
+        let prepared =
+            materialize_fresh_runtime(&registry, original.clone(), workspace.path()).await;
+        let mut spec = registry
+            .recovery_context(original.clone())
+            .await
+            .unwrap()
+            .fresh_agent
+            .unwrap();
+        spec.provider = FreshProvider::Codex;
+        spec.session_type = "freshcodex".into();
+        spec.runtime_variant = "codex".into();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+            params![original.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::to_string(&spec).unwrap(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                original.clone(),
+                prepared.incarnation_id.clone(),
+                "native-a".into(),
+            )
+            .await
+            .unwrap();
+        let before = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == original)
+            .unwrap();
+        let claim = FreshAgentPresentationClaimRequest {
+            soul_id: original.clone(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            native_session_id: "native-a".into(),
+            intent_revision: before.intent_revision,
+            identity_revision: before.identity_revision,
+            execution_generation: before.execution_generation,
+            host_boot_id: before.host_boot_id.clone(),
+            expected_control_epoch: Some(registry.control_epoch()),
+        };
+        let mut unfenced = Vec::new();
+        for (field, value) in [
+            (
+                "executionGeneration",
+                serde_json::json!(before.execution_generation + 1),
+            ),
+            ("hostBootId", serde_json::json!(HostBootId::new())),
+        ] {
+            let mut input = serde_json::to_value(&claim).unwrap();
+            input[field] = value;
+            let stale: FreshAgentPresentationClaimRequest = serde_json::from_value(input).unwrap();
+            if registry.claim_codex_presentation(stale).await.is_ok() {
+                unfenced.push(field);
+            }
+        }
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "DELETE FROM writer_claims WHERE soul_id=?1 AND incarnation_id=?2",
+            params![original.as_str(), prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        if registry
+            .claim_codex_presentation(claim.clone())
+            .await
+            .is_ok()
+        {
+            unfenced.push("writerClaim");
+        }
+        registry
+            .record_native_session(
+                original.clone(),
+                prepared.incarnation_id.clone(),
+                "native-a".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            unfenced.is_empty(),
+            "a presentation claim must match the current execution and writer: {unfenced:?}"
+        );
+        registry
+            .claim_codex_presentation(claim.clone())
+            .await
+            .unwrap();
+        registry
+            .record_fresh_agent_dispatch_identity(
+                original.clone(),
+                prepared.incarnation_id.clone(),
+                NativeDispatchIdentity {
+                    previous_native_session_id: "native-a".into(),
+                    native_session_id: "native-c".into(),
+                    pending_naming_handle: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .claim_codex_presentation(claim.clone())
+                .await
+                .is_err(),
+            "stale A cannot be re-claimed after replacement"
+        );
+        drop(registry);
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let original_view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == original)
+            .unwrap();
+        assert_eq!(original_view.native_session_id.as_deref(), Some("native-c"));
+        assert_eq!(original_view.fresh_agent_presentation_ids, vec!["native-a"]);
+
+        let other = SoulId::new();
+        let other_prepared =
+            materialize_fresh_runtime(&registry, other.clone(), workspace.path()).await;
+        let mut other_spec = registry
+            .recovery_context(other.clone())
+            .await
+            .unwrap()
+            .fresh_agent
+            .unwrap();
+        other_spec.provider = FreshProvider::Codex;
+        other_spec.session_type = "freshcodex".into();
+        other_spec.runtime_variant = "codex".into();
+        other_spec.session_id = "managed-two".into();
+        other_spec.provider_store_id = "second-store".into();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex',provider_store_id='second-store' WHERE soul_id=?1",
+            params![other.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::to_string(&other_spec).unwrap(),
+                other_prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                other.clone(),
+                other_prepared.incarnation_id.clone(),
+                "native-a".into(),
+            )
+            .await
+            .unwrap();
+        let other_view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == other)
+            .unwrap();
+        let other_claim = FreshAgentPresentationClaimRequest {
+            soul_id: other.clone(),
+            incarnation_id: other_prepared.incarnation_id.clone(),
+            native_session_id: "native-a".into(),
+            intent_revision: other_view.intent_revision,
+            identity_revision: other_view.identity_revision,
+            execution_generation: other_view.execution_generation,
+            host_boot_id: other_view.host_boot_id.clone(),
+            expected_control_epoch: Some(registry.control_epoch()),
+        };
+        assert!(
+            registry
+                .claim_codex_presentation(other_claim)
+                .await
+                .is_err(),
+            "a different native-A soul cannot take public A"
+        );
+        registry
+            .record_fresh_agent_dispatch_identity(
+                other.clone(),
+                other_prepared.incarnation_id.clone(),
+                NativeDispatchIdentity {
+                    previous_native_session_id: "native-a".into(),
+                    native_session_id: "native-d".into(),
+                    pending_naming_handle: None,
+                },
+            )
+            .await
+            .unwrap();
+        let views = registry.inventory().await.unwrap();
+        assert!(views
+            .iter()
+            .find(|view| view.soul_id == other)
+            .unwrap()
+            .fresh_agent_presentation_ids
+            .is_empty());
+        assert_eq!(
+            views
+                .iter()
+                .find(|view| view.soul_id == original)
+                .unwrap()
+                .fresh_agent_presentation_ids,
+            vec!["native-a"]
+        );
+        registry
+            .transition_native_session(
+                original.clone(),
+                prepared.incarnation_id,
+                "native-c",
+                "native-child",
+            )
+            .await
+            .unwrap();
+        let forked = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == original)
+            .unwrap();
+        assert_eq!(
+            forked.fresh_agent_session_id.as_deref(),
+            Some("native-child")
+        );
+        assert!(
+            forked.fresh_agent_presentation_ids.is_empty(),
+            "a fork retires all prior public presentations"
+        );
+        assert!(
+            registry.claim_codex_presentation(claim).await.is_err(),
+            "a stale claim cannot resurrect the fork parent"
         );
     }
 
@@ -11926,6 +12358,7 @@ pub(crate) mod tests {
             DROP TRIGGER IF EXISTS view_intents_inventory_insert;
             DROP TRIGGER IF EXISTS view_intents_inventory_update;
             DROP TRIGGER IF EXISTS view_intents_inventory_delete;
+            DROP TABLE IF EXISTS codex_presentations;
             DROP INDEX IF EXISTS one_automatic_primary_view_per_soul;
             DROP TABLE IF EXISTS view_intents;
             ALTER TABLE souls DROP COLUMN configured_limits;

@@ -51,8 +51,9 @@ import {
 import { getFreshAgentPaneActions, getFreshAgentTurnItemsBuilder } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 import { findPaneContent } from '@/lib/pane-utils'
-import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
+import { applyManagedRuntimeMergePlan, buildManagedRuntimeMergePlan, resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
 import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
+import { ManagedRuntimeInventorySnapshotSchema } from '@shared/managed-runtime'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { isClientPerfLoggingEnabled, setClientPerfEnabled } from '@/lib/perf-logger'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
@@ -1877,6 +1878,62 @@ describe('new conversation close acceptance', () => {
 })
 
 describe('FreshAgentView', () => {
+  it.each(['managed-public', 'claimed-public'] as const)(
+    'keeps the %s route through an inventory refresh, attach, and send', async (publicId) => {
+      const store = createStore()
+      const nativeId = 'native-current-reserved-by-other-soul'
+      const locator = { sessionId: publicId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const runtime = {
+        incarnationId: 'incarnation-one', launchState: 'running', cleanupState: 'none',
+        intentRevision: 3, executionGeneration: 1, desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable', provider: 'codex',
+        freshAgentSessionType: 'freshcodex', evidenceRevision: 1, identityRevision: 1,
+        successfulRecoveriesInWindow: 0,
+      }
+      const inventory = ManagedRuntimeInventorySnapshotSchema.parse({
+        revision: 9,
+        readiness: { inventoryRevision: 9, initialScanState: 'complete', blockedSubsystems: [],
+          startupRecoveryConcurrencyLimit: 1, startupRecoveryPeak: 0 },
+        souls: [
+          { ...runtime, soulId: 'soul-one', freshAgentSessionId: 'managed-public',
+            freshAgentPresentationIds: ['claimed-public'], nativeSessionId: nativeId },
+          { ...runtime, soulId: 'soul-two', incarnationId: 'incarnation-two',
+            freshAgentSessionId: nativeId, nativeSessionId: 'other-current-native' },
+        ],
+        viewIntents: [{ viewId: 'view-one', soulId: 'soul-one', ownerId: 'installation',
+          workspaceId: 'workspace', kind: 'automatic_primary', preferredTabId: 'tab-1',
+          preferredPaneId: 'pane-1', title: '', placementGroup: '', visibility: 'visible',
+          revision: 1, soulIntentRevision: 3, createdAt: 1, updatedAt: 1 }],
+        pendingProjectionCount: 0,
+      })
+      store.dispatch(sessionInit(locator))
+      store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', provider: 'codex',
+        sessionId: nativeId, epoch: 7, generation: 8, ownerKind: 'fresh-agent',
+        operationId: 'current-owner', transition: 'handoff-committed' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'existing-pane', status: 'idle',
+        sessionRef: { provider: 'codex', sessionId: 'old-native' }, resumeSessionId: 'old-native',
+        soulId: 'soul-one', viewIntentId: 'view-one',
+      } }))
+      const plan = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+      applyManagedRuntimeMergePlan(store as any, plan)
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: 'Send after inventory refresh' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+        sessionId: publicId, sessionRef: { provider: 'codex', sessionId: nativeId },
+        observedEpoch: 7, observedGeneration: 8,
+      })
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({
+        sessionId: publicId, observedEpoch: 7, observedGeneration: 8,
+      })
+    },
+  )
+
   it('converges Codex native settings into the next send while preserving newer staged choices and absent metadata', async () => {
     const store = createStore()
     const locator = { sessionId: 'settings-convergence', sessionType: 'freshcodex' as const, provider: 'codex' as const }

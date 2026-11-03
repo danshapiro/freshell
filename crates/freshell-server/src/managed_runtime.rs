@@ -2829,6 +2829,7 @@ mod tests {
             terminal_create_request_id: Some("create-stable".into()),
             terminal_resume_session_id: Some("request-time-session".into()),
             fresh_agent_session_id: None,
+            fresh_agent_presentation_ids: Vec::new(),
             fresh_agent_create_request_id: None,
             fresh_agent_session_type: None,
             fresh_agent_runtime_variant: None,
@@ -2845,6 +2846,7 @@ mod tests {
             prior_incarnation_id: None,
             recovery_attempt_id: None,
             evidence_revision: 0,
+            identity_revision: 0,
             successful_recoveries_in_window: 0,
         };
         let descriptor = managed_descriptor_from_view(&running, Some("reconcile-create".into()))

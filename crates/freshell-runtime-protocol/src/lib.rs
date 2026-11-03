@@ -3426,6 +3426,23 @@ pub struct FreshAgentForkRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+/// Claim the currently owned Codex native ID as an additional public pane ID.
+/// The source identity fences registration against a concurrent fork/recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentPresentationClaimRequest {
+    pub soul_id: SoulId,
+    pub incarnation_id: IncarnationId,
+    pub native_session_id: String,
+    pub intent_revision: u64,
+    pub identity_revision: u64,
+    pub execution_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_boot_id: Option<HostBootId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentForkResult {
@@ -4489,6 +4506,7 @@ pub enum AdminCommand {
     TerminalReadOutput(TerminalReadOutputRequest),
     FreshAgentSend(FreshAgentSendRequest),
     FreshAgentFork(FreshAgentForkRequest),
+    FreshAgentClaimPresentation(FreshAgentPresentationClaimRequest),
     FreshAgentCompact(FreshAgentCompactRequest),
     FreshAgentConfigure(FreshAgentConfigureRequest),
     FreshAgentRollback(FreshAgentRollbackRequest),
@@ -4897,6 +4915,9 @@ pub struct RuntimeView {
     pub terminal_resume_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_session_id: Option<String>,
+    /// Additional Codex public IDs actually admitted for this soul.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh_agent_presentation_ids: Vec<String>,
     /// Original Fresh create request, persisted as the soul creation seed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_create_request_id: Option<String>,
@@ -4930,6 +4951,8 @@ pub struct RuntimeView {
     pub recovery_attempt_id: Option<RecoveryAttemptId>,
     #[serde(default)]
     pub evidence_revision: u64,
+    #[serde(default)]
+    pub identity_revision: u64,
     #[serde(default)]
     pub successful_recoveries_in_window: u64,
 }
@@ -5016,6 +5039,7 @@ pub enum AdminResult {
         state: CommandState,
     },
     FreshAgentFork(FreshAgentForkResult),
+    FreshAgentPresentationClaimed,
     FreshAgentCapture(FreshAgentCapture),
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),

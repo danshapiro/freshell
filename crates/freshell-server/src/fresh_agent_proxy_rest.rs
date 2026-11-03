@@ -181,14 +181,26 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
         };
         let view = if let Some(soul) = mapped {
             Some(
-                inventory
-                    .iter()
-                    .find(|view| {
-                        view.soul_id == soul
-                            && view.provider.as_deref() == Some(runtime_provider.as_str())
-                    })
+                codex_current_view(&inventory, &soul)
+                    .filter(|view| view.provider.as_deref() == Some(runtime_provider.as_str()))
                     .ok_or(ManagedUnavailable)?,
             )
+        } else if runtime_provider == FreshProvider::Codex {
+            codex_presentation_owner(&inventory, &request.session_id)
+                .map_err(|_| ManagedUnavailable)?
+                .or_else(|| {
+                    inventory.iter().rev().find(|view| {
+                        codex_view_running(view)
+                            && view.provider.as_deref() == Some("codex")
+                            && view.native_session_id.as_deref() == Some(&request.session_id)
+                    })
+                })
+                .or_else(|| {
+                    inventory.iter().rev().find(|view| {
+                        view.provider.as_deref() == Some("codex")
+                            && view.native_session_id.as_deref() == Some(&request.session_id)
+                    })
+                })
         } else {
             inventory.iter().rev().find(|view| {
                 view.provider.as_deref() == Some(runtime_provider.as_str())
@@ -223,11 +235,12 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             .inventory()
             .await
             .map_err(|_| ManagedUnavailable)?;
-        let latest = current
-            .iter()
-            .rev()
-            .find(|row| row.soul_id == view.soul_id)
-            .ok_or(ManagedUnavailable)?;
+        let latest = if runtime_provider == FreshProvider::Codex {
+            codex_current_view(&current, &view.soul_id)
+        } else {
+            current.iter().rev().find(|row| row.soul_id == view.soul_id)
+        }
+        .ok_or(ManagedUnavailable)?;
         if !same_snapshot_source(view, latest)
             || snapshot["sessionType"].as_str() != Some(request.session_type.as_str())
             || snapshot["provider"].as_str() != Some(request.provider.as_str())
@@ -275,6 +288,9 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 serde_json::json!(false);
         }
         if runtime_provider == FreshProvider::Codex {
+            self.claim_codex_presentation(view, &request.session_id)
+                .await
+                .map_err(|_| ManagedUnavailable)?;
             if !self
                 .register_codex_alias(alias_key, &view.soul_id, generation)
                 .await
@@ -527,6 +543,8 @@ pub(super) fn same_snapshot_source(
         && before.native_session_id == after.native_session_id
         && before.provider == after.provider
         && before.intent_revision == after.intent_revision
+        && (before.provider.as_deref() != Some("codex")
+            || before.identity_revision == after.identity_revision)
         && before.host_boot_id == after.host_boot_id
         && before.execution_generation == after.execution_generation
         && before.fresh_agent_session_id == after.fresh_agent_session_id

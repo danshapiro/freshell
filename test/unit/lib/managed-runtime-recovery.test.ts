@@ -352,6 +352,31 @@ describe('managed runtime recovery merge', () => {
     expect((plan.updates[0].content as any).streamId).toBe('stream-one')
   })
 
+  it('matches a recorded Codex public presentation before another soul sharing its native ID', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent', createRequestId: 'reminted-pane', status: 'connected',
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'claimed-public',
+      sessionRef: { provider: 'codex', sessionId: 'claimed-public' },
+    }
+    const common = {
+      provider: 'codex', terminalId: undefined, terminalStreamId: undefined,
+      terminalMode: undefined, terminalCreateRequestId: undefined,
+      freshAgentSessionType: 'freshcodex',
+    }
+    const original = soul({ ...common, freshAgentSessionId: 'managed-public',
+      freshAgentPresentationIds: ['claimed-public'], nativeSessionId: 'original-current' })
+    const other = soul({ ...common, soulId: 'soul-two', incarnationId: 'incarnation-two',
+      freshAgentSessionId: 'other-public', nativeSessionId: 'claimed-public' })
+    const earlierView = view({ viewId: 'a-other-view', soulId: 'soul-two' })
+    const plan = buildManagedRuntimeMergePlan(snapshot([original, other], [earlierView, view()]), state)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({ soulId: 'soul-one', sessionId: 'claimed-public',
+      sessionRef: { provider: 'codex', sessionId: 'original-current' } })
+    expect(plan.creates).toHaveLength(1)
+    expect(plan.creates[0].content.soulId).toBe('soul-two')
+  })
+
   it('rekeys an offline fresh-agent view to the supervisor current native branch after provider fork', () => {
     const state = baseState()
     state.tabs.tabs[0].mode = 'freshcodex'

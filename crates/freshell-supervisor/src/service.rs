@@ -891,6 +891,16 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentFork(result))
             }
+            AdminCommand::FreshAgentClaimPresentation(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.registry
+                    .claim_codex_presentation(request)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentPresentationClaimed)
+            }
             AdminCommand::FreshAgentCompact(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)

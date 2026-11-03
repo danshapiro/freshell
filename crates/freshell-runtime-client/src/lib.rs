@@ -8,19 +8,20 @@ use freshell_runtime_protocol::{
     write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
     CanonicalOwnerChoice, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
     FreshAgentCompactRequest, FreshAgentConfigureRequest, FreshAgentForkRequest,
-    FreshAgentInterruptRequest, FreshAgentProviderStartDiagnostic, FreshAgentReadEventsRequest,
-    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan,
-    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
-    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
-    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
-    RestoreLostSoulsResult, RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode,
-    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
-    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
-    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
-    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    FreshAgentInterruptRequest, FreshAgentPresentationClaimRequest,
+    FreshAgentProviderStartDiagnostic, FreshAgentReadEventsRequest, FreshAgentResolveRequest,
+    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshAgentRollbackRequest,
+    FreshAgentSendRequest, IncidentId, IncidentSummaryRequest, LaunchRequest, LossIncidentSummary,
+    LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
+    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, OpenCodeTransferAction,
+    OpenCodeTransferDescriptor, OpenCodeTransferResult, PendingNoticesRequest,
+    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
+    RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest, RestoreLostSoulsResult,
+    RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode, RuntimeInventorySnapshot,
+    RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice, RuntimeView, SoulId, StopOutcome,
+    StopRequest, TerminalInputRequest, TerminalReadOutputRequest, TerminalResizeRequest,
+    UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest, UpsertViewIntentRequest,
+    ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -976,6 +977,36 @@ impl RuntimeClient {
             .await?
         {
             AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_claim_presentation(
+        &self,
+        view: &RuntimeView,
+    ) -> Result<(), ClientError> {
+        let epoch = self.current_epoch().await?;
+        let native_session_id = view
+            .native_session_id
+            .clone()
+            .ok_or(ClientError::UnexpectedResult)?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentClaimPresentation(FreshAgentPresentationClaimRequest {
+                    soul_id: view.soul_id.clone(),
+                    incarnation_id: view.incarnation_id.clone(),
+                    native_session_id,
+                    intent_revision: view.intent_revision,
+                    identity_revision: view.identity_revision,
+                    execution_generation: view.execution_generation,
+                    host_boot_id: view.host_boot_id.clone(),
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentPresentationClaimed => Ok(()),
             _ => Err(ClientError::UnexpectedResult),
         }
     }

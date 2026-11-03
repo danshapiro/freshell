@@ -2529,6 +2529,7 @@ async fn codex_journal_fixture(
     let socket = dir.path().join("codex-journal.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
+        let mut presentations: Vec<String> = Vec::new();
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
@@ -2539,8 +2540,16 @@ async fn codex_journal_fixture(
                     "launchState":"running", "cleanupState":"none", "intentRevision":1, "executionGeneration":1,
                     "desiredState":"running", "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
                     "evidenceRevision":1, "successfulRecoveriesInWindow":0, "provider":"codex",
-                    "nativeSessionId":native, "freshAgentSessionId":public, "freshAgentSessionType":"freshcodex"
+                    "nativeSessionId":native, "freshAgentSessionId":public,
+                    "freshAgentPresentationIds":presentations, "freshAgentSessionType":"freshcodex"
                 })).unwrap()]),
+                AdminCommand::FreshAgentClaimPresentation(claim) => {
+                    assert_eq!(claim.native_session_id, native);
+                    if !presentations.contains(&claim.native_session_id) {
+                        presentations.push(claim.native_session_id);
+                    }
+                    AdminResult::FreshAgentPresentationClaimed
+                }
                 AdminCommand::FreshAgentReadEvents(read) => {
                     let mut page = batch.clone();
                     page.events.retain(|row| row.sequence > read.after_sequence);

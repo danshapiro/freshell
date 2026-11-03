@@ -159,6 +159,7 @@ export const ManagedRuntimeSoulSchema = z.object({
   terminalCreateRequestId: z.string().optional(),
   terminalResumeSessionId: z.string().optional(),
   freshAgentSessionId: z.string().optional(),
+  freshAgentPresentationIds: z.array(NonEmptyIdSchema).optional(),
   freshAgentCreateRequestId: z.string().optional(),
   freshAgentSessionType: z.string().optional(),
   freshAgentRuntimeVariant: z.string().optional(),
@@ -176,6 +177,7 @@ export const ManagedRuntimeSoulSchema = z.object({
   priorIncarnationId: z.string().optional(),
   recoveryAttemptId: z.string().optional(),
   evidenceRevision: NonNegativeIntSchema,
+  identityRevision: NonNegativeIntSchema.optional(),
   successfulRecoveriesInWindow: NonNegativeIntSchema,
 }).strict()
 

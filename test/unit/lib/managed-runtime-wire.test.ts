@@ -31,6 +31,17 @@ describe('production managed runtime repair wire parsing', () => {
     expect(consumed.souls[0]?.nativeIdentityObservation).toEqual(produced.observation)
     expect(detail.soul.nativeIdentityObservation).toEqual(consumed.souls[0]?.nativeIdentityObservation)
     expect(ManagedRuntimeSoulSchema.parse(produced.legacy).nativeIdentityObservation).toBeUndefined()
+    const codex = ManagedRuntimeSoulSchema.parse(produced.codex)
+    expect(codex.freshAgentPresentationIds).toEqual(['native-old'])
+    expect(codex.identityRevision).toBe(3)
+    for (const change of [
+      { freshAgentPresentationIds: [''] },
+      { freshAgentPresentationIds: 'native-old' },
+      { identityRevision: -1 },
+      { identityRevision: '3' },
+    ]) {
+      expect(ManagedRuntimeSoulSchema.safeParse({ ...produced.codex, ...change }).success).toBe(false)
+    }
     for (const change of [{ source: 'requested_id' }, { launchNonce: undefined }, { evidenceRevision: '1' }]) {
       expect(ManagedRuntimeSoulSchema.safeParse({ ...produced.inventory.souls[0],
         nativeIdentityObservation: { ...produced.observation, ...change },
@@ -54,6 +65,8 @@ describe('production managed runtime repair wire parsing', () => {
       ...soul, nativeIdentityObservation: observation,
     }))).nativeIdentityObservation).toEqual(observation)
     expect(ManagedRuntimeSoulSchema.parse(soul).nativeIdentityObservation).toBeUndefined()
+    expect(ManagedRuntimeSoulSchema.parse(soul).identityRevision).toBeUndefined()
+    expect(ManagedRuntimeSoulSchema.parse(soul).freshAgentPresentationIds).toBeUndefined()
     for (const invalid of [
       { ...observation, source: 'requested_id' },
       { ...observation, launchNonce: undefined },

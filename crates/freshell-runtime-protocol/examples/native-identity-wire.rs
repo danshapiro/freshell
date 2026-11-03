@@ -25,6 +25,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     let legacy = soul.clone();
     soul.native_identity_observation = Some(observation.clone());
+    let mut codex = legacy.clone();
+    codex.provider = Some("codex".into());
+    codex.fresh_agent_session_id = Some("managed-codex".into());
+    codex.fresh_agent_presentation_ids = vec!["native-old".into()];
+    codex.fresh_agent_session_type = Some("freshcodex".into());
+    codex.identity_revision = 3;
     let readiness: RuntimeReadiness = serde_json::from_value(json!({
         "inventoryRevision":1, "initialScanState":"pending", "blockedSubsystems":[],
         "startupRecoveryConcurrencyLimit":1, "startupRecoveryPeak":0
@@ -39,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         serde_json::to_string(&json!({
-            "observation":observation, "inventory":inventory, "legacy":legacy,
+            "observation":observation, "inventory":inventory, "legacy":legacy, "codex":codex,
             "detail":{"revision":1,"readiness":readiness,"soul":soul,"viewIntents":[],"actualUsage":null}
         }))?
     );

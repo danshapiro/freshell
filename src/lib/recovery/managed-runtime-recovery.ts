@@ -199,10 +199,17 @@ function updateExistingContent(
   }
   if (existing.kind === 'fresh-agent') {
     const sessionRef = sessionRefFor(soul)
+    // A Codex pane's public route can differ from its current native thread.
+    // Only recorded presentations survive a replacement; a fork retires them.
+    const recordedCodexPresentation = existing.provider === 'codex'
+      && soul.provider === 'codex'
+      && !!existing.sessionId
+      && (existing.sessionId === soul.freshAgentSessionId
+        || soul.freshAgentPresentationIds?.includes(existing.sessionId))
     return {
       ...existing,
       ...(sessionRef ? {
-        sessionId: sessionRef.sessionId,
+        sessionId: recordedCodexPresentation ? existing.sessionId : sessionRef.sessionId,
         resumeSessionId: sessionRef.sessionId,
         sessionRef,
       } : {}),
@@ -217,6 +224,7 @@ function paneMatchPriority(
   location: PaneLocation,
   soul: ManagedRuntimeSoul,
   view: ManagedRuntimeViewIntent,
+  codexPresentationOwners: Map<string, string | null>,
 ): number {
   const content = location.content
   if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return 0
@@ -242,7 +250,11 @@ function paneMatchPriority(
   if (freshAgent && soul.freshAgentCreateRequestId && freshAgent.createRequestId === soul.freshAgentCreateRequestId) return 3
   if (content.soulId === soul.soulId) return 2
   if (content.kind === 'terminal' && soul.terminalId && content.terminalId === soul.terminalId) return 2
-  if (freshAgent && soul.freshAgentSessionId && freshAgent.sessionId === soul.freshAgentSessionId) return 1
+  if (content.kind === 'fresh-agent' && content.provider === 'codex' && content.sessionId
+    && codexPresentationOwners.has(content.sessionId)
+    && codexPresentationOwners.get(content.sessionId) !== soul.soulId) return 0
+  if (freshAgent && freshAgent.sessionId && (freshAgent.sessionId === soul.freshAgentSessionId
+    || (soul.provider === 'codex' && soul.freshAgentPresentationIds?.includes(freshAgent.sessionId)))) return 1
   const sessionRef = sessionRefFor(soul)
   if (sessionRef
     && content.sessionRef?.provider === sessionRef.provider
@@ -255,12 +267,13 @@ function findPaneForView(
   soul: ManagedRuntimeSoul,
   view: ManagedRuntimeViewIntent,
   claimed: Set<string>,
+  codexPresentationOwners: Map<string, string | null>,
 ): PaneLocation | undefined {
   let location: PaneLocation | undefined
   let bestPriority = 0
   for (const candidate of locations) {
     if (claimed.has(`${candidate.tabId}:${candidate.paneId}`)) continue
-    const priority = paneMatchPriority(candidate, soul, view)
+    const priority = paneMatchPriority(candidate, soul, view, codexPresentationOwners)
     if (priority > bestPriority) {
       location = candidate
       bestPriority = priority
@@ -361,6 +374,15 @@ export function buildManagedRuntimeMergePlan(
   state: LayoutState,
 ): ManagedRuntimeMergePlan {
   const souls = latestSoulViews(snapshot)
+  const codexPresentationOwners = new Map<string, string | null>()
+  for (const soul of souls.values()) {
+    if (soul.provider !== 'codex') continue
+    for (const id of [soul.freshAgentSessionId, ...(soul.freshAgentPresentationIds ?? [])]) {
+      if (!id) continue
+      const owner = codexPresentationOwners.get(id)
+      codexPresentationOwners.set(id, owner === undefined || owner === soul.soulId ? soul.soulId : null)
+    }
+  }
   const locations = collectPaneLocations(state.panes.layouts)
   const claimed = new Set<string>()
   const creates: ManagedRuntimePaneCreate[] = []
@@ -374,7 +396,7 @@ export function buildManagedRuntimeMergePlan(
     const soul = souls.get(view.soulId)
     if (!soul) continue
 
-    const location = findPaneForView(locations, soul, view, claimed)
+    const location = findPaneForView(locations, soul, view, claimed, codexPresentationOwners)
 
     if (location) {
       claimed.add(`${location.tabId}:${location.paneId}`)
