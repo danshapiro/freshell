@@ -2429,7 +2429,7 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
-    it.each(['idle', 'running'] as const)(
+    it.each(['idle', 'running', 'settled'] as const)(
       'does not duplicate a landed prompt when acceptance follows materialization with a %s snapshot', async (landedStatus) => {
       const store = createStore()
       const placeholder = 'freshopencode-landed-acceptance-placeholder'
@@ -2442,7 +2442,7 @@ describe('FreshAgentView', () => {
       }
       let landed = false
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
-        status: landed ? landedStatus : 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true },
+        status: landed && landedStatus === 'running' ? 'running' : 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true },
         turns: landed ? [{ id: 'landed-turn', turnId: 'landed-turn', role: 'user',
           items: [{ id: 'landed-text', kind: 'text', text: prompt }] }] : [],
         extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
@@ -2460,17 +2460,19 @@ describe('FreshAgentView', () => {
         message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
       await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
 
-      // A completed busy window retires the outgoing ref before the delayed
-      // receipt, while the original request and its send boundary remain.
-      const locator = { sessionId: placeholder, sessionType: first.sessionType, provider: first.provider }
-      act(() => {
-        store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
-        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'running' } }))
-      })
-      act(() => {
-        store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
-        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'idle' } }))
-      })
+      if (landedStatus === 'settled') {
+        // Retire the outgoing ref before the delayed receipt while retaining
+        // the original request and its send boundary.
+        const locator = { sessionId: placeholder, sessionType: first.sessionType, provider: first.provider }
+        act(() => {
+          store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+          store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'running' } }))
+        })
+        act(() => {
+          store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+          store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'idle' } }))
+        })
+      }
 
       landed = true
       act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
