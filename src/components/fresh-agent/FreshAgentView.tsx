@@ -560,11 +560,11 @@ function countNewNativeTextMatches(
   previousTurnKeys: Set<string> | null,
 ): number {
   if (!previousTurnKeys || !echo.text) return 0
-  const needle = echo.text.slice(0, 80)
+  const text = echo.text.trim()
   return turns.filter((turn) => turn.role === 'user'
     && belongsToNativeTurn(turn, submittedTurnId)
     && !isTurnBeforeEchoBoundary(turn, previousTurnKeys)
-    && echoTextMatchesTurn(echo.text, needle, freshAgentTurnText(turn))).length
+    && freshAgentTurnText(turn).trim() === text).length
 }
 
 function localEchoLanded(
@@ -4177,16 +4177,26 @@ export function FreshAgentView({
       }
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
+      const displayTurns = mergeFreshAgentTranscriptProjection(displaySnapshot, liveProjection)
+      // A live patch newer than this read may contain additional user rows or
+      // ongoing work. An older idle read cannot settle the send or its echo.
+      const snapshotCoversLiveProjection = !liveProjection || Boolean(projectionMetadata
+        && liveProjection.id === projectionMetadata.id
+        && (liveProjection.historyGeneration < projectionMetadata.historyGeneration
+          || (liveProjection.historyGeneration === projectionMetadata.historyGeneration
+            && liveProjection.eventRevision <= projectionMetadata.eventRevision)))
       const allowSettledTextMatch = snapshotAccepted && displaySnapshot.status === 'idle'
         && snapshotStatusAuthoritative
+        && snapshotCoversLiveProjection
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
       const outgoing = outgoingTurnRef.current
       if (
         outgoing && outgoing.requestId === requestOutgoingTurnId
         && snapshotAccepted && displaySnapshot.status === 'idle'
         && snapshotStatusAuthoritative
+        && snapshotCoversLiveProjection
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
-        && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
+        && localEchoLanded(displayTurns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
           allowSettledTextMatch,
           previousTurnKeys: new Set((outgoing.previousTurns ?? []).map(getTurnKey)),
@@ -4269,7 +4279,7 @@ export function FreshAgentView({
       const echoSubmittedTurnId = echo?.submittedTurnId ?? echoPendingMetadata?.submittedTurnId
       const echoBoundary = echo?.previousTurnKeys ? new Set(echo.previousTurnKeys) : null
       const landedEcho = echo
-        ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
+        ? localEchoLanded(displayTurns, echo, echoPendingMetadata, {
             allowTextMatch: snapshotAccepted,
             allowSettledTextMatch,
             previousTurnKeys: echoBoundary,
@@ -4278,7 +4288,7 @@ export function FreshAgentView({
       // A status change can revoke this read's authority to settle a send,
       // but it cannot make multiple possible matches safe to discard.
       const ambiguousNativeEcho = Boolean(echo && echoSubmittedTurnId
-        && countNewNativeTextMatches(displaySnapshot.turns, echo, echoSubmittedTurnId, echoBoundary) > 1)
+        && countNewNativeTextMatches(displayTurns, echo, echoSubmittedTurnId, echoBoundary) > 1)
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
       // stale-echo clear, INDEPENDENT of the retry-exhaustion gate below.
       const echoStillPending = echo
@@ -4289,6 +4299,7 @@ export function FreshAgentView({
       // echo still clears immediately.
       const staleEcho = echo
         ? snapshotAccepted
+          && snapshotCoversLiveProjection
           && !ambiguousNativeEcho
           && idleIncompleteRetryCountRef.current >= IDLE_INCOMPLETE_MAX_RETRIES
           && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
@@ -4370,7 +4381,7 @@ export function FreshAgentView({
         && !wouldRegressStatus
         && (
           snapshotIsBusy
-          || (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
+          || (snapshotCoversLiveProjection && !hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
         )
       ) {
         dispatch(setSessionStatus({
@@ -4403,7 +4414,7 @@ export function FreshAgentView({
           && nextSessionId
           && canAdoptSnapshotStatus
           && !wouldRegressStatus
-          && (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
+          && (snapshotCoversLiveProjection && !hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
         )
       const nextPaneStatus = snapshotClearsGenuineRunning ? fresh.status : nextStatus
       if (
