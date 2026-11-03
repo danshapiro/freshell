@@ -338,6 +338,61 @@ fn current_fixture_native_session<'a>(
         .filter(|root| !root.is_empty() && context.native_session_id.as_deref() == Some(*root))
 }
 
+impl Supervisor {
+    /// Native exit and host exit have different recovery owners. Only an
+    /// authenticated attached Codex actor with the exact committed source may
+    /// retain SEND recovery; ordinary native controls still require live proof.
+    pub(crate) async fn retained_codex_host_eligible(
+        &self,
+        context: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+        status: &crate::service::HostStatus,
+    ) -> Result<bool, RuntimeError> {
+        let Some(source) = status.fresh_agent_recovery_source.as_ref() else {
+            return Ok(false);
+        };
+        let Some(launch) = context.native_identity_launch.as_ref() else {
+            return Ok(false);
+        };
+        if context.provider != "codex"
+            || context.fixture.is_some()
+            || !context.fresh_agent.as_ref().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    && agent.fixture_transport.is_none()
+                    && agent.native_session_id == context.native_session_id
+            })
+            || context.desired_state != DesiredState::Running
+            || !status.exited
+            || status.worker_pid.is_none()
+            || status.host_boot_id != host.host_boot_id
+            || status.max_control_epoch != context.control_epoch
+            || launch.execution_generation != status.max_execution_generation
+            || launch.launch_nonce != context.prior_handle.launch_nonce().as_str()
+            || source.incarnation_id != *context.prior_handle.incarnation_id()
+            || context.native_session_id.as_deref() != Some(source.native_session_id.as_str())
+            || !source.matches_launch(launch)
+            || !source.matches_provider("codex", true)
+            || ![
+                "native-identity-observation-v1",
+                "fresh-agent-codex-recovery-source-v1",
+            ]
+            .iter()
+            .all(|required| host.capabilities.iter().any(|value| value == required))
+        {
+            return Ok(false);
+        }
+        self.registry
+            .validate_fresh_codex_recovery_source(
+                context.soul_id.clone(),
+                source.clone(),
+                status.host_boot_id.clone(),
+                context.write_fence(),
+            )
+            .await
+            .map_err(map_registry)
+    }
+}
+
 pub(crate) fn current_native_observation<'a>(
     context: &RecoveryContext,
     status: &'a crate::service::HostStatus,
@@ -2098,6 +2153,12 @@ impl Supervisor {
                             context.identity_revision += 1;
                             context.evidence_revision += 1;
                         }
+                    }
+                    if self
+                        .retained_codex_host_eligible(context, &host, &status)
+                        .await?
+                    {
+                        return Ok(live_reattach_probe(context, &status));
                     }
                     if !status.exited {
                         if !native_observation_qualified
@@ -6589,6 +6650,8 @@ pub(crate) mod tests {
             Some(OpenCodeAdoptionBaseline::from_descriptor(descriptor).unwrap());
         let launch = context.native_identity_launch.as_ref().unwrap();
         let make_status = || crate::service::HostStatus {
+            fresh_agent_recovery_source: None,
+            max_control_epoch: 0,
             max_execution_generation: 1,
             native_identity_observation: Some(NativeIdentityObservation {
                 native_session_id: "ses_repaired".into(),
@@ -6809,6 +6872,7 @@ pub(crate) mod tests {
                             effective_limits: limits,
                         },
                         HostCommand::Status { .. } => HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
                             worker_launch_count: 1,
@@ -7013,6 +7077,7 @@ pub(crate) mod tests {
                         effective_limits: limits,
                     },
                     HostCommand::Status { .. } => HostResult::Status {
+                        fresh_agent_recovery_source: None,
                         native_identity_observation: responder_observation.lock().unwrap().clone(),
                         host_boot_id: boot.clone(),
                         worker_pid: Some(123),
@@ -7378,6 +7443,7 @@ pub(crate) mod tests {
                         let native_identity_observation =
                             responder_observation.lock().unwrap().clone();
                         Ok(HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             native_identity_observation,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
@@ -8981,6 +9047,7 @@ pub(crate) mod automatic_retry_tests {
                                     &serde_json::to_string(&observation).unwrap(),
                                 );
                                 HostResult::Status {
+                                    fresh_agent_recovery_source: None,
                                     host_boot_id: boot.clone(),
                                     worker_pid: Some(42),
                                     worker_launch_count: 1,
@@ -9111,6 +9178,7 @@ pub(crate) mod automatic_retry_tests {
                             })
                             };
                             HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(42),
                                 worker_launch_count: 1,

@@ -257,6 +257,7 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                     effective_limits: limits,
                 },
                 HostCommand::Status { .. } => HostResult::Status {
+                    fresh_agent_recovery_source: None,
                     host_boot_id: boot.clone(),
                     worker_pid: live.then_some(123),
                     worker_launch_count: 1,

@@ -281,7 +281,7 @@ async fn native_send_host(
                     assert!(!ready_for_send, "only one readiness read may precede each original input");
                     assert!(observation.matches_launch(&launch));
                     ready_for_send = true;
-                    HostResult::Status {
+                    HostResult::Status { fresh_agent_recovery_source: None,
                         host_boot_id: boot.clone(),
                         worker_pid: Some(123),
                         worker_launch_count: 1,

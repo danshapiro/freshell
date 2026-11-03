@@ -236,7 +236,7 @@ impl DeterministicNativeRecovery {
                         }
                     }
                     freshell_runtime_protocol::HostCommand::Status { .. } => {
-                        freshell_runtime_protocol::HostResult::Status {
+                        freshell_runtime_protocol::HostResult::Status { fresh_agent_recovery_source: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(42),
                             worker_launch_count: 1,

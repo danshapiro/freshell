@@ -1023,6 +1023,30 @@ impl FreshAgentHostActor {
         self.transport.native_identity_evidence().await
     }
 
+    /// The established Codex actor can attempt guarded recovery after its
+    /// native exits. This is retained producer evidence, never live proof or
+    /// authority derived from a saved resume profile.
+    pub async fn retained_codex_native_identity_evidence(&self) -> Option<Value> {
+        let _dispatch = self.dispatch_lock.try_lock().ok()?;
+        if self.stopped.load(Ordering::SeqCst)
+            || self.native_identity_transition.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let state = self.state.lock().await;
+        if state.profile.provider != FreshProvider::Codex {
+            return None;
+        }
+        let observed = self.observed_native_session_id.lock().await.clone()?;
+        if state.profile.native_session_id.as_ref() != Some(&observed) {
+            return None;
+        }
+        let evidence = self.transport.native_identity_evidence().await?;
+        (evidence["nativeSessionId"].as_str() == Some(observed.as_str())
+            && !self.stopped.load(Ordering::SeqCst))
+        .then_some(evidence)
+    }
+
     pub async fn observe_native_identity(
         &self,
         native_session_id: String,

@@ -308,6 +308,13 @@ impl Supervisor {
                         .await?;
                     return Ok(());
                 }
+                let lifecycle = supervisor.lifecycle_lock(&view.soul_id).await;
+                // SEND owns its native ACK and commit under this same lock.
+                // Reobserve next tick rather than classify transient proof as
+                // an ended owner or spend a recovery attempt while it settles.
+                let Ok(lifecycle_guard) = lifecycle.try_lock() else {
+                    return Ok(());
+                };
                 let handle = supervisor
                     .registry
                     .active_handle_for_soul(view.soul_id.clone())
@@ -337,7 +344,15 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
+                                Ok(status) if status.exited => {
+                                    let current = supervisor.registry.recovery_context(view.soul_id.clone())
+                                        .await.map_err(map_registry)?;
+                                    if supervisor.retained_codex_host_eligible(&current, &host, &status).await? {
+                                        None
+                                    } else {
+                                        Some(RecoveryTrigger::ProviderExit)
+                                    }
+                                },
                                 Ok(_) => {
                                     if view.provider.as_deref() != Some("shell")
                                         && !matches!(
@@ -350,7 +365,7 @@ impl Supervisor {
                                         // Publish initial native proof even when nobody reads
                                         // output. The existing probe refreshes ownership under
                                         // the lifecycle lock and reuses the capture retry gate.
-                                        supervisor.probe_recovery(view.soul_id.clone()).await?;
+                                        supervisor.probe_recovery_locked(view.soul_id.clone()).await?;
                                     }
                                     None
                                 }
@@ -383,6 +398,7 @@ impl Supervisor {
                         Some(RecoveryTrigger::HostUnreachable)
                     }
                 };
+                drop(lifecycle_guard);
                 if let Some(trigger) = trigger {
                     append_event(
                         &supervisor.config.lifecycle_log,
@@ -626,7 +642,7 @@ mod tests {
                             }
                             HostCommand::Status { incarnation_id } => {
                                 assert_eq!(incarnation_id, launch.incarnation_id);
-                                Ok(HostResult::Status {
+                                Ok(HostResult::Status { fresh_agent_recovery_source: None,
                                     host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
                                     max_control_epoch: registry.control_epoch(), max_execution_generation: 1,
                                     fixture_evidence: serde_json::json!({}), exited: false,

@@ -202,6 +202,7 @@ impl Fixture {
                     HostCommand::Status { .. } => {
                         let state = current.lock().unwrap();
                         Ok(HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
                             worker_launch_count: 1,

@@ -409,7 +409,7 @@ async fn startup_recovery_naturally_exhausts_and_cold_hydration_requires_manual_
                     ],
                     effective_limits: limits(),
                 },
-                HostCommand::Status { .. } => HostResult::Status {
+                HostCommand::Status { .. } => HostResult::Status { fresh_agent_recovery_source: None,
                     host_boot_id: boot.clone(),
                     worker_pid: Some(123),
                     worker_launch_count: 1,

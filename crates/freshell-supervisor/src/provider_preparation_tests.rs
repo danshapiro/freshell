@@ -298,6 +298,7 @@ impl RuntimeBackend for Backend {
                         }
                     }
                     HostCommand::Status { .. } => HostResult::Status {
+                        fresh_agent_recovery_source: None,
                         native_identity_observation: observation.clone(),
                         opencode_adoption:
                             freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,

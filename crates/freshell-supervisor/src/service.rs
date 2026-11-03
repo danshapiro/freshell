@@ -2455,7 +2455,7 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_current_fresh_host(&soul_id, &active)
+            .authenticate_fresh_host(&soul_id, &active, true)
             .await?;
         let (disposition, incarnation_id) = self
             .registry
@@ -2584,6 +2584,15 @@ impl Supervisor {
         soul_id: &SoulId,
         active: &crate::registry::OwnedRuntimeHandle,
     ) -> Result<AuthenticatedHost, RuntimeError> {
+        self.authenticate_fresh_host(soul_id, active, false).await
+    }
+
+    async fn authenticate_fresh_host(
+        &self,
+        soul_id: &SoulId,
+        active: &crate::registry::OwnedRuntimeHandle,
+        allow_codex_recovery: bool,
+    ) -> Result<AuthenticatedHost, RuntimeError> {
         let host = self
             .authenticate_host(active.incarnation_id(), active.runtime_dir())
             .await?;
@@ -2671,10 +2680,15 @@ impl Supervisor {
                 ));
             }
         }
+        let retained_codex = allow_codex_recovery
+            && self
+                .retained_codex_host_eligible(&current, &host, &status)
+                .await?;
         if current.desired_state != freshell_runtime_protocol::DesiredState::Running
             || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || status.exited
+            || (status.exited && !retained_codex)
             || (!fixture
+                && !retained_codex
                 && (!host
                     .capabilities
                     .iter()
@@ -2690,6 +2704,15 @@ impl Supervisor {
                 RuntimeErrorCode::RecoveryBlocked,
                 "fresh-agent input requires the current committed native identity",
             ));
+        }
+        if retained_codex {
+            append_event(
+                &self.config.lifecycle_log,
+                "fresh_agent.retained_codex_recovery_admitted",
+                serde_json::json!({"severity":"info","soulId":soul_id,
+                    "incarnationId":active.incarnation_id(),"hostBootId":host.host_boot_id,
+                    "nativeSessionId":current.native_session_id}),
+            );
         }
         Ok(host)
     }
@@ -5156,6 +5179,8 @@ impl Supervisor {
             .await?
         {
             HostResult::Status {
+                fresh_agent_recovery_source,
+                max_control_epoch,
                 native_identity_observation,
                 max_execution_generation,
                 host_boot_id,
@@ -5168,6 +5193,8 @@ impl Supervisor {
                 opencode_transfer_receipt,
                 ..
             } => Ok(HostStatus {
+                fresh_agent_recovery_source,
+                max_control_epoch,
                 native_identity_observation,
                 max_execution_generation,
                 host_boot_id,
@@ -5488,7 +5515,7 @@ fn ensure_host_actor_state_dir(
 #[derive(Clone)]
 pub(crate) struct AuthenticatedHost {
     pub(crate) capabilities: Vec<String>,
-    host_boot_id: HostBootId,
+    pub(crate) host_boot_id: HostBootId,
     secret: Vec<u8>,
     effective_limits: RuntimeLimits,
 }
@@ -5502,6 +5529,9 @@ pub(crate) struct AcceptedGrant {
     opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 pub(crate) struct HostStatus {
+    pub(crate) fresh_agent_recovery_source:
+        Option<freshell_runtime_protocol::NativeIdentityObservation>,
+    pub(crate) max_control_epoch: u64,
     pub(crate) max_execution_generation: u64,
     pub(crate) native_identity_observation:
         Option<freshell_runtime_protocol::NativeIdentityObservation>,
@@ -8073,6 +8103,7 @@ mod codex_pre_worker_retry_tests {
                     }
                 }
                 HostCommand::Status { .. } => Ok(HostResult::Status {
+                    fresh_agent_recovery_source: None,
                     host_boot_id: boot.clone(),
                     worker_pid: Some(42),
                     worker_launch_count: 1,
@@ -8992,6 +9023,7 @@ mod opencode_transfer_restart_tests {
                         HostCommand::Status { .. } => {
                             let observation = current_proof.lock().unwrap().clone();
                             HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 native_session_id: observation
                                     .as_ref()
                                     .map(|proof| proof.native_session_id.clone()),
@@ -9473,6 +9505,7 @@ mod opencode_transfer_restart_tests {
                             continue;
                         }
                         HostCommand::Status { .. } => HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             native_identity_observation: observed,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
@@ -13837,6 +13870,7 @@ mod native_observation_ipc_tests {
                             effective_limits: requested_limits,
                         },
                         HostCommand::Status { .. } => HostResult::Status {
+                            fresh_agent_recovery_source: None,
                             native_identity_observation: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(123),
@@ -13981,6 +14015,7 @@ mod native_observation_ipc_tests {
                         HostCommand::Status { incarnation_id } if step == 1 => {
                             assert_eq!(incarnation_id, expected_incarnation);
                             HostResult::Status {
+                                fresh_agent_recovery_source: None,
                                 native_identity_observation: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: Some(123),
@@ -14367,3 +14402,7 @@ mod control_connection_tests {
 #[cfg(test)]
 #[path = "native_clear_service_tests.rs"]
 mod native_clear_service_tests;
+
+#[cfg(test)]
+#[path = "retained_codex_recovery_tests.rs"]
+mod retained_codex_recovery_tests;

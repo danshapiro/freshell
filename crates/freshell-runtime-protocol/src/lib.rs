@@ -5226,6 +5226,11 @@ pub enum HostResult {
     FreshAgentNativeName(FreshAgentNativeNameReply),
     FreshAgentChildSnapshot(serde_json::Value),
     Status {
+        /// Ephemeral settled source retained by an attached Codex actor after
+        /// native exit. Authorizes only an attempt at its guarded SEND recovery;
+        /// it does not assert native liveness or confirmed process cleanup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fresh_agent_recovery_source: Option<NativeIdentityObservation>,
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,
         worker_launch_count: u64,

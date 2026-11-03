@@ -96,6 +96,12 @@ impl From<&PersistedHostState> for HostControlFence {
 }
 
 impl HostControlFence {
+    fn is_current_running(&self, epoch: u64, generation: u64) -> bool {
+        !self.stopped
+            && self.max_control_epoch == epoch
+            && self.max_execution_generation == generation
+    }
+
     fn validate_generation(&self, epoch: u64, generation: u64) -> Result<(), RuntimeError> {
         if epoch < self.max_control_epoch || generation < self.max_execution_generation {
             return Err(RuntimeError::new(
@@ -790,6 +796,7 @@ async fn dispatch_with_effects(
                     "opencode-adoption-observation-v1".into(),
                     "native-identity-observation-v1".into(),
                     "fresh-agent-native-readiness-v1".into(),
+                    "fresh-agent-codex-recovery-source-v1".into(),
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
@@ -872,10 +879,12 @@ async fn dispatch_with_effects(
                 HostCommand::Status { incarnation_id } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let persisted = state.persisted.lock().await.clone();
-                    let mut evidence = persisted.fixture_evidence;
+                    let mut evidence = persisted.fixture_evidence.clone();
+                    let fresh_agent = state.fresh_agent.lock().await.clone();
                     let mut exited = false;
                     let mut native_session_id = None;
                     let mut native_identity_observation = None;
+                    let mut fresh_agent_recovery_source = None;
                     let mut opencode_adoption = OpenCodeAdoptionStatus::NotRequired;
                     if let Some(pty) = state.pty.lock().await.as_ref() {
                         exited = pty.exited();
@@ -894,8 +903,12 @@ async fn dispatch_with_effects(
                             "exitCode":pty.exit_code(),
                             "nativeSessionId":native_session_id,
                         });
-                    } else if let Some(agent) = state.fresh_agent.lock().await.as_ref() {
+                    } else if let Some(agent) = fresh_agent.as_ref() {
                         exited = !agent.is_live().await;
+                        if exited {
+                            fresh_agent_recovery_source =
+                                retained_codex_recovery_source(state, &persisted, agent).await;
+                        }
                         if let Some(launch) = persisted.native_identity_launch.as_ref() {
                             native_identity_observation =
                                 fresh_native_observation(launch, agent).await;
@@ -952,6 +965,7 @@ async fn dispatch_with_effects(
                         ));
                     }
                     Ok(HostResult::Status {
+                        fresh_agent_recovery_source,
                         native_identity_observation,
                         host_boot_id: state.host_boot_id.clone(),
                         worker_pid: persisted.worker_pid,
@@ -1075,13 +1089,19 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
                     let actor = state
                         .fresh_agent
                         .lock()
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
+                    let persisted = state.persisted.lock().await.clone();
+                    if retained_codex_recovery_source(state, &persisted, &actor)
+                        .await
+                        .is_none()
+                    {
+                        ensure_current_fresh_native_observation(state).await?;
+                    }
                     let before = actor.profile().await;
                     let command_state = actor
                         .dispatch_with_checkpoint_identity(
@@ -1092,6 +1112,12 @@ async fn dispatch_with_effects(
                         )
                         .await
                         .map_err(map_actor_error)?;
+                    commit_fresh_native_transition(
+                        state,
+                        &actor,
+                        before.native_session_id.as_deref(),
+                    )
+                    .await?;
                     let after = actor.profile().await;
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
@@ -2570,6 +2596,56 @@ async fn fresh_native_observation(
         freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake
     };
     providers::native_identity::bind_provider_observation(launch, &native, source, &evidence)
+}
+
+async fn retained_codex_recovery_source(
+    state: &HostState,
+    persisted: &PersistedHostState,
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+) -> Option<freshell_runtime_protocol::NativeIdentityObservation> {
+    let current_control = || {
+        state.control_fence.lock().unwrap().is_current_running(
+            persisted.max_control_epoch,
+            persisted.max_execution_generation,
+        )
+    };
+    if persisted.provider.as_deref() != Some("codex")
+        || persisted.host_boot_id.as_ref() != Some(&state.host_boot_id)
+        || persisted.worker_pid.is_none()
+        || !current_control()
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, actor))
+    {
+        return None;
+    }
+    let launch = persisted.native_identity_launch.as_ref()?;
+    if launch.incarnation_id != state.incarnation_id
+        || launch.execution_generation != persisted.max_execution_generation
+    {
+        return None;
+    }
+    let evidence = actor.retained_codex_native_identity_evidence().await?;
+    let native = evidence["nativeSessionId"].as_str()?;
+    if serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(
+        evidence["launch"].clone(),
+    )
+    .ok()
+    .as_ref()
+        != Some(launch)
+        || !current_control()
+    {
+        return None;
+    }
+    providers::native_identity::bind_provider_observation(
+        launch,
+        native,
+        freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+        &evidence,
+    )
 }
 
 async fn commit_fresh_native_transition(
@@ -10615,6 +10691,128 @@ mod tests {
     };
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct UnobservedCodexTransport(AtomicUsize);
+
+    #[async_trait]
+    impl FreshAgentTransport for UnobservedCodexTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: None,
+            })
+        }
+        async fn is_live(&self) -> bool {
+            false
+        }
+        async fn dispatch(
+            &self,
+            request: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchAck {
+                provider_ack_id: Some(request.to_string()),
+                native_identity: None,
+            })
+        }
+        async fn resolve_permission(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            Ok(())
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_crash_send_requires_prior_observed_actor_source() {
+        let owned = tempfile::tempdir().unwrap();
+        let mut state = test_host_state();
+        let empty_created = state.state_dir.clone();
+        assert!(std::fs::read_dir(&empty_created).unwrap().next().is_none());
+        std::fs::remove_dir(empty_created).unwrap();
+        Arc::get_mut(&mut state).unwrap().state_dir = owned.path().into();
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "unobserved-native-launch".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("saved-native-only".into()),
+        };
+        {
+            let mut persisted = state.persisted.lock().await;
+            persisted.native_identity_launch = Some(binding);
+            persisted.host_boot_id = Some(state.host_boot_id.clone());
+            persisted.provider = Some("codex".into());
+            persisted.worker_pid = Some(std::process::id());
+            persisted.worker_launch_count = 1;
+            persisted.max_control_epoch = 1;
+            persisted.max_execution_generation = 1;
+            *state.control_fence.lock().unwrap() = HostControlFence::from(&*persisted);
+        }
+        let transport = Arc::new(UnobservedCodexTransport(AtomicUsize::new(0)));
+        let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+            "provider":"codex", "runtimeVariant":"codex-app-server-v1", "cwd":owned.path(), "providerStoreId":"unobserved-store"
+        })).unwrap();
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            owned.path().join("actor"),
+            profile,
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::new(),
+                    text: "forbidden unobserved input".into(),
+                    settings: None,
+                    checkpoint_logical_attempt_id: None,
+                },
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            RuntimeErrorCode::RecoveryWrongIdentity
+        );
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        let status = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::Status {
+                    incarnation_id: state.incarnation_id.clone(),
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            status,
+            HostResult::Status {
+                fresh_agent_recovery_source: None,
+                native_identity_observation: None,
+                exited: true,
+                ..
+            }
+        ));
+        actor.stop().await.unwrap();
+    }
 
     struct RpcFixtureTransport {
         native_evidence: std::sync::Mutex<Option<serde_json::Value>>,
