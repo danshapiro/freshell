@@ -14,12 +14,21 @@
 //! resumable — a stale or parse-gap warm snapshot must never adjudicate it
 //! absent.
 //!
-//! Gate deferral (load-bearing A2): this locator improves existence answers
-//! for pane-reconcile dead-session adjudication and the FUTURE resume-gate
-//! activation; antigravity stays OUT of
-//! `freshell_platform::resume_gate::VALIDATED_PROVIDERS` until real-binary
-//! transcript-store evidence exists, so no spawn door consults it through
-//! the gate today.
+//! Gate activation (resume-gate flip, Task 3 of
+//! docs/plans/2026-11-02-antigravity-transcript-validation.md): the
+//! conversation-resume gate is ACTIVE for antigravity (activated
+//! 2026-11-03 on real-binary transcript evidence (2026-11-02) + a
+//! proven settings-conformant real resume (2026-11-03; Provider
+//! Contract Record rows 74/75/76; evidence:
+//! real-binary-transcript-evidence.md) — antigravity joined
+//! `freshell_platform::resume_gate::VALIDATED_PROVIDERS`, so the spawn
+//! doors consult this locator through the gate: `exists_for_gate`
+//! validates BOTH a warm-index Present and a cold-index Unknown against
+//! this same on-disk by-id walk before the gate trusts them (GC3's
+//! no-silent-replacement rule — the CLI's documented missing-ID
+//! behavior silently starts a fresh conversation). The locator's
+//! pane-reconcile role (the warm-Absent attach-parity arm in
+//! `existence.rs`) is unchanged.
 //!
 //! Tri-state contract (mirrors [`crate::existence_by_id::ByIdAnswer`]):
 //! * transcript exists + readable ⇒ `Present`;
@@ -48,8 +57,10 @@ pub type AntigravityTranscriptLocator = Arc<dyn Fn(&str) -> ByIdAnswer + Send + 
 /// conversation directory: a conversation dir name cannot contain a path
 /// separator or NUL, and neither `.` nor `..` names one — joining such an
 /// id would walk OUT of the brain tree and probe a foreign path, so it is
-/// treated as definitively absent instead.
-fn conversation_transcript_path(home: &Path, session_id: &str) -> Option<PathBuf> {
+/// treated as definitively absent instead. `pub(crate)` so the existence
+/// gate tests seed and delete the exact canonical path the locator probes
+/// (single source of truth).
+pub(crate) fn conversation_transcript_path(home: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty()
         || session_id.contains('/')
         || session_id.contains('\0')

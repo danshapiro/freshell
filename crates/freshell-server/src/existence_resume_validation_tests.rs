@@ -6,6 +6,7 @@
 //! module's `pub(super)` scaffolding helpers.
 use super::tests::{direct_locator_over, probe_over, temp_claude_home, write_session};
 use super::*;
+use crate::antigravity_existence_by_id::conversation_transcript_path;
 use crate::existence_by_id::codex_rollout_on_disk;
 
 use freshell_sessions::directory_index::{ClaudeSource, SessionSource};
@@ -563,6 +564,147 @@ async fn claude_absent_never_consults_the_antigravity_locator() {
         probe.exists("claude", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"),
         SessionExistence::Absent,
         "the by-id transcript fallback is provider-gated to antigravity only"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ── Antigravity gate validation (resume-gate activation, plan Task 3) ────────
+//
+// The conversation-resume gate is ACTIVE for antigravity (activated
+// 2026-11-03 on real-binary transcript evidence (2026-11-02) + a proven
+// settings-conformant real resume (2026-11-03;
+// real-binary-transcript-evidence.md) — Provider Contract Record rows
+// 74/75/76). Neither a warm-index hit nor a cold-index Unknown is
+// sufficient gate evidence: the index can be STALE for a conversation
+// deleted from disk, the cold window precedes every warm-up, and the
+// CLI's documented missing-ID behavior silently starts a FRESH
+// conversation (GC3's no-silent-replacement rule). `exists_for_gate`
+// therefore validates BOTH answers against the same on-disk by-id
+// locator the warm-Absent arm uses.
+
+/// Seed one PARSEABLE antigravity conversation under `home` — the
+/// committed fixture bytes (the same transcript `existence.rs`'s
+/// `temp_antigravity_home` seeds), so a REAL `AntigravitySource` snapshot
+/// CARRIES the row and a warm-index hit is reproducible. Returns the
+/// canonical transcript path (the `conversation_transcript_path` builder
+/// — the exact path the production locator probes).
+fn seed_parseable_agy_conversation(home: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let transcript = conversation_transcript_path(home, id).expect("plausible conversation id");
+    if let Some(parent) = transcript.parent() {
+        std::fs::create_dir_all(parent).expect("mkdir antigravity brain conversation");
+    }
+    let fixture = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/antigravity/fresh.sanitized.jsonl"),
+    )
+    .expect("read antigravity fixture");
+    std::fs::write(&transcript, fixture).expect("write antigravity transcript");
+    transcript
+}
+
+/// The gate-test probe shape: a REAL `SessionIndex` over a REAL
+/// `AntigravitySource` rooted at `home` (the `antigravity_probe` wiring
+/// shape from `existence.rs`'s tests — the `main.rs` construction), with
+/// the antigravity provider root registered (an existing root keeps the
+/// cold answer the deferrable `Unknown`, never `ProviderUnavailable`) and
+/// the PRODUCTION by-id locator chained over the same home.
+fn gate_probe_over(home: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionIndex>) {
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![
+            Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+                home.to_path_buf(),
+            )) as Arc<dyn SessionSource>,
+        ],
+        Duration::from_millis(50),
+        None,
+    ));
+    (
+        IndexExistenceProbe::new(
+            Arc::clone(&index),
+            None,
+            HashMap::from([("antigravity".to_string(), home.to_path_buf())]),
+        )
+        .with_antigravity_transcript_locator(antigravity_transcript_locator(home.to_path_buf())),
+        index,
+    )
+}
+
+/// A warm-index hit must NOT answer Present for a conversation whose
+/// transcript is gone: the snapshot can be stale (the file was deleted
+/// after the last warm), and the gate passing such an id through to `agy`
+/// would silently start a FRESH conversation (the CLI's documented
+/// missing-ID behavior — GC3 violation). The gate variant validates the
+/// warm Present against the on-disk by-id locator and corrects it to
+/// Absent BEFORE the gate trusts it. Activated with the resume gate
+/// 2026-11-03 — GC3's no-silent-replacement rule.
+#[tokio::test]
+async fn antigravity_warm_index_present_is_disk_validated_by_the_gate_variant() {
+    let home = rv_temp_dir("gate-present-validation");
+    let id = "11111111-2222-3333-4444-555555555555";
+    let transcript = seed_parseable_agy_conversation(&home, id);
+    let (probe, index) = gate_probe_over(&home);
+    index.warm().await;
+    std::fs::remove_file(&transcript).expect("delete transcript");
+    assert_eq!(
+        probe.exists_for_gate("antigravity", id),
+        SessionExistence::Absent,
+        "a stale warm-index hit for a deleted transcript must be corrected to \
+         Absent before the gate trusts it"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The positive twin: a warm hit whose transcript IS on disk stays Present
+/// (disk confirms the index; the gate proceeds with the exact id).
+#[tokio::test]
+async fn antigravity_warm_index_present_with_disk_present_stays_present() {
+    let home = rv_temp_dir("gate-present-kept");
+    let id = "11111111-2222-3333-4444-555555555556";
+    seed_parseable_agy_conversation(&home, id);
+    let (probe, index) = gate_probe_over(&home);
+    index.warm().await;
+    assert_eq!(
+        probe.exists_for_gate("antigravity", id),
+        SessionExistence::Present,
+        "disk Present confirms the warm hit — the gate proceeds with the exact id"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The cold window (every startup, before the index warms) must not pass a
+/// stale id through as Unknown → Proceed: the gate variant validates cold
+/// Unknowns against the disk too. Absent on disk ⇒ the typed refusal, not
+/// a silent fresh conversation. Activated with the resume gate 2026-11-03
+/// — GC3's no-silent-replacement rule. Plain #[test] (no tokio runtime)
+/// so kick_refresh no-ops and the index deterministically stays cold.
+#[test]
+fn antigravity_cold_index_absent_id_is_disk_refused_not_unknown_proceed() {
+    let home = rv_temp_dir("gate-cold-absent");
+    let id = "11111111-2222-3333-4444-555555555557";
+    let transcript = seed_parseable_agy_conversation(&home, id);
+    let (probe, _index) = gate_probe_over(&home);
+    std::fs::remove_file(&transcript).expect("delete transcript");
+    assert_eq!(
+        probe.exists_for_gate("antigravity", id),
+        SessionExistence::Absent,
+        "cold Unknown + disk Absent ⇒ the typed refusal, never Unknown → Proceed"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The cold-window positive twin: a conversation whose transcript IS on
+/// disk resumes through the cold window (disk Present promotes the cold
+/// Unknown to Present — the restore resumes, never a fresh spawn).
+#[test]
+fn antigravity_cold_index_present_id_resumes() {
+    let home = rv_temp_dir("gate-cold-present");
+    let id = "11111111-2222-3333-4444-555555555558";
+    seed_parseable_agy_conversation(&home, id);
+    let (probe, _index) = gate_probe_over(&home);
+    assert_eq!(
+        probe.exists_for_gate("antigravity", id),
+        SessionExistence::Present,
+        "cold Unknown + disk Present ⇒ Present — the restore resumes through the cold window"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

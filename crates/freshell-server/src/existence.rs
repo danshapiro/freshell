@@ -145,10 +145,12 @@ pub struct IndexExistenceProbe {
     /// lives on the sync warm-Absent adjudication path in `exists()` beside
     /// the amplifier/opencode arms (NOT the codex gate-only treatment —
     /// there is no ~1s walk to keep off the reconcile path) and improves
-    /// pane-reconcile dead-session answers today; `exists_for_gate`
-    /// inherits it through `exists()` for the deferred future gate
-    /// activation. `None` (tests, callers that never set it) keeps the
-    /// pure index answer.
+    /// pane-reconcile dead-session answers; since the resume-gate
+    /// activation (2026-11-03) `exists_for_gate` ALSO consults it
+    /// DIRECTLY to validate a warm-index Present and a cold-index
+    /// Unknown before the gate trusts them (the gate block below).
+    /// `None` (tests, callers that never set it) keeps the pure index
+    /// answer.
     antigravity_transcript_locator: Option<AntigravityTranscriptLocator>,
 }
 
@@ -437,9 +439,11 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // resumable. CHEAP single-open check (the amplifier/opencode
                 // class, NOT codex's gate-only ~1s walk), so it stays on
                 // this sync reconcile-consulted path and improves
-                // pane-reconcile dead-session answers today;
-                // `exists_for_gate` inherits it through `exists()` for the
-                // deferred future gate activation. An unreadable store is
+                // pane-reconcile dead-session answers; since the
+                // resume-gate activation (2026-11-03) `exists_for_gate`
+                // ALSO consults it directly (the gate block below), so
+                // after this arm `Absent` for antigravity is POSITIVE
+                // absence for BOTH callers. An unreadable store is
                 // honest Unknown (G28: bounded deferral), NEVER Absent.
                 if provider == "antigravity" {
                     if let Some(locator) = &self.antigravity_transcript_locator {
@@ -487,9 +491,11 @@ impl SessionExistenceProbe for IndexExistenceProbe {
             .contains(&format!("{provider}:{session_id}"))
     }
 
-    /// Gate-caller variant (trait doc): `exists()` plus the EXPENSIVE codex
-    /// by-id rollout walk (~1s on a real store) on a warm-Absent answer.
-    /// The walk lives HERE and not in `exists()` because `exists()` is
+    /// Gate-caller variant (trait doc): `exists()` plus (a) the EXPENSIVE
+    /// codex by-id rollout walk (~1s on a real store) on a warm-Absent
+    /// answer, and (b) the antigravity Present/Unknown disk validation
+    /// (see the gate block below — activated 2026-11-03). The expensive
+    /// work lives HERE and not in `exists()` because `exists()` is
     /// consulted inline on the sync reconcile path, whose IO discipline is
     /// ~250ms per consult (see `opencode_db_locator`); gate callers run this
     /// variant inside `tokio::task::spawn_blocking` (A13: never inline on
@@ -498,6 +504,40 @@ impl SessionExistenceProbe for IndexExistenceProbe {
     /// `Absent`, so it still NEVER runs on the cold path.
     fn exists_for_gate(&self, provider: &str, session_id: &str) -> SessionExistence {
         let base = self.exists(provider, session_id);
+        // Antigravity gate validation (activated 2026-11-03 on real-binary
+        // transcript evidence (2026-11-02) + a proven settings-conformant
+        // real resume (2026-11-03; real-binary-transcript-evidence.md)):
+        // neither a warm-index hit nor a cold-index Unknown is sufficient
+        // evidence for the resume gate — the index can be stale for a
+        // conversation deleted from disk, and the cold window precedes
+        // every warm-up, while the CLI's documented missing-ID behavior
+        // silently starts a FRESH conversation (GC3 violation). Validate
+        // both against the same on-disk by-id walk the Absent arm uses:
+        // disk Present confirms (and feeds the observed set — module-doc
+        // invariant), disk Absent corrects to Absent (typed refusal), disk
+        // Unreadable defers as Unknown (G28 fail-open). Absent itself needs
+        // no re-check — the warm-Absent arm at exists() already
+        // disk-verified it.
+        if provider == "antigravity" {
+            if let Some(locator) = &self.antigravity_transcript_locator {
+                match base {
+                    SessionExistence::Present | SessionExistence::Unknown => {
+                        return match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                SessionExistence::Present
+                            }
+                            ByIdAnswer::Absent => SessionExistence::Absent,
+                            ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
         if base == SessionExistence::Absent && provider == "codex" {
             if let Some(locator) = &self.codex_rollout_locator {
                 return match locator(session_id) {
