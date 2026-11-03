@@ -2562,8 +2562,10 @@ impl FreshClaudeState {
                                 None,
                                 None,
                                 &None,
-                                claim.as_ref(),
-                                crate::identity_sink::SettingsUpdate::Keep,
+                                binding::EstablishedBindingOptions {
+                                    transition_claim: claim.as_ref(),
+                                    settings_update: crate::identity_sink::SettingsUpdate::Keep,
+                                },
                             )
                             .await
                     })
@@ -2596,8 +2598,10 @@ impl FreshClaudeState {
                 None,
                 None,
                 &no_ticket,
-                None,
-                crate::identity_sink::SettingsUpdate::Keep,
+                binding::EstablishedBindingOptions {
+                    transition_claim: None,
+                    settings_update: crate::identity_sink::SettingsUpdate::Keep,
+                },
             )
             .await
         };

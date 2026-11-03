@@ -840,8 +840,10 @@ impl FreshClaudeState {
                         .as_ref()
                         .expect("binding write guard is present")
                         .ticket_ref(),
-                    binding_claim.as_ref(),
-                    settings_update,
+                    super::binding::EstablishedBindingOptions {
+                        transition_claim: binding_claim.as_ref(),
+                        settings_update,
+                    },
                 )
                 .await
             {
