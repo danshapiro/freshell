@@ -147,3 +147,49 @@ async fn blocked_send_preserves_existing_queued_ambiguous_and_accepted_outcomes(
         .unwrap();
     assert_eq!(accepted, CommandState::Completed);
 }
+
+#[tokio::test]
+async fn blocked_send_refusal_preserves_input_settings_and_checkpoint_identity() {
+    let (_root, registry, soul, supervisor) = blocked_fixture().await;
+    block(&registry, &soul).await;
+    let request = RequestId::parse("blocked-correlated-send").unwrap();
+    let settings = freshell_runtime_protocol::FreshAgentTurnSettings {
+        model: Some("original-model".into()),
+        ..Default::default()
+    };
+    let initial = supervisor
+        .fresh_agent_send(
+            request.clone(),
+            soul.clone(),
+            "original message".into(),
+            Some(settings.clone()),
+            Some("original-attempt".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        initial.fresh_agent_send_diagnostic.unwrap().outcome,
+        FreshAgentSendDiagnosticOutcome::Refused
+    );
+    for (message, model, attempt) in [
+        ("different message", "original-model", "original-attempt"),
+        ("original message", "different-model", "original-attempt"),
+        ("original message", "original-model", "different-attempt"),
+    ] {
+        let changed_settings = freshell_runtime_protocol::FreshAgentTurnSettings {
+            model: Some(model.into()),
+            ..Default::default()
+        };
+        let conflict = supervisor
+            .fresh_agent_send(
+                request.clone(),
+                soul.clone(),
+                message.into(),
+                Some(changed_settings),
+                Some(attempt.into()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, RuntimeErrorCode::RequestIdConflict);
+    }
+}
