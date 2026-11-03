@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // v2 adds mandatory per-attempt ownership tokens to OpenCode transfer actions.
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1: &str =
+    "fresh-agent-native-readiness-receipt-v1";
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_HISTORY_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_OPENCODE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
@@ -3777,6 +3779,195 @@ pub struct NativeIdentityLaunch {
     pub requested_native_session_id: Option<String>,
 }
 
+/// The registry write fence carried with a no-turn native readiness request.
+/// It is persisted in the host receipt so a retry cannot adopt a transition
+/// that belongs to an older owner or user intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReadinessFence {
+    pub control_epoch: u64,
+    pub intent_revision: u64,
+    pub identity_revision: u64,
+    pub evidence_revision: u64,
+    pub native_import_revision: u64,
+    pub recovery_attempt_id: Option<RecoveryAttemptId>,
+    pub active_incarnation_id: IncarnationId,
+}
+
+impl NativeReadinessFence {
+    /// A durable receipt from an earlier supervisor process may be replayed
+    /// under a newly issued fence after the registry advances its control
+    /// epoch. Every ownership and identity component must remain exact; only
+    /// a monotonic control-epoch increase is accepted.
+    pub fn is_covered_by(&self, current: &Self) -> bool {
+        self.control_epoch <= current.control_epoch
+            && self.intent_revision == current.intent_revision
+            && self.identity_revision == current.identity_revision
+            && self.evidence_revision == current.evidence_revision
+            && self.native_import_revision == current.native_import_revision
+            && self.recovery_attempt_id == current.recovery_attempt_id
+            && self.active_incarnation_id == current.active_incarnation_id
+    }
+}
+
+/// A replacement host may retry one exact Codex resume before it starts a
+/// replacement thread. This authority is valid only for a reserved recovery
+/// attempt and the target incarnation's source launch; it never grants a
+/// general create-on-resume-failure policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReadinessRecoveryAuthorization {
+    pub source_fence: NativeReadinessFence,
+    pub source_launch: NativeIdentityLaunch,
+    pub prior_incarnation_id: IncarnationId,
+    pub resume_spec_sha256: String,
+}
+
+impl NativeReadinessRecoveryAuthorization {
+    pub fn is_valid(&self) -> bool {
+        self.source_fence.recovery_attempt_id.is_some()
+            && self.source_fence.active_incarnation_id == self.source_launch.incarnation_id
+            && self.prior_incarnation_id != self.source_launch.incarnation_id
+            && self.source_fence.evidence_revision == self.source_launch.evidence_revision
+            && self.source_launch.execution_generation > 0
+            && !self.source_launch.launch_nonce.is_empty()
+            && is_lower_hex_sha256(&self.resume_spec_sha256)
+            && self
+                .source_launch
+                .requested_native_session_id
+                .as_deref()
+                .is_some_and(|root| !root.is_empty() && !root.chars().any(char::is_control))
+    }
+
+    /// Confirm that the authorization, launch, and exact persisted resume
+    /// selection all name the same Codex source. The CWD in `resume_spec`
+    /// remains part of the provider-store identity even if the accepted
+    /// launch CWD has since changed.
+    pub fn is_valid_for(&self, launch: &FreshAgentLaunchSpec, resume_spec: &ResumeSpec) -> bool {
+        let Some(source_root) = self.source_launch.requested_native_session_id.as_deref() else {
+            return false;
+        };
+        self.is_valid()
+            && self.resume_spec_sha256 == resume_spec_sha256(resume_spec)
+            && launch.provider == FreshProvider::Codex
+            && launch.session_type == "freshcodex"
+            && launch.native_session_id.as_deref() == Some(source_root)
+            && launch.provider_store_id == resume_spec.provider_session.provider_store_id
+            && resume_spec.provider_session.provider == FreshProvider::Codex.as_str()
+            && resume_spec.provider_session.native_session_id == source_root
+            && resume_spec.mode == launch.session_type
+            && resume_spec.runtime_variant == launch.runtime_variant
+            && resume_spec.evidence_revision == self.source_fence.evidence_revision
+            && launch.session_ref.as_ref().is_none_or(|reference| {
+                reference.provider == FreshProvider::Codex.as_str()
+                    && reference.session_id == source_root
+            })
+    }
+}
+
+pub fn resume_spec_sha256(resume_spec: &ResumeSpec) -> String {
+    sha256_hex(&serde_json::to_vec(resume_spec).expect("resume spec serializes"))
+}
+
+/// Exact, body-free native-store census captured after the provider reports
+/// that the requested source thread is absent. It travels with the durable
+/// receipt so the supervisor can verify that the root transition concerned
+/// the same store selection and recovery fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReadinessAbsenceEvidence {
+    pub prior_incarnation_id: IncarnationId,
+    pub provider: String,
+    pub provider_store_id: String,
+    pub native_session_id: String,
+    pub evidence_revision: u64,
+    pub store_state: EvidenceStoreState,
+    pub census_reference: String,
+}
+
+impl NativeReadinessAbsenceEvidence {
+    pub fn is_valid_for(&self, source_launch: &NativeIdentityLaunch) -> bool {
+        self.prior_incarnation_id != source_launch.incarnation_id
+            && self.provider == FreshProvider::Codex.as_str()
+            && !self.provider_store_id.is_empty()
+            && !self.native_session_id.is_empty()
+            && !self.native_session_id.chars().any(char::is_control)
+            && source_launch.requested_native_session_id.as_deref()
+                == Some(self.native_session_id.as_str())
+            && self.evidence_revision == source_launch.evidence_revision
+            && matches!(
+                self.store_state,
+                EvidenceStoreState::Missing | EvidenceStoreState::PresentReadable
+            )
+            && self.census_reference.starts_with("nativeAbsenceCensus=v2:")
+            && !self.census_reference.chars().any(char::is_control)
+    }
+}
+
+/// Durable proof of one accepted Codex native-root transition. The actor
+/// commits this beside its updated profile so a lost reply can be replayed
+/// without repeating provider work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeReadinessReceipt {
+    pub source_fence: NativeReadinessFence,
+    pub source_launch: NativeIdentityLaunch,
+    pub next_launch: NativeIdentityLaunch,
+    pub identity: NativeDispatchIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence_evidence: Option<NativeReadinessAbsenceEvidence>,
+    /// Exact source ResumeSpec used when a cold replacement first proved the
+    /// old root absent. A later incarnation may replay that actor-only receipt
+    /// only when its freshly issued authorization names the same full source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_spec_sha256: Option<String>,
+}
+
+impl NativeReadinessReceipt {
+    pub fn is_valid(&self) -> bool {
+        let previous = self.identity.previous_native_session_id.as_str();
+        let Some(next_revision) = self.source_launch.evidence_revision.checked_add(1) else {
+            return false;
+        };
+        let mut expected_next = self.source_launch.clone();
+        expected_next.evidence_revision = next_revision;
+        expected_next.requested_native_session_id = Some(self.identity.native_session_id.clone());
+
+        self.source_fence.active_incarnation_id == self.source_launch.incarnation_id
+            && self.source_fence.evidence_revision == self.source_launch.evidence_revision
+            && !self.source_launch.launch_nonce.is_empty()
+            && !previous.is_empty()
+            && !previous.chars().any(char::is_control)
+            && self
+                .source_launch
+                .requested_native_session_id
+                .as_deref()
+                .is_none_or(|requested| requested == previous)
+            && !self.identity.native_session_id.is_empty()
+            && self.identity.native_session_id != previous
+            && !self
+                .identity
+                .native_session_id
+                .chars()
+                .any(char::is_control)
+            && self
+                .identity
+                .pending_naming_handle
+                .as_deref()
+                .is_none_or(|handle| !handle.is_empty() && !handle.chars().any(char::is_control))
+            && self.next_launch == expected_next
+            && self
+                .absence_evidence
+                .as_ref()
+                .is_none_or(|evidence| evidence.is_valid_for(&self.source_launch))
+            && match (&self.absence_evidence, &self.resume_spec_sha256) {
+                (None, None) => true,
+                (Some(_), Some(digest)) => is_lower_hex_sha256(digest),
+                _ => false,
+            }
+    }
+}
+
 impl NativeIdentityObservation {
     pub fn matches_provider(&self, provider: &str, fresh_agent: bool) -> bool {
         if fresh_agent {
@@ -5051,6 +5242,10 @@ pub enum HostCommand {
         dispatch_budget_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_identity_launch: Option<NativeIdentityLaunch>,
+        /// Exact source/attempt authorization for the replacement-only
+        /// Codex startup path. Ordinary launches never receive this permit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_readiness_recovery: Option<NativeReadinessRecoveryAuthorization>,
     },
     Stop {
         incarnation_id: IncarnationId,
@@ -5082,6 +5277,10 @@ pub enum HostCommand {
     },
     FreshAgentPrepareNative {
         incarnation_id: IncarnationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_launch: Option<NativeIdentityLaunch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_fence: Option<NativeReadinessFence>,
     },
     FreshAgentResumePending {
         incarnation_id: IncarnationId,
@@ -5191,6 +5390,11 @@ pub enum HostResult {
         native_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_identity_observation: Option<NativeIdentityObservation>,
+        /// Durable actor/host receipt for a Codex root transition performed
+        /// during replacement startup. Supervisor retries can commit it
+        /// without asking the provider to start another thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_readiness_receipt: Option<NativeReadinessReceipt>,
         /// Present only when an OpenCode transfer's durable provider-reader
         /// receipt was revalidated before this grant was consumed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5239,6 +5443,10 @@ pub enum HostResult {
         native_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_identity_observation: Option<NativeIdentityObservation>,
+        /// Durable Codex startup receipt that lets a supervisor reconcile a
+        /// root transition after losing the grant reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_readiness_receipt: Option<NativeReadinessReceipt>,
         /// Persisted post-import and provider-reader receipt. Recovery uses it
         /// to finish the supervisor's release marker after a crash between
         /// grant acknowledgement and marker persistence.
@@ -6199,6 +6407,122 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
         }
+    }
+
+    #[test]
+    fn native_readiness_replacement_authorization_binds_exact_attempt_and_resume_store() {
+        let launch = fresh_agent_launch(FreshProvider::Codex, "freshcodex");
+        let resume: ResumeSpec = serde_json::from_value(serde_json::json!({
+            "providerSession": {
+                "provider": "codex",
+                "providerStoreId": "soul-store-one",
+                "nativeSessionId": "native-one"
+            },
+            "mode": "freshcodex",
+            "runtimeVariant": "pinned-runtime-variant",
+            "program": "codex",
+            "resumeArgv": ["--resume", "native-one"],
+            "providerHome": "/home/freshell/provider",
+            "cwd": "/workspace/original",
+            "workspacePath": "/workspace/original",
+            "environment": {"HOME": "/home/freshell/provider"},
+            "creationSeedRef": "seed-one",
+            "checkpointRevision": 0,
+            "allocationState": "verified_durable",
+            "evidenceRevision": 7,
+            "neverDispatched": false
+        }))
+        .unwrap();
+        let source_launch = NativeIdentityLaunch {
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: "target-launch-nonce".into(),
+            evidence_revision: 7,
+            execution_generation: 3,
+            requested_native_session_id: Some("native-one".into()),
+        };
+        let authorization = NativeReadinessRecoveryAuthorization {
+            source_fence: NativeReadinessFence {
+                control_epoch: 2,
+                intent_revision: 4,
+                identity_revision: 6,
+                evidence_revision: 7,
+                native_import_revision: 0,
+                recovery_attempt_id: Some(RecoveryAttemptId::new()),
+                active_incarnation_id: source_launch.incarnation_id.clone(),
+            },
+            source_launch: source_launch.clone(),
+            prior_incarnation_id: IncarnationId::new(),
+            resume_spec_sha256: resume_spec_sha256(&resume),
+        };
+
+        assert!(authorization.is_valid());
+        assert!(authorization.is_valid_for(&launch, &resume));
+
+        let receipt_fence = authorization.source_fence.clone();
+        let mut current_fence = receipt_fence.clone();
+        current_fence.control_epoch += 1;
+        assert!(receipt_fence.is_covered_by(&current_fence));
+        current_fence.identity_revision += 1;
+        assert!(!receipt_fence.is_covered_by(&current_fence));
+
+        let mut stale = authorization.clone();
+        stale.source_fence.recovery_attempt_id = None;
+        assert!(!stale.is_valid());
+
+        let mut wrong_incarnation = authorization.clone();
+        wrong_incarnation.source_fence.active_incarnation_id = IncarnationId::new();
+        assert!(!wrong_incarnation.is_valid());
+
+        let mut wrong_root = resume.clone();
+        wrong_root.provider_session.native_session_id = "native-other".into();
+        assert!(!authorization.is_valid_for(&launch, &wrong_root));
+
+        let mut wrong_cwd = resume.clone();
+        wrong_cwd.cwd = "/workspace/other".into();
+        assert!(!authorization.is_valid_for(&launch, &wrong_cwd));
+
+        let mut wrong_resume_argv = resume.clone();
+        wrong_resume_argv
+            .resume_argv
+            .push("--different-store".into());
+        assert!(!authorization.is_valid_for(&launch, &wrong_resume_argv));
+
+        let mut wrong_store = resume;
+        wrong_store.provider_session.provider_store_id = "other-store".into();
+        assert!(!authorization.is_valid_for(&launch, &wrong_store));
+    }
+
+    #[test]
+    fn native_readiness_absence_receipt_requires_the_exact_previous_root_and_revision() {
+        let source_launch = NativeIdentityLaunch {
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: "target-launch-nonce".into(),
+            evidence_revision: 7,
+            execution_generation: 3,
+            requested_native_session_id: Some("native-one".into()),
+        };
+        let evidence = NativeReadinessAbsenceEvidence {
+            prior_incarnation_id: IncarnationId::new(),
+            provider: "codex".into(),
+            provider_store_id: "soul-store-one".into(),
+            native_session_id: "native-one".into(),
+            evidence_revision: 7,
+            store_state: EvidenceStoreState::Missing,
+            census_reference: "nativeAbsenceCensus=v2:{}".into(),
+        };
+        assert!(evidence.is_valid_for(&source_launch));
+
+        let mut wrong_root = evidence.clone();
+        wrong_root.native_session_id = "native-other".into();
+        assert!(!wrong_root.is_valid_for(&source_launch));
+
+        let mut wrong_revision = evidence.clone();
+        wrong_revision.evidence_revision += 1;
+        assert!(!wrong_revision.is_valid_for(&source_launch));
+
+        let mut malformed = evidence;
+        malformed.census_reference = "not-a-census".into();
+        assert!(!malformed.is_valid_for(&source_launch));
     }
 
     #[test]

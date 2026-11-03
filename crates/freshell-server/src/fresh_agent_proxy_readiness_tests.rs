@@ -269,7 +269,7 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                     opencode_transfer_receipt: None,
                     opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
                 },
-                HostCommand::FreshAgentPrepareNative { incarnation_id } => {
+                HostCommand::FreshAgentPrepareNative { incarnation_id, .. } => {
                     assert_eq!(incarnation_id, host_launch.incarnation_id);
                     assert_eq!(
                         host_registry

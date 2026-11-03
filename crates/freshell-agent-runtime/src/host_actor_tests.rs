@@ -1248,6 +1248,22 @@ fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshA
     }
 }
 
+#[tokio::test]
+async fn codex_profile_rejects_a_non_codex_session_reference_before_provider_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut profile = profile(FreshProvider::Codex, "codex-store", Some("native-root"));
+    profile.session_ref = Some(freshell_runtime_protocol::ProviderSessionReference {
+        provider: "claude".into(),
+        session_id: "native-root".into(),
+    });
+    let transport = FakeTransport::new("native-root");
+
+    let result = FreshAgentHostActor::open(dir.path(), profile, transport.clone()).await;
+
+    assert!(matches!(result, Err(ActorError::InvalidProfile)));
+    assert_eq!(transport.starts.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn provider_start_diagnostic_accepts_only_known_categories() {
     for (error, expected) in [
@@ -2323,8 +2339,11 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
         .await
         .unwrap();
     actor.resume_pending_native_permissions().await.unwrap();
-    assert_eq!(old.recovery_releases.load(Ordering::SeqCst), 0,
-        "retained current callback is not a prepared recovered checkpoint and must not receive recovery input");
+    assert_eq!(
+        old.recovery_releases.load(Ordering::SeqCst),
+        0,
+        "retained current callback is not a prepared recovered checkpoint and must not receive recovery input"
+    );
     drop(actor);
     let current = FakeTransport::new(native);
     *current.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "current"));
@@ -2683,6 +2702,1483 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
     assert!(matches!(wrong, Err(ActorError::NativeIdentityMismatch)));
 }
 
+#[derive(Clone, Copy)]
+enum ReadinessEvidenceFault {
+    None,
+    WrongIncarnation,
+    WrongPreviousRoot,
+}
+
+struct NativeReadinessTransport {
+    initial_launch: NativeIdentityLaunch,
+    launch: std::sync::Mutex<NativeIdentityLaunch>,
+    root: std::sync::Mutex<String>,
+    fault: ReadinessEvidenceFault,
+    dispatches: AtomicUsize,
+    readiness_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl FreshAgentTransport for NativeReadinessTransport {
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        let launch = self.launch.lock().unwrap().clone();
+        let root = self.root.lock().unwrap().clone();
+        Some(serde_json::json!({"launch":launch,"nativeSessionId":root}))
+    }
+
+    async fn restore_native_readiness_receipt(
+        &self,
+        receipt: &NativeReadinessReceipt,
+    ) -> Result<(), String> {
+        if !receipt.is_valid() {
+            return Err("invalid readiness receipt".into());
+        }
+        let mut launch = self.launch.lock().unwrap();
+        if *launch == receipt.source_launch {
+            if self.root.lock().unwrap().as_str() != receipt.identity.native_session_id {
+                return Err("restored provider root differs from readiness receipt".into());
+            }
+            *launch = receipt.next_launch.clone();
+        }
+        Ok(())
+    }
+
+    async fn prepare_native_readiness(
+        &self,
+        expected_launch: &NativeIdentityLaunch,
+    ) -> Result<Option<NativeDispatchIdentity>, String> {
+        self.readiness_calls.fetch_add(1, Ordering::SeqCst);
+        if expected_launch != &self.initial_launch {
+            return Err("stale readiness launch".into());
+        }
+        let previous = "codex-native-old";
+        let next = "codex-native-recovered";
+        let mut next_launch = expected_launch.clone();
+        next_launch.evidence_revision += 1;
+        next_launch.requested_native_session_id = Some(next.into());
+        if matches!(self.fault, ReadinessEvidenceFault::WrongIncarnation) {
+            next_launch.incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+        }
+        *self.launch.lock().unwrap() = next_launch;
+        *self.root.lock().unwrap() = next.into();
+        let previous_native_session_id =
+            if matches!(self.fault, ReadinessEvidenceFault::WrongPreviousRoot) {
+                "codex-native-other"
+            } else {
+                previous
+            };
+        Ok(Some(NativeDispatchIdentity {
+            previous_native_session_id: previous_native_session_id.into(),
+            native_session_id: next.into(),
+            pending_naming_handle: Some("pending-codex-name".into()),
+        }))
+    }
+
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: profile.native_session_id.clone(),
+        })
+    }
+
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        Ok(DispatchAck {
+            native_identity: None,
+            provider_ack_id: None,
+        })
+    }
+
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+fn readiness_launch() -> NativeIdentityLaunch {
+    NativeIdentityLaunch {
+        incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        launch_nonce: "codex-readiness-launch-nonce".into(),
+        evidence_revision: 12,
+        execution_generation: 3,
+        requested_native_session_id: Some("codex-native-old".into()),
+    }
+}
+
+fn readiness_fence(launch: &NativeIdentityLaunch) -> NativeReadinessFence {
+    NativeReadinessFence {
+        control_epoch: 4,
+        intent_revision: 8,
+        identity_revision: 2,
+        evidence_revision: launch.evidence_revision,
+        native_import_revision: 1,
+        recovery_attempt_id: None,
+        active_incarnation_id: launch.incarnation_id.clone(),
+    }
+}
+
+struct ColdCodexReadinessTransport {
+    source_launch: NativeIdentityLaunch,
+    launch: std::sync::Mutex<NativeIdentityLaunch>,
+    root: std::sync::Mutex<String>,
+    next_root: String,
+    resume_calls: AtomicUsize,
+    replacement_calls: AtomicUsize,
+    ordinary_start_calls: AtomicUsize,
+    receipt_restore_calls: AtomicUsize,
+    dispatches: AtomicUsize,
+    resume_reports_missing: bool,
+    replacement_error: Option<String>,
+    resume_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
+    resume_specs: std::sync::Mutex<Vec<freshell_runtime_protocol::ResumeSpec>>,
+    replacement_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
+    ordinary_start_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
+}
+
+impl ColdCodexReadinessTransport {
+    fn new(
+        source_launch: NativeIdentityLaunch,
+        root: &str,
+        next_root: &str,
+        resume_reports_missing: bool,
+        replacement_error: Option<&str>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            source_launch: source_launch.clone(),
+            launch: std::sync::Mutex::new(source_launch),
+            root: std::sync::Mutex::new(root.into()),
+            next_root: next_root.into(),
+            resume_calls: AtomicUsize::new(0),
+            replacement_calls: AtomicUsize::new(0),
+            ordinary_start_calls: AtomicUsize::new(0),
+            receipt_restore_calls: AtomicUsize::new(0),
+            dispatches: AtomicUsize::new(0),
+            resume_reports_missing,
+            replacement_error: replacement_error.map(str::to_owned),
+            resume_profiles: std::sync::Mutex::new(Vec::new()),
+            resume_specs: std::sync::Mutex::new(Vec::new()),
+            replacement_profiles: std::sync::Mutex::new(Vec::new()),
+            ordinary_start_profiles: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl FreshAgentTransport for ColdCodexReadinessTransport {
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "launch": self.launch.lock().unwrap().clone(),
+            "nativeSessionId": self.root.lock().unwrap().clone(),
+        }))
+    }
+
+    async fn restore_native_readiness_receipt(
+        &self,
+        receipt: &NativeReadinessReceipt,
+    ) -> Result<(), String> {
+        self.receipt_restore_calls.fetch_add(1, Ordering::SeqCst);
+        if !receipt.is_valid() {
+            return Err("invalid native readiness receipt".into());
+        }
+        if self.root.lock().unwrap().as_str() != receipt.identity.native_session_id {
+            return Err("receipt root differs from provider root".into());
+        }
+        let mut launch = self.launch.lock().unwrap();
+        if *launch == receipt.source_launch {
+            *launch = receipt.next_launch.clone();
+        } else if *launch != receipt.next_launch {
+            return Err("receipt launch differs from provider launch".into());
+        }
+        Ok(())
+    }
+
+    async fn start_native_readiness_resume(
+        &self,
+        profile: &FreshAgentProfile,
+        resume_spec: &freshell_runtime_protocol::ResumeSpec,
+    ) -> Result<NativeReadinessResumeStart, NativeReadinessProviderStartFailure> {
+        self.resume_calls.fetch_add(1, Ordering::SeqCst);
+        self.resume_profiles.lock().unwrap().push(profile.clone());
+        self.resume_specs.lock().unwrap().push(resume_spec.clone());
+        let source_root = self
+            .source_launch
+            .requested_native_session_id
+            .as_deref()
+            .unwrap();
+        if profile.provider != FreshProvider::Codex
+            || profile.native_session_id.as_deref() != Some(source_root)
+            || resume_spec.provider_session.native_session_id != source_root
+        {
+            return Err(NativeReadinessProviderStartFailure::new(
+                NativeReadinessProviderStartCause::ExactResumeValidation,
+                ProviderStartDiagnostic::NoDiagnostic,
+            ));
+        }
+        if self.resume_reports_missing {
+            Ok(NativeReadinessResumeStart::PriorThreadNotFound)
+        } else {
+            Ok(NativeReadinessResumeStart::Resumed(TransportStart {
+                native_session_id: Some(source_root.into()),
+            }))
+        }
+    }
+
+    async fn start_native_readiness_replacement(
+        &self,
+        profile: &FreshAgentProfile,
+        _authorization: &NativeReadinessRecoveryAuthorization,
+    ) -> Result<TransportStart, NativeReadinessProviderStartFailure> {
+        self.replacement_calls.fetch_add(1, Ordering::SeqCst);
+        self.replacement_profiles
+            .lock()
+            .unwrap()
+            .push(profile.clone());
+        let source_root = self
+            .source_launch
+            .requested_native_session_id
+            .as_deref()
+            .unwrap();
+        if profile.native_session_id.as_deref() != Some(source_root) {
+            return Err(NativeReadinessProviderStartFailure::new(
+                NativeReadinessProviderStartCause::ReplacementValidation,
+                ProviderStartDiagnostic::NoDiagnostic,
+            ));
+        }
+        // Model the provider accepting thread/start before its acknowledgement
+        // is returned. If `replacement_error` is set, this side effect remains
+        // while the actor's durable journal must prevent another mint.
+        *self.root.lock().unwrap() = self.next_root.clone();
+        if let Some(error) = self.replacement_error.as_ref() {
+            return Err(NativeReadinessProviderStartFailure::from_provider_error(
+                NativeReadinessProviderStartCause::ReplacementThreadStart,
+                error,
+            ));
+        }
+        Ok(TransportStart {
+            native_session_id: Some(self.next_root.clone()),
+        })
+    }
+
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        self.ordinary_start_calls.fetch_add(1, Ordering::SeqCst);
+        self.ordinary_start_profiles
+            .lock()
+            .unwrap()
+            .push(profile.clone());
+        let observed = self.root.lock().unwrap().clone();
+        if profile.native_session_id.as_deref() != Some(observed.as_str()) {
+            return Err("ordinary start did not resume the exact persisted Codex root".into());
+        }
+        Ok(TransportStart {
+            native_session_id: Some(observed),
+        })
+    }
+
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        panic!("cold native readiness must not dispatch a user turn")
+    }
+
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        panic!("cold native readiness must not resolve a permission")
+    }
+
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+fn cold_readiness_resume_spec(
+    provider_home: &std::path::Path,
+    workspace: &std::path::Path,
+    root: &str,
+) -> freshell_runtime_protocol::ResumeSpec {
+    use freshell_runtime_protocol::{
+        AllocationState, DurablePosition, IdentityProvenance, ProviderSessionRef, ResumeSpec,
+    };
+
+    ResumeSpec {
+        claude_fork: None,
+        schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
+        provider_session: ProviderSessionRef {
+            provider: "codex".into(),
+            provider_store_id: "codex-readiness-store".into(),
+            native_session_id: root.into(),
+        },
+        mode: "freshcodex".into(),
+        runtime_variant: "codex".into(),
+        fixture_transport: None,
+        opencode_adoption_baseline: None,
+        program: "codex".into(),
+        resume_argv: vec!["--resume".into(), root.into()],
+        provider_home: provider_home.display().to_string(),
+        provider_volume: None,
+        cwd: workspace.display().to_string(),
+        workspace_path: workspace.display().to_string(),
+        project_key: None,
+        runtime_profile: None,
+        environment: std::collections::BTreeMap::from([(
+            "HOME".into(),
+            provider_home.display().to_string(),
+        )]),
+        model: Some("fixture-model".into()),
+        reasoning_effort: Some("low".into()),
+        permission_mode: Some("ask".into()),
+        image_ref: None,
+        provider_version: None,
+        credential_references: Vec::new(),
+        identity_provenance: IdentityProvenance::ProviderObserved,
+        durable_position: DurablePosition::default(),
+        checkpoint_references: Vec::new(),
+        creation_seed_ref: "cold-codex-seed".into(),
+        checkpoint_revision: 0,
+        allocation_state: AllocationState::VerifiedDurable,
+        evidence_revision: 12,
+        never_dispatched: false,
+    }
+}
+
+fn cold_readiness_launch() -> NativeIdentityLaunch {
+    NativeIdentityLaunch {
+        incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        launch_nonce: "cold-codex-recovery-launch".into(),
+        evidence_revision: 12,
+        execution_generation: 4,
+        requested_native_session_id: Some("codex-cold-root-old".into()),
+    }
+}
+
+fn cold_readiness_authorization(
+    launch: &NativeIdentityLaunch,
+    resume_spec: &freshell_runtime_protocol::ResumeSpec,
+) -> freshell_runtime_protocol::NativeReadinessRecoveryAuthorization {
+    use freshell_runtime_protocol::{NativeReadinessFence, RecoveryAttemptId};
+
+    freshell_runtime_protocol::NativeReadinessRecoveryAuthorization {
+        source_fence: NativeReadinessFence {
+            control_epoch: 9,
+            intent_revision: 13,
+            identity_revision: 6,
+            evidence_revision: launch.evidence_revision,
+            native_import_revision: 0,
+            recovery_attempt_id: Some(RecoveryAttemptId::new()),
+            active_incarnation_id: launch.incarnation_id.clone(),
+        },
+        source_launch: launch.clone(),
+        prior_incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+        resume_spec_sha256: freshell_runtime_protocol::resume_spec_sha256(resume_spec),
+    }
+}
+
+fn cold_readiness_profile(root: &str, cwd: &str) -> FreshAgentProfile {
+    let mut profile = profile(FreshProvider::Codex, "codex-readiness-store", Some(root));
+    profile.cwd = cwd.into();
+    profile.session_ref = Some(freshell_runtime_protocol::ProviderSessionReference {
+        provider: FreshProvider::Codex.as_str().into(),
+        session_id: root.into(),
+    });
+    profile
+}
+
+struct ColdReadinessCommittedFixture {
+    replacement_profile: FreshAgentProfile,
+    committed_profile: FreshAgentProfile,
+    source_launch: NativeIdentityLaunch,
+    authorization: freshell_runtime_protocol::NativeReadinessRecoveryAuthorization,
+    resume_spec: freshell_runtime_protocol::ResumeSpec,
+    receipt: NativeReadinessReceipt,
+}
+
+async fn create_cold_readiness_committed_fixture(
+    actor_dir: &std::path::Path,
+    provider_home: &std::path::Path,
+    workspace: &std::path::Path,
+) -> ColdReadinessCommittedFixture {
+    fs::create_dir_all(provider_home).unwrap();
+    fs::create_dir_all(workspace).unwrap();
+    let source_profile =
+        cold_readiness_profile("codex-cold-root-old", &workspace.display().to_string());
+    let initial = FreshAgentHostActor::open(
+        actor_dir,
+        source_profile.clone(),
+        FakeTransport::new("codex-cold-root-old"),
+    )
+    .await
+    .unwrap();
+    drop(initial);
+
+    let resume_spec = cold_readiness_resume_spec(provider_home, workspace, "codex-cold-root-old");
+    let source_launch = cold_readiness_launch();
+    let authorization = cold_readiness_authorization(&source_launch, &resume_spec);
+    let mut replacement_profile = source_profile;
+    replacement_profile.cwd = "/workspace".into();
+    let transport = ColdCodexReadinessTransport::new(
+        source_launch.clone(),
+        "codex-cold-root-old",
+        "codex-cold-root-new",
+        true,
+        None,
+    );
+    let actor = FreshAgentHostActor::open_with_native_readiness_recovery(
+        actor_dir,
+        replacement_profile.clone(),
+        transport.clone(),
+        authorization.clone(),
+        resume_spec.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    drop(actor);
+
+    let persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(actor_dir.join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    let receipt = persisted
+        .native_readiness_receipt
+        .clone()
+        .expect("fixture setup must commit the cold-readiness receipt");
+    assert!(persisted.native_readiness_mint_in_progress.is_none());
+    assert!(receipt.is_valid());
+    ColdReadinessCommittedFixture {
+        replacement_profile,
+        committed_profile: persisted.profile,
+        source_launch,
+        authorization,
+        resume_spec,
+        receipt,
+    }
+}
+
+#[tokio::test]
+async fn cold_codex_missing_root_mints_once_and_replays_its_persisted_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = provider_home.join("workspace/recovery-cwd");
+    fs::create_dir_all(&provider_home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+
+    // The previous actor's durable CWD is the exact path captured in the
+    // ResumeSpec. The replacement launch carries its accepted CWD; resume and
+    // census must still use the old immutable ResumeSpec selection.
+    let source_profile =
+        cold_readiness_profile("codex-cold-root-old", &workspace.display().to_string());
+    let initial = FreshAgentHostActor::open(
+        &actor_dir,
+        source_profile.clone(),
+        FakeTransport::new("codex-cold-root-old"),
+    )
+    .await
+    .unwrap();
+    drop(initial);
+
+    let resume_spec = cold_readiness_resume_spec(&provider_home, &workspace, "codex-cold-root-old");
+    let launch = cold_readiness_launch();
+    let authorization = cold_readiness_authorization(&launch, &resume_spec);
+    let mut replacement_launch_profile = source_profile.clone();
+    replacement_launch_profile.cwd = "/workspace".into();
+    let transport = ColdCodexReadinessTransport::new(
+        launch.clone(),
+        "codex-cold-root-old",
+        "codex-cold-root-new",
+        true,
+        None,
+    );
+
+    let actor = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        replacement_launch_profile.clone(),
+        transport.clone(),
+        authorization.clone(),
+        resume_spec.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        transport.resume_profiles.lock().unwrap()[0].cwd,
+        replacement_launch_profile.cwd
+    );
+    assert_eq!(
+        transport.resume_specs.lock().unwrap().as_slice(),
+        &[resume_spec.clone()]
+    );
+    assert_eq!(
+        transport.replacement_profiles.lock().unwrap()[0].cwd,
+        replacement_launch_profile.cwd
+    );
+    assert!(transport.ordinary_start_profiles.lock().unwrap().is_empty());
+
+    let persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(actor_dir.join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    let receipt = persisted
+        .native_readiness_receipt
+        .clone()
+        .expect("accepted root transition and profile must share one durable actor snapshot");
+    assert!(persisted.native_readiness_mint_in_progress.is_none());
+    assert_eq!(
+        persisted.profile.native_session_id.as_deref(),
+        Some("codex-cold-root-new")
+    );
+    assert_eq!(persisted.profile.cwd, replacement_launch_profile.cwd);
+    assert_eq!(
+        persisted
+            .profile
+            .session_ref
+            .as_ref()
+            .map(|reference| reference.session_id.as_str()),
+        Some("codex-cold-root-new")
+    );
+    assert_eq!(receipt.source_fence, authorization.source_fence);
+    assert_eq!(receipt.source_launch, authorization.source_launch);
+    assert_eq!(
+        receipt.identity.previous_native_session_id,
+        "codex-cold-root-old"
+    );
+    assert_eq!(receipt.identity.native_session_id, "codex-cold-root-new");
+    let absence = receipt
+        .absence_evidence
+        .as_ref()
+        .expect("mint receipt requires a complete source-store absence census");
+    assert_eq!(
+        absence.prior_incarnation_id,
+        authorization.prior_incarnation_id
+    );
+    assert_eq!(absence.provider, FreshProvider::Codex.as_str());
+    assert_eq!(
+        absence.provider_store_id,
+        resume_spec.provider_session.provider_store_id
+    );
+    assert_eq!(absence.native_session_id, "codex-cold-root-old");
+    assert_eq!(absence.evidence_revision, resume_spec.evidence_revision);
+    let census = [absence.census_reference.clone()];
+    assert!(crate::native_absence_census_matches(
+        FreshProvider::Codex.as_str(),
+        &resume_spec.provider_session.provider_store_id,
+        "codex-cold-root-old",
+        resume_spec.evidence_revision,
+        absence.store_state,
+        &census,
+    ));
+    assert!(crate::native_absence_census_environment_matches(
+        &resume_spec,
+        &census
+    ));
+
+    drop(actor);
+    let replay_transport = ColdCodexReadinessTransport::new(
+        launch.clone(),
+        "codex-cold-root-new",
+        "codex-cold-root-newer",
+        true,
+        None,
+    );
+    let reopened = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        replacement_launch_profile,
+        replay_transport.clone(),
+        authorization,
+        resume_spec,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.native_readiness_receipt().await, Some(receipt));
+    assert_eq!(
+        replay_transport
+            .receipt_restore_calls
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(replay_transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replay_transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        replay_transport.ordinary_start_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(replay_transport.dispatches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cold_codex_actor_only_receipt_rebinds_to_new_attempt_without_mint() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = provider_home.join("workspace/recovery-cwd");
+    let mut fixture =
+        create_cold_readiness_committed_fixture(&actor_dir, &provider_home, &workspace).await;
+    let attempt_a_name = "codex-cold-name-attempt-a".to_string();
+    let attempt_b_name = "codex-cold-name-attempt-b".to_string();
+    let state_path = actor_dir.join("fresh-agent-state.json");
+    let mut persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    persisted.profile.naming_handle = Some(attempt_a_name.clone());
+    let persisted_receipt = persisted
+        .native_readiness_receipt
+        .as_mut()
+        .expect("fixture must persist the attempt A receipt");
+    persisted_receipt.identity.pending_naming_handle = Some(attempt_a_name.clone());
+    fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    fixture.replacement_profile.naming_handle = Some(attempt_a_name.clone());
+    fixture.receipt.identity.pending_naming_handle = Some(attempt_a_name);
+
+    // Model the split commit boundary: attempt A atomically wrote the actor's
+    // R1 profile and receipt, but its host-state and Registry writes never
+    // happened. A newly prepared attempt B still has R0 as its registry root.
+    let mut next_launch = fixture.source_launch.clone();
+    next_launch.incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+    next_launch.launch_nonce = "cold-codex-rebind-launch-b".into();
+    next_launch.execution_generation += 1;
+    let mut authorization = cold_readiness_authorization(&next_launch, &fixture.resume_spec);
+    authorization.source_fence.control_epoch = fixture.authorization.source_fence.control_epoch + 1;
+    authorization.prior_incarnation_id = fixture.source_launch.incarnation_id.clone();
+    let mut accepted_profile = fixture.replacement_profile.clone();
+    accepted_profile.cwd = "/workspace/attempt-b".into();
+    accepted_profile.naming_handle = Some(attempt_b_name.clone());
+
+    // The provider still has R1. The source R0 is absent, and B must adopt
+    // R1 by exact resume instead of issuing another thread/start.
+    let transport = ColdCodexReadinessTransport::new(
+        next_launch.clone(),
+        "codex-cold-root-new",
+        "codex-must-not-mint-during-rebind",
+        true,
+        None,
+    );
+    let actor = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        accepted_profile.clone(),
+        transport.clone(),
+        authorization.clone(),
+        fixture.resume_spec.clone(),
+    )
+    .await
+    .expect("an actor-only cold receipt should transfer under the new exact attempt");
+
+    let rebound = actor
+        .native_readiness_receipt()
+        .await
+        .expect("the replacement attempt needs a fresh, target-bound receipt");
+    assert!(rebound.is_valid());
+    assert_eq!(rebound.source_fence, authorization.source_fence);
+    assert_eq!(rebound.source_launch, authorization.source_launch);
+    assert_eq!(
+        rebound.resume_spec_sha256.as_deref(),
+        Some(authorization.resume_spec_sha256.as_str())
+    );
+    assert_eq!(
+        rebound.next_launch.incarnation_id,
+        next_launch.incarnation_id
+    );
+    assert_eq!(
+        rebound.next_launch.execution_generation,
+        next_launch.execution_generation
+    );
+    assert_eq!(
+        rebound.next_launch.requested_native_session_id.as_deref(),
+        Some("codex-cold-root-new")
+    );
+    let mut expected_identity = fixture.receipt.identity.clone();
+    expected_identity.pending_naming_handle = Some(attempt_b_name.clone());
+    assert_eq!(
+        rebound.identity, expected_identity,
+        "the exact root identity must be retained with B's accepted name"
+    );
+    assert_eq!(
+        rebound.identity.pending_naming_handle.as_deref(),
+        Some(attempt_b_name.as_str()),
+        "the rebound receipt must carry B's accepted naming handle"
+    );
+    let absence = rebound
+        .absence_evidence
+        .as_ref()
+        .expect("the new attempt must revalidate the old root's absence");
+    assert_eq!(
+        absence.prior_incarnation_id,
+        authorization.prior_incarnation_id
+    );
+    assert_eq!(absence.native_session_id, "codex-cold-root-old");
+    assert_eq!(
+        absence.provider_store_id,
+        fixture.resume_spec.provider_session.provider_store_id
+    );
+    let census = [absence.census_reference.clone()];
+    assert!(crate::native_absence_census_matches(
+        FreshProvider::Codex.as_str(),
+        &fixture.resume_spec.provider_session.provider_store_id,
+        "codex-cold-root-old",
+        fixture.resume_spec.evidence_revision,
+        absence.store_state,
+        &census,
+    ));
+    assert!(crate::native_absence_census_environment_matches(
+        &fixture.resume_spec,
+        &census
+    ));
+
+    assert_eq!(transport.receipt_restore_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        transport.ordinary_start_profiles.lock().unwrap()[0]
+            .native_session_id
+            .as_deref(),
+        Some("codex-cold-root-new"),
+        "ordinary startup must resume the persisted R1 root exactly"
+    );
+    assert_eq!(
+        transport.ordinary_start_profiles.lock().unwrap()[0].cwd,
+        accepted_profile.cwd,
+        "the accepted target CWD must survive the receipt rebind"
+    );
+    assert_eq!(
+        transport.ordinary_start_profiles.lock().unwrap()[0].naming_handle,
+        accepted_profile.naming_handle,
+        "the strict R1 start must keep B's accepted naming handle"
+    );
+    let actor_profile = actor.profile().await;
+    assert_eq!(actor_profile.cwd, accepted_profile.cwd);
+    assert_eq!(actor_profile.naming_handle, accepted_profile.naming_handle);
+    assert_eq!(*transport.launch.lock().unwrap(), rebound.next_launch);
+    assert_eq!(
+        serde_json::from_slice::<PersistedActorState>(&fs::read(&state_path).unwrap())
+            .unwrap()
+            .native_readiness_receipt,
+        Some(rebound)
+    );
+}
+
+#[tokio::test]
+async fn cold_codex_actor_only_receipt_rejects_a_different_exact_resume_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = provider_home.join("workspace/recovery-cwd");
+    let fixture =
+        create_cold_readiness_committed_fixture(&actor_dir, &provider_home, &workspace).await;
+
+    let mut different_resume = fixture.resume_spec.clone();
+    // Keep the store census selection unchanged while changing another
+    // persisted resume field. Only the byte-exact ResumeSpec digest catches
+    // this mismatch.
+    different_resume
+        .resume_argv
+        .push("--changed-resume-selection".into());
+    let mut next_launch = fixture.source_launch.clone();
+    next_launch.incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+    next_launch.launch_nonce = "cold-codex-rebind-different-resume".into();
+    next_launch.execution_generation += 1;
+    let mut authorization = cold_readiness_authorization(&next_launch, &different_resume);
+    authorization.source_fence.control_epoch = fixture.authorization.source_fence.control_epoch + 1;
+    authorization.prior_incarnation_id = fixture.source_launch.incarnation_id.clone();
+
+    let transport = ColdCodexReadinessTransport::new(
+        next_launch,
+        "codex-cold-root-new",
+        "codex-must-not-mint-for-different-resume",
+        true,
+        None,
+    );
+    let opened = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        fixture.replacement_profile,
+        transport.clone(),
+        authorization,
+        different_resume,
+    )
+    .await;
+    assert!(
+        opened.is_err(),
+        "an actor-only receipt cannot cross into a different exact ResumeSpec"
+    );
+    assert_eq!(transport.receipt_restore_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 0);
+
+    let persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(actor_dir.join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted.native_readiness_receipt,
+        Some(fixture.receipt),
+        "refusal must leave the original durable receipt intact"
+    );
+}
+
+#[tokio::test]
+async fn cold_codex_receipt_retry_accepts_only_a_control_epoch_advance() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = provider_home.join("workspace/recovery-cwd");
+    let fixture =
+        create_cold_readiness_committed_fixture(&actor_dir, &provider_home, &workspace).await;
+
+    let mut retry_authorization = fixture.authorization.clone();
+    retry_authorization.source_fence.control_epoch += 1;
+    let mut expected_fence = fixture.authorization.source_fence.clone();
+    expected_fence.control_epoch += 1;
+    assert_eq!(retry_authorization.source_fence, expected_fence);
+    assert_eq!(retry_authorization.source_launch, fixture.source_launch);
+    assert_eq!(
+        retry_authorization.prior_incarnation_id,
+        fixture.authorization.prior_incarnation_id
+    );
+    assert_eq!(
+        retry_authorization.resume_spec_sha256,
+        fixture.authorization.resume_spec_sha256
+    );
+
+    let transport = ColdCodexReadinessTransport::new(
+        fixture.source_launch.clone(),
+        "codex-cold-root-new",
+        "codex-must-not-mint-on-replay",
+        true,
+        None,
+    );
+    let actor = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        fixture.replacement_profile,
+        transport.clone(),
+        retry_authorization,
+        fixture.resume_spec,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        actor.native_readiness_receipt().await,
+        Some(fixture.receipt.clone())
+    );
+    assert_eq!(transport.receipt_restore_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *transport.launch.lock().unwrap(),
+        fixture.receipt.next_launch
+    );
+}
+
+#[tokio::test]
+async fn cold_codex_later_incarnation_resumes_exact_next_profile_and_supersedes_old_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = provider_home.join("workspace/recovery-cwd");
+    let fixture =
+        create_cold_readiness_committed_fixture(&actor_dir, &provider_home, &workspace).await;
+
+    let mut later_launch = fixture.receipt.next_launch.clone();
+    later_launch.incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+    later_launch.launch_nonce = "codex-cold-later-incarnation".into();
+    later_launch.execution_generation += 1;
+    assert_ne!(
+        later_launch.incarnation_id,
+        fixture.source_launch.incarnation_id
+    );
+    assert_eq!(
+        later_launch.requested_native_session_id.as_deref(),
+        fixture.committed_profile.native_session_id.as_deref()
+    );
+
+    let stale_transport = ColdCodexReadinessTransport::new(
+        later_launch.clone(),
+        "codex-cold-root-new",
+        "codex-stale-profile-must-not-mint",
+        true,
+        None,
+    );
+    let stale = FreshAgentHostActor::open(
+        &actor_dir,
+        fixture.replacement_profile.clone(),
+        stale_transport.clone(),
+    )
+    .await;
+    assert!(
+        stale.is_err(),
+        "the old source profile needs its recovery authorization"
+    );
+    assert_eq!(
+        stale_transport.receipt_restore_calls.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(stale_transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(stale_transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        stale_transport.ordinary_start_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    let transport = ColdCodexReadinessTransport::new(
+        later_launch.clone(),
+        "codex-cold-root-new",
+        "codex-later-unrequested-root",
+        true,
+        None,
+    );
+    let actor = FreshAgentHostActor::open(
+        &actor_dir,
+        fixture.committed_profile.clone(),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(actor.profile().await, fixture.committed_profile);
+    assert!(actor.native_readiness_receipt().await.is_none());
+    assert_eq!(*transport.launch.lock().unwrap(), later_launch);
+    assert_eq!(transport.receipt_restore_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        transport.ordinary_start_profiles.lock().unwrap().as_slice(),
+        &[fixture.committed_profile.clone()]
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+
+    let persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(actor_dir.join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    assert!(persisted.native_readiness_receipt.is_none());
+    assert!(persisted.native_readiness_mint_in_progress.is_none());
+    assert_eq!(persisted.profile, fixture.committed_profile);
+}
+
+#[tokio::test]
+async fn cold_codex_mint_ack_loss_is_durable_and_never_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = dir.path().join("workspace/recovery-cwd");
+    fs::create_dir_all(&provider_home).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let source_profile =
+        cold_readiness_profile("codex-cold-root-old", &workspace.display().to_string());
+    let initial = FreshAgentHostActor::open(
+        &actor_dir,
+        source_profile.clone(),
+        FakeTransport::new("codex-cold-root-old"),
+    )
+    .await
+    .unwrap();
+    drop(initial);
+
+    let resume_spec = cold_readiness_resume_spec(&provider_home, &workspace, "codex-cold-root-old");
+    let launch = cold_readiness_launch();
+    let authorization = cold_readiness_authorization(&launch, &resume_spec);
+    let transport = ColdCodexReadinessTransport::new(
+        launch.clone(),
+        "codex-cold-root-old",
+        "codex-cold-root-new",
+        true,
+        Some("replacement thread acknowledgement lost"),
+    );
+
+    let result = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        source_profile.clone(),
+        transport.clone(),
+        authorization.clone(),
+        resume_spec.clone(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ActorError::NativeReadinessProviderStartFailed {
+            cause: NativeReadinessProviderStartCause::ReplacementThreadStart,
+            ..
+        })
+    ));
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(*transport.root.lock().unwrap(), "codex-cold-root-new");
+
+    let persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(actor_dir.join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    let journal = persisted
+        .native_readiness_mint_in_progress
+        .as_ref()
+        .expect("mint intent must be persisted before the provider call");
+    assert_eq!(journal.authorization, authorization);
+    assert!(journal.absence_evidence.is_valid_for(&launch));
+    assert!(persisted.native_readiness_receipt.is_none());
+    assert_eq!(
+        persisted.profile.native_session_id.as_deref(),
+        Some("codex-cold-root-old")
+    );
+
+    let reopened_transport = ColdCodexReadinessTransport::new(
+        launch,
+        "codex-cold-root-new",
+        "codex-cold-root-newer",
+        true,
+        None,
+    );
+    let reopened = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        source_profile,
+        reopened_transport.clone(),
+        journal.authorization.clone(),
+        resume_spec,
+    )
+    .await;
+    assert!(matches!(reopened, Err(ActorError::AmbiguousDispatch)));
+    assert_eq!(reopened_transport.resume_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        reopened_transport.replacement_calls.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        reopened_transport
+            .ordinary_start_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(reopened_transport.dispatches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cold_codex_exact_rollout_still_present_refuses_replacement_before_mint() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home");
+    let workspace = dir.path().join("workspace/recovery-cwd");
+    let sessions = provider_home.join(".codex/sessions");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("remaining-rollout.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": "codex-cold-root-old", "cwd": workspace.display().to_string()}
+            })
+        ),
+    )
+    .unwrap();
+    let source_profile =
+        cold_readiness_profile("codex-cold-root-old", &workspace.display().to_string());
+    let initial = FreshAgentHostActor::open(
+        &actor_dir,
+        source_profile.clone(),
+        FakeTransport::new("codex-cold-root-old"),
+    )
+    .await
+    .unwrap();
+    drop(initial);
+
+    let resume_spec = cold_readiness_resume_spec(&provider_home, &workspace, "codex-cold-root-old");
+    let launch = cold_readiness_launch();
+    let authorization = cold_readiness_authorization(&launch, &resume_spec);
+    let transport = ColdCodexReadinessTransport::new(
+        launch,
+        "codex-cold-root-old",
+        "codex-cold-root-new",
+        true,
+        None,
+    );
+    let result = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        source_profile,
+        transport.clone(),
+        authorization,
+        resume_spec,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ActorError::NativeReadinessRecoveryFailed {
+            stage: super::NativeReadinessRecoveryStage::AbsenceProbeReady
+        })
+    ));
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(*transport.root.lock().unwrap(), "codex-cold-root-old");
+}
+
+#[tokio::test]
+async fn cold_codex_incomplete_store_census_refuses_replacement_before_mint() {
+    let dir = tempfile::tempdir().unwrap();
+    let actor_dir = dir.path().join("actor");
+    let provider_home = dir.path().join("provider-home-missing");
+    let workspace = dir.path().join("workspace/recovery-cwd");
+    fs::create_dir_all(&workspace).unwrap();
+    let source_profile =
+        cold_readiness_profile("codex-cold-root-old", &workspace.display().to_string());
+    let initial = FreshAgentHostActor::open(
+        &actor_dir,
+        source_profile.clone(),
+        FakeTransport::new("codex-cold-root-old"),
+    )
+    .await
+    .unwrap();
+    drop(initial);
+
+    let resume_spec = cold_readiness_resume_spec(&provider_home, &workspace, "codex-cold-root-old");
+    let launch = cold_readiness_launch();
+    let authorization = cold_readiness_authorization(&launch, &resume_spec);
+    let transport = ColdCodexReadinessTransport::new(
+        launch.clone(),
+        "codex-cold-root-old",
+        "codex-cold-root-new",
+        true,
+        None,
+    );
+
+    let result = FreshAgentHostActor::open_with_native_readiness_recovery(
+        &actor_dir,
+        source_profile,
+        transport.clone(),
+        authorization,
+        resume_spec,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ActorError::NativeReadinessRecoveryFailed {
+            stage: super::NativeReadinessRecoveryStage::AbsenceProbeBlocked {
+                reason: freshell_runtime_protocol::RecoveryBlockReason::StoreMissing,
+                store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
+                ..
+            }
+        })
+    ));
+    assert_eq!(transport.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.replacement_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(*transport.root.lock().unwrap(), "codex-cold-root-old");
+
+    let persisted: PersistedActorState =
+        serde_json::from_slice(&fs::read(actor_dir.join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    assert!(persisted.native_readiness_mint_in_progress.is_none());
+    assert!(persisted.native_readiness_receipt.is_none());
+}
+
+#[tokio::test]
+async fn codex_native_readiness_accepts_only_the_exact_verified_root_transition_without_a_turn() {
+    for fault in [
+        ReadinessEvidenceFault::None,
+        ReadinessEvidenceFault::WrongIncarnation,
+        ReadinessEvidenceFault::WrongPreviousRoot,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = readiness_launch();
+        let transport = Arc::new(NativeReadinessTransport {
+            initial_launch: launch.clone(),
+            launch: std::sync::Mutex::new(launch.clone()),
+            root: std::sync::Mutex::new("codex-native-old".into()),
+            fault,
+            dispatches: AtomicUsize::new(0),
+            readiness_calls: AtomicUsize::new(0),
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(
+                FreshProvider::Codex,
+                "codex-readiness-store",
+                Some("codex-native-old"),
+            ),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = actor.prepare_native_readiness(&launch).await;
+        match fault {
+            ReadinessEvidenceFault::None => {
+                let identity = result.unwrap().expect("verified root transition");
+                assert_eq!(identity.previous_native_session_id, "codex-native-old");
+                assert_eq!(identity.native_session_id, "codex-native-recovered");
+                assert_eq!(
+                    actor.profile().await.native_session_id.as_deref(),
+                    Some("codex-native-recovered")
+                );
+                let events = actor.read_events(0, 32).await.events;
+                assert!(events.iter().any(|entry| matches!(
+                    &entry.event,
+                    AgentEvent::Started { native_session_id }
+                        if native_session_id == "codex-native-recovered"
+                )));
+            }
+            ReadinessEvidenceFault::WrongIncarnation
+            | ReadinessEvidenceFault::WrongPreviousRoot => {
+                assert!(matches!(result, Err(ActorError::NativeIdentityMismatch)));
+                assert_eq!(
+                    actor.profile().await.native_session_id.as_deref(),
+                    Some("codex-native-old"),
+                    "invalid recovery evidence must not change the actor's committed root"
+                );
+                assert!(actor.read_events(0, 32).await.events.is_empty());
+            }
+        }
+        assert_eq!(
+            transport.dispatches.load(Ordering::SeqCst),
+            0,
+            "native readiness must not dispatch a user turn"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_native_readiness_checks_exact_source_evidence_before_provider_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = readiness_launch();
+    let transport = Arc::new(NativeReadinessTransport {
+        initial_launch: launch.clone(),
+        launch: std::sync::Mutex::new(launch.clone()),
+        root: std::sync::Mutex::new("codex-native-unexpected".into()),
+        fault: ReadinessEvidenceFault::None,
+        dispatches: AtomicUsize::new(0),
+        readiness_calls: AtomicUsize::new(0),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(
+            FreshProvider::Codex,
+            "codex-readiness-store",
+            Some("codex-native-old"),
+        ),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        actor.prepare_native_readiness(&launch).await,
+        Err(ActorError::NativeIdentityMismatch)
+    ));
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *transport.root.lock().unwrap(),
+        "codex-native-unexpected",
+        "stale source evidence must be rejected before the provider operation"
+    );
+    assert_eq!(
+        actor.profile().await.native_session_id.as_deref(),
+        Some("codex-native-old")
+    );
+}
+
+#[tokio::test]
+async fn codex_readiness_receipt_binds_an_unrequested_source_root_to_exact_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut launch = readiness_launch();
+    launch.requested_native_session_id = None;
+    let fence = readiness_fence(&launch);
+    let transport = Arc::new(NativeReadinessTransport {
+        initial_launch: launch.clone(),
+        launch: std::sync::Mutex::new(launch.clone()),
+        root: std::sync::Mutex::new("codex-native-old".into()),
+        fault: ReadinessEvidenceFault::None,
+        dispatches: AtomicUsize::new(0),
+        readiness_calls: AtomicUsize::new(0),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(
+            FreshProvider::Codex,
+            "codex-readiness-store",
+            Some("codex-native-old"),
+        ),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    let receipt = actor
+        .prepare_native_readiness_with_receipt(&launch, &fence)
+        .await
+        .unwrap()
+        .expect("the evidence-bound transition should produce a durable receipt");
+    assert!(receipt.is_valid());
+    assert_eq!(receipt.source_launch.requested_native_session_id, None);
+    assert_eq!(
+        receipt.identity.previous_native_session_id,
+        "codex-native-old"
+    );
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        actor.profile().await.native_session_id.as_deref(),
+        Some("codex-native-recovered")
+    );
+    drop(actor);
+    let restarted_transport = Arc::new(NativeReadinessTransport {
+        initial_launch: launch.clone(),
+        launch: std::sync::Mutex::new(launch.clone()),
+        root: std::sync::Mutex::new("codex-native-recovered".into()),
+        fault: ReadinessEvidenceFault::None,
+        dispatches: AtomicUsize::new(0),
+        readiness_calls: AtomicUsize::new(0),
+    });
+    let reopened = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "codex-readiness-store", None),
+        restarted_transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *restarted_transport.launch.lock().unwrap(),
+        receipt.next_launch,
+        "the fresh provider bridge must be rebound before actor start"
+    );
+    let replayed = reopened
+        .prepare_native_readiness_with_receipt(&launch, &fence)
+        .await
+        .unwrap()
+        .expect("the no-root source receipt should replay after actor restart");
+    assert_eq!(replayed, receipt);
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        restarted_transport.readiness_calls.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn codex_native_readiness_receipt_replays_after_actor_restart_only_for_its_exact_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = readiness_launch();
+    let fence = readiness_fence(&launch);
+    let transport = Arc::new(NativeReadinessTransport {
+        initial_launch: launch.clone(),
+        launch: std::sync::Mutex::new(launch.clone()),
+        root: std::sync::Mutex::new("codex-native-old".into()),
+        fault: ReadinessEvidenceFault::None,
+        dispatches: AtomicUsize::new(0),
+        readiness_calls: AtomicUsize::new(0),
+    });
+    let actor_dir = dir.path().join("actor");
+    let actor = FreshAgentHostActor::open(
+        &actor_dir,
+        profile(
+            FreshProvider::Codex,
+            "codex-readiness-store",
+            Some("codex-native-old"),
+        ),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    let receipt = actor
+        .prepare_native_readiness_with_receipt(&launch, &fence)
+        .await
+        .unwrap()
+        .expect("the first readiness operation should durably record its transition");
+    assert_eq!(receipt.source_fence, fence);
+    assert_eq!(receipt.source_launch, launch);
+    assert_eq!(
+        receipt.identity.previous_native_session_id,
+        "codex-native-old"
+    );
+    assert_eq!(receipt.identity.native_session_id, "codex-native-recovered");
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+
+    drop(actor);
+    let reopened_profile = profile(
+        FreshProvider::Codex,
+        "codex-readiness-store",
+        Some("codex-native-old"),
+    );
+    let mut unrelated_profile = reopened_profile.clone();
+    unrelated_profile.cwd = "/different-workspace".into();
+    assert!(matches!(
+        FreshAgentHostActor::open(&actor_dir, unrelated_profile, transport.clone()).await,
+        Err(ActorError::NativeProfileMismatch(_))
+    ));
+    let reopened = FreshAgentHostActor::open(&actor_dir, reopened_profile, transport.clone())
+        .await
+        .unwrap();
+    let replayed = reopened
+        .prepare_native_readiness_with_receipt(&launch, &fence)
+        .await
+        .unwrap()
+        .expect("the exact durable transition should replay after reopen");
+    assert_eq!(replayed, receipt);
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+
+    let mut stale_fence = fence.clone();
+    stale_fence.intent_revision += 1;
+    assert!(matches!(
+        reopened
+            .prepare_native_readiness_with_receipt(&launch, &stale_fence)
+            .await,
+        Err(ActorError::NativeIdentityMismatch)
+    ));
+    assert_eq!(
+        transport.readiness_calls.load(Ordering::SeqCst),
+        1,
+        "a different write fence must never replay or repeat the native operation"
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+
+    drop(reopened);
+    let reopened_without_requested_root = FreshAgentHostActor::open(
+        &actor_dir,
+        profile(FreshProvider::Codex, "codex-readiness-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let replayed_without_requested_root = reopened_without_requested_root
+        .prepare_native_readiness_with_receipt(&launch, &fence)
+        .await
+        .unwrap()
+        .expect("the original source profile may omit its requested root");
+    assert_eq!(replayed_without_requested_root, receipt);
+    assert_eq!(transport.readiness_calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
     use freshell_runtime_protocol::{
@@ -2788,7 +4284,17 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
         let result =
             FreshAgentHostActor::open(dir.path(), next_preparation.clone(), wrong_native.clone())
                 .await;
-        assert!(matches!(result, Err(ActorError::NativeIdentityMismatch)));
+        assert!(
+            matches!(
+                result,
+                Err(ActorError::NativeSessionIdentityMismatch {
+                    expected_present: true,
+                    observed_present: true,
+                    matches: false,
+                })
+            ),
+            "the startup error retains only identity-presence and match facts"
+        );
         assert_eq!(
             wrong_native.start_profiles.lock().unwrap().as_slice(),
             &[next_preparation]
@@ -2835,10 +4341,57 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
             }
             let transport = FakeTransport::new("same-native");
             let result = FreshAgentHostActor::open(dir.path(), wrong, transport.clone()).await;
-            assert!(
-                matches!(result, Err(ActorError::NativeIdentityMismatch)),
-                "{changed}"
-            );
+            let Err(ActorError::NativeProfileMismatch(facts)) = result else {
+                panic!("{changed} did not retain its persisted-profile mismatch reason");
+            };
+            if changed == "secret-reference" {
+                assert_eq!(
+                    facts.reason,
+                    crate::host_actor::NativeProfileMismatchReason::NonConfigurationSecretReferences
+                );
+                assert!(!facts.non_configuration_secret_references_match);
+                assert!(facts.profile_fields.is_none());
+            } else {
+                assert_eq!(
+                    facts.reason,
+                    crate::host_actor::NativeProfileMismatchReason::PersistedProfileFields
+                );
+                assert!(facts.non_configuration_secret_references_match);
+                let fields = facts.profile_fields.expect("field comparisons are present");
+                let mismatch_field = match changed {
+                    "native" => !fields.native_session_id,
+                    "model" => !fields.model,
+                    "effort" => !fields.effort,
+                    "cwd" => !fields.cwd,
+                    "plugins" => !fields.plugins,
+                    "store" => !fields.provider_store_id,
+                    "runtime" => !fields.runtime_variant,
+                    "permission" => !fields.permission_mode,
+                    "sandbox" => !fields.sandbox,
+                    "context-absent" => !fields.provider_launch_context,
+                    _ => false,
+                };
+                assert!(mismatch_field, "{changed} mismatch was not identified");
+                let expected_fields = NativeProfileFieldMatches {
+                    naming_handle: true,
+                    collaboration_mode: true,
+                    provider: true,
+                    runtime_variant: changed != "runtime",
+                    cwd: changed != "cwd",
+                    model: changed != "model",
+                    effort: changed != "effort",
+                    permission_mode: changed != "permission",
+                    sandbox: changed != "sandbox",
+                    provider_store_id: changed != "store",
+                    native_session_id: changed != "native",
+                    plugins: changed != "plugins",
+                    model_selection: true,
+                    session_ref: true,
+                    provider_launch_context: changed != "context-absent",
+                    provider_secret_references: true,
+                };
+                assert_eq!(fields, expected_fields, "{changed}");
+            }
             assert_eq!(transport.starts.load(Ordering::SeqCst), 0, "{changed}");
             assert!(
                 fs::read(dir.path().join("fresh-agent-state.json")).unwrap() == before,

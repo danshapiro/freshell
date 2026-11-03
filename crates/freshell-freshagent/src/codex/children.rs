@@ -59,8 +59,8 @@ impl FreshCodexState {
         let (raw, materialized, unmaterialized) = match read {
             Ok(raw) => (raw, true, false),
             Err(error) => {
-                let unmaterialized =
-                    is_codex_include_turns_unavailable(&error) || is_codex_thread_not_found(&error);
+                let unmaterialized = is_codex_include_turns_unavailable(&error)
+                    || is_codex_thread_not_found(&error, "thread/read", child_thread_id);
                 tracing::warn!(provider=PROVIDER, session_id=%parent, child_thread_id, error=%error, "freshagent.codex.child_history_unavailable");
                 match client.read_thread(child_thread_id, false).await {
                     Ok(raw) => (raw, false, unmaterialized),
@@ -301,6 +301,18 @@ mod tests {
                     let _ = peer.expect_notification().await;
                 } else if method == "thread/read" {
                     if params["threadId"] != parent["thread"]["id"]
+                        && child["_missingRollout"] == true
+                    {
+                        peer.respond_error(
+                            &id,
+                            -32600,
+                            child["_missingRolloutMessage"]
+                                .as_str()
+                                .unwrap_or("no rollout found for thread id child"),
+                        );
+                        continue;
+                    }
+                    if params["threadId"] != parent["thread"]["id"]
                         && params["includeTurns"] == true
                         && child["_historyUnavailable"] == true
                     {
@@ -416,6 +428,59 @@ mod tests {
         assert!(!reads
             .iter()
             .any(|(_, params)| params["threadId"] == "unrelated"));
+    }
+
+    #[tokio::test]
+    async fn child_read_classifies_only_exact_native_missing_rollout_for_its_read_request() {
+        for (message, expected_status) in [
+            (
+                "no rollout found for thread id child",
+                "history_unavailable",
+            ),
+            (
+                "no rollout found for thread id another-child",
+                "source_unavailable",
+            ),
+        ] {
+            let child = json!({
+                "_missingRollout": true,
+                "_missingRolloutMessage": message,
+                "thread": {
+                    "id":"child",
+                    "parentThreadId":"parent",
+                    "status":{"type":"active"},
+                    "ephemeral":false,
+                    "turns":[]
+                }
+            });
+            let (state, driver) = fixture(child).await;
+            let result = state.read_child("parent", "child", None, None).await;
+            state.shutdown().await;
+            let reads = driver.await.unwrap();
+
+            if expected_status == "history_unavailable" {
+                let unavailable = result.expect("the exact missing child is unavailable history");
+                assert_eq!(unavailable["status"], "unavailable");
+                assert_eq!(unavailable["reason"], "history_unavailable");
+                assert_eq!(unavailable["retryable"], false);
+            } else {
+                assert!(matches!(result, Err(ChildReadError::SourceUnavailable)));
+            }
+            assert!(reads.iter().any(|(method, params)| {
+                method == "thread/read"
+                    && params["threadId"] == "child"
+                    && params["includeTurns"] == true
+            }));
+            assert!(reads.iter().any(|(method, params)| {
+                method == "thread/read"
+                    && params["threadId"] == "child"
+                    && params["includeTurns"] == false
+            }));
+            assert!(reads.iter().all(|(method, _)| matches!(
+                method.as_str(),
+                "initialize" | "thread/read" | "thread/turns/list"
+            )));
+        }
     }
 
     #[tokio::test]
