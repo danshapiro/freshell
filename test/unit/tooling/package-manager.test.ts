@@ -78,6 +78,8 @@ function invokeEntrypoint(command: ManagerCommand, env: NodeJS.ProcessEnv, cwd?:
   invocation += 1
   const outputPath = path.join(fixture.root, `dump-${invocation}.json`)
   const child = spawnSync(command.command, command.args, {
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
     ...(cwd === undefined ? {} : { cwd }),
     env: { ...env, FAKE_OUT: outputPath },
     encoding: 'utf8',
@@ -90,6 +92,8 @@ function invokeNative(command: ManagerCommand, env: NodeJS.ProcessEnv): string[]
   invocation += 1
   const outputPath = path.join(fixture.root, `dump-${invocation}.txt`)
   const child = spawnSync(command.command, command.args, {
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
     env: { ...env, FAKE_OUT: outputPath },
     encoding: 'utf8',
   })

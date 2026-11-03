@@ -785,12 +785,46 @@ pub async fn spawn_server_with_specs_hub_and_state(
     delays: Vec<u64>,
     identity_grace_delays: Vec<u64>,
 ) -> (String, freshell_terminal::TerminalRegistry, WsState) {
+    spawn_server_with_specs_hub_and_state_inner(cli_commands, delays, identity_grace_delays, None)
+        .await
+}
+
+/// Retry-exhaustion fixtures hold real children until their generation's
+/// wire receipt arrives. Model the intended crash age separately from that
+/// scheduling delay; every exit and replacement still goes through the real
+/// PTY hook, registry, and auto-resume hub. Healthy-lifetime policy itself is
+/// covered by the hub's explicit decision/healthy-reset tests.
+///
+/// The registry's independent three-generation cap remains unchanged. Either
+/// exhaustion guard may settle the third crash; the test checks the same
+/// two-replacement contract.
+pub async fn spawn_server_with_fixed_crash_lifetime(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    delays: Vec<u64>,
+    lifetime_ms: i64,
+) -> (String, freshell_terminal::TerminalRegistry) {
+    let (url, registry, _) = spawn_server_with_specs_hub_and_state_inner(
+        cli_commands,
+        delays,
+        vec![25, 25],
+        Some(lifetime_ms),
+    )
+    .await;
+    (url, registry)
+}
+
+async fn spawn_server_with_specs_hub_and_state_inner(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    delays: Vec<u64>,
+    identity_grace_delays: Vec<u64>,
+    fixed_crash_lifetime_ms: Option<i64>,
+) -> (String, freshell_terminal::TerminalRegistry, WsState) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let registry = freshell_terminal::TerminalRegistry::new();
-    let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (auto_resume_tx, mut auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = WsState {
         layout: Default::default(),
@@ -850,9 +884,23 @@ pub async fn spawn_server_with_specs_hub_and_state(
         ownership: None,
     };
 
+    let hub_rx = if let Some(lifetime_ms) = fixed_crash_lifetime_ms {
+        let (forward_tx, forward_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(mut event) = auto_resume_rx.recv().await {
+                event.lifetime_ms = lifetime_ms;
+                if forward_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        forward_rx
+    } else {
+        auto_resume_rx
+    };
     freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(
         state.clone(),
-        auto_resume_rx,
+        hub_rx,
         delays,
         identity_grace_delays,
     );

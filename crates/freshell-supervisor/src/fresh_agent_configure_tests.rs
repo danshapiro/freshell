@@ -1130,6 +1130,40 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                 );
             }
         }
+        let expected_refusal = match scenario {
+            "busy" => Some(("lifecycle_busy", "info")),
+            "stale-native" | "stale-boot" | "stale-incarnation" | "stale-generation"
+            | "stale-intent" => Some(("source_mismatch", "warning")),
+            "wrong-provider" => Some(("provider_mismatch", "warning")),
+            _ => None,
+        };
+        let lifecycle = match std::fs::read_to_string(&fixture.supervisor.config.lifecycle_log) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("read supervisor lifecycle log: {error}"),
+        };
+        let refusal_events: Vec<serde_json::Value> = lifecycle
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|event: &serde_json::Value| event["event"] == "freshagent.native_name_refused")
+            .collect();
+        if let Some((reason, severity)) = expected_refusal {
+            assert_eq!(
+                refusal_events.len(),
+                1,
+                "{scenario}: the refused request is recorded in the supervisor lifecycle log"
+            );
+            assert_eq!(refusal_events[0]["data"]["reason"], reason, "{scenario}");
+            assert_eq!(
+                refusal_events[0]["data"]["severity"], severity,
+                "{scenario}"
+            );
+        } else {
+            assert!(
+                refusal_events.is_empty(),
+                "{scenario}: successful or pre-route requests do not record a refusal"
+            );
+        }
         assert_eq!(
             fixture
                 .supervisor

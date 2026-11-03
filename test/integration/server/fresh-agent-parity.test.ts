@@ -114,7 +114,7 @@ describe('hosted fresh-agent provider inputs', () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
     workspace = path.join(homeDir, 'workspace')
     fs.mkdirSync(workspace)
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     onecli = fakeOnecliGrants(providers.map(row => row.provider))
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     const xdgConfigHome = path.join(homeDir, 'custom-xdg')
@@ -438,7 +438,7 @@ describe('installed Codex through the managed gateway and durable actor', () => 
     fs.mkdirSync(path.join(workspace, '.agents'))
     fs.mkdirSync(path.join(workspace, '.codex'))
     fs.writeFileSync(path.join(workspace, 'child-input.txt'), 'managed-child-command-ran\n')
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     const xdg = path.join(home, 'xdg')
     prepareProviderParityUserRoots(home, xdg)
     grants = fakeOnecliGrants(['codex'])
@@ -718,19 +718,17 @@ tool_timeout_sec = 120
     })
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
-    const contextualAnswer = 'Question: Which managed environment? Answer: Staging.'
-    await send(contextualAnswer, { effort: null })
+    const contextualAnswer = await send('Question: Which managed environment? Answer: Staging.', { effort: null })
+    expect(contextualAnswer.submittedTurnId).toBeTruthy()
     await waitFor('managed contextual answer at loopback model', async () => (await model!.readTraffic()).some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
-    const contextualTurnId = await waitFor('managed contextual answer completion', async () => {
-      const value = await snapshot()
-      const turn = value.turns.find((turn: any) => turn.role === 'user'
-        && turn.items?.some((item: any) => item.text === contextualAnswer))
-      return value.status === 'idle' && turn?.nativeTurnId ? turn.nativeTurnId as string : undefined
-    })
+    const contextualTurnId = contextualAnswer.submittedTurnId
     const contextualCompletion = await wire.wait(frame => frame.type === 'freshAgent.event'
-      && frame.provider === 'codex' && frame.sessionType === 'freshcodex' && frame.sessionId === created.sessionId
-      && frame.event?.type === 'freshAgent.transcript.patch' && frame.event.sessionId === created.sessionId
-      && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === contextualTurnId && op.status === 'completed'))
+      && frame.event?.type === 'freshAgent.transcript.patch'
+      && frame.provider === 'codex'
+      && frame.sessionType === 'freshcodex'
+      && frame.event.ops?.some((operation: any) => operation.op === 'settleTurn'
+        && operation.nativeTurnId === contextualTurnId
+        && operation.status === 'completed'))
     const adoptionFrameCursor = wire.frames.length
     const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })

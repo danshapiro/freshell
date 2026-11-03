@@ -15273,6 +15273,14 @@ pub(crate) mod tests {
         cmd.spawn().expect("spawn sleep fixture")
     }
 
+    pub(super) fn spawn_sleeper_with_owner(ownership_id: &str) -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30")
+            .env(CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
+            .kill_on_drop(true);
+        cmd.spawn().expect("spawn owned sleep fixture")
+    }
+
     /// Like [`insert_fake_session`], but wires the REAL notification-consumer
     /// ([`FreshCodexState::spawn_consumer`]) instead of a no-op, so a scripted
     /// `turn/completed` notification pushed via the paired
@@ -19846,6 +19854,7 @@ pub(crate) mod tests {
                 pid: 1,
                 start_time: None,
                 tree: Vec::new(),
+                root_parent: None,
                 ownership_id: ownership_id.to_string(),
                 capture_complete: false,
             },

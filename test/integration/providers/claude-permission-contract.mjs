@@ -40,6 +40,11 @@ const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
 const fixturePrefix = process.env.FRESHELL_CLAUDE_PERMISSION_FIXTURE_PREFIX ?? 'freshell-claude-perm'
 
+// A fixture-only failure seam, reached after the owned processes have settled.
+const removeRoot = process.argv.includes('--fail-fixture-removal')
+  ? async () => { throw Object.assign(new Error('injected fixture removal failure'), { code: 'ENOTEMPTY' }) }
+  : undefined
+
 const TURN_TIMEOUT_MS = 45_000
 export const PLAN = '# Plan\n\n1. Edit foo.ts\n2. Run the tests'
 export const PLAN_FILE_TEXT = '# Real plan\n\n- step A\n- step B'
@@ -139,7 +144,13 @@ async function readJson(file) {
 }
 
 async function runScenario(name, spec) {
-  const fixture = await createClaudeFixture({ prefix: `${fixturePrefix}-${name}-` })
+  const injectUncleanExit = process.env.FRESHELL_CLAUDE_PERMISSION_TEST_UNCLEAN_EXIT_SCENARIO === name
+  const fixture = await createClaudeFixture({
+    prefix: `${fixturePrefix}-${name}-`,
+    // The synthetic unclean exit must join the real writers while retaining
+    // their fixture, before it exercises the unclean-exit evidence path.
+    removeRoot: injectUncleanExit ? async () => {} : removeRoot,
+  })
   const outside = path.join(fixture.root, 'outside')
   await fs.mkdir(outside, { recursive: true })
   const ctx = { cwd: fixture.cwd, outsideFile: path.join(outside, 'notes.txt'), planPath: null }
@@ -166,9 +177,9 @@ async function runScenario(name, spec) {
   let provider
   let sidecar
   let sidecarExit
-  // Resolves when the directly spawned sidecar exits; fixture cleanup also
-  // waits for its stdio close before removing the root.
-  let exited = Promise.resolve()
+  // The direct child's close event also joins its stdout/stderr. The shared
+  // fixture separately joins the native CLI before removing its writable home.
+  let closed = Promise.resolve()
   let failure
   let cleanupFailure
   let settingsLocal = null
@@ -194,7 +205,8 @@ async function runScenario(name, spec) {
     })
     fixture.ownProcess(sidecar)
     sidecar.stdin.on('error', () => {})
-    exited = new Promise((resolve) => sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal }; resolve() }))
+    sidecar.once('exit', (code, signal) => { sidecarExit = { code, signal } })
+    closed = new Promise((resolve) => sidecar.once('close', resolve))
     createInterface({ input: sidecar.stderr }).on('line', () => {})
     const send = (message) => sidecar.stdin.write(`${JSON.stringify(message)}\n`)
     const waiters = []
@@ -224,6 +236,7 @@ async function runScenario(name, spec) {
     if (created.type !== 'created') throw new Error(`the sidecar refused the create: ${created.message}`)
     if (created.sessionId !== nativeSessionId) throw new Error('the sidecar changed the requested native session identity')
     sessionId = created.sessionId
+    await fixture.ownProcessId(created.cliPid)
     if (spec.plan) {
       send({ type: 'configure', sessionId, requestId: 'to-plan', settings: { permissionMode: 'plan' } })
       const answer = await waitFor((frame) => frame.type === 'sdk.configured' && frame.requestId === 'to-plan', 'the plan-mode configure')
@@ -245,26 +258,26 @@ async function runScenario(name, spec) {
     }
     send({ type: 'shutdown' })
     sidecar.stdin.end()
-    await Promise.race([exited, sleep(10_000)])
+    await Promise.race([closed, sleep(10_000)])
   } catch (error) {
     failure = String(error?.message ?? error).slice(0, 1000)
     log('error', 'scenario.failed', { scenario: name, error: failure })
   } finally {
-    // Test the unclean-exit retention path after the real child has exited,
-    // without leaving its native CLI writer orphaned.
-    if (process.env.FRESHELL_CLAUDE_PERMISSION_TEST_UNCLEAN_EXIT_SCENARIO === name
-      && sidecarExit?.code === 0 && sidecarExit.signal === null) {
-      sidecarExit = { code: 1, signal: null }
-    }
     let cleanupCallbackStarted = false
     let fixtureCleanupStarted = false
     try {
       await stopFixtureProcessThen(sidecar, async () => {
         cleanupCallbackStarted = true
         await closeProvider()
+        if (injectUncleanExit && sidecarExit?.code === 0 && sidecarExit.signal === null) {
+          fixtureCleanupStarted = true
+          await fixture.cleanup()
+          fixtureCleanupStarted = false
+          sidecarExit = { code: 1, signal: null }
+        }
         if (sidecar && (sidecarExit?.code !== 0 || sidecarExit.signal !== null)) {
-          // The native CLI is deliberately outside this harness's process
-          // ownership; retain its fixture in case it is still writing.
+          // An unclean shutdown retains its fixture and diagnostic evidence.
+          // Successful cleanup below separately joins every registered writer.
           throw new Error(`sidecar did not complete a clean shutdown (code=${sidecarExit?.code ?? 'unknown'}, signal=${sidecarExit?.signal ?? 'none'}); fixture was retained`)
         }
         fixtureCleanupStarted = true

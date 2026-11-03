@@ -1,4 +1,4 @@
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import { ensureRustServerBuilt, RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import * as fs from 'node:fs/promises'
@@ -28,21 +28,10 @@ import type { Page } from '@playwright/test'
  * never the chooser), explicit tab/pane ids dispatched through the harness.
  */
 test.describe('local-first machine workspace', () => {
-  test.describe.configure({ mode: 'serial' })
+  test.describe.configure({ mode: 'default' })
 
   let server: RustServer
   let serverInfo: Awaited<ReturnType<RustServer['start']>>
-
-  /** Machine-selection storage payload captured from Scenario 1 (the first
-   * serial test): the remembered-selection localStorage entries
-   * ('freshell.machine-id.v1' + 'freshell.machine-selections.v1',
-   * storage-keys.ts:17-18). Scenario 3 (Task 7 Step 6) opens a FRESH
-   * per-test context against this already-existing machine; a first
-   * navigation there would open the machine chooser (machine-identity.ts:
-   * 216-222: no remembered selection + machines present → chooser) and never
-   * connect, so Scenario 3 seeds this payload into its context BEFORE first
-   * navigation. Serial mode guarantees Scenario 1 ran first. */
-  let machineSelectionStorage: Record<string, string> | undefined
 
   test.beforeAll(async () => {
     test.setTimeout(600_000) // first release build of freshell-server can take minutes
@@ -61,29 +50,51 @@ test.describe('local-first machine workspace', () => {
     { id: 'tab-apple', title: 'Apple', file: '/tmp/apple.md', pane: 'tab-apple-pane', paneTitle: 'Apple notes', userSet: true },
   ]
 
-  /** Spec-LOCAL fs-poll (the donor idiom, recover-my-panes-rust.spec.ts:452-494,
-   * per LB-07 — there is NO TestHarness method of this name; TestHarness's
-   * real methods are only waitForHarness/waitForConnection/waitForTabCount/
-   * getState/... per helpers/test-harness.ts): read every generation file
-   * under the server home's tabs-snapshots dir, keep only the given
-   * clientInstanceId's, rank newest by (snapshotRevision, capturedAt) — the
-   * server's own per-client monotonic ordering — and insist the newest
-   * generation has >= minRecords records. Bounded, 500ms poll interval. */
-  async function waitForNewestGenerationRecordCount(
+  /** Wait for this client's newest durable generation to contain the
+   * complete intended open workspace. A count can match an intermediate
+   * push (auto-tab plus Mango), and closed historical inventory must not
+   * count as an extra open tab. Keep the existing 30 s bound and poll rate. */
+  async function waitForNewestGenerationWorkspace(
     clientInstanceId: string,
-    minRecords: number,
+    expectedTabs: typeof TABS,
     timeoutMs = 30_000,
   ): Promise<void> {
     const snapshotsDir = path.join(serverInfo.homeDir, '.freshell', 'tabs-snapshots')
+    const expected = expectedTabs.map((tab) => ({
+      tabId: tab.id,
+      // A single pane's override title is the registry's displayed tab name.
+      tabName: tab.paneTitle,
+      panes: [{
+        paneId: tab.pane,
+        kind: 'editor',
+        title: tab.paneTitle,
+        titleSetByUser: tab.userSet,
+        filePath: tab.file,
+      }],
+    })).sort((a, b) => a.tabId.localeCompare(b.tabId))
+    const projectOpenWorkspace = (records: any[]) => records
+      .filter((record) => record?.status === 'open')
+      .map((record) => ({
+        tabId: record.tabId,
+        tabName: record.tabName,
+        panes: (Array.isArray(record.panes) ? record.panes : []).map((pane: any) => ({
+          paneId: pane.paneId,
+          kind: pane.kind,
+          title: pane.title,
+          titleSetByUser: pane.titleSetByUser === true,
+          filePath: pane.payload?.filePath,
+        })).sort((a: any, b: any) => String(a.paneId).localeCompare(String(b.paneId))),
+      }))
+      .sort((a, b) => String(a.tabId).localeCompare(String(b.tabId)))
     const deadline = Date.now() + timeoutMs
-    let lastObserved = 0
+    let lastObserved: unknown = null
     while (Date.now() < deadline) {
+      let newest: { revision: number; capturedAt: number; records: any[] } | null = null
       const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
       for (const device of devices) {
         const deviceDir = path.join(snapshotsDir, device)
         const files = (await fs.readdir(deviceDir).catch(() => [] as string[]))
           .filter((f) => f.endsWith('.json'))
-        let newest: { revision: number; capturedAt: number; count: number } | null = null
         for (const f of files) {
           const raw = await fs.readFile(path.join(deviceDir, f), 'utf8').catch(() => '')
           let doc: any = null
@@ -91,21 +102,21 @@ test.describe('local-first machine workspace', () => {
           if (doc?.clientInstanceId !== clientInstanceId) continue
           const revision = Number(doc?.snapshotRevision ?? 0)
           const capturedAt = Number(doc?.capturedAt ?? 0)
-          const count = Array.isArray(doc?.records) ? doc.records.length : 0
           if (!newest || revision > newest.revision || (revision === newest.revision && capturedAt > newest.capturedAt)) {
-            newest = { revision, capturedAt, count }
+            newest = { revision, capturedAt, records: Array.isArray(doc.records) ? doc.records : [] }
           }
         }
-        if (newest) {
-          lastObserved = Math.max(lastObserved, newest.count)
-          if (newest.count >= minRecords) return
-        }
+      }
+      if (newest) {
+        const workspace = projectOpenWorkspace(newest.records)
+        lastObserved = { revision: newest.revision, capturedAt: newest.capturedAt, workspace }
+        if (JSON.stringify(workspace) === JSON.stringify(expected)) return
       }
       await new Promise((r) => setTimeout(r, 500))
     }
     throw new Error(
-      `No persisted generation for client ${clientInstanceId} reached ${minRecords} records `
-      + `within ${timeoutMs}ms (last observed: ${lastObserved})`,
+      `No newest persisted generation for client ${clientInstanceId} matched the expected open workspace `
+      + `within ${timeoutMs}ms (last observed: ${JSON.stringify(lastObserved)})`,
     )
   }
 
@@ -127,19 +138,6 @@ test.describe('local-first machine workspace', () => {
     await page.waitForTimeout(500)
     await harness.waitForHarness()
     await harness.waitForConnection()
-
-    // Capture the resolved machine-selection storage payload at spec scope
-    // (see the machineSelectionStorage declaration): the boot has resolved
-    // and persisted the auto-created machine by now (resolveMachineIdentity
-    // → persistSelectedMachineId, machine-identity.ts:208/:217-218).
-    machineSelectionStorage = await page.evaluate(() => {
-      const out: Record<string, string> = {}
-      for (const key of ['freshell.machine-id.v1', 'freshell.machine-selections.v1']) {
-        const value = localStorage.getItem(key)
-        if (value !== null) out[key] = value
-      }
-      return out
-    })
 
     // Fresh home auto-created a machine AND an auto shell tab. Remove it
     // AFTER our own tabs exist: the App's ensure-at-least-one-tab effect
@@ -187,7 +185,7 @@ test.describe('local-first machine workspace', () => {
     // natural reload preserves it, which is what makes the
     // `machine-bootstrap:` prefix load-bearing in Scenario 2).
     const clientInstanceId = await page.evaluate(() => sessionStorage.getItem('freshell.tabs.client-instance-id.v1'))
-    await waitForNewestGenerationRecordCount(clientInstanceId, 2)
+    await waitForNewestGenerationWorkspace(clientInstanceId, TABS)
     await waitForPersistedEnvelope(page, (env) =>
       typeof env.machineId === 'string' && env.machineId.length > 0 && env.tabs?.tabs?.length === 2)
 
@@ -246,192 +244,219 @@ test.describe('local-first machine workspace', () => {
     expect(rebuilt.panes.paneTitleSetByUser['tab-mango']?.['tab-mango-pane']).toBeFalsy()
   })
 
-  test('cross-window pane-title hydration is title-only: newer titles deliver, older do not clobber, user-set survives, each window keeps its own arrangement, and received titles are durable across the receiver\u2019s reload', async ({ page }) => {
-    // Establish the remembered machine in this FRESH context BEFORE first
-    // navigation (see the donor-idiom note above): seed the payload
-    // Scenario 1 captured, then boot page1 — it resolves the seeded machine
-    // (kind 'selected', machine-identity.ts:191-214) with NO chooser. This
-    // is a SEEDING init script, not the clearing kind LB-08 forbids: it
-    // writes the same values the boot itself persists, idempotently, and
-    // never touches sessionStorage.
-    test.skip(!machineSelectionStorage, 'Scenario 1 must have captured the machine-selection payload')
-    await page.addInitScript((payload) => {
-      for (const [key, value] of Object.entries(payload)) localStorage.setItem(key, value)
-      // Without a freshell_version stamp, runStorageMigration()'s full path
-      // (storage-migration.ts:475) wipes every freshell.* key outside its
-      // keep list — including the machine-selection keys just seeded — and
-      // the boot falls into the chooser. Stamping the current version keeps
-      // the migration on its preserve-only early-return path.
-      localStorage.setItem('freshell_version', '5')
-    }, machineSelectionStorage)
+  test('cross-window pane-title hydration is title-only: newer titles deliver, older do not clobber, user-set survives, each window keeps its own arrangement, and received titles are durable across the receiver\u2019s reload', async ({ browser }) => {
+    const { context, page } = await createFreshE2ePage(browser, serverInfo, { serviceWorkers: 'block' })
+    try {
+      await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await harness.waitForTabCount(1)
 
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    const harness = new TestHarness(page)
-    await harness.waitForHarness()
-    await harness.waitForConnection()
+      // This scenario owns its machine and initial editor workspace. It
+      // must be runnable by itself, without inheriting a prior test's
+      // machine selection or persisted snapshot.
+      await page.evaluate((tabs) => {
+        const h = window.__FRESHELL_TEST_HARNESS__
+        if (!h) throw new Error('Test harness is unavailable')
+        const initialTabIds = h.getState().tabs.tabs.map((tab) => tab.id)
+        for (const t of tabs) {
+          h.dispatch({ type: 'tabs/addTab', payload: { id: t.id, title: t.title, activate: false } })
+          h.dispatch({
+            type: 'panes/initLayout',
+            payload: {
+              tabId: t.id, paneId: t.pane,
+              content: { kind: 'editor', filePath: t.file, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
+            },
+          })
+          h.dispatch({ type: 'panes/updatePaneTitle', payload: { tabId: t.id, paneId: t.pane, title: t.paneTitle, setByUser: t.userSet } })
+        }
+        h.dispatch({ type: 'tabs/setActiveTab', payload: 'tab-mango' })
+        for (const id of initialTabIds) {
+          h.dispatch({ type: 'tabs/removeTab', payload: id })
+          h.dispatch({ type: 'panes/removeLayout', payload: { tabId: id } })
+        }
+        h.dispatch({ type: 'persist/flushNow' })
+      }, TABS)
+      await harness.waitForTabCount(2)
+      const clientInstanceId = await page.evaluate(() => sessionStorage.getItem('freshell.tabs.client-instance-id.v1'))
+      if (!clientInstanceId) throw new Error('Workspace has no client instance id')
+      // Page2 bootstraps these same pane ids from this test's own durable
+      // generation, so its title-only delivery assertions have real peers.
+      await waitForNewestGenerationWorkspace(clientInstanceId, TABS)
+      await waitForPersistedEnvelope(page, (env) =>
+        typeof env.machineId === 'string' && env.machineId.length > 0
+        && env.tabs?.tabs?.length === 2)
 
-    // The seeded context has NO local envelope, so this boot REBUILDS from
-    // the machine-bootstrap inventory: Scenario 1's tabs come back with
-    // PRESERVED ids (Task 3), exactly as Scenario 2 just pinned — there is
-    // no auto shell tab to remove, and tab-mango's restored pane tree
-    // already carries the tab-mango-pane pane this scenario titles.
-    await harness.waitForTabCount(2)
-    await waitForPersistedEnvelope(page, (env) =>
-      typeof env.machineId === 'string' && env.machineId.length > 0
-      && env.tabs?.tabs?.some((t: { id: string }) => t.id === 'tab-mango'))
+      // Page2 shares this context's machine selection and localStorage,
+      // while keeping its own client and layout-window identities.
+      const page2 = await page.context().newPage()
+      await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+      const harness2 = new TestHarness(page2)
+      await harness2.waitForHarness()
+      await harness2.waitForConnection()
+      await harness2.waitForTabCount(2)
 
-    // page2 opens in the SAME context (shared localStorage — the donor's
-    // `page.context().newPage()` idiom, multi-client.spec.ts:198-199) and
-    // rehydrates the envelope; it resolves the same saved machine (the
-    // donor's second-page mechanism, :202/:205-206) — no init script needed.
-    const page2 = await page.context().newPage()
-    await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    const harness2 = new TestHarness(page2)
-    await harness2.waitForHarness()
-    await harness2.waitForConnection()
-    await harness2.waitForTabCount(2)
-
-    // Give page2 a LOCAL-ONLY tab so the two arrangements demonstrably
-    // diverge before any cross-window event fires (the approved tradeoff:
-    // two windows on the same machine may keep divergent arrangements).
-    await page2.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id: 'tab-page2-only', title: 'Page2 only' } })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/initLayout',
-        payload: {
-          tabId: 'tab-page2-only', paneId: 'tab-page2-only-pane',
-          content: { kind: 'editor', filePath: '/tmp/page2-only.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
-        },
+      // Give page2 a LOCAL-ONLY tab so the two arrangements demonstrably
+      // diverge before any cross-window event fires (the approved tradeoff:
+      // two windows on the same machine may keep divergent arrangements).
+      await page2.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id: 'tab-page2-only', title: 'Page2 only' } })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/initLayout',
+          payload: {
+            tabId: 'tab-page2-only', paneId: 'tab-page2-only-pane',
+            content: { kind: 'editor', filePath: '/tmp/page2-only.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
+          },
+        })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
-    })
-    await waitForPersistedEnvelope(page2, (env) =>
-      env.tabs?.tabs?.some((t: { id: string }) => t.id === 'tab-page2-only'))
-    // Page2's arrangement as it stands before any page1 event (the rebuild's
-    // tab order is the server inventory's, not the seeded order — pin the
-    // arrangement's INVARIANCE below instead of assuming an order).
-    const page2TabsBefore = await page2.evaluate(() =>
-      (window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.tabs ?? []).map((t: { id: string }) => t.id))
+      await waitForPersistedEnvelope(page2, (env) =>
+        env.tabs?.tabs?.some((t: { id: string }) => t.id === 'tab-page2-only'))
+      // Page2's arrangement as it stands before any page1 event (the rebuild's
+      // tab order is the server inventory's, not the seeded order — pin the
+      // arrangement's INVARIANCE below instead of assuming an order).
+      const page2TabsBefore = await page2.evaluate(() =>
+        (window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.tabs ?? []).map((t: { id: string }) => t.id))
 
-    // ── Step A: page1's flush delivers its NEWER pane title to page2's
-    // matching pane through the title-only path — and nothing else.
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/updatePaneTitle',
-        payload: { tabId: 'tab-mango', paneId: 'tab-mango-pane', title: 'Newer from page1', setByUser: false },
+      // ── Step A: page1's flush delivers its NEWER pane title to page2's
+      // matching pane through the title-only path — and nothing else.
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/updatePaneTitle',
+          payload: { tabId: 'tab-mango', paneId: 'tab-mango-pane', title: 'Newer from page1', setByUser: false },
+        })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id: 'tab-page1-only', title: 'Page1 only' } })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/initLayout',
+          payload: {
+            tabId: 'tab-page1-only', paneId: 'tab-page1-only-pane',
+            content: { kind: 'editor', filePath: '/tmp/page1-only.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
+          },
+        })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id: 'tab-page1-only', title: 'Page1 only' } })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/initLayout',
-        payload: {
-          tabId: 'tab-page1-only', paneId: 'tab-page1-only-pane',
-          content: { kind: 'editor', filePath: '/tmp/page1-only.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
-        },
+      const t1 = await waitForPersistedEnvelopeTitled(page, 'tab-mango', 'tab-mango-pane', 'Newer from page1')
+
+      // The title-only delivery landed on page2 (a positive, pollable
+      // control that page2 processed page1's flush event at all).
+      await page2.waitForFunction(() =>
+        window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'] === 'Newer from page1',
+        undefined, { timeout: 15_000 })
+
+      // The divergence pin: the SAME flush carried 'tab-page1-only' — page2's
+      // arrangement must stay EXACTLY its own: same tabs, same order, no
+      // adoption, no reordering.
+      const page2After = await page2.evaluate(() => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        return {
+          tabIds: (state?.tabs?.tabs ?? []).map((t: { id: string }) => t.id),
+          layoutTabIds: Object.keys(state?.panes?.layouts ?? {}).sort(),
+        }
       })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
-    })
-    const t1 = await waitForPersistedEnvelopeTitled(page, 'tab-mango', 'tab-mango-pane', 'Newer from page1')
+      expect(page2After.tabIds).toEqual(page2TabsBefore)
+      expect(page2After.tabIds, 'page1\u2019s local-only tab is not adopted cross-window').not.toContain('tab-page1-only')
+      expect(page2After.layoutTabIds).toEqual(['tab-apple', 'tab-mango', 'tab-page2-only'])
 
-    // The title-only delivery landed on page2 (a positive, pollable
-    // control that page2 processed page1's flush event at all).
-    await page2.waitForFunction(() =>
-      window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'] === 'Newer from page1',
-      undefined, { timeout: 15_000 })
+      // Page1's own arrangement, settled after its Step A flush, for the
+      // Step B invariance pin below.
+      const page1TabsBefore = await page.evaluate(() =>
+        (window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.tabs ?? []).map((t: { id: string }) => t.id))
 
-    // The divergence pin: the SAME flush carried 'tab-page1-only' — page2's
-    // arrangement must stay EXACTLY its own: same tabs, same order, no
-    // adoption, no reordering.
-    const page2After = await page2.evaluate(() => {
-      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
-      return {
-        tabIds: (state?.tabs?.tabs ?? []).map((t: { id: string }) => t.id),
-        layoutTabIds: Object.keys(state?.panes?.layouts ?? {}).sort(),
-      }
-    })
-    expect(page2After.tabIds).toEqual(page2TabsBefore)
-    expect(page2After.tabIds, 'page1\u2019s local-only tab is not adopted cross-window').not.toContain('tab-page1-only')
-    expect(page2After.layoutTabIds).toEqual(['tab-apple', 'tab-mango', 'tab-page2-only'])
-
-    // Page1's own arrangement, settled after its Step A flush, for the
-    // Step B invariance pin below.
-    const page1TabsBefore = await page.evaluate(() =>
-      (window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.tabs ?? []).map((t: { id: string }) => t.id))
-
-    // ── Step B: page2 sets a USER-SET title on the other shared pane and
-    // flushes; page1's matching pane receives it (incoming user-set wins
-    // per the Task-7 rules) — the positive control that page1 processed
-    // page2's flush, so the non-adoption read below is causally grounded.
-    await page2.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/updatePaneTitle',
-        payload: { tabId: 'tab-apple', paneId: 'tab-apple-pane', title: 'User-set on page2', setByUser: true },
+      // ── Step B: page2 sets a USER-SET title on the other shared pane and
+      // flushes; page1's matching pane receives it (incoming user-set wins
+      // per the Task-7 rules) — the positive control that page1 processed
+      // page2's flush, so the non-adoption read below is causally grounded.
+      await page2.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/updatePaneTitle',
+          payload: { tabId: 'tab-apple', paneId: 'tab-apple-pane', title: 'User-set on page2', setByUser: true },
+        })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
-    })
-    const t2 = await waitForPersistedEnvelopeTitled(page2, 'tab-apple', 'tab-apple-pane', 'User-set on page2')
-    expect(t2).toBeGreaterThan(t1)
+      const t2 = await waitForPersistedEnvelopeTitled(page2, 'tab-apple', 'tab-apple-pane', 'User-set on page2')
+      expect(t2).toBeGreaterThan(t1)
 
-    await page.waitForFunction(() =>
-      window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-apple']?.['tab-apple-pane'] === 'User-set on page2',
-      undefined, { timeout: 15_000 })
-    const page1After = await page.evaluate(() => {
-      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
-      return {
-        tabIds: (state?.tabs?.tabs ?? []).map((t: { id: string }) => t.id),
-        appleTitleUserSet: !!state?.panes?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane'],
-      }
-    })
-    expect(page1After.tabIds, 'page1\u2019s arrangement stays exactly its own across page2\u2019s flush').toEqual(page1TabsBefore)
-    expect(page1After.tabIds).not.toContain('tab-page2-only')
-    expect(page1After.appleTitleUserSet, 'the incoming user-set flag propagates').toBe(true)
+      await page.waitForFunction(() =>
+        window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-apple']?.['tab-apple-pane'] === 'User-set on page2',
+        undefined, { timeout: 15_000 })
+      const page1After = await page.evaluate(() => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        return {
+          tabIds: (state?.tabs?.tabs ?? []).map((t: { id: string }) => t.id),
+          appleTitleUserSet: !!state?.panes?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane'],
+        }
+      })
+      expect(page1After.tabIds, 'page1\u2019s arrangement stays exactly its own across page2\u2019s flush').toEqual(page1TabsBefore)
+      expect(page1After.tabIds).not.toContain('tab-page2-only')
+      expect(page1After.appleTitleUserSet, 'the incoming user-set flag propagates').toBe(true)
 
-    // ── Step B-reload (e3r3 finding 1): the received title must be DURABLE.
-    // page1 is the RECEIVER of a cross-window title (Step B's user-set
-    // apple title, folded in through the title-only path). The durable
-    // reconciliation writes the received title into page1's OWN envelope
-    // (the debounced persist flush), so a refresh of the HEALTHY receiver
-    // boots WITH it — the reviewer's exact durability case: a receiver
-    // that reloads before any unrelated mutation flushes must not lose
-    // the received title.
-    await waitForPersistedEnvelopeTitled(page, 'tab-apple', 'tab-apple-pane', 'User-set on page2')
-    await page.reload()
-    await harness.waitForHarness()
-    await harness.waitForConnection()
-    const reloadedReceiver = await page.evaluate(() =>
-      window.__FRESHELL_TEST_HARNESS__?.getState()?.panes)
-    expect(reloadedReceiver?.paneTitles?.['tab-apple']?.['tab-apple-pane'], 'the received user-set title survives the receiver\u2019s healthy reload').toBe('User-set on page2')
-    expect(reloadedReceiver?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane'], 'the received user-set flag survives the reload too').toBe(true)
-    expect(reloadedReceiver?.paneTitles?.['tab-mango']?.['tab-mango-pane'], 'the receiver\u2019s own Step A title also survives the reload').toBe('Newer from page1')
+      // ── Step B-reload (e3r3 finding 1): the received title must be DURABLE.
+      // page1 is the RECEIVER of a cross-window title (Step B's user-set
+      // apple title, folded in through the title-only path). The durable
+      // reconciliation writes the received title into page1's OWN envelope
+      // (the debounced persist flush), so a refresh of the HEALTHY receiver
+      // boots WITH it — the reviewer's exact durability case: a receiver
+      // that reloads before any unrelated mutation flushes must not lose
+      // the received title.
+      await waitForPersistedEnvelopeTitled(page, 'tab-apple', 'tab-apple-pane', 'User-set on page2')
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      const reloadedReceiver = await page.evaluate(() =>
+        window.__FRESHELL_TEST_HARNESS__?.getState()?.panes)
+      expect(reloadedReceiver?.paneTitles?.['tab-apple']?.['tab-apple-pane'], 'the received user-set title survives the receiver\u2019s healthy reload').toBe('User-set on page2')
+      expect(reloadedReceiver?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane'], 'the received user-set flag survives the reload too').toBe(true)
+      expect(reloadedReceiver?.paneTitles?.['tab-mango']?.['tab-mango-pane'], 'the receiver\u2019s own Step A title also survives the reload').toBe('Newer from page1')
 
-    // ── Step C: an OLDER staged envelope does not clobber newer local
-    // titles, and the user-set title survives it. From page1, mutate PAGE2's
-    // OWN per-window envelope in place — the shared pane titles reverted,
-    // persistedAt 60s OLDER than page2's local stamp (t2). page1's
-    // cross-document write fires a storage event on page2 carrying page2's
-    // own key: the own-envelope replacement path, recency-guarded through
-    // the same Task-7 merge rules (remoteLayoutPersistedAt <
-    // localLayoutPersistedAt). The stale title (non-user) must lose to
-    // page2's recency, and the stale apple title must lose to the
-    // user-set flag outright.
-    const page2LayoutWindowId = await page2.evaluate(() => sessionStorage.getItem('freshell.layout-window-id.v1'))
-    expect(page2LayoutWindowId, 'page2 has a per-window layout-window id in sessionStorage').toBeTruthy()
-    await page.evaluate(([t2, layoutWindowId]) => {
-      const layoutKey = `freshell.layout.v3.${layoutWindowId}`
-      const env = JSON.parse(localStorage.getItem(layoutKey) ?? '{}')
-      env.panes.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
-      env.panes.paneTitles['tab-apple']['tab-apple-pane'] = 'Stale apple from page1'
-      env.persistedAt = t2 - 60_000
-      localStorage.setItem(layoutKey, JSON.stringify(env))
-    }, [t2, page2LayoutWindowId] as [number, string | null])
+      // ── Step C: an OLDER staged envelope does not clobber newer local
+      // titles, and the user-set title survives it. From page1, mutate PAGE2's
+      // OWN per-window envelope in place — the shared pane titles reverted,
+      // persistedAt 60s OLDER than page2's local stamp (t2). page1's
+      // cross-document write fires a storage event on page2 carrying page2's
+      // own key: the own-envelope replacement path, recency-guarded through
+      // the same Task-7 merge rules (remoteLayoutPersistedAt <
+      // localLayoutPersistedAt). The stale title (non-user) must lose to
+      // page2's recency, and the stale apple title must lose to the
+      // user-set flag outright.
+      const page2LayoutWindowId = await page2.evaluate(() => sessionStorage.getItem('freshell.layout-window-id.v1'))
+      expect(page2LayoutWindowId, 'page2 has a per-window layout-window id in sessionStorage').toBeTruthy()
+      await page2.evaluate(({ layoutWindowId, persistedAt }) => {
+        const observed = window as Window & { __staleEnvelopeDelivered?: boolean }
+        observed.__staleEnvelopeDelivered = false
+        const onStorage = (event: StorageEvent) => {
+          if (event.storageArea !== localStorage
+            || event.key !== `freshell.layout.v3.${layoutWindowId}`
+            || !event.newValue) return
+          const envelope = JSON.parse(event.newValue)
+          if (envelope.persistedAt !== persistedAt) return
+          window.removeEventListener('storage', onStorage)
+          // The app's already-registered storage handler applies or rejects
+          // the envelope synchronously before this later listener runs.
+          observed.__staleEnvelopeDelivered = true
+        }
+        window.addEventListener('storage', onStorage)
+      }, { layoutWindowId: page2LayoutWindowId, persistedAt: t2 - 60_000 })
+      await page.evaluate(([t2, layoutWindowId]) => {
+        const layoutKey = `freshell.layout.v3.${layoutWindowId}`
+        const env = JSON.parse(localStorage.getItem(layoutKey) ?? '{}')
+        env.panes.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
+        env.panes.paneTitles['tab-apple']['tab-apple-pane'] = 'Stale apple from page1'
+        env.persistedAt = t2 - 60_000
+        localStorage.setItem(layoutKey, JSON.stringify(env))
+      }, [t2, page2LayoutWindowId] as [number, string | null])
 
-    // Bounded settle for the storage-event hydration, then ONE hard read
-    // (not a poll — a poll could sample before the hydrate lands and
-    // false-pass).
-    await page2.waitForTimeout(2_000)
-    const kept = await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState()?.panes)
-    expect(kept?.paneTitles?.['tab-mango']?.['tab-mango-pane'], 'the newer local title wins against the older staged envelope').toBe('Newer from page1')
-    expect(kept?.paneTitles?.['tab-apple']?.['tab-apple-pane'], 'the user-set title survives the older staged envelope').toBe('User-set on page2')
-    expect(kept?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane']).toBe(true)
+      // A negative assertion is meaningful only after the receiver has
+      // processed the exact stale write; elapsed time does not prove that.
+      await page2.waitForFunction(() =>
+        (window as Window & { __staleEnvelopeDelivered?: boolean }).__staleEnvelopeDelivered === true)
+      const kept = await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getState()?.panes)
+      expect(kept?.paneTitles?.['tab-mango']?.['tab-mango-pane'], 'the newer local title wins against the older staged envelope').toBe('Newer from page1')
+      expect(kept?.paneTitles?.['tab-apple']?.['tab-apple-pane'], 'the user-set title survives the older staged envelope').toBe('User-set on page2')
+      expect(kept?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane']).toBe(true)
+    } finally {
+      await context.close()
+    }
   })
 })
 

@@ -25,6 +25,8 @@ if (process.argv[2] === 'fake-durable-writer') {
   appendWitness()
 
   const server = net.createServer((socket) => {
+    // The reply acknowledges a completed write; callers need no timer sleep.
+    appendWitness()
     socket.end('fake codex durable writer\n')
   })
   server.listen(0, '127.0.0.1', () => {
@@ -34,6 +36,7 @@ if (process.argv[2] === 'fake-durable-writer') {
     }
     fs.writeFileSync(portPath, `${address.port}\n`, 'utf8')
     fs.writeFileSync(readyPath, `${process.pid}\n`, 'utf8')
+    process.send?.({ type: 'durable-writer.ready' })
   })
   const timer = setInterval(appendWitness, intervalMs)
   process.on('SIGTERM', () => {
@@ -634,12 +637,32 @@ if (behavior.spawnDurableWriter) {
       ...process.env,
       FAKE_CODEX_WRITER_IGNORE_SIGTERM: behavior.durableWriterIgnoresSigterm ? '1' : '',
     },
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
-  durableWriterChild.unref()
   if (behavior.durableWriterPidPath) {
     fs.writeFileSync(behavior.durableWriterPidPath, `${durableWriterChild.pid}\n`, 'utf8')
   }
+  // Establish the writer before exposing the app-server handshake. Readiness is
+  // a child acknowledgement, independent of startup speed and host contention.
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      durableWriterChild.off('message', onMessage)
+      durableWriterChild.off('error', onError)
+      durableWriterChild.off('exit', onExit)
+    }
+    const onError = (error) => { cleanup(); reject(error) }
+    const onExit = (code, signal) => onError(new Error(`durable writer exited before readiness: ${code ?? signal}`))
+    const onMessage = (message) => {
+      if (message?.type !== 'durable-writer.ready') return
+      cleanup()
+      resolve()
+    }
+    durableWriterChild.on('message', onMessage)
+    durableWriterChild.once('error', onError)
+    durableWriterChild.once('exit', onExit)
+  })
+  durableWriterChild.unref()
+  durableWriterChild.channel?.unref()
 }
 
 const wss = portFile

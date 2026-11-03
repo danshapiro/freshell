@@ -235,9 +235,15 @@ test.describe('Freshopencode snapshot-409 recovery (cloud-legal)', () => {
     // envelope the Rust server mints for a Live{FreshAgent} key), every
     // subsequent GET answers the recovered 200 snapshot.
     const servedStatuses: number[] = []
+    const snapshotTriggers: Array<string | null> = []
+    let releaseRefusal!: () => void
+    const refusalGate = new Promise<void>(resolve => { releaseRefusal = resolve })
     await page.route(`**/api/fresh-agent/threads/freshopencode/opencode/${SESSION_ID}**`, async (route) => {
+      snapshotTriggers.push(new URL(route.request().url()).searchParams.get('trigger'))
       if (servedStatuses.length === 0) {
         servedStatuses.push(409)
+        // Mount must settle before its failure starts a recovery epoch.
+        await refusalGate
         await route.fulfill({
           status: 409,
           contentType: 'application/json',
@@ -262,6 +268,15 @@ test.describe('Freshopencode snapshot-409 recovery (cloud-legal)', () => {
     await enableFreshClientsAndOpencode(page)
     await seedIncidentOwnerRecord(page)
     await createFreshopencodePaneWithDurableSession(page, cwd)
+    await expect.poll(() => servedStatuses.length, { timeout: 20_000 }).toBe(1)
+    await expect.poll(async () => {
+      const sent = await harness.getSentWsMessages() as Array<Record<string, unknown>>
+      return sent.filter(message => message.type === 'freshAgent.attach'
+        && message.sessionId === SESSION_ID
+        && message.observedEpoch === SEEDED_RECORD_EPOCH
+        && message.observedGeneration === SEEDED_RECORD_GENERATION).length
+    }, { timeout: 20_000, message: 'the exact mount attach is observed before releasing the 409' }).toBe(1)
+    releaseRefusal()
 
     // The mount snapshot GET landed the typed 409 (the incident premise —
     // a filter that never saw the 409 proves nothing).
@@ -306,7 +321,7 @@ test.describe('Freshopencode snapshot-409 recovery (cloud-legal)', () => {
       observedEpoch: SEEDED_RECORD_EPOCH,
       observedGeneration: REFUSAL_OWNER_GENERATION,
     })
-    expect(servedStatuses, 'one mount 409 + one recovery 200 refetch, no loop').toEqual([409, 200])
+    expect(servedStatuses, `one mount 409 + one recovery 200 refetch, no loop; triggers=${JSON.stringify(snapshotTriggers)}`).toEqual([409, 200])
 
     // The pane kept its identity (the 409 arm is NOT the 404 lost-thread
     // reset — that arm clears the session).

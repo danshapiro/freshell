@@ -306,8 +306,8 @@ describe('App Mobile - Sidebar Backdrop', () => {
       expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
     })
 
-    // Backdrop should be present
-    const backdrop = screen.getByRole('presentation')
+    // Observe the backdrop's committed render, not only the sidebar's.
+    const backdrop = await screen.findByRole('presentation')
     expect(backdrop.className).toContain('bg-black/50')
     expect(backdrop.className).toContain('absolute')
     expect(backdrop.className).toContain('inset-0')

@@ -18782,6 +18782,7 @@ rl.on('line', (line) => {
             pid,
             start_time: Some(u64::MAX / 2),
             tree: Vec::new(),
+            root_parent: None,
             ownership_id: sid.clone(),
             capture_complete: true,
         };
