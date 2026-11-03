@@ -10,6 +10,7 @@ struct JournalState {
     reads: usize,
     advance_on_read: Option<String>,
     inventory_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    replay_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     sends: Vec<String>,
 }
 
@@ -34,6 +35,7 @@ impl JournalFixture {
             reads: 0,
             advance_on_read: None,
             inventory_gate: None,
+            replay_gate: None,
             sends: Vec::new(),
         }));
         let server_state = state.clone();
@@ -64,6 +66,7 @@ impl JournalFixture {
                         AdminCommand::FreshAgentReadEvents(read) => {
                             state.reads += 1;
                             let mut page = state.batch.clone();
+                            if read.max_events == 4096 { gate = state.replay_gate.take(); }
                             if let Some(native) = state.advance_on_read.take() { state.native = native; }
                             page.events.retain(|row| row.sequence > read.after_sequence);
                             if read.after_sequence != 0 { page.retained_state = None; page.reset_required = false; }
@@ -812,6 +815,96 @@ async fn disconnected_pane_reconnects_with_its_saved_pre_replacement_reference()
 }
 
 #[tokio::test]
+async fn legacy_canonical_pane_reconnects_to_current_native_without_fabricating_proof() {
+    use freshell_agent_runtime::host_actor::{FreshAgentHostActor, FreshAgentProfile};
+    let directory = tempfile::tempdir().unwrap();
+    let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "runtimeVariant":"codex", "cwd":directory.path(), "providerStoreId":"legacy-reconnect",
+        "nativeSessionId":"native-a", "sessionRef":{"provider":"codex", "sessionId":"native-a"}
+    })).unwrap();
+    let actor = FreshAgentHostActor::open(
+        directory.path(),
+        profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    actor
+        .dispatch(
+            RequestId::parse("legacy-a-to-b").unwrap(),
+            "recover".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let profile = actor.profile().await;
+    assert_eq!(profile.native_session_id.as_deref(), Some("native-b"));
+    actor.stop().await.unwrap();
+    // The approved base serialized this exact actor shape without the new
+    // transition proof, while already persisting B as the current native.
+    let path = directory.path().join("fresh-agent-state.json");
+    let mut old_state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(old_state
+        .as_object_mut()
+        .unwrap()
+        .remove("acceptedNativeDispatch")
+        .is_some());
+    std::fs::write(&path, serde_json::to_vec(&old_state).unwrap()).unwrap();
+    let reopened = FreshAgentHostActor::open(
+        directory.path(),
+        profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    let mut batch = reopened.read_events(0, 128).await;
+    assert!(batch.accepted_native_dispatch.is_none());
+    batch.head += 1;
+    batch.events.push(AgentJournalEvent {
+        sequence: batch.head,
+        event: status("native-b", "legacy-current"),
+    });
+    reopened.stop().await.unwrap();
+
+    let mut fixture = JournalFixture::new("native-b", "managed-public", batch).await;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        fixture
+            .proxy
+            .clone()
+            .handle(attach("managed-public", "codex", "native-a"))
+            .await;
+        let mut frames = Vec::new();
+        assert!(
+            collect_until(&mut fixture.frames, &mut frames, |frames| frames
+                .iter()
+                .any(|frame| frame["event"]["status"] == "legacy-current"
+                    || frame["event"]["type"] == "freshAgent.error"))
+            .await,
+            "{frames:?}"
+        );
+        let announcement = frames.iter().position(|frame| {
+            frame["type"] == "freshAgent.session.materialized"
+                && frame["sessionId"] == "managed-public"
+                && frame["sessionRef"]["sessionId"] == "native-b"
+        });
+        let output = frames.iter().position(|frame| {
+            frame["sessionId"] == "managed-public" && frame["event"]["status"] == "legacy-current"
+        });
+        assert!(
+            announcement.zip(output).is_some_and(|(a, b)| a < b),
+            "legacy M/A must announce its authoritative current B before replay: {frames:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn older_presentation_can_reconnect_with_its_proven_saved_reference() {
     let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
     let scenario = std::panic::AssertUnwindSafe(async {
@@ -1271,6 +1364,106 @@ async fn retained_provisional_control_is_retried_after_replacement_is_accepted()
     if let Err(panic) = scenario {
         std::panic::resume_unwind(panic);
     }
+}
+
+// The live poller's cursor has already passed the receipt when a second pane
+// attaches. Pause that pane's actual replay after it captures A, then let the
+// live poller publish B (or let a fork retire the pane) before replay resumes.
+async fn targeted_replay_after_route_change(fork: bool) {
+    let receipt = AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.send.accepted", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"native-a", "requestId":"prior-request", "submittedTurnId":"prior-turn"
+        }),
+    };
+    let mut first = journal_batch();
+    first.accepted_native_dispatch = None;
+    first.events = vec![AgentJournalEvent {
+        sequence: 1,
+        event: receipt,
+    }];
+    let mut fixture = JournalFixture::new("native-a", "managed-public", first).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let scenario = std::panic::AssertUnwindSafe(async {
+        assert!(fixture.proxy.start_poller(
+            fixture.soul.clone(), "codex".into(), "managed-public".into(), "freshcodex".into(), 0,
+        ).await);
+        let mut initial = Vec::new();
+        assert!(collect_until(&mut fixture.frames, &mut initial, |frames| frames.iter().any(|frame|
+            frame["type"] == "freshAgent.send.accepted" && frame["sessionId"] == "managed-public"
+        )).await, "live poller did not advance: {initial:?}");
+        fixture.state.lock().unwrap().replay_gate = Some((entered.clone(), release.clone()));
+        let attaching = tokio::spawn({
+            let proxy = fixture.proxy.clone();
+            async move { proxy.handle(attach("native-a", "codex", "native-a")).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified()).await
+            .expect("targeted replay must capture the old batch");
+        if fork {
+            fixture.proxy.clone().handle(HostedFreshAgentCommand::Fork(serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"replay-fork"
+            })).unwrap())).await;
+            let mut forked = Vec::new();
+            assert!(collect_until(&mut fixture.frames, &mut forked, |frames| frames.iter().any(|frame|
+                frame["type"] == "freshAgent.forked" && frame["sessionId"] == "native-c"
+            )).await, "fork must retire the parent: {forked:?}");
+        } else {
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.native = "native-b".into();
+                state.batch.accepted_native_dispatch = Some(accepted_codex_journal_proof());
+                state.batch.retained_state = Some(serde_json::json!({
+                    "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+                    "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-b","turns":[{"id":"current-turn"}]},
+                    "attentionMarks":[], "pendingControls":[{"type":"freshAgent.permission.request","sessionId":"native-b","requestId":"current-control"}]
+                }));
+            }
+            let mut live = Vec::new();
+            assert!(collect_until(&mut fixture.frames, &mut live, |frames| frames.iter().any(|frame|
+                frame["type"] == "freshAgent.session.materialized"
+                    && frame["sessionId"] == "managed-public" && frame["sessionRef"]["sessionId"] == "native-b"
+            )).await, "live poller must publish replacement B: {live:?}");
+        }
+        while fixture.frames.try_recv().is_ok() {}
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), attaching).await.unwrap().unwrap();
+        let mut after = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            after.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        if fork {
+            assert!(!after.iter().any(|frame| frame["sessionId"] == "native-a"),
+                "targeted replay must not resurrect the fork-retired presentation: {after:?}");
+        } else {
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a"
+                && frame["event"]["retainedState"]["snapshot"]["turns"][0]["id"] == "current-turn"),
+                "targeted replay must recover current retained transcript: {after:?}");
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a"
+                && frame["event"]["requestId"] == "current-control"),
+                "targeted replay must recover current pending control: {after:?}");
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a"
+                && frame["type"] == "freshAgent.send.accepted" && frame["requestId"] == "prior-request"),
+                "targeted replay must recover receipts already passed by the live cursor: {after:?}");
+            assert!(!after.iter().any(|frame| frame["event"]["retainedState"]["snapshot"]["threadId"] == "native-a"),
+                "old A retained state cannot follow B: {after:?}");
+        }
+    }).catch_unwind().await;
+    release.notify_one();
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn targeted_replay_recovers_after_a_live_replacement() {
+    targeted_replay_after_route_change(false).await;
+}
+
+#[tokio::test]
+async fn targeted_replay_does_not_revive_a_fork_retired_presentation() {
+    targeted_replay_after_route_change(true).await;
 }
 
 #[tokio::test]
