@@ -100,12 +100,26 @@ async fn a_500ms_write_timeout_kills_only_its_runtime_and_rings_the_owed_turn_on
     let (rig, mut conn, stalled) = stalled_rig("500").await;
     let healthy = conn.create("create-healthy").await;
     let blocked = block_stdin(&rig, &stalled);
-    let refused = tokio::time::timeout(Duration::from_secs(3), blocked).await;
-    assert!(refused.is_ok(), "the stalled write never timed out");
-    assert!(matches!(
-        refused.unwrap().unwrap(),
-        ClaudeSendOutcome::Refused { .. }
-    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(3), blocked)
+        .await
+        .expect("the stalled write never timed out")
+        .expect("the stalled write task failed");
+    let ClaudeSendOutcome::Ambiguous {
+        message,
+        submitted_turn_id,
+    } = outcome
+    else {
+        panic!("a write that reached the writer must remain uncertain: {outcome:?}");
+    };
+    assert!(!submitted_turn_id.is_empty());
+    conn.wait_for("the blocked send's uncertainty report", |frame| {
+        frame["type"] == "freshAgent.event"
+            && frame["sessionId"] == stalled
+            && frame["event"]["type"] == "freshAgent.send.uncertain"
+            && frame["event"]["requestId"] == "blocked"
+            && frame["event"]["message"] == message
+    })
+    .await;
     conn.wait_for("the wedged sidecar's EOF report", |frame| {
         frame["type"] == "freshAgent.event"
             && frame["sessionId"] == stalled
@@ -114,6 +128,13 @@ async fn a_500ms_write_timeout_kills_only_its_runtime_and_rings_the_owed_turn_on
     })
     .await;
     conn.read_for(Duration::from_millis(200)).await;
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "error" && frame["requestId"] == "blocked"),
+        "an uncertain send must not also be reported as a definite refusal"
+    );
     assert_eq!(
         conn.frames
             .iter()

@@ -5753,9 +5753,15 @@ impl WorkspaceGitChild {
                 .name("workspace-git-stderr".into())
                 .spawn(move || {
                     #[cfg(all(test, target_os = "linux"))]
-                    started_tx
-                        .send(unsafe { libc::syscall(libc::SYS_gettid) as u32 })
-                        .expect("owned test drainer receiver");
+                    {
+                        let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+                        let identity = workspace_metadata_test_hooks::drainer_identity(tid)
+                            .expect("read owned drainer identity")
+                            .expect("running owned drainer exists");
+                        started_tx
+                            .send(identity)
+                            .expect("owned test drainer receiver");
+                    }
                     let mut retained = Vec::new();
                     let mut bytes = [0; 8192];
                     loop {
@@ -6005,18 +6011,124 @@ mod workspace_metadata_test_hooks {
         pub fail_drain_read: bool,
         pub fail_drain_join: bool,
         #[cfg(target_os = "linux")]
-        pub drainer_tids: Vec<u32>,
+        pub drainer_tids: Vec<DrainerIdentity>,
     }
     thread_local! { pub(super) static STATE: RefCell<State> = RefCell::new(State::default()); }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct DrainerIdentity {
+        tid: u32,
+        start_ticks: u64,
+    }
+
+    /// A numeric TID can be reused by another thread after the owned drainer
+    /// exits. Record the kernel's start time while the drainer is still alive.
+    #[cfg(target_os = "linux")]
+    pub(super) fn drainer_identity(tid: u32) -> io::Result<Option<DrainerIdentity>> {
+        let stat = match fs::read_to_string(format!("/proc/self/task/{tid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let fields = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid drainer task stat"))?
+            .1;
+        let start_ticks = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing drainer start time")
+            })?
+            .parse::<u64>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Some(DrainerIdentity { tid, start_ticks }))
+    }
+
+    /// A successful join can precede the kernel removing the task from /proc.
+    /// Wait only for this original identity, not a later reused numeric TID.
+    #[cfg(target_os = "linux")]
+    pub(super) fn wait_for_original_drainer_exit(
+        identity: DrainerIdentity,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if drainer_identity(identity.tid)? != Some(identity) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("owned stderr drainer {} remains after join", identity.tid),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub(super) fn spawned(pid: u32) {
         STATE.with(|state| state.borrow_mut().owned_pids.push(pid));
         count("spawn");
         process_spawned(pid);
     }
+
+    /// A freshly spawned process can still be the forked test executable while
+    /// its stdio is being installed. Wait for exec before attributing its open
+    /// descriptors to Git. A process that exits first has no live descriptors.
+    #[cfg(target_os = "linux")]
+    fn wait_for_child_exec(pid: u32, timeout: Duration) -> io::Result<bool> {
+        let current_exe = std::env::current_exe()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match fs::read_link(format!("/proc/{pid}/exe")) {
+                Ok(exe) if exe != current_exe => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("workspace Git child {pid} remained in the pre-exec test process"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Count all descriptors referencing a child's stdio pipes, including
+    /// duplicated descriptors and descriptors marked close-on-exec.
+    #[cfg(target_os = "linux")]
+    fn owned_pipe_fds(candidate: u32) -> io::Result<Vec<(String, PathBuf)>> {
+        let entries = fs::read_dir(format!("/proc/{candidate}/fd"))?;
+        let owned_pipe_targets: BTreeSet<_> = (0..3)
+            .filter_map(|fd| fs::read_link(format!("/proc/{candidate}/fd/{fd}")).ok())
+            .filter(|target| target.to_string_lossy().starts_with("pipe:"))
+            .collect();
+        Ok(entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                fs::read_link(entry.path())
+                    .ok()
+                    .map(|target| (entry.file_name().to_string_lossy().into_owned(), target))
+            })
+            .filter(|(_, target)| owned_pipe_targets.contains(target))
+            .collect())
+    }
+
     pub(super) fn process_spawned(pid: u32) {
         count("all_spawn");
         #[cfg(target_os = "linux")]
         {
+            wait_for_child_exec(pid, Duration::from_secs(5))
+                .expect("the spawned workspace Git child must reach exec or exit");
             let tid = unsafe { libc::syscall(libc::SYS_gettid) };
             let children = fs::read_to_string(format!("/proc/self/task/{tid}/children"))
                 .expect("owned test thread children");
@@ -6037,24 +6149,7 @@ mod workspace_metadata_test_hooks {
                 } else {
                     continue;
                 }
-                if let Ok(entries) = fs::read_dir(format!("/proc/{candidate}/fd")) {
-                    // The command owns its stdio pipes, not arbitrary pipe
-                    // descriptors inherited from another concurrent test.
-                    // Count every endpoint referencing those identities so
-                    // duplicated owned descriptors still exceed the bound.
-                    let owned_pipe_targets: BTreeSet<_> = (0..3)
-                        .filter_map(|fd| fs::read_link(format!("/proc/{candidate}/fd/{fd}")).ok())
-                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
-                        .collect();
-                    let owned_fds: Vec<_> = entries
-                        .filter_map(Result::ok)
-                        .filter_map(|entry| {
-                            fs::read_link(entry.path()).ok().map(|target| {
-                                (entry.file_name().to_string_lossy().into_owned(), target)
-                            })
-                        })
-                        .filter(|(_, target)| owned_pipe_targets.contains(target))
-                        .collect();
+                if let Ok(owned_fds) = owned_pipe_fds(candidate) {
                     pipes += owned_fds.len();
                     pipe_details.push((candidate, owned_fds));
                 }
@@ -6103,6 +6198,223 @@ mod workspace_metadata_test_hooks {
                 *peak = (*peak).max(live);
             }
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drainer_exit_wait_tracks_the_original_live_thread_identity() {
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let held = scope.spawn(move || {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+                let identity = drainer_identity(tid).unwrap().unwrap();
+                started_tx.send(identity).unwrap();
+                let _ = release_rx.recv();
+            });
+            let identity = started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let error = wait_for_original_drainer_exit(identity, Duration::from_millis(30))
+                .expect_err("the original live thread must not be considered gone");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+            let other_identity = DrainerIdentity {
+                start_ticks: identity.start_ticks.checked_add(1).unwrap(),
+                ..identity
+            };
+            wait_for_original_drainer_exit(other_identity, Duration::ZERO)
+                .expect("the same numeric TID with a different start time is not the original");
+
+            drop(release_tx);
+            held.join().expect("join held test thread");
+            wait_for_original_drainer_exit(identity, Duration::from_secs(2))
+                .expect("the joined original thread must disappear");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_readiness_reports_a_live_process_whose_executable_does_not_change() {
+        let pid = std::process::id();
+        let error = wait_for_child_exec(pid, Duration::from_millis(5))
+            .expect_err("an unchanged live executable must not be considered ready");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains(&pid.to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_pipe_meter_waits_for_a_held_child_to_exec_before_sampling() {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        fn pipe() -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+
+        struct OwnedChild(libc::pid_t);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let mut status = 0;
+                unsafe {
+                    // Only a still-unreaped child of this process may be killed.
+                    if libc::waitpid(self.0, &mut status, libc::WNOHANG) == 0 {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, &mut status, 0);
+                    }
+                }
+            }
+        }
+
+        let (gate_read, gate_write) = pipe();
+        let (stdin_read, stdin_write) = pipe();
+        let gate_write_fd = gate_write.as_raw_fd();
+        let stdin_write_fd = stdin_write.as_raw_fd();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (sampled_tx, sampled_rx) = mpsc::channel();
+        let meter = std::thread::spawn(move || {
+            // Prepare all strings before fork: the child uses only
+            // async-signal-safe libc calls until exec or _exit.
+            let shell = CString::new("/bin/sh").unwrap();
+            let option = CString::new("-c").unwrap();
+            let script = CString::new("IFS= read -r ignored || :").unwrap();
+            let argv = [
+                shell.as_ptr(),
+                option.as_ptr(),
+                script.as_ptr(),
+                std::ptr::null(),
+            ];
+            let gate_read_fd = gate_read.as_raw_fd();
+            let stdin_read_fd = stdin_read.as_raw_fd();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork the test-owned child");
+            if pid == 0 {
+                unsafe {
+                    libc::close(gate_write_fd);
+                    libc::close(stdin_write_fd);
+                    if libc::dup2(stdin_read_fd, libc::STDIN_FILENO) != libc::STDIN_FILENO {
+                        libc::_exit(125);
+                    }
+                    if stdin_read_fd != libc::STDIN_FILENO {
+                        libc::close(stdin_read_fd);
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(gate_read_fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        libc::_exit(126);
+                    }
+                    libc::close(gate_read_fd);
+                    libc::execv(shell.as_ptr(), argv.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
+            let child = OwnedChild(pid);
+            drop(gate_read);
+            drop(stdin_read);
+            started_tx.send(pid).expect("report test-owned child");
+            process_spawned(pid as u32);
+            let counts = STATE.with(|state| state.borrow().counts.clone());
+            sampled_tx.send(counts).expect("report completed sampling");
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            drop(child);
+        });
+
+        let pid = started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("test-owned child must start");
+        assert_eq!(
+            fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            std::env::current_exe().unwrap(),
+            "the child must still be held before exec"
+        );
+        assert!(
+            matches!(
+                sampled_rx.recv_timeout(Duration::from_millis(250)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the meter must not finish while the child is held before exec"
+        );
+
+        let mut gate = File::from(gate_write);
+        gate.write_all(b"x").expect("release the held child");
+        drop(gate);
+        let counts = sampled_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the meter must finish after the child execs");
+        assert_eq!(counts.get("all_spawn"), Some(&1));
+        assert_eq!(counts.get("os_workspace_peak"), Some(&1));
+        drop(stdin_write);
+        meter.join().expect("join the owned child and meter");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_pipe_meter_counts_a_close_on_exec_duplicate_in_an_execed_child() {
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        // Python's os.dup returns a close-on-exec descriptor. Keep the execed
+        // child alive so the real /proc meter can observe that duplicate.
+        let mut child = OwnedChild(
+            Command::new("python3")
+                .args([
+                    "-c",
+                    "import os,sys; fd=os.dup(1); print(fd,flush=True); sys.stdin.read(1)",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn held descriptor fixture"),
+        );
+        let input = child.0.stdin.take().expect("fixture stdin");
+        let output = child.0.stdout.take().expect("fixture stdout");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let duplicate = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("held child must report its duplicate")
+            .expect("read held child readiness");
+        reader.join().expect("join fixture readiness reader");
+        let duplicate = duplicate.trim();
+        assert!(!duplicate.is_empty());
+
+        let pid = child.0.id();
+        assert!(wait_for_child_exec(pid, Duration::from_secs(5)).unwrap());
+        let fds = owned_pipe_fds(pid).expect("read held child's owned pipes");
+        let stdout = fds.iter().find(|(fd, _)| fd == "1").expect("stdout pipe");
+        let duplicate_fd = fds
+            .iter()
+            .find(|(fd, _)| fd == duplicate)
+            .expect("duplicate must be counted");
+        assert_eq!(duplicate_fd.1, stdout.1);
+        assert!(fds.len() >= 2, "both descriptors must be counted: {fds:?}");
+        let fdinfo = fs::read_to_string(format!("/proc/{pid}/fdinfo/{duplicate}"))
+            .expect("read duplicate flags");
+        let flags = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .and_then(|value| u32::from_str_radix(value, 8).ok())
+            .expect("parse duplicate flags");
+        assert_ne!(flags & libc::O_CLOEXEC as u32, 0);
+
+        drop(input);
+        assert!(child.0.wait().expect("reap held fixture").success());
     }
 }
 
@@ -12656,8 +12968,12 @@ mod native_source_inventory_tests {
                     assert!(!Path::new(&format!("/proc/{pid}")).exists());
                 }
                 #[cfg(target_os = "linux")]
-                for tid in &state.drainer_tids {
-                    assert!(!Path::new(&format!("/proc/self/task/{tid}")).exists());
+                for identity in &state.drainer_tids {
+                    workspace_metadata_test_hooks::wait_for_original_drainer_exit(
+                        *identity,
+                        Duration::from_secs(2),
+                    )
+                    .expect("exact owned stderr drainer disappeared after join");
                 }
             });
         }
@@ -12938,11 +13254,12 @@ mod native_source_inventory_tests {
                 let state = state.borrow();
                 assert_eq!(state.counts["all_spawn"], state.counts["all_reap"]);
                 assert_eq!(state.counts["all_peak"], 1);
-                for tid in &state.drainer_tids {
-                    assert!(
-                        !Path::new(&format!("/proc/self/task/{tid}")).exists(),
-                        "exact owned stderr drainer joined"
-                    );
+                for identity in &state.drainer_tids {
+                    workspace_metadata_test_hooks::wait_for_original_drainer_exit(
+                        *identity,
+                        Duration::from_secs(2),
+                    )
+                    .expect("exact owned stderr drainer disappeared after join");
                 }
                 state.counts.clone()
             });

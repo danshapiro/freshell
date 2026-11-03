@@ -2657,11 +2657,32 @@ assert child.wait() == 0
             .output()
             .expect("run isolated subreaper regression helper");
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // `--exact` selects only this helper; its unique structured event
+        // proves it ran even when libtest interleaves its progress output.
+        let reports: Vec<_> = stdout
+            .match_indices('{')
+            .filter_map(|(start, _)| {
+                serde_json::Deserializer::from_str(&stdout[start..])
+                    .into_iter::<serde_json::Value>()
+                    .next()
+                    .and_then(Result::ok)
+            })
+            .filter(|event| {
+                event.get("event").and_then(serde_json::Value::as_str)
+                    == Some("session_lease.subreaper_opaque_child_remains_ambiguous")
+            })
+            .collect();
         assert!(
             output.status.success()
-                && stdout.contains("running 1 test")
-                && stdout.contains("session_lease::tests::subreaper_ambiguity_helper_child ... ok")
-                && stdout.contains("session_lease.subreaper_opaque_child_remains_ambiguous"),
+                && reports.len() == 1
+                && reports[0]
+                    .get("confirmation")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                && reports[0]
+                    .get("opaqueSurvivedConfirmation")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
             "isolated subreaper regression failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             stdout,

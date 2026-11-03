@@ -21,6 +21,8 @@ import {
   addElicitationRequest,
   removeElicitation,
   applyRuntimeOwner,
+  beginOperationAttempt,
+  markControlAttemptPending,
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
@@ -686,6 +688,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(removePermission({
         ...locator,
         requestId: event.requestId as string,
+        ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+        ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+        ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+          ? { operationJournalSequence: event.operationJournalSequence } : {}),
       }))
       return true
     case 'freshAgent.question.request':
@@ -697,11 +703,27 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         providerRequest: event,
       }))
       return true
+    case 'freshAgent.operation.started':
+      if (typeof event.requestId === 'string' && typeof event.operationAttemptId === 'string') {
+        dispatch(beginOperationAttempt({ ...locator, requestId: event.requestId, operationAttemptId: event.operationAttemptId,
+          ...(event.operationAttemptReplay === true ? { operationAttemptReplay: true } : {}),
+          ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+          ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+            ? { operationJournalSequence: event.operationJournalSequence } : {}) }))
+        if (event.operationAttemptReplay === true && event.operationPending === true) {
+          dispatch(markControlAttemptPending({ ...locator, requestId: event.requestId, operationAttemptId: event.operationAttemptId }))
+        }
+      }
+      return true
     case 'freshAgent.elicitation.request':
       dispatch(addElicitationRequest({ ...locator, ...event, requestId: event.requestId as string } as never))
       return true
     case 'freshAgent.elicitation.cancelled':
-      dispatch(removeElicitation({ ...locator, requestId: event.requestId as string }))
+      dispatch(removeElicitation({ ...locator, requestId: event.requestId as string,
+        ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+        ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+        ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+          ? { operationJournalSequence: event.operationJournalSequence } : {}) }))
       return true
     case 'freshAgent.question.cancelled':
       // Provider-originated cancellation: the Rust claude/kilroy slice forwards
@@ -710,13 +732,18 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(removeQuestion({
         ...locator,
         requestId: event.requestId as string,
+        ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+        ...(typeof event.operationJournalId === 'string' ? { operationJournalId: event.operationJournalId } : {}),
+        ...(typeof event.operationJournalSequence === 'number' && Number.isSafeInteger(event.operationJournalSequence)
+          ? { operationJournalSequence: event.operationJournalSequence } : {}),
       }))
       return true
     case 'freshAgent.exit':
       dispatch(sessionExited(locator))
       return true
     case 'freshAgent.error':
-      if (event.code === 'INVALID_SESSION_ID') {
+    case 'freshAgent.operation.error':
+      if (event.type === 'freshAgent.error' && event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
       } else if (event.rollback === true) {
         // kata 1wxv: rollback rejections route to the initiating pane's notice
@@ -728,6 +755,12 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
           ...locator,
           code: event.code as string | undefined,
           message: (event.message as string) || (event.error as string) || 'Unknown error',
+          ...(event.type === 'freshAgent.operation.error' || event.operationReceipt === true ? { operationReceipt: true } : {}),
+          ...(event.operationFallback === true ? { operationFallback: true } : {}),
+          ...(event.operationOutcomeUncertain === true ? { operationOutcomeUncertain: true } : {}),
+          ...(event.operationReceiptReplay === true ? { operationReceiptReplay: true } : {}),
+          ...(typeof event.operationAttemptId === 'string' ? { operationAttemptId: event.operationAttemptId } : {}),
+          ...(typeof event.requestId === 'string' ? { requestId: event.requestId } : {}),
         }))
       }
       return true

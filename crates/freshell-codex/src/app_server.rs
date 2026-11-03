@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 
 use crate::protocol::{
     build_notification_frame, build_request_frame, classify_notification, parse_client_frame,
@@ -988,6 +988,7 @@ pub struct ChannelTransport {
     to_server: mpsc::UnboundedSender<String>,
     from_server: TokioMutex<mpsc::UnboundedReceiver<String>>,
     closed: AtomicBool,
+    close_signal: watch::Sender<bool>,
 }
 
 impl WsTransport for ChannelTransport {
@@ -1003,12 +1004,25 @@ impl WsTransport for ChannelTransport {
     }
 
     fn recv(&self) -> BoxFuture<'_, Option<String>> {
-        Box::pin(async move { self.from_server.lock().await.recv().await })
+        Box::pin(async move {
+            let mut close_signal = self.close_signal.subscribe();
+            let mut from_server = self.from_server.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = close_signal.changed() => None,
+                message = from_server.recv() => message,
+            }
+        })
     }
 
     fn close(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.closed.store(true, Ordering::SeqCst);
+            if !self.closed.swap(true, Ordering::SeqCst) {
+                self.close_signal.send_replace(true);
+            }
             self.from_server.lock().await.close();
         })
     }
@@ -1094,10 +1108,12 @@ impl ChannelPeer {
 pub fn new_channel_transport() -> (Arc<ChannelTransport>, ChannelPeer) {
     let (to_server, from_client) = mpsc::unbounded_channel();
     let (to_client, from_server) = mpsc::unbounded_channel();
+    let (close_signal, _) = watch::channel(false);
     let transport = Arc::new(ChannelTransport {
         to_server,
         from_server: TokioMutex::new(from_server),
         closed: AtomicBool::new(false),
+        close_signal,
     });
     let peer = ChannelPeer {
         to_client,
@@ -1109,6 +1125,37 @@ pub fn new_channel_transport() -> (Arc<ChannelTransport>, ChannelPeer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_transport_close_wakes_an_idle_receive_without_peer_disconnect() {
+        let (transport, peer) = new_channel_transport();
+        let receiver_transport = transport.clone();
+        let receive = tokio::spawn(async move { receiver_transport.recv().await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport.from_server.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the receive task should be waiting on the live peer");
+
+        tokio::time::timeout(Duration::from_secs(1), transport.close())
+            .await
+            .expect("closing must not wait for the blocked receive mutex");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receive)
+                .await
+                .expect("close must wake the pending receive")
+                .expect("receive task must finish"),
+            None
+        );
+        assert!(peer.to_client.is_closed());
+        assert!(transport.send("{}".to_string()).await.is_err());
+    }
 
     #[test]
     fn only_native_pre_admission_errors_are_refusals() {

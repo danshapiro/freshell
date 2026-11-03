@@ -980,6 +980,7 @@ async fn codex_readiness_reconciles_receipt_after_host_commit_reply_is_lost() {
             ControlRole::Web,
             AdminCommand::FreshAgentPrepareNative(FreshAgentInterruptRequest {
                 soul_id: fixture.soul.clone(),
+                request_id: None,
                 expected_control_epoch: Some(control_epoch),
             }),
         );

@@ -418,6 +418,41 @@ impl HostedNativeIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostedSendReceipt {
+    Accepted,
+    Refused(Option<String>),
+    Ambiguous {
+        provider: AgentProvider,
+        session_type: SessionType,
+        session_id: String,
+        message: String,
+    },
+}
+
+impl HostedSendReceipt {
+    fn matches_source(
+        &self,
+        provider: AgentProvider,
+        session_type: SessionType,
+        session_id: &str,
+    ) -> bool {
+        match self {
+            Self::Ambiguous {
+                provider: actual_provider,
+                session_type: actual_type,
+                session_id: actual_session,
+                ..
+            } => {
+                *actual_provider == provider
+                    && *actual_type == session_type
+                    && actual_session == session_id
+            }
+            _ => true,
+        }
+    }
+}
+
 struct HostedTransport {
     provider: FreshProvider,
     run_as_uid: u32,
@@ -441,7 +476,7 @@ struct HostedTransport {
     native_tx: watch::Sender<Option<String>>,
     native_evidence_tx: watch::Sender<Option<Value>>,
     native_identity: Arc<std::sync::Mutex<HostedNativeIdentity>>,
-    send_outcomes: broadcast::Sender<(String, bool)>,
+    send_outcomes: broadcast::Sender<(String, HostedSendReceipt)>,
     kill_outcomes: broadcast::Sender<(String, bool)>,
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
     event_tx: mpsc::Sender<AgentEvent>,
@@ -923,6 +958,7 @@ impl HostedTransport {
             .expect("suppressed kill lock")
             .remove(session_id);
         Err(DispatchFailure {
+            provider_diagnostic: None,
             message: match observed {
                 Some(false) => "provider-native session retirement was refused",
                 _ => "provider-native session retirement could not be verified",
@@ -1272,6 +1308,7 @@ impl FreshAgentTransport for HostedTransport {
 
     async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
         let reject = |message: &str| DispatchFailure {
+            provider_diagnostic: None,
             message: message.into(),
             acceptance_ambiguous: false,
         };
@@ -1311,6 +1348,7 @@ impl FreshAgentTransport for HostedTransport {
             )
             .await
             .map_err(|failure| DispatchFailure {
+                provider_diagnostic: None,
                 message: failure.message,
                 acceptance_ambiguous: failure.acceptance_ambiguous,
             })
@@ -1682,6 +1720,7 @@ impl FreshAgentTransport for HostedTransport {
             .provider_session_id()
             .await
             .ok_or_else(|| DispatchFailure {
+                provider_diagnostic: None,
                 message: "fresh-agent session is not started".into(),
                 acceptance_ambiguous: false,
             })?;
@@ -1736,6 +1775,7 @@ impl FreshAgentTransport for HostedTransport {
                         let mut current = self.session_id.lock().await;
                         if current.as_deref() != Some(session_id.as_str()) {
                             return Err(DispatchFailure {
+                                provider_diagnostic: None,
                                 message: "native send source changed after acceptance".into(),
                                 acceptance_ambiguous: true,
                             });
@@ -1750,6 +1790,7 @@ impl FreshAgentTransport for HostedTransport {
                                     .is_some_and(|root| root != session_id)
                             {
                                 return Err(DispatchFailure {
+                                    provider_diagnostic: None,
                                     message: "native identity source changed after acceptance"
                                         .into(),
                                     acceptance_ambiguous: true,
@@ -1771,6 +1812,7 @@ impl FreshAgentTransport for HostedTransport {
                                         )
                                     })
                                     .map_err(|message| DispatchFailure {
+                                        provider_diagnostic: None,
                                         message,
                                         acceptance_ambiguous: true,
                                     })?;
@@ -1795,14 +1837,28 @@ impl FreshAgentTransport for HostedTransport {
                             }),
                         })
                     }
-                    CodexSendOutcome::Refused { code, message, .. } => Err(DispatchFailure {
-                        message: format!("{code}: {message}"),
-                        acceptance_ambiguous: false,
-                    }),
-                    CodexSendOutcome::Ambiguous { code, message, .. } => Err(DispatchFailure {
-                        message: format!("{code}: {message}"),
-                        acceptance_ambiguous: true,
-                    }),
+                    CodexSendOutcome::Refused { code, message, .. } => {
+                        let message = format!("{code}: {message}");
+                        Err(DispatchFailure {
+                            provider_diagnostic: Some(freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                                message: Some(message.clone()),
+                            }),
+                            message,
+                            acceptance_ambiguous: false,
+                        })
+                    }
+                    CodexSendOutcome::Ambiguous { code, message, .. } => {
+                        let message = format!("{code}: {message}");
+                        Err(DispatchFailure {
+                            provider_diagnostic: Some(freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous,
+                                message: Some(message.clone()),
+                            }),
+                            message,
+                            acceptance_ambiguous: true,
+                        })
+                    }
                 };
             }
             ProviderState::Opencode { runtime, .. } => runtime.handle_send(send).await,
@@ -1810,8 +1866,15 @@ impl FreshAgentTransport for HostedTransport {
         match tokio::time::timeout(SEND_ACK_TIMEOUT, async {
             loop {
                 match outcomes.recv().await {
-                    Ok((observed, accepted)) if observed == request_id.as_str() => {
-                        return Ok(accepted);
+                    Ok((observed, receipt))
+                        if observed == request_id.as_str()
+                            && receipt.matches_source(
+                                self.provider_wire(),
+                                self.session_type(),
+                                &session_id,
+                            ) =>
+                    {
+                        return Ok(receipt);
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => {
@@ -1822,19 +1885,36 @@ impl FreshAgentTransport for HostedTransport {
         })
         .await
         {
-            Ok(Ok(true)) => Ok(DispatchAck {
+            Ok(Ok(HostedSendReceipt::Accepted)) => Ok(DispatchAck {
                 native_identity: None,
                 provider_ack_id: Some(request_id.as_str().to_string()),
             }),
-            Ok(Ok(false)) => Err(DispatchFailure {
+            Ok(Ok(HostedSendReceipt::Refused(message))) => Err(DispatchFailure {
+                provider_diagnostic: message.map(|message| {
+                    freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                        outcome:
+                            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                        message: Some(message),
+                    }
+                }),
                 message: "provider rejected input before acceptance".into(),
                 acceptance_ambiguous: false,
             }),
+            Ok(Ok(HostedSendReceipt::Ambiguous { message, .. })) => Err(DispatchFailure {
+                provider_diagnostic: Some(freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                    outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous,
+                    message: Some(message),
+                }),
+                message: "provider could not confirm input delivery".into(),
+                acceptance_ambiguous: true,
+            }),
             Ok(Err(message)) => Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: message.into(),
                 acceptance_ambiguous: true,
             }),
             Err(_) => Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "provider acceptance acknowledgement timed out".into(),
                 acceptance_ambiguous: true,
             }),
@@ -1855,6 +1935,7 @@ impl FreshAgentTransport for HostedTransport {
             .provider_session_id()
             .await
             .ok_or_else(|| DispatchFailure {
+                provider_diagnostic: None,
                 message: "fresh-agent session is not started".into(),
                 acceptance_ambiguous: false,
             })?;
@@ -1867,6 +1948,7 @@ impl FreshAgentTransport for HostedTransport {
                 && self.current_native_id().await.ok().as_deref() == Some(parent_session_id));
         if !owned {
             return Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "provider-native fork parent no longer matches the owned session".into(),
                 acceptance_ambiguous: false,
             });
@@ -1877,6 +1959,7 @@ impl FreshAgentTransport for HostedTransport {
             .expect("native identity lock")
             .begin(claude)
             .map_err(|message| DispatchFailure {
+                provider_diagnostic: None,
                 message,
                 acceptance_ambiguous: false,
             })?;
@@ -1920,7 +2003,41 @@ impl FreshAgentTransport for HostedTransport {
                 runtime.handle_fork(message, None, sink).await
             }
         }
-        let forked = match tokio::time::timeout(FORK_TIMEOUT, receiver).await {
+        let reply = tokio::time::timeout(FORK_TIMEOUT, receiver).await;
+        if let Ok(Ok(ServerMessage::FreshAgentEvent(event))) = &reply {
+            let expected_provider = match self.provider {
+                FreshProvider::Claude | FreshProvider::Kilroy => "claude",
+                FreshProvider::Codex => "codex",
+                FreshProvider::Opencode => "opencode",
+            };
+            let expected_session_type = match self.provider {
+                FreshProvider::Claude => "freshclaude",
+                FreshProvider::Kilroy => "kilroy",
+                FreshProvider::Codex => "freshcodex",
+                FreshProvider::Opencode => "freshopencode",
+            };
+            let original_request = event.event["requestId"].as_str();
+            if event.provider == expected_provider
+                && event.session_type == expected_session_type
+                && event.session_id == current
+                && event.event["type"] == "freshAgent.error"
+                && original_request.is_none_or(|id| id == request_id.as_str())
+            {
+                // The provider's reply is already a user-facing error frame.
+                // Keep it on the existing event path rather than putting its
+                // potentially sensitive text into a control error or log.
+                let mut event = event.clone();
+                // This provider receipt is newly broadcast by the hosted path.
+                // Older clients must ignore it rather than end a running turn.
+                event.event["type"] = json!("freshAgent.operation.error");
+                event.event["requestId"] = json!(request_id.as_str());
+                event.event["operationReceipt"] = json!(true);
+                if let Ok(payload) = serde_json::to_value(ServerMessage::FreshAgentEvent(event)) {
+                    let _ = self.event_tx.send(AgentEvent::Provider { payload }).await;
+                }
+            }
+        }
+        let forked = match reply {
             Ok(Ok(ServerMessage::FreshAgentForked(forked))) => forked,
             Ok(Ok(ServerMessage::FreshAgentEvent(event))) if claude => {
                 let code = event.event["code"].as_str().unwrap_or_default();
@@ -1955,18 +2072,21 @@ impl FreshAgentTransport for HostedTransport {
                     "launch":next_launch,
                 }));
                 return Err(DispatchFailure {
+                    provider_diagnostic: None,
                     message: "provider rejected hosted fork".into(),
                     acceptance_ambiguous: !restored,
                 });
             }
             Ok(Ok(_)) => {
                 return Err(DispatchFailure {
+                    provider_diagnostic: None,
                     message: "provider-native fork did not return a fork transition".into(),
                     acceptance_ambiguous: true,
                 });
             }
             Ok(Err(_)) | Err(_) => {
                 return Err(DispatchFailure {
+                    provider_diagnostic: None,
                     message: "provider-native fork acknowledgement was not observed".into(),
                     acceptance_ambiguous: true,
                 });
@@ -1991,6 +2111,7 @@ impl FreshAgentTransport for HostedTransport {
                 }
         {
             return Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "provider-native fork returned mismatched ownership identity".into(),
                 acceptance_ambiguous: true,
             });
@@ -2019,12 +2140,14 @@ impl FreshAgentTransport for HostedTransport {
                     .is_err();
             }
             return Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "provider-native fork could not retire its previous branch".into(),
                 acceptance_ambiguous,
             });
         }
         if !self.provider_session_is_live(&child).await {
             return Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "native fork child is no longer owned".into(),
                 acceptance_ambiguous: true,
             });
@@ -2041,6 +2164,7 @@ impl FreshAgentTransport for HostedTransport {
             .expect("native identity lock")
             .acknowledge(&child, (!claude).then_some(evidence))
             .map_err(|message| DispatchFailure {
+                provider_diagnostic: None,
                 message,
                 acceptance_ambiguous: true,
             })?;
@@ -2056,6 +2180,16 @@ impl FreshAgentTransport for HostedTransport {
         decision_id: &str,
         decision: Value,
     ) -> Result<(), DispatchFailure> {
+        self.resolve_permission_with_attempt_id(decision_id, decision, None)
+            .await
+    }
+
+    async fn resolve_permission_with_attempt_id(
+        &self,
+        decision_id: &str,
+        decision: Value,
+        operation_attempt_id: Option<&str>,
+    ) -> Result<(), DispatchFailure> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
             return delegate.resolve_permission(decision_id, decision).await;
@@ -2064,6 +2198,7 @@ impl FreshAgentTransport for HostedTransport {
             .provider_session_id()
             .await
             .ok_or_else(|| DispatchFailure {
+                provider_diagnostic: None,
                 message: "fresh-agent session is not started".into(),
                 acceptance_ambiguous: false,
             })?;
@@ -2077,12 +2212,14 @@ impl FreshAgentTransport for HostedTransport {
                 cwd: None,
                 action: serde_json::from_value(elicitation["action"].clone()).map_err(|_| {
                     DispatchFailure {
+                        provider_diagnostic: None,
                         message: "invalid elicitation action".into(),
                         acceptance_ambiguous: false,
                     }
                 })?,
                 content: serde_json::from_value(elicitation["content"].clone()).map_err(|_| {
                     DispatchFailure {
+                        provider_diagnostic: None,
                         message: "invalid elicitation content".into(),
                         acceptance_ambiguous: false,
                     }
@@ -2090,13 +2227,20 @@ impl FreshAgentTransport for HostedTransport {
             };
             return match &self.state {
                 ProviderState::Codex(state) => {
-                    if state.try_handle_elicitation_respond(message).await {
+                    if state
+                        .try_handle_elicitation_respond_with_attempt_id(
+                            message,
+                            operation_attempt_id,
+                        )
+                        .await
+                    {
                         Ok(())
                     } else {
-                        Err(DispatchFailure { message:"Codex did not accept this elicitation response; the request remains pending.".into(), acceptance_ambiguous:false })
+                        Err(DispatchFailure { provider_diagnostic: None, message:"Codex did not accept this elicitation response; the request remains pending.".into(), acceptance_ambiguous:false })
                     }
                 }
                 _ => Err(DispatchFailure {
+                    provider_diagnostic: None,
                     message: "provider has no elicitation flow".into(),
                     acceptance_ambiguous: false,
                 }),
@@ -2120,16 +2264,21 @@ impl FreshAgentTransport for HostedTransport {
                     .dispatch_question_checked(message)
                     .await
                     .map_err(|failure| DispatchFailure {
+                        provider_diagnostic: None,
                         message: failure.message,
                         acceptance_ambiguous: failure.acceptance_ambiguous,
                     })?,
                 ProviderState::Codex(state) => {
-                    if !state.try_handle_question_respond(message).await {
-                        return Err(DispatchFailure {message:"Codex did not accept this question answer; the request remains pending.".into(),acceptance_ambiguous:false});
+                    if !state
+                        .try_handle_question_respond_with_attempt_id(message, operation_attempt_id)
+                        .await
+                    {
+                        return Err(DispatchFailure { provider_diagnostic: None,message:"Codex did not accept this question answer; the request remains pending.".into(),acceptance_ambiguous:false});
                     }
                 }
                 ProviderState::Opencode { .. } => {
                     return Err(DispatchFailure {
+                        provider_diagnostic: None,
                         message: "provider has no question flow".into(),
                         acceptance_ambiguous: false,
                     });
@@ -2149,16 +2298,21 @@ impl FreshAgentTransport for HostedTransport {
                     .dispatch_approval_checked(message)
                     .await
                     .map_err(|failure| DispatchFailure {
+                        provider_diagnostic: None,
                         message: failure.message,
                         acceptance_ambiguous: failure.acceptance_ambiguous,
                     })?,
                 ProviderState::Codex(state) => {
-                    if !state.try_handle_approval_respond(message).await {
-                        return Err(DispatchFailure {message:"Codex did not accept this approval decision; the request remains pending.".into(),acceptance_ambiguous:false});
+                    if !state
+                        .try_handle_approval_respond_with_attempt_id(message, operation_attempt_id)
+                        .await
+                    {
+                        return Err(DispatchFailure { provider_diagnostic: None,message:"Codex did not accept this approval decision; the request remains pending.".into(),acceptance_ambiguous:false});
                     }
                 }
                 ProviderState::Opencode { .. } => {
                     return Err(DispatchFailure {
+                        provider_diagnostic: None,
                         message: "provider has no approval flow".into(),
                         acceptance_ambiguous: false,
                     });
@@ -2169,16 +2323,20 @@ impl FreshAgentTransport for HostedTransport {
     }
 
     async fn interrupt(&self) -> Result<(), String> {
+        self.interrupt_with_request_id(None).await
+    }
+
+    async fn interrupt_with_request_id(&self, request_id: Option<&str>) -> Result<(), String> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
-            return delegate.interrupt().await;
+            return delegate.interrupt_with_request_id(request_id).await;
         }
         let session_id = self
             .provider_session_id()
             .await
             .ok_or_else(|| "fresh-agent session is not started".to_string())?;
         let message = FreshAgentInterrupt {
-            request_id: None,
+            request_id: request_id.map(str::to_owned),
             provider: self.provider_wire(),
             session_id,
             session_type: self.session_type(),
@@ -2350,12 +2508,18 @@ impl FreshAgentTransport for HostedTransport {
                 }
                 let frames = captured.lock().expect("rollback frames").clone();
                 for payload in &frames {
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::Provider {
-                            payload: payload.clone(),
-                        })
-                        .await;
+                    let mut payload = payload.clone();
+                    if payload["type"] == "freshAgent.event"
+                        && find_correlated_rollback_error(
+                            &payload,
+                            request_id.as_str(),
+                            &session_id,
+                        )
+                        .is_some()
+                    {
+                        payload["event"]["operationReceipt"] = json!(true);
+                    }
+                    let _ = self.event_tx.send(AgentEvent::Provider { payload }).await;
                 }
                 if let Some(code) = frames.iter().find_map(find_operation_error_code) {
                     let parent_is_live = frames.iter().any(|frame| {
@@ -2807,7 +2971,7 @@ struct BroadcastBridgeOutputs {
     native_evidence: watch::Sender<Option<Value>>,
     native_identity: Arc<std::sync::Mutex<HostedNativeIdentity>>,
     events: mpsc::Sender<AgentEvent>,
-    send_outcomes: broadcast::Sender<(String, bool)>,
+    send_outcomes: broadcast::Sender<(String, HostedSendReceipt)>,
     kill_outcomes: broadcast::Sender<(String, bool)>,
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
     #[cfg(test)]
@@ -3514,16 +3678,49 @@ fn find_operation_session_id(value: &Value, request_id: &str) -> Option<String> 
     }
 }
 
-fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
+fn parse_send_outcome(value: &Value) -> Option<(String, HostedSendReceipt)> {
     let event_type = value.get("type")?.as_str()?;
+    if event_type == "freshAgent.event" {
+        let event = value.get("event")?;
+        if event.get("type")?.as_str()? != "freshAgent.send.uncertain" {
+            return None;
+        }
+        let session_id = value.get("sessionId")?.as_str()?;
+        if event.get("sessionId")?.as_str()? != session_id {
+            return None;
+        }
+        let message = event.get("message")?.as_str()?;
+        if !message.starts_with("FRESH_AGENT_DELIVERY_AMBIGUOUS:") {
+            return None;
+        }
+        let request_id = event.get("requestId")?.as_str()?.to_owned();
+        return Some((
+            request_id,
+            HostedSendReceipt::Ambiguous {
+                provider: serde_json::from_value(value.get("provider")?.clone()).ok()?,
+                session_type: serde_json::from_value(value.get("sessionType")?.clone()).ok()?,
+                session_id: session_id.to_owned(),
+                message: message.to_owned(),
+            },
+        ));
+    }
     let request_id = value.get("requestId").and_then(|value| match value {
         Value::String(value) => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
         _ => None,
     })?;
     match event_type {
-        "freshAgent.send.accepted" => Some((request_id, true)),
-        "error" => Some((request_id, false)),
+        "freshAgent.send.accepted" => Some((request_id, HostedSendReceipt::Accepted)),
+        "error" => Some((
+            request_id,
+            HostedSendReceipt::Refused(
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .map(str::to_owned),
+            ),
+        )),
         _ => None,
     }
 }
@@ -3536,6 +3733,138 @@ pub(super) static NATIVE_PROVIDER_FIXTURE_LOCK: Mutex<()> = Mutex::const_new(())
 mod tests {
     use super::*;
     use freshell_freshagent::session_lease::CondemnedRuntimeIdentity;
+
+    include!("fresh_agent_stop_tests.rs");
+
+    include!("fresh_agent_send_delivery_tests.rs");
+
+    #[tokio::test]
+    async fn hosted_codex_send_refusal_retains_the_published_diagnostic_across_host_boundary() {
+        let log_dir = tempfile::tempdir().unwrap();
+        let log = log_dir.path().join("requests.jsonl");
+        let mut fixture = native_codex_fixture(json!({
+            "appendRequestLogPath":log,
+            "overrides":{"turn/start":{"error":{
+                "code":-32602,
+                "message":"Selected model is at capacity. Please try a different model."
+            }}}
+        }))
+        .await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("owned-send-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let request = RequestId::parse("owned-provider-refusal").unwrap();
+        let host = crate::tests::test_host_state();
+        let host_dir = host.state_dir.clone();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: host.incarnation_id.clone(),
+            launch_nonce: "owned-send-host".into(),
+            evidence_revision: 1,
+            execution_generation: 1,
+            requested_native_session_id: actor.profile().await.native_session_id,
+        };
+        {
+            let mut persisted = host.persisted.lock().await;
+            persisted.native_identity_launch = Some(launch.clone());
+            persisted.max_execution_generation = 1;
+        }
+        *host.fresh_agent.lock().await = Some(actor.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::fresh_native_observation(&launch, &actor)
+                .await
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real host must observe its owned native provider");
+        let (mut socket, host_socket) = tokio::net::UnixStream::pair().unwrap();
+        let host_task = tokio::spawn(crate::handle_connection(host_socket, host.clone()));
+        freshell_runtime_protocol::write_frame(
+            &mut socket,
+            &crate::tests::authenticated_host_envelope(
+                &host,
+                freshell_runtime_protocol::HostCommand::FreshAgentSend {
+                    incarnation_id: host.incarnation_id.clone(),
+                    request_id: request.clone(),
+                    text: "owned prompt".into(),
+                    settings: None,
+                    checkpoint_logical_attempt_id: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let response: freshell_runtime_protocol::HostReply =
+            freshell_runtime_protocol::read_frame(&mut socket)
+                .await
+                .unwrap();
+        let error = response
+            .result
+            .expect_err("the native provider must refuse this turn");
+        drop(socket);
+        host_task.await.unwrap().unwrap();
+        let receipt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value: Value =
+                    serde_json::from_str(&fixture.diagnostic.recv().await.unwrap()).unwrap();
+                if value["type"] == "error" && value["requestId"] == request.as_str() {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("Codex must have already published the same request-scoped error");
+        let result = serde_json::to_value(error).unwrap();
+        actor.stop().await.unwrap();
+        std::fs::remove_dir_all(host_dir).unwrap();
+        let starts = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["method"] == "turn/start")
+            .count();
+        assert_eq!(starts, 1, "the refused input must never be retried");
+        assert_eq!(
+            result["message"], "hosted fresh-agent command failed",
+            "generic control text stays redacted"
+        );
+        assert_eq!(result["freshAgentSendDiagnostic"]["outcome"], "refused");
+        assert_eq!(
+            result["freshAgentSendDiagnostic"]["message"],
+            receipt["message"]
+        );
+        assert!(result["freshAgentSendDiagnostic"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Selected model is at capacity"));
+        let opaque =
+            crate::map_actor_error(freshell_agent_runtime::host_actor::ActorError::Transport(
+                "private prompt and credential: do-not-publish".into(),
+            ));
+        let opaque = serde_json::to_value(opaque).unwrap();
+        assert!(
+            !opaque.to_string().contains("do-not-publish"),
+            "ordinary transport failures must remain body-free"
+        );
+        assert!(opaque.get("freshAgentSendDiagnostic").is_none());
+        let body_free_refusal = serde_json::to_value(crate::map_actor_error(
+            freshell_agent_runtime::host_actor::ActorError::SendRefused,
+        ))
+        .unwrap();
+        assert_eq!(
+            body_free_refusal["freshAgentSendDiagnostic"]["outcome"],
+            "refused"
+        );
+        assert!(body_free_refusal["freshAgentSendDiagnostic"]
+            .get("message")
+            .is_none());
+    }
 
     #[tokio::test]
     async fn task6_dropping_transport_closes_its_owned_bridge_without_more_provider_frames() {
@@ -3575,6 +3904,7 @@ mod tests {
         }
         async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
             Err(DispatchFailure {
+                provider_diagnostic: None,
                 message: "this actor does not own that decision".into(),
                 acceptance_ambiguous: false,
             })
@@ -5111,8 +5441,8 @@ await import(parameters.source)
         .unwrap();
         assert!(
             matches!(refused,
-            Err(freshell_agent_runtime::host_actor::ActorError::Transport(ref message))
-                if message.starts_with("SESSION_RESERVED:")),
+            Err(freshell_agent_runtime::host_actor::ActorError::ProviderSendDiagnostic(ref diagnostic))
+                if diagnostic.message.as_deref().is_some_and(|message| message.starts_with("SESSION_RESERVED:"))),
             "{refused:?}"
         );
         assert_eq!(actor.profile().await, before);
@@ -5330,8 +5660,8 @@ await import(parameters.source)
         );
         assert!(
             matches!(refused,
-            Ok(Err(freshell_agent_runtime::host_actor::ActorError::Transport(ref message)))
-                if message.starts_with("SESSION_RESERVED:")),
+            Ok(Err(freshell_agent_runtime::host_actor::ActorError::ProviderSendDiagnostic(ref diagnostic)))
+                if diagnostic.message.as_deref().is_some_and(|message| message.starts_with("SESSION_RESERVED:"))),
             "unconfirmed teardown must refuse; pending={pending}; result={refused:?}"
         );
         let before_proof = std::fs::read_to_string(&log).unwrap();
@@ -6112,6 +6442,109 @@ await import(parameters.source)
         actor.stop().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn hosted_codex_fork_refusal_reaches_the_actor_as_a_request_receipt() {
+        let fixture = native_codex_fixture(json!({
+            "overrides": { "thread/fork": { "error": {
+                "code": -32600, "message": "fixture fork needs a saved conversation"
+            } } }
+        }))
+        .await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("fork-refusal-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let parent = actor.profile().await.native_session_id.unwrap();
+        let before = actor.read_events(0, 256).await.head;
+        let result = actor
+            .fork(
+                RequestId::parse("fork-refusal-request").unwrap(),
+                parent.clone(),
+                None,
+            )
+            .await;
+        let refusal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let batch = actor.read_events(before, 256).await;
+                if let Some(payload) = batch.events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["requestId"] == "fork-refusal-request" =>
+                    {
+                        Some(payload.clone())
+                    }
+                    _ => None,
+                }) {
+                    break payload;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        actor.stop().await.unwrap();
+        assert!(result.is_err(), "the native provider refused the fork");
+        let refusal = refusal.expect("the native refusal must reach the retained event stream");
+        assert_eq!(refusal["sessionId"], parent);
+        assert_eq!(refusal["event"]["type"], "freshAgent.operation.error");
+        assert!(refusal["event"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fixture fork needs a saved conversation"));
+    }
+
+    #[tokio::test]
+    async fn hosted_codex_rollback_refusal_retains_the_provider_receipt() {
+        let fixture = native_codex_fixture(json!({"recordTurns": true})).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("rollback-refusal-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        send_controlled_native_turn(&actor, "rollback-seed")
+            .await
+            .unwrap();
+        let result = actor
+            .semantic_operation(
+                RequestId::parse("rollback-refusal-request").unwrap(),
+                rollback_to(Some("missing-native-turn".into())),
+            )
+            .await;
+        let refusal = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let batch = actor.read_events(0, 256).await;
+                if let Some(payload) = batch.events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["requestId"] == "rollback-refusal-request" =>
+                    {
+                        Some(payload.clone())
+                    }
+                    _ => None,
+                }) {
+                    break payload;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        actor.stop().await.unwrap();
+        assert!(
+            result.is_err(),
+            "the provider refused the unknown rollback target"
+        );
+        let refusal = refusal.expect("the provider's refusal must be retained");
+        assert_eq!(refusal["event"]["type"], "freshAgent.error");
+        assert_eq!(refusal["event"]["rollback"], true);
+        assert_eq!(refusal["event"]["operationReceipt"], true);
+        assert!(!refusal["event"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+    }
+
     async fn task5_durable_native_control(
         method: &str,
         params: Value,
@@ -6159,11 +6592,79 @@ await import(parameters.source)
         assert_eq!(payload["providerRequest"]["id"], 41);
         // Reading from a reconnect's cursor yields the exact same public/native IDs.
         assert!(actor.read_events(0,256).await.events.iter().any(|entry| matches!(&entry.event,AgentEvent::PermissionRequested{decision_id:id,payload:p} if id==&decision_id && p==&payload)));
-        let invalid = actor.resolve_permission(&decision_id, invalid_answer).await;
+        let invalid = actor
+            .resolve_permission_with_attempt_id(
+                &decision_id,
+                invalid_answer.clone(),
+                Some("control-attempt-one"),
+            )
+            .await;
         assert!(
             invalid.is_err(),
             "an invalid native answer must not resolve its durable decision"
         );
+        let refusal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let batch = actor.read_events(0, 256).await;
+                if let Some(payload) = batch.events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.error"
+                            && payload["event"]["requestId"] == decision_id =>
+                    {
+                        Some((entry.sequence, payload.clone()))
+                    }
+                    _ => None,
+                }) {
+                    break payload;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let (refusal_sequence, refusal) = match refusal {
+            Ok(refusal) => refusal,
+            Err(_) => {
+                actor.stop().await.unwrap();
+                panic!(
+                    "the native validation error must be a replayable receipt for this decision"
+                );
+            }
+        };
+        assert!(!refusal["event"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+        assert_eq!(
+            refusal["event"]["operationAttemptId"],
+            "control-attempt-one"
+        );
+        assert!(actor.read_events(0, 256).await.events.iter().any(|entry| matches!(&entry.event,
+            AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.operation.started"
+                && payload["event"]["operationAttemptId"] == "control-attempt-one"
+                && entry.sequence < refusal_sequence)), "the source-owned start must be journaled before the provider refusal");
+        assert!(actor
+            .resolve_permission_with_attempt_id(
+                &decision_id,
+                invalid_answer,
+                Some("control-attempt-two")
+            )
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if actor.read_events(0, 256).await.events.iter().any(|entry| {
+                    matches!(&entry.event,
+                    AgentEvent::Provider { payload } if payload["event"]["requestId"] == decision_id
+                        && payload["event"]["type"] == "freshAgent.error"
+                        && payload["event"]["operationAttemptId"] == "control-attempt-two")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second refusal must retain its own attempt ID in the host journal");
         assert!(!actor.read_events(0,256).await.events.iter().any(|entry|matches!(&entry.event,AgentEvent::DecisionResolved{decision_id:id} if id==&decision_id)));
         actor
             .resolve_permission(&decision_id, valid_answer.clone())
@@ -11392,6 +11893,7 @@ export function query({ prompt, options }) {
             );
             if unsupported {
                 return Err(DispatchFailure {
+                    provider_diagnostic: None,
                     message: format!("fixture provider does not support {operation}"),
                     acceptance_ambiguous: false,
                 });
@@ -12383,11 +12885,11 @@ export function query({ prompt, options }) {
                 "type":"freshAgent.send.accepted",
                 "requestId":"request-1"
             })),
-            Some(("request-1".into(), true))
+            Some(("request-1".into(), HostedSendReceipt::Accepted))
         );
         assert_eq!(
             parse_send_outcome(&json!({"type":"error","requestId":"request-1"})),
-            Some(("request-1".into(), false))
+            Some(("request-1".into(), HostedSendReceipt::Refused(None)))
         );
         assert_eq!(
             parse_send_outcome(&json!({"type":"freshAgent.send.accepted"})),

@@ -200,7 +200,7 @@ export function query(params) {{
         let mut extra = vec![("FRESHELL_CLAUDE_SDK_QUERY_MODULE", module.to_str().unwrap())];
         if reissued {
             extra.push(("FRESHELL_CLAUDE_SIM_COLD_COMMAND", "queued"));
-            extra.push(("FRESHELL_CLAUDE_SIM_HOLD_QUEUED_COLD", "1"));
+            extra.push(("FRESHELL_CLAUDE_SIM_COLD_HOLD_UNTIL_STOP", "1"));
         }
         let rig = ClaudeRig::start_with_env(RigKind::Sim, &extra).await;
         let mut conn = rig.connect().await;
@@ -218,6 +218,18 @@ export function query(params) {{
                 .as_str()
                 .expect("send.accepted carries submittedTurnId")
                 .to_owned();
+            let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+            while !rig
+                .ledger_rows("cold_hold_ready")
+                .iter()
+                .any(|row| row["uuid"] == submitted_turn_id)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the simulator never held the accepted cold command"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             logs.wait_for("the accepted turn's queued lifecycle", |event| {
                 event.message == "freshagent.claude.command"
                     && event.field("session_id") == Some(&id)

@@ -533,6 +533,7 @@ impl ServerManagedRuntimeController {
                     message: "recovery is already in progress".into(),
                     diagnostic_code: None,
                     fresh_agent_provider_start_diagnostic: None,
+                    fresh_agent_send_diagnostic: None,
                 })?;
         let result = self
             .client

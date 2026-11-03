@@ -100,7 +100,10 @@ export type FreshAgentLiveSession = {
   retry?: LiveRetry
   /** Transcript line uuids announced by the CLI and not yet seen in a snapshot. */
   expectedTurnIds: string[]
+  /** The latest informational or warning notice for the mounted pane. */
   notice?: LiveNotice
+  /** The latest provider error, independent of subsequent non-error notices. */
+  errorNotice?: LiveNotice
 }
 
 export type FreshAgentLiveState = {

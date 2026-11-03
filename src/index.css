@@ -1618,6 +1618,19 @@ body {
   overflow: auto;
 }
 .fresh-agent-error-summaries > details { min-width: 0; max-width: 100%; }
+.fresh-agent-error-summary-compact { display: none; }
+/* Multiple diagnostics share one small row in compact panes. Their full
+   descriptions remain available in each disclosure and its accessible name. */
+@container (max-width: 899px) or (max-height: 479px) {
+  .fresh-agent-error-summary-full { display: none; }
+  .fresh-agent-error-summary-compact { display: inline; }
+  /* Bound errors while leaving warning instructions readable before opening. */
+  .fresh-agent-error-summaries > details[data-agent-diagnostic-level="error"]:not([open]) > summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
 .fresh-agent-errors:has(details[open]) { display: block; }
 .fresh-agent-errors:has(details[open]) .fresh-agent-error-summaries { display: block; }
 .fresh-agent-notices { min-width: 0; max-width: 100%; }
@@ -1663,6 +1676,11 @@ body {
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-notices summary { white-space: nowrap; }
+  /* Text can extend above the compact line box; keep it inside the scroller. */
+  .fresh-agent-top-stack .fresh-agent-error-summaries { padding-top: 2px; }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) {
+    grid-template-columns: auto minmax(0, .65fr) minmax(0, 1.65fr) minmax(0, 1fr);
+  }
 }
 
 @container (max-height: 479px) and (max-width: 899px) {
@@ -1729,6 +1747,33 @@ body {
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-notices summary { white-space: nowrap; }
+  .fresh-agent-top-stack .fresh-agent-error-summaries { padding-top: 2px; }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) {
+    grid-template-columns: minmax(0, .5fr) minmax(0, 2fr) minmax(0, 1fr);
+  }
+}
+
+@container (max-width: 899px) and (min-height: 560px) {
+  .fresh-agent-top-stack .fresh-agent-errors summary { white-space: normal; }
+}
+
+@container (max-width: 560px) and (max-height: 479px) {
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) {
+    grid-template-columns: max-content minmax(45px, .45fr) minmax(0, 2fr) minmax(70px, .7fr);
+    column-gap: 2px;
+    padding-inline: 4px;
+  }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) > .fresh-agent-request-count {
+    font-size: 0;
+    white-space: nowrap;
+  }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) > .fresh-agent-request-count::after {
+    content: attr(data-request-count) ' pending';
+    font-size: .75rem;
+  }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) .fresh-agent-errors {
+    gap: 0;
+  }
 }
 
 /* The compact layout flattens this wrapper. When diagnostics expand, the

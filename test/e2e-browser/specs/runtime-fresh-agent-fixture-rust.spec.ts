@@ -630,7 +630,7 @@ test('managed update modes - default preserves running souls and reports reminde
     })
     expect(failed.content.createError).toMatchObject({ retryable: true })
     const failedPane = page.locator(`[data-context="fresh-agent"][data-pane-id="${failed.id}"]`)
-    await expect(failedPane.getByText(/Host coding-agent starts are temporarily paused for maintenance/)).toBeVisible()
+    await expect(failedPane.locator('[data-agent-error="create"] .fresh-agent-diagnostic-body').getByText(/Host coding-agent starts are temporarily paused for maintenance/)).toBeVisible()
     await expect(failedPane.getByRole('button', { name: 'Retry', exact: true })).toBeVisible()
     await post(info.baseUrl, info.token, '/api/runtime/maintenance/release', { ownerId: leaseOwner, leaseId })
     await failedPane.getByRole('button', { name: 'Retry', exact: true }).click()

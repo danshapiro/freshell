@@ -4,6 +4,8 @@ use crate::rest_lane::*;
 use axum::http::StatusCode;
 use freshell_protocol::{AgentProvider, SessionType};
 
+include!("codex_rest_previous_delivery_tests.rs");
+
 fn http_pane(state: FreshCodexState, id: &str) -> (axum::Router, String) {
     let api = crate::FreshAgentState::new(
         Arc::new("tok".into()),

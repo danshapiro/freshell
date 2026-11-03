@@ -9,6 +9,8 @@ mod provider_input_preparation;
 mod provider_secret_resolution;
 mod providers;
 mod pty;
+#[cfg(test)]
+mod retained_read_cancellation_tests;
 mod retained_store;
 #[cfg(all(test, feature = "managed-stop-contract-tests"))]
 mod stop_contract_tests;
@@ -755,7 +757,22 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
     let envelope: Envelope<HostCommand> =
         read_frame(&mut stream).await.map_err(|e| e.to_string())?;
     let request_id = envelope.request_id.clone();
-    let result = dispatch(envelope, &state).await;
+    let result = if matches!(&envelope.body, HostCommand::FreshAgentReadEvents { .. }) {
+        // A retained read is read-only and can wait on provider state after
+        // its supervisor deadline. Do not leave that work running after the
+        // supervisor drops the connection. Mutating commands must still run
+        // to their normal conclusion when their caller disconnects.
+        tokio::select! {
+            result = dispatch(envelope, &state) => result,
+            closed = wait_for_peer_disconnect(&stream) => {
+                closed.map_err(|error| format!("observe peer disconnect: {error}"))?;
+                tracing::debug!(%request_id, "freshagent.host.event_read_cancelled");
+                return Ok(());
+            }
+        }
+    } else {
+        dispatch(envelope, &state).await
+    };
     if let Err(error) = &result {
         let _ = append_event_with_secret(
             &state.state_dir,
@@ -781,6 +798,43 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+// EOF alone is insufficient: a client may shut down its write half while it
+// remains connected to read the reply. POLLHUP signals a fully closed peer.
+async fn wait_for_peer_disconnect(stream: &UnixStream) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    stream.readable().await?;
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: the borrowed stream keeps its descriptor valid; poll reads
+        // one initialized descriptor and a zero timeout cannot block.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid peer socket",
+            ));
+        }
+        if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(());
+        }
+        // Readability remains set after a write-half-close, so avoid spinning
+        // while that still-connected caller waits for its reply.
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn dispatch(
@@ -1433,6 +1487,7 @@ async fn dispatch_with_effects(
                     incarnation_id,
                     decision_id,
                     decision,
+                    operation_attempt_id,
                 } => {
                     let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
@@ -1444,7 +1499,11 @@ async fn dispatch_with_effects(
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
                     actor
-                        .resolve_permission(&decision_id, decision)
+                        .resolve_permission_with_attempt_id(
+                            &decision_id,
+                            decision,
+                            operation_attempt_id.as_deref(),
+                        )
                         .await
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
@@ -1455,7 +1514,10 @@ async fn dispatch_with_effects(
                         native_session_id,
                     })
                 }
-                HostCommand::FreshAgentInterrupt { incarnation_id } => {
+                HostCommand::FreshAgentInterrupt {
+                    incarnation_id,
+                    request_id,
+                } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let actor = state
                         .fresh_agent
@@ -1463,7 +1525,10 @@ async fn dispatch_with_effects(
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
-                    actor.interrupt().await.map_err(map_actor_error)?;
+                    actor
+                        .interrupt_with_request_id(request_id.as_deref())
+                        .await
+                        .map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentInterrupted)
                 }
                 HostCommand::FreshAgentReadEvents {
@@ -1603,6 +1668,30 @@ fn configure_outcome_event(
 
 fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> RuntimeError {
     use freshell_agent_runtime::host_actor::ActorError;
+    if let ActorError::SendRefused = error {
+        return RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent command failed",
+        )
+        .with_fresh_agent_send_diagnostic(
+            freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                message: None,
+            },
+        );
+    }
+    if let ActorError::ProviderSendDiagnostic(diagnostic) = error {
+        let code = match diagnostic.outcome {
+            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused => {
+                RuntimeErrorCode::HostUnreachable
+            }
+            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous => {
+                RuntimeErrorCode::CommandAmbiguous
+            }
+        };
+        return RuntimeError::new(code, "hosted fresh-agent command failed")
+            .with_fresh_agent_send_diagnostic(diagnostic);
+    }
     let code = match error {
         ActorError::RequestConflict => RuntimeErrorCode::RequestIdConflict,
         ActorError::AmbiguousDispatch => RuntimeErrorCode::CommandAmbiguous,
@@ -1622,6 +1711,9 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
         | ActorError::NativeReadinessProviderStartFailed { .. }
         | ActorError::Transport(_)
         | ActorError::Persistence(_) => RuntimeErrorCode::HostUnreachable,
+        ActorError::ProviderSendDiagnostic(_) | ActorError::SendRefused => {
+            unreachable!("handled above")
+        }
     };
     // Provider error strings may contain request bodies, environment values,
     // or credentials. Keep the control payload typed and deliberately opaque.
@@ -1682,6 +1774,15 @@ fn fresh_agent_open_failure_data(
         ActorError::UnsupportedOperation => "unsupported_operation",
         ActorError::ProviderStartFailed { .. } => "provider_start_failed",
         ActorError::NativeReadinessProviderStartFailed { .. } => "provider_start_failed",
+        ActorError::ProviderSendDiagnostic(diagnostic) => match diagnostic.outcome {
+            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused => {
+                "provider_send_refused"
+            }
+            freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Ambiguous => {
+                "provider_send_ambiguous"
+            }
+        },
+        ActorError::SendRefused => "send_refused",
         ActorError::UnknownDecision => "unknown_decision",
         ActorError::DecisionAlreadyResolved => "decision_already_resolved",
         ActorError::Transport(_) => "transport",
@@ -10628,7 +10729,8 @@ mod tests {
             ActorError, NativeReadinessProviderStartCause, ProviderStartDiagnostic,
         };
         use freshell_runtime_protocol::{
-            FreshAgentProviderStartDiagnostic, RuntimeDiagnosticCode, RuntimeErrorCode,
+            FreshAgentProviderStartDiagnostic, FreshAgentSendDiagnostic,
+            FreshAgentSendDiagnosticOutcome, RuntimeDiagnosticCode, RuntimeErrorCode,
         };
 
         let provider_start = super::map_fresh_agent_open_error(ActorError::ProviderStartFailed {
@@ -10646,6 +10748,31 @@ mod tests {
         assert_eq!(
             provider_start.message,
             "hosted fresh-agent provider failed to start (startup diagnostic: authentication)"
+        );
+
+        let private_provider_message = "private-send-diagnostic";
+        for (outcome, expected_category) in [
+            (
+                FreshAgentSendDiagnosticOutcome::Refused,
+                "provider_send_refused",
+            ),
+            (
+                FreshAgentSendDiagnosticOutcome::Ambiguous,
+                "provider_send_ambiguous",
+            ),
+        ] {
+            let data = super::fresh_agent_open_failure_data(&ActorError::ProviderSendDiagnostic(
+                FreshAgentSendDiagnostic {
+                    outcome,
+                    message: Some(private_provider_message.into()),
+                },
+            ));
+            assert_eq!(data["actorErrorCategory"], expected_category);
+            assert!(!data.to_string().contains(private_provider_message));
+        }
+        assert_eq!(
+            super::fresh_agent_open_failure_data(&ActorError::SendRefused)["actorErrorCategory"],
+            "send_refused"
         );
 
         let secret_detail = "private-provider-output-should-not-cross-the-host-boundary";
@@ -12784,6 +12911,7 @@ mod tests {
                         incarnation_id: state.incarnation_id.clone(),
                         decision_id: "permission-1".into(),
                         decision: serde_json::json!({"behavior":"allow"}),
+                        operation_attempt_id: None,
                     },
                 ),
                 &state,

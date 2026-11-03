@@ -2,11 +2,12 @@ import { useLayoutEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 
 export type FreshAgentNotice = { id: string; text: string; prominent?: boolean }
-export type FreshAgentError = { id: string; summary: string; content: ReactNode; level?: 'warning' | 'error'; initiallyExpanded?: boolean; onToggle?: (expanded: boolean) => void }
+export type FreshAgentError = { id: string; renderKey?: string; summary: string; compactSummary?: string; content: ReactNode; level?: 'warning' | 'error'; initiallyExpanded?: boolean; onToggle?: (expanded: boolean) => void }
 
-function NoticeDisclosure({ children, errorId, initiallyExpanded, onExpandedChange }: {
+function NoticeDisclosure({ children, errorId, errorLevel, initiallyExpanded, onExpandedChange }: {
   children: ReactNode
   errorId?: string
+  errorLevel?: 'warning' | 'error'
   initiallyExpanded?: boolean
   onExpandedChange?: (expanded: boolean) => void
 }) {
@@ -16,7 +17,7 @@ function NoticeDisclosure({ children, errorId, initiallyExpanded, onExpandedChan
     return () => onExpandedChange?.(false)
   }, [expanded, onExpandedChange])
 
-  return <details open={expanded} data-agent-error={errorId} onToggle={event => setExpanded(event.currentTarget.open)}>{children}</details>
+  return <details open={expanded} data-agent-error={errorId} data-agent-diagnostic-level={errorLevel} onToggle={event => setExpanded(event.currentTarget.open)}>{children}</details>
 }
 
 /** Keep request controls separate; diagnostic bodies stay mounted across toggles. */
@@ -56,8 +57,15 @@ export function FreshAgentNoticeStack({ notices, errors, onNoticesExpandedChange
       <div className="fresh-agent-errors" role="region" aria-label="Agent errors">
         <span role="img" aria-label={diagnosticCount} title={diagnosticCount} className="fresh-agent-diagnostic-count text-xs text-muted-foreground">{errors.length}</span>
         <div className="fresh-agent-error-summaries">{errors.map(error => (
-          <NoticeDisclosure key={error.id} errorId={error.id} initiallyExpanded={error.initiallyExpanded} onExpandedChange={error.onToggle}>
-            <summary aria-label={error.summary}><span role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : undefined}>{error.summary}</span></summary>
+          <NoticeDisclosure key={error.renderKey ?? error.id} errorId={error.id} errorLevel={error.level ?? 'error'} initiallyExpanded={error.initiallyExpanded} onExpandedChange={error.onToggle}>
+            <summary aria-label={error.summary}>
+              <span role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : error.summary}>
+                {errors.length > 1 && error.level !== 'warning' && error.compactSummary ? <>
+                  <span className="fresh-agent-error-summary-full" aria-hidden="true">{error.summary}</span>
+                  <span className="fresh-agent-error-summary-compact" aria-hidden="true">{error.compactSummary}</span>
+                </> : error.summary}
+              </span>
+            </summary>
             {error.content !== null ? <div className="fresh-agent-diagnostic-body">{error.content}</div> : null}
           </NoticeDisclosure>
         ))}</div>
