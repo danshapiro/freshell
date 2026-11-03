@@ -356,14 +356,25 @@ PY
     exit 2
   fi
 
-  p2_g01_preparation_signal() {
-    local result="$1"
+  preparation_signal() {
+    local requested_signal="$1"
+    local result="$2"
     if [ -z "${PREPARATION_PID:-}" ]; then
-      P2_G01_PENDING_SIGNAL="${result}"
+      PREPARATION_PENDING_SIGNAL="${requested_signal}"
+      PREPARATION_PENDING_STATUS="${result}"
+      printf '{"severity":"info","event":"sandbox_preparation_signal_deferred","signal":"%s"}\n' \
+        "${requested_signal}" >&2
       return
     fi
     trap '' INT TERM HUP
-    kill -TERM "${PREPARATION_PID}" 2>/dev/null || true
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      # The P2 preparation's parent EXIT handler settles its private store;
+      # TERM gives the owned sandbox wrapper its normal container cleanup path.
+      kill -TERM "${PREPARATION_PID}" 2>/dev/null || true
+    else
+      # Ordinary runtime-suite setup keeps forwarding the same signal it got.
+      kill -s "${requested_signal}" "${PREPARATION_PID}" 2>/dev/null || true
+    fi
     wait "${PREPARATION_PID}" 2>/dev/null || true
     exit "${result}"
   }
@@ -425,13 +436,14 @@ PY
   # guard and completed settlement. Only the fixed preparation has networking.
   if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
-    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
-      PREPARATION_PID=""
-      P2_G01_PENDING_SIGNAL=""
-      trap 'p2_g01_preparation_signal 130' INT
-      trap 'p2_g01_preparation_signal 143' TERM
-      trap 'p2_g01_preparation_signal 129' HUP
-    fi
+    PREPARATION_PID=""
+    PREPARATION_PENDING_SIGNAL=""
+    PREPARATION_PENDING_STATUS=0
+    # Arm handlers before launching the child. A signal in the fork-to-$! gap
+    # is saved and forwarded as soon as Bash records the preparation PID.
+    trap 'preparation_signal INT 130' INT
+    trap 'preparation_signal TERM 143' TERM
+    trap 'preparation_signal HUP 129' HUP
     PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
@@ -444,17 +456,8 @@ PY
       "${PREPARATION_COMMAND}" &
     fi
     PREPARATION_PID=$!
-    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
-      if [ -n "${P2_G01_PENDING_SIGNAL}" ]; then
-        p2_g01_preparation_signal "${P2_G01_PENDING_SIGNAL}"
-      fi
-    else
-      # Preserve the established signal forwarding for ordinary runtime-suite
-      # preparation. Only the external browser route needs the run-store
-      # settling handler above.
-      trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
-      trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
-      trap 'kill -HUP "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 129' HUP
+    if [ -n "${PREPARATION_PENDING_SIGNAL}" ]; then
+      preparation_signal "${PREPARATION_PENDING_SIGNAL}" "${PREPARATION_PENDING_STATUS}"
     fi
     PREPARATION_STATUS=0
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?

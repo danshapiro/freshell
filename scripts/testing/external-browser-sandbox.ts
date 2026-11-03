@@ -100,7 +100,7 @@ export function p2G01PlaywrightInvocation(
     command: 'pnpm',
     args: [
       'exec', 'playwright', 'test', '--config', 'test/e2e-browser/playwright.cloud.config.ts',
-      '--project=chromium-external-target', '--workers=1', '--retries=0', '--timeout=120m',
+      '--project=chromium-external-target', '--workers=1', '--retries=0', '--timeout=7200000',
       P2_G01_SPEC, '--grep', P2_G01_TITLE,
     ],
     environment: {

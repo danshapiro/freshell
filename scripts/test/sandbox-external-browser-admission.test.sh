@@ -146,6 +146,7 @@ if os.environ.get("FRESHELL_SANDBOX_PREPARE_ONLY") == "1" and ready and signal_f
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGINT, record)
+    signal.signal(signal.SIGTERM, record)
     signal.signal(signal.SIGHUP, record)
     with open(ready, "w", encoding="utf-8"):
         pass
@@ -417,7 +418,78 @@ PY
 }
 
 run_ordinary_preparation_signal_case SIGINT 130 int
+run_ordinary_preparation_signal_case SIGTERM 143 term
 run_ordinary_preparation_signal_case SIGHUP 129 hup
+
+# Pause the parent Bash in a deterministic pre-launch window after its DEBUG
+# hook installs but before the asynchronous preparation command is forked.
+# The ordinary runtime-suite signal handler must remember TERM with no child
+# PID yet, then forward it immediately after assigning that PID.
+python3 - "${REPO_ROOT}" "${FAKE_BIN}" "${TEST_TMP}" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+repo, fake_bin, test_tmp = sys.argv[1:]
+barrier_entered = pathlib.Path(test_tmp, "prepid-barrier-entered")
+barrier_release = pathlib.Path(test_tmp, "prepid-barrier-release")
+bash_env = pathlib.Path(test_tmp, "prepid-bash-env")
+bash_env.write_text('''if [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
+  trap '\n    if [[ "${BASH_COMMAND}" == *"FRESHELL_SANDBOX_PREPARE_ONLY=1"* ]] && [ ! -e "${FRESHELL_TEST_PREPID_BARRIER_ENTERED}" ]; then
+      : >"${FRESHELL_TEST_PREPID_BARRIER_ENTERED}"
+      while [ ! -e "${FRESHELL_TEST_PREPID_BARRIER_RELEASE}" ]; do sleep 0.01; done
+    fi\n  ' DEBUG
+fi
+''', encoding="utf-8")
+stdout_file = open(pathlib.Path(test_tmp, "prepid.stdout"), "w", encoding="utf-8")
+stderr_path = pathlib.Path(test_tmp, "prepid.stderr")
+stderr_file = open(stderr_path, "w", encoding="utf-8")
+environment = os.environ.copy()
+environment.update({
+    "PATH": f"{fake_bin}:{environment.get('PATH', '')}",
+    "BASH_ENV": str(bash_env),
+    "FRESHELL_TEST_PREPID_BARRIER_ENTERED": str(barrier_entered),
+    "FRESHELL_TEST_PREPID_BARRIER_RELEASE": str(barrier_release),
+})
+process = subprocess.Popen(
+    [str(pathlib.Path(fake_bin, "bash")), str(pathlib.Path(repo, "scripts/sandbox-test.sh")),
+     "--workspace-root", repo, "--runtime-suite", "true"],
+    env=environment, stdout=stdout_file, stderr=stderr_file,
+)
+try:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if barrier_entered.exists(): break
+        if process.poll() is not None: raise AssertionError("outer runtime preparation exited before its pre-PID barrier")
+        time.sleep(0.01)
+    if not barrier_entered.exists(): raise AssertionError("ordinary preparation missed the pre-PID barrier")
+    process.send_signal(signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        stderr_file.flush()
+        if '"event":"sandbox_preparation_signal_deferred"' in stderr_path.read_text(encoding="utf-8"):
+            break
+        if process.poll() is not None: raise AssertionError("pre-PID TERM exited without recording a deferred signal")
+        time.sleep(0.01)
+    else:
+        raise AssertionError("pre-PID TERM was not deferred while the child PID was unset")
+    barrier_release.touch()
+    status = process.wait(timeout=15)
+    assert status == 143, f"pre-PID TERM produced exit {status}, expected 143"
+    events = [line for line in stderr_path.read_text(encoding="utf-8").splitlines()
+              if '"event":"sandbox_preparation_signal_deferred"' in line]
+    assert len(events) == 1 and '"signal":"TERM"' in events[0]
+finally:
+    if process.poll() is None:
+        barrier_release.touch()
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=15)
+    stdout_file.close()
+    stderr_file.close()
+PY
 
 : >"${DOCKER_CALLS}"
 python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'

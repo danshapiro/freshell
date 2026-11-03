@@ -2965,7 +2965,8 @@ export async function dispatchOwnedExternalBrowser(
     const child = localSandbox
       ? await owner.child('sandbox-p2-g01', [], env, ...(signal ? [signal] : []))
       : await owner.child('pnpm', [
-        'run', 'test:e2e', '--project=chromium-external-target', '--shards=1', '--workers=1', '--retries=0', '--timeout=120m',
+        // Playwright's CLI accepts milliseconds; keep this at 120 minutes.
+        'run', 'test:e2e', '--project=chromium-external-target', '--shards=1', '--workers=1', '--retries=0', '--timeout=7200000',
         selection.spec, ...(selection.grep ? ['--grep', selection.grep] : []),
       ], env, ...(signal ? [signal] : []))
     signal?.throwIfAborted()

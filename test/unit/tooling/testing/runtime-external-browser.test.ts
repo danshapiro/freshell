@@ -936,7 +936,7 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     expect(childArgs).not.toContain('--local')
     // Preserve the 60-minute native case plus two 15-minute retained cases,
     // including their browser setup and cleanup time.
-    expect(childArgs).toContain('--timeout=120m')
+    expect(childArgs).toContain('--timeout=7200000')
     expect(owned.list.mock.invocationCallOrder[0]).toBeLessThan(child.mock.invocationCallOrder[0])
     expect(receipt).toMatchObject({ selected: 1, executed: 1, passed: 1, skipped: 0, failed: 0, timedOut: 0 })
     expect(owned.finish).toHaveBeenCalledOnce()
@@ -1019,7 +1019,7 @@ describe('actual runner child and nonvacuity lifecycle', () => {
     expect(invocation.command).toBe('pnpm')
     expect(invocation.args).toEqual([
       'exec', 'playwright', 'test', '--config', 'test/e2e-browser/playwright.cloud.config.ts',
-      '--project=chromium-external-target', '--workers=1', '--retries=0', '--timeout=120m',
+      '--project=chromium-external-target', '--workers=1', '--retries=0', '--timeout=7200000',
       p2G01Spec, '--grep', p2G01Title,
     ])
     expect(invocation.environment).toEqual({
