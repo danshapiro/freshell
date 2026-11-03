@@ -9273,6 +9273,217 @@ export function query({ prompt, options }) {
         }
     }
 
+    /// The saved-actor checkpoint fixture: the recording incarnation answers
+    /// the card's validation with the evidence it was published against, while
+    /// the reopened incarnation defers every identity read to the real hosted
+    /// transport whose bridge drove the `freshAgent.created` announce.
+    struct SavedCheckpointReopenTransport {
+        native: Option<String>,
+        recorded_evidence: Option<Value>,
+        hosted: Option<Arc<HostedTransport>>,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for SavedCheckpointReopenTransport {
+        async fn native_identity_evidence(&self) -> Option<Value> {
+            match self.hosted.as_ref() {
+                Some(hosted) => hosted.native_identity_evidence().await,
+                None => self.recorded_evidence.clone(),
+            }
+        }
+
+        async fn prepare_native_permission_recovery(
+            &self,
+            checkpoints: Vec<Value>,
+        ) -> Result<(), String> {
+            match self.hosted.as_ref() {
+                Some(hosted) => hosted.prepare_native_permission_recovery(checkpoints).await,
+                None => Ok(()),
+            }
+        }
+
+        async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+            // The reopen's open settles on the announce that named the durable
+            // root; the hosted branch reads the same native watch the real
+            // transport's `wait_exact_native` observes.
+            let native = match self.hosted.as_ref() {
+                Some(hosted) => hosted.native_rx.lock().await.borrow().clone(),
+                None => self.native.clone(),
+            };
+            Ok(TransportStart {
+                native_session_id: native,
+            })
+        }
+
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            unreachable!("the saved-actor reopen fixture dispatches no turns")
+        }
+
+        async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+            unreachable!("the saved-actor reopen fixture resolves no decisions")
+        }
+
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn take_event_stream(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn created_announce_without_identity_evidence_refuses_saved_checkpoint_release() {
+        use sha2::Digest as _;
+        // The czzp refusal contract, characterized deterministically: the
+        // transport's `freshAgent.created` announce satisfies the native watch
+        // but never publishes identity evidence, and a saved checkpoint
+        // released in that window refuses with the exact typed mismatch
+        // instead of bypassing the current native identity.
+        const ROOT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let owned = tempfile::tempdir().unwrap();
+        let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+            serde_json::from_value(json!({
+                "incarnationId":"announce-incarnation", "launchNonce":"announce-nonce",
+                "evidenceRevision":3, "executionGeneration":1, "requestedNativeSessionId":ROOT
+            }))
+            .unwrap();
+        let input = json!({"command":"harmless"});
+        let input_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&input).unwrap())
+        );
+        let mut binding = json!({"launch":launch, "queryGeneration":2});
+        binding["nativeRequestId"] = json!("announce-native-request");
+        let card = json!({"type":"freshAgent.permission.request",
+            "nativeRequestId":"announce-native-request", "toolUseID":"toolu_original1",
+            "tool":{"name":"Bash","input":input},
+            "nativeCheckpoint":{"nativeSessionId":ROOT, "toolUseID":"toolu_original1",
+                "toolName":"Bash", "inputDigest":input_digest, "profileDigest":"b".repeat(64),
+                "checkpointUuid":"announce-checkpoint", "assistantUuid":"announce-assistant",
+                "checkpointDigest":"c".repeat(64), "nativeVersion":"2.1.237"},
+            "nativeBinding":binding});
+        let recorded_evidence =
+            json!({"launch":launch, "queryGeneration":2, "nativeSessionId":ROOT});
+        let mut profile = parity_profile(FreshProvider::Claude);
+        profile.cwd = owned.path().to_string_lossy().into();
+        profile.native_session_id = None;
+        profile.session_ref = None;
+        profile.provider_launch_context = None;
+        profile.provider_secret_references.clear();
+        profile.plugins = None;
+        let actor_dir = owned.path().join("actor");
+        let recording = Arc::new(SavedCheckpointReopenTransport {
+            native: Some(ROOT.into()),
+            recorded_evidence: Some(recorded_evidence),
+            hosted: None,
+        });
+        let actor = FreshAgentHostActor::open(&actor_dir, profile.clone(), recording)
+            .await
+            .unwrap();
+        actor
+            .record_permission("announce-card".into(), card)
+            .await
+            .expect("the recorded card must validate against its published evidence");
+        drop(actor);
+        // The reopened incarnation: a fresh transport whose bridge sees only
+        // the announce — the window the checkpoint recovery's second open
+        // returns in while the identity publication is still behind it.
+        let (sender, receiver) = broadcast::channel(32);
+        let (created, _) = watch::channel(None);
+        let (native, native_rx) = watch::channel(None);
+        let (native_evidence, _) = watch::channel(None);
+        let (events, mut event_rx) = mpsc::channel(32);
+        let (send_outcomes, _) = broadcast::channel(16);
+        let (kill_outcomes, _) = broadcast::channel(16);
+        let identity = Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default()));
+        let mut transport = HostedTransport::new_with_context(FreshProvider::Claude, None).await;
+        {
+            let hosted = Arc::get_mut(&mut transport).expect("new transport has one owner");
+            hosted.native_identity = identity.clone();
+            hosted.native_rx = Mutex::new(native_rx);
+            hosted.native_tx = native.clone();
+            *hosted.session_id.lock().await = Some("presentation-reopened".into());
+        }
+        let _bridge = spawn_broadcast_bridge(
+            FreshProvider::Claude,
+            receiver,
+            BroadcastBridgeOutputs {
+                owned_session: None,
+                retained_codex: None,
+                created,
+                native,
+                native_evidence,
+                native_identity: identity.clone(),
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                refusal_observer: None,
+            },
+        );
+        {
+            // Production installs this binding in private child secrets; the
+            // bridge resets the identity launch at spawn, so install after.
+            let mut identity = identity.lock().unwrap();
+            identity.launch = Some(launch.clone());
+            identity.producer_launch = Some(launch);
+        }
+        sender
+            .send(
+                json!({"type":"freshAgent.created", "sessionId":"presentation-reopened",
+            "sessionRef":{"provider":"claude", "sessionId":ROOT}})
+                .to_string(),
+            )
+            .unwrap();
+        drain_native_bridge(&sender, &mut event_rx).await;
+        assert_eq!(
+            transport.native_rx.lock().await.borrow().clone().as_deref(),
+            Some(ROOT),
+            "the freshAgent.created announce must satisfy the native watch"
+        );
+        assert!(
+            transport.native_identity_evidence().await.is_none(),
+            "the announce path must not publish native identity evidence"
+        );
+        assert!(
+            identity.lock().unwrap().root.is_none(),
+            "the announce must leave the native identity root unobserved"
+        );
+        let reopened = Arc::new(SavedCheckpointReopenTransport {
+            native: None,
+            recorded_evidence: None,
+            hosted: Some(transport.clone()),
+        });
+        let actor = FreshAgentHostActor::open(&actor_dir, profile.clone(), reopened)
+            .await
+            .unwrap();
+        assert!(
+            !transport
+                .prepared_native_checkpoints
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "the reopened actor must register its saved checkpoint before the release"
+        );
+        assert_eq!(
+            actor.resume_pending_native_permissions().await,
+            Err(freshell_agent_runtime::host_actor::ActorError::NativeIdentityMismatch),
+            "a saved checkpoint released in the announce-only window must refuse instead of bypassing the current native identity"
+        );
+    }
+
     #[tokio::test]
     async fn hosted_actor_checkpoint_recovery_preserves_the_created_root_and_current_card() {
         let _lock = NATIVE_PROVIDER_FIXTURE_LOCK.lock().await;
@@ -9431,6 +9642,10 @@ export function query({ prompt, options }) {
                     .is_empty(),
                 "actual saved actor must register its native checkpoint before startup"
             );
+            actor
+                .prepare_native_readiness()
+                .await
+                .expect("reopened checkpoint actor must reach native readiness");
             let before = std::fs::read(&transcript).unwrap();
             let receipt = actor.resume_pending_native_permissions().await;
             let recovered = tokio::time::timeout(Duration::from_secs(3), async {
