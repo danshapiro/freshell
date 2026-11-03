@@ -2035,7 +2035,10 @@ describe('FreshAgentView', () => {
 
         const notice = errorNotice()
         expect(notice).toBeInTheDocument()
-        fireEvent.click(notice!.querySelector('summary')!)
+        await act(async () => {
+          fireEvent.click(notice!.querySelector('summary')!)
+          await vi.advanceTimersByTimeAsync(0)
+        })
         const details = notice!.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
         expect(within(details).getByText(errorMessage, { exact: true })).toBeVisible()
         fireEvent.click(within(details).getByRole('button', { name: 'Dismiss', exact: true }))

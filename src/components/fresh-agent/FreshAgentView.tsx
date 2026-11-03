@@ -3,6 +3,7 @@ import {
   forwardRef,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -1315,14 +1316,15 @@ export function FreshAgentView({
     text: string
     level: 'info' | 'warning' | 'error'
     prominent?: boolean
-    codexProviderErrorIdentity?: string
+    sourceSessionKey?: string
+    codexProviderError?: boolean
   } | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
-  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', codexProviderErrorIdentity?: string) => {
+  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', sourceSessionKey?: string, codexProviderError = false) => {
     setNoticeState(current => {
       if (text === null) return null
-      if (current?.text === text && current.level === level && current.codexProviderErrorIdentity === codexProviderErrorIdentity) return current
-      return { text, level, ...(codexProviderErrorIdentity ? { codexProviderErrorIdentity } : {}) }
+      if (current?.text === text && current.level === level && current.sourceSessionKey === sourceSessionKey && Boolean(current.codexProviderError) === codexProviderError) return current
+      return { text, level, ...(sourceSessionKey ? { sourceSessionKey } : {}), ...(codexProviderError ? { codexProviderError } : {}) }
     })
   }, [])
   const deliveryNoticeRef = useRef<{ requestId: string; text: string } | null>(null)
@@ -4851,10 +4853,13 @@ export function FreshAgentView({
       || liveNotice.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
       || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR'
       || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
-    const codexProviderErrorIdentity = paneContent.provider === 'codex' && liveNotice.code === 'CODEX_PROVIDER_ERROR'
-      ? snapshotHydrationIdentity : undefined
-    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level, codexProviderErrorIdentity)
-  }, [liveNotice, paneContent.provider, setNotice, snapshotHydrationIdentity])
+    const codexProviderError = paneContent.provider === 'codex' && liveNotice.code === 'CODEX_PROVIDER_ERROR'
+    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level, liveSessionKey, codexProviderError)
+  }, [liveNotice, liveSessionKey, paneContent.provider, setNotice])
+  useLayoutEffect(() => {
+    if (!notice?.sourceSessionKey || !liveSessionKey || notice.sourceSessionKey === liveSessionKey) return
+    setNoticeState(current => current === notice ? null : current)
+  }, [notice, liveSessionKey])
   const rawUnattributedCodexError = paneContent.provider === 'codex'
     ? snapshot?.extensions?.codex?.unattributedProviderError : undefined
   const unattributedCodexError = codexDiagnostic?.identity === snapshotHydrationIdentity
@@ -4862,9 +4867,9 @@ export function FreshAgentView({
     : typeof rawUnattributedCodexError === 'string' && rawUnattributedCodexError.trim()
       ? rawUnattributedCodexError : undefined
   useEffect(() => {
-    if (!notice || notice.codexProviderErrorIdentity !== snapshotHydrationIdentity || notice.text !== unattributedCodexError) return
+    if (!notice?.codexProviderError || notice.sourceSessionKey !== liveSessionKey || notice.text !== unattributedCodexError) return
     setNoticeState(current => current === notice ? null : current)
-  }, [notice, snapshotHydrationIdentity, unattributedCodexError])
+  }, [notice, liveSessionKey, unattributedCodexError])
   const pendingCodexError = codexPendingDiagnostic?.identity === snapshotHydrationIdentity
     ? codexPendingDiagnostic.error
     : paneContent.provider === 'codex' ? readCodexPendingProviderError(snapshot?.extensions?.codex?.pendingProviderError) : null
@@ -5472,9 +5477,11 @@ export function FreshAgentView({
       ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{
         id: 'notice', summary: noticeSummary ?? notice.text,
         compactSummary: notice.level === 'warning' ? 'Warning' : 'Error', level: notice.level,
-        content: notice.level === 'error'
-          ? <FreshAgentApprovalBanner text={notice.text} onDismiss={() => setNoticeState(current => current === notice ? null : current)} />
-          : <p>{notice.text}</p>,
+        content: verboseNotice || uncertainDelivery || noticeExpanded
+          ? notice.level === 'error'
+            ? <FreshAgentApprovalBanner text={notice.text} announce={false} onDismiss={() => setNoticeState(current => current === notice ? null : current)} />
+            : <p>{notice.text}</p>
+          : null,
         onToggle: setNoticeExpanded,
       }] : []),
     { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), compactSummary: 'Codex error', content: (pendingCodexError ? (

@@ -414,7 +414,7 @@ describe('provider notices (transcript-live D6)', () => {
     },
   )
 
-  it('keeps a replacement diagnostic while its same reading surface stays open, then gives full close grace', async () => {
+  it('keeps a replacement error while reading and after closing, until dismissed', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()
     await mount(store)
@@ -431,6 +431,11 @@ describe('provider notices (transcript-live D6)', () => {
     await advance(5_999)
     expect(screen.getByRole('alert')).toHaveTextContent('Replacement error')
     await advance(2)
+    expect(screen.getByRole('alert')).toHaveTextContent('Replacement error')
+    details.open = true
+    fireEvent(details, new Event('toggle', { bubbles: true }))
+    await advance(0)
+    fireEvent.click(within(details).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText('Replacement error')).toBeNull()
   })
 
@@ -468,7 +473,7 @@ describe('provider notices (transcript-live D6)', () => {
     expect(screen.queryByText('New settings saved')).toBeNull()
   })
 
-  it('keeps expanded provider diagnostics until the user finishes reading', async () => {
+  it('keeps provider errors after reading until the user dismisses them', async () => {
     serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
     const store = createStore()
     await mount(store)
@@ -483,6 +488,12 @@ describe('provider notices (transcript-live D6)', () => {
     fireEvent.click(summary)
     await advance(0)
     await advance(6_001)
+    expect(summary).toBeVisible()
+    expect(summary).toHaveTextContent(message.slice(0, 160))
+    fireEvent.click(summary)
+    await advance(0)
+    expect(screen.getByText(message.trim())).toBeVisible()
+    fireEvent.click(within(summary.closest('details')!).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(message.trim())).not.toBeInTheDocument()
   })
 
