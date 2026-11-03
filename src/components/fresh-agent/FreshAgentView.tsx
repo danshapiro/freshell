@@ -952,7 +952,9 @@ type PaneNoticeSource = {
   codexProviderError?: boolean
 }
 
-function scopePaneNotice(notice: PaneNotice | null, liveSessionKey?: string, savedSessionKey?: string): PaneNotice | null {
+type DeliveryNotice = PaneNotice & { requestId: string }
+
+function scopePaneNotice<T extends PaneNotice>(notice: T | null, liveSessionKey?: string, savedSessionKey?: string): T | null {
   if (!notice?.sourceSessionKey) return notice
   if (notice.sourceSessionKey === liveSessionKey) {
     return !notice.sourceCanonicalSessionKey && savedSessionKey
@@ -1339,7 +1341,7 @@ export function FreshAgentView({
     previousTurns: readonly FreshAgentTurn[]
   }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
-  // Keep errors separate so later feedback cannot hide an unread failure.
+  // Keep error notices separate from informational and warning feedback.
   const [notice, setNoticeState] = useState<PaneNotice | null>(null)
   const [errorNotice, setErrorNoticeState] = useState<PaneNotice | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
@@ -1363,7 +1365,8 @@ export function FreshAgentView({
       }
     })
   }, [])
-  const deliveryNoticeRef = useRef<{ requestId: string; text: string } | null>(null)
+  const [deliveryNotice, setDeliveryNoticeState] = useState<DeliveryNotice | null>(null)
+  const deliveryNoticeRef = useRef<DeliveryNotice | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
   const openModelDialog = useCallback(() => setModelDialogOpen(true), [])
@@ -3388,6 +3391,12 @@ export function FreshAgentView({
           : notice
         setNoticeState(rekeyNotice)
         setErrorNoticeState(rekeyNotice)
+        const pendingDelivery = deliveryNoticeRef.current
+        if (pendingDelivery?.sourceSessionKey === previousNoticeSessionKey) {
+          const rekeyedDelivery = { ...pendingDelivery, sourceSessionKey: nextNoticeSessionKey, sourceCanonicalSessionKey: canonicalNoticeSessionKey }
+          deliveryNoticeRef.current = rekeyedDelivery
+          setDeliveryNoticeState(rekeyedDelivery)
+        }
         const nextContent = {
           ...current,
           sessionId: message.sessionId,
@@ -3492,9 +3501,10 @@ export function FreshAgentView({
           const deliveryNotice = deliveryNoticeRef.current
           if (deliveryNotice?.requestId === message.requestId) {
             deliveryNoticeRef.current = null
-            setNoticeState(currentNotice => currentNotice?.text === deliveryNotice.text
-              ? { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true }
-              : currentNotice)
+            setDeliveryNoticeState(null)
+            setNoticeState(currentNotice => currentNotice?.level === 'warning'
+              ? currentNotice
+              : { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true })
           }
           const outgoing = outgoingTurnRef.current
           if ((!echo || echo.requestId === message.requestId) && outgoing?.requestId === message.requestId) {
@@ -3630,9 +3640,29 @@ export function FreshAgentView({
           const failureNotice = ambiguous
             ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(message.message)}. Check the conversation before sending again.`
             : `Message not sent: ${sendFailureReason(message.message)}`
-          if (ambiguous) deliveryNoticeRef.current = { requestId: failedRequestId, text: failureNotice }
-          else if (deliveryNoticeRef.current?.requestId === failedRequestId) deliveryNoticeRef.current = null
-          setNotice(failureNotice)
+          if (ambiguous) {
+            const savedSessionId = (current.sessionRef?.provider === current.provider
+              ? current.sessionRef.sessionId : undefined) ?? current.resumeSessionId
+            const sourceSessionKey = current.sessionId ? makeFreshAgentSessionKey({
+              sessionId: current.sessionId, sessionType: current.sessionType, provider: current.provider,
+            }) : undefined
+            const sourceCanonicalSessionKey = savedSessionId ? makeFreshAgentSessionKey({
+              sessionId: savedSessionId, sessionType: current.sessionType, provider: current.provider,
+            }) : undefined
+            const pendingDelivery: DeliveryNotice = {
+              requestId: failedRequestId, text: failureNotice, level: 'warning',
+              ...(sourceSessionKey ? { sourceSessionKey } : {}),
+              ...(sourceCanonicalSessionKey ? { sourceCanonicalSessionKey } : {}),
+            }
+            deliveryNoticeRef.current = pendingDelivery
+            setDeliveryNoticeState(pendingDelivery)
+          } else {
+            if (deliveryNoticeRef.current?.requestId === failedRequestId) {
+              deliveryNoticeRef.current = null
+              setDeliveryNoticeState(null)
+            }
+            setNotice(failureNotice)
+          }
           log.warn(ambiguous ? 'fresh_agent.send_delivery_ambiguous' : 'fresh_agent.send_refused', {
             provider: current.provider,
             sessionType: current.sessionType,
@@ -4920,7 +4950,13 @@ export function FreshAgentView({
   useLayoutEffect(() => {
     setNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
     setErrorNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
-  }, [notice, errorNotice, liveSessionKey, savedNoticeSessionKey])
+    const currentDelivery = deliveryNoticeRef.current
+    const scopedDelivery = scopePaneNotice(currentDelivery, liveSessionKey, savedNoticeSessionKey)
+    if (scopedDelivery !== currentDelivery) {
+      deliveryNoticeRef.current = scopedDelivery
+      setDeliveryNoticeState(scopedDelivery)
+    }
+  }, [notice, errorNotice, deliveryNotice, liveSessionKey, savedNoticeSessionKey])
   const rawUnattributedCodexError = paneContent.provider === 'codex'
     ? snapshot?.extensions?.codex?.unattributedProviderError : undefined
   const unattributedCodexError = codexDiagnostic?.identity === snapshotHydrationIdentity
@@ -5143,7 +5179,7 @@ export function FreshAgentView({
       setNoticeExpanded(false)
       return
     }
-    if (notice.level === 'error' || noticeExpanded || notice.text === deliveryNoticeRef.current?.text) return
+    if (notice.level === 'error' || noticeExpanded) return
     const timer = window.setTimeout(() => {
       setNoticeState(current => current === notice ? null : current)
     }, 6000)
@@ -5538,18 +5574,20 @@ export function FreshAgentView({
       ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
     const verboseNotice = notice && isVerboseDiagnostic(notice.text)
-    const uncertainDelivery = Boolean(notice && notice.text === deliveryNoticeRef.current?.text)
-    const noticeSummary = uncertainDelivery
-      ? 'Check the conversation before sending again. Delivery is uncertain.'
-      : verboseNotice ? summarizeDiagnostic(notice.text) : notice?.text
+    const noticeSummary = verboseNotice ? summarizeDiagnostic(notice.text) : notice?.text
     const displayedTransientError = notice && notice.level !== 'info' && notice.text !== unattributedCodexError
     const verboseErrorNotice = errorNotice && isVerboseDiagnostic(errorNotice.text)
     const visibleErrors: FreshAgentError[] = [
+      ...(deliveryNotice ? [{
+        id: 'notice', renderKey: 'delivery-uncertain',
+        summary: 'Check the conversation before sending again. Delivery is uncertain.',
+        level: 'warning' as const, content: <p>{deliveryNotice.text}</p>,
+      }] : []),
       ...(displayedTransientError ? [{
-        id: 'notice', renderKey: 'transient-notice', summary: noticeSummary ?? notice.text,
+        id: deliveryNotice ? 'feedback-notice' : 'notice', renderKey: 'transient-notice', summary: noticeSummary ?? notice.text,
         compactSummary: notice.level === 'warning' ? 'Warning' : 'Error',
         level: notice.level === 'error' ? 'error' as const : 'warning' as const,
-        content: verboseNotice || uncertainDelivery || noticeExpanded
+        content: verboseNotice || noticeExpanded
           ? notice.level === 'error'
             ? <FreshAgentApprovalBanner text={notice.text} announce={false} onDismiss={() => setNoticeState(current => current === notice ? null : current)} />
             : <p>{notice.text}</p>
@@ -5557,7 +5595,7 @@ export function FreshAgentView({
         onToggle: setNoticeExpanded,
       }] : []),
       ...(errorNotice && errorNotice.text !== unattributedCodexError ? [{
-        id: displayedTransientError ? 'provider-error' : 'notice', renderKey: 'persistent-error-notice',
+        id: displayedTransientError || deliveryNotice ? 'provider-error' : 'notice', renderKey: 'persistent-error-notice',
         summary: verboseErrorNotice ? summarizeDiagnostic(errorNotice.text) : errorNotice.text,
         compactSummary: 'Error', level: 'error' as const,
         content: verboseErrorNotice || errorNoticeExpanded
@@ -5750,7 +5788,7 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null) },
-    ].filter(entry => entry.id === 'notice' || entry.id === 'provider-error' || Boolean(entry.content))
+    ].filter(entry => entry.id === 'notice' || entry.id === 'feedback-notice' || entry.id === 'provider-error' || Boolean(entry.content))
     const childParent: FreshAgentChildParent | undefined = paneContent.provider === 'codex' && paneContent.sessionType === 'freshcodex' && contextSessionId ? {
       provider: 'codex', sessionType: 'freshcodex', parentSessionId: effectiveSessionRef(paneContent)?.sessionId ?? snapshot?.threadId ?? contextSessionId,
       ...(runtimeOwnerEpoch !== undefined && runtimeOwnerGeneration !== undefined ? { observedEpoch: runtimeOwnerEpoch, observedGeneration: runtimeOwnerGeneration } : {}),
@@ -6125,6 +6163,7 @@ export function FreshAgentView({
     noticeExpanded,
     errorNotice,
     errorNoticeExpanded,
+    deliveryNotice,
     setNotice,
     ownerDivergence,
     attachTerminalOwnerHere,
