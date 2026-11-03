@@ -2986,7 +2986,7 @@ export async function dispatchOwnedExternalBrowser(
     }
     const cleanup = await owner.finish()
     if (!cleanup.ok || cleanup.errors.length) throw new Error('owned external cleanup failed')
-    if (owner.publishOriginals) counts.originals = [owner.publishOriginals(selected, results)]
+    if (owner.publishOriginals && !localSandbox) counts.originals = [owner.publishOriginals(selected, results)]
     return counts
   } catch (error) {
     let cleanup: { ok: boolean; errors: string[] }
