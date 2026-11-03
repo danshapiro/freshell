@@ -8865,10 +8865,15 @@ async fn handle_pane_reconcile(
     // design, and `snapshot().await` on a truly cold index runs the sweep
     // inline for potentially minutes — unbounded, so unusable here). The
     // honest expectation stands: a truly cold scan takes far longer than the
-    // budget, so `error{index_warming}` is EXPECTED on cold boots and the
-    // client's manual retry affordance is the recovery path. The stall is
-    // delay-only and scoped to THIS connection's select loop, bounded by the
-    // budget (default 2000ms, shrunk in tests).
+    // budget, so `error{index_warming}` is EXPECTED on cold boots — and the
+    // recovery path is the client's readiness-driven driver (auto-restore-
+    // warming, kata freshell#vnpc), not a manual Retry click: a client that
+    // negotiated `sessionIndexReadyV1` learns readiness from the
+    // `ready.sessionIndexReady` handshake state or the once-per-boot
+    // `sessions.index.ready` broadcast and re-issues the reconcile for its
+    // parked panes with bounded dedup retries. The stall is delay-only and
+    // scoped to THIS connection's select loop, bounded by the budget
+    // (default 2000ms, shrunk in tests).
     let is_index_warming = |v: &freshell_protocol::PaneVerdict| {
         matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
             && v.reason.as_deref() == Some("index_warming")
