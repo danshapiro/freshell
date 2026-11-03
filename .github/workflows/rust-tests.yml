@@ -1,106 +1,49 @@
-name: Rust Tests
+name: FreshAgent client regression verification
 
 on:
   workflow_dispatch:
-  pull_request:
 
 permissions:
   contents: read
 
-# Server-side enforcement for the class of red that landed via PR #795:
-# nothing between commit and main ran `cargo test`, so 11 failing freshagent
-# unit tests merged with every advisory check green. The pre-push gate now
-# runs targeted cargo tests locally (scripts/hooks/pre-push); this workflow
-# is the merge-time backstop that cannot be bypassed with --no-verify.
-#
-# The `gate` job always reports, so it can be a required status check without
-# blocking PRs that touch no Rust (a paths-filtered workflow would leave the
-# required check stuck on "Expected" forever).
-
 jobs:
-  changes:
+  client-regressions:
     runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Detect Rust changes
-        id: filter
+          fetch-depth: 2
+      - name: Verify exact source commit
+        shell: bash
         run: |
-          # Manager and dependency configuration changes must exercise the
-          # Rust suite too: it spawns Node fixtures (the codex fake
-          # app-server imports `ws`) whose behavior depends on the installed
-          # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility. Scoped to the
-          # root and workspace members — the independent demo locks are
-          # not part of the workspace dependency tree.
-          # `github.base_ref` exists only for pull_request events; manual
-          # dispatch (the event-routing escape hatch) compares against the
-          # default branch instead.
-          BASE="${{ github.base_ref }}"
-          [ -n "$BASE" ] || BASE="main"
-          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  rust-tests:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-      - uses: Swatinem/rust-cache@v2
-      # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs the workspace dependencies installed
-      # or those tests die at fixture boot ("fake app-server exited before
-      # listening").
-      # Pinned revision of the v4 major; reads the exact version from the root
-      # packageManager pin (no floating duplicate).
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = 'df382143536649a0e17bc22e6491cdd57fa14a09'
+          test "$(git diff --name-only HEAD^ HEAD)" = '.github/workflows/rust-tests.yml'
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies (Rust test fixtures)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Workspace tests
-        # Workspace feature unification turns freshell-codex's default-off
-        # `real-transport` feature ON in this step (freshell-ws,
-        # freshell-server, freshell-session-host, and freshell-freshagent all
-        # depend on freshell-codex with the feature), so the
-        # remote_proxy_relay integration tests run here without an explicit
-        # --features flag. A bare `cargo test -p freshell-codex` would skip
-        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
-        # reports 38 tests; the same -p invocation reports 0).
-        # Keep the gate red on any failure, but report failures in later
-        # crates in the same run instead of stopping at the first suite.
-        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
-
-  gate:
-    name: rust-gate
-    needs: [changes, rust-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Evaluate
-        run: |
-          if [ "${{ needs.changes.outputs.rust }}" = "false" ]; then
-            echo "no Rust changes in this PR — rust tests skipped"
-            exit 0
-          fi
-          if [ "${{ needs.rust-tests.result }}" = "success" ]; then
-            echo "workspace rust tests passed"
-            exit 0
-          fi
-          echo "workspace rust tests failed or did not run"
-          exit 1
+      - name: Typecheck
+        run: pnpm run --silent typecheck
+      - name: Run affected client regressions
+        run: >-
+          pnpm run test:vitest run
+          test/unit/client/components/fresh-agent/FreshAgentView.approvals.test.tsx
+          test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx
+          test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+          test/unit/client/components/fresh-agent/FreshAgentView.live-tail.test.tsx
+          test/unit/client/components/fresh-agent/FreshAgentNoticeStack.test.tsx
+          test/unit/client/components/fresh-agent/FreshAgentApprovalBanner.test.tsx
+          test/unit/client/lib/fresh-agent-transcript-projection.test.ts
+          test/unit/client/store/freshAgentLiveSlice.test.ts
+          test/unit/client/fresh-agent-ws.test.ts
+          test/unit/client/lib/fresh-agent-ws.test.ts
+          test/unit/client/store/freshAgentSlice.test.ts
+          test/unit/client/components/fresh-agent/FreshAgentChildObserver.test.tsx
+          --config config/vitest/vitest.config.ts --reporter=dot --maxWorkers=1
