@@ -10,7 +10,16 @@ afterEach(() => {
   for (const root of fixtureRoots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-function runCloudVitestWrapper(captureEnabled: boolean): string {
+function getUpdateEnvVarsValue(args: string[]): string | undefined {
+  const flag = '--update-env-vars'
+  const flagIndex = args.findIndex(argument => argument === flag || argument.startsWith(`${flag}=`))
+  if (flagIndex < 0) return undefined
+
+  const flagArgument = args[flagIndex]
+  return flagArgument === flag ? args[flagIndex + 1] : flagArgument.slice(flag.length + 1)
+}
+
+function runCloudVitestWrapper(captureEnabled: boolean): string[] {
   const tempRoot = path.resolve('.test-tmp')
   mkdirSync(tempRoot, { recursive: true })
   const root = mkdtempSync(path.join(tempRoot, 'vitest-cloud-capture-env-'))
@@ -18,13 +27,17 @@ function runCloudVitestWrapper(captureEnabled: boolean): string {
   const bin = path.join(root, 'bin')
   const log = path.join(root, 'gcloud.log')
   mkdirSync(bin)
+  writeFileSync(log, '')
 
   const fakeGcloud = path.join(bin, 'gcloud')
   writeFileSync(fakeGcloud, `#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$FAKE_GCLOUD_LOG"
 if [[ "$*" == *"auth print-access-token"* ]]; then echo fake-token; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo /usr/lib/google-cloud-sdk; exit 0; fi
-if [[ "$*" == *"run jobs execute"* ]]; then echo 'Execution [capture-test] has successfully completed.'; exit 0; fi
+if [[ "$1" == "run" && "$2" == "jobs" && "$3" == "execute" ]]; then
+  printf '%s\\0' "$@" >> "$FAKE_GCLOUD_LOG"
+  echo 'Execution [capture-test] has successfully completed.'
+  exit 0
+fi
 if [[ "$*" == *"logs read"* ]]; then echo 'Test Files  1 passed (1)'; exit 0; fi
 if [[ "$*" == *"executions describe"* ]]; then
   if [[ "$*" == *"succeededCount"* ]]; then echo 1; else echo 0; fi
@@ -57,15 +70,21 @@ exit 0
     throw new Error(`Cloud wrapper exited ${result.status}: ${result.stdout}\n${result.stderr}`)
   }
 
-  return readFileSync(log, 'utf8').split('\n').find(line => line.includes('run jobs execute')) ?? ''
+  const args = readFileSync(log, 'utf8').split('\0')
+  if (args.at(-1) === '') args.pop()
+  return args
 }
 
 describe('Cloud Vitest capture environment', () => {
   it('forwards the native Codex capture opt-in only when requested', () => {
     const enabledArgs = runCloudVitestWrapper(true)
-    expect(enabledArgs).toContain('FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT=1')
+    const enabledUpdateEnvVars = getUpdateEnvVarsValue(enabledArgs)
+    expect(enabledUpdateEnvVars).toBeDefined()
+    expect(enabledUpdateEnvVars).toContain('FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT=1')
 
     const disabledArgs = runCloudVitestWrapper(false)
-    expect(disabledArgs).not.toContain('FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT')
+    const disabledUpdateEnvVars = getUpdateEnvVarsValue(disabledArgs)
+    expect(disabledUpdateEnvVars).toBeDefined()
+    expect(disabledUpdateEnvVars).not.toContain('FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT')
   })
 })
