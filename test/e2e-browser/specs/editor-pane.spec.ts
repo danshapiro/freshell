@@ -1,3 +1,4 @@
+import type { Page, Route } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Editor Pane', () => {
@@ -11,15 +12,20 @@ test.describe('Editor Pane', () => {
     )
   }
 
-  async function delayFirstNewScriptRequest(page: any) {
+  async function delayFirstNewScriptRequest(page: Page) {
     const loadedScriptUrls = await getLoadedScriptUrls(page)
     let delayedUrl: string | null = null
+    let release!: () => void
+    let acknowledgeRequest!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const requested = new Promise<void>(resolve => { acknowledgeRequest = resolve })
 
-    const routeHandler = async (route: any) => {
+    const routeHandler = async (route: Route) => {
       const url = route.request().url()
       if (!delayedUrl && !loadedScriptUrls.has(url)) {
         delayedUrl = url
-        await new Promise((resolve) => setTimeout(resolve, 250))
+        acknowledgeRequest()
+        await held
       }
       await route.continue()
     }
@@ -28,19 +34,27 @@ test.describe('Editor Pane', () => {
 
     return {
       delayedUrl: () => delayedUrl,
+      requested,
+      release,
       cleanup: async () => {
+        release()
         await page.unroute('**/*.js*', routeHandler)
       },
     }
   }
 
-  async function waitForEditorPane(page: any, openEditor: () => Promise<unknown>) {
+  async function waitForEditorPane(
+    page: Page,
+    openEditor: () => Promise<unknown>,
+    chunk: Awaited<ReturnType<typeof delayFirstNewScriptRequest>>,
+  ) {
     const loadingShell = page.locator('[data-testid="editor-pane-loading"]')
     const editorPane = page.locator('[data-testid="editor-pane"]')
 
-    const openPromise = openEditor()
+    await openEditor()
+    await chunk.requested
     await expect(loadingShell).toBeVisible({ timeout: 10_000 })
-    await openPromise
+    chunk.release()
     await expect(editorPane).toBeVisible({ timeout: 15_000 })
     await expect(loadingShell).toBeHidden({ timeout: 15_000 })
   }
@@ -58,7 +72,7 @@ test.describe('Editor Pane', () => {
     await expect(editorButton).toBeVisible({ timeout: 10_000 })
     const delayedChunk = await delayFirstNewScriptRequest(page)
     try {
-      await waitForEditorPane(page, () => editorButton.click())
+      await waitForEditorPane(page, () => editorButton.click(), delayedChunk)
       expect(delayedChunk.delayedUrl()).toBeTruthy()
     } finally {
       await delayedChunk.cleanup()
@@ -106,11 +120,14 @@ test.describe('Editor Pane', () => {
     page.on('request', requestListener)
     const delayedChunk = await delayFirstNewScriptRequest(page)
     try {
-      await waitForEditorPane(page, () => editorButton.click())
+      await waitForEditorPane(page, () => editorButton.click(), delayedChunk)
 
       expect(delayedChunk.delayedUrl()).toBeTruthy()
       expect(jsRequestsAfterClick.length).toBeGreaterThan(0)
-      await expect(page.locator('[data-testid="editor-pane"]')).toHaveScreenshot('editor-pane-loaded.png')
+      // This contract is lazy loading, not the host's system-font rasterizer.
+      // Keep the loading and loaded states observable through their real UI.
+      await expect(page.getByPlaceholder('Enter file path...')).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Open File', exact: true })).toBeVisible()
     } finally {
       await delayedChunk.cleanup()
       page.off('request', requestListener)

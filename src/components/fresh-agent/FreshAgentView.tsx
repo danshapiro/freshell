@@ -1250,6 +1250,16 @@ export function FreshAgentView({
   // suppressed attach restores the previous value so it does NOT consume the
   // latch.
   const restoreUnavailableRecoveryRef = useRef<string | null>(null)
+  // A refusal-fence generation change also reruns the snapshot effect. When
+  // that happens before the recovery handler's explicit refresh update, skip
+  // that owner-only effect pass so the recovery still performs one GET. If
+  // the explicit update is already committed, the changed refresh serial lets
+  // the effect proceed normally (including when React batches both updates).
+  const pendingRefusalFenceRefreshRef = useRef<{
+    recoveryKey: string
+    refreshSerial: number
+    ownerGeneration: number
+  } | null>(null)
   // Non-null while the snapshot key is rate-limited (429/backoff): the last
   // good snapshot stays visible and a single retry is armed at expiry.
   // Task 17 also consumes this for the snapshot `trigger` query param.
@@ -3599,6 +3609,21 @@ export function FreshAgentView({
   }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, setNotice, tabId, ws])
 
   useEffect(() => {
+    const pendingRefusalFenceRefresh = pendingRefusalFenceRefreshRef.current
+    if (pendingRefusalFenceRefresh) {
+      const currentRecoveryKey = snapshotThreadId
+        ? `${paneContent.createRequestId}:${snapshotThreadId}`
+        : null
+      const currentOwnerFence = selectPaneOwnerFence(appStore.getState(), paneContent)
+      const refusalFenceOnlyRefresh = pendingRefusalFenceRefresh.recoveryKey === currentRecoveryKey
+        && currentOwnerFence?.generation === pendingRefusalFenceRefresh.ownerGeneration
+        && snapshotRefreshSerialRef.current === pendingRefusalFenceRefresh.refreshSerial
+      pendingRefusalFenceRefreshRef.current = null
+      if (refusalFenceOnlyRefresh) {
+        recordSnapshotAudit('effect_skipped', () => ({ reason: 'refusal_fence_refresh_coalesced' }))
+        return
+      }
+    }
     if (!snapshotThreadId) {
       recordSnapshotAudit('effect_skipped', () => ({ reason: 'no_thread' }))
       return
@@ -4055,7 +4080,15 @@ export function FreshAgentView({
           && restoreUnavailableRecoveryRef.current !== recoveryKey
         ) {
           const previousRecoveryKey = restoreUnavailableRecoveryRef.current
+          const ownerFenceBeforeRefusal = selectPaneOwnerFence(appStore.getState(), fresh)
           restoreUnavailableRecoveryRef.current = recoveryKey
+          if (ownerFenceBeforeRefusal && refusalOwnerGeneration > ownerFenceBeforeRefusal.generation) {
+            pendingRefusalFenceRefreshRef.current = {
+              recoveryKey,
+              refreshSerial: snapshotRefreshSerialRef.current,
+              ownerGeneration: refusalOwnerGeneration,
+            }
+          }
           // Bind the fence to the 409's CURRENT generation — refresh the
           // observed owner fence from the refusal itself (the refusal names
           // the coordinator's live generation; the record's epoch is
@@ -4096,6 +4129,11 @@ export function FreshAgentView({
           // refetch — restore the latch and fall through to the honest error
           // surfaces below.
           restoreUnavailableRecoveryRef.current = previousRecoveryKey
+          // No recovery refresh follows a suppressed attach, so the fence
+          // update must not suppress a later unrelated snapshot effect.
+          if (pendingRefusalFenceRefreshRef.current?.recoveryKey === recoveryKey) {
+            pendingRefusalFenceRefreshRef.current = null
+          }
         }
         // Recovery already attempted for this identity (or the refusal
         // carried no fenceable generation): do NOT clear errors and do NOT

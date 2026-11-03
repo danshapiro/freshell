@@ -28,6 +28,11 @@ const providers = [
   { provider: 'opencode', sessionType: 'freshopencode', config: 'custom-xdg/opencode/opencode.jsonc' },
 ] as const
 
+// Native name synchronization allows retries no sooner than 5s and then
+// 30s after the first two failed cycles. Include one 20s Codex metadata
+// request and worker scheduling margin for the final attempt.
+const NATIVE_NAME_SYNC_TIMEOUT_MS = 60_000
+
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -109,7 +114,7 @@ describe('hosted fresh-agent provider inputs', () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
     workspace = path.join(homeDir, 'workspace')
     fs.mkdirSync(workspace)
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     onecli = fakeOnecliGrants(providers.map(row => row.provider))
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     const xdgConfigHome = path.join(homeDir, 'custom-xdg')
@@ -433,7 +438,7 @@ describe('installed Codex through the managed gateway and durable actor', () => 
     fs.mkdirSync(path.join(workspace, '.agents'))
     fs.mkdirSync(path.join(workspace, '.codex'))
     fs.writeFileSync(path.join(workspace, 'child-input.txt'), 'managed-child-command-ran\n')
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     const xdg = path.join(home, 'xdg')
     prepareProviderParityUserRoots(home, xdg)
     grants = fakeOnecliGrants(['codex'])
@@ -661,9 +666,21 @@ tool_timeout_sec = 120
       const publicApiCounts = { total: apiRequests.length,
         byRoute: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.route] = (counts[row.route] ?? 0) + 1; return counts }, {}),
         byStatus: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.status] = (counts[row.status] ?? 0) + 1; return counts }, {}) }
+      const relevantNativeNameLogs = (output: string) => output.split('\n')
+        .filter(line => /freshagent\.native_name_refused|freshagent\.codex\.native_name_failed|session_names\.native_route_unavailable/i.test(line))
+        .slice(-100)
+      const captureNativeNameLogs = (capture: () => string) => {
+        try { return relevantNativeNameLogs(capture()) }
+        catch (error) { return [`capture_failed: ${String(error).slice(0, 500)}`] }
+      }
+      const nativeNameDiagnostics = {
+        supervisorLifecycle: captureNativeNameLogs(() =>
+          fs.readFileSync(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8')),
+      }
       return { created, initialView: view, currentViews, nativeContext, final,
         fixtureContext: model?.context, traffic, sentControls: wire.sentControls, frames: wire.frames,
-        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, ownedHostEvidence: ownedHostEvidence() }
+        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, nativeNameDiagnostics,
+        ownedHostEvidence: ownedHostEvidence() }
     }
     const catalogResponse = await fetch(`${rig.info.baseUrl}/api/fresh-agent/model-capabilities/freshcodex?${new URLSearchParams({ sessionId: created.sessionId, sessionRef: JSON.stringify(created.sessionRef), cwd: workspace })}`, { headers })
     expect(catalogResponse.ok, await catalogResponse.clone().text()).toBe(true)
@@ -701,19 +718,17 @@ tool_timeout_sec = 120
     })
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
-    const contextualAnswer = 'Question: Which managed environment? Answer: Staging.'
-    await send(contextualAnswer, { effort: null })
+    const contextualAnswer = await send('Question: Which managed environment? Answer: Staging.', { effort: null })
+    expect(contextualAnswer.submittedTurnId).toBeTruthy()
     await waitFor('managed contextual answer at loopback model', async () => (await model!.readTraffic()).some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
-    const contextualTurnId = await waitFor('managed contextual answer completion', async () => {
-      const value = await snapshot()
-      const turn = value.turns.find((turn: any) => turn.role === 'user'
-        && turn.items?.some((item: any) => item.text === contextualAnswer))
-      return value.status === 'idle' && turn?.nativeTurnId ? turn.nativeTurnId as string : undefined
-    })
+    const contextualTurnId = contextualAnswer.submittedTurnId
     const contextualCompletion = await wire.wait(frame => frame.type === 'freshAgent.event'
-      && frame.provider === 'codex' && frame.sessionType === 'freshcodex' && frame.sessionId === created.sessionId
-      && frame.event?.type === 'freshAgent.transcript.patch' && frame.event.sessionId === created.sessionId
-      && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === contextualTurnId && op.status === 'completed'))
+      && frame.event?.type === 'freshAgent.transcript.patch'
+      && frame.provider === 'codex'
+      && frame.sessionType === 'freshcodex'
+      && frame.event.ops?.some((operation: any) => operation.op === 'settleTurn'
+        && operation.nativeTurnId === contextualTurnId
+        && operation.status === 'completed'))
     const adoptionFrameCursor = wire.frames.length
     const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
@@ -771,13 +786,23 @@ tool_timeout_sec = 120
     }
     expect((await inspectNativeContext()).pid).toBe(nativeContext.pid)
     const durableNameRef = { kind: 'session', provider: 'codex', sessionId: view.nativeSessionId }
-    const readNameFor = async (ref: unknown) => {
+    const readNameUpdateFor = async (ref: unknown) => {
       const response = await observeRead('/api/session-names/read', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify({ refs: [ref] }) })
       expect(response.ok, `name read ${response.status}: ${await response.clone().text()}`).toBe(true)
-      return (await response.json()).names[0]?.record
+      return (await response.json()).names[0]
     }
+    const readNameFor = async (ref: unknown) => (await readNameUpdateFor(ref))?.record
     const readName = () => readNameFor(durableNameRef)
+    const waitForNativeNameSync = (ref: unknown, expected: any, label: string) => waitFor(label, async () => {
+      const update = await readNameUpdateFor(ref)
+      return update?.record?.revision === expected.revision
+        && update.record.name === expected.name
+        && update.nativeSync?.status === 'synced'
+        && update.nativeSync.desiredRevision === expected.revision
+        ? update
+        : undefined
+    }, NATIVE_NAME_SYNC_TIMEOUT_MS)
     const nativeMetadata = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path');
       const env=Object.fromEntries(fs.readFileSync('/proc/${nativeContext.pid}/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
@@ -834,6 +859,7 @@ tool_timeout_sec = 120
         if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
     const nativeNameBeforeWait = await readNativeName()
     rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
+    await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization')
     await waitFor('managed native name writeback', async () => {
       const observation = await readNativeName()
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
@@ -1079,11 +1105,14 @@ tool_timeout_sec = 120
       headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ target: recoveredNameRef,
         name: 'Managed recovered saved name', nameIntent: 'user' }) })
     expect(renamedRecovery.ok, await renamedRecovery.clone().text()).toBe(true)
+    const recoveredCanonicalName = await readNameFor(recoveredNameRef)
+    expect(recoveredCanonicalName).toMatchObject({ ref: recoveredNameRef, name: 'Managed recovered saved name', source: 'manual' })
     rig.runtime.writeIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
       oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await readName(), firstNewName: recoveredName,
       manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archiveManifest })
     const recoveredNativeContext = await inspectNativeContext()
     expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
+    await waitForNativeNameSync(recoveredNameRef, recoveredCanonicalName, 'recovered native name synchronization')
     await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
     const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)

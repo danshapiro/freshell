@@ -4,6 +4,7 @@ import savedCodexNativeHistory from '../../../../fixtures/managed-native-history
 import savedOpenCodeNativeHistory from '../../../../fixtures/managed-native-history/opencode.json'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { lazy, Suspense } from 'react'
+import { flushSync } from 'react-dom'
 import userEvent from '@testing-library/user-event'
 import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
@@ -12,7 +13,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
 import freshAgentLiveReducer from '@/store/freshAgentLiveSlice'
-import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRefusalFence, applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
@@ -416,6 +417,15 @@ function createStore(tabTitleSetByUser = false, extraMiddleware: Middleware[] = 
       },
     },
   })
+}
+
+function createSynchronousRefusalFenceMiddleware(): Middleware {
+  return () => (next) => (action) => {
+    if (!applyRefusalFence.match(action)) return next(action)
+    let result: unknown
+    flushSync(() => { result = next(action) })
+    return result
+  }
 }
 
 function StoreBackedFreshAgentView({
@@ -3686,79 +3696,90 @@ describe('FreshAgentView', () => {
   // LB-09: the mount attach already sends ONE freshAgent.attach on mount, so a
   // bare length assertion is vacuous — read the baseline AFTER the mount
   // settles and assert the POST-409 delta.
-  it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and a refetch', async () => {
-    const store = createStore()
-    // Seed the runtime-owner record and make the 409 name a NEWER generation —
-    // the recovery attach MUST carry the 409's generation (fence bound to the
-    // refusal, not the possibly-stale record), or the wired server refuses it
-    // with FENCE_REQUIRED and the dead-end persists.
-    store.dispatch(applyRuntimeOwner({
-      type: 'session.runtimeOwner',
-      provider: 'opencode',
-      sessionId: 'ses_live',
-      epoch: 1,
-      generation: 1,
-      ownerKind: 'fresh-agent',
-      operationId: 'incident-live-claim',
-      transition: 'handoff-committed',
-    }))
-    // DEFER the first rejection until after the baseline is read — an
-    // immediately-rejected mock races the mount fetch (the recovery attach may
-    // land before the test snapshots the count).
-    let rejectFirstSnapshot!: (error: unknown) => void
-    apiMock.getFreshAgentThreadSnapshot
-      .mockImplementationOnce(() => new Promise<never>((_, reject) => {
-        rejectFirstSnapshot = reject
-      }))
-      .mockResolvedValue({
-        ...freshopencodeSnapshot('recovered transcript', 7),
-        threadId: 'ses_live',
-        sessionId: 'ses_live',
-      })
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshopencode',
+  it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and one refetch across separate owner updates', async () => {
+    vi.useFakeTimers()
+    try {
+      // Keep the store commit separate from the handler's explicit refresh so
+      // batching cannot hide a duplicate generation-triggered snapshot GET.
+      const store = createStore(false, [createSynchronousRefusalFenceMiddleware()])
+      // Seed the runtime-owner record and make the 409 name a NEWER generation —
+      // the recovery attach MUST carry the 409's generation (fence bound to the
+      // refusal, not the possibly-stale record), or the wired server refuses it
+      // with FENCE_REQUIRED and the dead-end persists.
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
         provider: 'opencode',
-        createRequestId: 'req-live-409',
         sessionId: 'ses_live',
-        sessionRef: { provider: 'opencode', sessionId: 'ses_live' },
-        status: 'connected',
-      },
-    }))
-
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
-    // The mount attach, settled (LB-09 baseline).
-    const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
-    expect(attachCountBeforeRecovery).toBe(1)
-    await act(async () => {
-      rejectFirstSnapshot(new ApiError(409, 'Session ses_live is still running on the server.', {
-        code: 'RESTORE_UNAVAILABLE',
+        epoch: 1,
+        generation: 1,
         ownerKind: 'fresh-agent',
-        ownerGeneration: 2,
+        operationId: 'incident-live-claim',
+        transition: 'handoff-committed',
       }))
-    })
-    await waitFor(() => {
+      // DEFER the first rejection until after the baseline is read — an
+      // immediately-rejected mock races the mount fetch (the recovery attach may
+      // land before the test snapshots the count).
+      let rejectFirstSnapshot!: (error: unknown) => void
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => new Promise<never>((_, reject) => {
+          rejectFirstSnapshot = reject
+        }))
+        .mockResolvedValue({
+          ...freshopencodeSnapshot('recovered transcript', 7),
+          threadId: 'ses_live',
+          sessionId: 'ses_live',
+        })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-live-409',
+          sessionId: 'ses_live',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_live' },
+          status: 'connected',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      // The mount attach, settled (LB-09 baseline).
+      const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
+      expect(attachCountBeforeRecovery).toBe(1)
+      await act(async () => {
+        rejectFirstSnapshot(new ApiError(409, 'Session ses_live is still running on the server.', {
+          code: 'RESTORE_UNAVAILABLE',
+          ownerKind: 'fresh-agent',
+          ownerGeneration: 2,
+        }))
+        await Promise.resolve()
+      })
       expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
       const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
       expect(recoveryAttach?.observedEpoch).toBe(1) // the record's epoch
       expect(recoveryAttach?.observedGeneration).toBe(2) // the 409's CURRENT generation, not the stale record's 1
-    })
-    await waitFor(() => {
-      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
-    })
-    // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
-    expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_live')
-    expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-live-409')
-    // And no dead-end banner for the recovered pane:
-    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+      // Drain the recovery run and one possible scheduler trailing slot.
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS * 2) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // mount + exactly one recovery refetch
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.map(([, , , options]) => options?.trigger))
+        .toEqual(['identity', 'manual'])
+      // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
+      expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_live')
+      expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-live-409')
+      // And no dead-end banner for the recovered pane:
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 
   // Task 5 review M2: a pane holding a superseded (alias) session id must
@@ -3767,90 +3788,122 @@ describe('FreshAgentView', () => {
   // through the stored aliasOf chain. Folding the pane's RAW id lands on the
   // inert alias mirror, the attach goes out with the canonical record's
   // STALE generation, and the wired server refuses it with FENCE_REQUIRED.
-  it('recovers an aliased freshopencode pane from a snapshot 409 by folding the refusal onto the canonical owner record', async () => {
-    const store = createStore()
-    store.dispatch(applyRuntimeOwner({
-      type: 'session.runtimeOwner',
-      provider: 'opencode',
-      sessionId: 'ses_canonical',
-      epoch: 1,
-      generation: 1,
-      ownerKind: 'fresh-agent',
-      operationId: 'incident-live-claim',
-      transition: 'handoff-committed',
-    }))
-    // The rekey alias mirror (selectors-runtime-owner seeding pattern): the
-    // pane's superseded id resolves through the stored aliasOf chain to the
-    // canonical key.
-    store.dispatch(applyRuntimeOwner({
-      type: 'session.runtimeOwner',
-      provider: 'opencode',
-      sessionId: 'ses_alias',
-      epoch: 1,
-      generation: 1,
-      ownerKind: 'fresh-agent',
-      operationId: 'rekey-mirror',
-      transition: 'handoff-committed',
-      aliasOf: 'ses_canonical',
-    }))
-    let rejectFirstSnapshot!: (error: unknown) => void
-    apiMock.getFreshAgentThreadSnapshot
-      .mockImplementationOnce(() => new Promise<never>((_, reject) => {
-        rejectFirstSnapshot = reject
-      }))
-      .mockResolvedValue({
-        ...freshopencodeSnapshot('recovered transcript', 7),
-        threadId: 'ses_alias',
-        sessionId: 'ses_alias',
-      })
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshopencode',
+  it('recovers an aliased freshopencode pane from a snapshot 409 once and refreshes after a later owner generation change', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore(false, [createSynchronousRefusalFenceMiddleware()])
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
         provider: 'opencode',
-        createRequestId: 'req-alias-409',
-        sessionId: 'ses_alias',
-        sessionRef: { provider: 'opencode', sessionId: 'ses_alias' },
-        status: 'connected',
-      },
-    }))
-
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
-    // The mount attach, settled (LB-09 baseline).
-    const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
-    expect(attachCountBeforeRecovery).toBe(1)
-    await act(async () => {
-      rejectFirstSnapshot(new ApiError(409, 'Session ses_alias is still running on the server.', {
-        code: 'RESTORE_UNAVAILABLE',
+        sessionId: 'ses_canonical',
+        epoch: 1,
+        generation: 1,
         ownerKind: 'fresh-agent',
-        ownerGeneration: 2,
+        operationId: 'incident-live-claim',
+        transition: 'handoff-committed',
       }))
-    })
-    await waitFor(() => {
+      // The rekey alias mirror (selectors-runtime-owner seeding pattern): the
+      // pane's superseded id resolves through the stored aliasOf chain to the
+      // canonical key.
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId: 'ses_alias',
+        epoch: 1,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'rekey-mirror',
+        transition: 'handoff-committed',
+        aliasOf: 'ses_canonical',
+      }))
+      let rejectFirstSnapshot!: (error: unknown) => void
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => new Promise<never>((_, reject) => {
+          rejectFirstSnapshot = reject
+        }))
+        .mockResolvedValue({
+          ...freshopencodeSnapshot('recovered transcript', 7),
+          threadId: 'ses_alias',
+          sessionId: 'ses_alias',
+        })
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-alias-409',
+          sessionId: 'ses_alias',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_alias' },
+          status: 'connected',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      // The mount attach, settled (LB-09 baseline).
+      const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
+      expect(attachCountBeforeRecovery).toBe(1)
+      await act(async () => {
+        rejectFirstSnapshot(new ApiError(409, 'Session ses_alias is still running on the server.', {
+          code: 'RESTORE_UNAVAILABLE',
+          ownerKind: 'fresh-agent',
+          ownerGeneration: 2,
+        }))
+        await Promise.resolve()
+      })
       expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
       const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
       expect(recoveryAttach?.observedEpoch).toBe(1) // the canonical record's epoch
       expect(recoveryAttach?.observedGeneration).toBe(2) // the 409's CURRENT generation, not the canonical record's stale 1
-    })
-    // The fold landed on the CANONICAL record; the alias mirror stays inert.
-    const owners = store.getState().freshAgent.runtimeOwners
-    expect(owners['opencode:ses_canonical'].generation).toBe(2)
-    expect(owners['opencode:ses_alias'].generation).toBe(1)
-    await waitFor(() => {
-      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
-    })
-    // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
-    expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_alias')
-    expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-alias-409')
-    // And no dead-end banner for the recovered pane:
-    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+      // Drain the recovery run and one possible scheduler trailing slot before
+      // counting calls, so a delayed duplicate cannot arrive after the assertion.
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS * 2) })
+
+      // The fold landed on the CANONICAL record; the alias mirror stays inert.
+      const owners = store.getState().freshAgent.runtimeOwners
+      expect(owners['opencode:ses_canonical'].generation).toBe(2)
+      expect(owners['opencode:ses_alias'].generation).toBe(1)
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.map(([, , , options]) => options?.trigger))
+        .toEqual(['identity', 'manual']) // exactly one recovery refetch, after the identity read
+      // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
+      expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_alias')
+      expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-alias-409')
+      // And no dead-end banner for the recovered pane:
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+      // A genuinely newer canonical generation must still cause a read; the
+      // refusal coalescing marker must not hide later owner changes.
+      await act(async () => {
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'opencode',
+          sessionId: 'ses_canonical',
+          epoch: 1,
+          generation: 3,
+          ownerKind: 'fresh-agent',
+          operationId: 'later-canonical-owner-transition',
+          transition: 'handoff-committed',
+        }))
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS * 2) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.map(([, , , options]) => options?.trigger))
+        .toEqual(['identity', 'manual', 'manual'])
+      expect(store.getState().freshAgent.runtimeOwners['opencode:ses_canonical'].generation).toBe(3)
+      expect(store.getState().freshAgent.runtimeOwners['opencode:ses_alias'].generation).toBe(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 
   it('does not loop recovery fetches on repeated 409s', async () => {
@@ -10088,7 +10141,7 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
 
-    expect(screen.getByRole('menu', { name: 'Slash commands' })).toBeInTheDocument()
+    expect(await screen.findByRole('menu', { name: 'Slash commands' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: /\/new/i })).toHaveTextContent('Start a new conversation')
     expect(screen.getByRole('menuitem', { name: /\/compact/i })).toHaveTextContent('compact')
     expect(screen.queryByText('/reset')).not.toBeInTheDocument()
@@ -19030,23 +19083,29 @@ describe('task6 late retained source after native replacement', () => {
     apiMock.getFreshAgentThreadSnapshot.mockReturnValue(refresh.promise)
     const retained = {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.backpressure',retainedState:{source:{projectionId:'old-source',ownerEpoch:0,ownerGeneration:0,soulId:'soul',incarnationId:'incarnation',hostBootId:'host'},snapshot:original,pendingControls:[],attentionMarks:[]}}}
     const receive = (message: any) => {handleFreshAgentMessage(store.dispatch,message);for (const handler of handlers) handler(message)}
+    const dispatchAndStartEventSnapshotRead = async (message: any) => {
+      vi.useFakeTimers()
+      try {
+        act(() => receive(message))
+        await act(async () => {await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)})
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      } finally {vi.useRealTimers()}
+    }
     try {
-      act(() => receive(earlierRetained ? retained : {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}}))
-      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      await dispatchAndStartEventSnapshotRead(earlierRetained ? retained : {type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}})
       await act(async () => refresh.resolve(replacement))
       await expectRenderedText('Output from the current native source')
       if (late === 'retained') act(() => receive(retained))
       else {
         apiMock.getFreshAgentThreadSnapshot.mockClear()
         apiMock.getFreshAgentThreadSnapshot.mockReturnValue(lateNative.promise)
-        act(() => receive({type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}}))
-        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+        await dispatchAndStartEventSnapshotRead({type:'freshAgent.event',...locator,event:{type:'freshAgent.host.journal.reset'}})
         await act(async () => lateNative.resolve(original))
       }
       expect(store.getState().freshAgentLive.bySession[`freshcodex:codex:${native.threadId}`].projection?.id).toBe('replacement-source')
       expect(screen.getByText('Output from the current native source')).toBeVisible()
       expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
-    } finally {cleanup();await act(async () => {refresh.resolve(replacement);lateNative.resolve(replacement)})}
+    } finally {vi.useRealTimers();cleanup();await act(async () => {refresh.resolve(replacement);lateNative.resolve(replacement)})}
   })
 })
 

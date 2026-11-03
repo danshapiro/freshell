@@ -86,6 +86,10 @@ mod terminal_launch_prep_tests;
 mod managed_fixture_denies_host_pty;
 
 #[cfg(test)]
+#[path = "terminal_keepalive_tests.rs"]
+mod terminal_keepalive_tests;
+
+#[cfg(test)]
 #[path = "terminal_managed_input_tests.rs"]
 mod terminal_managed_input_tests;
 
@@ -512,6 +516,10 @@ async fn run_loop(
     // real cadence starts one full interval out, matching the original.
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping_ticker.tick().await;
+    // Only a scoped unit-test connection can replace timer scheduling; the
+    // real keepalive state machine and inbound Pong arm are shared unchanged.
+    #[cfg(test)]
+    let mut ping_ticker = terminal_keepalive_tests::TickSource::new(ping_ticker);
     let mut keepalive = connection_writer::Keepalive::default();
 
     // Managed-runtime output is drained continuously by the session host. While

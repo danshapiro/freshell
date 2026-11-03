@@ -1398,7 +1398,7 @@ async fn a_malformed_if_revision_is_rejected_loudly_not_silently_dropped() {
         json!(1.5),                      // a non-integral number
         json!(-5),                       // negative
         json!(true),                     // a bare boolean
-        json!(9_007_199_254_740_993u64), // one beyond the JS-safe ceiling
+        json!(9_007_199_254_740_993u64), // two beyond the JS-safe ceiling
     ] {
         let (status, body) = {
             let sessions = sessions_router(&home, &names);

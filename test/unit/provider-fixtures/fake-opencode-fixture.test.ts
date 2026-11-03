@@ -75,7 +75,7 @@ beforeAll(async () => {
   // Two seeded turns in the source session (the CLI-shaped `run` entry point,
   // exactly how the e2e specs seed history).
   for (const prompt of ['turn one', 'turn two']) {
-    const seeded = spawnSync(process.execPath, [FIXTURE, 'run', prompt, '--session', 'ses_src'], { env })
+    const seeded = spawnSync(process.execPath, [FIXTURE, 'run', prompt, '--session', 'ses_src'], { timeout: 30_000, killSignal: 'SIGKILL', env })
     expect(seeded.status).toBe(0)
   }
   port = await allocPort()
@@ -129,6 +129,8 @@ describe('fake-opencode fixture fork sequence parity (ep3-r1 F3)', () => {
       process.execPath,
       [FIXTURE, 'run', 'seed prompt', '--session', sessionId],
       {
+        timeout: 30_000,
+        killSignal: 'SIGKILL',
         env: {
           ...process.env,
           XDG_DATA_HOME: xdgDataHome,

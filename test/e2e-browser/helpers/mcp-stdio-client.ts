@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { assertSubprocessCompleted, SYNC_BUILD_TIMEOUT_MS } from '../../../scripts/testing/sync-subprocess.js'
 import { resolveManagerExecFileCommand } from '../../setup/manager-command.js'
 
 /**
@@ -57,8 +58,11 @@ export function ensureMcpServerBuilt(root: string = REPO_ROOT): { path: string; 
     stdio: 'pipe',
     encoding: 'utf8',
     shell: build.viaShell ?? false,
+    timeout: SYNC_BUILD_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
   })
   const buildMs = Date.now() - start
+  assertSubprocessCompleted(result, 'MCP tools build')
   if (result.status !== 0) {
     throw new Error(
       `manager run build:tools failed (exit ${result.status ?? 'signal ' + result.signal}); ` +

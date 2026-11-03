@@ -11,7 +11,7 @@ const roots: string[] = []
 function scratchRepo(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-id-'))
   roots.push(root)
-  execFileSync('git', ['init', '-q', '-b', 'main', root])
+  execFileSync('git', ['init', '-q', '-b', 'main', root], { timeout: 30_000, killSignal: 'SIGKILL' })
   return root
 }
 
@@ -19,8 +19,8 @@ function commit(root: string, message: string): string {
   execFileSync('git', [
     '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
     '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', message,
-  ], { cwd: root })
-  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+  ], { timeout: 30_000, killSignal: 'SIGKILL', cwd: root })
+  return execFileSync('git', ['rev-parse', 'HEAD'], { timeout: 30_000, killSignal: 'SIGKILL', cwd: root, encoding: 'utf8' }).trim()
 }
 
 afterEach(() => {
@@ -54,7 +54,7 @@ describe('client build identity', () => {
     const root = scratchRepo()
     const mainSha = commit(root, 'main')
     const linked = path.join(root, 'linked')
-    execFileSync('git', ['worktree', 'add', '-qb', 'feature', linked], { cwd: root })
+    execFileSync('git', ['worktree', 'add', '-qb', 'feature', linked], { timeout: 30_000, killSignal: 'SIGKILL', cwd: root })
     const featureSha = commit(linked, 'feature')
     expect(computeClientBuildId(linked)).toBe(featureSha)
     expect(computeClientBuildId(root)).toBe(mainSha)

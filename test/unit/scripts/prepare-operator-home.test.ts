@@ -33,7 +33,7 @@ function fixtureHome(): string {
 }
 
 function run(home: string): void {
-  execFileSync('bash', [SCRIPT], { env: { ...process.env, FRESHELL_OPERATOR_HOME: home } })
+  execFileSync('bash', [SCRIPT], { timeout: 30_000, killSignal: 'SIGKILL', env: { ...process.env, FRESHELL_OPERATOR_HOME: home } })
 }
 
 describe('prepare-operator-home', () => {
