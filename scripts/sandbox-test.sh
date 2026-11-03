@@ -36,6 +36,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKSPACE_ROOT="${REPO_ROOT}"
 IMAGE_TAG="freshell-sandbox:latest"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
+PNPM_STORE_VOLUME="${CACHE_PREFIX}-pnpm-store"
 
 if [ "${1:-}" = "--provider-mountpoints" ]; then
   shift
@@ -259,6 +260,18 @@ except (AssertionError, OSError, ValueError, json.JSONDecodeError):
     print("[sandbox] P2-G01 descriptor is invalid or selects an unapproved case", file=sys.stderr)
     raise SystemExit(2)
 PY
+    EXTERNAL_RUN_ID="$(python3 - "${EXTERNAL_DESCRIPTOR_PATH}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream)["FRESHELL_RUNTIME_EXTERNAL_RUN_ID"])
+PY
+)"
+    if [ "${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}" != "${EXTERNAL_RUN_ID}" ] \
+      || [ "${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}" != "freshell-p2g01-pnpm-${EXTERNAL_RUN_ID}" ]; then
+      echo '[sandbox] P2-G01 requires its owner run-bound disposable pnpm store' >&2
+      exit 2
+    fi
     CMD='pnpm exec tsx scripts/testing/external-browser-sandbox.ts'
   elif [ "$#" -lt 1 ]; then
     echo "usage: $0 [--workspace-root <absolute-worktree>] [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
@@ -266,6 +279,60 @@ PY
   else
     CMD="$1"
   fi
+
+  P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
+  P2_G01_PNPM_STORE_VOLUME="${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}"
+  if [ -n "${P2_G01_RUN_ID}" ] || [ -n "${P2_G01_PNPM_STORE_VOLUME}" ]; then
+    if ! [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+      || [ "${P2_G01_PNPM_STORE_VOLUME}" != "freshell-p2g01-pnpm-${P2_G01_RUN_ID}" ] \
+      || { [ "${EXTERNAL_BROWSER}" -ne 1 ] && [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" != preparation ]; }; then
+      echo '[sandbox] P2-G01 pnpm store identity is invalid for this sandbox phase' >&2
+      exit 2
+    fi
+    PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}"
+  elif [[ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" =~ ^(preparation|execution)$ ]]; then
+    echo '[sandbox] P2-G01 sandbox phase requires its run-bound pnpm store identity' >&2
+    exit 2
+  fi
+
+  cleanup_p2_g01_pnpm_store() {
+    local phase="$1"
+    local expected_volume="freshell-p2g01-pnpm-${P2_G01_RUN_ID}"
+    local listed_volume=""
+    local consumers=""
+    local removed=false
+    if [ -z "${P2_G01_RUN_ID}" ] || [ "${P2_G01_PNPM_STORE_VOLUME}" != "${expected_volume}" ] \
+      || [[ ! "${phase}" =~ ^(preparation|execution)$ ]]; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","reason":"invalid_identity_or_phase"}\n' >&2
+      return 1
+    fi
+    if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")"; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_list_failed"}\n' \
+        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+      return 1
+    fi
+    if printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
+      if ! consumers="$(docker ps -aq --filter "volume=${expected_volume}")"; then
+        printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"consumer_check_failed"}\n' \
+          "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+        return 1
+      fi
+      if [ -n "${consumers}" ] || ! docker volume rm "${expected_volume}" >/dev/null; then
+        printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_in_use_or_removal_failed"}\n' \
+          "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+        return 1
+      fi
+      removed=true
+    fi
+    if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")" \
+      || printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_absence_unconfirmed"}\n' \
+        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+      return 1
+    fi
+    printf '{"severity":"info","event":"sandbox_external_pnpm_store_settled","runId":"%s","volume":"%s","phase":"%s","absent":true,"removed":%s}\n' \
+      "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" "${removed}" >&2
+  }
 
   STRICT_SANDBOX=0
   if [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; then STRICT_SANDBOX=1; fi
@@ -334,7 +401,12 @@ PY
     PREPARATION_STATUS=0
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
     trap - INT TERM HUP
-    if [ "${PREPARATION_STATUS}" -ne 0 ]; then exit "${PREPARATION_STATUS}"; fi
+    if [ "${PREPARATION_STATUS}" -ne 0 ]; then
+      if [ "${EXTERNAL_BROWSER}" -eq 1 ] && ! cleanup_p2_g01_pnpm_store preparation; then
+        PREPARATION_STATUS=1
+      fi
+      exit "${PREPARATION_STATUS}"
+    fi
     CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}")
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       CALLER_FLAGS+=(--external-browser "${EXTERNAL_DESCRIPTOR_PATH}")
@@ -597,6 +669,10 @@ finish_owned_sandbox() {
       container_settled=0
     fi
   fi
+  if [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" = execution ] \
+    && [ -n "${P2_G01_RUN_ID}" ] && ! cleanup_p2_g01_pnpm_store execution; then
+    result=1
+  fi
   if [ "${container_settled}" -eq 1 ]; then
     rm -rf -- "${OWNED_CONTROL_DIR}" || result=1
   else
@@ -668,7 +744,7 @@ DOCKER_ARGS=(
   -v "${WORKSPACE_ROOT}:/workspace"
   -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
   -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
-  -v "${CACHE_PREFIX}-pnpm-store:/home/sandbox/.local/share/pnpm/store"
+  -v "${PNPM_STORE_VOLUME}:/home/sandbox/.local/share/pnpm/store"
   --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/workspace/target,${TARGET_CACHE_LABEL_OPTIONS}"
   -v "${CACHE_PREFIX}-node-modules:/workspace/node_modules"
   # pnpm workspace members with their own dependencies get their own

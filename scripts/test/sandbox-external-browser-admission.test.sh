@@ -10,6 +10,8 @@ DESCRIPTOR="${DESCRIPTOR_DIR}/external-target.json"
 export FRESHELL_TEST_WORKSPACE_ROOT="${REPO_ROOT}"
 export DOCKER_CALLS
 export FRESHELL_SANDBOX_CACHE_PREFIX="freshell-external-admission-${TEST_TMP##*.}"
+P2_G01_RUN_ID='7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
+P2_G01_PNPM_STORE_VOLUME="freshell-p2g01-pnpm-${P2_G01_RUN_ID}"
 trap 'rm -rf -- "${TEST_TMP}" "${DESCRIPTOR_DIR}"' EXIT
 
 mkdir -p "${FAKE_BIN}"
@@ -35,7 +37,30 @@ case "${1:-}" in
         for ((index = 1; index <= $#; index++)); do
           if [ "${!index}" = --filter ]; then
             next=$((index + 1))
-            printf '%s\n' "${!next#name=}"
+            filter="${!next#name=}"
+            if [[ "${filter}" =~ ^\^freshell-p2g01-pnpm-[a-f0-9-]{36}\$$ ]]; then
+              volume="${filter#^}"
+              volume="${volume%\$}"
+              python3 - "${DOCKER_CALLS}" "${volume}" <<'PY'
+import json
+import sys
+
+volume = sys.argv[2]
+present = False
+for line in open(sys.argv[1], encoding="utf-8"):
+    call = json.loads(line)
+    if call[:2] == ["volume", "rm"] and call[2:] == [volume]:
+        present = False
+    elif call and call[0] == "run" and any(
+        value.startswith(f"{volume}:/home/sandbox/.local/share/pnpm/store") for value in call
+    ):
+        present = True
+if present:
+    print(volume)
+PY
+            else
+              printf '%s\n' "${filter}"
+            fi
             exit 0
           fi
         done
@@ -97,12 +122,15 @@ PY
 
 run_external() {
   PATH="${FAKE_BIN}:${PATH}" FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
+    FRESHELL_SANDBOX_P2_G01_RUN_ID="${P2_G01_RUN_ID}" \
+    FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}" \
     bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
       --external-browser "${DESCRIPTOR}"
 }
 
 run_external_with_preparation() {
-  PATH="${FAKE_BIN}:${PATH}" \
+  PATH="${FAKE_BIN}:${PATH}" FRESHELL_SANDBOX_P2_G01_RUN_ID="${P2_G01_RUN_ID}" \
+    FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}" \
     bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
       --external-browser "${DESCRIPTOR}"
 }
@@ -119,10 +147,11 @@ fi
 grep -q '"event":"sandbox_workload_finished"' "${TEST_TMP}/valid.stderr"
 grep -q '"phase":"execution"' "${TEST_TMP}/valid.stderr"
 grep -q '"event":"sandbox_container_settled"' "${TEST_TMP}/valid.stderr"
+grep -q '"event":"sandbox_external_pnpm_store_settled"' "${TEST_TMP}/valid.stderr"
 
 GIT_COMMON_DIR="$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir)"
 GIT_COMMON_DIR="$(realpath -e "${GIT_COMMON_DIR}")"
-python3 - "${DOCKER_CALLS}" "${DESCRIPTOR}" "${GIT_COMMON_DIR}" <<'PY'
+python3 - "${DOCKER_CALLS}" "${DESCRIPTOR}" "${GIT_COMMON_DIR}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
 import json
 import sys
 
@@ -138,6 +167,7 @@ assert "--memory" in args and args[args.index("--memory") + 1] == "8g"
 assert "--security-opt" in args and "no-new-privileges" in args
 assert f"type=bind,src={sys.argv[2]},dst=/run/freshell-external-target.json,readonly" in args
 assert f"type=bind,src={sys.argv[3]},dst={sys.argv[3]},readonly" in args
+assert f"{sys.argv[4]}:/home/sandbox/.local/share/pnpm/store" in args
 assert "GIT_OPTIONAL_LOCKS=0" in args
 assert "GIT_CONFIG_COUNT=1" in args
 assert "GIT_CONFIG_KEY_0=safe.directory" in args
@@ -148,7 +178,16 @@ for forbidden in ("sandbox-test-bearer-sentinel", "DOCKER_HOST", "/var/run/docke
                   "/run/docker.sock", ".claude", ".codex", ".config/opencode",
                   "GOOGLE_APPLICATION_CREDENTIALS"):
     assert forbidden not in joined, f"forbidden host authority reached Docker argv: {forbidden}"
-assert not any(value.startswith(("FRESHELL_E2E_TARGET_", "FRESHELL_RUNTIME_EXTERNAL_")) for value in args)
+assert not any(value.startswith(("FRESHELL_E2E_TARGET_", "FRESHELL_RUNTIME_EXTERNAL_",
+                                "FRESHELL_SANDBOX_P2_G01_")) for value in args)
+PY
+python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+removals = [call for call in calls if call[:2] == ["volume", "rm"]]
+assert removals == [["volume", "rm", sys.argv[2]]], removals
 PY
 
 : >"${DOCKER_CALLS}"
@@ -159,7 +198,7 @@ if [ "${STATUS}" -ne 0 ]; then
   echo 'FAIL: the P2-G01 preparation plus execution phases did not settle successfully' >&2
   exit 1
 fi
-python3 - "${DOCKER_CALLS}" "${DESCRIPTOR}" "${TEST_TMP}/prepared.stderr" <<'PY'
+python3 - "${DOCKER_CALLS}" "${DESCRIPTOR}" "${P2_G01_PNPM_STORE_VOLUME}" "${TEST_TMP}/prepared.stderr" <<'PY'
 import json
 import sys
 
@@ -171,7 +210,9 @@ assert prepared.count("--network") == 1 and prepared[prepared.index("--network")
 assert executed.count("--network") == 1 and executed[executed.index("--network") + 1] == "freshell-sandbox"
 assert not any("/run/freshell-external-target.json" in arg for arg in prepared)
 assert f"type=bind,src={sys.argv[2]},dst=/run/freshell-external-target.json,readonly" in executed
-events = [json.loads(line) for line in open(sys.argv[3], encoding="utf-8")
+assert f"{sys.argv[3]}:/home/sandbox/.local/share/pnpm/store" in prepared
+assert f"{sys.argv[3]}:/home/sandbox/.local/share/pnpm/store" in executed
+events = [json.loads(line) for line in open(sys.argv[4], encoding="utf-8")
           if line.strip().startswith("{")]
 finished = [row for row in events if row.get("event") == "sandbox_workload_finished"]
 assert [row.get("phase") for row in finished] == ["preparation", "execution"], finished
@@ -180,6 +221,12 @@ assert len({row.get("container") for row in finished}) == 2
 settled = [row for row in events if row.get("event") == "sandbox_container_settled"]
 assert [row.get("phase") for row in settled] == ["preparation", "execution"], settled
 assert all(row.get("code") == 0 and row.get("severity") == "info" for row in settled)
+store_cleanup = [row for row in events if row.get("event") == "sandbox_external_pnpm_store_settled"]
+assert store_cleanup == [{"severity": "info", "event": "sandbox_external_pnpm_store_settled",
+                          "runId": "7aab49a4-08ed-4ca7-a4b2-6501f4821a63",
+                          "volume": sys.argv[3], "phase": "execution", "absent": True,
+                          "removed": True}], store_cleanup
+assert [call for call in calls if call[:2] == ["volume", "rm"]] == [["volume", "rm", sys.argv[3]]]
 PY
 
 : >"${DOCKER_CALLS}"
@@ -188,6 +235,17 @@ STATUS=0
 run_external >"${TEST_TMP}/invalid.stdout" 2>"${TEST_TMP}/invalid.stderr" || STATUS=$?
 test "${STATUS}" -eq 2
 grep -qi 'P2-G01' "${TEST_TMP}/invalid.stderr"
+test ! -s "${DOCKER_CALLS}"
+
+write_descriptor "${DESCRIPTOR}" "${P2_G01_TITLE}"
+: >"${DOCKER_CALLS}"
+STATUS=0
+PATH="${FAKE_BIN}:${PATH}" FRESHELL_SANDBOX_P2_G01_RUN_ID="${P2_G01_RUN_ID}" \
+  FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME="freshell-p2g01-pnpm-00000000-0000-0000-0000-000000000000" \
+  bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
+    --external-browser "${DESCRIPTOR}" >"${TEST_TMP}/wrong-store.stdout" 2>"${TEST_TMP}/wrong-store.stderr" || STATUS=$?
+test "${STATUS}" -eq 2
+grep -q 'owner run-bound disposable pnpm store' "${TEST_TMP}/wrong-store.stderr"
 test ! -s "${DOCKER_CALLS}"
 
 : >"${DOCKER_CALLS}"
@@ -199,12 +257,24 @@ test "${STATUS}" -eq 0
 grep -q '"event":"sandbox_workload_finished"' "${TEST_TMP}/runtime.stderr"
 python3 - "${DOCKER_CALLS}" <<'PY'
 import json
+import os
 import sys
 calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 runs = [call for call in calls if call and call[0] == "run"]
 assert len(runs) == 1
 args = runs[0]
 assert args.count("--network") == 1 and args[args.index("--network") + 1] == "none"
+assert f"{os.environ['FRESHELL_SANDBOX_CACHE_PREFIX']}-pnpm-store:/home/sandbox/.local/share/pnpm/store" in args
 PY
 
+if python3 - "${DOCKER_CALLS}" <<'PY'
+import json
+import sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+raise SystemExit(0 if any(call[:2] == ["volume", "rm"] for call in calls) else 1)
+PY
+then
+  echo 'FAIL: ordinary --runtime-suite removed a shared cache volume' >&2
+  exit 1
+fi
 echo 'PASS: P2-G01 external browser dispatch is fixed, bridge-only, read-only, and keeps runtime-suite networkless'
