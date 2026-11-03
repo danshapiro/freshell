@@ -2578,6 +2578,93 @@ fn accepted_codex_journal_proof() -> freshell_runtime_protocol::AcceptedNativeDi
 }
 
 #[tokio::test]
+async fn review_codex_replay_and_live_each_announce_before_their_output() {
+    use futures_util::FutureExt;
+
+    for replay_first in [true, false] {
+        let batch = freshell_runtime_protocol::AgentEventBatch {
+            accepted_native_dispatch: Some(accepted_codex_journal_proof()),
+            native_dispatch_in_flight: false,
+            retained_from: 1,
+            head: 1,
+            reset_required: false,
+            retained_state: None,
+            events: vec![freshell_runtime_protocol::AgentJournalEvent {
+                sequence: 1,
+                event: AgentEvent::Provider {
+                    payload: serde_json::json!({
+                        "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+                        "sessionId":"native-b", "event":{"type":"freshAgent.status", "sessionId":"native-b", "status":"after-acceptance"}
+                    }),
+                },
+            }],
+        };
+        let (_dir, proxy, mut frames, server) =
+            codex_journal_fixture("native-b", "managed-public", batch).await;
+        let soul = SoulId::parse("codex-journal-soul").unwrap();
+        let mut route = PresentationRoute::initial("managed-public");
+        route.resumed_session_ids.insert("native-b".into());
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .insert(soul.clone(), route);
+        let scenario = std::panic::AssertUnwindSafe(async {
+            let mut replay_frames = Vec::new();
+            let mut live_frames = Vec::new();
+            if replay_first {
+                proxy.replay_once(soul.clone(), "codex", "native-b", "freshcodex").await;
+                while let Ok(frame) = frames.try_recv() {
+                    replay_frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+                }
+            }
+            assert!(proxy.start_poller(soul.clone(), "codex".into(), "managed-public".into(), "freshcodex".into(), 0).await);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while ["managed-public", "native-b"].iter().any(|id| !live_frames.iter().any(|frame: &serde_json::Value| {
+                    frame["sessionId"] == *id && frame["event"]["status"] == "after-acceptance"
+                })) {
+                    live_frames.push(serde_json::from_str::<serde_json::Value>(&frames.recv().await.unwrap()).unwrap());
+                }
+            }).await.expect("live output must reach both presentations");
+            if !replay_first {
+                proxy.replay_once(soul.clone(), "codex", "native-b", "freshcodex").await;
+                while let Ok(frame) = frames.try_recv() {
+                    replay_frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+                }
+            }
+            proxy.replay_once(soul.clone(), "codex", "native-b", "freshcodex").await;
+            let mut repeated = Vec::new();
+            while let Ok(frame) = frames.try_recv() {
+                repeated.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+            }
+            for output in [&replay_frames, &repeated] {
+                assert!(output.iter().any(|frame| frame["type"] == "freshAgent.session.materialized"
+                    && frame["sessionId"] == "native-b" && frame["sessionRef"]["sessionId"] == "native-b"), "{output:?}");
+                assert!(output.iter().all(|frame| frame["sessionId"] == "native-b"), "targeted replay must not send to other presentations: {output:?}");
+            }
+            for id in ["managed-public", "native-b"] {
+                let announced = live_frames.iter().position(|frame| frame["type"] == "freshAgent.session.materialized" && frame["sessionId"] == id);
+                let prior_replay = id == "native-b" && replay_first && replay_frames.iter().any(|frame| frame["type"] == "freshAgent.session.materialized" && frame["sessionId"] == id);
+                let output = live_frames.iter().position(|frame| frame["sessionId"] == id && frame["event"]["status"] == "after-acceptance").unwrap();
+                assert!(prior_replay || announced.is_some_and(|index| index < output), "{id} needs its own B announcement before live output; replay_first={replay_first}; replay={replay_frames:?}; live={live_frames:?}");
+            }
+        }).catch_unwind().await;
+        server.abort();
+        let _ = server.await;
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while proxy.pollers.lock().await.contains(&soul) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        if let Err(panic) = scenario {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(settled.is_ok(), "owned poller must settle");
+    }
+}
+
+#[tokio::test]
 async fn codex_native_resume_keeps_an_existing_unmaterialized_pane_live() {
     let batch = freshell_runtime_protocol::AgentEventBatch {
         accepted_native_dispatch: None,

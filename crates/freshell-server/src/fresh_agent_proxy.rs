@@ -77,7 +77,8 @@ struct PresentationRoute {
     resumed_session_ids: HashSet<String>,
     materialized: bool,
     known_native: Option<String>,
-    announced_native: Option<String>,
+    /// A targeted replay must not announce a replacement for other panes.
+    announced_native: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -101,7 +102,7 @@ impl PresentationRoute {
             resumed_session_ids: HashSet::new(),
             materialized: false,
             known_native: None,
-            announced_native: None,
+            announced_native: HashMap::new(),
         }
     }
 
@@ -112,7 +113,7 @@ impl PresentationRoute {
             session_id,
             resumed_session_ids: HashSet::new(),
             materialized: true,
-            announced_native: None,
+            announced_native: HashMap::new(),
         }
     }
 
@@ -1496,8 +1497,10 @@ impl HostedFreshAgentProxy {
                 .as_ref()
                 .is_some_and(|accepted| {
                     replay
-                        || route.announced_native.as_ref()
-                            != Some(&accepted.identity.native_session_id)
+                        || route.presentations().iter().any(|presentation| {
+                            route.announced_native.get(presentation)
+                                != Some(&accepted.identity.native_session_id)
+                        })
                 });
         let needs_source = pending_announcement
             || batch.events.iter().any(|entry| {
@@ -1543,7 +1546,12 @@ impl HostedFreshAgentProxy {
             .get(soul)
             .cloned()
             .unwrap_or_else(|| PresentationRoute::initial(fallback));
-        if !replay && route.announced_native.as_ref() == Some(native) {
+        if !replay
+            && route
+                .delivery_presentations(provider, replay_session_id)
+                .iter()
+                .all(|presentation| route.announced_native.get(presentation) == Some(native))
+        {
             return true;
         }
         let Some(source) = source else {
@@ -1576,10 +1584,13 @@ impl HostedFreshAgentProxy {
         if current.session_id != route.session_id {
             return true;
         }
-        if !replay && current.announced_native.as_ref() == Some(native) {
-            return true;
-        }
-        let presentations = current.delivery_presentations(provider, replay_session_id);
+        let presentations: Vec<_> = current
+            .delivery_presentations(provider, replay_session_id)
+            .into_iter()
+            .filter(|presentation| {
+                replay || current.announced_native.get(presentation) != Some(native)
+            })
+            .collect();
         if presentations.is_empty() {
             return true;
         }
@@ -1588,7 +1599,7 @@ impl HostedFreshAgentProxy {
                 FreshAgentSessionMaterialized {
                     previous_session_id: presentation.clone(),
                     provider: provider.into(),
-                    session_id: presentation,
+                    session_id: presentation.clone(),
                     session_type: session_type.into(),
                     session_ref: Some(SessionLocator {
                         provider: provider.into(),
@@ -1598,10 +1609,12 @@ impl HostedFreshAgentProxy {
                     session_name: projection.as_ref().map(|(_, record)| record.clone()),
                 },
             ));
+            current
+                .announced_native
+                .insert(presentation, native.clone());
         }
         current.materialized = true;
         current.known_native = Some(native.clone());
-        current.announced_native = Some(native.clone());
         true
     }
 
@@ -1885,6 +1898,7 @@ impl HostedFreshAgentProxy {
         let route = presentation_routes
             .entry(soul.clone())
             .or_insert_with(|| PresentationRoute::initial(fallback_presentation_id));
+        let mut codex_materialization = None;
         if provider == "codex" {
             let materialized = materialized_session_id(&event);
             if let Some(native) = codex_event_native_id(&event).map(str::to_owned) {
@@ -1907,15 +1921,12 @@ impl HostedFreshAgentProxy {
                     route.known_native = Some(native.clone());
                 }
                 if materialized.is_some() {
-                    if !force_materialization && route.announced_native.as_ref() == Some(&native) {
-                        return true;
-                    }
                     if let AgentEvent::Provider { payload } = &mut event {
                         preserve_codex_materialized_route(payload, &route.session_id);
                     }
                     route.materialized = true;
                     route.known_native = Some(native.clone());
-                    route.announced_native = Some(native);
+                    codex_materialization = Some(native);
                 }
             }
         }
@@ -1985,6 +1996,16 @@ impl HostedFreshAgentProxy {
         }
 
         let mut presentations = route.delivery_presentations(provider, replay_session_id);
+        if let Some(native) = codex_materialization {
+            presentations.retain(|presentation| {
+                force_materialization || route.announced_native.get(presentation) != Some(&native)
+            });
+            for presentation in &presentations {
+                route
+                    .announced_native
+                    .insert(presentation.clone(), native.clone());
+            }
+        }
         if let Some(session_id) = other_materialized_session_id {
             route.session_id = session_id;
             route.materialized = true;
