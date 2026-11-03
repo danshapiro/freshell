@@ -2127,9 +2127,10 @@ function parseExternalCaseObservations(
     cases.push({ id: event.id, title: event.title, file: event.file, status: event.status as ExternalBrowserCaseResult['status'] })
   }
   const status = z.enum(['passed', 'failed', 'timedout', 'interrupted']).safeParse(completion?.status)
-  if (!completion || !status.success || !cases.length || completion.cases !== cases.length) {
-    throw new Error('external execution completion is missing, failed or incomplete')
-  }
+  if (!completion) throw new Error('external execution completion event is missing')
+  if (!status.success) throw new Error('external execution completion status is invalid')
+  if (!cases.length) throw new Error('external execution completed without an executed case')
+  if (completion.cases !== cases.length) throw new Error('external execution case count is incomplete')
   return { status: status.data, cases }
 }
 
@@ -3403,19 +3404,35 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     this.sandboxChildSettled = true
     const output = this.sandboxChild.output()
     this.sandboxChild = undefined
-    const cases = parseExternalExecutionEvents(
-      output.stdout.split(/\r?\n/).flatMap((line) => {
+    const stdoutEvents = output.stdout.split(/\r?\n/).flatMap((line) => {
         try { return [JSON.parse(line)] } catch { return [] }
-      }), this.descriptor,
-    )
-    const completed = output.stderr.split(/\r?\n/).flatMap((line) => {
+      })
+    const reporterEvents = stdoutEvents.filter((event): event is Record<string, unknown> =>
+      Boolean(event) && typeof event === 'object' && !Array.isArray(event)
+      && ['managed_external_case', 'managed_external_complete'].includes(String((event as Record<string, unknown>).event)))
+    const reportedCases = reporterEvents.filter(event => event.event === 'managed_external_case')
+    const reportedCompletions = reporterEvents.filter(event => event.event === 'managed_external_complete')
+    const completionStatus = reportedCompletions.length === 1
+      && ['passed', 'failed', 'timedout', 'interrupted'].includes(String(reportedCompletions[0].status))
+      ? reportedCompletions[0].status as string : reportedCompletions.length === 1 ? 'invalid' : 'missing-or-duplicate'
+    const completionCases = reportedCompletions.length === 1 && Number.isSafeInteger(reportedCompletions[0].cases)
+      ? reportedCompletions[0].cases as number : null
+    const cleanupEvents = output.stderr.split(/\r?\n/).flatMap((line) => {
       try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
     }).filter((event) => event.event === 'sandbox_workload_finished')
+    this.owner.runtime.recordLifecycle('external.sandbox_browser_reporter_observed', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, exitCode,
+      reporterEventCount: reporterEvents.length, caseCount: reportedCases.length,
+      completionCount: reportedCompletions.length, completionStatus, completionCases,
+      cleanupCompletionCount: cleanupEvents.length,
+    })
+    const completed = cleanupEvents
     if (completed.length !== 1 || completed[0].severity !== 'info' || completed[0].code !== 0
       || typeof completed[0].container !== 'string' || !/^freshell-sandbox-[A-Za-z0-9]{8}$/.test(completed[0].container)) {
       throw new Error('P2-G01 sandbox cleanup completion evidence is missing or invalid')
     }
     if (exitCode !== 0) throw new Error('P2-G01 sandbox browser child failed')
+    const cases = parseExternalExecutionEvents(stdoutEvents, this.descriptor)
     if (cases.length !== 1 || cases[0].status !== 'passed'
       || cases[0].file !== P2_G01_SPEC || cases[0].title.split(' › ').at(-1) !== P2_G01_TITLE) {
       throw new Error('P2-G01 sandbox reporter did not prove exactly one matching pass')
