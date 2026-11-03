@@ -481,7 +481,7 @@ export function applyManagedRuntimeMergePlan(
       && previous.sessionRef.sessionId !== next.sessionRef.sessionId) {
       const locator = { sessionId: previous.sessionId, sessionType: previous.sessionType, provider: previous.provider }
       streamBatcherFor(store.dispatch).flush(locator)
-      store.dispatch(nativeProjectionRetired(locator))
+      store.dispatch(nativeProjectionRetired({ ...locator, awaitingNativeSessionId: next.sessionRef.sessionId }))
     }
     store.dispatch(updatePaneContent({
       tabId: update.tabId,

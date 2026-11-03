@@ -86,6 +86,8 @@ import type { TranscriptProjection } from '@/lib/fresh-agent-transcript-projecti
 import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
 
 export type FreshAgentLiveSession = {
+  /** Inventory moved ahead of the ordered WebSocket source announcement. */
+  awaitingNativeSessionId?: string
   retainedSnapshot?: FreshAgentSnapshot
   retainedSourceKey?: string
   /** Small identity tombstones live until this session scope is removed.

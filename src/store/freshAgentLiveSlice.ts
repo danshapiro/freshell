@@ -107,8 +107,8 @@ function isViewed(state: FreshAgentLiveState, key: string): boolean {
 }
 
 function dropUnviewedTail(state: FreshAgentLiveState, key: string): void {
-  const { retiredProjectionIds, retiredRetainedSourceKeys } = state.bySession[key]
-  if (!retiredProjectionIds && !retiredRetainedSourceKeys) {
+  const { retiredProjectionIds, retiredRetainedSourceKeys, awaitingNativeSessionId } = state.bySession[key]
+  if (!retiredProjectionIds && !retiredRetainedSourceKeys && !awaitingNativeSessionId) {
     delete state.bySession[key]
     return
   }
@@ -118,6 +118,7 @@ function dropUnviewedTail(state: FreshAgentLiveState, key: string): void {
     ...emptySession(),
     ...(retiredProjectionIds ? { retiredProjectionIds } : {}),
     ...(retiredRetainedSourceKeys ? { retiredRetainedSourceKeys } : {}),
+    ...(awaitingNativeSessionId ? { awaitingNativeSessionId } : {}),
   }
 }
 
@@ -196,9 +197,16 @@ const freshAgentLiveSlice = createSlice({
   name: 'freshAgentLive',
   initialState,
   reducers: {
-    nativeProjectionRetired(state, action: PayloadAction<FreshAgentSessionLocator>) {
-      const session = state.bySession[makeFreshAgentSessionKey(action.payload)]
-      if (session) retireLiveProjection(session)
+    nativeProjectionRetired(state, action: PayloadAction<FreshAgentSessionLocator & { awaitingNativeSessionId: string }>) {
+      const { awaitingNativeSessionId, ...locator } = action.payload
+      const session = sessionFor(state, locator)
+      retireLiveProjection(session)
+      session.awaitingNativeSessionId = awaitingNativeSessionId
+    },
+    nativeSourceAnnounced(state, action: PayloadAction<FreshAgentSessionLocator & { nativeSessionId: string }>) {
+      const { nativeSessionId, ...locator } = action.payload
+      const session = state.bySession[makeFreshAgentSessionKey(locator)]
+      if (session?.awaitingNativeSessionId === nativeSessionId) delete session.awaitingNativeSessionId
     },
     /** Authoritative init/snapshot binding; arbitrary patches cannot change incarnation. */
     transcriptProjectionBound(state, action: PayloadAction<FreshAgentSessionLocator & { projectionId: string; historyGeneration: number }>) {
@@ -441,6 +449,7 @@ const freshAgentLiveSlice = createSlice({
 
 export const {
   nativeProjectionRetired,
+  nativeSourceAnnounced,
   transcriptProjectionBound,
   transcriptPatchApplied,
   transcriptProjectionSnapshotReceived,

@@ -3263,7 +3263,17 @@ export function FreshAgentView({
         && message.sessionType === paneContentRef.current.sessionType
         && message.provider === paneContentRef.current.provider
       ) {
-        const current = paneContentRef.current
+        const state = appStore.getState()
+        const layout = state.panes.layouts[tabId]
+        const stored = layout ? findPaneContent(layout, paneId) : paneContentRef.current
+        if (stored?.kind !== 'fresh-agent' || isManagedFreshAgentStopped(stored)
+          || (stored.sessionId !== message.previousSessionId && stored.sessionId !== message.sessionId)
+          || stored.sessionType !== message.sessionType || stored.provider !== message.provider) return
+        const liveKey = makeFreshAgentSessionKey({ sessionId: stored.sessionId, sessionType: stored.sessionType, provider: stored.provider })
+        const awaitingNative = state.freshAgentLive?.bySession[liveKey]?.awaitingNativeSessionId
+        if (awaitingNative && (message.sessionId !== message.previousSessionId
+          || message.sessionRef?.provider !== 'codex' || message.sessionRef.sessionId !== awaitingNative)) return
+        const current = stored
         const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
         const nextContent = {
           ...current,
@@ -3287,7 +3297,7 @@ export function FreshAgentView({
           sessionType: message.sessionType,
           sessionRef,
         }, current.checkpointWorkspace)
-        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider, message.sessionType)
+        migratePendingAutoTitle(message.previousSessionId, message.sessionId, message.provider, message.sessionType)
         requestSnapshotRefresh('materialized')
         dispatch(updatePaneContent({
           tabId,
@@ -3641,31 +3651,43 @@ export function FreshAgentView({
       recordSnapshotAudit(stage, () => ({ requestSerial, readGeneration: requestReadGeneration,
         requestReadOnly, hasSoul: Boolean(requestPaneSoulId), trigger, refreshSerial, appliedSerial: snapshotRequestAuthorityRef.current.applied,
         currentGeneration: snapshotRequestAuthorityRef.current.generation, ...data() }))
+    const hadStoredLayout = Boolean(appStore.getState().panes.layouts[tabId])
+    const currentSnapshotPane = () => {
+      const layout = appStore.getState().panes.layouts[tabId]
+      // Some callers render a view directly without a stored layout.
+      if (!layout) return hadStoredLayout ? undefined : paneContentRef.current
+      const content = findPaneContent(layout, paneId)
+      return content?.kind === 'fresh-agent' ? content : undefined
+    }
     const isStaleSnapshotRequest = (check: 'native-error' | 'before-soul' | 'outcome' | 'error-fold') => {
       const rejected = (fence: string) => {
         auditRequest('currentness_checked', () => ({ check, stale: true, fence }))
         return true
       }
       // Keep the original order and short circuit: later fences are unobserved after rejection.
-      if (paneContentRef.current.createRequestId !== requestCreateRequestId) return rejected('create')
-      if (paneContentRef.current.soulId !== requestPaneSoulId) return rejected('soul')
-      if (paneContentRef.current.soulIntentRevision !== requestPaneSoulRevision) return rejected('revision')
-      const currentPane = paneContentRef.current
+      const currentPane = currentSnapshotPane()
+      if (!currentPane) return rejected('pane')
+      if (currentPane.createRequestId !== requestCreateRequestId) return rejected('create')
+      if (currentPane.soulId !== requestPaneSoulId) return rejected('soul')
+      if (currentPane.soulIntentRevision !== requestPaneSoulRevision) return rejected('revision')
       const currentNativeId = currentPane.provider === 'codex' && currentPane.soulId
         ? (currentPane.sessionRef?.provider === 'codex' ? currentPane.sessionRef.sessionId : currentPane.sessionId)
         : undefined
       if (currentNativeId !== requestNativeId) return rejected('native')
       if (appStore.getState().connection.bootId !== requestBootId) return rejected('boot')
-      if (JSON.stringify(selectPaneOwnerFence(appStore.getState(), paneContentRef.current)) !== JSON.stringify(requestOwnerFence)) return rejected('owner')
+      if (JSON.stringify(selectPaneOwnerFence(appStore.getState(), currentPane)) !== JSON.stringify(requestOwnerFence)) return rejected('owner')
       if (requestSerial < snapshotRequestAuthorityRef.current.applied) return rejected('applied_serial')
       // Ordinary reads predating managed recovery never regain authority after Retry.
       // The initial history read can still supply history while a resumed live read waits.
       if (requestReadGeneration !== snapshotRequestAuthorityRef.current.generation
         && (!requestReadOnly || snapshotRequestAuthorityRef.current.readOnlySource)) return rejected('read_generation')
-      if (!requestReadOnly && isFreshAgentLifecycleBlocked(paneContentRef.current)) return rejected('recovery')
-      if (paneContentRef.current.provider !== provider) return rejected('provider')
-      if (paneContentRef.current.sessionType !== requestSessionType) return rejected('session_type')
-      if (snapshotThreadIdRef.current !== sessionId) return rejected('thread')
+      if (!requestReadOnly && isFreshAgentLifecycleBlocked(currentPane)) return rejected('recovery')
+      if (currentPane.provider !== provider) return rejected('provider')
+      if (currentPane.sessionType !== requestSessionType) return rejected('session_type')
+      const sameBootstrapHistory = requestReadOnly && !paneContent.sessionId
+        && currentPane.sessionRef?.provider === provider && currentPane.sessionRef.sessionId === sessionId
+      if (snapshotThreadIdRef.current !== sessionId
+        || (currentPane.sessionId !== paneContent.sessionId && !sameBootstrapHistory)) return rejected('thread')
       if (ownerDivergenceRef.current !== null) return rejected('divergence')
       auditRequest('currentness_checked', () => ({ check, stale: false }))
       return false
@@ -3696,6 +3718,8 @@ export function FreshAgentView({
         .map(([name, value]) => [name, previous !== null && previous[name] !== value])) }
     })
     const applySnapshot = (next: FreshAgentSnapshot) => {
+      const currentPane = currentSnapshotPane()
+      if (!currentPane) return
       const historyOnly = isNativeHistoryOnlySnapshot(next)
       if ((historyOnly || (requestPaneSoulId && next.extensions?.[provider]?.statusFromLiveState === true))
         && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== (requestNativeId ?? sessionId))) {
@@ -3732,8 +3756,8 @@ export function FreshAgentView({
       const displaySnapshot = withSharedTurns(previousSnapshot, mergeSnapshotForDisplay(
         previousSnapshot,
         resolved,
-        isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary),
-        isManagedFreshAgentStopped(paneContentRef.current),
+        isManagedRuntimeRecoveryPending(currentPane.recoverySummary),
+        isManagedFreshAgentStopped(currentPane),
       ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
@@ -3813,15 +3837,15 @@ export function FreshAgentView({
       // The current reader can still authorize recovery; rejected revisions cannot.
       const snapshotAcceptedForRecovery = snapshotAccepted || displaySnapshot === resolved
       if (
-        snapshotAcceptedForRecovery && paneContentRef.current.soulId && requestSessionWasLost && agentSessionLostRef.current
+        snapshotAcceptedForRecovery && currentPane.soulId && requestSessionWasLost && agentSessionLostRef.current
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && resolved.provider === provider && resolved.sessionType === requestSessionType
         && resolved.threadId === (requestNativeId ?? sessionId)
         && liveProviderState?.statusFromLiveState === true
         && liveProviderState.ownerKind !== 'vacant'
       ) {
-        dispatch(clearSessionLost({ sessionId: paneContentRef.current.sessionId!, sessionType: requestSessionType, provider }))
-        dispatch(clearSessionError({ sessionId: paneContentRef.current.sessionId!, sessionType: requestSessionType, provider }))
+        dispatch(clearSessionLost({ sessionId: currentPane.sessionId!, sessionType: requestSessionType, provider }))
+        dispatch(clearSessionError({ sessionId: currentPane.sessionId!, sessionType: requestSessionType, provider }))
       }
       const echo = localEchoRef.current
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
@@ -3885,7 +3909,8 @@ export function FreshAgentView({
       } else if (!echoStillPending && !Object.values(projectionMetadata?.turnOutputStates ?? {}).some((state) => state.refreshPending)) {
         idleIncompleteRetryCountRef.current = 0
       }
-      const fresh = paneContentRef.current
+      const fresh = currentSnapshotPane()
+      if (!fresh) return
       if (requestReadOnly || isFreshAgentLifecycleBlocked(fresh)) return
       const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
       const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
@@ -3984,10 +4009,12 @@ export function FreshAgentView({
       // fetches carry no signal (A2), so this can no longer fire.
       if (error instanceof Error && error.name === 'AbortError') return
       if (isStaleSnapshotRequest('error-fold')) return
+      const currentPane = currentSnapshotPane()
+      if (!currentPane) return
       // A history refusal must not initiate an attach/resume or clear the
       // saved identity while the supervisor owns recovery.
-      if (requestReadOnly || isFreshAgentLifecycleBlocked(paneContentRef.current)) {
-        if (paneContentRef.current.recoverySummary?.recoveryState === 'recovering') {
+      if (requestReadOnly || isFreshAgentLifecycleBlocked(currentPane)) {
+        if (currentPane.recoverySummary?.recoveryState === 'recovering') {
           log.debug({ event: 'fresh_agent.recovery_history_unavailable', provider,
             sessionType: requestSessionType, sessionId, soulId: requestPaneSoulId, error })
           setLoadError(null)
@@ -4004,7 +4031,7 @@ export function FreshAgentView({
         return
       }
       if (paneContent.provider === 'codex' && isUnmaterializedCodexThreadError(error)) {
-        const fresh = paneContentRef.current
+        const fresh = currentPane
         if (isFreshAgentLifecycleBlocked(fresh)) return
         setLoadError(null)
         commitSnapshot(null)
@@ -4024,7 +4051,7 @@ export function FreshAgentView({
         return
       }
       if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
-        const fresh = paneContentRef.current
+        const fresh = currentPane
         if (isFreshAgentLifecycleBlocked(fresh)) return
         setLoadError(null)
         commitSnapshot(null)
@@ -4052,7 +4079,7 @@ export function FreshAgentView({
       // then refetch. Repeated 409s fall through to the honest error surfaces
       // below; never reset the pane (that is the 404 lost-thread arm above).
       if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(error)) {
-        const fresh = paneContentRef.current
+        const fresh = currentPane
         const recoveryKey = `${fresh.createRequestId}:${sessionId}`
         const refusalOwnerGeneration = readRestoreRefusalOwnerGeneration(error)
         if (

@@ -14,7 +14,7 @@ import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
-import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
+import { assistantBlockBound, liveNoticeReceived, liveRetrySet, nativeSourceAnnounced, transcriptAnnounced, transcriptProjectionBound, transcriptPatchApplied, codexMetadataReceived, transcriptProjectionSnapshotReceived } from '@/store/freshAgentLiveSlice'
 import { FreshAgentSnapshotSchema, FreshAgentTranscriptPatchSchema } from '@shared/fresh-agent-contract'
 import {
   addPermissionRequest,
@@ -239,6 +239,16 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.session.materialized': {
       const materialized = msg as FreshAgentSessionMaterializedMessage
+      const locator = { sessionId: materialized.previousSessionId, sessionType: materialized.sessionType, provider: materialized.provider }
+      let awaitingNativeSessionId: string | undefined
+      if (materialized.provider === 'codex') dispatch((_innerDispatch, getState) => {
+        awaitingNativeSessionId = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]?.awaitingNativeSessionId
+      })
+      if (awaitingNativeSessionId) {
+        const announcedNative = materialized.sessionRef?.provider === 'codex' ? materialized.sessionRef.sessionId : undefined
+        if (materialized.sessionId !== materialized.previousSessionId || announcedNative !== awaitingNativeSessionId) return true
+        dispatch(nativeSourceAnnounced({ ...locator, nativeSessionId: announcedNative }))
+      }
       dispatch(rekeyFreshAgentAttention(materialized))
       // Stream events queued under the old id land before the re-key moves them.
       streamBatcherFor(dispatch).flush({
@@ -486,6 +496,17 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     sessionType: msg.sessionType,
     provider: msg.provider,
   }
+
+  // The gateway publishes a native materialization before that source's
+  // events on this ordered connection. An inventory response can overtake
+  // already-sent events, whose public-routed frames do not name their native
+  // source. Wait for the matching announcement rather than binding one of
+  // those old frames to the new inventory reference.
+  let awaitingNativeSessionId: string | undefined
+  if (locator.provider === 'codex') dispatch((_innerDispatch, getState) => {
+    awaitingNativeSessionId = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]?.awaitingNativeSessionId
+  })
+  if (awaitingNativeSessionId && !(event.type === 'freshAgent.error' && event.code === 'FRESH_AGENT_REPLAY_RETRY')) return true
 
   // Stream events are batched; every other event of the session first
   // applies the ones still waiting, so the store sees them in arrival order.

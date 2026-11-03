@@ -40,7 +40,7 @@ import type { AppDispatch, RootState } from '@/store/store'
 import { getFreshAgentSnapshotThreadId, getManagedBootstrapHistoryThreadId } from '@/lib/fresh-agent-snapshot-thread'
 import { FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT, type FreshAgentPaneContent } from '@/store/paneTypes'
 import { ApiError } from '@/lib/api'
-import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
+import { getSnapshotScheduler, resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
 import { SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/session-handoff'
 import {
   ROLLBACK_BUSY_REDO_NOTICE,
@@ -1961,6 +1961,343 @@ describe('FreshAgentView', () => {
     act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
     await expectRenderedText('Current hosted B answer')
     expect(screen.queryByText('Other soul answer')).not.toBeInTheDocument()
+  })
+
+  it.each(['init and patch', 'retained state'] as const)(
+    'rejects a first old Codex %s after inventory advances before the new announcement', (delivery) => {
+      const store = createStore()
+      const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const other = { ...locator, sessionId: 'separate-public' }
+      for (const [route, tabId, paneId] of [[locator, 'tab-1', 'pane-1'], [other, 'tab-2', 'pane-2']] as const) {
+        store.dispatch(sessionInit(route))
+        store.dispatch(initLayout({ tabId, paneId, content: {
+          kind: 'fresh-agent', ...route, createRequestId: `create-${route.sessionId}`, status: 'idle',
+          sessionRef: { provider: 'codex', sessionId: 'native-a' },
+          ...(route === locator ? { soulId: 'soul-one', soulIntentRevision: 3, viewIntentId: 'view-one' } : {}),
+        } }))
+      }
+      const send = (route: typeof locator, event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event', ...route, event: { sessionId: route.sessionId, ...event },
+      })
+      const init = (id: string) => ({ type: 'freshAgent.session.init', projectionId: id, historyGeneration: 0 })
+      const patch = (id: string, text: string) => ({ type: 'freshAgent.transcript.patch', projectionId: id, historyGeneration: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 1, turns: [{ id: 'turn', turnId: 'turn',
+          role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text }] }] }] })
+      send(other, init('other-projection'))
+      send(other, patch('other-projection', 'Separate answer'))
+      const key = 'freshcodex:codex:managed-public'
+      send(locator, { type: 'freshAgent.permission.request', requestId: 'existing-control', tool: { name: 'existing-tool' } })
+      expect(store.getState().freshAgent.sessions[key].pendingPermissions['existing-control']).toBeDefined()
+      expect(store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any))
+      expect(getFreshAgentPaneContent(store).sessionRef).toEqual({ provider: 'codex', sessionId: 'native-b' })
+      send(locator, { type: 'freshAgent.error', code: 'FRESH_AGENT_REPLAY_RETRY', message: 'Reconnect to retry.' })
+      expect(store.getState().freshAgent.sessions[key].lastErrorCode).toBe('FRESH_AGENT_REPLAY_RETRY')
+
+      if (delivery === 'init and patch') {
+        send(locator, init('old-projection'))
+        send(locator, patch('old-projection', 'Delayed A answer'))
+      } else {
+        const base = hostedCodexSnapshot('native-a', 'Delayed retained A answer')
+        send(locator, { type: 'freshAgent.host.backpressure', retainedState: {
+          source: { soulId: 'soul-one', incarnationId: 'incarnation-one', hostBootId: 'host-one',
+            nativeSessionId: 'native-a', projectionId: 'old-projection', ownerEpoch: 0, ownerGeneration: 0 },
+          snapshot: { ...base, extensions: { codex: { ...base.extensions?.codex, projection: {
+            id: 'old-projection', historyGeneration: 0, eventRevision: 1,
+            eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: [],
+            turnRows: {}, turnOutputStates: {}, settledTurnIds: [],
+          } } } },
+          pendingControls: [{ type: 'freshAgent.permission.request', requestId: 'old-control', tool: { name: 'old-tool' } }],
+          attentionMarks: [],
+        } })
+        // The gateway also forwards retained controls as separate frames.
+        send(locator, { type: 'freshAgent.permission.request', requestId: 'old-control', tool: { name: 'old-tool' } })
+      }
+      expect.soft(store.getState().freshAgentLive.bySession[key]?.projection).toBeUndefined()
+      expect.soft(store.getState().freshAgent.sessions[key].pendingPermissions['old-control']).toBeUndefined()
+      handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.session.materialized', ...locator,
+        previousSessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: 'native-a' } })
+      expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('native-b')
+      const announce = () => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.session.materialized', ...locator,
+        previousSessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+      announce()
+      send(locator, init('new-projection'))
+      send(locator, patch('new-projection', 'Current B answer'))
+      send(locator, { type: 'freshAgent.permission.request', requestId: 'current-control', tool: { name: 'current-tool' } })
+      const current = store.getState().freshAgentLive.bySession[key]
+      announce()
+      expect.soft(store.getState().freshAgentLive.bySession[key]).toEqual(current)
+      expect.soft(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0]?.items[0]).toMatchObject({ text: 'Current B answer' })
+      expect.soft(store.getState().freshAgent.sessions[key].pendingPermissions['current-control']).toBeDefined()
+      expect.soft(store.getState().freshAgent.sessions[key].pendingPermissions['old-control']).toBeUndefined()
+      expect.soft(store.getState().freshAgent.sessions[key].pendingPermissions['existing-control']).toBeDefined()
+      expect(store.getState().freshAgentLive.bySession['freshcodex:codex:separate-public']?.projection?.turns[0]?.items[0])
+        .toMatchObject({ text: 'Separate answer' })
+    },
+  )
+
+  it.each(['success', 'error'] as const)(
+    'rejects a queued A snapshot %s after Redux advances but before the pane renders B', async (outcome) => {
+      const store = createStore()
+      const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(markSessionLost(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'queue-race', status: 'idle',
+        sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one',
+        soulIntentRevision: 3, viewIntentId: 'view-one',
+        recoverySummary: { desiredState: 'running', recoveryState: 'live', durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+      } }))
+      const old = createDeferred<unknown>()
+      const next = createDeferred<unknown>()
+      const finished = createDeferred<string>()
+      const release = createDeferred<void>()
+      const applied = createDeferred<void>()
+      const scheduler = getSnapshotScheduler()
+      const schedule = scheduler.schedule.bind(scheduler)
+      const scheduleSpy = vi.spyOn(scheduler, 'schedule').mockImplementation((...args) => schedule(...args).then(async (result) => {
+        finished.resolve(result.status)
+        await release.promise
+        return result
+      }))
+      const bridge = createPerfAuditBridge()
+      const addPerfEvent = bridge.addPerfEvent
+      let renderedNative: string | undefined
+      let nativeAtOutcome: string | undefined
+      bridge.addPerfEvent = (event) => {
+        addPerfEvent(event)
+        if (event.event === 'fresh_agent.snapshot_request' && event.stage === 'outcome_received' && event.requestSerial === 1) {
+          nativeAtOutcome = renderedNative
+          queueMicrotask(() => applied.resolve())
+        }
+      }
+      installPerfAuditBridge(bridge)
+      function ObservedPane() {
+        const content = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], 'pane-1'))
+        if (content?.kind !== 'fresh-agent') throw new Error('Missing observed pane')
+        renderedNative = content.sessionRef?.sessionId
+        return <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+      }
+      const error = new Error('no rollout found for thread id: old A')
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(old.promise)
+        .mockImplementation((_type, _provider, _id, options) => options?.soulId ? Promise.reject(error) : next.promise)
+      render(<Provider store={store}><ObservedPane /></Provider>)
+      try {
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+        if (outcome === 'success') old.resolve({ ...hostedCodexSnapshot('native-a', 'Delayed A snapshot'), status: 'running' })
+        else old.reject(error)
+        expect(await finished.promise).toBe(outcome === 'success' ? 'ok' : 'error')
+        expect(renderedNative).toBe('native-a')
+        await act(async () => {
+          applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any))
+          const current = getFreshAgentPaneContent(store)
+          const session = store.getState().freshAgent.sessions['freshcodex:codex:managed-public']
+          expect(current.sessionRef?.sessionId).toBe('native-b')
+          expect(renderedNative).toBe('native-a')
+          release.resolve()
+          await applied.promise
+          expect(nativeAtOutcome).toBe('native-a')
+          expect(renderedNative).toBe('native-a')
+          expect.soft(getFreshAgentPaneContent(store)).toEqual(current)
+          expect.soft(store.getState().freshAgent.sessions['freshcodex:codex:managed-public']).toEqual(session)
+          expect.soft(bridge.snapshot().perfEvents.some((entry) => entry.stage === 'display_committed' && entry.requestSerial === 1)).toBe(false)
+        })
+        expect(screen.queryByText('Delayed A snapshot')).not.toBeInTheDocument()
+        expect(screen.queryByText(/no rollout found/)).not.toBeInTheDocument()
+      } finally {
+        release.resolve()
+        next.resolve(hostedCodexSnapshot('native-b', 'Current B snapshot'))
+        scheduleSpy.mockRestore()
+        installPerfAuditBridge(null)
+      }
+    },
+  )
+
+  it('applies a current snapshot to the latest pane fields before the pane renders them', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'current-queue-race', status: 'idle', model: 'old-model',
+      sessionRef: { provider: 'codex', sessionId: 'native-b' }, soulId: 'soul-one', soulIntentRevision: 3,
+    } }))
+    const read = createDeferred<unknown>()
+    const finished = createDeferred<void>()
+    const release = createDeferred<void>()
+    const applied = createDeferred<void>()
+    const scheduler = getSnapshotScheduler()
+    const schedule = scheduler.schedule.bind(scheduler)
+    const spy = vi.spyOn(scheduler, 'schedule').mockImplementation((...args) => schedule(...args).then(async (result) => {
+      finished.resolve()
+      await release.promise
+      return result
+    }))
+    const bridge = createPerfAuditBridge()
+    const addPerfEvent = bridge.addPerfEvent
+    let renderedModel: string | undefined
+    let modelAtOutcome: string | undefined
+    bridge.addPerfEvent = (entry) => {
+      addPerfEvent(entry)
+      if (entry.event === 'fresh_agent.snapshot_request' && entry.stage === 'outcome_received' && entry.requestSerial === 1) {
+        modelAtOutcome = renderedModel
+        queueMicrotask(() => applied.resolve())
+      }
+    }
+    installPerfAuditBridge(bridge)
+    function ObservedPane() {
+      const content = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], 'pane-1'))
+      if (content?.kind !== 'fresh-agent') throw new Error('Missing observed pane')
+      renderedModel = content.model
+      return <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+    }
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(read.promise)
+    render(<Provider store={store}><ObservedPane /></Provider>)
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      read.resolve({ ...hostedCodexSnapshot('native-b', 'Accepted B snapshot'), status: 'running' })
+      await finished.promise
+      await act(async () => {
+        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { model: 'current-model' } }))
+        expect(renderedModel).toBe('old-model')
+        expect(getFreshAgentPaneContent(store).model).toBe('current-model')
+        release.resolve()
+        await applied.promise
+        expect(modelAtOutcome).toBe('old-model')
+        expect(getFreshAgentPaneContent(store)).toMatchObject({ model: 'current-model', status: 'running',
+          sessionRef: { provider: 'codex', sessionId: 'native-b' } })
+      })
+      await expectRenderedText('Accepted B snapshot')
+    } finally {
+      release.resolve()
+      spy.mockRestore()
+      installPerfAuditBridge(null)
+    }
+  })
+
+  it('keeps the inventory reference when the mounted pane receives an older materialization before B', async () => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://codex-inventory-race.test/ws')
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'mounted-inventory-race', status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one',
+      soulIntentRevision: 3, viewIntentId: 'view-one',
+    } }))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      const receive = (message: Record<string, unknown>) => client.receiveMessageForTest(message as never)
+      const announce = (native: string) => receive({ type: 'freshAgent.session.materialized', ...locator,
+        previousSessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: native } })
+      const event = (value: Record<string, unknown>) => receive({ type: 'freshAgent.event', ...locator,
+        event: { sessionId: locator.sessionId, ...value } })
+      const init = (id: string) => event({ type: 'freshAgent.session.init', projectionId: id, historyGeneration: 0 })
+      const patch = (id: string, text: string) => event({ type: 'freshAgent.transcript.patch', projectionId: id, historyGeneration: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 1, turns: [{ id: 'turn', turnId: 'turn',
+          role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text }] }] }] })
+      act(() => {
+        applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any))
+        expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('native-b')
+        announce('native-a')
+        expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('native-b')
+        init('old-projection')
+        patch('old-projection', 'Old mounted answer')
+        announce('native-b')
+        init('new-projection')
+        patch('new-projection', 'Current mounted answer')
+        announce('native-b')
+      })
+      await expectRenderedText('Current mounted answer')
+      expect(screen.queryByText('Old mounted answer')).not.toBeInTheDocument()
+      expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('native-b')
+    } finally {
+      cleanup()
+      held.resolve(hostedCodexSnapshot('native-b', 'Current snapshot'))
+    }
+  })
+
+  it('reattaches and receives the current source when a second replacement overtakes inventory', async () => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://codex-second-replacement.test/ws')
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'second-replacement', status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one',
+      soulIntentRevision: 3, viewIntentId: 'view-one',
+    } }))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      wsMock.send.mockClear()
+      const receive = (message: Record<string, unknown>) => client.receiveMessageForTest(message as never)
+      const announceC = () => receive({ type: 'freshAgent.session.materialized', ...locator,
+        previousSessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: 'native-c' } })
+      const cOutput = () => {
+        receive({ type: 'freshAgent.event', ...locator, event: {
+          type: 'freshAgent.session.init', sessionId: locator.sessionId, projectionId: 'projection-c', historyGeneration: 0,
+        } })
+        receive({ type: 'freshAgent.event', ...locator, event: {
+          type: 'freshAgent.transcript.patch', sessionId: locator.sessionId, projectionId: 'projection-c', historyGeneration: 0,
+          ops: [{ op: 'resetTurn', nativeTurnId: 'turn', revision: 1, turns: [{ id: 'turn', turnId: 'turn',
+            role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text: 'Current C answer' }] }] }],
+        } })
+      }
+      act(() => {
+        applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any))
+        announceC()
+        cOutput()
+        expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('native-b')
+        applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-c'), store.getState() as any))
+      })
+      await waitFor(() => expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.attach', sessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: 'native-c' },
+      })))
+      // The gateway's targeted attach replay re-announces the current source.
+      act(() => { announceC(); cOutput() })
+      await expectRenderedText('Current C answer')
+      expect(getFreshAgentPaneContent(store).sessionRef?.sessionId).toBe('native-c')
+    } finally {
+      cleanup()
+      held.resolve(hostedCodexSnapshot('native-c', 'Current C snapshot'))
+    }
+  })
+
+  it('keeps non-Codex checkpoint identity after the global materialization fold', async () => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://non-codex-materialization.test/ws')
+    const store = createStore()
+    const locator = { sessionId: 'freshopencode-pending', sessionType: 'freshopencode' as const, provider: 'opencode' as const }
+    client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'other-provider-create', status: 'idle',
+      checkpointOutcomes: [{ version: 1, requestId: 'send-one', conversationRequestId: 'other-provider-create',
+        status: 'unavailable', reason: 'No checkpoint was supplied.' }],
+    } }))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    try {
+      act(() => client.receiveMessageForTest({ type: 'freshAgent.session.materialized', ...locator,
+        previousSessionId: locator.sessionId, sessionId: 'ses_materialized',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_materialized' } } as never))
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ sessionId: 'ses_materialized', checkpointOutcomes: [{
+        requestId: 'send-one', conversationSessionKey: JSON.stringify(['opencode', 'freshopencode', 'ses_materialized']),
+      }] })
+    } finally { cleanup(); held.resolve({ status: 'idle', turns: [] }) }
   })
 
   it.each(['reference', 'legacy resume'] as const)('replaces a live Codex projection when inventory moves first and rejects delayed A (%s)', async (identity) => {
