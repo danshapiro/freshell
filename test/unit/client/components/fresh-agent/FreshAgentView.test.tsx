@@ -1985,7 +1985,7 @@ describe('FreshAgentView', () => {
   })
 
   describe('outgoing message queue', () => {
-    async function setup(status = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
+    async function setup(status: 'running' | 'idle' = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
       const store = createStore()
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
         status, capabilities: { send: canSend, interrupt: true }, turns: [],
@@ -1993,25 +1993,26 @@ describe('FreshAgentView', () => {
       const content = {
         kind: 'fresh-agent' as const, sessionType: provider === 'claude' ? 'freshclaude' as const : 'freshcodex' as const,
         provider, createRequestId: 'queue-create',
-        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status: status as 'running' | 'idle',
+        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status,
       }
-      const view = (nextStatus: string) => (
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(
         <Provider store={store}>
-          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{ ...content, status: nextStatus as 'idle' }} />
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
         </Provider>
       )
-      const rendered = render(view(status))
       await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
       const send = (text: string) => {
         fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
         fireEvent.click(screen.getByRole('button', { name: 'Send' }))
       }
-      return { send, store, status: (nextStatus: string) => {
-        act(() => store.dispatch(setSessionStatus({
-          sessionId: content.sessionId, sessionType: content.sessionType, provider,
-          status: nextStatus as 'idle',
-        })))
-        rendered.rerender(view(nextStatus))
+      return { send, store, status: (nextStatus: 'running' | 'idle' | 'exited') => {
+        act(() => {
+          store.dispatch(setSessionStatus({
+            sessionId: content.sessionId, sessionType: content.sessionType, provider, status: nextStatus,
+          }))
+          store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: nextStatus } }))
+        })
       } }
     }
 
