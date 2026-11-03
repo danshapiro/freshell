@@ -3529,6 +3529,7 @@ export function FreshAgentView({
         const pending = originalPending?.sourceSessionKey
           ? scopeToPaneSession(originalPending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)
           : originalPending && persistedEchoMatches ? { ...originalPending, ...currentScope } : null
+        console.log('ACCEPTANCE_DIAGNOSTIC', { message, current, originalPending, currentScope, persistedEchoMatches, pending, echo, outgoing: outgoingTurnRef.current, locator: locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator()), delivery: deliveryNoticeRef.current })
         if ((originalPending?.sourceSessionKey && !pending)
           || (!pending && !persistedEchoMatches)
           || !locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())) {
@@ -3558,6 +3559,7 @@ export function FreshAgentView({
               : { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true, ...currentScope })
           }
           const outgoing = outgoingTurnRef.current
+          console.log('ACCEPTANCE_AMBIGUOUS_DIAGNOSTIC', { outgoing, echo })
           if ((!echo || echo.requestId === message.requestId) && outgoing?.requestId === message.requestId) {
             setLocalEcho({ requestId: outgoing.requestId, text: outgoing.text,
               previousTurnKeys: outgoing.previousTurns.map(getTurnKey),
