@@ -2512,7 +2512,11 @@ describe('FreshAgentView', () => {
       }
     })
 
-    it.each([false, true])('does not revive a suppressed Codex notice when its retained warning clears (newer notice: %s)', async (withNewerNotice) => {
+    it.each([
+      [false, 'CODEX_PROVIDER_ERROR'],
+      [true, 'CODEX_PROVIDER_ERROR'],
+      [false, 'OTHER_PROVIDER_ERROR'],
+    ])('does not revive a suppressed Codex notice when its retained warning clears (newer notice: %s; original source: %s)', async (withNewerNotice, originalCode) => {
       const queue = await setup('running')
       const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
       const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
@@ -2528,7 +2532,7 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
       await act(async () => {})
 
-      deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      deliver({ type: 'freshAgent.notice', level: 'error', code: originalCode, message: diagnostic })
       await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic))
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...running,
         extensions: { codex: { unattributedProviderError: diagnostic } } })
@@ -2547,6 +2551,8 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
       if (withNewerNotice) {
         expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(newerDiagnostic)
+      } else if (originalCode !== 'CODEX_PROVIDER_ERROR') {
+        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent(diagnostic)
       } else {
         expect(document.querySelector('[data-agent-error="notice"]')).toBeNull()
       }

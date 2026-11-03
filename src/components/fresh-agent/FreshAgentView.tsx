@@ -1311,10 +1311,19 @@ export function FreshAgentView({
   }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Action feedback and provider notices share a banner; errors need dismissal.
-  const [notice, setNoticeState] = useState<{ text: string; level: 'info' | 'warning' | 'error'; prominent?: boolean } | null>(null)
+  const [notice, setNoticeState] = useState<{
+    text: string
+    level: 'info' | 'warning' | 'error'
+    prominent?: boolean
+    codexProviderErrorIdentity?: string
+  } | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
-  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning') => {
-    setNoticeState(current => text === null ? null : current?.text === text && current.level === level ? current : { text, level })
+  const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', codexProviderErrorIdentity?: string) => {
+    setNoticeState(current => {
+      if (text === null) return null
+      if (current?.text === text && current.level === level && current.codexProviderErrorIdentity === codexProviderErrorIdentity) return current
+      return { text, level, ...(codexProviderErrorIdentity ? { codexProviderErrorIdentity } : {}) }
+    })
   }, [])
   const deliveryNoticeRef = useRef<{ requestId: string; text: string } | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
@@ -4842,14 +4851,20 @@ export function FreshAgentView({
       || liveNotice.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
       || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR'
       || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
-    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level)
-  }, [liveNotice, setNotice])
+    const codexProviderErrorIdentity = paneContent.provider === 'codex' && liveNotice.code === 'CODEX_PROVIDER_ERROR'
+      ? snapshotHydrationIdentity : undefined
+    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level, codexProviderErrorIdentity)
+  }, [liveNotice, paneContent.provider, setNotice, snapshotHydrationIdentity])
   const rawUnattributedCodexError = paneContent.provider === 'codex'
     ? snapshot?.extensions?.codex?.unattributedProviderError : undefined
   const unattributedCodexError = codexDiagnostic?.identity === snapshotHydrationIdentity
     ? codexDiagnostic.message ?? undefined
     : typeof rawUnattributedCodexError === 'string' && rawUnattributedCodexError.trim()
       ? rawUnattributedCodexError : undefined
+  useEffect(() => {
+    if (!notice || notice.codexProviderErrorIdentity !== snapshotHydrationIdentity || notice.text !== unattributedCodexError) return
+    setNoticeState(current => current === notice ? null : current)
+  }, [notice, snapshotHydrationIdentity, unattributedCodexError])
   const pendingCodexError = codexPendingDiagnostic?.identity === snapshotHydrationIdentity
     ? codexPendingDiagnostic.error
     : paneContent.provider === 'codex' ? readCodexPendingProviderError(snapshot?.extensions?.codex?.pendingProviderError) : null
