@@ -443,13 +443,15 @@ const freshAgentSlice = createSlice({
       if (key) delete state.sessions[key].pendingElicitations?.[String(action.payload.requestId)]
     },
 
-    sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string }>) {
+    sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string; preserveStatus?: boolean }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
       session.lastError = action.payload.message
       // Task 14: the view filters SESSION_RESERVED out of the pane-level
       // error banner (a transient reservation is re-driven, never surfaced).
       session.lastErrorCode = action.payload.code
+      // A gateway failure describes a request, not the native turn's status.
+      if (action.payload.preserveStatus) return
       if (action.payload.code?.startsWith('RESTORE_')) {
         session.awaitingDurableHistory = false
         session.historyLoaded = true

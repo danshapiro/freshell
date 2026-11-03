@@ -1,5 +1,5 @@
-import type { AppDispatch } from '@/store/store'
-import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { AppDispatch, RootState } from '@/store/store'
+import { makeFreshAgentSessionKey, normalizeFreshAgentSessionType } from '@shared/fresh-agent'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
 import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
@@ -484,6 +484,30 @@ function parseLiveStreamOp(frame: Record<string, unknown>): LiveStreamOp | undef
   return undefined
 }
 
+/** Whether an ordered, public-routed event can affect the current source. */
+export function isCurrentFreshAgentEvent(state: RootState, msg: {
+  provider: string; sessionType: string; sessionId: string; event: Record<string, unknown>
+}): boolean {
+  if (msg.provider !== 'codex') return true
+  const sessionType = normalizeFreshAgentSessionType(msg.sessionType)
+  if (!sessionType) return true
+  const awaiting = state.freshAgentLive?.bySession[makeFreshAgentSessionKey({
+    provider: 'codex', sessionType, sessionId: msg.sessionId,
+  })]?.awaitingNativeSessionId
+  const gateway = isObject(msg.event.gateway) ? msg.event.gateway : undefined
+  if (msg.event.type === 'freshAgent.error' && gateway?.operation === 'attach') {
+    const expected = awaiting ?? Object.values(state.panes?.layouts ?? {}).flatMap(collectPaneEntries)
+      .flatMap(({ content }) => content.kind === 'fresh-agent' && content.provider === msg.provider
+        && content.sessionType === msg.sessionType && content.sessionId === msg.sessionId
+        && content.sessionRef?.provider === 'codex' ? [content.sessionRef.sessionId] : [])[0]
+    return !expected || gateway.nativeSessionId === expected
+  }
+  if (!awaiting) return true
+  if (msg.event.type !== 'freshAgent.error') return false
+  return msg.event.code === 'FRESH_AGENT_REPLAY_RETRY'
+    || (typeof gateway?.operation === 'string' && gateway.operation !== 'attach')
+}
+
 export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: FreshAgentEventMessage): boolean {
   const event = msg.event
   const sessionId = typeof msg.sessionId === 'string'
@@ -502,11 +526,11 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   // already-sent events, whose public-routed frames do not name their native
   // source. Wait for the matching announcement rather than binding one of
   // those old frames to the new inventory reference.
-  let awaitingNativeSessionId: string | undefined
+  let current = true
   if (locator.provider === 'codex') dispatch((_innerDispatch, getState) => {
-    awaitingNativeSessionId = getState().freshAgentLive?.bySession[makeFreshAgentSessionKey(locator)]?.awaitingNativeSessionId
+    current = isCurrentFreshAgentEvent(getState(), { ...locator, event })
   })
-  if (awaitingNativeSessionId && !(event.type === 'freshAgent.error' && event.code === 'FRESH_AGENT_REPLAY_RETRY')) return true
+  if (!current) return true
 
   // Stream events are batched; every other event of the session first
   // applies the ones still waiting, so the store sees them in arrival order.
@@ -768,6 +792,9 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
           ...locator,
           code: event.code as string | undefined,
           message: (event.message as string) || (event.error as string) || 'Unknown error',
+          ...(isObject(event.gateway) || event.code === 'FRESH_AGENT_REPLAY_RETRY'
+            || (event.code === 'THREAD_MEMORY_LOST' && event.retainedReplay === true)
+            ? { preserveStatus: true } : {}),
         }))
       }
       return true

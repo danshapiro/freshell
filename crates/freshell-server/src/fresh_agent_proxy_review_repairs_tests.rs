@@ -16,6 +16,8 @@ struct JournalState {
     replay_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     live_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     sends: Vec<String>,
+    ambiguous_send: bool,
+    disconnect_send: bool,
 }
 
 struct JournalFixture {
@@ -45,6 +47,8 @@ impl JournalFixture {
             replay_gate: None,
             live_gate: None,
             sends: Vec::new(),
+            ambiguous_send: false,
+            disconnect_send: false,
         }));
         let server_state = state.clone();
         let server = tokio::spawn(async move {
@@ -57,11 +61,13 @@ impl JournalFixture {
                 let server_state = server_state.clone();
                 connections.spawn(async move {
                 let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
-                let (result, gate, stale_claim, failed_inventory) = {
+                let (result, gate, stale_claim, failed_inventory, ambiguous_send, disconnect_send) = {
                     let mut state = server_state.lock().unwrap();
                     let mut gate = None;
                     let mut stale_claim = false;
                     let mut failed_inventory = false;
+                    let mut ambiguous_send = false;
+                    let mut disconnect_send = false;
                     let result = match envelope.body {
                         AdminCommand::Health => AdminResult::Health {
                             control_epoch: 1, installation_id: InstallationId::new(),
@@ -108,21 +114,28 @@ impl JournalFixture {
                         })),
                         AdminCommand::FreshAgentSend(send) => {
                             state.sends.push(send.text);
+                            ambiguous_send = state.ambiguous_send;
+                            disconnect_send = state.disconnect_send;
                             AdminResult::FreshAgentCommand { state: freshell_runtime_protocol::CommandState::ProviderAcked }
                         }
                         other => panic!("unexpected review fixture request: {other:?}"),
                     };
-                    (result, gate, stale_claim, failed_inventory)
+                    (result, gate, stale_claim, failed_inventory, ambiguous_send, disconnect_send)
                 };
                 if let Some((entered, release)) = gate {
                     entered.notify_one();
                     release.notified().await;
                 }
+                if disconnect_send { return; }
                 write_frame(
                     &mut stream,
                     &AdminReply {
                         request_id: envelope.request_id,
-                        result: if failed_inventory {
+                        result: if ambiguous_send {
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::CommandAmbiguous, "fixture delivery is ambiguous",
+                            ))
+                        } else if failed_inventory {
                             Err(freshell_runtime_protocol::RuntimeError::new(
                                 RuntimeErrorCode::BackendUnavailable, "fixture inventory unavailable",
                             ))
@@ -377,6 +390,363 @@ async fn collect_until(
     })
     .await
     .is_ok()
+}
+
+#[tokio::test]
+async fn gateway_failures_identify_attach_source_and_operation_request() {
+    let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
+    fixture.state.lock().unwrap().fail_inventory_reads = 2;
+    fixture
+        .proxy
+        .clone()
+        .handle(attach("managed-public", "codex", "native-b"))
+        .await;
+    fixture
+        .proxy
+        .clone()
+        .handle(HostedFreshAgentCommand::Send(
+            serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+                "requestId":"send-current", "text":"hello"
+            }))
+            .unwrap(),
+        ))
+        .await;
+    let mut frames = Vec::new();
+    while let Ok(frame) = fixture.frames.try_recv() {
+        frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+    }
+    fixture.shutdown().await;
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(
+        frames[0]["event"]["gateway"],
+        serde_json::json!({"operation":"attach", "nativeSessionId":"native-b"}),
+        "{frames:?}"
+    );
+    assert_eq!(
+        frames[1]["event"]["gateway"],
+        serde_json::json!({"operation":"send"}),
+        "{frames:?}"
+    );
+    assert_eq!(
+        frames[1]["event"]["requestId"], "send-current",
+        "{frames:?}"
+    );
+    println!(
+        "FRESHELL_GATEWAY_ERRORS={}",
+        serde_json::json!({"attach":frames[0],"send":frames[1]})
+    );
+}
+
+#[tokio::test]
+async fn gateway_correlates_other_failed_operations() {
+    let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
+    fixture.state.lock().unwrap().fail_inventory_reads = 6;
+    let commands = vec![
+        HostedFreshAgentCommand::Interrupt(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"interrupt-id"
+        })).unwrap()),
+        HostedFreshAgentCommand::Configure(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"configure-id", "settings":{}
+        })).unwrap()),
+        HostedFreshAgentCommand::Compact(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"compact-id"
+        })).unwrap()),
+        HostedFreshAgentCommand::Fork(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"fork-id"
+        })).unwrap()),
+        HostedFreshAgentCommand::Undo(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"rollback-id"
+        })).unwrap()),
+        HostedFreshAgentCommand::Approval(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"decision-id", "decision":{}
+        })).unwrap()),
+    ];
+    for command in commands {
+        fixture.proxy.clone().handle(command).await;
+    }
+    let mut frames = Vec::new();
+    while let Ok(frame) = fixture.frames.try_recv() {
+        frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+    }
+    fixture.shutdown().await;
+    assert_eq!(frames.len(), 6, "{frames:?}");
+    for (frame, operation) in frames.iter().zip([
+        "interrupt",
+        "configure",
+        "compact",
+        "fork",
+        "rollback",
+        "decision",
+    ]) {
+        assert_eq!(
+            frame["event"]["gateway"]["operation"], operation,
+            "{frames:?}"
+        );
+        assert_eq!(
+            frame["event"]["requestId"],
+            format!("{operation}-id"),
+            "{frames:?}"
+        );
+    }
+    assert_eq!(frames[4]["event"]["rollback"], true);
+}
+
+#[tokio::test]
+async fn gateway_preserves_ambiguous_send_delivery() {
+    let mut outcomes = Vec::new();
+    for disconnect in [false, true] {
+        let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.ambiguous_send = !disconnect;
+            state.disconnect_send = disconnect;
+        }
+        fixture.proxy.aliases.lock().await.insert(
+            ("codex".into(), "managed-public".into()),
+            fixture.soul.clone(),
+        );
+        fixture
+            .proxy
+            .clone()
+            .handle(HostedFreshAgentCommand::Send(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+                    "requestId":"ambiguous-send", "text":"one delivery"
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        let sends = fixture.state.lock().unwrap().sends.clone();
+        fixture.shutdown().await;
+        outcomes.push((disconnect, sends, frames));
+    }
+    if let Some((_, _, frames)) = outcomes.first() {
+        if let Some(frame) = frames.first() {
+            println!("FRESHELL_GATEWAY_AMBIGUOUS={frame}");
+        }
+    }
+    for (disconnect, sends, frames) in outcomes {
+        assert_eq!(sends, vec!["one delivery"], "disconnect={disconnect}");
+        assert_eq!(frames.len(), 1, "disconnect={disconnect}: {frames:?}");
+        assert_eq!(
+            frames[0]["event"]["requestId"], "ambiguous-send",
+            "{frames:?}"
+        );
+        assert_eq!(
+            frames[0]["event"]["code"], "COMMAND_AMBIGUOUS",
+            "{frames:?}"
+        );
+        assert!(
+            frames[0]["event"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("CODEX_DELIVERY_AMBIGUOUS:"),
+            "{frames:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_replay_recovers_only_current_codex_memory_loss() {
+    const CURRENT_WARNING: &str = "Codex crashed and this pane was restarted as a new thread. The agent no longer has memory of the earlier conversation in this pane.";
+    let warning = |native: &str| AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":native,
+            "event":{"type":"freshAgent.error", "sessionId":native, "code":"THREAD_MEMORY_LOST",
+                "message":if native == "native-c" { CURRENT_WARNING.to_string() } else { format!("stale {native} warning") }}
+        }),
+    };
+    for native in ["native-b", "native-c"] {
+        let mut batch = journal_batch();
+        let mut proof = accepted_codex_journal_proof();
+        if native == "native-c" {
+            proof.identity.previous_native_session_id = "native-b".into();
+            proof.identity.native_session_id = native.into();
+            proof.prior_native_session_ids = vec!["native-a".into(), "native-b".into()];
+        }
+        batch.accepted_native_dispatch = Some(proof);
+        let mut events = vec![warning("native-a")];
+        if native == "native-c" {
+            events.push(warning("native-b"));
+        }
+        events.push(warning(native));
+        events.push(status(native, "unrelated"));
+        events.push(AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.send.accepted", "provider":"codex", "sessionType":"freshcodex",
+                "sessionId":native, "requestId":"retained-receipt", "submittedTurnId":"turn-receipt"
+            }),
+        });
+        batch.events = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| AgentJournalEvent {
+                sequence: index as u64 + 1,
+                event,
+            })
+            .collect();
+        batch.head = batch.events.len() as u64;
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../test/fixtures/managed-native-history/codex-hosted-live.json"
+        ))
+        .unwrap();
+        snapshot["threadId"] = native.into();
+        snapshot["status"] = "running".into();
+        snapshot["turns"][0]["items"][0]["text"] = "Retained current transcript".into();
+        snapshot["extensions"]["codex"]["projection"] = serde_json::json!({
+            "id":"current", "historyGeneration":0, "eventRevision":1,
+            "eventOwnedTurnIds":[], "nativePreviewTurnIds":[], "nativeFinalTurnIds":[],
+            "turnRows":{}, "turnOutputStates":{}, "settledTurnIds":[]
+        });
+        let retained = serde_json::json!({
+            "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+            "snapshot":snapshot, "attentionMarks":[], "pendingControls":[]
+        });
+        let mut retained_live_batch = batch.clone();
+        retained_live_batch.retained_state = Some(retained.clone());
+        let mut fixture = JournalFixture::new(native, "managed-public", batch).await;
+        let scenario = std::panic::AssertUnwindSafe(async {
+            assert!(
+                fixture
+                    .proxy
+                    .start_poller(
+                        fixture.soul.clone(),
+                        "codex".into(),
+                        "managed-public".into(),
+                        "freshcodex".into(),
+                        0
+                    )
+                    .await
+            );
+            let mut live = Vec::new();
+            assert!(
+                collect_until(&mut fixture.frames, &mut live, |frames| frames
+                    .iter()
+                    .any(|frame| frame["type"] == "freshAgent.send.accepted"
+                        && frame["requestId"] == "retained-receipt"))
+                .await,
+                "{live:?}"
+            );
+            fixture.state.lock().unwrap().batch.retained_state = Some(retained);
+            fixture
+                .proxy
+                .replay_once(
+                    fixture.soul.clone(),
+                    "codex",
+                    "managed-public",
+                    "freshcodex",
+                )
+                .await;
+            let mut replay = Vec::new();
+            while let Ok(frame) = fixture.frames.try_recv() {
+                replay.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+            }
+            (live, replay)
+        })
+        .catch_unwind()
+        .await;
+        fixture.shutdown().await;
+        let (live, replay) = scenario.unwrap();
+        let expected_warning = if native == "native-c" {
+            CURRENT_WARNING.to_string()
+        } else {
+            format!("stale {native} warning")
+        };
+        for frames in [&live, &replay] {
+            let notices: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+                .collect();
+            assert_eq!(notices.len(), 1, "{frames:?}");
+            assert_eq!(notices[0]["event"]["message"], expected_warning);
+        }
+        assert!(live
+            .iter()
+            .all(|frame| frame["event"]["retainedReplay"].is_null()));
+        assert!(replay
+            .iter()
+            .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"
+                && frame["event"]["retainedReplay"] == true));
+        assert!(
+            replay.iter().any(
+                |frame| frame["event"]["retainedState"]["snapshot"]["turns"][0]["items"][0]["text"]
+                    == "Retained current transcript"
+            ),
+            "{replay:?}"
+        );
+        assert!(
+            replay
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.send.accepted"
+                    && frame["requestId"] == "retained-receipt"),
+            "{replay:?}"
+        );
+        assert!(
+            !replay
+                .iter()
+                .any(|frame| frame["event"]["status"] == "unrelated"),
+            "{replay:?}"
+        );
+        let mut retained_fixture =
+            JournalFixture::new(native, "managed-public", retained_live_batch).await;
+        let retained_scenario = std::panic::AssertUnwindSafe(async {
+            assert!(
+                retained_fixture
+                    .proxy
+                    .start_poller(
+                        retained_fixture.soul.clone(),
+                        "codex".into(),
+                        "managed-public".into(),
+                        "freshcodex".into(),
+                        0
+                    )
+                    .await
+            );
+            let mut frames = Vec::new();
+            assert!(
+                collect_until(&mut retained_fixture.frames, &mut frames, |frames| frames
+                    .iter()
+                    .any(|frame| frame["type"] == "freshAgent.send.accepted"
+                        && frame["requestId"] == "retained-receipt"))
+                .await,
+                "{frames:?}"
+            );
+            frames
+        })
+        .catch_unwind()
+        .await;
+        retained_fixture.shutdown().await;
+        let retained_live = retained_scenario.unwrap();
+        assert_eq!(
+            retained_live
+                .iter()
+                .filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+                .count(),
+            1,
+            "{retained_live:?}"
+        );
+        assert!(retained_live
+            .iter()
+            .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"
+                && frame["event"]["retainedReplay"] == true));
+        assert!(
+            !retained_live
+                .iter()
+                .any(|frame| frame["event"]["status"] == "unrelated"),
+            "{retained_live:?}"
+        );
+        if native == "native-c" {
+            println!(
+                "FRESHELL_GATEWAY_BRIDGE={}",
+                serde_json::json!({"live":live,"replay":replay})
+            );
+        }
+    }
 }
 
 #[tokio::test]

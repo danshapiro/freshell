@@ -75,6 +75,11 @@ struct CodexAttachOwnership {
     observed: Option<(String, freshell_ownership::OwnershipSnapshot)>,
 }
 
+enum GatewayErrorContext<'a> {
+    Attach(Option<&'a str>),
+    Operation(&'a str, Option<&'a str>),
+}
+
 struct CreatedRoute {
     session_id: String,
     cleanup_receipt: Option<(SoulId, u64)>,
@@ -243,12 +248,13 @@ impl HostedFreshAgentProxy {
             .as_ref()
             .map(|intent| intent.logical_attempt_id.clone());
         if let Err(reason) = self.post_barrier_admission(&message) {
-            self.error_event_code(
+            self.gateway_error_event_code(
                 &provider,
                 &session_id,
                 session_type,
                 "FRESH_AGENT_STALE_SESSION",
                 reason,
+                GatewayErrorContext::Operation("send", message.request_id.as_deref()),
             );
             return;
         }
@@ -274,15 +280,44 @@ impl HostedFreshAgentProxy {
                     .await
                     .map(|_| ())
             }
-            None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+            None => {
+                self.error_event(
+                    &provider,
+                    &session_id,
+                    session_type,
+                    "managed fresh-agent input was not accepted",
+                    GatewayErrorContext::Operation("send", message.request_id.as_deref()),
+                );
+                return;
+            }
         };
-        if result.is_err() {
-            self.error_event(
-                &provider,
-                &session_id,
-                session_type,
-                "managed fresh-agent input was not accepted",
+        if let Err(error) = result {
+            use freshell_runtime_client::ClientError;
+            let ambiguous = matches!(
+                error,
+                ClientError::Io(_) | ClientError::Protocol(_) | ClientError::UnexpectedResult
+            ) || matches!(
+                error.runtime_code(),
+                Some(RuntimeErrorCode::CommandAmbiguous | RuntimeErrorCode::HostUnreachable)
             );
+            if provider == AgentProvider::Codex && ambiguous {
+                self.gateway_error_event_code(
+                    &provider,
+                    &session_id,
+                    session_type,
+                    "COMMAND_AMBIGUOUS",
+                    "CODEX_DELIVERY_AMBIGUOUS: the managed gateway could not confirm whether the message reached Codex",
+                    GatewayErrorContext::Operation("send", message.request_id.as_deref()),
+                );
+            } else {
+                self.error_event(
+                    &provider,
+                    &session_id,
+                    session_type,
+                    "managed fresh-agent input was not accepted",
+                    GatewayErrorContext::Operation("send", message.request_id.as_deref()),
+                );
+            }
         }
     }
 
@@ -323,12 +358,18 @@ impl HostedFreshAgentProxy {
                         Ok(Some((soul, ownership))) => (Some(soul), Some(ownership)),
                         Ok(None) => (None, None),
                         Err(()) => {
-                            self.error_event_code(
+                            self.gateway_error_event_code(
                                 &message.provider,
                                 &message.session_id,
                                 message.session_type,
                                 "SESSION_RESERVED",
                                 "the managed session owner changed; refresh and retry",
+                                GatewayErrorContext::Attach(
+                                    message
+                                        .session_ref
+                                        .as_ref()
+                                        .map(|reference| reference.session_id.as_str()),
+                                ),
                             );
                             return;
                         }
@@ -366,6 +407,12 @@ impl HostedFreshAgentProxy {
                         &message.session_id,
                         message.session_type,
                         "managed fresh-agent soul was not found",
+                        GatewayErrorContext::Attach(
+                            message
+                                .session_ref
+                                .as_ref()
+                                .map(|reference| reference.session_id.as_str()),
+                        ),
                     );
                 }
             }
@@ -399,6 +446,7 @@ impl HostedFreshAgentProxy {
                         &message.session_id,
                         message.session_type,
                         "managed fresh-agent interrupt failed",
+                        GatewayErrorContext::Operation("interrupt", message.request_id.as_deref()),
                     );
                 }
             }
@@ -440,6 +488,7 @@ impl HostedFreshAgentProxy {
                         message.session_type,
                         &error,
                         "managed fresh-agent configure was not accepted",
+                        GatewayErrorContext::Operation("configure", message.request_id.as_deref()),
                     );
                 }
             }
@@ -539,6 +588,7 @@ impl HostedFreshAgentProxy {
                         message.session_type,
                         &error,
                         "managed fresh-agent compact was not accepted",
+                        GatewayErrorContext::Operation("compact", message.request_id.as_deref()),
                     );
                 }
             }
@@ -622,6 +672,7 @@ impl HostedFreshAgentProxy {
                         &session_id,
                         session_type,
                         "managed provider-native fork failed without creating another soul",
+                        GatewayErrorContext::Operation("fork", message.request_id.as_deref()),
                     ),
                 }
             }
@@ -1408,7 +1459,7 @@ impl HostedFreshAgentProxy {
         {
             Some(soul) => self
                 .client
-                .fresh_agent_resolve(soul, decision_id, decision)
+                .fresh_agent_resolve(soul, decision_id.clone(), decision)
                 .await
                 .map(|_| ()),
             None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
@@ -1419,6 +1470,7 @@ impl HostedFreshAgentProxy {
                 &session_id,
                 session_type,
                 "managed fresh-agent decision was not accepted",
+                GatewayErrorContext::Operation("decision", Some(&decision_id)),
             );
         }
     }
@@ -1434,7 +1486,7 @@ impl HostedFreshAgentProxy {
             turn_id,
             cwd,
         } = invocation;
-        let parsed_request_id = RequestId::parse(request_id);
+        let parsed_request_id = RequestId::parse(request_id.clone());
         let result = match (
             parsed_request_id,
             self.resolve_soul(&provider, session_type, &session_id)
@@ -1468,6 +1520,7 @@ impl HostedFreshAgentProxy {
                 session_type,
                 &error,
                 "managed fresh-agent rollback was not accepted",
+                GatewayErrorContext::Operation("rollback", Some(&request_id)),
             );
         }
     }
@@ -1928,13 +1981,24 @@ impl HostedFreshAgentProxy {
                             cursor = cursor.max(batch.head);
                         }
                         for event in batch.events {
+                            let retained_warning = event.sequence <= retained_through
+                                && is_current_codex_memory_loss(
+                                    &event.event,
+                                    &provider,
+                                    source_before.as_ref(),
+                                );
                             if event.sequence <= retained_through
                                 && !is_request_receipt(&event.event)
+                                && !retained_warning
                             {
                                 cursor = cursor.max(event.sequence);
                                 continue;
                             }
-                            if !proxy.deliver_polled_event(event.event, &delivery).await {
+                            let mut forwarded = event.event;
+                            if retained_warning {
+                                mark_retained_memory_loss(&mut forwarded);
+                            }
+                            if !proxy.deliver_polled_event(forwarded, &delivery).await {
                                 break;
                             }
                             cursor = cursor.max(event.sequence);
@@ -2435,10 +2499,19 @@ impl HostedFreshAgentProxy {
                 if event.sequence > replay_through {
                     return true;
                 }
-                if (event.sequence > retained_through || is_request_receipt(&event.event))
-                    && !self.deliver_polled_event(event.event, &delivery).await
+                let retained_warning = event.sequence <= retained_through
+                    && is_current_codex_memory_loss(&event.event, provider, before.as_ref());
+                if event.sequence > retained_through
+                    || is_request_receipt(&event.event)
+                    || retained_warning
                 {
-                    return false;
+                    let mut forwarded = event.event;
+                    if retained_warning {
+                        mark_retained_memory_loss(&mut forwarded);
+                    }
+                    if !self.deliver_polled_event(forwarded, &delivery).await {
+                        return false;
+                    }
                 }
                 cursor = cursor.max(event.sequence);
             }
@@ -2944,13 +3017,15 @@ impl HostedFreshAgentProxy {
         session_id: &str,
         session_type: SessionType,
         message: &str,
+        context: GatewayErrorContext<'_>,
     ) {
-        self.error_event_code(
+        self.gateway_error_event_code(
             provider,
             session_id,
             session_type,
             "MANAGED_FRESH_AGENT_ERROR",
             message,
+            context,
         );
     }
 
@@ -2961,9 +3036,45 @@ impl HostedFreshAgentProxy {
         session_type: SessionType,
         error: &freshell_runtime_client::ClientError,
         fallback: &str,
+        context: GatewayErrorContext<'_>,
     ) {
         let code = operation_error_code(error);
-        self.error_event_code(provider, session_id, session_type, code, fallback);
+        self.gateway_error_event_code(provider, session_id, session_type, code, fallback, context);
+    }
+
+    fn gateway_error_event_code(
+        &self,
+        provider: &AgentProvider,
+        session_id: &str,
+        session_type: SessionType,
+        code: &str,
+        message: &str,
+        context: GatewayErrorContext<'_>,
+    ) {
+        let mut event = fresh_agent_error_payload(code, message);
+        if *provider == AgentProvider::Codex {
+            match context {
+                GatewayErrorContext::Attach(native) => {
+                    event["gateway"] =
+                        serde_json::json!({ "operation":"attach", "nativeSessionId":native });
+                }
+                GatewayErrorContext::Operation(operation, request_id) => {
+                    event["gateway"] = serde_json::json!({ "operation":operation });
+                    if operation == "rollback" {
+                        event["rollback"] = serde_json::json!(true);
+                    }
+                    if let Some(request_id) = request_id {
+                        event["requestId"] = serde_json::json!(request_id);
+                    }
+                }
+            }
+        }
+        self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event,
+            provider: provider_wire(provider),
+            session_id: session_id.into(),
+            session_type: session_type_wire(session_type),
+        }));
     }
 
     fn error_event_code(
@@ -3376,6 +3487,33 @@ fn is_request_receipt(event: &AgentEvent) -> bool {
     receipt["requestId"]
         .as_str()
         .is_some_and(|id| !id.is_empty())
+}
+
+// Retained Codex state contains the transcript and controls, but not the
+// warning that a replacement thread lost its predecessor's memory. Replay
+// only that warning from the verified current native source; other journal
+// display events are already represented by the retained state.
+fn is_current_codex_memory_loss(
+    event: &AgentEvent,
+    provider: &str,
+    source: Option<&freshell_runtime_protocol::RuntimeView>,
+) -> bool {
+    let AgentEvent::Provider { payload } = event else {
+        return false;
+    };
+    provider == "codex"
+        && payload["type"] == "freshAgent.event"
+        && payload["event"]["type"] == "freshAgent.error"
+        && payload["event"]["code"] == "THREAD_MEMORY_LOST"
+        && payload["sessionId"].as_str().is_some_and(|native| {
+            source.and_then(|view| view.native_session_id.as_deref()) == Some(native)
+        })
+}
+
+fn mark_retained_memory_loss(event: &mut AgentEvent) {
+    if let AgentEvent::Provider { payload } = event {
+        payload["event"]["retainedReplay"] = serde_json::json!(true);
+    }
 }
 
 fn retained_batch_matches_source(

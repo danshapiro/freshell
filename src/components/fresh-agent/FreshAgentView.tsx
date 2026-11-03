@@ -48,7 +48,7 @@ import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clea
 import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { isCurrentFreshAgentEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
@@ -3308,8 +3308,13 @@ export function FreshAgentView({
           },
         }))
       }
+      // WsClient broadcasts each frame to both the global fold and this
+      // mounted subscriber. Apply the same source fence to pane-local effects.
+      const currentEvent = message.type !== 'freshAgent.event' || !isRecord(message.event)
+        || isCurrentFreshAgentEvent(appStore.getState(), { ...message, event: message.event })
       if (
         message.type === 'freshAgent.event'
+        && currentEvent
         && message.sessionId === paneContentRef.current.sessionId
         && (message.event as { type?: string; code?: string } | undefined)?.type === 'freshAgent.error'
         && (message.event as { code?: string }).code === 'SESSION_RESERVED'
@@ -3403,17 +3408,20 @@ export function FreshAgentView({
           requestSnapshotRefresh('send-accepted')
         }
       }
-      if (message.type === 'error') {
-        // Task 10: owned send failures. `requestId` is the only correlation
-        // handle on an error frame, and freshAgent.send is the only
-        // fresh-agent path that threads it: frames whose requestId matches a
-        // pendingSendMetadataRef entry are this pane's send failures. Frames
-        // with no matching requestId are not ours -- leave them alone.
-        const failedRequestId = typeof message.requestId === 'string' ? message.requestId : undefined
+      const gatewaySendFailure = message.type === 'freshAgent.event' && currentEvent
+        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
+        && isRecord(message.event) && message.event.type === 'freshAgent.error'
+        && isRecord(message.event.gateway) && message.event.gateway.operation === 'send'
+        ? message.event : undefined
+      const sendFailure = message.type === 'error' ? message : gatewaySendFailure
+      if (sendFailure) {
+        // Only the pane that submitted this request can restore its input or
+        // release its reservation, including for a managed gateway failure.
+        const failedRequestId = typeof sendFailure.requestId === 'string' ? sendFailure.requestId : undefined
         if (!failedRequestId || !pendingSendMetadataRef.current.has(failedRequestId)) return
         const current = paneContentRef.current
         if (
-          message.code === 'FRESH_AGENT_LOST_SESSION'
+          sendFailure.code === 'FRESH_AGENT_LOST_SESSION'
           && current.sessionType === 'freshopencode'
           && !lostSessionRetryRef.current.has(failedRequestId)
         ) {
@@ -3453,7 +3461,7 @@ export function FreshAgentView({
         const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
         const asyncQuestionKeys = pendingSendMetadataRef.current.get(failedRequestId)?.asyncQuestionKeys
         const ambiguous = current.provider === 'codex'
-          && typeof message.message === 'string' && message.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
+          && typeof sendFailure.message === 'string' && sendFailure.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
         if (asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, ambiguous ? 'ambiguous' as const : 'refused' as const])) }))
         if (ambiguous && pendingSendMetadataRef.current.get(failedRequestId)?.deliveryAmbiguous) return
         if (ambiguous) {
@@ -3479,21 +3487,22 @@ export function FreshAgentView({
         if ((current.provider === 'claude' || current.provider === 'codex') && failedText) {
           composerRef.current?.restoreText(failedText)
           const failureNotice = ambiguous
-            ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(message.message)}. Check the conversation before sending again.`
-            : `Message not sent: ${sendFailureReason(message.message)}`
+            ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(sendFailure.message)}. Check the conversation before sending again.`
+            : `Message not sent: ${sendFailureReason(sendFailure.message)}`
           deliveryNoticeRef.current = ambiguous ? failureNotice : null
           setNotice(failureNotice)
           log.warn('fresh_agent.send_refused', {
             provider: current.provider,
             sessionType: current.sessionType,
             sessionId: current.sessionId,
-            code: typeof message.code === 'string' ? message.code : undefined,
+            code: typeof sendFailure.code === 'string' ? sendFailure.code : undefined,
           })
         }
         return
       }
       if (
         message.type === 'freshAgent.event'
+        && currentEvent
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
         && outgoingTurnRef.current && isRecord(message.event)
       ) {
@@ -3507,6 +3516,7 @@ export function FreshAgentView({
         if (isBusyEvent) outgoingTurnRef.current.sawBusy = true
       }
       const messageBelongsToPane = message.type === 'freshAgent.event'
+        && currentEvent
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
       const eventType = readMessageEventType(message)
       const event = message.type === 'freshAgent.event' && isRecord(message.event) ? message.event : undefined
