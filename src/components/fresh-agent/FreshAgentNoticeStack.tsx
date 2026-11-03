@@ -58,7 +58,7 @@ export function FreshAgentNoticeStack({ notices, errors, onNoticesExpandedChange
           <NoticeDisclosure key={error.id} errorId={error.id} onExpandedChange={error.onToggle}>
             <summary aria-label={error.summary}>
               <span role="alert" aria-label={error.level === 'warning' ? 'Agent warning' : error.summary}>
-                {errors.length > 1 && error.compactSummary ? <>
+                {errors.length > 1 && error.level !== 'warning' && error.compactSummary ? <>
                   <span className="fresh-agent-error-summary-full" aria-hidden="true">{error.summary}</span>
                   <span className="fresh-agent-error-summary-compact" aria-hidden="true">{error.compactSummary}</span>
                 </> : error.summary}

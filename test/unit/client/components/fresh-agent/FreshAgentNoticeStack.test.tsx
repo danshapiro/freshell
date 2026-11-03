@@ -97,11 +97,13 @@ it('reports the already-open routine surface when a transient joins, then clears
 
 it('clears a removed diagnostic surface and derives named severity counts after updates', () => {
  const onOpen = vi.fn()
- const first = { id: 'notice', summary: 'Provider warning', level: 'warning' as const, content: <p>Original details</p>, onToggle: onOpen }
+ const first = { id: 'notice', summary: 'Provider warning', compactSummary: 'Warning', level: 'warning' as const, content: <p>Original details</p>, onToggle: onOpen }
  const { rerender } = render(<FreshAgentNoticeStack notices={[]} errors={[first, { id: 'create', summary: 'Agent could not start', content: null }]} />)
  const count = screen.getByRole('img', { name: '1 error, 1 warning' })
  expect(count).toHaveTextContent('2')
- const details = screen.getByRole('alert', { name: 'Agent warning' }).closest('details')!
+ const warning = screen.getByRole('alert', { name: 'Agent warning' })
+ expect(warning).toHaveTextContent(/^Provider warning$/)
+ const details = warning.closest('details')!
  details.open = true
  fireEvent(details, new Event('toggle', { bubbles: true }))
  expect(onOpen).toHaveBeenLastCalledWith(true)
