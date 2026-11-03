@@ -165,7 +165,7 @@ pub(crate) fn host_actor_state_dir(
         .join("actor")
 }
 
-fn verified_host_actor_state_dir(
+pub(crate) fn verified_host_actor_state_dir(
     runtime_root: &Path,
     installation_id: &InstallationId,
     soul_id: &SoulId,

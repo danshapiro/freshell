@@ -7,15 +7,18 @@
 //! for a failed native resume.
 
 use crate::{
-    backend::{BackendError, BackendRuntimeState, StoppedOpenCodeRepairReceipts},
+    backend::{
+        host_actor_state_dir, verified_host_actor_state_dir, BackendError, BackendRuntimeState,
+        StoppedOpenCodeRepairReceipts,
+    },
     checkpoints,
     loss_report::{
         hash_loss_certificate, path_name, IncidentExporter, LossDecisionInput, LostDecision,
     },
     recovery_retry::{RecoveryRetry, TransientRecoveryFailure},
     registry::{
-        NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryWriteFence, RegistryError,
-        StoppedRepairOwnerCandidate, StoppedRepairRootReceipt,
+        NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryWriteFence, Registry,
+        RegistryError, StoppedRepairOwnerCandidate, StoppedRepairRootReceipt,
     },
     resume_catalog,
     service::{map_backend, LaunchWorkload, Supervisor},
@@ -52,6 +55,103 @@ pub(crate) const LIVE_RESUME_EVIDENCE_RETRY_INTERVAL: Duration = Duration::from_
 #[cfg(not(test))]
 pub(crate) const LIVE_RESUME_EVIDENCE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const LIVE_RESUME_EVIDENCE_ATTEMPT_CACHE_MAX_ENTRIES: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedCodexReconciliation {
+    NoProof,
+    WriterBusy,
+    Reconciled,
+}
+
+struct RecheckedStoppedOwner {
+    context: RecoveryContext,
+    resume_spec: freshell_runtime_protocol::ResumeSpec,
+    probe: RecoveryProbe,
+    path: RecoveryPath,
+}
+
+enum StoppedOwnerCheck {
+    Unchanged,
+    Ready(Box<RecheckedStoppedOwner>),
+    Blocked(Box<RecoveryResult>),
+}
+
+/// A closed per-soul actor can retain an accepted dispatch whose host reply
+/// was lost. The exclusive actor lock prevents a new writer until the
+/// supervisor has correlated that proof with its own fenced input journal.
+async fn reconcile_closed_codex_dispatch(
+    registry: &Registry,
+    runtime_root: &Path,
+    context: &RecoveryContext,
+    closed_recovery_owner: bool,
+) -> Result<ClosedCodexReconciliation, RuntimeError> {
+    if context.provider != "codex"
+        || context.fresh_agent.is_none()
+        || context.desired_state != DesiredState::Running
+    {
+        return Ok(ClosedCodexReconciliation::NoProof);
+    }
+    let path = host_actor_state_dir(runtime_root, registry.installation_id(), &context.soul_id);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClosedCodexReconciliation::NoProof);
+        }
+        Err(_) => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "owned actor state is unavailable",
+            ))
+        }
+    }
+    let path =
+        verified_host_actor_state_dir(runtime_root, registry.installation_id(), &context.soul_id)
+            .map_err(map_backend)?;
+    let proof = match freshell_agent_runtime::host_actor::lock_accepted_codex_dispatch(&path) {
+        Ok(Some(proof)) => proof,
+        Ok(None) => return Ok(ClosedCodexReconciliation::NoProof),
+        Err(freshell_agent_runtime::host_actor::ActorError::WriterBusy) => {
+            return Ok(ClosedCodexReconciliation::WriterBusy)
+        }
+        Err(_) => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryWrongIdentity,
+                "owned actor acceptance proof is unavailable",
+            ))
+        }
+    };
+    if proof.provider_store_id() != context.provider_store_id {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "owned actor provider store does not match",
+        ));
+    }
+    let result = if closed_recovery_owner {
+        registry
+            .reconcile_closed_fresh_agent_dispatch_identity(
+                context.soul_id.clone(),
+                context.prior_handle.incarnation_id().clone(),
+                proof.accepted().clone(),
+            )
+            .await
+    } else {
+        registry
+            .reconcile_fresh_agent_dispatch_identity(
+                context.soul_id.clone(),
+                context.prior_handle.incarnation_id().clone(),
+                proof.accepted().clone(),
+            )
+            .await
+    };
+    drop(proof);
+    let reconciled = result.map_err(map_registry)?;
+    Ok(if reconciled {
+        ClosedCodexReconciliation::Reconciled
+    } else {
+        ClosedCodexReconciliation::NoProof
+    })
+}
+
 fn source_transfer_target_context(
     root: &str,
     target: &freshell_runtime_protocol::LostSoulRepairTarget,
@@ -1860,8 +1960,30 @@ impl Supervisor {
             .recovery_context(soul_id)
             .await
             .map_err(map_registry)?;
+        let reconciliation = Box::pin(reconcile_closed_codex_dispatch(
+            &self.registry,
+            &self.config.runtime_root,
+            &context,
+            false,
+        ))
+        .await?;
+        if reconciliation == ClosedCodexReconciliation::Reconciled {
+            tracing::info!(soul_id=%context.soul_id, incarnation_id=%context.prior_handle.incarnation_id(),
+                "freshagent.native_dispatch_identity_reconciled_from_closed_actor");
+            context = self
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+        }
         let mut transient = None;
         let probe = Box::pin(self.probe_recovery_context(&mut context, &mut transient)).await?;
+        let (probe, deferred_loss) =
+            Box::pin(self.defer_loss_for_unsettled_codex_input(&context, reconciliation, probe))
+                .await?;
+        if deferred_loss {
+            transient = Some(TransientRecoveryFailure::Host);
+        }
         let probe = match probe {
             RecoveryProbe::ResumeReady { resume_spec, .. } => {
                 // Validate even an unchanged proof against the current attempt;
@@ -1930,6 +2052,39 @@ impl Supervisor {
         let probe = after_native_probe(&context, probe);
         let transient = transient.filter(|failure| matches!(&probe,RecoveryProbe::Blocked { reason, .. } if failure.permits(*reason)));
         Ok((probe, context, transient))
+    }
+
+    async fn defer_loss_for_unsettled_codex_input(
+        &self,
+        context: &RecoveryContext,
+        reconciliation: ClosedCodexReconciliation,
+        probe: RecoveryProbe,
+    ) -> Result<(RecoveryProbe, bool), RuntimeError> {
+        // An in-flight actor might still persist a replacement acknowledgement.
+        // Its unresolved input prevents certifying the older root as lost.
+        if reconciliation == ClosedCodexReconciliation::WriterBusy
+            && matches!(&probe, RecoveryProbe::DefinitivelyUnavailable { .. })
+            && self
+                .registry
+                .has_unsettled_fresh_input(
+                    context.soul_id.clone(),
+                    context.prior_handle.incarnation_id().clone(),
+                )
+                .await
+                .map_err(map_registry)?
+        {
+            Ok((
+                blocked(
+                    RecoveryPath::Reattach,
+                    RecoveryBlockReason::ProviderUnavailable,
+                    "the owned actor is settling an ambiguous native input",
+                    Some(2_000),
+                ),
+                true,
+            ))
+        } else {
+            Ok((probe, false))
+        }
     }
 
     fn log_recovery_preflight(&self, context: &RecoveryContext, probe: &RecoveryProbe) {
@@ -3433,19 +3588,108 @@ impl Supervisor {
         }
     }
 
+    async fn recheck_changed_stopped_owner(
+        &self,
+        soul_id: &SoulId,
+        previous_native: Option<&str>,
+        prior_incarnation_id: &freshell_runtime_protocol::IncarnationId,
+        attempt_id: &RecoveryAttemptId,
+    ) -> Result<StoppedOwnerCheck, RuntimeError> {
+        let after_stop = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if after_stop.native_session_id.as_deref() == previous_native {
+            return Ok(StoppedOwnerCheck::Unchanged);
+        }
+        let (rechecked, refreshed, transient) =
+            Box::pin(self.classify_recovery(soul_id.clone())).await?;
+        if let (RecoveryProbe::ResumeReady { resume_spec, .. }, DesiredState::Running) =
+            (&rechecked, refreshed.desired_state)
+        {
+            let resume_spec = (**resume_spec).clone();
+            let path = if resume_spec.checkpoint_revision > 0 {
+                RecoveryPath::CheckpointRestore
+            } else {
+                RecoveryPath::NativeResume
+            };
+            return Ok(StoppedOwnerCheck::Ready(Box::new(RecheckedStoppedOwner {
+                context: refreshed,
+                resume_spec,
+                probe: rechecked,
+                path,
+            })));
+        }
+        let (reason, evidence) = match &rechecked {
+            RecoveryProbe::Blocked {
+                reason, evidence, ..
+            } => (*reason, evidence.clone()),
+            _ => (
+                RecoveryBlockReason::ProviderUnavailable,
+                vec!["accepted replacement requires a fresh native recovery proof".into()],
+            ),
+        };
+        let outcome = if refreshed.desired_state == DesiredState::Stopped {
+            RecoveryOutcome::Stopped
+        } else {
+            match self
+                .registry
+                .mark_recovery_blocked_with_retry(
+                    soul_id.clone(),
+                    Some(attempt_id.clone()),
+                    reason,
+                    evidence,
+                    refreshed.write_fence(),
+                    transient,
+                )
+                .await
+            {
+                Ok(()) => RecoveryOutcome::Blocked,
+                Err(RegistryError::InvalidState(message))
+                    if message.starts_with("stale recovery write fence") =>
+                {
+                    // Stop clears the recovery attempt. It can win after the
+                    // probe but before this fenced write; preserve that intent
+                    // without hiding other registry failures.
+                    let current = self
+                        .registry
+                        .recovery_context(soul_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    if current.desired_state != DesiredState::Stopped {
+                        return Err(map_registry(RegistryError::InvalidState(message)));
+                    }
+                    RecoveryOutcome::Stopped
+                }
+                Err(error) => return Err(map_registry(error)),
+            }
+        };
+        Ok(StoppedOwnerCheck::Blocked(Box::new(RecoveryResult {
+            outcome,
+            view: self.view_for(prior_incarnation_id).await?,
+            probe: Some(rechecked),
+            prior_incarnation_id: Some(prior_incarnation_id.clone()),
+            attempt_id: Some(attempt_id.clone()),
+            expected_native_session_id: refreshed.native_session_id,
+            observed_native_session_id: None,
+            incident_id: None,
+        })))
+    }
+
     // Callers box this large, infrequent recovery future so its owned launch
     // and post-loader probe state do not inflate their polling stack.
     async fn replace(
         &self,
         soul_id: SoulId,
         trigger: RecoveryTrigger,
-        path: RecoveryPath,
-        resume_spec: Option<freshell_runtime_protocol::ResumeSpec>,
-        probe: RecoveryProbe,
+        mut path: RecoveryPath,
+        mut resume_spec: Option<freshell_runtime_protocol::ResumeSpec>,
+        mut probe: RecoveryProbe,
         probe_fence: RecoveryWriteFence,
     ) -> Result<RecoveryResult, RuntimeError> {
         let recovery_started = Instant::now();
-        let start = match self
+        let mut start = match self
             .registry
             .begin_recovery_fenced(soul_id.clone(), trigger, path, probe_fence)
             .await
@@ -3481,9 +3725,8 @@ impl Supervisor {
         let attempt_id = start.attempt_id.clone();
         let mut verdict_fence = start.context.write_fence_for_attempt(attempt_id.clone());
 
-        let stop_outcome = self
-            .terminate_owned_for_recovery(&start.context.prior_handle)
-            .await?;
+        let stop_outcome =
+            Box::pin(self.terminate_owned_for_recovery(&start.context.prior_handle)).await?;
         if stop_outcome != StopOutcome::VerifiedEmpty {
             let reason = RecoveryBlockReason::OldRuntimeNotEmpty;
             self.registry
@@ -3513,6 +3756,29 @@ impl Supervisor {
                 observed_native_session_id: None,
                 incident_id: None,
             });
+        }
+
+        // An in-flight actor can persist an accepted replacement while its
+        // enclosure is stopping. The empty-owner boundary reconciles it before
+        // releasing the old writer. Never launch the earlier A resume proof
+        // after that transaction: probe the newly authorized root instead.
+        match Box::pin(self.recheck_changed_stopped_owner(
+            &soul_id,
+            start.context.native_session_id.as_deref(),
+            &prior_incarnation_id,
+            &attempt_id,
+        ))
+        .await?
+        {
+            StoppedOwnerCheck::Unchanged => {}
+            StoppedOwnerCheck::Ready(rechecked) => {
+                resume_spec = Some(rechecked.resume_spec);
+                path = rechecked.path;
+                probe = rechecked.probe;
+                verdict_fence = rechecked.context.write_fence();
+                start.context = rechecked.context;
+            }
+            StoppedOwnerCheck::Blocked(result) => return Ok(*result),
         }
 
         let prior_has_indexed_inputs = start
@@ -3823,15 +4089,14 @@ impl Supervisor {
             );
         let observed_native_session_id = if expected_native_session_id.is_some() || requires_native
         {
-            let wait = self
-                .wait_for_native_identity(
-                    &soul_id,
-                    &prepared.prepared.incarnation_id,
-                    start.context.intent_revision,
-                    native_identity_wait_timeout(opencode_readiness),
-                    true,
-                )
-                .await;
+            let wait = Box::pin(self.wait_for_native_identity(
+                &soul_id,
+                &prepared.prepared.incarnation_id,
+                start.context.intent_revision,
+                native_identity_wait_timeout(opencode_readiness),
+                true,
+            ))
+            .await;
             if matches!(wait, NativeIdentityWait::StopIntent { .. }) {
                 let current = self
                     .registry
@@ -5317,6 +5582,7 @@ impl Supervisor {
         handle: &OwnedRuntimeHandle,
     ) -> Result<StopOutcome, RuntimeError> {
         if self.backend.verify_empty(handle).await.unwrap_or(false) {
+            Box::pin(self.reconcile_codex_before_recording_empty(handle)).await?;
             self.registry
                 .mark_stop_outcome(handle.incarnation_id().clone(), StopOutcome::VerifiedEmpty)
                 .await
@@ -5358,6 +5624,9 @@ impl Supervisor {
             Err(BackendError::Unavailable(_)) => StopOutcome::BackendUnavailable,
             Err(_) => StopOutcome::TerminationUnconfirmed,
         };
+        if outcome == StopOutcome::VerifiedEmpty {
+            Box::pin(self.reconcile_codex_before_recording_empty(handle)).await?;
+        }
         self.registry
             .mark_stop_outcome(handle.incarnation_id().clone(), outcome)
             .await
@@ -5366,6 +5635,48 @@ impl Supervisor {
             self.record_recovery_writer_release(handle);
         }
         Ok(outcome)
+    }
+
+    async fn reconcile_codex_before_recording_empty(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), RuntimeError> {
+        if !handle
+            .fresh_agent()
+            .is_some_and(|agent| agent.provider == freshell_runtime_protocol::FreshProvider::Codex)
+        {
+            return Ok(());
+        }
+        let context = self
+            .registry
+            .recovery_context(handle.soul_id().clone())
+            .await
+            .map_err(map_registry)?;
+        if context.desired_state != DesiredState::Running
+            || context.recovery_state != freshell_runtime_protocol::RecoveryState::Recovering
+            || context.prior_handle.incarnation_id() != handle.incarnation_id()
+        {
+            return Ok(());
+        }
+        match Box::pin(reconcile_closed_codex_dispatch(
+            &self.registry,
+            &self.config.runtime_root,
+            &context,
+            true,
+        ))
+        .await?
+        {
+            ClosedCodexReconciliation::NoProof => Ok(()),
+            ClosedCodexReconciliation::Reconciled => {
+                tracing::info!(soul_id=%context.soul_id, incarnation_id=%handle.incarnation_id(),
+                    "freshagent.native_dispatch_identity_reconciled_after_stop");
+                Ok(())
+            }
+            ClosedCodexReconciliation::WriterBusy => Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "the verified-empty owner still has an active actor writer",
+            )),
+        }
     }
 
     fn record_recovery_writer_release(&self, handle: &OwnedRuntimeHandle) {
@@ -6159,6 +6470,385 @@ pub(crate) mod tests {
     use freshell_runtime_protocol::{
         FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
     };
+
+    pub(super) struct AcceptedRecoveryTransport {
+        pub(super) native: &'static str,
+        pub(super) identity: Option<freshell_runtime_protocol::NativeDispatchIdentity>,
+        pub(super) dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    struct OfflineRecoveryBackend;
+
+    #[async_trait::async_trait]
+    impl crate::backend::RuntimeBackend for OfflineRecoveryBackend {
+        async fn create_stopped(
+            &self,
+            _: &crate::backend::CreateRuntimeSpec,
+        ) -> Result<crate::backend::BackendCreated, BackendError> {
+            unreachable!()
+        }
+        async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn inspect(
+            &self,
+            _: &OwnedRuntimeHandle,
+        ) -> Result<crate::backend::BackendInspection, BackendError> {
+            Err(BackendError::Unavailable(
+                "owned test backend unavailable".into(),
+            ))
+        }
+        async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            unreachable!()
+        }
+        async fn list_known(
+            &self,
+            _: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, crate::backend::BackendInspection)>, BackendError> {
+            unreachable!()
+        }
+        async fn read_limits(
+            &self,
+            _: &OwnedRuntimeHandle,
+        ) -> Result<freshell_runtime_protocol::RuntimeLimits, BackendError> {
+            unreachable!()
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FreshAgentTransport for AcceptedRecoveryTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some(self.native.into()),
+            })
+        }
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(DispatchAck {
+                native_identity: self.identity.clone(),
+                provider_ack_id: Some("accepted".into()),
+            })
+        }
+        async fn resolve_permission(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            Ok(())
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(
+            &self,
+        ) -> Option<tokio::sync::mpsc::Receiver<freshell_runtime_protocol::AgentEvent>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_codex_actor_acceptance_updates_supervisor_before_reopen() {
+        for recovery_started in [false, true] {
+            closed_codex_actor_acceptance_case(recovery_started).await;
+        }
+    }
+
+    async fn closed_codex_actor_acceptance_case(recovery_started: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), dir.path())
+                .await;
+        let mut spec = registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .fresh_agent
+            .unwrap();
+        spec.provider = FreshProvider::Codex;
+        spec.session_type = "freshcodex".into();
+        spec.runtime_variant = "codex".into();
+        let conn = rusqlite::Connection::open(registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            rusqlite::params![
+                serde_json::to_string(&spec).unwrap(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-a".into(),
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let stale_profile: FreshAgentProfile = serde_json::from_value(
+            serde_json::to_value(context.fresh_agent.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let runtime_root = dir.path().join("runtime");
+        let actor_dir = host_actor_state_dir(&runtime_root, registry.installation_id(), &soul);
+        std::fs::create_dir_all(&actor_dir).unwrap();
+        std::fs::set_permissions(&actor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(OfflineRecoveryBackend),
+            crate::service::SupervisorConfig {
+                runtime_root: runtime_root.clone(),
+                control_socket_path: dir.path().join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "actor-recovery".into(),
+                control_secret: "synthetic-secret".into(),
+                lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                admission: crate::admission::AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let first = Arc::new(AcceptedRecoveryTransport {
+            native: "native-a",
+            identity: Some(freshell_runtime_protocol::NativeDispatchIdentity {
+                previous_native_session_id: "native-a".into(),
+                native_session_id: "native-b".into(),
+                pending_naming_handle: None,
+            }),
+            dispatches: Default::default(),
+        });
+        let actor = FreshAgentHostActor::open(&actor_dir, stale_profile.clone(), first)
+            .await
+            .unwrap();
+        let request = RequestId::parse("accepted-before-crash").unwrap();
+        registry
+            .begin_input(soul.clone(), request.clone(), b"recover once", None)
+            .await
+            .unwrap();
+        registry
+            .mark_input_dispatching(soul.clone(), request.clone())
+            .await
+            .unwrap();
+        actor
+            .dispatch(request.clone(), "recover once".into(), None)
+            .await
+            .unwrap();
+        registry
+            .mark_input_ambiguous(soul.clone(), request.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile_closed_codex_dispatch(&registry, &runtime_root, &context, false)
+                .await
+                .unwrap(),
+            ClosedCodexReconciliation::WriterBusy
+        );
+        let negative = RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            reason: "old root absent".into(),
+            evidence: Vec::new(),
+            store_state: EvidenceStoreState::Missing,
+            negative_paths: Vec::new(),
+        };
+        let (deferred, was_deferred) = supervisor
+            .defer_loss_for_unsettled_codex_input(
+                &context,
+                ClosedCodexReconciliation::WriterBusy,
+                negative.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(was_deferred);
+        assert!(
+            matches!(
+                deferred,
+                RecoveryProbe::Blocked {
+                    reason: RecoveryBlockReason::ProviderUnavailable,
+                    ..
+                }
+            ),
+            "a live actor with an unresolved input cannot certify the old root lost"
+        );
+        assert_eq!(
+            registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-a")
+        );
+        let (_, while_live, _) = supervisor.classify_recovery(soul.clone()).await.unwrap();
+        assert_eq!(
+            while_live.native_session_id.as_deref(),
+            Some("native-a"),
+            "preflight cannot inspect a live writer"
+        );
+        let attempt = if recovery_started {
+            Some(
+                registry
+                    .begin_recovery_fenced(
+                        soul.clone(),
+                        RecoveryTrigger::StartupReconcile,
+                        RecoveryPath::NativeResume,
+                        context.write_fence(),
+                    )
+                    .await
+                    .unwrap()
+                    .attempt_id,
+            )
+        } else {
+            None
+        };
+        actor.stop().await.unwrap();
+        let mut wrong_store = context.clone();
+        wrong_store.provider_store_id = "foreign-store".into();
+        let refused =
+            reconcile_closed_codex_dispatch(&registry, &runtime_root, &wrong_store, false)
+                .await
+                .unwrap_err();
+        assert_eq!(refused.code, RuntimeErrorCode::RecoveryWrongIdentity);
+        assert_eq!(
+            registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-a"),
+            "a mismatched provider store cannot transfer identity"
+        );
+        if recovery_started {
+            assert_eq!(
+                reconcile_closed_codex_dispatch(&registry, &runtime_root, &context, false)
+                    .await
+                    .unwrap(),
+                ClosedCodexReconciliation::NoProof,
+                "a normal live observation cannot commit a stopping owner"
+            );
+        }
+        if recovery_started {
+            assert_eq!(
+                reconcile_closed_codex_dispatch(&registry, &runtime_root, &context, true)
+                    .await
+                    .unwrap(),
+                ClosedCodexReconciliation::Reconciled
+            );
+        } else {
+            let (_, observed, _) = supervisor.classify_recovery(soul.clone()).await.unwrap();
+            assert_eq!(
+                observed.native_session_id.as_deref(),
+                Some("native-b"),
+                "the real supervisor preflight must commit acceptance before probing recovery"
+            );
+        }
+        let updated = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(updated.native_session_id.as_deref(), Some("native-b"));
+        assert_eq!(
+            updated.fresh_agent.as_ref().unwrap().session_id,
+            "fresh-session"
+        );
+        assert_eq!(
+            registry
+                .begin_input(soul.clone(), request.clone(), b"recover once", None)
+                .await
+                .unwrap()
+                .0,
+            crate::registry::InputJournalDisposition::Completed
+        );
+        let (unchanged, was_deferred) = supervisor
+            .defer_loss_for_unsettled_codex_input(
+                &updated,
+                ClosedCodexReconciliation::WriterBusy,
+                negative,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !was_deferred,
+            "a completed input must not block an unrelated loss verdict"
+        );
+        assert!(matches!(
+            unchanged,
+            RecoveryProbe::DefinitivelyUnavailable { .. }
+        ));
+        if !recovery_started {
+            let authorized: FreshAgentProfile = serde_json::from_value(
+                serde_json::to_value(updated.fresh_agent.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let replacement = Arc::new(AcceptedRecoveryTransport {
+                native: "native-b",
+                identity: None,
+                dispatches: Default::default(),
+            });
+            let reopened = FreshAgentHostActor::open(&actor_dir, authorized, replacement.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .dispatch(request, "recover once".into(), None)
+                    .await,
+                Ok(CommandState::ProviderAcked)
+            );
+            assert_eq!(replacement.dispatches.load(Ordering::SeqCst), 0);
+            reopened.stop().await.unwrap();
+        }
+        assert_eq!(
+            reconcile_closed_codex_dispatch(&registry, &runtime_root, &updated, false)
+                .await
+                .unwrap(),
+            ClosedCodexReconciliation::NoProof
+        );
+        if let Some(attempt) = attempt {
+            registry.begin_stop(soul.clone()).await.unwrap();
+            let stopped = supervisor
+                .recheck_changed_stopped_owner(
+                    &soul,
+                    Some("native-a"),
+                    updated.prior_handle.incarnation_id(),
+                    &attempt,
+                )
+                .await
+                .expect("a concurrent stop intent must settle as stopped");
+            let StoppedOwnerCheck::Blocked(stopped) = stopped else {
+                panic!("expected stopped result")
+            };
+            assert_eq!(stopped.outcome, RecoveryOutcome::Stopped);
+            assert_eq!(
+                registry.recovery_context(soul).await.unwrap().desired_state,
+                DesiredState::Stopped
+            );
+        }
+    }
 
     pub(crate) fn stopped_source_options_for_targets(
         extraction_root: PathBuf,
@@ -8739,6 +9429,12 @@ pub(crate) mod automatic_retry_tests {
         clock: Arc<AtomicI64>,
         hosts: Mutex<Vec<(PathBuf, tokio::task::JoinHandle<()>)>>,
         baseline_stop: Option<Arc<BaselineStopReadiness>>,
+        stop_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
     }
     impl Drop for RetryBackend {
         fn drop(&mut self) {
@@ -8754,6 +9450,7 @@ pub(crate) mod automatic_retry_tests {
                 clock,
                 hosts: Mutex::new(vec![]),
                 baseline_stop: None,
+                stop_gate: Mutex::new(None),
             }
         }
         fn record(&self, name: &str, value: &str) {
@@ -9246,6 +9943,10 @@ pub(crate) mod automatic_retry_tests {
                 Some((65534, 0))
             );
             self.record("native-census", handle.incarnation_id().as_str());
+            self.record(
+                "native-census-roots",
+                &spec.provider_session.native_session_id,
+            );
             if let Some(error) = self.reader_failure("native-reader-failure") {
                 return Err(error);
             }
@@ -9374,6 +10075,13 @@ pub(crate) mod automatic_retry_tests {
             handle: &OwnedRuntimeHandle,
             _: u64,
         ) -> Result<(), BackendError> {
+            let gate = self.stop_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                release
+                    .await
+                    .map_err(|_| BackendError::Unavailable("owned test stop gate closed".into()))?;
+            }
             // Like Docker, no-op Stop on a never-started enclosure leaves it
             // Created. Inspection must not silently start its host either.
             if handle.runtime_dir().join("fixture-started").exists() {
@@ -9531,6 +10239,183 @@ pub(crate) mod automatic_retry_tests {
             soul
         })
     }
+
+    #[tokio::test]
+    async fn accepted_codex_replacement_during_stop_reprobes_new_root_before_launch() {
+        use super::tests::AcceptedRecoveryTransport;
+        use freshell_agent_runtime::host_actor::{FreshAgentHostActor, FreshAgentProfile};
+        use freshell_runtime_protocol::{NativeDispatchIdentity, RequestId};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed_native(&supervisor, dir.path()).await;
+        let initial = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let old_runtime = dir.path().join("old-owned-host");
+        std::fs::create_dir(&old_runtime).unwrap();
+        std::fs::write(old_runtime.join("secret"), b"synthetic-secret").unwrap();
+        std::fs::write(
+            old_runtime.join("fixture-object"),
+            initial.prior_handle.container_id(),
+        )
+        .unwrap();
+        std::fs::write(old_runtime.join("fixture-started"), b"running").unwrap();
+        let mut spec = initial.fresh_agent.clone().unwrap();
+        spec.native_session_id = Some("retry-root".into());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+            rusqlite::params![
+                old_runtime.to_str().unwrap(),
+                serde_json::to_string(&spec).unwrap(),
+                initial.prior_handle.incarnation_id().as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE writer_claims SET provider='codex' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let old_resume = before.resume_spec.clone().unwrap();
+        assert_eq!(old_resume.provider_session.native_session_id, "retry-root");
+        let actor_dir = host_actor_state_dir(
+            &supervisor.config.runtime_root,
+            supervisor.registry.installation_id(),
+            &soul,
+        );
+        std::fs::create_dir_all(&actor_dir).unwrap();
+        for directory in [
+            &actor_dir,
+            actor_dir.parent().unwrap(),
+            actor_dir.parent().unwrap().parent().unwrap(),
+        ] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let profile: FreshAgentProfile =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        let transport = Arc::new(AcceptedRecoveryTransport {
+            native: "retry-root",
+            identity: Some(NativeDispatchIdentity {
+                previous_native_session_id: "retry-root".into(),
+                native_session_id: "replacement-root".into(),
+                pending_naming_handle: None,
+            }),
+            dispatches: Default::default(),
+        });
+        let actor = FreshAgentHostActor::open(&actor_dir, profile, transport)
+            .await
+            .unwrap();
+        let request = RequestId::parse("accepted-at-stop").unwrap();
+        supervisor
+            .registry
+            .begin_input(soul.clone(), request.clone(), b"recover once", None)
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .mark_input_dispatching(soul.clone(), request.clone())
+            .await
+            .unwrap();
+        actor
+            .dispatch(request.clone(), "recover once".into(), None)
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .mark_input_ambiguous(soul.clone(), request.clone())
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("provider/.codex/sessions/rollout-replacement-root.jsonl"),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"replacement-root\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("create-failure"), b"transient").unwrap();
+        let (entered, stopping) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *backend.stop_gate.lock().unwrap() = Some((entered, released));
+        let mut recovery = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            async move {
+                supervisor
+                    .replace(
+                        soul,
+                        RecoveryTrigger::StartupReconcile,
+                        RecoveryPath::NativeResume,
+                        Some(old_resume.clone()),
+                        RecoveryProbe::ResumeReady {
+                            evidence_revision: old_resume.evidence_revision,
+                            resume_spec: Box::new(old_resume),
+                        },
+                        before.write_fence(),
+                    )
+                    .await
+            }
+        });
+        tokio::select! {
+            result = &mut recovery => panic!("recovery ended before the owned stop gate: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(30), stopping) => {
+                result.expect("the owned stop gate must be reached").unwrap();
+            }
+        }
+        actor.stop().await.unwrap();
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), recovery)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            RecoveryOutcome::Blocked,
+            "the synthetic backend refuses the later launch"
+        );
+        let after = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(after.native_session_id.as_deref(), Some("replacement-root"));
+        assert_eq!(
+            after.fresh_agent.as_ref().unwrap().session_id,
+            "retry-fresh-codex"
+        );
+        assert_eq!(
+            supervisor
+                .registry
+                .begin_input(soul.clone(), request, b"recover once", None)
+                .await
+                .unwrap()
+                .0,
+            crate::registry::InputJournalDisposition::Completed
+        );
+        let roots = std::fs::read_to_string(dir.path().join("native-census-roots")).unwrap();
+        assert_eq!(
+            roots.lines().collect::<Vec<_>>(),
+            vec!["replacement-root"],
+            "the stopped owner's stale A resume proof must not be reused"
+        );
+        assert_eq!(
+            backend.count("creates"),
+            0,
+            "the synthetic backend must not start another enclosure"
+        );
+        close_retry_hosts(&backend).await;
+    }
+
     async fn seed_offline_amplifier(supervisor: &Supervisor, root: &Path) -> SoulId {
         let soul = seed(supervisor).await;
         let context = supervisor

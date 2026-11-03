@@ -631,6 +631,47 @@ impl Drop for WriterLock {
     }
 }
 
+/// Accepted Codex identity proof read while excluding any live actor writer.
+/// The supervisor must still correlate the request and producer incarnation
+/// with its own durable input journal before changing launch authority.
+pub struct LockedAcceptedCodexDispatch {
+    accepted: AcceptedNativeDispatch,
+    provider_store_id: String,
+    _writer_lock: WriterLock,
+}
+
+impl LockedAcceptedCodexDispatch {
+    pub fn accepted(&self) -> &AcceptedNativeDispatch {
+        &self.accepted
+    }
+
+    pub fn provider_store_id(&self) -> &str {
+        &self.provider_store_id
+    }
+}
+
+pub fn lock_accepted_codex_dispatch(
+    state_dir: &Path,
+) -> Result<Option<LockedAcceptedCodexDispatch>, ActorError> {
+    let state_path = state_dir.join("fresh-agent-state.json");
+    match fs::symlink_metadata(&state_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(persist(error)),
+    }
+    let writer_lock = WriterLock::acquire(&state_dir.join("fresh-agent-writer.lock"))?;
+    let state: PersistedActorState =
+        serde_json::from_slice(&fs::read(state_path).map_err(persist)?).map_err(persist)?;
+    state.profile.validate()?;
+    Ok(
+        current_accepted_native_dispatch(&state).map(|accepted| LockedAcceptedCodexDispatch {
+            accepted,
+            provider_store_id: state.profile.provider_store_id,
+            _writer_lock: writer_lock,
+        }),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeRecoveryRelease {
     Pending,

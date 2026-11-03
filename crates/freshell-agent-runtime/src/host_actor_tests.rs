@@ -1850,6 +1850,120 @@ async fn codex_native_dispatch_acceptance_survives_eviction_and_actor_reopen() {
 }
 
 #[tokio::test]
+async fn codex_accepted_replacement_requires_authority_before_reopening_stale_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stale_launch = profile(FreshProvider::Codex, "crash-window-store", Some("native-a"));
+    stale_launch.session_ref = Some(ProviderSessionReference {
+        provider: "codex".into(),
+        session_id: "native-a".into(),
+    });
+    let first_transport = FakeTransport::new("native-a");
+    *first_transport.dispatch_identity.lock().unwrap() = Some(NativeDispatchIdentity {
+        previous_native_session_id: "native-a".into(),
+        native_session_id: "native-b".into(),
+        pending_naming_handle: None,
+    });
+    let actor =
+        FreshAgentHostActor::open(dir.path(), stale_launch.clone(), first_transport.clone())
+            .await
+            .unwrap();
+    let request = RequestId::parse("accepted-before-host-exit").unwrap();
+    assert_eq!(
+        actor
+            .dispatch(request.clone(), "recover once".into(), None)
+            .await,
+        Ok(CommandState::ProviderAcked)
+    );
+    let accepted = actor
+        .read_events(0, 16)
+        .await
+        .accepted_native_dispatch
+        .unwrap();
+    assert_eq!(accepted.request_id, request);
+    assert_eq!(accepted.identity.native_session_id, "native-b");
+    assert!(
+        matches!(
+            lock_accepted_codex_dispatch(dir.path()),
+            Err(ActorError::WriterBusy)
+        ),
+        "the supervisor cannot inspect an actor that still owns its writer lock"
+    );
+    actor.stop().await.unwrap();
+
+    // The supervisor has not yet learned B and supplies its last launch A;
+    // the durable actor has already recorded the accepted A -> B transition.
+    let stale_transport = FakeTransport::new("native-a");
+    assert!(
+        matches!(
+            FreshAgentHostActor::open(dir.path(), stale_launch.clone(), stale_transport.clone())
+                .await,
+            Err(ActorError::NativeIdentityMismatch)
+        ),
+        "the actor cannot promote its own identity without supervisor authority"
+    );
+    assert_eq!(stale_transport.starts.load(Ordering::SeqCst), 0);
+    let locked = lock_accepted_codex_dispatch(dir.path()).unwrap().unwrap();
+    assert_eq!(locked.accepted(), &accepted);
+    assert_eq!(locked.provider_store_id(), "crash-window-store");
+    let mut authorized = stale_launch.clone();
+    authorized.native_session_id = Some("native-b".into());
+    authorized.session_ref.as_mut().unwrap().session_id = "native-b".into();
+    let replacement_transport = FakeTransport::new("native-b");
+    assert!(
+        matches!(
+            FreshAgentHostActor::open(
+                dir.path(),
+                authorized.clone(),
+                replacement_transport.clone()
+            )
+            .await,
+            Err(ActorError::WriterBusy)
+        ),
+        "the inspected proof remains fenced until the supervisor is finished"
+    );
+    drop(locked);
+    let reopened = FreshAgentHostActor::open(dir.path(), authorized, replacement_transport.clone())
+        .await
+        .expect("a supervisor-authorized replacement must reopen after its host exits");
+    let started = replacement_transport.start_profiles.lock().unwrap().clone();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].native_session_id.as_deref(), Some("native-b"));
+    assert_eq!(
+        started[0].session_ref.as_ref().unwrap().session_id,
+        "native-b"
+    );
+    assert_eq!(
+        reopened.read_events(0, 16).await.accepted_native_dispatch,
+        Some(accepted)
+    );
+    assert_eq!(
+        reopened
+            .dispatch(request, "recover once".into(), None)
+            .await,
+        Ok(CommandState::ProviderAcked)
+    );
+    assert_eq!(
+        replacement_transport.dispatches.load(Ordering::SeqCst),
+        0,
+        "the accepted input must not be delivered twice"
+    );
+    reopened.stop().await.unwrap();
+
+    let mut foreign_launch = stale_launch;
+    foreign_launch.provider_store_id = "foreign-store".into();
+    let foreign = FakeTransport::new("native-b");
+    assert!(matches!(
+        FreshAgentHostActor::open(dir.path(), foreign_launch, foreign.clone()).await,
+        Err(ActorError::NativeIdentityMismatch)
+    ));
+    assert_eq!(
+        foreign.starts.load(Ordering::SeqCst),
+        0,
+        "persisted acceptance cannot authorize a different provider store"
+    );
+}
+
+#[tokio::test]
 async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_restart() {
     let dir = tempfile::tempdir().unwrap();
     let transport = FakeTransport::new("thread-7");

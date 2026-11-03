@@ -42,6 +42,7 @@ enum NativeSessionTransitionEvidence {
     AcceptedDispatch {
         pending_naming_handle: Option<String>,
         request_id: Option<RequestId>,
+        closed_recovery_owner: bool,
     },
 }
 
@@ -2339,10 +2340,25 @@ impl Registry {
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: identity.pending_naming_handle,
                 request_id: None,
+                closed_recovery_owner: false,
             },
         )
         .await
         .map(|_| ())
+    }
+
+    pub(crate) async fn has_unsettled_fresh_input(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM input_commands WHERE soul_id=?1 AND incarnation_id=?2 AND state IN ('dispatching','ambiguous'))",
+                params![soul_id.as_str(), incarnation_id.as_str()],
+                |row| row.get(0),
+            ).map_err(RegistryError::from)
+        }).await
     }
 
     /// Reconcile a lost send reply only for the exact command and incarnation
@@ -2353,6 +2369,29 @@ impl Registry {
         incarnation_id: IncarnationId,
         accepted: AcceptedNativeDispatch,
     ) -> Result<bool, RegistryError> {
+        self.reconcile_fresh_agent_dispatch_identity_inner(soul_id, incarnation_id, accepted, false)
+            .await
+    }
+
+    /// Used only after the exact recovering enclosure is proved empty while
+    /// the closed actor's writer lock is held by the caller.
+    pub(crate) async fn reconcile_closed_fresh_agent_dispatch_identity(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        accepted: AcceptedNativeDispatch,
+    ) -> Result<bool, RegistryError> {
+        self.reconcile_fresh_agent_dispatch_identity_inner(soul_id, incarnation_id, accepted, true)
+            .await
+    }
+
+    async fn reconcile_fresh_agent_dispatch_identity_inner(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        accepted: AcceptedNativeDispatch,
+        closed_recovery_owner: bool,
+    ) -> Result<bool, RegistryError> {
         let query_soul = soul_id.clone();
         let query_incarnation = incarnation_id.clone();
         let query_request = accepted.request_id.clone();
@@ -2360,8 +2399,8 @@ impl Registry {
         let native = accepted.identity.native_session_id.clone();
         let eligible = self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM input_commands c JOIN souls s ON s.soul_id=c.soul_id JOIN incarnations i ON i.incarnation_id=c.incarnation_id WHERE c.soul_id=?1 AND c.request_id=?2 AND c.incarnation_id=?3 AND c.state IN ('dispatching','ambiguous') AND s.provider='codex' AND s.desired_state='running' AND i.launch_state='running' AND s.native_session_id IN (?4,?5))",
-                params![query_soul.as_str(), query_request.as_str(), query_incarnation.as_str(), previous, native],
+                "SELECT EXISTS(SELECT 1 FROM input_commands c JOIN souls s ON s.soul_id=c.soul_id JOIN incarnations i ON i.incarnation_id=c.incarnation_id WHERE c.soul_id=?1 AND c.request_id=?2 AND c.incarnation_id=?3 AND c.state IN ('dispatching','ambiguous') AND s.provider='codex' AND s.desired_state='running' AND (i.launch_state='running' OR (?6 AND i.launch_state='stopping' AND s.recovery_state='recovering' AND i.recovery_attempt_id IS NOT NULL AND i.recovery_attempt_id=s.recovery_attempt_id)) AND s.native_session_id IN (?4,?5))",
+                params![query_soul.as_str(), query_request.as_str(), query_incarnation.as_str(), previous, native, closed_recovery_owner],
                 |row| row.get::<_, bool>(0),
             ).map_err(RegistryError::from)
         }).await?;
@@ -2378,6 +2417,7 @@ impl Registry {
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: accepted.identity.pending_naming_handle,
                 request_id: Some(accepted.request_id),
+                closed_recovery_owner,
             },
         )
         .await?;
@@ -2452,15 +2492,28 @@ impl Registry {
         fence: RecoveryWriteFence,
         evidence: NativeSessionTransitionEvidence,
     ) -> Result<RecoveryWriteFence, RegistryError> {
-        let (claude_fork, native_clear, pending_naming_handle, accepted_request) = match evidence {
-            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None, None),
+        let (
+            claude_fork,
+            native_clear,
+            pending_naming_handle,
+            accepted_request,
+            closed_recovery_owner,
+        ) = match evidence {
+            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None, None, false),
             NativeSessionTransitionEvidence::ClaudeClear(observation) => {
-                (None, Some(observation), None, None)
+                (None, Some(observation), None, None, false)
             }
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle,
                 request_id,
-            } => (None, None, Some(pending_naming_handle), request_id),
+                closed_recovery_owner,
+            } => (
+                None,
+                None,
+                Some(pending_naming_handle),
+                request_id,
+                closed_recovery_owner,
+            ),
         };
         let preserve_presentation = pending_naming_handle.is_some();
         if let Some(recipe) = &claude_fork {
@@ -2512,8 +2565,8 @@ impl Registry {
                 // request only if the current owner still claims the target.
                 if existing.as_deref() == Some(child_session_id.as_str()) && expected_parent != child_session_id {
                     let current: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND i.launch_state='running' AND s.desired_state='running' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
-                        params![soul_id.as_str(), incarnation_id.as_str(), child_session_id], |row| row.get(0),
+                        "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND (i.launch_state='running' OR (?4 AND i.launch_state='stopping' AND s.recovery_state='recovering' AND i.recovery_attempt_id IS NOT NULL AND i.recovery_attempt_id=s.recovery_attempt_id)) AND s.desired_state='running' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
+                        params![soul_id.as_str(), incarnation_id.as_str(), child_session_id, closed_recovery_owner], |row| row.get(0),
                     )?;
                     if !current { return Err(RegistryError::NativeIdentityConflict); }
                     tx.execute("UPDATE input_commands SET state='completed',updated_at=?1 WHERE soul_id=?2 AND request_id=?3 AND incarnation_id=?4 AND state IN ('dispatching','ambiguous')",
@@ -2525,8 +2578,8 @@ impl Registry {
             }
             if preserve_presentation {
                 let current: bool=tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND i.launch_state='running' AND s.desired_state='running' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
-                    params![soul_id.as_str(),incarnation_id.as_str(),expected_parent],|row|row.get(0)
+                    "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND (i.launch_state='running' OR (?4 AND i.launch_state='stopping' AND s.recovery_state='recovering' AND i.recovery_attempt_id IS NOT NULL AND i.recovery_attempt_id=s.recovery_attempt_id)) AND s.desired_state='running' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
+                    params![soul_id.as_str(),incarnation_id.as_str(),expected_parent,closed_recovery_owner],|row|row.get(0)
                 )?;
                 if provider!="codex" || existing.as_deref()!=Some(expected_parent.as_str()) || !current {
                     return Err(RegistryError::NativeIdentityConflict);
