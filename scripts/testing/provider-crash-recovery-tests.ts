@@ -190,6 +190,27 @@ function targetKey(test: RecoveryTest): string {
   return `${test.package}:${test.target.join(':')}`
 }
 
+function runControlledCodexHostContract(): Promise<number> {
+  return new Promise((resolve) => {
+    log('info', 'controlled_codex_host_contract_started')
+    const child = spawn(process.execPath, ['--import', 'tsx', path.join(PROJECT_ROOT, 'scripts/testing/controlled-codex-host-contract.ts')], {
+      cwd: PROJECT_ROOT, env: process.env, stdio: 'inherit', windowsHide: true,
+    })
+    let settled = false
+    const finish = (code: number, signal: NodeJS.Signals | null) => {
+      if (settled) return
+      settled = true
+      log(code === 0 && !signal ? 'info' : 'error', 'controlled_codex_host_contract_finished', { code, signal })
+      resolve(code)
+    }
+    child.once('error', (error) => {
+      log('error', 'controlled_codex_host_contract_spawn_failed', { error: error.message })
+      finish(1, null)
+    })
+    child.once('close', (code, signal) => finish(code ?? 1, signal))
+  })
+}
+
 export async function main(): Promise<number> {
   if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
     log('error', 'provider_recovery_selector_refused', {
@@ -244,6 +265,8 @@ export async function main(): Promise<number> {
     const code = await runTest(test)
     if (code !== 0) return code
   }
+  const contractCode = await runControlledCodexHostContract()
+  if (contractCode !== 0) return contractCode
   log('info', 'provider_recovery_selector_finished', { testCount: RECOVERY_TESTS.length })
   return 0
 }

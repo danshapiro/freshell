@@ -143,4 +143,34 @@ describe('combined enclosed Rust recovery route', () => {
       expect(result.events[3].mode).toBe('runtime-suite')
     } finally { f.cleanup() }
   })
+
+  it('cleans provider-contract files within the existing Rust sandbox temporary root', () => {
+    const f = fixture()
+    try {
+      const result = f.run({ FRESHELL_RUST_TEST_SANDBOX: '1', PROBE_RECOVERY_TEMP: '1' }, [])
+      expect(result.status, result.stderr).toBe(0)
+      const recovery = result.events.find(event => event.kind === 'recovery')
+      expect(recovery?.tmp).toBeTruthy()
+      expect(existsSync(recovery.tmp)).toBe(false)
+    } finally { f.cleanup() }
+  })
+
+  it.each([['linux', '', '1'], ['darwin', '', ''], ['darwin', '1', '1']] as const)(
+    'routes the direct-host recovery phase on %s (requested guard %s) and cleans its owned temp', (platform, requestedGuard, ownerGuard) => {
+      const f = fixture()
+      try {
+        const sentinel = path.join(f.artifacts, 'foreign')
+        writeFileSync(sentinel, 'keep')
+        const result = f.run({ FRESHELL_FIXTURE_PLATFORM: platform, FRESHELL_SANDBOX_MODE: '', FRESHELL_SANDBOX_OWNER_GUARD: requestedGuard,
+          RECOVERY_WRAPPER_PROBE: '1', PROBE_RECOVERY_TEMP: '1' }, [])
+        expect(result.status, result.stderr).toBe(0)
+        expect(result.events.map(event => event.kind)).toEqual(['cargo', 'cargo', 'sandbox', 'recovery'])
+        expect(result.events[2].ownerGuard).toBe(ownerGuard)
+        expect(result.events[3].mode).toBe('runtime-suite')
+        expect(result.events[3].tmp).toBeTruthy()
+        expect(existsSync(result.events[3].tmp)).toBe(false)
+        expect(readFileSync(sentinel, 'utf8')).toBe('keep')
+      } finally { f.cleanup() }
+    },
+  )
 })

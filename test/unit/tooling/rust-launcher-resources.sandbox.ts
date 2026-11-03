@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import path from 'node:path'
 import { expect, it } from 'vitest'
 import { fixture } from './run-rust-tests-fixture.js'
-import { sandboxCommand } from '../../../scripts/testing/run-rust-tests.js'
+import { providerRecoverySandboxCommand, sandboxCommand } from '../../../scripts/testing/run-rust-tests.js'
 import { descendantPids, readProcessSnapshot } from '../../../scripts/testing/process-tree.js'
 
 if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
@@ -104,6 +104,116 @@ it('removes its temporary artifacts when an interrupted child ignores terminatio
     await joined
     if (ownedTmp) rmSync(ownedTmp, { recursive: true, force: true })
     if (ownedExecutableTmp) rmSync(ownedExecutableTmp, { recursive: true, force: true })
+    f.cleanup()
+  }
+})
+
+function recoveryProbe(f: ReturnType<typeof fixture>, marker: string, sentinel: string) {
+  const probe = path.join(f.root, 'recovery-probe.cjs')
+  const executable = path.join(f.root, 'bin/pnpm')
+  writeFileSync(probe, `
+const fs = require('node:fs');
+const path = require('node:path');
+const tmp = process.env.TMPDIR;
+const owned = path.join(tmp, 'controlled-probe-' + process.pid);
+fs.mkdirSync(owned);
+const sealed = path.join(owned, 'sealed');
+fs.mkdirSync(sealed);
+fs.writeFileSync(path.join(sealed, 'private'), 'owned', {mode: 0o400});
+fs.symlinkSync(${JSON.stringify(sentinel)}, path.join(owned, 'external-ready'));
+fs.chmodSync(sealed, 0o500);
+let unlinkError;
+try { fs.unlinkSync(path.join(sealed, 'private')); } catch (error) { unlinkError = error.code; }
+if (process.env.HOLD_RECOVERY_PROBE === '1') process.on('SIGTERM', () => process.exit(143));
+fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({tmp, owned, uid: process.getuid(),
+  sealedMode: fs.statSync(sealed).mode & 0o777, fileMode: fs.statSync(path.join(sealed, 'private')).mode & 0o777,
+  unlinkError}));
+if (process.env.HOLD_RECOVERY_PROBE === '1') {
+  setInterval(() => {}, 1000);
+} else process.exit(Number(process.env.RECOVERY_PROBE_EXIT || 0));
+`)
+  const quote = (word: string) => `'${word.replaceAll("'", "'\\''")}'`
+  writeFileSync(executable, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(probe)}\n`, { mode: 0o755 })
+}
+
+function settleRecoveryProbe(marker: string) {
+  if (!existsSync(marker)) return
+  const { tmp, owned } = JSON.parse(readFileSync(marker, 'utf8')) as { tmp: string; owned: string }
+  if (path.dirname(owned) === tmp) {
+    const sealed = path.join(owned, 'sealed')
+    if (existsSync(sealed)) chmodSync(sealed, 0o700)
+    rmSync(owned, { recursive: true, force: true })
+  }
+  if (path.dirname(tmp) === '/freshell-test-artifacts' && /^[A-Za-z0-9]{3}$/.test(path.basename(tmp))) {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+it.each([0, 31])('direct-host recovery sandbox cleans only its own target temp and preserves exit %s', status => {
+  const f = fixture()
+  const marker = path.join(f.root, 'recovery-normal.json')
+  const sentinel = path.join(f.artifacts, 'foreign')
+  mkdirSync(sentinel)
+  writeFileSync(path.join(sentinel, 'private'), 'keep', { mode: 0o400 })
+  chmodSync(sentinel, 0o500)
+  recoveryProbe(f, marker, sentinel)
+  try {
+    const result = spawnSync('bash', ['-c', providerRecoverySandboxCommand()], {
+      env: { ...process.env, PATH: `${f.root}/bin:${process.env.PATH}`, RECOVERY_PROBE_EXIT: String(status) },
+      encoding: 'utf8', timeout: 10_000,
+    })
+    const observation = JSON.parse(readFileSync(marker, 'utf8'))
+    expect(observation.uid).not.toBe(0)
+    expect(observation).toMatchObject({ sealedMode: 0o500, fileMode: 0o400, unlinkError: 'EACCES' })
+    console.info(JSON.stringify({ severity: 'info', event: 'provider_recovery_fixture_ready', status, directory: observation.tmp }))
+    expect(result.status, result.stderr).toBe(status)
+    expect(path.dirname(observation.tmp)).toBe('/freshell-test-artifacts')
+    expect(existsSync(observation.tmp)).toBe(false)
+    expect(readFileSync(path.join(sentinel, 'private'), 'utf8')).toBe('keep')
+    expect(statSync(sentinel).mode & 0o777).toBe(0o500)
+    expect(statSync(path.join(sentinel, 'private')).mode & 0o777).toBe(0o400)
+  } finally {
+    settleRecoveryProbe(marker)
+    chmodSync(sentinel, 0o700)
+    f.cleanup()
+  }
+})
+
+it('direct-host recovery sandbox cleans its exact target temp on interruption', async () => {
+  const f = fixture()
+  const marker = path.join(f.root, 'recovery-held.json')
+  const sentinel = path.join(f.artifacts, 'foreign')
+  mkdirSync(sentinel)
+  writeFileSync(path.join(sentinel, 'private'), 'keep', { mode: 0o400 })
+  chmodSync(sentinel, 0o500)
+  recoveryProbe(f, marker, sentinel)
+  const child = spawn('bash', ['-c', providerRecoverySandboxCommand()], {
+    env: { ...process.env, PATH: `${f.root}/bin:${process.env.PATH}`, HOLD_RECOVERY_PROBE: '1' }, stdio: 'ignore',
+  })
+  const joined = new Promise(resolve => child.once('close', resolve))
+  try {
+    await expect.poll(() => existsSync(marker), { timeout: 5_000 }).toBe(true)
+    const observation = JSON.parse(readFileSync(marker, 'utf8'))
+    expect(observation.uid).not.toBe(0)
+    expect(observation).toMatchObject({ sealedMode: 0o500, fileMode: 0o400, unlinkError: 'EACCES' })
+    console.info(JSON.stringify({ severity: 'info', event: 'provider_recovery_fixture_ready', signal: 'SIGTERM', directory: observation.tmp }))
+    expect(path.dirname(observation.tmp)).toBe('/freshell-test-artifacts')
+    expect(existsSync(observation.tmp)).toBe(true)
+    child.kill('SIGTERM')
+    await expect.poll(() => existsSync(observation.tmp), { timeout: 3_000 }).toBe(false)
+    expect(readFileSync(path.join(sentinel, 'private'), 'utf8')).toBe('keep')
+    expect(statSync(sentinel).mode & 0o777).toBe(0o500)
+    expect(statSync(path.join(sentinel, 'private')).mode & 0o777).toBe(0o400)
+  } finally {
+    if (child.pid !== undefined && child.exitCode === null) {
+      const snapshot = readProcessSnapshot(process.platform)
+      for (const pid of [child.pid, ...descendantPids(child.pid, snapshot)]) {
+        try { process.kill(pid, 'SIGKILL') } catch { /* already settled */ }
+      }
+    }
+    await joined
+    settleRecoveryProbe(marker)
+    chmodSync(sentinel, 0o700)
     f.cleanup()
   }
 })

@@ -141,6 +141,48 @@ runner_pid=$!
 wait "$runner_pid"`
 }
 
+export function providerRecoverySandboxCommand(): string {
+  return `set -e
+owned_tmp="$(mktemp -d /freshell-test-artifacts/XXX)"
+runner_pid=
+remove_owned_temp() {
+  # Restore writes only on owned directories, without following outside links.
+  if [ -d "$owned_tmp" ]; then
+    find -P "$owned_tmp" -type d -uid "$(id -u)" -exec chmod u+w -- {} + || return 1
+  fi
+  rm -rf -- "$owned_tmp"
+}
+cleanup() {
+  status=$?
+  trap - EXIT
+  if ! remove_owned_temp || [ -e "$owned_tmp" ]; then
+    printf '{"severity":"error","event":"provider_recovery_temp_cleanup_failed"}\\n' >&2
+    status=1
+  fi
+  exit "$status"
+}
+interrupt() {
+  trap '' INT TERM HUP
+  if [ -n "$runner_pid" ]; then
+    kill -s "$1" "$runner_pid" 2>/dev/null || true
+    if ! remove_owned_temp; then
+      printf '{"severity":"error","event":"provider_recovery_temp_cleanup_failed"}\\n' >&2
+      exit 1
+    fi
+    wait "$runner_pid" || true
+  fi
+  exit "$2"
+}
+trap cleanup EXIT
+trap 'interrupt INT 130' INT
+trap 'interrupt TERM 143' TERM
+trap 'interrupt HUP 129' HUP
+export TMPDIR="$owned_tmp" FRESHELL_TEST_EXECUTABLE_TMP_DIR="$owned_tmp"
+pnpm exec tsx scripts/testing/provider-crash-recovery-tests.ts &
+runner_pid=$!
+wait "$runner_pid"`
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   if (process.env.FRESHELL_RUST_TEST_SANDBOX === '1') {
     log('info', 'rust_test_sandbox_route_selected', {
@@ -178,8 +220,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   return runChild('bash', [
     'scripts/sandbox-test.sh',
     '--runtime-suite',
-    'pnpm exec tsx scripts/testing/provider-crash-recovery-tests.ts',
-  ], env)
+    providerRecoverySandboxCommand(),
+  ], process.platform === 'linux' ? { ...env, FRESHELL_SANDBOX_OWNER_GUARD: '1' } : env)
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

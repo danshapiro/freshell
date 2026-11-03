@@ -5763,17 +5763,46 @@ mod codex_replacement_realpath {
     #[tokio::test]
     async fn review_definite_refusal_crosses_actor_supervisor_gateway_without_provider_notice() {
         replacement_across_realpath(false, NativeOutcome::Refused, false).await;
-        if let Some(host_binary) = std::env::var_os("FRESHELL_TEST_CONTROLLED_HOST_BINARY") {
-            production_host_refusal_path(&host_binary, false).await;
-            production_host_refusal_path(&host_binary, true).await;
+        if let Some(mode) = std::env::var_os("FRESHELL_TEST_CONTROLLED_MODE") {
+            assert_eq!(mode, "client-contract");
+            let host_binary = std::env::var_os("FRESHELL_TEST_CONTROLLED_HOST_BINARY")
+                .expect("controlled host test executable is required");
+            let request: serde_json::Value = serde_json::from_str(
+                &std::env::var("FRESHELL_TEST_CONTROLLED_CLIENT_REQUEST")
+                    .expect("mounted client request is required"),
+            )
+            .unwrap();
+            assert_eq!(request["type"], "freshAgent.send");
+            assert_eq!(request["provider"], "codex");
+            assert_eq!(request["sessionType"], "freshcodex");
+            assert_eq!(request["sessionId"], "managed-public");
+            let message =
+                serde_json::from_value(request).expect("actual client send must deserialize");
+            let ambiguous = match std::env::var("FRESHELL_TEST_CONTROLLED_OUTCOME").as_deref() {
+                Ok("refused") => false,
+                Ok("ambiguous") => true,
+                _ => panic!("controlled outcome is required"),
+            };
+            production_host_refusal_path(&host_binary, ambiguous, message).await;
         }
     }
 
     // The helper binary is the session-host's own test executable. Its
     // provider is controlled and silent, but it accepts socket connections
     // through the actual host handler and executes production dispatch.
-    async fn production_host_refusal_path(host_binary: &std::ffi::OsStr, ambiguous: bool) {
+    async fn production_host_refusal_path(
+        host_binary: &std::ffi::OsStr,
+        ambiguous: bool,
+        message: freshell_protocol::FreshAgentSend,
+    ) {
         let root = tempfile::tempdir().unwrap();
+        if std::env::var_os("FRESHELL_TEST_CONTROLLED_CLIENT_REQUEST").is_some() {
+            assert!(root.path().starts_with(std::env::temp_dir()));
+            println!(
+                "FRESHELL_PRODUCTION_HOST_FIXTURE_TMP={}",
+                root.path().display()
+            );
+        }
         let workspace = root.path().to_string_lossy().into_owned();
         let runtime = root.path().join("runtime");
         std::fs::create_dir(&runtime).unwrap();
@@ -5929,15 +5958,11 @@ mod codex_replacement_realpath {
                 HashMap::from([(("codex".into(), "managed-public".into()), soul.clone())]),
             );
             let inner = std::panic::AssertUnwindSafe(async {
-                let command = |request: &str, session: &str| {
-                    HostedFreshAgentCommand::Send(
-                        serde_json::from_value(serde_json::json!({
-                            "provider":"codex", "sessionType":"freshcodex", "sessionId":session,
-                            "requestId":request, "text":"controlled input"
-                        }))
-                        .unwrap(),
-                    )
-                };
+                let request_id = message
+                    .request_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .expect("actual client send must carry its request identity");
                 let expected = if ambiguous {
                     "COMMAND_AMBIGUOUS"
                 } else {
@@ -5945,7 +5970,7 @@ mod codex_replacement_realpath {
                 };
                 proxy
                     .clone()
-                    .handle(command("production-host-request", "managed-public"))
+                    .handle(HostedFreshAgentCommand::Send(message.clone()))
                     .await;
                 let mut frames = Vec::new();
                 while let Ok(frame) = public.try_recv() {
@@ -5953,7 +5978,7 @@ mod codex_replacement_realpath {
                 }
                 let frame = frames
                     .iter()
-                    .find(|frame| frame["event"]["requestId"] == "production-host-request")
+                    .find(|frame| frame["event"]["requestId"].as_str() == Some(request_id))
                     .expect("actual gateway outcome");
                 assert_eq!(frame["event"]["code"], expected, "{frames:?}");
                 println!(
@@ -5964,16 +5989,19 @@ mod codex_replacement_realpath {
 
                 proxy
                     .clone()
-                    .handle(command("production-host-request", "managed-public"))
+                    .handle(HostedFreshAgentCommand::Send(message.clone()))
                     .await;
                 let mut repeated = Vec::new();
                 while let Ok(frame) = public.try_recv() {
                     repeated.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
                 }
                 assert!(
-                    repeated.iter().any(|frame| frame["event"]["requestId"]
-                        == "production-host-request"
-                        && frame["event"]["code"] == expected),
+                    repeated
+                        .iter()
+                        .any(
+                            |frame| frame["event"]["requestId"].as_str() == Some(request_id)
+                                && frame["event"]["code"] == expected
+                        ),
                     "{repeated:?}"
                 );
                 assert_eq!(
@@ -5982,9 +6010,12 @@ mod codex_replacement_realpath {
                     "the same request must not redispatch"
                 );
 
+                let mut missing_message = message.clone();
+                missing_message.session_id = "missing-public".into();
+                missing_message.request_id = Some("missing-soul-request".into());
                 proxy
                     .clone()
-                    .handle(command("missing-soul-request", "missing-public"))
+                    .handle(HostedFreshAgentCommand::Send(missing_message))
                     .await;
                 let mut missing = Vec::new();
                 while let Ok(frame) = public.try_recv() {
@@ -5998,20 +6029,25 @@ mod codex_replacement_realpath {
                 );
                 assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
 
+                let different_id = format!("{request_id}-different");
+                let mut different_message = message.clone();
+                different_message.request_id = Some(different_id.clone());
                 proxy
                     .clone()
-                    .handle(command("production-host-different", "managed-public"))
+                    .handle(HostedFreshAgentCommand::Send(different_message))
                     .await;
                 let mut different = Vec::new();
                 while let Ok(frame) = public.try_recv() {
                     different.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
                 }
-                assert!(
-                    different.iter().any(|frame| frame["event"]["requestId"]
-                        == "production-host-different"
-                        && frame["event"]["code"] == expected),
-                    "{different:?}"
-                );
+                let different_frame = different
+                    .iter()
+                    .find(|frame| {
+                        frame["event"]["requestId"].as_str() == Some(different_id.as_str())
+                            && frame["event"]["code"] == expected
+                    })
+                    .expect("separately correlated gateway outcome");
+                println!("FRESHELL_PRODUCTION_HOST_SEND_Different={different_frame}");
                 assert_eq!(
                     std::fs::read_to_string(&counter).unwrap(),
                     "2",
