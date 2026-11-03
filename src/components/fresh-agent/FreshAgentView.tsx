@@ -3585,9 +3585,7 @@ export function FreshAgentView({
             const turns = snapshot && sameSnapshotConversation
               ? mergeFreshAgentTranscriptProjection(snapshot, projection)
               : projection?.turns ?? []
-            if (!localEchoLanded(turns, recoveredEcho, pending, {
-              allowTextMatch: true, previousTurnKeys: new Set(boundary),
-            })) setLocalEcho(recoveredEcho)
+            setLocalEcho(recoveredEcho)
           }
         }
         if (pending?.asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(pending.asyncQuestionKeys!.map((key) => [key, 'accepted' as const])) }))
