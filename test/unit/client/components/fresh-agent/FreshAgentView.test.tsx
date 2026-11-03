@@ -2317,6 +2317,51 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
+    it('restores an uncertain send after the same conversation materializes', async () => {
+      const store = createStore()
+      const placeholder = 'freshopencode-send-scope-placeholder'
+      const durable = 'ses_send_scope_materialized'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'send-scope-materialize', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => snapshot(sessionId))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const sourcePrompt = 'Keep the materialized conversation prompt'
+      fireEvent.change(composer, { target: { value: sourcePrompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+
+      let listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        const message = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(durable))
+      listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({
+        type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost',
+      }))
+
+      await waitFor(() => expect(composer).toHaveValue(sourcePrompt))
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
     it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
       const store = createStore()
       const first = {
