@@ -1055,7 +1055,7 @@ tool_timeout_sec = 120
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
+      archiveManifest, nativeExit, blockedRecovery, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
