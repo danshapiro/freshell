@@ -1138,6 +1138,27 @@ pub enum StopOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReopenOutcome {
+    Reopened,
+    Pending,
+    Failed,
+}
+
+/// Result of a request to reopen a previously stopped managed runtime.
+/// Pending means the exact prior Stop or its capability revocation still
+/// needs confirmation; the request has not created a replacement incarnation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReopenResult {
+    pub outcome: ReopenOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view: Option<RuntimeView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RuntimeErrorCode {
     InvalidRequest,
@@ -4528,6 +4549,15 @@ pub struct StopRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReopenRequest {
+    pub soul_id: SoulId,
+    pub expected_intent_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecoveryProbeRequest {
     pub soul_id: SoulId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4641,6 +4671,7 @@ pub enum AdminCommand {
     /// frames; launch carries only the immutable descriptor.
     OpenCodeTransfer(OpenCodeTransferAction),
     Stop(StopRequest),
+    Reopen(ReopenRequest),
     Inventory,
     InventorySnapshot,
     PendingViewProjections(PendingViewProjectionsRequest),
@@ -5165,6 +5196,7 @@ pub enum AdminResult {
         outcome: StopOutcome,
         view: RuntimeView,
     },
+    Reopen(ReopenResult),
     Inventory(Vec<RuntimeView>),
     InventorySnapshot(RuntimeInventorySnapshot),
     PendingViewProjections(Vec<ViewProjectionEvent>),

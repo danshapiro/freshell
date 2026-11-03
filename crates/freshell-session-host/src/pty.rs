@@ -55,6 +55,7 @@ pub struct HostedPty {
     stream_epoch: String,
     native_session_id: Arc<Mutex<Option<String>>>,
     native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
+    fresh_opencode_identity_bootstrap_open: AtomicBool,
     provider_mode: String,
     native_signal: Option<(PathBuf, u32, u32, String)>,
     amplifier_signal_reader: Mutex<crate::providers::native_identity::AmplifierObservationReader>,
@@ -148,6 +149,15 @@ impl HostedPty {
         {
             return Err("native launch belongs to another incarnation".into());
         }
+        let fresh_opencode_identity_bootstrap_open = launch.mode == "opencode"
+            && launch.create_request_id.is_some()
+            && launch.resume_session_id.is_none()
+            && launch.opencode_transfer.is_none()
+            && launch.opencode_transfer_attempt_id.is_none()
+            && launch.opencode_adoption.is_none()
+            && native_identity_launch
+                .as_ref()
+                .is_some_and(|binding| binding.requested_native_session_id.is_none());
         let opencode_adoption = launch
             .opencode_adoption
             .as_ref()
@@ -532,6 +542,9 @@ impl HostedPty {
             stream_epoch,
             native_session_id,
             native_identity_launch,
+            fresh_opencode_identity_bootstrap_open: AtomicBool::new(
+                fresh_opencode_identity_bootstrap_open,
+            ),
             provider_mode: launch.mode.clone(),
             native_signal,
             amplifier_signal_reader: Mutex::default(),
@@ -549,10 +562,14 @@ impl HostedPty {
         data: &str,
     ) -> Result<CommandState, RuntimeError> {
         let adoption_gate = self.opencode_adoption.clone();
+        let native_identity_observed = self.native_identity_observation().is_some();
         let native_ready = !matches!(
             self.provider_mode.as_str(),
             "claude" | "codex" | "opencode" | "amplifier"
-        ) || self.native_identity_observation().is_some();
+        ) || native_identity_observed
+            || self
+                .fresh_opencode_identity_bootstrap_open
+                .load(Ordering::SeqCst);
         let activity_readiness = self
             .opencode_activity
             .as_ref()
@@ -716,7 +733,13 @@ impl HostedPty {
                 )
             };
             return match result {
-                Ok(observation) if !self.exited() => observation,
+                Ok(observation) if !self.exited() => {
+                    if observation.is_some() {
+                        self.fresh_opencode_identity_bootstrap_open
+                            .store(false, Ordering::SeqCst);
+                    }
+                    observation
+                }
                 Ok(_) => None,
                 Err(reason) => {
                     tracing::warn!(incarnation_id=%launch.incarnation_id,launch_nonce=%launch.launch_nonce,evidence_revision=launch.evidence_revision,execution_generation=launch.execution_generation,provider=%self.provider_mode,reason,"managed_provider.native_identity_blocked");
@@ -739,9 +762,14 @@ impl HostedPty {
             },
             _ => return None,
         };
-        crate::providers::native_identity::bind_provider_observation(
+        let observation = crate::providers::native_identity::bind_provider_observation(
             launch, &native, source, &evidence,
-        )
+        );
+        if observation.is_some() {
+            self.fresh_opencode_identity_bootstrap_open
+                .store(false, Ordering::SeqCst);
+        }
+        observation
     }
 
     pub fn opencode_adoption_status(&self) -> OpenCodeAdoptionStatus {
@@ -2855,6 +2883,142 @@ mod provider_exec_tests {
         assert!(
             matches!(result,Err(ref cause) if cause.contains("provider exec profile")),
             "oversized final argv+env must fail with a classified pre-dispatch profile error"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fresh_opencode_input_tests {
+    use super::HostedPty;
+    use crate::providers::native_identity::LAUNCH_ENV;
+    use freshell_runtime_protocol::{
+        CommandState, IncarnationId, NativeIdentityLaunch, RequestId, RuntimeErrorCode,
+        TerminalLaunchSpec,
+    };
+    use std::collections::BTreeMap;
+
+    async fn hosted(
+        root: &std::path::Path,
+        terminal_id: &str,
+        mode: &str,
+        resume_session_id: Option<&str>,
+        requested_native_session_id: Option<&str>,
+    ) -> HostedPty {
+        let incarnation_id = IncarnationId::new();
+        let binding = NativeIdentityLaunch {
+            incarnation_id: incarnation_id.clone(),
+            launch_nonce: format!("{terminal_id}-launch"),
+            evidence_revision: 1,
+            execution_generation: 1,
+            requested_native_session_id: requested_native_session_id.map(str::to_owned),
+        };
+        let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal_id,
+            "streamId": format!("{terminal_id}-stream"),
+            "mode": mode,
+            "program": "/usr/bin/cat",
+            "args": [],
+            "cwd": root,
+            "workspacePath": root,
+            "projectKey": terminal_id,
+            "createRequestId": format!("create-{terminal_id}"),
+            "resumeSessionId": resume_session_id,
+            "cols": 80,
+            "rows": 24,
+            "runAsUid": unsafe { libc::geteuid() },
+            "runAsGid": unsafe { libc::getegid() },
+            "env": { "HOME": root, "PATH": "/usr/bin:/bin" }
+        }))
+        .unwrap();
+        HostedPty::spawn(
+            &root.join(terminal_id),
+            incarnation_id,
+            &launch,
+            BTreeMap::from([(LAUNCH_ENV.into(), serde_json::to_string(&binding).unwrap())]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fresh_opencode_accepts_first_input_before_native_identity_but_other_paths_do_not() {
+        let root = crate::tests::executable_fixture();
+        let mut fresh_opencode =
+            hosted(root.path(), "fresh-opencode", "opencode", None, None).await;
+        assert!(fresh_opencode.native_identity_observation().is_none());
+        let first_input = fresh_opencode.write_input(&RequestId::new(), "first prompt");
+        let enter_input = fresh_opencode.write_input(&RequestId::new(), "\r");
+        assert_eq!(
+            first_input.unwrap(),
+            CommandState::Completed,
+            "fresh OpenCode's first prompt must reach the PTY so it can create native identity"
+        );
+        assert_eq!(
+            enter_input.unwrap(),
+            CommandState::Completed,
+            "split text and Enter must reach OpenCode while it creates the first identity"
+        );
+
+        let signal_path = &fresh_opencode.native_signal.as_ref().unwrap().0;
+        std::fs::create_dir_all(signal_path.parent().unwrap()).unwrap();
+        let binding = fresh_opencode.native_identity_launch.as_ref().unwrap();
+        std::fs::write(
+            signal_path,
+            serde_json::to_vec(&serde_json::json!({
+                "launch": binding,
+                "native": {
+                    "source": "opencode-tui-native-loader",
+                    "hydrated": true,
+                    "parent_id": null,
+                    "session_id": "ses_bootstrap",
+                    "active_message_count": 0,
+                    "messages_read": "empty_confirmed",
+                    "tail_message_id": null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(fresh_opencode.native_identity_observation().is_some());
+        std::fs::remove_file(signal_path).unwrap();
+        let input_after_observation_withdrawal =
+            fresh_opencode.write_input(&RequestId::new(), "must stay blocked\n");
+        fresh_opencode.stop().await;
+        assert_eq!(
+            input_after_observation_withdrawal.unwrap_err().code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "a later missing observation must not reopen fresh-session bootstrap"
+        );
+
+        let mut fresh_claude = hosted(root.path(), "fresh-claude", "claude", None, None).await;
+        assert!(fresh_claude.native_identity_observation().is_none());
+        let other_provider_input =
+            fresh_claude.write_input(&RequestId::new(), "must stay blocked\n");
+        fresh_claude.stop().await;
+        assert_eq!(
+            other_provider_input.unwrap_err().code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "other provider modes still require native identity before input"
+        );
+
+        let mut resumed_opencode = hosted(
+            root.path(),
+            "resumed-opencode",
+            "opencode",
+            Some("ses_existing"),
+            Some("ses_existing"),
+        )
+        .await;
+        assert!(resumed_opencode.native_identity_observation().is_none());
+        let resumed_input = resumed_opencode.write_input(&RequestId::new(), "must stay blocked\n");
+        resumed_opencode.stop().await;
+        assert_eq!(
+            resumed_input.unwrap_err().code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "resumed OpenCode still requires proof of the requested native identity"
         );
     }
 }

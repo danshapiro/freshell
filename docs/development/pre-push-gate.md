@@ -8,7 +8,7 @@ Filtered by what the push changes (diff between the remote refs being updated an
 
 | Push contains | Checks |
 |---|---|
-| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*`, `test/fixtures/**` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test`**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. Test fixtures are cross-crate rust-test infrastructure, so a `test/fixtures/**` change routes to the whole workspace. |
+| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*`, `test/fixtures/**` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test` in the disposable Docker sandbox**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. Test fixtures are cross-crate rust-test infrastructure, so a `test/fixtures/**` change routes to the whole workspace. |
 | Any `.ts`/`.tsx`, `package.json`/`package-lock.json`, `pnpm-lock.yaml`/`pnpm-workspace.yaml`, `.npmrc`, `tsconfig*` | The repo typecheck (client + tools, tsc `--noEmit`), run through the pushing worktree's package manager |
 | Only docs/config/other files | Nothing |
 | New branch with no merge-base with origin/main | Both gates (full) |

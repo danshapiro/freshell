@@ -88,9 +88,12 @@ export async function waitForClearAdmissionAndRecheck({ pending, signals, isCurr
   return isCurrent() ? result.value : false
 }
 
-export async function waitForNativeCheckpointRelease(state, input, generation, hookSignal, nativeInputDigest) {
+export async function waitForNativeCheckpointRelease(state, input, generation, hookSignal, nativeInputDigest, sessionId, log) {
   const admissionSignal = state.nativeAdmissionAbort?.signal
   let pendingOperation
+  const logConcurrentDenial = (reason) => log?.('info', 'native.concurrent_hook_denied', {
+    sessionId, queryGeneration: generation, reason,
+  })
   const isCurrent = () => state.queryGeneration === generation && state.nativeReady
     && !isTransportRetired(state, pendingOperation) && !state.abort.signal.aborted
     && !admissionSignal?.aborted && !hookSignal?.aborted
@@ -99,14 +102,20 @@ export async function waitForNativeCheckpointRelease(state, input, generation, h
 
   if (state.nativePendingOperation) {
     pendingOperation = state.nativePendingOperation
-    if (pendingOperation.toolUseID === input.tool_use_id) return false
-    return await waitForClearAdmissionAndRecheck({
+    if (pendingOperation.toolUseID === input.tool_use_id) {
+      logConcurrentDenial('same_tool_use_pending')
+      return false
+    }
+    const admitted = await waitForClearAdmissionAndRecheck({
       pending: pendingOperation,
       signals,
       isCurrent,
       isStreamEnded: () => isTransportRetired(state, pendingOperation),
-      recheck: () => waitForNativeCheckpointRelease(state, input, generation, hookSignal, nativeInputDigest),
+      recheck: () => waitForNativeCheckpointRelease(state, input, generation, hookSignal,
+        nativeInputDigest, sessionId, undefined),
     })
+    if (!admitted) logConcurrentDenial('concurrent_admission_not_clear')
+    return admitted
   }
 
   let release

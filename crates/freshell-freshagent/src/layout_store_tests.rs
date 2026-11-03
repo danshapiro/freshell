@@ -124,6 +124,55 @@ fn update_from_ui_replaces_snapshot_and_seeds_nonsticky_titles() {
 }
 
 #[test]
+fn live_pane_snapshots_cover_connected_clients_and_exclude_retained_stale_layouts() {
+    let store = LayoutStore::default();
+    for (client, tab, pane) in [
+        ("client-a", "tab-a", "pane-a"),
+        ("client-b", "tab-b", "pane-b"),
+        ("client-stale", "tab-stale", "pane-stale"),
+    ] {
+        store.update_from_ui(
+            &sync_from(json!({
+                "tabs": [{ "id": tab }],
+                "activeTabId": tab,
+                "layouts": { tab: leaf(pane, json!({ "kind": "terminal", "mode": "codex", "terminalId": pane })) },
+                "activePane": { tab: pane },
+                "timestamp": 1,
+            })),
+            client,
+        );
+    }
+    store.remove_client("client-stale");
+
+    let mut live = store
+        .live_pane_snapshots()
+        .into_iter()
+        .map(|entry| (entry.client_id, entry.pane.pane_id))
+        .collect::<Vec<_>>();
+    live.sort();
+    assert_eq!(
+        live,
+        vec![
+            ("client-a".to_string(), "pane-a".to_string()),
+            ("client-b".to_string(), "pane-b".to_string()),
+        ],
+        "all live clients are represented and retained disconnected clients are excluded"
+    );
+    assert_eq!(
+        store.stale_entry_count(),
+        1,
+        "fixture retains a stale layout"
+    );
+
+    let server_only = LayoutStore::default();
+    server_only.create_tab(Some("server-created"));
+    assert!(
+        server_only.live_pane_snapshots().is_empty(),
+        "the server-owned bootstrap snapshot is not a connected UI layout"
+    );
+}
+
+#[test]
 fn rename_pane_mirrors_to_tab_when_single_pane_and_reports_tab_renamed() {
     let store = LayoutStore::default();
     store.update_from_ui(&single_pane_sync(None, None, 1), "c");

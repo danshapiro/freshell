@@ -5710,6 +5710,26 @@ impl Supervisor {
         timeout: Duration,
         persist_observation: bool,
     ) -> NativeIdentityWait {
+        self.wait_for_native_identity_with_reopen_authority(
+            soul_id,
+            incarnation_id,
+            expected_intent_revision,
+            timeout,
+            persist_observation,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn wait_for_native_identity_with_reopen_authority(
+        &self,
+        soul_id: &SoulId,
+        incarnation_id: &freshell_runtime_protocol::IncarnationId,
+        expected_intent_revision: u64,
+        timeout: Duration,
+        persist_observation: bool,
+        reopen_attempt: Option<&freshell_runtime_protocol::RecoveryAttemptId>,
+    ) -> NativeIdentityWait {
         let started = Instant::now();
         let handle = match self.registry.owned_handle(incarnation_id.clone()).await {
             Ok(handle) => handle,
@@ -5749,8 +5769,34 @@ impl Supervisor {
                     }
                 }
             };
+            let reopen_is_current = match reopen_attempt {
+                Some(attempt) => match self
+                    .registry
+                    .is_current_reopen_preparation(
+                        soul_id.clone(),
+                        incarnation_id.clone(),
+                        expected_intent_revision,
+                        attempt.clone(),
+                    )
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        return NativeIdentityWait::HostUnavailable {
+                            transient: None,
+                            message: map_registry(error).message,
+                            elapsed_ms,
+                        }
+                    }
+                },
+                None => false,
+            };
             if let Some(cancellation) = native_identity_wait_cancellation(
-                current.desired_state,
+                if reopen_is_current {
+                    DesiredState::Running
+                } else {
+                    current.desired_state
+                },
                 current.intent_revision,
                 expected_intent_revision,
                 started.elapsed().as_millis().min(u64::MAX as u128) as u64,
