@@ -125,6 +125,31 @@ describe('fresh-agent-ws', () => {
     delayed.dispatch(clearSessionError(locator))
     for (const frame of phases[2]) delayedClient.receiveMessageForTest(frame as never)
     expect(delayed.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+
+    // A warning first received while hidden is still unseen if another error
+    // takes its banner before the presentation leaves and returns to A.
+    const displaced = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
+    } })
+    const displacedClient = new WsClient('ws://source-return-displaced.test/ws')
+    displacedClient.onMessage((message) => { handleFreshAgentMessage(displaced.dispatch, message, displacedClient) })
+    displaced.dispatch(initLayout({ tabId: 'tab', paneId: 'pane', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: 'native-a' },
+      createRequestId: 'source-return-displaced', status: 'idle',
+    } }))
+    displaced.dispatch(sessionCreated({ ...locator, requestId: 'source-return-displaced' }))
+    for (const frame of phases[0]) displacedClient.receiveMessageForTest(frame as never)
+    displacedClient.receiveMessageForTest({ type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Newer failure' } } as never)
+    for (const phase of phases.slice(1, 3)) {
+      for (const frame of phase) displacedClient.receiveMessageForTest(frame as never)
+      expect(displaced.getState().freshAgent.sessions[key].lastError).toBe('Newer failure')
+    }
+    displaced.dispatch(clearSessionError(locator))
+    expect(displaced.getState().freshAgent.sessions[key].lastError).toBe('Memory lost at native-a')
+    displaced.dispatch(clearSessionError(locator))
+    for (const frame of phases[2]) displacedClient.receiveMessageForTest(frame as never)
+    expect(displaced.getState().freshAgent.sessions[key].lastError).toBeUndefined()
   })
 
   it('does not resurrect a consumed journal warning or replace a newer failure on replay', () => {
@@ -173,7 +198,7 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key].lastError).toBe('Newer operation failed')
   })
 
-  it('keeps hidden retained output and retry when a replayed warning is not a turn failure', () => {
+  it.each([false, true])('keeps hidden retained output and retry when a managed warning is not a turn failure (replay: %s)', (replay) => {
     const store = createFreshAgentStore()
     const outer = { type: 'freshAgent.event' as const, provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: savedCodexNativeHistory.threadId }
     const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
@@ -187,7 +212,7 @@ describe('fresh-agent-ws', () => {
     const key = `freshcodex:codex:${outer.sessionId}`
     expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
     expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
-    send({ type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: 'Memory was lost', retainedReplay: true,
+    send({ type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: 'Memory was lost', ...(replay ? { retainedReplay: true } : {}),
       journalIdentity: { soulId: 'soul', nativeSessionId: outer.sessionId, sequence: 2 } })
     expect(store.getState().freshAgentLive.bySession[key]?.retainedSnapshot?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
     expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
@@ -198,6 +223,34 @@ describe('fresh-agent-ws', () => {
     send({ type: 'freshAgent.error', code: 'TURN_FAILED', message: 'Turn failed' })
     expect(store.getState().freshAgentLive.bySession[key]?.retry).toBeUndefined()
     expect(store.getState().freshAgent.sessions[key].status).toBe('idle')
+  })
+
+  it('keeps a newer error and running hidden output when a journal warning arrives live before its replay', () => {
+    const store = createFreshAgentStore()
+    const outer = { type: 'freshAgent.event' as const, provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: savedCodexNativeHistory.threadId }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.host.backpressure', retainedState: {
+      source: { projectionId: 'p', ownerEpoch: 0, ownerGeneration: 0, soulId: 'soul', incarnationId: 'incarnation', hostBootId: 'boot' },
+      snapshot: { ...savedCodexNativeHistory, status: 'running', turns: [{ id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text: 'Unsaved output' }] }],
+        extensions: { codex: { projection: { id: 'p', historyGeneration: 0, eventRevision: 1, eventOwnedTurnIds: ['t'], nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: { t: ['t'] }, turnOutputStates: {}, settledTurnIds: [] } } } },
+      pendingControls: [], attentionMarks: [],
+    } })
+    send({ type: 'freshAgent.retry', attempt: 2 })
+    send({ type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Newer operation failed', gateway: { operation: 'compact' } })
+    const warning = { type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: 'Memory was lost',
+      journalIdentity: { soulId: 'soul', nativeSessionId: outer.sessionId, sequence: 2 } }
+    send(warning)
+    send({ ...warning, retainedReplay: true })
+    const key = `freshcodex:codex:${outer.sessionId}`
+    expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'running', lastError: 'Newer operation failed' })
+    expect(store.getState().freshAgentLive.bySession[key]?.retainedSnapshot?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
+    expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
+    store.dispatch(clearSessionError(outer))
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Memory was lost')
+    store.dispatch(clearSessionError(outer))
+    send({ ...warning, retainedReplay: true })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
   })
   it('routes native patches outside the session slice and fences complete items and stale init incarnations', () => {
     const store = createFreshAgentStore()

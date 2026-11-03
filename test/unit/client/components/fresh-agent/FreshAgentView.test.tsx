@@ -2413,9 +2413,10 @@ describe('FreshAgentView', () => {
       sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one',
       soulIntentRevision: 3, viewIntentId: 'view-one',
     } }))
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexSnapshot('native-b', 'B snapshot'))
+    const native = process.env.FRESHELL_TEST_CODEX_SEND_NATIVE ?? 'native-b'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexSnapshot(native, 'Current snapshot'))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    act(() => applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any)))
+    act(() => applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory(native), store.getState() as any)))
     const composer = await screen.findByRole('textbox', { name: 'Chat message input' })
     await waitFor(() => expect(composer).toBeEnabled())
     fireEvent.change(composer, { target: { value: 'Restore this message' } })
@@ -2454,9 +2455,10 @@ describe('FreshAgentView', () => {
       sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one',
       soulIntentRevision: 3, viewIntentId: 'view-one',
     } }))
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexSnapshot('native-b', 'B snapshot'))
+    const native = process.env.FRESHELL_TEST_CODEX_SEND_NATIVE ?? 'native-b'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(hostedCodexSnapshot(native, 'Current snapshot'))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    act(() => applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any)))
+    act(() => applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory(native), store.getState() as any)))
     const composer = await screen.findByRole('textbox', { name: 'Chat message input' })
     await waitFor(() => expect(composer).toBeEnabled())
     const send = (text: string) => {
@@ -2643,7 +2645,11 @@ describe('FreshAgentView', () => {
         for (const frame of frames.replay) receive(frame)
       })
       expect(store.getState().freshAgent.sessions[key].lastError).toBe('Newer operation failed')
-      expect(screen.getByText('Agent error: Newer operation failed')).toBeInTheDocument()
+      const later = screen.getByText('Agent error: Newer operation failed').closest('[role="alert"]')
+      if (!later) throw new Error('newer error banner is missing')
+      fireEvent.click(within(later as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+      expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+      expect(screen.queryByText(/Agent error: Codex crashed/)).not.toBeInTheDocument()
     } finally { cleanup(); held.resolve(hostedCodexSnapshot('native-c', 'Current snapshot')) }
   })
 
@@ -2728,6 +2734,107 @@ describe('FreshAgentView', () => {
       await expectRenderedText('Retained current transcript')
       expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
     } finally { cleanup(); held.resolve(hostedCodexSnapshot('native-c', 'Current snapshot')) }
+  })
+
+  it.each([false, true])('reveals an undismissed hidden warning after a newer error (source changed: %s)', async (sourceChanged) => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://codex-hidden-superseded-warning.test/ws')
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    client.onMessage((frame) => { handleFreshAgentMessage(store.dispatch, frame, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'hidden-superseded-warning', status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one', soulIntentRevision: 3, viewIntentId: 'view-one',
+    } }))
+    applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-c'), store.getState() as any))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+    const receive = (frame: Record<string, unknown>) => client.receiveMessageForTest(frame as never)
+    const frames = codexGatewayWarningFrames()
+    const key = 'freshcodex:codex:managed-public'
+    try {
+      act(() => {
+        for (const frame of frames.replay) receive(frame)
+        receive({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.error', code: 'OPERATION_FAILED',
+          message: 'Newer operation failed', gateway: { operation: 'compact' } } })
+        if (sourceChanged) {
+          applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-d'), store.getState() as any))
+          receive({ type: 'freshAgent.session.materialized', ...locator, previousSessionId: locator.sessionId,
+            sessionRef: { provider: 'codex', sessionId: 'native-d' } })
+        }
+      })
+      view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const banner = screen.getByText('Agent error: Newer operation failed').closest('[role="alert"]')
+      if (!banner) throw new Error('newer error banner is missing')
+      fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+      if (sourceChanged) {
+        expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+      } else {
+        expect(screen.getByText(/Agent error: Codex crashed/)).toBeInTheDocument()
+        const warning = screen.getByText(/Agent error: Codex crashed/).closest('[role="alert"]')
+        if (!warning) throw new Error('pending warning banner is missing')
+        fireEvent.click(within(warning as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+        act(() => { for (const frame of frames.replay) receive(frame) })
+        expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+      }
+    } finally { cleanup(); held.resolve(hostedCodexSnapshot(sourceChanged ? 'native-d' : 'native-c', 'Current snapshot')) }
+  })
+
+  it('preserves a newer error and running hidden output when the gateway live warning overtakes replay', async () => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://codex-live-before-replay.test/ws')
+    const store = createStore()
+    const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const supplied = process.env.FRESHELL_TEST_CODEX_INTERLEAVE
+    const fallback = codexGatewayWarningFrames()
+    const isWarning = (frame: Record<string, unknown>) => (frame.event as Record<string, unknown> | undefined)?.code === 'THREAD_MEMORY_LOST'
+    const frames: { snapshot: Record<string, unknown>[]; live: Record<string, unknown>[]; replay: Record<string, unknown>[] } = supplied
+      ? JSON.parse(supplied)
+      : { snapshot: fallback.replay.filter((frame) => !isWarning(frame)), live: fallback.live.filter(isWarning), replay: fallback.replay.filter(isWarning) }
+    const native = supplied ? 'native-b' : 'native-c'
+    client.onMessage((frame) => { handleFreshAgentMessage(store.dispatch, frame, client) })
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'live-before-replay', status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: native }, soulId: 'soul-one', soulIntentRevision: 3, viewIntentId: 'view-one',
+    } }))
+    applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory(native), store.getState() as any))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+    const receive = (frame: Record<string, unknown>) => client.receiveMessageForTest(frame as never)
+    const key = 'freshcodex:codex:managed-public'
+    try {
+      expect(frames.live.some(isWarning)).toBe(true)
+      expect(frames.replay.some(isWarning)).toBe(true)
+      act(() => {
+        for (const frame of frames.snapshot) receive(frame)
+        receive({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.retry', attempt: 2 } })
+        receive({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.error', code: 'OPERATION_FAILED',
+          message: 'Newer operation failed', gateway: { operation: 'compact' } } })
+        for (const frame of frames.live) receive(frame)
+        for (const frame of frames.replay) receive(frame)
+      })
+      expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'running', lastError: 'Newer operation failed' })
+      expect(store.getState().freshAgentLive.bySession[key]?.retainedSnapshot?.turns[0].items[0]).toMatchObject({ text: 'Retained current transcript' })
+      expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Retained current transcript' })
+      expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
+      view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await expectRenderedText('Retained current transcript')
+      const banner = screen.getByText('Agent error: Newer operation failed').closest('[role="alert"]')
+      if (!banner) throw new Error('newer error banner is missing')
+      fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+      const message = String((frames.live.find(isWarning)?.event as Record<string, unknown>).message)
+      const warning = screen.getByText(`Agent error: ${message}`).closest('[role="alert"]')
+      if (!warning) throw new Error('current warning banner is missing')
+      fireEvent.click(within(warning as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+      act(() => { for (const frame of frames.replay) receive(frame) })
+      expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+    } finally { cleanup(); held.resolve(hostedCodexSnapshot(native, 'Current snapshot')) }
   })
 
   it('keeps non-Codex checkpoint identity after the global materialization fold', async () => {
@@ -13035,6 +13142,10 @@ describe('FreshAgentView', () => {
       apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => pending.promise)
       if (events !== 'none') apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => followup.promise)
       wsMock.send.mockClear()
+      if (events === 'none') {
+        act(() => store.dispatch(sessionError({ ...locator, code: 'LOOKUP_FAILED', message: 'Earlier lookup failed' })))
+        expect(currentSession()?.lastError).toBe('Earlier lookup failed')
+      }
       act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
         event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Stale managed lookup' } }))
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
@@ -13065,8 +13176,57 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
       expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
       expect(currentSession()).toMatchObject({ lost: false, status: 'idle' })
+      if (events === 'none') expect(currentSession()?.lastError).toBeUndefined()
     },
   )
+
+  it('keeps an undismissed hidden memory warning when a lost-session recovery read completes', async () => {
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+    const currentSession = () => store.getState().freshAgent.sessions[`freshcodex:codex:${native.threadId}`]
+    const makeLive = () => ({ ...native, status: 'idle' as const,
+      capabilities: { ...native.capabilities, send: true },
+      extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent' } } })
+    const content = { kind: 'fresh-agent' as const, ...locator,
+      sessionRef: { provider: 'codex' as const, sessionId: native.threadId }, resumeSessionId: native.threadId,
+      createRequestId: 'warning-during-lost-recovery', status: 'idle' as const, soulId: 'warning-recovery-soul', soulIntentRevision: 7,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => makeLive())
+    const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).not.toBeDisabled())
+
+    const pending = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => pending.promise)
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Stale managed lookup' } }))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    expect(currentSession().lost).toBe(true)
+    view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+    const warning = { type: 'freshAgent.event' as const, ...locator, event: {
+      type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', sessionId: native.threadId,
+      message: 'Recovered Codex conversation lost its previous memory',
+      journalIdentity: { soulId: 'warning-recovery-soul', nativeSessionId: native.threadId, sequence: 37 },
+    } }
+    act(() => handleFreshAgentMessage(store.dispatch, warning))
+    expect(currentSession().lastError).toBe(warning.event.message)
+    await act(async () => pending.resolve(makeLive()))
+    await waitFor(() => expect(currentSession().lost).toBe(false))
+    expect(currentSession().lastError).toBe(warning.event.message)
+
+    view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const banner = screen.getByText(/Agent error: Recovered Codex conversation lost its previous memory/).closest('[role="alert"]')
+    if (!banner) throw new Error('the undismissed warning is missing')
+    fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+    act(() => handleFreshAgentMessage(store.dispatch, warning))
+    expect(currentSession().lastError).toBeUndefined()
+  })
 
   it('recovers managed Codex loss when an older coalesced reader first displays the current live response', async () => {
     vi.useFakeTimers()

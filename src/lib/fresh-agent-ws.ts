@@ -809,10 +809,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
             const previous = session?.memoryWarningHighWater?.find((source) => source.soulId === validIdentity.soulId
               && source.nativeSessionId === validIdentity.nativeSessionId)
             if (previous && previous.sequence >= validIdentity.sequence) return
-            const pending = session?.memoryWarning
-            if (pending?.pendingMessage && pending.soulId === validIdentity.soulId
-              && pending.nativeSessionId === validIdentity.nativeSessionId && pending.sequence >= validIdentity.sequence) return
-            const defer = event.retainedReplay === true && Boolean(session?.lastError) && session?.lastErrorCode !== 'SESSION_RESERVED'
+            const warning = session?.memoryWarning
+            if (warning && warning.soulId === validIdentity.soulId
+              && warning.nativeSessionId === validIdentity.nativeSessionId && warning.sequence >= validIdentity.sequence) return
+            const defer = Boolean(session?.lastError) && session?.lastErrorCode !== 'SESSION_RESERVED'
             innerDispatch(memoryWarningObserved({ ...locator, identity: { ...validIdentity, ...(defer ? { pendingMessage: message } : {}) } }))
             // Keep the visible error and present the missed warning after it is dismissed.
             if (defer) return
@@ -822,6 +822,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
             code: event.code as string | undefined,
             message,
             ...(isObject(event.gateway) || event.code === 'FRESH_AGENT_REPLAY_RETRY'
+              || Boolean(validIdentity)
               || (event.code === 'THREAD_MEMORY_LOST' && event.retainedReplay === true)
               ? { preserveStatus: true } : {}),
           }))

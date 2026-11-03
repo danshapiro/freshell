@@ -647,6 +647,7 @@ pub struct FreshCodexState {
     sessions: Arc<TokioMutex<HashMap<String, CodexSession>>>,
     child_reads: Arc<TokioMutex<ChildReadAttempts>>,
     retained_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    hosted_warning_fork_generation: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
     attention: Arc<crate::attention_ledger::AttentionLedger>,
     /// The `settings.freshAgent.enabled` gate the WS `freshAgent.create` requires
     /// (default off; flipped true by `PATCH /api/settings`, as a real freshcodex user does).
@@ -1153,6 +1154,7 @@ impl FreshCodexState {
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             child_reads: Arc::new(TokioMutex::new(HashMap::new())),
             retained_changed: Arc::new(tokio::sync::watch::channel(0).0),
+            hosted_warning_fork_generation: Arc::new(std::sync::OnceLock::new()),
             attention: Arc::new(crate::attention_ledger::AttentionLedger::default()),
             fresh_agent_enabled: Arc::new(AtomicBool::new(enabled)),
             settings: Arc::new(TokioMutex::new(settings)),
@@ -1192,6 +1194,12 @@ impl FreshCodexState {
     pub fn with_hosted_naming_events(mut self) -> Self {
         self.hosted_naming_events = true;
         self
+    }
+
+    /// Hosted actors stamp memory warnings before they enter the broadcast
+    /// queue, so a later fork can retire queued parent warnings.
+    pub fn set_hosted_warning_fork_generation(&self, generation: Arc<AtomicU64>) {
+        let _ = self.hosted_warning_fork_generation.set(generation);
     }
 
     pub fn set_naming_rollout_probe(&self, probe: CodexNamingRolloutProbe) {
@@ -2287,17 +2295,28 @@ impl FreshCodexState {
     /// (locator resolution) and `message` is user-facing (the banner shows the message,
     /// never the code).
     fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str) {
+        let mut event = json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": code,
+            "message": message,
+        });
+        if code == "THREAD_MEMORY_LOST" {
+            if let Some(generation) = self.hosted_warning_fork_generation.get() {
+                event["_hostForkGeneration"] = generation.load(Ordering::SeqCst).into();
+            }
+        }
         self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-            event: json!({
-                "type": "freshAgent.error",
-                "sessionId": session_id,
-                "code": code,
-                "message": message,
-            }),
+            event,
             provider: PROVIDER.to_string(),
             session_id: session_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
         }));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn emit_memory_warning_for_test(&self, session_id: &str, message: &str) {
+        self.emit_fresh_agent_error(session_id, "THREAD_MEMORY_LOST", message);
     }
 
     /// The `PATCH /api/settings` sub-router (the fresh-clients enable toggle).
@@ -13954,6 +13973,27 @@ pub(crate) mod tests {
             Arc::new(tx),
             json!({ "freshAgent": { "enabled": false } }),
         )
+    }
+
+    #[test]
+    fn hosted_memory_warning_captures_fork_generation_when_broadcast() {
+        let state = state();
+        let mut frames = state.broadcast_tx.subscribe();
+        state.emit_fresh_agent_error("native-c", "THREAD_MEMORY_LOST", "legacy warning");
+        let legacy: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        assert!(legacy["event"].get("_hostForkGeneration").is_none());
+
+        let generation = Arc::new(AtomicU64::new(0));
+        state.set_hosted_warning_fork_generation(generation.clone());
+        state.emit_fresh_agent_error("native-c", "THREAD_MEMORY_LOST", "parent warning");
+        generation.store(2, Ordering::SeqCst);
+        state.emit_fresh_agent_error("native-c", "THREAD_MEMORY_LOST", "child warning");
+        let parent: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        let child: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        assert_eq!(parent["event"]["_hostForkGeneration"], 0);
+        assert_eq!(child["event"]["_hostForkGeneration"], 2);
+        assert_eq!(parent["event"]["message"], "parent warning");
+        assert_eq!(child["event"]["message"], "child warning");
     }
 
     #[test]

@@ -787,6 +787,11 @@ impl HostedTransport {
 
 #[async_trait]
 impl FreshAgentTransport for HostedTransport {
+    fn set_codex_warning_fork_generation(&self, generation: Arc<std::sync::atomic::AtomicU64>) {
+        if let ProviderState::Codex(state) = &self.state {
+            state.set_hosted_warning_fork_generation(generation);
+        }
+    }
     async fn prepare_native_readiness(&self) -> Result<(), String> {
         let ProviderState::Claude(state) = &self.state else {
             return Ok(());
@@ -2942,6 +2947,175 @@ pub(super) static NATIVE_PROVIDER_FIXTURE_LOCK: Mutex<()> = Mutex::const_new(())
 mod tests {
     use super::*;
     use freshell_freshagent::session_lease::CondemnedRuntimeIdentity;
+
+    struct QueuedWarningBridgeDelegate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        events: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for QueuedWarningBridgeDelegate {
+        async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: profile.native_session_id.clone(),
+            })
+        }
+        async fn native_identity_evidence(&self) -> Option<Value> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            None
+        }
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            unreachable!()
+        }
+        async fn fork(
+            &self,
+            _: &RequestId,
+            parent: &str,
+            _: Option<Value>,
+        ) -> Result<ForkTransition, DispatchFailure> {
+            Ok(ForkTransition {
+                parent_session_id: parent.into(),
+                child_session_id: if parent == "native-c" {
+                    "native-fork"
+                } else {
+                    "native-c"
+                }
+                .into(),
+                parent_retired_by_runtime: true,
+            })
+        }
+        async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+            unreachable!()
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+            self.events.lock().unwrap().take()
+        }
+    }
+
+    impl HostedTransportTestDelegate for QueuedWarningBridgeDelegate {
+        fn record_provider_create(&self, _: &FreshAgentCreate) {}
+    }
+
+    #[tokio::test]
+    async fn hosted_codex_emitter_bridge_retires_a_queued_parent_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let delegate = Arc::new(QueuedWarningBridgeDelegate {
+            entered: entered.clone(),
+            release: release.clone(),
+            events: std::sync::Mutex::new(None),
+        });
+        let transport =
+            HostedTransport::with_test_delegate(FreshProvider::Codex, delegate.clone()).await;
+        // The delegate replaces only provider startup/fork; the actor drains
+        // the actual hosted bridge's event receiver.
+        *delegate.events.lock().unwrap() = transport.event_rx.lock().unwrap().take();
+        let profile: FreshAgentProfile = serde_json::from_value(json!({
+            "provider":"codex", "runtimeVariant":"codex", "cwd":directory.path(), "providerStoreId":"bridge-fork-warning",
+            "nativeSessionId":"native-c", "sessionRef":{"provider":"codex", "sessionId":"native-c"}
+        })).unwrap();
+        let actor = FreshAgentHostActor::open(directory.path(), profile, transport.clone())
+            .await
+            .unwrap();
+        transport
+            .event_tx
+            .send(AgentEvent::Started {
+                native_session_id: "native-c".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("actor consumer must pause");
+        let codex = match &transport.state {
+            ProviderState::Codex(state) => state,
+            _ => unreachable!(),
+        };
+        let empty_capacity = transport.event_tx.capacity();
+        codex.emit_memory_warning_for_test("native-c", "Queued parent warning");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while transport.event_tx.capacity() == empty_capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real bridge must queue the emitted warning");
+        for (request, parent) in [
+            ("bridge-fork-away", "native-c"),
+            ("bridge-fork-back", "native-fork"),
+        ] {
+            actor
+                .fork(RequestId::parse(request).unwrap(), parent.into(), None)
+                .await
+                .unwrap();
+        }
+        release.notify_one();
+        let sentinel = |label: &str| {
+            json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-c",
+            "event":{"type":"freshAgent.status", "sessionId":"native-c", "status":label}}).to_string()
+        };
+        transport
+            .provider_frames
+            .send(sentinel("parent-drained"))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if actor.read_events(0, 4096).await.events.iter().any(|entry| matches!(&entry.event,
+                    AgentEvent::Provider { payload } if payload["event"]["status"] == "parent-drained")) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("the queued parent must be consumed after both forks");
+        let before = actor.read_events(0, 4096).await;
+        assert!(
+            !before.events.iter().any(|entry| matches!(&entry.event,
+            AgentEvent::Provider { payload } if payload["event"]["code"] == "THREAD_MEMORY_LOST")),
+            "{before:?}"
+        );
+
+        codex.emit_memory_warning_for_test("native-c", "Current child warning");
+        transport
+            .provider_frames
+            .send(sentinel("child-drained"))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if actor.read_events(0, 4096).await.events.iter().any(|entry| matches!(&entry.event,
+                    AgentEvent::Provider { payload } if payload["event"]["status"] == "child-drained")) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("the new child warning must reach the actor");
+        let after = actor.read_events(0, 4096).await;
+        let warnings: Vec<_> = after
+            .events
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                AgentEvent::Provider { payload }
+                    if payload["event"]["code"] == "THREAD_MEMORY_LOST" =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "{after:?}");
+        assert_eq!(warnings[0]["event"]["message"], "Current child warning");
+        assert!(warnings[0]["event"].get("_hostForkGeneration").is_none());
+        actor.stop().await.unwrap();
+    }
 
     #[tokio::test]
     async fn task6_dropping_transport_closes_its_owned_bridge_without_more_provider_frames() {

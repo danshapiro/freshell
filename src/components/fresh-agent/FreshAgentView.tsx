@@ -3855,7 +3855,7 @@ export function FreshAgentView({
         && liveProviderState.ownerKind !== 'vacant'
       ) {
         dispatch(clearSessionLost({ sessionId: currentPane.sessionId!, sessionType: requestSessionType, provider }))
-        dispatch(clearSessionError({ sessionId: currentPane.sessionId!, sessionType: requestSessionType, provider }))
+        dispatch(clearSessionError({ sessionId: currentPane.sessionId!, sessionType: requestSessionType, provider, preserveUndismissedWarning: true }))
       }
       const echo = localEchoRef.current
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined

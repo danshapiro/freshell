@@ -459,20 +459,33 @@ const freshAgentSlice = createSlice({
     memoryWarningObserved(state, action: PayloadAction<SessionMutationPayload & { identity: NonNullable<FreshAgentSessionState['memoryWarning']> }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
-      if (!action.payload.identity.pendingMessage) recordMemoryWarningConsumed(session, action.payload.identity)
       session.memoryWarning = action.payload.identity
     },
 
     memoryWarningSourceChanged(state, action: PayloadAction<SessionMutationPayload & { nativeSessionId: string; soulId?: string }>) {
       const key = resolveSessionKey(state, action.payload)
-      const warning = key ? state.sessions[key]?.memoryWarning : undefined
-      if (warning && (warning.nativeSessionId !== action.payload.nativeSessionId
-        || (action.payload.soulId && warning.soulId !== action.payload.soulId))) delete warning.pendingMessage
+      const session = key ? state.sessions[key] : undefined
+      const warning = session?.memoryWarning
+      if (session && warning && (warning.nativeSessionId !== action.payload.nativeSessionId
+        || (action.payload.soulId && warning.soulId !== action.payload.soulId))) {
+        if (session.lastErrorCode === 'THREAD_MEMORY_LOST') {
+          session.lastError = undefined
+          session.lastErrorCode = undefined
+        }
+        delete session.memoryWarning
+      }
     },
 
     sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string; preserveStatus?: boolean }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
+      // A banner can arrive while its pane is hidden. Keep the warning until
+      // dismissal when a later error takes its place, but only for its source.
+      if (session.lastErrorCode === 'THREAD_MEMORY_LOST' && session.lastError
+        && action.payload.code !== 'THREAD_MEMORY_LOST' && session.memoryWarning
+        && !session.memoryWarning.pendingMessage) {
+        session.memoryWarning.pendingMessage = session.lastError
+      }
       session.lastError = action.payload.message
       // Task 14: the view filters SESSION_RESERVED out of the pane-level
       // error banner (a transient reservation is re-driven, never surfaced).
@@ -530,17 +543,22 @@ const freshAgentSlice = createSlice({
      * or shows a current-source warning that was waiting behind it. Never
      * ENSURE-creates a session record, and never touches status/streaming.
      */
-    clearSessionError(state, action: PayloadAction<SessionMutationPayload>) {
+    clearSessionError(state, action: PayloadAction<SessionMutationPayload & { preserveUndismissedWarning?: boolean }>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
       const session = state.sessions[key]
       if (!session) return
+      // Recovery can clear a lost lookup without dismissing a separate warning.
+      if (action.payload.preserveUndismissedWarning && session.lastErrorCode === 'THREAD_MEMORY_LOST' && session.memoryWarning) return
       if (session.memoryWarning?.pendingMessage) {
-        recordMemoryWarningConsumed(session, session.memoryWarning)
         session.lastError = session.memoryWarning.pendingMessage
         session.lastErrorCode = 'THREAD_MEMORY_LOST'
         delete session.memoryWarning.pendingMessage
         return
+      }
+      if (session.lastErrorCode === 'THREAD_MEMORY_LOST' && session.memoryWarning) {
+        recordMemoryWarningConsumed(session, session.memoryWarning)
+        delete session.memoryWarning
       }
       session.lastError = undefined
       session.lastErrorCode = undefined

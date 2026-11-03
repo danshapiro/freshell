@@ -23,7 +23,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -303,6 +303,8 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn native_identity_evidence(&self) -> Option<Value> {
         None
     }
+    /// Bind the hosted Codex warning producer to this actor's fork boundary.
+    fn set_codex_warning_fork_generation(&self, _generation: Arc<AtomicU64>) {}
     /// Restore provider readiness without sending a user turn or releasing a
     /// retained permission/effect. The host revalidates native identity next.
     async fn prepare_native_readiness(&self) -> Result<(), String> {
@@ -703,6 +705,7 @@ pub struct FreshAgentHostActor {
     observed_native_session_id: Mutex<Option<String>>,
     native_identity_transition: AtomicBool,
     native_dispatch_in_flight: AtomicBool,
+    codex_warning_fork_generation: Arc<AtomicU64>,
     stopped: AtomicBool,
     dispatch_lock: Mutex<()>,
     native_recovery_release: Mutex<NativeRecoveryRelease>,
@@ -949,6 +952,10 @@ impl FreshAgentHostActor {
             state.initialization_state = Some(CommandState::Dispatching);
             write_state(&state_dir, &state)?;
         }
+        let codex_warning_fork_generation = Arc::new(AtomicU64::new(0));
+        if state.profile.provider == FreshProvider::Codex {
+            transport.set_codex_warning_fork_generation(codex_warning_fork_generation.clone());
+        }
         let started = transport.start(&state.profile).await.map_err(|error| {
             ActorError::ProviderStartFailed {
                 diagnostic: ProviderStartDiagnostic::from_provider_error(&error),
@@ -981,6 +988,7 @@ impl FreshAgentHostActor {
             observed_native_session_id: Mutex::new(observed_native_session_id),
             native_identity_transition: AtomicBool::new(false),
             native_dispatch_in_flight: AtomicBool::new(false),
+            codex_warning_fork_generation,
             stopped: AtomicBool::new(false),
             dispatch_lock: Mutex::new(()),
             native_recovery_release: Mutex::new(NativeRecoveryRelease::Pending),
@@ -1455,13 +1463,18 @@ impl FreshAgentHostActor {
                     write_state(&self.state_dir, &state)?;
                     return Err(ActorError::AmbiguousDispatch);
                 }
-                state.profile.native_session_id = Some(transition.child_session_id.clone());
                 if state.profile.provider == FreshProvider::Codex {
+                    // The producer stamps a warning when it enters its broadcast
+                    // stream. Events already queued there or in the actor stream
+                    // retain the parent generation even if journaled later.
+                    self.codex_warning_fork_generation
+                        .fetch_add(1, Ordering::SeqCst);
                     // A fork retires the whole parent presentation chain. A
                     // later child may reuse an old native ID, but that must
                     // never make its earlier replacement proof authoritative.
                     state.accepted_native_dispatch = None;
                 }
+                state.profile.native_session_id = Some(transition.child_session_id.clone());
                 state.profile.naming_handle = None;
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = transition.child_session_id.clone();
@@ -1934,9 +1947,18 @@ impl FreshAgentHostActor {
     }
 
     pub async fn record_event(&self, mut event: AgentEvent) -> Result<u64, ActorError> {
+        let mut warning_generation = None;
         // The provider owns retained bodies. The bounded journal keeps only the
         // invalidation edge; reads reconcile against the current source.
         if let AgentEvent::Provider { payload } = &mut event {
+            if payload["event"]["type"] == "freshAgent.error"
+                && payload["event"]["code"] == "THREAD_MEMORY_LOST"
+            {
+                warning_generation = payload["event"]
+                    .as_object_mut()
+                    .and_then(|event| event.remove("_hostForkGeneration"))
+                    .and_then(|generation| generation.as_u64());
+            }
             if payload["event"]["type"] == "freshAgent.host.backpressure" {
                 if let Some(event) = payload["event"].as_object_mut() {
                     event.remove("retainedState");
@@ -1953,6 +1975,14 @@ impl FreshAgentHostActor {
                 .await;
         }
         let mut state = self.state.lock().await;
+        if state.profile.provider == FreshProvider::Codex
+            && warning_generation.is_some_and(|generation| {
+                generation != self.codex_warning_fork_generation.load(Ordering::SeqCst)
+            })
+        {
+            tracing::debug!("freshagent.host.retired_codex_warning_discarded");
+            return Err(ActorError::NativeIdentityMismatch);
+        }
         if let AgentEvent::Provider { payload } = &event {
             let native = payload.get("event").unwrap_or(payload);
             if matches!(

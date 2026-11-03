@@ -10758,6 +10758,7 @@ mod tests {
         evidence: serde_json::Value,
         ambiguous: bool,
         sends: AtomicUsize,
+        counter_file: Option<PathBuf>,
     }
 
     #[async_trait]
@@ -10776,7 +10777,10 @@ mod tests {
             _: &str,
             _: &FreshAgentProfile,
         ) -> Result<DispatchAck, DispatchFailure> {
-            self.sends.fetch_add(1, Ordering::SeqCst);
+            let count = self.sends.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(path) = &self.counter_file {
+                std::fs::write(path, count.to_string()).expect("write controlled provider count");
+            }
             Err(DispatchFailure {
                 message: "controlled refusal".into(),
                 acceptance_ambiguous: self.ambiguous,
@@ -10800,8 +10804,93 @@ mod tests {
         }
     }
 
+    // The server's cross-layer test starts this test executable in a child
+    // process and talks to the production host connection/dispatch boundary.
+    // The provider has no event stream, so a refusal cannot be supplied by a
+    // separate notification. EOF on the owned stdin shuts the fixture down.
+    async fn serve_controlled_refusal_host(path: &Path) {
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let launch: freshell_runtime_protocol::NativeIdentityLaunch =
+            serde_json::from_value(spec["launch"].clone()).unwrap();
+        let boot: HostBootId = serde_json::from_value(spec["hostBootId"].clone()).unwrap();
+        let limits: RuntimeLimits = serde_json::from_value(spec["limits"].clone()).unwrap();
+        let state_dir = PathBuf::from(spec["stateDir"].as_str().unwrap());
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let persisted = PersistedHostState {
+            native_identity_launch: Some(launch.clone()),
+            host_boot_id: Some(boot.clone()),
+            max_control_epoch: spec["controlEpoch"].as_u64().unwrap(),
+            max_execution_generation: launch.execution_generation,
+            worker_pid: Some(std::process::id()),
+            worker_launch_count: 1,
+            ..Default::default()
+        };
+        let state = Arc::new(HostState {
+            incarnation_id: launch.incarnation_id.clone(),
+            host_boot_id: boot,
+            state_dir: state_dir.clone(),
+            secret: b"realpath-host-secret".to_vec(),
+            requested_limits: limits,
+            control_fence: std::sync::Mutex::new(HostControlFence::from(&persisted)),
+            persisted: Mutex::new(persisted),
+            child: Mutex::new(None),
+            pty: Mutex::new(None),
+            fresh_agent: Mutex::new(None),
+            fresh_native_command: Mutex::new(()),
+            provider_config_paths: ProviderConfigPaths::default(),
+            opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),
+            bootstrap_root: PathBuf::from("/run/freshell-bootstrap"),
+        });
+        let transport = Arc::new(RefusingRpcTransport {
+            evidence: serde_json::json!({"launch":launch, "nativeSessionId":"native-a", "queryGeneration":1}),
+            ambiguous: spec["ambiguous"].as_bool().unwrap(),
+            sends: AtomicUsize::new(0),
+            counter_file: Some(PathBuf::from(spec["counterFile"].as_str().unwrap())),
+        });
+        let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+            "provider":"codex", "runtimeVariant":"codex", "cwd":spec["workspace"].as_str().unwrap(), "providerStoreId":"realpath-store",
+            "nativeSessionId":"native-a", "sessionRef":{"provider":"codex","sessionId":"native-a"}
+        })).unwrap();
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state_dir.join("actor"),
+            profile,
+            transport,
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let listener = UnixListener::bind(spec["socket"].as_str().unwrap()).unwrap();
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut input = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut input);
+            let _ = stopped_tx.send(());
+        });
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped_rx => break,
+                Some(done) = connections.join_next(), if !connections.is_empty() => done.unwrap(),
+                incoming = listener.accept() => {
+                    let (stream, _) = incoming.unwrap();
+                    let state = state.clone();
+                    connections.spawn(async move { handle_connection(stream, state).await.unwrap() });
+                }
+            }
+        }
+        while let Some(done) = connections.join_next().await {
+            done.unwrap();
+        }
+        actor.stop().await.unwrap();
+    }
+
     #[tokio::test]
     async fn send_rpc_preserves_refused_and_ambiguous_provider_outcomes() {
+        if let Some(path) = std::env::var_os("FRESHELL_TEST_CONTROLLED_HOST") {
+            serve_controlled_refusal_host(Path::new(&path)).await;
+            return;
+        }
         for (provider, ambiguous) in [
             (FreshProvider::Codex, false),
             (FreshProvider::Codex, true),
@@ -10827,6 +10916,7 @@ mod tests {
                 }),
                 ambiguous,
                 sends: AtomicUsize::new(0),
+                counter_file: None,
             });
             let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
                 "provider":provider, "runtimeVariant":if provider == FreshProvider::Codex { "codex" } else { "fixture-sdk" }, "cwd":"/workspace", "providerStoreId":"test-store",

@@ -5763,6 +5763,278 @@ mod codex_replacement_realpath {
     #[tokio::test]
     async fn review_definite_refusal_crosses_actor_supervisor_gateway_without_provider_notice() {
         replacement_across_realpath(false, NativeOutcome::Refused, false).await;
+        if let Some(host_binary) = std::env::var_os("FRESHELL_TEST_CONTROLLED_HOST_BINARY") {
+            production_host_refusal_path(&host_binary, false).await;
+            production_host_refusal_path(&host_binary, true).await;
+        }
+    }
+
+    // The helper binary is the session-host's own test executable. Its
+    // provider is controlled and silent, but it accepts socket connections
+    // through the actual host handler and executes production dispatch.
+    async fn production_host_refusal_path(host_binary: &std::ffi::OsStr, ambiguous: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_string_lossy().into_owned();
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"realpath-host-secret").unwrap();
+        let limits = RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        };
+        let registry = Registry::open(root.path().join("registry"), None).unwrap();
+        let soul = SoulId::parse("production-host-codex-soul").unwrap();
+        let spec = serde_json::from_value(serde_json::json!({
+            "sessionId":"managed-public", "provider":"codex", "sessionType":"freshcodex",
+            "runtimeVariant":"codex", "providerStoreId":"realpath-store", "cwd":workspace,
+            "workspacePath":workspace, "runAsUid":65534, "runAsGid":0,
+            "nativeSessionId":"native-a", "sessionRef":{"provider":"codex","sessionId":"native-a"}
+        }))
+        .unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul.clone(),
+                provider: "codex".into(),
+                provider_store_id: "realpath-store".into(),
+                native_session_id: Some("native-a".into()),
+                creation_seed_ref: "production-host-seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "production-host-launch".into(),
+                requested_limits: limits,
+                profile: RuntimeProfile::Custom,
+                project_key: "production-host-workspace".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(spec),
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    launch_policy: None,
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: runtime.clone(),
+                    host_binary_path: std::env::current_exe().unwrap(),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        let boot = HostBootId::new();
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), boot.clone(), limits)
+            .await
+            .unwrap();
+        let current = registry.recovery_context(soul.clone()).await.unwrap();
+        let launch = registry
+            .bind_native_identity_launch(NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: prepared.launch_nonce.as_str().into(),
+                evidence_revision: current.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: Some("native-a".into()),
+            })
+            .await
+            .unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-a".into(),
+            )
+            .await
+            .unwrap();
+        let current = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                NativeIdentityObservation {
+                    native_session_id: "native-a".into(),
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: launch.launch_nonce.clone(),
+                    evidence_revision: launch.evidence_revision,
+                    source: NativeIdentitySource::FreshProviderHandshake,
+                    evidence_digest: "d".repeat(64),
+                },
+                current.write_fence(),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+
+        let counter = root.path().join("provider-count");
+        let host_spec = root.path().join("controlled-host.json");
+        std::fs::write(&host_spec, serde_json::to_vec(&serde_json::json!({
+            "launch":launch, "hostBootId":boot, "limits":limits, "controlEpoch":registry.control_epoch(),
+            "workspace":workspace, "stateDir":runtime.join("host-state"), "socket":runtime.join("host.sock"),
+            "counterFile":counter, "ambiguous":ambiguous
+        })).unwrap()).unwrap();
+        let mut child = tokio::process::Command::new(host_binary)
+            .args([
+                "--exact",
+                "tests::send_rpc_preserves_refused_and_ambiguous_provider_outcomes",
+                "--nocapture",
+            ])
+            .env("FRESHELL_TEST_CONTROLLED_HOST", &host_spec)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start owned production host test process");
+        let scenario = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if runtime.join("host.sock").exists() {
+                        break;
+                    }
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "controlled host exited before binding"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("controlled host must bind its socket");
+            let control_path = root.path().join("control.sock");
+            let listener = UnixListener::bind(&control_path).unwrap();
+            let supervisor = Supervisor::new(
+                registry.clone(),
+                Arc::new(NoRuntime),
+                SupervisorConfig {
+                    runtime_root: root.path().into(),
+                    control_socket_path: control_path.clone(),
+                    host_binary_path: std::env::current_exe().unwrap(),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    test_run_id: "production-host-refusal".into(),
+                    control_secret: "0123456789abcdef".into(),
+                    lifecycle_log: root.path().join("lifecycle.jsonl"),
+                    admission: AdmissionPolicy::default(),
+                },
+            )
+            .unwrap();
+            let (stop, stop_rx) = oneshot::channel();
+            let control_task = tokio::spawn(serve_supervisor(listener, stop_rx, supervisor));
+            let (proxy, mut public) = configure_proxy(
+                &control_path,
+                HashMap::from([(("codex".into(), "managed-public".into()), soul.clone())]),
+            );
+            let inner = std::panic::AssertUnwindSafe(async {
+                let command = |request: &str, session: &str| {
+                    HostedFreshAgentCommand::Send(
+                        serde_json::from_value(serde_json::json!({
+                            "provider":"codex", "sessionType":"freshcodex", "sessionId":session,
+                            "requestId":request, "text":"controlled input"
+                        }))
+                        .unwrap(),
+                    )
+                };
+                let expected = if ambiguous {
+                    "COMMAND_AMBIGUOUS"
+                } else {
+                    "MANAGED_FRESH_AGENT_ERROR"
+                };
+                proxy
+                    .clone()
+                    .handle(command("production-host-request", "managed-public"))
+                    .await;
+                let mut frames = Vec::new();
+                while let Ok(frame) = public.try_recv() {
+                    frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+                }
+                let frame = frames
+                    .iter()
+                    .find(|frame| frame["event"]["requestId"] == "production-host-request")
+                    .expect("actual gateway outcome");
+                assert_eq!(frame["event"]["code"], expected, "{frames:?}");
+                println!(
+                    "FRESHELL_PRODUCTION_HOST_SEND_{}={frame}",
+                    if ambiguous { "Ambiguous" } else { "Refused" }
+                );
+                assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+                proxy
+                    .clone()
+                    .handle(command("production-host-request", "managed-public"))
+                    .await;
+                let mut repeated = Vec::new();
+                while let Ok(frame) = public.try_recv() {
+                    repeated.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+                }
+                assert!(
+                    repeated.iter().any(|frame| frame["event"]["requestId"]
+                        == "production-host-request"
+                        && frame["event"]["code"] == expected),
+                    "{repeated:?}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&counter).unwrap(),
+                    "1",
+                    "the same request must not redispatch"
+                );
+
+                proxy
+                    .clone()
+                    .handle(command("missing-soul-request", "missing-public"))
+                    .await;
+                let mut missing = Vec::new();
+                while let Ok(frame) = public.try_recv() {
+                    missing.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+                }
+                assert!(
+                    missing.iter().any(|frame| frame["event"]["requestId"]
+                        == "missing-soul-request"
+                        && frame["event"]["code"] == "MANAGED_FRESH_AGENT_ERROR"),
+                    "{missing:?}"
+                );
+                assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+                proxy
+                    .clone()
+                    .handle(command("production-host-different", "managed-public"))
+                    .await;
+                let mut different = Vec::new();
+                while let Ok(frame) = public.try_recv() {
+                    different.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+                }
+                assert!(
+                    different.iter().any(|frame| frame["event"]["requestId"]
+                        == "production-host-different"
+                        && frame["event"]["code"] == expected),
+                    "{different:?}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&counter).unwrap(),
+                    "2",
+                    "a separately correlated request is a separate provider call"
+                );
+            })
+            .catch_unwind()
+            .await;
+            let _ = stop.send(());
+            settle_task(control_task, "production supervisor")
+                .await
+                .unwrap();
+            inner.unwrap();
+        })
+        .catch_unwind()
+        .await;
+        drop(child.stdin.take());
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("owned host process must stop on stdin EOF")
+            .expect("wait for owned host");
+        assert!(status.success(), "controlled host process failed: {status}");
+        scenario.unwrap();
     }
 
     #[tokio::test]

@@ -15,6 +15,8 @@ struct JournalState {
     inventory_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     fail_inventory_reads: usize,
     replay_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    replay_next_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    replay_page_limit: Option<usize>,
     live_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     sends: Vec<String>,
     ambiguous_send: bool,
@@ -48,6 +50,8 @@ impl JournalFixture {
             inventory_gate: None,
             fail_inventory_reads: 0,
             replay_gate: None,
+            replay_next_gate: None,
+            replay_page_limit: None,
             live_gate: None,
             sends: Vec::new(),
             ambiguous_send: false,
@@ -98,9 +102,13 @@ impl JournalFixture {
                             state.reads += 1;
                             let mut page = state.batch.clone();
                             if read.max_events == 4096 { gate = state.replay_gate.take(); }
+                            if read.max_events == 4096 && read.after_sequence > 0 { gate = state.replay_next_gate.take().or(gate); }
                             if read.max_events == 128 && read.after_sequence > 0 { gate = state.live_gate.take(); }
                             if let Some(native) = state.advance_on_read.take() { state.native = native; }
                             page.events.retain(|row| row.sequence > read.after_sequence);
+                            if read.max_events == 4096 {
+                                if let Some(limit) = state.replay_page_limit { page.events.truncate(limit); }
+                            }
                             if read.after_sequence != 0 { page.retained_state = None; page.reset_required = false; }
                             AdminResult::FreshAgentEvents(page)
                         }
@@ -698,6 +706,83 @@ fn canonical_warning_batch() -> AgentEventBatch {
 }
 
 #[tokio::test]
+async fn live_warning_can_overtake_targeted_replay_after_running_snapshot() {
+    let mut initial = journal_batch();
+    initial.accepted_native_dispatch = None;
+    initial.events[0].event = status("native-b", "initial");
+    let mut fixture = JournalFixture::new("native-b", "managed-public", initial).await;
+    let mut route = PresentationRoute::materialized("managed-public");
+    route.known_native = Some("native-b".into());
+    route
+        .announced_native
+        .insert("managed-public".into(), "native-b".into());
+    fixture
+        .proxy
+        .presentation_routes
+        .lock()
+        .await
+        .insert(fixture.soul.clone(), route);
+    let scenario = std::panic::AssertUnwindSafe(async {
+        assert!(fixture.proxy.start_poller(fixture.soul.clone(), "codex".into(), "managed-public".into(), "freshcodex".into(), 0).await);
+        let mut initial_frames = Vec::new();
+        assert!(collect_until(&mut fixture.frames, &mut initial_frames, |frames| frames.iter().any(|frame| frame["event"]["status"] == "initial")).await);
+
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!("../../../test/fixtures/managed-native-history/codex-hosted-live.json")).unwrap();
+        snapshot["threadId"] = "native-b".into();
+        snapshot["status"] = "running".into();
+        snapshot["turns"][0]["items"][0]["text"] = "Retained current transcript".into();
+        snapshot["extensions"]["codex"]["projection"] = serde_json::json!({
+            "id":"current", "historyGeneration":0, "eventRevision":1,
+            "eventOwnedTurnIds":["original-soul"], "nativePreviewTurnIds":[], "nativeFinalTurnIds":[],
+            "turnRows":{"original-soul":["original-soul"]}, "turnOutputStates":{"original-soul":{"provenance":"retained","diagnostic":"unsaved","refreshPending":false}}, "settledTurnIds":[]
+        });
+        let live_entered = Arc::new(tokio::sync::Notify::new());
+        let live_release = Arc::new(tokio::sync::Notify::new());
+        let replay_entered = Arc::new(tokio::sync::Notify::new());
+        let replay_release = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.live_gate = Some((live_entered.clone(), live_release.clone()));
+            state.replay_next_gate = Some((replay_entered.clone(), replay_release.clone()));
+            state.replay_page_limit = Some(1);
+            state.batch.head = 2;
+            state.batch.retained_state = Some(serde_json::json!({
+                "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+                "snapshot":snapshot, "attentionMarks":[], "pendingControls":[]
+            }));
+            state.batch.events.push(AgentJournalEvent { sequence: 2, event: AgentEvent::Provider { payload: serde_json::json!({
+                "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-b",
+                "event":{"type":"freshAgent.error", "sessionId":"native-b", "code":"THREAD_MEMORY_LOST", "message":"Memory lost at native-b"}
+            }) } });
+        }
+        tokio::time::timeout(Duration::from_secs(3), live_entered.notified()).await.expect("poller must hold the live warning");
+        let replay_proxy = fixture.proxy.clone();
+        let soul = fixture.soul.clone();
+        let replay = tokio::spawn(async move { replay_proxy.replay_once(soul, "codex", "managed-public", "freshcodex").await });
+        tokio::time::timeout(Duration::from_secs(3), replay_entered.notified()).await.expect("replay must pause after the retained snapshot");
+        let mut snapshot_frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() { snapshot_frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap()); }
+        assert!(snapshot_frames.iter().any(|frame| frame["event"]["retainedState"]["snapshot"]["status"] == "running"), "{snapshot_frames:?}");
+        assert!(!snapshot_frames.iter().any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"));
+
+        live_release.notify_one();
+        let mut live = Vec::new();
+        assert!(collect_until(&mut fixture.frames, &mut live, |frames| frames.iter().any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")).await, "{live:?}");
+        let live_warning = live.iter().find(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST").unwrap();
+        assert!(live_warning["event"]["retainedReplay"].is_null());
+        assert_eq!(live_warning["event"]["journalIdentity"]["sequence"], 2);
+        replay_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), replay).await.unwrap().unwrap();
+        let mut replay_frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() { replay_frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap()); }
+        assert!(replay_frames.iter().any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST" && frame["event"]["retainedReplay"] == true), "{replay_frames:?}");
+        println!("FRESHELL_GATEWAY_LIVE_BEFORE_REPLAY={}", serde_json::json!({"snapshot":snapshot_frames,"live":live,"replay":replay_frames}));
+    }).catch_unwind().await;
+    fixture.shutdown().await;
+    scenario.unwrap();
+}
+
+#[tokio::test]
 async fn canonical_memory_warning_live_and_replay_carry_journal_identity() {
     let mut fixture = JournalFixture::new("native-a", "native-a", canonical_warning_batch()).await;
     fixture.proxy.presentation_routes.lock().await.insert(
@@ -936,6 +1021,214 @@ async fn canonical_memory_warning_after_real_forks_excludes_retired_parent() {
         warnings[0]["event"]["journalIdentity"]["nativeSessionId"],
         "native-c"
     );
+}
+
+struct QueuedForkWarningTransport {
+    stream: StdMutex<Option<tokio::sync::mpsc::Receiver<AgentEvent>>>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    generation: StdMutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
+}
+
+#[async_trait::async_trait]
+impl freshell_agent_runtime::host_actor::FreshAgentTransport for QueuedForkWarningTransport {
+    fn set_codex_warning_fork_generation(&self, generation: Arc<std::sync::atomic::AtomicU64>) {
+        *self.generation.lock().unwrap() = Some(generation);
+    }
+    async fn start(
+        &self,
+        profile: &freshell_agent_runtime::host_actor::FreshAgentProfile,
+    ) -> Result<freshell_agent_runtime::host_actor::TransportStart, String> {
+        Ok(freshell_agent_runtime::host_actor::TransportStart {
+            native_session_id: profile.native_session_id.clone(),
+        })
+    }
+    async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        None
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &freshell_agent_runtime::host_actor::FreshAgentProfile,
+    ) -> Result<
+        freshell_agent_runtime::host_actor::DispatchAck,
+        freshell_agent_runtime::host_actor::DispatchFailure,
+    > {
+        unreachable!()
+    }
+    async fn fork(
+        &self,
+        _: &RequestId,
+        parent: &str,
+        _: Option<serde_json::Value>,
+    ) -> Result<
+        freshell_agent_runtime::host_actor::ForkTransition,
+        freshell_agent_runtime::host_actor::DispatchFailure,
+    > {
+        Ok(freshell_agent_runtime::host_actor::ForkTransition {
+            parent_session_id: parent.into(),
+            child_session_id: if parent == "native-c" {
+                "native-fork"
+            } else {
+                "native-c"
+            }
+            .into(),
+            parent_retired_by_runtime: true,
+        })
+    }
+    async fn resolve_permission(
+        &self,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<(), freshell_agent_runtime::host_actor::DispatchFailure> {
+        unreachable!()
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        self.stream.lock().unwrap().take()
+    }
+}
+
+#[tokio::test]
+async fn queued_parent_warning_cannot_cross_forks_and_reused_native_id() {
+    use freshell_agent_runtime::host_actor::{FreshAgentHostActor, FreshAgentProfile};
+    let directory = tempfile::tempdir().unwrap();
+    let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "runtimeVariant":"codex", "cwd":directory.path(), "providerStoreId":"queued-fork-warning",
+        "nativeSessionId":"native-c", "sessionRef":{"provider":"codex", "sessionId":"native-c"}
+    })).unwrap();
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let transport = Arc::new(QueuedForkWarningTransport {
+        stream: StdMutex::new(Some(receiver)),
+        entered: entered.clone(),
+        release: release.clone(),
+        generation: StdMutex::new(None),
+    });
+    let actor = FreshAgentHostActor::open(directory.path(), profile, transport.clone())
+        .await
+        .unwrap();
+    let warning = |message: &str| AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-c",
+            "event":{"type":"freshAgent.error", "sessionId":"native-c", "code":"THREAD_MEMORY_LOST", "message":message,
+                "_hostForkGeneration":transport.generation.lock().unwrap().as_ref().unwrap().load(std::sync::atomic::Ordering::SeqCst)}
+        }),
+    };
+    sender
+        .send(AgentEvent::Started {
+            native_session_id: "native-c".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    sender.send(warning("Queued parent warning")).await.unwrap();
+    sender
+        .send(status("native-c", "queued sentinel"))
+        .await
+        .unwrap();
+    for (request, parent) in [
+        ("queued-fork-away", "native-c"),
+        ("queued-fork-back", "native-fork"),
+    ] {
+        actor
+            .fork(RequestId::parse(request).unwrap(), parent.into(), None)
+            .await
+            .unwrap();
+    }
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if actor.read_events(0, 4096).await.events.iter().any(|row| {
+                matches!(&row.event,
+                AgentEvent::Provider { payload } if payload["event"]["status"] == "queued sentinel")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the actor must consume the queued event after both fork markers");
+    let before_child_warning = actor.read_events(0, 4096).await;
+    sender.send(warning("Current child warning")).await.unwrap();
+    sender
+        .send(status("native-c", "child sentinel"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if actor.read_events(0, 4096).await.events.iter().any(|row| {
+                matches!(&row.event,
+                AgentEvent::Provider { payload } if payload["event"]["status"] == "child sentinel")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the actor must consume the new child event");
+    let restored_profile = actor.profile().await;
+    actor.stop().await.unwrap();
+    let actor = FreshAgentHostActor::open(
+        directory.path(),
+        restored_profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    let after_child_warning = actor.read_events(0, 4096).await;
+    actor.stop().await.unwrap();
+
+    let mut delivered = Vec::new();
+    for mut batch in [before_child_warning, after_child_warning] {
+        batch.retained_state = Some(serde_json::json!({
+            "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+            "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-c","turns":[],"status":"running"},
+            "attentionMarks":[],"pendingControls":[]
+        }));
+        let mut fixture = JournalFixture::new("native-c", "native-c", batch).await;
+        fixture.proxy.presentation_routes.lock().await.insert(
+            fixture.soul.clone(),
+            PresentationRoute::materialized("native-c"),
+        );
+        fixture
+            .proxy
+            .replay_once(fixture.soul.clone(), "codex", "native-c", "freshcodex")
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        fixture.shutdown().await;
+        delivered.push(frames);
+    }
+    assert!(
+        !delivered[0]
+            .iter()
+            .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"),
+        "queued parent warning reached an unseen child: {:?}",
+        delivered[0]
+    );
+    let warnings: Vec<_> = delivered[1]
+        .iter()
+        .filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", delivered[1]);
+    assert_eq!(warnings[0]["event"]["message"], "Current child warning");
+    assert!(warnings[0]["event"].get("_hostForkGeneration").is_none());
 }
 
 #[tokio::test]
