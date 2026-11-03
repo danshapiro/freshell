@@ -12,12 +12,13 @@ Complete the separately approved follow-up after PR #896 by retaining a small, b
 ### Explicit constraints
 - Track the work in Kata `freshell#w5b4`.
 - Skip the clean-base full-suite gate under the user's explicit waiver, preserving its failed result.
+- Skip the final full-suite gate under the user's explicit waiver; record its interrupted run as incomplete, not passing.
 - Keep the existing named screenshot evidence and current screenshot cap.
 - Run the affected compact-panel browser spec using the configured Cloud E2E backend before the separate PR.
 - Land this change on `main` through a separate PR.
 
 ### Accepted tradeoffs and residuals
-- No additional user-specified tradeoffs.
+- The final full-suite run was started before the waiver arrived. Its Cloud Vitest phase passed, but the local server integration companion was interrupted and is incomplete.
 
 **Goal:** Cloud E2E logs retain at most four additional generic compact-panel geometry-failure screenshots per Cloud task, while every currently named review screenshot continues to be retained.
 
@@ -34,7 +35,7 @@ Complete the separately approved follow-up after PR #896 by retaining a small, b
 - Keep the generic sample separate from the named markers; do not broaden retention to unrelated screenshots.
 - Use `.js` extensions for relative TypeScript imports.
 - Keep the pinned pnpm version and frozen lockfile; do not change dependencies.
-- Run the affected browser spec on the configured Cloud E2E backend. The clean-base full-suite gate remains recorded as failed and is waived by the user; do not relabel it as passing.
+- Run the affected browser spec on the configured Cloud E2E backend. The clean-base full-suite gate remains recorded as failed and is waived by the user; the final full-suite run was also waived and interrupted, so neither result may be relabeled as passing.
 - Submit the change through a separate PR to `main`; do not push behavior changes directly to `main`.
 
 ---
