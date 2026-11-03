@@ -1,106 +1,199 @@
-name: Rust Tests
+name: FreshAgent merged-head sandboxed Rust proof
 
 on:
   workflow_dispatch:
-  pull_request:
 
 permissions:
   contents: read
 
-# Server-side enforcement for the class of red that landed via PR #795:
-# nothing between commit and main ran `cargo test`, so 11 failing freshagent
-# unit tests merged with every advisory check green. The pre-push gate now
-# runs targeted cargo tests locally (scripts/hooks/pre-push); this workflow
-# is the merge-time backstop that cannot be bypassed with --no-verify.
-#
-# The `gate` job always reports, so it can be a required status check without
-# blocking PRs that touch no Rust (a paths-filtered workflow would leave the
-# required check stuck on "Expected" forever).
+env:
+  SOURCE_SHA: 10f932cc851caa1fe744ce3518161a828c3142f5
+  EVIDENCE_DIR: test-results/freshagent-rust-sandbox-proof
+  FRESHELL_SANDBOX_CACHE_PREFIX: freshagent-rust-proof-${{ github.run_id }}-${{ github.run_attempt }}
+  CI: 'true'
+  NO_COLOR: '1'
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+  rust-sandbox:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Detect Rust changes
-        id: filter
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact source
+        shell: bash
         run: |
-          # Manager and dependency configuration changes must exercise the
-          # Rust suite too: it spawns Node fixtures (the codex fake
-          # app-server imports `ws`) whose behavior depends on the installed
-          # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility. Scoped to the
-          # root and workspace members — the independent demo locks are
-          # not part of the workspace dependency tree.
-          # `github.base_ref` exists only for pull_request events; manual
-          # dispatch (the event-routing escape hatch) compares against the
-          # default branch instead.
-          BASE="${{ github.base_ref }}"
-          [ -n "$BASE" ] || BASE="main"
-          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  rust-tests:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-      - uses: Swatinem/rust-cache@v2
-      # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs the workspace dependencies installed
-      # or those tests die at fixture boot ("fake app-server exited before
-      # listening").
-      # Pinned revision of the v4 major; reads the exact version from the root
-      # packageManager pin (no floating duplicate).
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/proof-sha.txt"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_SHA"
+          test "$(git diff --name-only "$SOURCE_SHA" HEAD)" = '.github/workflows/rust-tests.yml'
+          git checkout --detach "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/source-sha.txt"
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies (Rust test fixtures)
-        run: pnpm install --frozen-lockfile
-      - name: Workspace tests
-        # Workspace feature unification turns freshell-codex's default-off
-        # `real-transport` feature ON in this step (freshell-ws,
-        # freshell-server, freshell-session-host, and freshell-freshagent all
-        # depend on freshell-codex with the feature), so the
-        # remote_proxy_relay integration tests run here without an explicit
-        # --features flag. A bare `cargo test -p freshell-codex` would skip
-        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
-        # reports 38 tests; the same -p invocation reports 0).
-        # Keep the gate red on any failure, but report failures in later
-        # crates in the same run instead of stopping at the first suite.
-        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
-
-  gate:
-    name: rust-gate
-    needs: [changes, rust-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Evaluate
+      - name: Install exact workspace dependencies
+        shell: bash
         run: |
-          if [ "${{ needs.changes.outputs.rust }}" = "false" ]; then
-            echo "no Rust changes in this PR — rust tests skipped"
-            exit 0
+          set -euo pipefail
+          node --version | tee "$EVIDENCE_DIR/node-version.txt"
+          pnpm --version | tee "$EVIDENCE_DIR/pnpm-version.txt"
+          test "$(pnpm --version)" = '10.34.5'
+          pnpm install --frozen-lockfile
+      - name: Record isolated runner and Docker baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$GITHUB_WORKSPACE" | tee "$EVIDENCE_DIR/disk-before.txt"
+          docker version | tee "$EVIDENCE_DIR/docker-version.txt"
+          docker info --format '{{json .}}' > "$EVIDENCE_DIR/docker-info.json"
+          docker volume ls --format '{{.Name}}' | sort > "$EVIDENCE_DIR/volumes-before.txt"
+          docker network ls --format '{{.Name}}' | sort > "$EVIDENCE_DIR/networks-before.txt"
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          directory = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          baseline = set((directory / 'volumes-before.txt').read_text().splitlines())
+          workspace = os.path.realpath(os.environ['GITHUB_WORKSPACE'])
+          digest = hashlib.sha256(workspace.encode()).hexdigest()
+          prefix = os.environ['FRESHELL_SANDBOX_CACHE_PREFIX']
+          candidates = [prefix + suffix for suffix in ('-cargo-registry', '-cargo-git', '-pnpm-store', '-node-modules', '-sidecar-node-modules', '-mcp-node-modules', '-playwright-cache')]
+          candidates.append('freshell-sandbox-rust-target-v1-' + digest[:24])
+          collision = sorted(baseline.intersection(candidates))
+          if collision:
+              raise SystemExit('Refusing to use pre-existing proof volumes: ' + repr(collision))
+          PY
+      - name: Run full Rust suite in the strict Docker sandbox
+        shell: bash
+        env:
+          FRESHELL_RUST_TEST_SANDBOX: '1'
+        run: |
+          set -uo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA" || exit 1
+          (set -o pipefail; pnpm run test:rust 2>&1 | tee "$EVIDENCE_DIR/rust-tests.log") &
+          test_pid=$!
+          inspected=0
+          inspect_status=1
+          while kill -0 "$test_pid" 2>/dev/null; do
+            if [ -f "$EVIDENCE_DIR/rust-tests.log" ]; then
+              container_name=$(sed -n 's/.*"event":"sandbox_owner_guard_started","container":"\([^"]*\)".*/\1/p' "$EVIDENCE_DIR/rust-tests.log" | tail -1)
+              if [[ "$container_name" =~ ^freshell-sandbox-[a-zA-Z0-9]+$ ]] && docker inspect "$container_name" > "$EVIDENCE_DIR/inspect-raw.json" 2>/dev/null; then
+                python3 - "$EVIDENCE_DIR/inspect-raw.json" "$EVIDENCE_DIR/sandbox-inspect.json" <<'PY'
+          import json, pathlib, sys
+          row = json.loads(pathlib.Path(sys.argv[1]).read_text())[0]
+          config = row['HostConfig']
+          mounts = [{'type': m['Type'], 'source': m['Source'], 'destination': m['Destination'], 'rw': m['RW']} for m in row['Mounts']]
+          receipt = {'container': row['Name'].lstrip('/'), 'running': row['State']['Running'], 'image': row['Config']['Image'],
+                     'networkMode': config['NetworkMode'], 'readOnlyRoot': config['ReadonlyRootfs'], 'securityOpt': config.get('SecurityOpt') or [],
+                     'pidMode': config['PidMode'], 'privileged': config['Privileged'], 'mounts': mounts}
+          receipt['safe'] = (receipt['running'] and receipt['image'] == 'freshell-sandbox:latest'
+                             and receipt['networkMode'] == 'none' and receipt['readOnlyRoot']
+                             and 'no-new-privileges' in receipt['securityOpt'] and receipt['pidMode'] != 'host'
+                             and not receipt['privileged'] and not any('docker.sock' in str(m) for m in mounts))
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(receipt, indent=2) + '\n')
+          raise SystemExit(0 if receipt['safe'] else 1)
+          PY
+                inspect_status=$?
+                rm -f "$EVIDENCE_DIR/inspect-raw.json"
+                inspected=1
+                break
+              fi
+            fi
+            sleep 2
+          done
+          wait "$test_pid"
+          test_status=$?
+          printf '%s\n' "$test_status" > "$EVIDENCE_DIR/test-exit-code.txt"
+          if [ "$inspected" -ne 1 ] || [ "$inspect_status" -ne 0 ]; then
+            echo 'The strict sandbox container could not be inspected or failed its safety checks.' >&2
+            exit 1
           fi
-          if [ "${{ needs.rust-tests.result }}" = "success" ]; then
-            echo "workspace rust tests passed"
-            exit 0
+          if ! grep -Fq '"event":"rust_test_sandbox_route_selected"' "$EVIDENCE_DIR/rust-tests.log" || ! grep -Fq '"event":"rust_test_temp_created"' "$EVIDENCE_DIR/rust-tests.log"; then
+            echo 'The sandbox route or its inner Rust runner did not start.' >&2
+            exit 1
           fi
-          echo "workspace rust tests failed or did not run"
-          exit 1
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -Fq '"event":"provider_recovery_selector_finished"' "$EVIDENCE_DIR/rust-tests.log" || exit 1
+      - name: Record and clean only this proof's sandbox resources
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          log = evidence / 'rust-tests.log'
+          rows = []
+          if log.exists():
+              for line in log.read_text(errors='replace').splitlines():
+                  try:
+                      row = json.loads(line)
+                      if isinstance(row, dict): rows.append(row)
+                  except json.JSONDecodeError:
+                      pass
+          names = sorted({r['container'] for r in rows if r.get('event') == 'sandbox_workload_started' and isinstance(r.get('container'), str)})
+          receipt = {'containers': [], 'removedVolumes': [], 'networkRemoved': False, 'errors': [],
+                     'innerRunnerStarted': any(r.get('event') == 'rust_test_temp_created' for r in rows)}
+          def call(args):
+              return subprocess.run(args, text=True, capture_output=True)
+          for name in names:
+              check = call(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'name=^/' + name + '$'])
+              remaining = check.stdout.splitlines()
+              receipt['containers'].append({'name': name, 'remaining': remaining, 'checkExit': check.returncode})
+              if check.returncode or remaining: receipt['errors'].append('container not confirmed absent: ' + name)
+          before_file = evidence / 'volumes-before.txt'
+          networks_file = evidence / 'networks-before.txt'
+          if before_file.exists() and not receipt['errors']:
+              before = set(before_file.read_text().splitlines())
+              workspace = os.path.realpath(os.environ['GITHUB_WORKSPACE'])
+              digest = hashlib.sha256(workspace.encode()).hexdigest()
+              prefix = os.environ['FRESHELL_SANDBOX_CACHE_PREFIX']
+              candidates = [prefix + suffix for suffix in ('-cargo-registry', '-cargo-git', '-pnpm-store', '-node-modules', '-sidecar-node-modules', '-mcp-node-modules', '-playwright-cache')]
+              target = 'freshell-sandbox-rust-target-v1-' + digest[:24]
+              candidates.append(target)
+              listed = call(['docker', 'volume', 'ls', '--format', '{{.Name}}'])
+              if listed.returncode:
+                  receipt['errors'].append('unable to list Docker volumes')
+              else:
+                  present = set(listed.stdout.splitlines())
+                  for volume in candidates:
+                      if volume in before or volume not in present: continue
+                      if volume == target:
+                          inspect = call(['docker', 'volume', 'inspect', volume])
+                          try: labels = json.loads(inspect.stdout)[0]['Labels'] or {}
+                          except (ValueError, IndexError, KeyError): labels = {}
+                          if inspect.returncode or labels.get('com.freshell.cache.worktree-sha256') != digest or labels.get('com.freshell.cache.owner') != 'freshell':
+                              receipt['errors'].append('target volume identity mismatch: ' + volume)
+                              continue
+                      removed = call(['docker', 'volume', 'rm', volume])
+                      if removed.returncode: receipt['errors'].append('volume removal failed: ' + volume + ': ' + removed.stderr.strip())
+                      else: receipt['removedVolumes'].append(volume)
+          if networks_file.exists() and not receipt['errors'] and 'freshell-sandbox' not in networks_file.read_text().splitlines():
+              listed = call(['docker', 'network', 'ls', '--format', '{{.Name}}'])
+              if listed.returncode: receipt['errors'].append('unable to list Docker networks')
+              elif 'freshell-sandbox' in listed.stdout.splitlines():
+                  removed = call(['docker', 'network', 'rm', 'freshell-sandbox'])
+                  if removed.returncode: receipt['errors'].append('sandbox network removal failed: ' + removed.stderr.strip())
+                  else: receipt['networkRemoved'] = True
+          receipt['ok'] = not receipt['errors']
+          (evidence / 'cleanup.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt))
+          raise SystemExit(0 if receipt['ok'] else 1)
+          PY
+          df -h "$GITHUB_WORKSPACE" > "$EVIDENCE_DIR/disk-after.txt" || true
+      - name: Preserve sandbox proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freshagent-sandboxed-rust-10f932cc8
+          path: test-results/freshagent-rust-sandbox-proof/
+          if-no-files-found: error
+          retention-days: 7
