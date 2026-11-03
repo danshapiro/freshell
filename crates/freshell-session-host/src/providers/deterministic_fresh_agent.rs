@@ -1804,14 +1804,35 @@ mod tests {
                 state,
                 freshell_runtime_protocol::CommandState::ProviderAcked
             );
-            tokio::task::yield_now().await;
-            let events = actor.read_events(0, 20).await;
-            assert!(events.events.iter().any(|entry| matches!(
+            // Dispatch queues provider events, while a separate actor task
+            // persists them. Wait for either completion shape before checking
+            // which contract this provider actually emitted.
+            let events =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let events = actor.read_events(0, 20).await;
+                        if events.events.iter().any(|entry| matches!(
+                        &entry.event,
+                        AgentEvent::Provider { payload }
+                            if payload["type"] == "freshAgent.turn.complete"
+                                || (payload["type"] == "freshAgent.event"
+                                    && payload["event"]["type"] == "freshAgent.turn.complete")
+                    )) {
+                        break events;
+                    }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("provider completion must reach the durable actor");
+            if provider != FreshProvider::Codex {
+                assert!(events.events.iter().any(|entry| matches!(
                 &entry.event,
                 AgentEvent::Provider { payload }
                     if payload.get("completionKind").and_then(Value::as_str)
                         == Some("provider_native_completed")
-            )));
+                )));
+            }
             let persisted: Value = serde_json::from_slice(
                 &fs::read(root.path().join("provider").join(STATE_FILE)).unwrap(),
             )
@@ -1865,6 +1886,76 @@ mod tests {
                     }
                 })
                 .collect();
+            if provider == FreshProvider::Codex {
+                assert!(
+                    !provider_events
+                        .iter()
+                        .any(|payload| payload["type"] == "freshAgent.session.materialized"),
+                    "a newly created Codex thread already has its native identity"
+                );
+                let assistant = provider_events
+                    .iter()
+                    .position(|payload| {
+                        payload["event"]["type"] == "fixture.provider_native.assistant_message"
+                    })
+                    .expect("the dispatched turn must produce its fixture assistant marker");
+                let completions: Vec<_> = provider_events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, payload)| {
+                        payload["type"] == "freshAgent.event"
+                            && payload["event"]["type"] == "freshAgent.turn.complete"
+                    })
+                    .collect();
+                assert_eq!(completions.len(), 1);
+                let (completed, completion) = completions[0];
+                assert!(assistant < completed);
+                assert_eq!(completion["provider"], "codex");
+                assert_eq!(completion["sessionType"], "freshcodex");
+                assert_eq!(completion["sessionId"], native_id);
+                assert_eq!(completion["event"]["sessionId"], native_id);
+                assert_eq!(saved["threadId"], native_id);
+                assert_eq!(saved["provider"], completion["provider"]);
+                assert_eq!(saved["sessionType"], completion["sessionType"]);
+                assert!(completion["event"]["at"].as_i64().is_some());
+                assert_eq!(completion["event"]["outcome"], "completed");
+                let expected_turn =
+                    format!("turn-{}-1", short_hash("request-fixture-native-proof"));
+                assert_eq!(provider_events[assistant]["event"]["turnId"], expected_turn);
+                let expected_message = format!("assistant-{}-1", short_hash(&expected_turn));
+                assert_eq!(
+                    provider_events[assistant]["event"]["assistantMessageId"],
+                    expected_message
+                );
+                let history = fs::read_to_string(
+                    root.path()
+                        .join(".codex/sessions")
+                        .join(format!("rollout-fixture-{native_id}.jsonl")),
+                )
+                .unwrap();
+                let records: Vec<Value> = history
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert!(records.iter().any(|record| record["type"] == "turn_context"
+                    && record["payload"]["turn_id"] == expected_turn));
+                assert!(records
+                    .iter()
+                    .any(|record| record["type"] == "response_item"
+                        && record["payload"]["id"] == expected_message));
+                assert!(saved["turns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|turn| turn["summary"] == "deterministic fixture completion"));
+                assert_eq!(
+                    freshell_freshagent::native_history::read("codex", root.path(), native_id)
+                        .unwrap(),
+                    saved
+                );
+                transport.stop().await.unwrap();
+                continue;
+            }
             let materialized = provider_events
                 .iter()
                 .position(|payload| payload["type"] == "freshAgent.session.materialized")
