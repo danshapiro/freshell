@@ -2783,6 +2783,88 @@ describe('FreshAgentView', () => {
     } finally { cleanup(); held.resolve(hostedCodexSnapshot(sourceChanged ? 'native-d' : 'native-c', 'Current snapshot')) }
   })
 
+  it.each(['undismissed', 'dismissed', 'later error', 'error before reservation', 'no warning'] as const)(
+    'keeps the correct hidden warning presentation after a current reservation (%s)', async (scenario) => {
+      const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+      const client = new WsClient('ws://codex-warning-reservation.test/ws')
+      const store = createStore()
+      const locator = { sessionId: 'managed-public', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      client.onMessage((frame) => { handleFreshAgentMessage(store.dispatch, frame, client) })
+      wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+      store.dispatch(sessionInit(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'warning-reservation', status: 'idle',
+        sessionRef: { provider: 'codex', sessionId: 'native-a' }, soulId: 'soul-one', soulIntentRevision: 3, viewIntentId: 'view-one',
+      } }))
+      applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-c'), store.getState() as any))
+      const held = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+      const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      const receive = (frame: Record<string, unknown>) => client.receiveMessageForTest(frame as never)
+      const frames = codexGatewayWarningFrames()
+      const isWarning = (frame: Record<string, unknown>) => (frame.event as Record<string, unknown> | undefined)?.code === 'THREAD_MEMORY_LOST'
+      const warning = frames.live.filter(isWarning)
+      const replay = frames.replay.filter(isWarning)
+      expect(warning).toHaveLength(1)
+      expect(replay).toHaveLength(1)
+      const reserve = (nativeSessionId: string) => receive({ type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.error', code: 'SESSION_RESERVED', message: 'Retry the attach',
+          gateway: { operation: 'attach', nativeSessionId } } })
+      const key = 'freshcodex:codex:managed-public'
+      try {
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+        act(() => {
+          for (const frame of frames.replay.filter((frame) => !isWarning(frame))) receive(frame)
+          receive({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.retry', attempt: 2 } })
+          if (scenario !== 'no warning') for (const frame of warning) receive(frame)
+          if (scenario === 'error before reservation') receive({ type: 'freshAgent.event', ...locator,
+            event: { type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Later operation failed', gateway: { operation: 'compact' } } })
+        })
+        if (scenario === 'dismissed') {
+          view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+          const banner = screen.getByText(/Agent error: Codex crashed/).closest('[role="alert"]')
+          if (!banner) throw new Error('warning banner is missing')
+          fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+          view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+        }
+        const initialCount = sentFreshAgentMessages('freshAgent.attach').length
+        vi.useFakeTimers()
+        act(() => reserve('native-a'))
+        await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+        expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(initialCount)
+        act(() => {
+          reserve('native-c')
+          if (scenario !== 'no warning') for (const frame of replay) receive(frame)
+          if (scenario === 'later error') receive({ type: 'freshAgent.event', ...locator,
+            event: { type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Later operation failed', gateway: { operation: 'compact' } } })
+        })
+        await act(async () => { await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 1) })
+        expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(initialCount + 1)
+        expect(sentFreshAgentMessages('freshAgent.attach').at(-1)).toMatchObject({ sessionRef: { provider: 'codex', sessionId: 'native-c' } })
+        expect(store.getState().freshAgent.sessions[key].status).toBe('running')
+        expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
+        expect(store.getState().freshAgentLive.bySession[key]?.retainedSnapshot?.turns[0].items[0]).toMatchObject({ text: 'Retained current transcript' })
+        view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        if (scenario === 'later error' || scenario === 'error before reservation') {
+          const banner = screen.getByText('Agent error: Later operation failed').closest('[role="alert"]')
+          if (!banner) throw new Error('later error banner is missing')
+          fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+        }
+        if (scenario === 'undismissed' || scenario === 'later error' || scenario === 'error before reservation') {
+          const banner = screen.getByText(/Agent error: Codex crashed/).closest('[role="alert"]')
+          if (!banner) throw new Error('warning banner is missing')
+          fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+          act(() => { for (const frame of replay) receive(frame) })
+        }
+        expect(screen.queryByText(/Agent error: Codex crashed/)).not.toBeInTheDocument()
+      } finally {
+        cleanup()
+        vi.useRealTimers()
+        held.resolve(hostedCodexSnapshot('native-c', 'Current snapshot'))
+      }
+    },
+  )
+
   it('preserves a newer error and running hidden output when the gateway live warning overtakes replay', async () => {
     const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
     const client = new WsClient('ws://codex-live-before-replay.test/ws')

@@ -479,6 +479,10 @@ const freshAgentSlice = createSlice({
     sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string; preserveStatus?: boolean }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
+      // Reservation is retried by the pane and has no dismissible banner.
+      // Do not let it hide an undismissed warning or the error ahead of it.
+      if (action.payload.code === 'SESSION_RESERVED' && session.memoryWarning
+        && (session.lastErrorCode === 'THREAD_MEMORY_LOST' || session.memoryWarning.pendingMessage)) return
       // A banner can arrive while its pane is hidden. Keep the warning until
       // dismissal when a later error takes its place, but only for its source.
       if (session.lastErrorCode === 'THREAD_MEMORY_LOST' && session.lastError
