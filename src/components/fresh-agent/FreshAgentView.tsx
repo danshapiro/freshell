@@ -3604,7 +3604,14 @@ export function FreshAgentView({
         if (!failedRequestId) return
         const originalPending = pendingSendMetadataRef.current.get(failedRequestId)
         if (!originalPending?.sourceSessionKey) return
-        const current = paneContentRef.current
+        // A pane switch and this error can be handled in one React batch,
+        // before paneContentRef reflects the already-committed Redux change.
+        // Correlate against the authoritative pane before restoring a draft or
+        // scheduling a retry for this request.
+        const root = appStore.getState().panes.layouts[tabId]
+        const latest = root ? findPaneContent(root, paneId) : null
+        if (latest?.kind !== 'fresh-agent') return
+        const current = latest
         const currentScope = paneSessionScope(current)
         const pending = scopeToPaneSession(originalPending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)
         // Top-level error frames contain no session locator. A request from a
