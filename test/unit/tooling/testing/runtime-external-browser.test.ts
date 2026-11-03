@@ -1281,7 +1281,7 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
       expect(childEnvironment).toEqual(environment)
       expect(JSON.stringify(childEnvironment)).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
       expect(fs.statSync(directory).mode & 0o777).toBe(0o700)
-      expect(fs.statSync(handoffFile).mode & 0o777).toBe(0o600)
+      expect(fs.statSync(handoffFile).mode & 0o777).toBe(0o444)
       expect(JSON.parse(fs.readFileSync(handoffFile, 'utf8'))).toEqual({
         FRESHELL_E2E_TARGET_URL: ownedDescriptor.baseUrl,
         FRESHELL_E2E_TARGET_WS_URL: ownedDescriptor.wsUrl,
