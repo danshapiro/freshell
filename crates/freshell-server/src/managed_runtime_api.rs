@@ -1490,6 +1490,8 @@ struct AgentPaneOwnership {
     #[serde(skip)]
     session_type: Option<String>,
     #[serde(skip)]
+    create_request_id: Option<String>,
+    #[serde(skip)]
     identity_consistent: bool,
     ownership: PaneOwnership,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1550,6 +1552,10 @@ fn pane_ownership_report(
         .unwrap_or_default()
         .into_iter()
         .filter_map(|entry| agent_pane_identity(entry.client_id, entry.pane))
+        // This is the census of work a web stop could interrupt. Retained
+        // history panes are excluded only with affirmative process-exit or
+        // supervisor cleanup evidence; missing and transitional work stays.
+        .filter(|pane| !pane_is_confirmed_inactive(pane, runtime_views, &terminal_rows, terminals))
         .map(|mut pane| {
             let classification =
                 classify_agent_pane(&pane, runtime_views, &terminal_rows, ownership);
@@ -1565,7 +1571,8 @@ fn pane_ownership_report(
             .then_with(|| left.tab_id.cmp(&right.tab_id))
             .then_with(|| left.pane_id.cmp(&right.pane_id))
     });
-    let mut unattached_processes = unattached_processes(&panes, &terminal_rows, ownership);
+    let mut unattached_processes =
+        unattached_processes(&panes, &terminal_rows, runtime_views, ownership);
     unattached_processes.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
@@ -1592,6 +1599,7 @@ fn pane_ownership_report(
 fn unattached_processes(
     panes: &[AgentPaneOwnership],
     terminal_rows: &[InventoryTerminal],
+    runtime_views: &[RuntimeView],
     ownership: Option<&RuntimeOwnershipRegistry>,
 ) -> Vec<UnattachedProcess> {
     let mut processes = Vec::new();
@@ -1620,8 +1628,13 @@ fn unattached_processes(
             .filter(|row| row.terminal_id == terminal.terminal_id)
             .count();
         let uniquely_durable = matching_inventory_count == 1
-            && !matching_panes.is_empty()
-            && !matching_soul_panes.is_empty()
+            && terminal_runtime_view(
+                &terminal.mode,
+                &terminal.terminal_id,
+                Some(terminal),
+                runtime_views,
+            )
+            .is_some_and(runtime_view_is_running)
             && matching_panes.iter().all(|pane| {
                 pane.ownership == PaneOwnership::Durable
                     && terminal.soul_id.as_deref() == pane.soul_id.as_deref()
@@ -1651,7 +1664,7 @@ fn unattached_processes(
                 .as_ref()
                 .map(|session_ref| session_ref.session_id.clone()),
             ownership,
-            reason: "running terminal has no consistent durable pane and soul match".into(),
+            reason: "running terminal has no unique current supervisor identity or has conflicting panes".into(),
         });
     }
 
@@ -1772,6 +1785,86 @@ fn classify_agent_pane(
     }
 }
 
+fn runtime_view_is_verified_empty(view: &RuntimeView) -> bool {
+    view.desired_state == DesiredState::Stopped
+        && view.cleanup_state == freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        && !view.launch_state.is_potentially_active()
+}
+
+fn pane_is_confirmed_inactive(
+    pane: &AgentPaneOwnership,
+    runtime_views: &[RuntimeView],
+    terminal_rows: &[InventoryTerminal],
+    terminals: Option<&TerminalRegistry>,
+) -> bool {
+    if !pane.identity_consistent {
+        return false;
+    }
+    match pane.kind.as_str() {
+        "terminal" => {
+            let Some(provider) = pane.provider.as_deref() else {
+                return false;
+            };
+            let terminal_id = match pane.terminal_id.as_deref() {
+                Some(id) => id,
+                None => {
+                    // The ordinary client clears terminalId on natural exit.
+                    // Its retained create key can identify one exact row, but
+                    // multiple generations or an absent row prove nothing.
+                    let (Some(create_id), Some(terminals)) =
+                        (pane.create_request_id.as_deref(), terminals)
+                    else {
+                        return false;
+                    };
+                    if create_id.is_empty() {
+                        return false;
+                    }
+                    let mut matching = terminal_rows.iter().filter(|row| {
+                        terminals
+                            .probe_create_request_id(&row.terminal_id)
+                            .as_deref()
+                            == Some(create_id)
+                    });
+                    let Some(row) = matching.next() else {
+                        return false;
+                    };
+                    if matching.next().is_some() {
+                        return false;
+                    }
+                    row.terminal_id.as_str()
+                }
+            };
+            let matching_rows = terminal_rows
+                .iter()
+                .filter(|row| row.terminal_id == terminal_id)
+                .collect::<Vec<_>>();
+            let terminal = match matching_rows.as_slice() {
+                [row]
+                    if row.mode == provider
+                        && row.status == freshell_protocol::TerminalRunStatus::Exited =>
+                {
+                    Some(*row)
+                }
+                [] => None,
+                _ => return false,
+            };
+            if terminal.is_some_and(|row| row.soul_id.is_none() && row.incarnation_id.is_none()) {
+                // Only confirmed local exits retain ordinary Exited rows.
+                // Managed blocked facades also say Exited, so their exact
+                // supervisor cleanup evidence is required below instead.
+                return !runtime_views
+                    .iter()
+                    .any(|view| view.terminal_id.as_deref() == Some(terminal_id));
+            }
+            terminal_runtime_view(provider, terminal_id, terminal, runtime_views)
+                .is_some_and(runtime_view_is_verified_empty)
+        }
+        "fresh-agent" => fresh_agent_runtime_view(pane, runtime_views)
+            .is_some_and(runtime_view_is_verified_empty),
+        _ => false,
+    }
+}
+
 fn classify_terminal_pane(
     pane: &AgentPaneOwnership,
     runtime_views: &[RuntimeView],
@@ -1797,27 +1890,51 @@ fn classify_terminal_pane(
         terminal.soul_id.as_deref(),
         terminal.incarnation_id.as_deref(),
     ) {
-        (Some(soul_id), Some(incarnation_id)) => {
-            let matching_views = runtime_views
-                .iter()
-                .filter(|view| {
-                    view.soul_id.as_str() == soul_id
-                        && view.incarnation_id.as_str() == incarnation_id
-                        && view.terminal_id.as_deref() == Some(terminal_id)
-                        && view.provider.as_deref() == Some(provider)
-                        && view.terminal_mode.as_deref() == Some(provider)
-                        && view.desired_state == DesiredState::Running
-                        && view.launch_state == freshell_runtime_protocol::LaunchState::Running
-                })
-                .collect::<Vec<_>>();
-            match matching_views.as_slice() {
-                [view] => PaneClassification::durable(view),
+        (Some(_), Some(_)) => {
+            match terminal_runtime_view(provider, terminal_id, Some(terminal), runtime_views) {
+                Some(view) if runtime_view_is_running(view) => PaneClassification::durable(view),
                 _ => PaneClassification::unknown(),
             }
         }
         (None, None) => PaneClassification::host_managed(),
         _ => PaneClassification::unknown(),
     }
+}
+
+fn runtime_view_is_running(view: &RuntimeView) -> bool {
+    view.desired_state == DesiredState::Running
+        && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+}
+
+/// Match the current supervisor identity independently of browser presence.
+/// Any second view sharing its terminal, soul, or incarnation is ambiguous.
+fn terminal_runtime_view<'a>(
+    provider: &str,
+    terminal_id: &str,
+    terminal: Option<&InventoryTerminal>,
+    runtime_views: &'a [RuntimeView],
+) -> Option<&'a RuntimeView> {
+    let mut candidates = runtime_views.iter().filter(|view| {
+        view.terminal_id.as_deref() == Some(terminal_id)
+            || terminal.is_some_and(|terminal| {
+                terminal.soul_id.as_deref() == Some(view.soul_id.as_str())
+                    || terminal.incarnation_id.as_deref() == Some(view.incarnation_id.as_str())
+            })
+    });
+    let view = candidates.next()?;
+    if candidates.next().is_some()
+        || view.terminal_id.as_deref() != Some(terminal_id)
+        || view.provider.as_deref() != Some(provider)
+        || view.terminal_mode.as_deref() != Some(provider)
+        || terminal.is_some_and(|terminal| {
+            terminal.mode != provider
+                || terminal.soul_id.as_deref() != Some(view.soul_id.as_str())
+                || terminal.incarnation_id.as_deref() != Some(view.incarnation_id.as_str())
+        })
+    {
+        return None;
+    }
+    Some(view)
 }
 
 fn classify_fresh_agent_pane(
@@ -1829,30 +1946,12 @@ fn classify_fresh_agent_pane(
     else {
         return PaneClassification::unknown();
     };
-    let session_type = pane.session_type.as_deref();
-    let matching_views = runtime_views
+    if runtime_views
         .iter()
-        .filter(|view| {
-            // The ordinary Fresh Agent pane changes `sessionId` from the
-            // launch/session identity to the provider's native session ID
-            // after materialization. Both identities are published by the
-            // same RuntimeView, so either exact match can establish ownership.
-            view.fresh_agent_session_id.as_deref() == Some(session_id)
-                || view.native_session_id.as_deref() == Some(session_id)
-        })
-        .collect::<Vec<_>>();
-    if !matching_views.is_empty() {
-        let current_matches = matching_views
-            .into_iter()
-            .filter(|view| {
-                view.provider.as_deref() == Some(provider)
-                    && view.fresh_agent_session_type.as_deref() == session_type
-                    && view.desired_state == DesiredState::Running
-                    && view.launch_state == freshell_runtime_protocol::LaunchState::Running
-            })
-            .collect::<Vec<_>>();
-        return match current_matches.as_slice() {
-            [view] => PaneClassification::durable(view),
+        .any(|view| fresh_agent_session_matches(view, session_id))
+    {
+        return match fresh_agent_runtime_view(pane, runtime_views) {
+            Some(view) if runtime_view_is_running(view) => PaneClassification::durable(view),
             _ => PaneClassification::unknown(),
         };
     }
@@ -1871,6 +1970,37 @@ fn classify_fresh_agent_pane(
         }
         _ => PaneClassification::unknown(),
     }
+}
+
+fn fresh_agent_session_matches(view: &RuntimeView, session_id: &str) -> bool {
+    // Materialization changes the pane's launch ID to the native session ID.
+    // Both aliases belong to the same authoritative supervisor view.
+    view.fresh_agent_session_id.as_deref() == Some(session_id)
+        || view.native_session_id.as_deref() == Some(session_id)
+}
+
+fn fresh_agent_runtime_view<'a>(
+    pane: &AgentPaneOwnership,
+    runtime_views: &'a [RuntimeView],
+) -> Option<&'a RuntimeView> {
+    let (Some(provider), Some(session_id), Some(session_type)) = (
+        pane.provider.as_deref(),
+        pane.session_id.as_deref(),
+        pane.session_type.as_deref(),
+    ) else {
+        return None;
+    };
+    let mut candidates = runtime_views
+        .iter()
+        .filter(|view| fresh_agent_session_matches(view, session_id));
+    let view = candidates.next()?;
+    if candidates.next().is_some()
+        || view.provider.as_deref() != Some(provider)
+        || view.fresh_agent_session_type.as_deref() != Some(session_type)
+    {
+        return None;
+    }
+    Some(view)
 }
 
 fn agent_pane_identity(client_id: String, pane: PaneSnapshot) -> Option<AgentPaneOwnership> {
@@ -1919,6 +2049,10 @@ fn agent_pane_identity(client_id: String, pane: PaneSnapshot) -> Option<AgentPan
         session_id: pane_session_id.or(reference_session_id),
         session_type: content
             .get("sessionType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        create_request_id: content
+            .get("createRequestId")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         identity_consistent,
@@ -2074,9 +2208,6 @@ mod tests {
         readiness_terminals: TerminalRegistry,
         ownership: Arc<RuntimeOwnershipRegistry>,
     ) -> (Router, tokio::task::JoinHandle<()>) {
-        use freshell_runtime_client::RuntimeClient;
-        use freshell_supervisor::backend::DockerEngineBackend;
-
         let (registry, _) = stop_contract_tests::fixture_fresh_soul_with_cleanup(
             root,
             false,
@@ -2086,6 +2217,27 @@ mod tests {
             false,
         )
         .await;
+        maintenance_router_with_registry(
+            root,
+            gate,
+            layout_store,
+            readiness_terminals,
+            ownership,
+            registry,
+        )
+        .await
+    }
+
+    async fn maintenance_router_with_registry(
+        root: &std::path::Path,
+        gate: HostAgentAdmissionGate,
+        layout_store: LayoutStore,
+        readiness_terminals: TerminalRegistry,
+        ownership: Arc<RuntimeOwnershipRegistry>,
+        registry: freshell_supervisor::registry::Registry,
+    ) -> (Router, tokio::task::JoinHandle<()>) {
+        use freshell_supervisor::backend::DockerEngineBackend;
+
         let backend = Arc::new(DockerEngineBackend::new(root.join("no-docker.sock")));
         let (socket, control) = stop_contract_tests::start_control(root, registry, backend).await;
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(4);
@@ -2733,6 +2885,523 @@ mod tests {
         assert!(!incomplete.ready_to_stop);
     }
 
+    fn register_readiness_managed_terminal(terminals: &TerminalRegistry, view: &RuntimeView) {
+        terminals.register_managed(
+            freshell_terminal::registry::ManagedTerminalDescriptor {
+                soul_id: view.soul_id.to_string(),
+                incarnation_id: view.incarnation_id.to_string(),
+                terminal_id: view.terminal_id.clone().unwrap(),
+                stream_id: view.terminal_stream_id.clone().unwrap(),
+                mode: view.terminal_mode.clone().unwrap(),
+                cwd: "/workspace".into(),
+                resume_session_id: view.native_session_id.clone(),
+                create_request_id: view.terminal_create_request_id.clone(),
+            },
+            "Managed terminal".into(),
+        );
+    }
+
+    async fn assert_maintenance_admits(app: &Router) {
+        let (status, body) = maintenance_request(
+            app,
+            "GET",
+            "/api/runtime/readiness",
+            Some("maintenance-secret"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["paneOwnership"]["readyToStop"], true, "{body}");
+        assert_eq!(body["paneOwnership"]["panes"], json!([]));
+        assert_eq!(body["paneOwnership"]["unattachedProcesses"], json!([]));
+        let (status, quiesce) = maintenance_request(
+            app,
+            "POST",
+            "/api/runtime/maintenance/quiesce",
+            Some("maintenance-secret"),
+            Some(json!({"ownerId":"census-regression"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{quiesce}");
+        assert_eq!(quiesce["readyToStop"], true, "{quiesce}");
+        let (status, committed) = maintenance_request(
+            app,
+            "POST",
+            "/api/runtime/maintenance/commit-stop",
+            Some("maintenance-secret"),
+            Some(json!({
+                "ownerId":quiesce["lease"]["ownerId"],
+                "leaseId":quiesce["lease"]["leaseId"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{committed}");
+        assert_eq!(committed["committed"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_admits_disconnected_managed_terminal_and_preserves_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (registry, view) = stop_contract_tests::fixture_terminal_soul_with_cleanup(
+            root.path(),
+            false,
+            "codex",
+            "disconnected-native-session",
+            false,
+        )
+        .await;
+        let terminals = TerminalRegistry::new();
+        register_readiness_managed_terminal(&terminals, &view);
+        let layouts = LayoutStore::default();
+        layouts.update_from_ui(
+            &readiness_layout_sync(
+                "tab",
+                "pane",
+                json!({
+                    "kind":"terminal", "mode":"codex", "terminalId":view.terminal_id,
+                    "createRequestId":"managed-terminal-create", "status":"running"
+                }),
+            ),
+            "client",
+        );
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let before = pane_ownership_report(
+            Some(&layouts),
+            Some(&terminals),
+            Some(&ownership),
+            std::slice::from_ref(&view),
+        );
+        assert!(before.ready_to_stop);
+        layouts.remove_client("client");
+        assert!(layouts.live_pane_snapshots().is_empty());
+        assert!(layouts.get_pane_snapshot("pane").is_some());
+        let (app, control) = maintenance_router_with_registry(
+            root.path(),
+            HostAgentAdmissionGate::new(),
+            layouts,
+            terminals.clone(),
+            ownership,
+            registry.clone(),
+        )
+        .await;
+
+        assert_maintenance_admits(&app).await;
+
+        let after = registry.inventory().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].soul_id, view.soul_id);
+        assert_eq!(after[0].incarnation_id, view.incarnation_id);
+        assert_eq!(after[0].desired_state, DesiredState::Running);
+        assert_eq!(
+            terminals.inventory()[0].status,
+            freshell_protocol::TerminalRunStatus::Running
+        );
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnected_managed_terminal_still_requires_unique_current_supervisor_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, view) = stop_contract_tests::fixture_terminal_soul_with_cleanup(
+            root.path(),
+            false,
+            "codex",
+            "unpaired-native-session",
+            false,
+        )
+        .await;
+        let terminals = TerminalRegistry::new();
+        register_readiness_managed_terminal(&terminals, &view);
+        let layouts = LayoutStore::default();
+        let ownership = RuntimeOwnershipRegistry::new();
+        let mut conflicting = view.clone();
+        conflicting.incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+        let mut inactive = view.clone();
+        inactive.desired_state = DesiredState::Stopped;
+        for views in [
+            vec![],
+            vec![conflicting.clone()],
+            vec![view, conflicting],
+            vec![inactive],
+        ] {
+            let report =
+                pane_ownership_report(Some(&layouts), Some(&terminals), Some(&ownership), &views);
+            assert!(!report.ready_to_stop);
+            assert_eq!(report.unattached_processes.len(), 1);
+            assert_eq!(
+                report.unattached_processes[0].ownership,
+                PaneOwnership::Unknown
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_admits_confirmed_ordinary_exit_and_preserves_saved_pane() {
+        use freshell_ownership::{BeginOutcome, CommitOutcome};
+        let root = tempfile::tempdir().unwrap();
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let terminals = TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        terminals.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "exited-terminal".into(),
+            stream_id: "exited-stream".into(),
+            mode: "codex".into(),
+            resume_session_id: Some("exited-session".into()),
+            create_request_id: Some("exited-create".into()),
+            created_at: None,
+        });
+        let locator = freshell_protocol::SessionLocator {
+            provider: "codex".into(),
+            session_id: "exited-session".into(),
+        };
+        let BeginOutcome::Granted { generation } = ownership.begin_start(
+            "codex",
+            "exited-session",
+            RuntimeOwnerKind::Terminal,
+            "exit-owner",
+            None,
+            "census-exit",
+            1,
+        ) else {
+            panic!("ordinary terminal fixture acquires ownership")
+        };
+        assert_eq!(
+            terminals.commit_session_ref_ownership(
+                &locator,
+                "exit-owner",
+                generation,
+                "exited-terminal"
+            ),
+            CommitOutcome::Committed
+        );
+        let layouts = LayoutStore::default();
+        let mut content = json!({"kind":"terminal", "mode":"codex", "terminalId":"exited-terminal", "createRequestId":"exited-create", "status":"exited"});
+        layouts.update_from_ui(
+            &readiness_layout_sync("tab", "pane", content.clone()),
+            "client",
+        );
+        assert!(
+            !pane_ownership_report(Some(&layouts), Some(&terminals), Some(&ownership), &[])
+                .ready_to_stop,
+            "UI exit status alone does not prove process exit"
+        );
+        assert!(terminals.finish_pty_exit("exited-terminal", 0));
+        assert!(matches!(
+            ownership.observe("codex", "exited-session").state,
+            OwnershipState::Vacant
+        ));
+        assert!(
+            pane_ownership_report(Some(&layouts), Some(&terminals), Some(&ownership), &[])
+                .ready_to_stop
+        );
+        // The ordinary client clears terminalId after receiving terminal.exit.
+        content.as_object_mut().unwrap().remove("terminalId");
+        layouts.update_from_ui(
+            &readiness_layout_sync("tab", "pane", content.clone()),
+            "client",
+        );
+        let (app, control) = maintenance_router_with_readiness_terminals(
+            root.path(),
+            HostAgentAdmissionGate::new(),
+            layouts.clone(),
+            terminals.clone(),
+            ownership,
+        )
+        .await;
+
+        assert_maintenance_admits(&app).await;
+
+        assert_eq!(
+            layouts
+                .get_pane_snapshot("pane")
+                .unwrap()
+                .pane_content
+                .unwrap(),
+            content
+        );
+        assert_eq!(
+            terminals.inventory()[0].status,
+            freshell_protocol::TerminalRunStatus::Exited
+        );
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[test]
+    fn inactive_ordinary_pane_requires_unique_matching_exit_evidence() {
+        let layouts = LayoutStore::default();
+        let ownership = RuntimeOwnershipRegistry::new();
+        let terminals = TerminalRegistry::new();
+        let content = json!({"kind":"terminal", "mode":"codex", "createRequestId":"ordinary-create", "status":"exited"});
+        layouts.update_from_ui(&readiness_layout_sync("tab", "pane", content), "client");
+        assert!(
+            !pane_ownership_report(Some(&layouts), Some(&terminals), Some(&ownership), &[])
+                .ready_to_stop
+        );
+        for id in ["first", "second"] {
+            terminals.register_headless(freshell_terminal::registry::HeadlessTerminal {
+                terminal_id: id.into(),
+                stream_id: format!("stream-{id}"),
+                mode: "codex".into(),
+                resume_session_id: None,
+                create_request_id: Some("ordinary-create".into()),
+                created_at: None,
+            });
+            assert!(terminals.finish_pty_exit(id, 0));
+        }
+        assert!(
+            !pane_ownership_report(Some(&layouts), Some(&terminals), Some(&ownership), &[])
+                .ready_to_stop,
+            "ambiguous retained generations do not prove which pane exited"
+        );
+        layouts.update_from_ui(
+            &readiness_layout_sync(
+                "tab",
+                "pane",
+                json!({
+                    "kind":"terminal", "mode":"claude", "terminalId":"first", "status":"exited"
+                }),
+            ),
+            "client",
+        );
+        assert!(
+            !pane_ownership_report(Some(&layouts), Some(&terminals), Some(&ownership), &[])
+                .ready_to_stop,
+            "an exited row for a different provider cannot establish absence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_admits_verified_empty_managed_panes_without_changing_identity() {
+        for (provider, session_type) in [("codex", "freshcodex"), ("opencode", "freshopencode")] {
+            for kind in ["terminal", "fresh-launch", "fresh-native"] {
+                let root = tempfile::tempdir().unwrap();
+                let (registry, view) = if kind == "terminal" {
+                    stop_contract_tests::fixture_terminal_soul_with_cleanup(
+                        root.path(),
+                        true,
+                        provider,
+                        "stopped-native-session",
+                        true,
+                    )
+                    .await
+                } else {
+                    stop_contract_tests::fixture_fresh_soul_with_cleanup(
+                        root.path(),
+                        true,
+                        provider,
+                        session_type,
+                        "stopped-native-session",
+                        true,
+                    )
+                    .await
+                };
+                let terminals = TerminalRegistry::new();
+                let content = if kind == "terminal" {
+                    register_readiness_managed_terminal(&terminals, &view);
+                    terminals.publish_managed_lifecycle(
+                        view.terminal_id.as_deref().unwrap(),
+                        Some(freshell_terminal::registry::ManagedLifecycle {
+                            state: freshell_terminal::registry::ManagedLifecycleState::Ended,
+                            recovery_summary: None,
+                        }),
+                    );
+                    json!({"kind":"terminal", "mode":provider, "terminalId":view.terminal_id, "status":"exited"})
+                } else {
+                    json!({"kind":"fresh-agent", "provider":provider, "sessionType":session_type,
+                        "sessionId":if kind == "fresh-launch" {view.fresh_agent_session_id.clone()} else {view.native_session_id.clone()},
+                        "createRequestId":"stopped-fresh-create", "status":"stopped"})
+                };
+                let layouts = LayoutStore::default();
+                layouts.update_from_ui(
+                    &readiness_layout_sync("tab", "pane", content.clone()),
+                    "client",
+                );
+                let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+                // A stopped supervisor view also proves absence after a facade was retired.
+                if kind == "terminal" {
+                    assert!(
+                        pane_ownership_report(
+                            Some(&layouts),
+                            Some(&TerminalRegistry::new()),
+                            Some(&ownership),
+                            std::slice::from_ref(&view)
+                        )
+                        .ready_to_stop
+                    );
+                }
+                let (app, control) = maintenance_router_with_registry(
+                    root.path(),
+                    HostAgentAdmissionGate::new(),
+                    layouts.clone(),
+                    terminals,
+                    ownership,
+                    registry.clone(),
+                )
+                .await;
+
+                assert_maintenance_admits(&app).await;
+
+                assert_eq!(
+                    layouts
+                        .get_pane_snapshot("pane")
+                        .unwrap()
+                        .pane_content
+                        .unwrap(),
+                    content
+                );
+                let after = registry.inventory().await.unwrap();
+                assert_eq!(after.len(), 1);
+                assert_eq!(after[0].soul_id, view.soul_id);
+                assert_eq!(after[0].incarnation_id, view.incarnation_id);
+                assert_eq!(after[0].native_session_id, view.native_session_id);
+                assert_eq!(
+                    after[0].cleanup_state,
+                    freshell_runtime_protocol::CleanupState::VerifiedEmpty
+                );
+                control.abort();
+                let _ = control.await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inactive_census_keeps_missing_uncertain_conflicting_and_transitioning_work_blocking() {
+        use freshell_runtime_protocol::{CleanupState, LaunchState};
+        for terminal in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (_, view) = if terminal {
+                stop_contract_tests::fixture_terminal_soul_with_cleanup(
+                    root.path(),
+                    true,
+                    "codex",
+                    "inactive-native-session",
+                    true,
+                )
+                .await
+            } else {
+                stop_contract_tests::fixture_fresh_soul_with_cleanup(
+                    root.path(),
+                    true,
+                    "codex",
+                    "freshcodex",
+                    "inactive-native-session",
+                    true,
+                )
+                .await
+            };
+            let layouts = LayoutStore::default();
+            layouts.update_from_ui(&readiness_layout_sync("tab", "pane", if terminal {
+                json!({"kind":"terminal", "mode":"codex", "terminalId":view.terminal_id, "status":"exited"})
+            } else {
+                json!({"kind":"fresh-agent", "provider":"codex", "sessionType":"freshcodex", "sessionId":view.native_session_id, "status":"stopped"})
+            }), "client");
+            let terminals = TerminalRegistry::new();
+            let ownership = RuntimeOwnershipRegistry::new();
+            let uncertain_root = tempfile::tempdir().unwrap();
+            let (_, uncertain) = if terminal {
+                stop_contract_tests::fixture_terminal_soul_with_cleanup(
+                    uncertain_root.path(),
+                    true,
+                    "codex",
+                    "inactive-native-session",
+                    false,
+                )
+                .await
+            } else {
+                stop_contract_tests::fixture_fresh_soul_with_cleanup(
+                    uncertain_root.path(),
+                    true,
+                    "codex",
+                    "freshcodex",
+                    "inactive-native-session",
+                    false,
+                )
+                .await
+            };
+            assert_eq!(
+                uncertain.cleanup_state,
+                CleanupState::TerminationUnconfirmed
+            );
+            let mut active = view.clone();
+            active.launch_state = LaunchState::Running;
+            let mut conflicting = view.clone();
+            conflicting.incarnation_id = freshell_runtime_protocol::IncarnationId::new();
+            for views in [
+                vec![],
+                vec![uncertain.clone()],
+                vec![active],
+                vec![view.clone(), conflicting.clone()],
+            ] {
+                assert!(
+                    !pane_ownership_report(
+                        Some(&layouts),
+                        Some(&terminals),
+                        Some(&ownership),
+                        &views
+                    )
+                    .ready_to_stop
+                );
+            }
+            if terminal {
+                register_readiness_managed_terminal(&terminals, &view);
+                assert!(
+                    !pane_ownership_report(
+                        Some(&layouts),
+                        Some(&terminals),
+                        Some(&ownership),
+                        std::slice::from_ref(&view)
+                    )
+                    .ready_to_stop,
+                    "a conflicting running facade must not be ignored"
+                );
+                terminals.publish_managed_lifecycle(
+                    view.terminal_id.as_deref().unwrap(),
+                    Some(freshell_terminal::registry::ManagedLifecycle {
+                        state: freshell_terminal::registry::ManagedLifecycleState::Blocked,
+                        recovery_summary: None,
+                    }),
+                );
+                for views in [vec![], vec![uncertain], vec![conflicting]] {
+                    assert!(
+                        !pane_ownership_report(
+                            Some(&layouts),
+                            Some(&terminals),
+                            Some(&ownership),
+                            &views,
+                        )
+                        .ready_to_stop,
+                        "an exited managed facade alone does not prove cleanup"
+                    );
+                }
+            } else {
+                let _ = ownership.begin_start(
+                    "codex",
+                    "inactive-native-session",
+                    RuntimeOwnerKind::FreshAgent,
+                    "transition",
+                    None,
+                    "census-transition",
+                    1,
+                );
+                assert!(
+                    !pane_ownership_report(
+                        Some(&layouts),
+                        Some(&terminals),
+                        Some(&ownership),
+                        &[view]
+                    )
+                    .ready_to_stop
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn runtime_readiness_rejects_missing_and_wrong_authentication() {
         use axum::{body::Body, http::Request};
@@ -2782,6 +3451,30 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_readiness_reports_exact_disabled_runtime_response() {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(4);
+        let state = ManagedRuntimeApiState::new(
+            Arc::new("readiness-secret".into()),
+            None,
+            None,
+            Arc::new(PaneLedger::new(None)),
+            Arc::new(broadcast_tx),
+        )
+        .await
+        .unwrap();
+        let (status, body) = maintenance_request(
+            &router(state),
+            "GET",
+            "/api/runtime/readiness",
+            Some("readiness-secret"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, json!({"error":"Managed runtime unavailable"}));
     }
 
     #[cfg(unix)]
@@ -2982,6 +3675,7 @@ mod tests {
             terminal_id: None,
             session_id: view.fresh_agent_session_id.clone(),
             session_type: Some("freshopencode".into()),
+            create_request_id: None,
             identity_consistent: true,
             ownership: PaneOwnership::Unknown,
             soul_id: None,
@@ -3022,6 +3716,7 @@ mod tests {
             terminal_id: None,
             session_id: view.native_session_id.clone(),
             session_type: Some("freshcodex".into()),
+            create_request_id: None,
             identity_consistent: true,
             ownership: PaneOwnership::Unknown,
             soul_id: None,
@@ -3070,6 +3765,7 @@ mod tests {
             terminal_id: Some("managed-terminal".into()),
             session_id: None,
             session_type: None,
+            create_request_id: None,
             identity_consistent: true,
             ownership: PaneOwnership::Unknown,
             soul_id: None,
@@ -3109,10 +3805,13 @@ mod tests {
         durable_pane.ownership = positive.ownership;
         durable_pane.soul_id = positive.soul_id.clone();
         durable_pane.incarnation_id = positive.incarnation_id.clone();
-        assert!(
-            unattached_processes(&[durable_pane], std::slice::from_ref(&terminal), None,)
-                .is_empty()
-        );
+        assert!(unattached_processes(
+            &[durable_pane],
+            std::slice::from_ref(&terminal),
+            std::slice::from_ref(&view),
+            None
+        )
+        .is_empty());
 
         let mut second_view = pane.clone();
         second_view.client_id = "second-client".into();
@@ -3128,6 +3827,7 @@ mod tests {
             unattached_processes(
                 &[first_view.clone(), second_view],
                 std::slice::from_ref(&terminal),
+                std::slice::from_ref(&view),
                 None,
             )
             .is_empty(),
@@ -3137,7 +3837,12 @@ mod tests {
         let mut wrong_incarnation = terminal.clone();
         wrong_incarnation.incarnation_id =
             Some(freshell_runtime_protocol::IncarnationId::new().to_string());
-        let mismatch = classify_agent_pane(&pane, &[view], &[wrong_incarnation.clone()], None);
+        let mismatch = classify_agent_pane(
+            &pane,
+            std::slice::from_ref(&view),
+            &[wrong_incarnation.clone()],
+            None,
+        );
         assert_eq!(mismatch.ownership, PaneOwnership::Unknown);
         assert!(mismatch.soul_id.is_none());
         let mut unknown_pane = pane.clone();
@@ -3148,13 +3853,18 @@ mod tests {
         let unknown_processes = unattached_processes(
             &[first_view, conflicting_view],
             std::slice::from_ref(&terminal),
+            std::slice::from_ref(&view),
             None,
         );
         assert_eq!(unknown_processes.len(), 1);
         assert_eq!(unknown_processes[0].ownership, PaneOwnership::Unknown);
 
-        let duplicate_inventory =
-            unattached_processes(&[unknown_pane], &[terminal, wrong_incarnation], None);
+        let duplicate_inventory = unattached_processes(
+            &[unknown_pane],
+            &[terminal, wrong_incarnation],
+            &[view],
+            None,
+        );
         assert!(!duplicate_inventory.is_empty());
         assert!(duplicate_inventory
             .iter()

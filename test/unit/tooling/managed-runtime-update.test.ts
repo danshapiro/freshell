@@ -783,7 +783,11 @@ esac
     ...dependencies().deps.paths,
     checkoutRoot: process.cwd(),
     systemctl: systemctlPath,
-  }, undefined, { supervisorReadinessTimeoutMs: 60, supervisorReadinessPollIntervalMs: 1 })
+  }, undefined, {
+    supervisorReadinessTimeoutMs: 1_000,
+    // Observe the mismatch with a full budget, then expire without polling a subprocess at the deadline.
+    supervisorReadinessPollIntervalMs: 1_000,
+  })
   const selected = {
     ...owner,
     checkoutRoot: process.cwd(),
@@ -1310,8 +1314,10 @@ it('reopen uses the stopped revision returned by the fenced Stop', async () => {
 
 it.each([
   ['Requires', 'web', 'supervisor'],
+  ['Requires', 'supervisor', 'web'],
   ['Wants', 'web', 'supervisor'],
   ['Requisite', 'web', 'supervisor'],
+  ['Requisite', 'supervisor', 'web'],
   ['PartOf', 'supervisor', 'web'],
   ['BindsTo', 'web', 'supervisor'],
   ['BindsTo', 'supervisor', 'web'],
@@ -1366,6 +1372,50 @@ it('transitive activation and stop relationships that reach the supervisor block
 
   expect(webActionCanReachSupervisor(activationGraph, web, supervisor)).toBe(true)
   expect(webActionCanReachSupervisor(stopPropagationGraph, web, supervisor)).toBe(true)
+})
+
+it.each(['Requires', 'Requisite'] as const)('transitive reverse %s stop propagation reaches the supervisor', (property) => {
+  const web = 'freshell-rust.service'
+  const supervisor = 'freshell-supervisor.service'
+  const graph: SystemdUnitGraph = {
+    units: {
+      [web]: {},
+      'intermediate.service': { [property]: [web] },
+      [supervisor]: { [property]: ['intermediate.service'] },
+    },
+  }
+
+  expect(webActionCanReachSupervisor(graph, web, supervisor)).toBe(true)
+})
+
+it.each([
+  ['Requires', false],
+  ['Requires', true],
+  ['Requisite', false],
+  ['Requisite', true],
+] as const)('client mode refuses reverse %s stop propagation (transitive: %s) before any service action', async (property, transitive) => {
+  const f = dependencies()
+  const units: SystemdUnitGraph['units'] = {
+    [owner.webUnit]: {},
+    [owner.supervisorUnit]: { [property]: [transitive ? 'intermediate.service' : owner.webUnit] },
+  }
+  if (transitive) units['intermediate.service'] = { [property]: [owner.webUnit] }
+  f.deps.owner.inspectGraph = vi.fn(async () => ({ units }))
+
+  const result = await runManagedRuntimeWorker('client', f.deps)
+
+  expect(result).toBe(2)
+  expect(f.deps.artifacts.build).not.toHaveBeenCalled()
+  expect(f.deps.filesystem.installExecutable).not.toHaveBeenCalled()
+  expect(f.deps.filesystem.swapClientDirectory).not.toHaveBeenCalled()
+  expect(f.deps.services.stop).not.toHaveBeenCalled()
+  expect(f.deps.services.start).not.toHaveBeenCalled()
+  expect(f.deps.services.restart).not.toHaveBeenCalled()
+  expect(f.deps.admin.stop).not.toHaveBeenCalled()
+  expect(f.runtimeApi.calls).toEqual([])
+  expect(f.events).toContainEqual(expect.objectContaining({
+    event: 'update.systemd_graph_refused', phase: 'graph', error_code: 'web_action_reaches_supervisor',
+  }))
 })
 
 it('all mode stops ingress, fences the coding-soul reset, then installs and reopens', async () => {

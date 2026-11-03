@@ -1383,8 +1383,10 @@ export function webActionCanReachSupervisor(graph: SystemdUnitGraph, webUnit: st
     for (const property of ['Requires', 'Wants', 'Requisite', 'BindsTo', 'Upholds'] as const) {
       for (const target of properties[property] ?? []) add(startEdges, unit, target)
     }
-    for (const target of properties.PartOf ?? []) add(stopEdges, target, unit)
-    for (const target of properties.BindsTo ?? []) add(stopEdges, target, unit)
+    // Explicit stops propagate back to requiring units, even without After= ordering.
+    for (const property of ['Requires', 'Requisite', 'PartOf', 'BindsTo'] as const) {
+      for (const target of properties[property] ?? []) add(stopEdges, target, unit)
+    }
     for (const target of properties.PropagatesStopTo ?? []) add(stopEdges, unit, target)
     for (const target of properties.ConsistsOf ?? []) add(stopEdges, unit, target)
     for (const target of properties.BoundBy ?? []) add(stopEdges, unit, target)

@@ -98,14 +98,14 @@ scripts/launch-rust.sh                 # build client + Rust server, start on po
 scripts/launch-rust.sh --port 3499     # any other port (e.g. testing from a worktree)
 scripts/launch-rust.sh --client-only   # rebuild dist/client ONLY (no restart needed)
 scripts/launch-rust.sh --skip-build    # start without rebuilding
-scripts/launch-rust.sh --restart       # non-managed instances only; production requires APPROVED
-scripts/launch-rust.sh --stop          # non-managed instances only; production requires APPROVED
+scripts/launch-rust.sh --restart       # non-managed instances only
+scripts/launch-rust.sh --stop          # non-managed instances only
 ```
 
 Key facts:
 
-- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart** (and therefore without needing "APPROVED"). Server-side (Rust) changes DO require a restart.
-- `--client-only` web updates do not restart the server and need no `APPROVED` gate. Stopping or restarting a non-managed production server requires the user's exact word `APPROVED`. Managed live `--stop`/`--restart` are refused; managed-runtime updates use the systemd-only updater modes documented above, and reset-capable modes ask for `APPROVED` based on the selected mode.
+- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart**. Server-side (Rust) changes DO require a restart.
+- Managed live `--stop`/`--restart` are refused; managed-runtime updates use the systemd-only updater modes documented above, and reset-capable modes ask for `APPROVED` based on the selected mode.
 - The script is safe by construction: it only ever kills PIDs from its own pid file, after verifying the process is this repo's `freshell-server` binary (cwd + args match); if the port is held by anything else it refuses. Logs go to `~/.freshell/logs/rust-server-<port>.log`, pid to `~/.freshell/rust-server-<port>.pid`.
 - The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
 - The startup log line self-identifies the binary that produced it: `[<ISO-8601 UTC timestamp>] freshell-server listening on http://0.0.0.0:<port> (ws://0.0.0.0:<port>/ws) [pid <pid>] [commit <sha>] [dirty <true|false|unknown>]`. Use it (or `~/.freshell/logs/rust-server-3001.log`) to check what the running server was built from when asking "are we running change X?".
