@@ -429,6 +429,20 @@ export class TestHarness {
     })
   }
 
+  /**
+   * The received-frame ring with each frame's page-clock __receivedAt stamp
+   * (delta fix focused review, findings 3+4) — the discriminator
+   * restart-scoped witnesses correlate by, instead of a boot-agnostic
+   * whole-ring type match.
+   */
+  async getReceivedWsMessagesWithTimestamps(): Promise<Array<{ __receivedAt?: number; type?: string }>> {
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getReceivedWsMessagesWithTimestamps?.() ?? []
+    })
+  }
+
   async clearSentWsMessages(): Promise<void> {
     await this.page.evaluate(() => {
       const harness = window.__FRESHELL_TEST_HARNESS__

@@ -93,6 +93,15 @@ export interface FreshellTestHarness {
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
   getReceivedWsMessages?: () => unknown[]
+  /**
+   * The received-frame ring with its page-clock stamps (delta fix focused
+   * review, findings 3+4): mirrors getSentWsMessagesWithTimestamps — every
+   * retained frame carries __receivedAt (Date.now() at receipt), letting
+   * e2e witnesses scope their search by TIME (e.g. only frames received
+   * after a restart's ready handshake, whose connection.lastReadyAt uses
+   * the same page clock) instead of a boot-agnostic whole-ring type match.
+   */
+  getReceivedWsMessagesWithTimestamps?: () => Array<{ __receivedAt?: number; type?: string }>
   clearReceivedWsMessages?: () => void
   recordReceivedWsMessage?: (msg: unknown) => void
   recordTerminalWrite?: (event: TerminalWriteEvent) => void
@@ -256,6 +265,7 @@ export function installTestHarness(
       const { __receivedAt, ...rest } = msg as { __receivedAt?: number }
       return rest
     }),
+    getReceivedWsMessagesWithTimestamps: () => [...receivedWsMessages] as Array<{ __receivedAt?: number; type?: string }>,
     clearReceivedWsMessages: () => {
       receivedWsMessages.length = 0
     },

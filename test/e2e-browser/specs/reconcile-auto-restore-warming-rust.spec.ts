@@ -202,28 +202,59 @@ async function witnessedWarmingVerdict(
 }
 
 /**
- * The readiness-broadcast witness: the server's once-per-boot
- * sessions.index.ready frame reached this client (the real client
- * negotiated sessionIndexReadyV1, so the frame is capability-gated IN, not
- * synthesized).
+ * The POST-RESTART readiness-broadcast witness (delta fix focused review,
+ * finding 4): the received-WS ring retains frames across boots, so a bare
+ * type match can be satisfied by the FIRST boot's sessions.index.ready —
+ * vacuous for the restart. The floor is the post-restart ready handshake's
+ * own page-clock stamp (connection.lastReadyAt — the same clock the
+ * ring's __receivedAt stamps use), so only a frame received after the
+ * restart's reconnection qualifies: the first boot's broadcast was
+ * received before the restart, strictly before the floor. Returns the
+ * newest qualifying frame's __receivedAt — the marker the re-drive
+ * witness below correlates against — or null when none has arrived.
  */
-async function witnessedReadinessBroadcast(harness: TestHarness): Promise<boolean> {
-  const received = await harness.getReceivedWsMessages()
-  return received.some((m: any) => m?.type === 'sessions.index.ready')
+async function postRestartReadinessBroadcastAt(
+  harness: TestHarness,
+  notBeforeMs: number,
+): Promise<number | null> {
+  const received = await harness.getReceivedWsMessagesWithTimestamps()
+  let newest: number | null = null
+  for (const m of received as Array<{ type?: string; __receivedAt?: number }>) {
+    if (m?.type !== 'sessions.index.ready') continue
+    const at = m.__receivedAt
+    if (typeof at !== 'number' || at < notBeforeMs) continue
+    if (newest === null || at > newest) newest = at
+  }
+  return newest
 }
 
-/** Count of pane.reconcile.requests THIS client sent naming the pane's key. */
+/**
+ * Count of pane.reconcile.requests THIS client sent naming the pane's key —
+ * optionally only those SENT AT OR AFTER sinceMs (the sent ring stamps
+ * every frame with __sentAt, page-clock). The re-drive witness correlates
+ * BY TIME, not by a raw count delta (delta fix focused review, finding
+ * 3): readiness may land during any earlier wait and fold the re-drive
+ * into a count baseline sampled too late, but a request naming the pane's
+ * key sent at/after the readiness frame was received is deterministically
+ * the DRIVER's re-drive — the boot reconcile was answered
+ * error{index_warming}, which proves it was sent while the index was
+ * still cold (hence before the readiness broadcast), and nothing else
+ * sends one in this zero-interaction flow.
+ */
 async function sentReconcileRequestCount(
   harness: TestHarness,
   tabId: string,
   paneId: string,
+  sinceMs = 0,
 ): Promise<number> {
-  const sent = await harness.getSentWsMessages()
+  const sent = (await harness.getSentWsMessagesWithTimestamps()) as Array<any>
   const key = paneKeyOf(tabId, paneId)
   return sent.filter((m: any) =>
     m?.type === 'pane.reconcile.request'
     && Array.isArray(m?.panes)
-    && m.panes.some((p: any) => p?.paneKey === key),
+    && m.panes.some((p: any) => p?.paneKey === key)
+    && typeof m.__sentAt === 'number'
+    && m.__sentAt >= sinceMs,
   ).length
 }
 
@@ -588,6 +619,10 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       const leavesBefore = await allTerminalLeaves(harness)
       const tabCountBefore = await harness.getTabCount()
       const argvCountBeforeRestart = (await readArgvLog(argLogPath)).length
+      // The pre-restart ready handshake's page-clock stamp: the floor the
+      // post-restart capture below must move past (a same-clock proof the
+      // restart really reconnected this client).
+      const lastReadyAtBeforeRestart = await harness.getLastReadyAt()
 
       // 3. Graceful restart (the ONE this test uses); the live client's WS
       //    reconnects inside the cold window and reconciles on the new
@@ -598,6 +633,15 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       //    durably: no self-recovery lane exists for an exited pane.
       await server.restart()
       await waitForWsReady(page)
+      // The POST-restart ready handshake's own page-clock stamp is the
+      // floor that makes every restart-scoped received-frame witness
+      // boot-agnostic (delta fix focused review, finding 4): the first
+      // boot's readiness broadcast was received before the restart, hence
+      // strictly before this stamp, so it can never satisfy a
+      // floor-scoped witness.
+      await harness.waitForConnectionAfter(lastReadyAtBeforeRestart)
+      const postRestartReadyAt = (await harness.getLastReadyAt())!
+      expect(postRestartReadyAt).not.toBe(lastReadyAtBeforeRestart)
 
       // 4. The park is witnessed BOTH ways — the server's warming verdict
       //    (durable in the received-WS ring) and the client's VISIBLE
@@ -609,6 +653,12 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         })
         .toBe(true)
       await expect(warmingBanner(page)).toBeVisible({ timeout: 20_000 })
+      // The boot reconcile that parked the pane is on the sent ring (its
+      // error{index_warming} answer is the verdict witnessed above) — the
+      // pre-readiness baseline the re-drive witness below must move past.
+      expect(
+        await sentReconcileRequestCount(harness, codexPane.tabId, codexPane.leafId),
+      ).toBeGreaterThanOrEqual(1)
 
       // 5. The shell pane needs no index — it is live again with a NEW
       //    terminalId (the fresh verdict's respawn).
@@ -667,25 +717,39 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       })
       expect(parkedContent?.restoreError).toBeFalsy()
 
-      // 7. READINESS: the once-per-boot broadcast reaches this client (the
-      //    real SPA negotiated sessionIndexReadyV1), the flag folds, and
-      //    the DRIVER re-drives the reconcile for the parked pane — a NEW
-      //    pane.reconcile.request naming the pane's key, beyond the boot
-      //    reconcile's own.
-      const requestCountBeforeReadiness = await sentReconcileRequestCount(
-        harness,
-        codexPane.tabId,
-        codexPane.leafId,
-      )
-      expect(requestCountBeforeReadiness).toBeGreaterThanOrEqual(1)
+      // 7. READINESS: the once-per-boot broadcast reaches this client AFTER
+      //    the restart (the real SPA negotiated sessionIndexReadyV1, so the
+      //    frame is capability-gated IN; the witness floors at the
+      //    post-restart ready handshake's page-clock stamp, so the FIRST
+      //    boot's broadcast can never satisfy it — delta fix focused
+      //    review, finding 4), the flag folds, and the DRIVER re-drives the
+      //    reconcile for the parked pane — a NEW pane.reconcile.request
+      //    naming the pane's key. The re-drive witness correlates BY TIME,
+      //    not by a raw count delta (delta fix focused review, finding 3):
+      //    readiness may land during any earlier wait and fold the
+      //    re-drive into a count baseline sampled too late, but a request
+      //    naming the pane's key SENT AT OR AFTER the readiness frame was
+      //    received is deterministically the driver's — the boot reconcile
+      //    was answered error{index_warming}, proving it was sent while the
+      //    index was cold (before the readiness broadcast), and nothing
+      //    else sends one in this zero-interaction flow.
       await waitForSessionIndexReady(harness)
-      expect(await witnessedReadinessBroadcast(harness)).toBe(true)
+      const readinessReceivedAt = await postRestartReadinessBroadcastAt(harness, postRestartReadyAt)
+      expect(
+        readinessReceivedAt,
+        'the post-restart readiness broadcast reached this client',
+      ).not.toBeNull()
       await expect
         .poll(
-          async () => sentReconcileRequestCount(harness, codexPane.tabId, codexPane.leafId),
+          async () => sentReconcileRequestCount(
+            harness,
+            codexPane.tabId,
+            codexPane.leafId,
+            readinessReceivedAt!,
+          ),
           { timeout: 30_000 },
         )
-        .toBeGreaterThan(requestCountBeforeReadiness)
+        .toBeGreaterThan(0)
 
       // 8. The re-drive's OWN result resolves the pane: a non-warming
       //    verdict (attach onto the live resumed terminal) folds, and the
@@ -968,12 +1032,22 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       await flushPersistence(page)
       const leavesBefore = await allTerminalLeaves(harness)
       const tabCountBefore = await harness.getTabCount()
+      // The pre-restart ready handshake's page-clock stamp (the floor the
+      // post-restart capture below must move past).
+      const lastReadyAtBeforeRestart = await harness.getLastReadyAt()
 
       // 4. Graceful restart; the exited pane PARKS during the hold (the
       //    received warming verdict + the VISIBLE banner witness it — the
       //    park is durable for an exited pane).
       await server.restart()
       await waitForWsReady(page)
+      // The post-restart ready handshake's own page-clock stamp: the floor
+      // that makes the readiness-broadcast witness below boot-agnostic
+      // (delta fix focused review, finding 4) — the first boot's broadcast
+      // was received before the restart, strictly before this stamp.
+      await harness.waitForConnectionAfter(lastReadyAtBeforeRestart)
+      const postRestartReadyAt = (await harness.getLastReadyAt())!
+      expect(postRestartReadyAt).not.toBe(lastReadyAtBeforeRestart)
       await expect
         .poll(async () => witnessedWarmingVerdict(harness, tabId, opencodeLeaf.id), {
           timeout: 30_000,
@@ -993,14 +1067,20 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
         }, { timeout: 30_000 })
         .toBe('exited')
 
-      // 6. READINESS: the broadcast reaches the client, the flag folds,
-      //    and the DRIVER re-drives the reconcile for the parked pane —
+      // 6. READINESS: the broadcast reaches the client AFTER the restart
+      //    (the witness floors at the post-restart ready handshake's
+      //    page-clock stamp — the first boot's broadcast can never satisfy
+      //    it, delta fix focused review finding 4), the flag folds, and
+      //    the DRIVER re-drives the reconcile for the parked pane —
       //    which now derives the HONEST error{session_store_unreadable}
       //    (the index published; the by-id locator cannot read the
       //    directory store). NEVER a lying warming banner over a dead
       //    pane, and never a false death (no dead_session/fresh).
       await waitForSessionIndexReady(harness, 90_000)
-      expect(await witnessedReadinessBroadcast(harness)).toBe(true)
+      expect(
+        await postRestartReadinessBroadcastAt(harness, postRestartReadyAt),
+        'the post-restart readiness broadcast reached this client',
+      ).not.toBeNull()
       await expect
         .poll(async () => witnessedUnreadableVerdict(harness, tabId, opencodeLeaf.id), {
           timeout: 60_000,
@@ -1010,10 +1090,7 @@ test.describe('reconcile auto-restore warming (rust server, zero interaction)', 
       // 7. The honest error FOLDS: a per-pane restoreError with the exact
       //    reason, the identity PRESERVED verbatim, and the VISIBLE
       //    in-buffer explanation line (finding 1's notice machinery) on
-      //    the pane's own surface — no user interaction anywhere. The
-      //    witness is the pane's rendered DOM text: the line is written
-      //    into the pane's xterm buffer, so it is what the user sees
-      //    (row-wrapping is irrelevant to textContent concatenation).
+      //    the pane's own surface — no user interaction anywhere.
       await expect
         .poll(async () => {
           const l = await findLeafById(harness, tabId, opencodeLeaf.id)
