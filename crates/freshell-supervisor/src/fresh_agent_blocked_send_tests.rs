@@ -63,16 +63,16 @@ async fn new_blocked_send_is_refused_with_the_available_recovery_reason() {
             "{message}"
         );
         let database = rusqlite::Connection::open(registry.database_path()).unwrap();
-        let count: i64 = database
+        let state: String = database
             .query_row(
-                "SELECT COUNT(*) FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
                 rusqlite::params![soul.as_str(), request.as_str()],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            count, 0,
-            "the refused input was never admitted to the journal"
+            state, "refused",
+            "the refused input must be journaled without becoming queued"
         );
     }
 }

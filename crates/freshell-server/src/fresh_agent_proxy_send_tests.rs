@@ -292,6 +292,59 @@ async fn hosted_blocked_send_distinguishes_new_from_queued_input() {
             fixture.sent_roots.lock().unwrap().is_empty(),
             "a blocked send must not reach the host"
         );
+        if !queued {
+            let context = fixture
+                .registry
+                .recovery_context(fixture.soul.clone())
+                .await
+                .unwrap();
+            fixture
+                .registry
+                .mark_recovery_live(
+                    fixture.soul.clone(),
+                    fixture.launch.incarnation_id.clone(),
+                    context.write_fence(),
+                )
+                .await
+                .unwrap();
+            proxy.dispatch_send(serde_json::from_value(serde_json::json!({
+                "provider":"claude", "sessionId":"owned-public-parent", "sessionType":"freshclaude",
+                "requestId":request.as_str(), "text":"one original browser input"
+            })).unwrap()).await;
+            assert!(
+                fixture.sent_roots.lock().unwrap().is_empty(),
+                "a refused request must not be dispatched after recovery"
+            );
+            let replay: serde_json::Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(replay["type"], "error", "{replay}");
+            assert_eq!(replay["requestId"], request.as_str());
+            assert_eq!(replay["message"], frame["message"]);
+            proxy.dispatch_send(serde_json::from_value(serde_json::json!({
+                "provider":"claude", "sessionId":"owned-public-parent", "sessionType":"freshclaude",
+                "requestId":request.as_str(), "text":"a different browser input"
+            })).unwrap()).await;
+            let conflict: serde_json::Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                conflict["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("request ID was already used"),
+                "{conflict}"
+            );
+            assert!(fixture.sent_roots.lock().unwrap().is_empty());
+        }
         let database =
             rusqlite::Connection::open(fixture.root.path().join("registry/runtime.sqlite3"))
                 .unwrap();
@@ -303,7 +356,10 @@ async fn hosted_blocked_send_distinguishes_new_from_queued_input() {
             )
             .optional()
             .unwrap();
-        assert_eq!(state.as_deref(), if queued { Some("queued") } else { None });
+        assert_eq!(
+            state.as_deref(),
+            Some(if queued { "queued" } else { "refused" })
+        );
     }
 }
 
