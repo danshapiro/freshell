@@ -212,7 +212,7 @@ test.describe('Fresh Agent Mobile', () => {
     await expect(meter).toBeVisible()
     await expect(meter).toHaveAttribute('aria-valuenow', '47')
 
-    // Only the model name shortens at ≤520px; the explicitly seeded effort remains.
+    // The model chip shortens at ≤520px while the explicitly seeded effort remains visible.
     await expect(paneRoot.getByText('Claude Opus 5 high', { exact: true })).toBeVisible()
     await expect(paneRoot.getByText('Claude Opus 5 (1M context) high', { exact: true })).toBeHidden()
 

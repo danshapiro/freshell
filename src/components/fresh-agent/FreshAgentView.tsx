@@ -5019,6 +5019,9 @@ export function FreshAgentView({
     if (!isActivePane) return
     const frame = requestAnimationFrame(() => {
       const active = document.activeElement
+      const drawer = active instanceof Element ? active.closest('.fresh-agent-diff-drawer-overlay') : null
+      if (drawer?.getAttribute('data-tab-id') === tabId
+        && drawer.getAttribute('data-pane-id') === paneId) return
       if (active instanceof HTMLElement
         && paneRootRef.current?.contains(active)
         && isEditableTarget(active)) return
@@ -5030,7 +5033,7 @@ export function FreshAgentView({
       composerRef.current?.focus()
     })
     return () => cancelAnimationFrame(frame)
-  }, [isActivePane, composerDisabled, mayFocusNow])
+  }, [isActivePane, composerDisabled, mayFocusNow, tabId, paneId])
 
   // Fallback poll while the agent is (or claims to be) working: if a
   // transport event is missed, the pane self-heals within a few seconds
@@ -5440,15 +5443,16 @@ export function FreshAgentView({
     const routineNotices = [
       ...(isRestoring ? [{ id: 'restoring', text: 'Restoring session...' }] : []),
       ...(paneContent.reconcileNotice ? [{ id: 'reconciliation', text: paneContent.reconcileNotice, prominent: true }] : []),
-      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text, prominent: notice.prominent, onToggle: setNoticeExpanded }] : []),
+      ...(notice?.level === 'info' ? [{ id: 'notice', text: notice.text, prominent: notice.prominent }] : []),
       ...(ownerDivergence?.fencedReason === undefined && ownerDivergence?.ownerKind !== 'terminal' && ownerDivergence?.inProgress ? [{ id: 'transition', text: 'This conversation is being reopened elsewhere…', prominent: true }] : []),
     ]
     const verboseNotice = notice && isVerboseDiagnostic(notice.text)
-    const noticeSummary = verboseNotice
-      ? `${summarizeDiagnostic(notice.text)}${notice.text === deliveryNoticeRef.current?.text ? ' Check the conversation before sending again.' : ''}`
-      : notice?.text
+    const uncertainDelivery = Boolean(notice && notice.text === deliveryNoticeRef.current?.text)
+    const noticeSummary = uncertainDelivery
+      ? 'Check the conversation before sending again. Delivery is uncertain.'
+      : verboseNotice ? summarizeDiagnostic(notice.text) : notice?.text
     const visibleErrors: FreshAgentError[] = [
-      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
+      ...(notice && notice.level !== 'info' && notice.text !== unattributedCodexError ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice || uncertainDelivery ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
     { id: 'codex-pending', level: 'warning' as const, summary: errorSummary('Codex reported an error', pendingCodexError?.message), content: (pendingCodexError ? (
                 <FreshAgentApprovalBanner text={`Codex reported an error: ${pendingCodexError.message}`} />
               ) : null) },
@@ -5671,7 +5675,7 @@ export function FreshAgentView({
             <div className="fresh-agent-top-stack" role="group" aria-label="Agent requests and status">
               {requestCount > 0 ? <div className="fresh-agent-request-count" role="status" data-request-count={requestCount} aria-label={`${requestCount} pending ${requestCount === 1 ? 'request' : 'requests'}`}>{requestCount} pending {requestCount === 1 ? 'request' : 'requests'}</div> : null}
               <div className="fresh-agent-top-stack-content">
-              <FreshAgentNoticeStack notices={routineNotices} errors={visibleErrors} />
+              <FreshAgentNoticeStack notices={routineNotices} errors={visibleErrors} onNoticesExpandedChange={notice?.level === 'info' ? setNoticeExpanded : undefined} />
               {requestCount > 0 ? <div className="fresh-agent-top-stack-scroll" role="region" aria-label="Pending requests">
               {pendingApprovals.map((approval) => (
                 <FreshAgentApprovalCard

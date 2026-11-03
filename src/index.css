@@ -1605,12 +1605,30 @@ body {
 .fresh-agent-top-stack-scroll > * + * { margin-top: .25rem; }
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-top-stack-content > .fresh-agent-diff-panel { flex: 0 0 auto; }
 .fresh-agent-top-stack-content > .fresh-agent-diff-panel { padding: 0; }
-.fresh-agent-errors { display: flex; align-items: start; gap: .375rem; min-height: 0; overflow: auto; flex: 0 1 auto; }
+.fresh-agent-errors { display: flex; align-items: start; gap: .375rem; min-height: 0; min-width: 0; overflow: auto; flex: 0 1 auto; }
 .fresh-agent-diagnostic-count { flex: 0 0 auto; line-height: 1.2; }
-.fresh-agent-error-summaries { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; }
+.fresh-agent-error-summaries {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: start;
+  column-gap: .5rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.fresh-agent-error-summaries > details { min-width: 0; max-width: 100%; }
 .fresh-agent-errors:has(details[open]) { display: block; }
+.fresh-agent-errors:has(details[open]) .fresh-agent-error-summaries { display: block; }
+.fresh-agent-notices { min-width: 0; max-width: 100%; }
+.fresh-agent-notices details:not([open]) > summary {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors summary { font-size: .75rem; }
-.fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; }
+.fresh-agent-top-stack summary { cursor: pointer; overflow-wrap: anywhere; white-space: normal; }
 .fresh-agent-top-stack summary:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
 .fresh-agent-diagnostic-body, .fresh-agent-approval-preview, .fresh-agent-plan-body {
   max-height: 10rem;
@@ -1631,8 +1649,8 @@ body {
 @container (max-height: 479px) or (min-width: 900px) {
   .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) {
     display: grid;
-    grid-template-columns: auto repeat(3, minmax(0, 1fr));
-    grid-template-rows: 20px minmax(44px, 1fr);
+    grid-template-columns: auto minmax(0, 1fr) fit-content(55%) auto;
+    grid-template-rows: minmax(0, max-content) minmax(44px, 1fr);
     gap: 2px 6px;
     padding: 2px 6px;
   }
@@ -1644,8 +1662,7 @@ body {
   .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
-  .fresh-agent-top-stack .fresh-agent-notices summary,
-  .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
+  .fresh-agent-top-stack .fresh-agent-notices summary { white-space: nowrap; }
   /* Text can extend above the compact line box; keep it inside the scroller. */
   .fresh-agent-top-stack .fresh-agent-error-summaries { padding-top: 2px; }
   .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) {
@@ -1655,16 +1672,35 @@ body {
 
 @container (max-height: 479px) and (max-width: 899px) {
   /* Share the remaining space between metadata and requests after reserving
-     the composer and a 64px transcript viewport. */
+     the composer and a transcript viewport. */
   .fresh-agent-layout {
     --fresh-agent-short-pane-reserve: 242px;
     --fresh-agent-short-panel-budget: max(0px, calc(100cqh - var(--fresh-agent-short-pane-reserve)));
-    --fresh-agent-short-sidebar-budget: min(10cqh, calc(var(--fresh-agent-short-panel-budget) * .125));
+    --fresh-agent-short-sidebar-budget: min(10cqh, calc(var(--fresh-agent-short-panel-budget) * .2));
   }
   .fresh-agent-pane .fresh-agent-top-stack { max-height: min(35cqh, var(--fresh-agent-short-panel-budget)); }
-  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) { grid-template-rows: 18px minmax(44px, 1fr); }
   .fresh-agent-sidebar { padding-block: 0; max-height: var(--fresh-agent-short-sidebar-budget); }
   .fresh-agent-layout--with-sidebar .fresh-agent-top-stack { max-height: min(25cqh, max(0px, calc(var(--fresh-agent-short-panel-budget) - var(--fresh-agent-short-sidebar-budget)))); }
+  .fresh-agent-sidebar-content { gap: 0 .5rem; }
+  .fresh-agent-sidebar-section {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: .375rem;
+    border: 0;
+    padding: 0;
+    min-width: 0;
+  }
+  .fresh-agent-sidebar-title { margin: 0; font-size: .625rem; line-height: 14px; }
+  .fresh-agent-sidebar-section :is(p, li) { margin-block: 0; font-size: .75rem; line-height: 14px; }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) { padding-block: 0; row-gap: 0; }
+  .fresh-agent-top-stack .fresh-agent-request-count,
+  .fresh-agent-top-stack summary,
+  .fresh-agent-top-stack .fresh-agent-diff-trigger { font-size: .625rem; line-height: 12px; }
+}
+
+@container (max-height: 359px) and (max-width: 899px) {
+  .fresh-agent-pane .fresh-agent-transcript-scroll { padding-block: 2px; }
 }
 
 @media (width < 640px) {
@@ -1673,7 +1709,6 @@ body {
       /* Mobile input and action rows each add 4px. Keep the 68px request
          grid intact when metadata shares the remaining height. */
       --fresh-agent-short-pane-reserve: 250px;
-      --fresh-agent-short-sidebar-budget: min(10cqh, calc(var(--fresh-agent-short-panel-budget) * .125), max(0px, calc(var(--fresh-agent-short-panel-budget) - 68px)));
     }
   }
 }
@@ -1686,7 +1721,7 @@ body {
   .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    grid-template-rows: 20px minmax(20px, 1fr) minmax(44px, 1fr);
+    grid-template-rows: 20px minmax(0, max-content) minmax(44px, 1fr);
     gap: 2px 6px;
     padding: 2px 6px;
   }
@@ -1698,8 +1733,7 @@ body {
   .fresh-agent-top-stack .fresh-agent-diff-trigger { padding: 0 4px; white-space: nowrap; line-height: 1.2; }
   .fresh-agent-top-stack .fresh-agent-request-count,
   .fresh-agent-top-stack summary { line-height: 1.2; }
-  .fresh-agent-top-stack .fresh-agent-notices summary,
-  .fresh-agent-top-stack .fresh-agent-errors summary { white-space: nowrap; }
+  .fresh-agent-top-stack .fresh-agent-notices summary { white-space: nowrap; }
   .fresh-agent-top-stack .fresh-agent-error-summaries { padding-top: 2px; }
   .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) {
     grid-template-columns: minmax(0, .5fr) minmax(0, 2fr) minmax(0, 1fr);
@@ -1713,8 +1747,6 @@ body {
 @container (max-width: 560px) and (max-height: 479px) {
   .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll):has(.fresh-agent-errors) {
     grid-template-columns: max-content minmax(45px, .45fr) minmax(0, 2fr) minmax(70px, .7fr);
-    grid-template-rows: 18px minmax(38px, 1fr);
-    max-height: max(0px, calc(var(--fresh-agent-short-panel-budget) - var(--fresh-agent-short-sidebar-budget) - 6px));
     column-gap: 2px;
     padding-inline: 4px;
   }
@@ -1769,12 +1801,21 @@ body {
 /* Below a 320px bordered pane the request, transcript and composer floors
    cannot fit together. Keep a usable stack, and scroll the existing layout
    to reach the conversation and composer instead of collapsing requests. */
-@container (max-height: 317px) {
+@container (max-height: 239px) {
   .fresh-agent-layout { overflow: auto; }
   .fresh-agent-main { min-height: 320px; flex-shrink: 0; }
-  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-request-count, .fresh-agent-notices, .fresh-agent-errors, .fresh-agent-diff-trigger) {
+}
+
+@container (max-height: 317px) {
+  .fresh-agent-layout:has(.fresh-agent-top-stack-scroll) { overflow: auto; }
+  .fresh-agent-main:has(.fresh-agent-top-stack-scroll) { min-height: 320px; flex-shrink: 0; }
+  .fresh-agent-pane .fresh-agent-top-stack:has(.fresh-agent-top-stack-scroll) {
     min-height: 68px;
     max-height: 78px;
+    flex-shrink: 0;
+  }
+  .fresh-agent-pane .fresh-agent-top-stack:not(:has(.fresh-agent-top-stack-scroll)):has(.fresh-agent-notices, .fresh-agent-errors, .fresh-agent-diff-trigger) {
+    max-height: min(25cqh, 78px);
     flex-shrink: 0;
   }
 }

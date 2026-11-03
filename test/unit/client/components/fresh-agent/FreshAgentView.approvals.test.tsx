@@ -559,13 +559,18 @@ it.each([['info', 'routine body'], ['warning', 'rate limit body'], ['error', 'co
  const store = createStore(CLAUDE)
  await mount(store)
  act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...CLAUDE, event: {type: 'freshAgent.notice', level, code: 'provider-notice', message} }))
- const text = screen.getByText(message)
  if (level === 'info') {
-  expect(text).not.toBeVisible()
-  fireEvent.click(screen.getByText('Notice details'))
-  expect(text).toBeVisible()
-  expect(text.closest('[role="status"]')).not.toBeNull()
+  const status = screen.getByRole('status', { name: 'Agent notices' })
+  const summary = status.querySelector('summary')!
+  const body = status.querySelector('.fresh-agent-diagnostic-body')!
+  expect(summary).toHaveTextContent(message)
+  expect(summary).toBeVisible()
+  expect(body).not.toBeVisible()
+  fireEvent.click(summary)
+  expect(body).toBeVisible()
+  expect(body).toHaveTextContent(message)
  } else {
+  const text = screen.getByText(message)
   expect(text).toBeVisible()
   expect(text.closest('[role="alert"]')).not.toBeNull()
  }
@@ -599,11 +604,14 @@ it('keeps the prevention instruction visible for persistent uncertain delivery w
  const reason = 'Long uncertain delivery explanation '.repeat(30).trim()
  act(()=>{for(const handler of wsMock.handlers) handler({type:'error',code:'INTERNAL_ERROR',requestId:sent.requestId,message:`CODEX_DELIVERY_AMBIGUOUS: ${reason}`})})
  const warning = within(screen.getByRole('region',{name:'Agent errors'})).getByRole('alert',{name:'Agent warning'})
+ const summary = warning.closest('summary')!
  expect(warning).toBeVisible()
- expect(warning).toHaveTextContent('Check the conversation before sending again.')
+ expect(summary).toHaveTextContent(/^Check the conversation before sending again\. Delivery is uncertain\./)
  await advance(7000)
- expect(warning).toBeVisible()
+ expect(summary).toBeVisible()
  expect(composer).toHaveValue('Keep this original')
- fireEvent.click(warning.closest('summary')!)
- expect(screen.getByText(`Delivery uncertain (${sent.requestId}): ${reason}. Check the conversation before sending again.`)).toBeVisible()
+ expect(wsMock.send.mock.calls.filter(([frame])=>frame.type==='freshAgent.send')).toHaveLength(1)
+ fireEvent.click(summary)
+ expect(within(summary.closest('details')!).getByText(`Delivery uncertain (${sent.requestId}): ${reason}. Check the conversation before sending again.`)).toBeVisible()
+ expect(wsMock.send.mock.calls.filter(([frame])=>frame.type==='freshAgent.send')).toHaveLength(1)
 })

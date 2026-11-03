@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { FreshAgentNoticeStack } from '@/components/fresh-agent/FreshAgentNoticeStack'
 afterEach(cleanup)
@@ -72,4 +72,41 @@ it('lets short warnings expand so wrapped instructions are reachable', async () 
  await user.click(alert)
  expect(disclosure).toHaveAttribute('open')
  expect(alert.closest('summary')).toHaveAccessibleName(summary)
+})
+
+it('shows a single routine message in its closed summary', () => {
+ const text = 'Code rewound to the selected checkpoint'
+ render(<FreshAgentNoticeStack notices={[{ id: 'notice', text }]} errors={[]} />)
+ const status = screen.getByRole('status', { name: 'Agent notices' })
+ expect(status.querySelector('summary')).toHaveTextContent(text)
+ expect(status.querySelector('details')).not.toHaveAttribute('open')
+})
+
+it('reports the already-open routine surface when a transient joins, then clears ownership', () => {
+ const onOpen = vi.fn()
+ const restoring = { id: 'restoring', text: 'Restoring session...' }
+ const { rerender } = render(<FreshAgentNoticeStack notices={[restoring]} errors={[]} />)
+ const details = screen.getByRole('status', { name: 'Agent notices' }).querySelector('details')!
+ details.open = true
+ fireEvent(details, new Event('toggle', { bubbles: true }))
+ rerender(<FreshAgentNoticeStack notices={[restoring, { id: 'notice', text: 'Settings saved' }]} errors={[]} onNoticesExpandedChange={onOpen} />)
+ expect(onOpen).toHaveBeenLastCalledWith(true)
+ rerender(<FreshAgentNoticeStack notices={[restoring]} errors={[]} />)
+ expect(onOpen).toHaveBeenLastCalledWith(false)
+})
+
+it('clears a removed diagnostic surface and derives named severity counts after updates', () => {
+ const onOpen = vi.fn()
+ const first = { id: 'notice', summary: 'Provider warning', level: 'warning' as const, content: <p>Original details</p>, onToggle: onOpen }
+ const { rerender } = render(<FreshAgentNoticeStack notices={[]} errors={[first, { id: 'create', summary: 'Agent could not start', content: null }]} />)
+ const count = screen.getByRole('img', { name: '1 error, 1 warning' })
+ expect(count).toHaveTextContent('2')
+ const details = screen.getByRole('alert', { name: 'Agent warning' }).closest('details')!
+ details.open = true
+ fireEvent(details, new Event('toggle', { bubbles: true }))
+ expect(onOpen).toHaveBeenLastCalledWith(true)
+ rerender(<FreshAgentNoticeStack notices={[]} errors={[{ id: 'create', summary: 'Agent could not start', content: null }]} />)
+ expect(onOpen).toHaveBeenLastCalledWith(false)
+ expect(screen.getByRole('img', { name: '1 error' })).toHaveTextContent('1')
+ expect(screen.queryByRole('img', { name: '1 error, 1 warning' })).toBeNull()
 })

@@ -439,12 +439,14 @@ function StoreBackedFreshAgentView({
 }) {
   const paneContent = useAppSelector((state) => {
     const layout = state.panes.layouts[tabId]
-    if (!layout || layout.type !== 'leaf' || layout.id !== paneId || layout.content.kind !== 'fresh-agent') {
+    const content = layout ? findPaneContent(layout, paneId) : null
+    if (!content || content.kind !== 'fresh-agent') {
       throw new Error(`Missing fresh-agent pane ${paneId}`)
     }
-    return layout.content
+    return content
   })
-  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} />
+  const focusEpoch = useAppSelector((state) => state.panes.focusEpochByPaneId?.[paneId] ?? 0)
+  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} focusEpoch={focusEpoch} />
 }
 
 function StoreBackedFreshAgentSettingsButton({
@@ -2116,7 +2118,7 @@ describe('FreshAgentView', () => {
         deliver({ type: 'freshAgent.notice', level: 'warning', code: 'CODEX_PENDING_PROVIDER_ERROR', turnId: 'active-turn', message: diagnostic })
         await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
         expect(document.querySelector('[data-agent-error="codex-pending"] summary')).toHaveTextContent(diagnostic)
-        expect(screen.queryByText(/delivery uncertain/i)).toBeNull()
+        expect(screen.queryByText(/delivery (?:is )?uncertain/i)).toBeNull()
         expect(screen.queryByTestId('fresh-agent-turn-error')).toBeNull()
         expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
         expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
@@ -2391,8 +2393,12 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input'))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
-      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)
-      expect(screen.getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeVisible()
+      const warning = screen.getByRole('alert', { name: 'Agent warning' })
+      const summary = warning.closest('summary')!
+      expect(summary).toHaveTextContent(/^Check the conversation before sending again\. Delivery is uncertain\./)
+      fireEvent.click(summary)
+      expect(within(summary.closest('details')!).getByText(`Delivery uncertain (${first.requestId}): response was lost. Check the conversation before sending again.`)).toBeVisible()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
       expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
@@ -2429,7 +2435,7 @@ describe('FreshAgentView', () => {
       expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
-      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery uncertain'))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain'))
     })
 
     it('keeps the provider diagnostic and delivery warning while its snapshot is delayed', async () => {
@@ -2440,7 +2446,7 @@ describe('FreshAgentView', () => {
       const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: first.requestId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
-      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery uncertain'))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain'))
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
       await act(async () => {})
 
@@ -2458,7 +2464,7 @@ describe('FreshAgentView', () => {
         })
         await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
         expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic)
-        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery uncertain')
+        expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain')
         expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Original uncertain input')
         expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
         expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
@@ -2501,7 +2507,7 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(previousCalls))
       await act(async () => {})
       await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"] summary')).toHaveTextContent(diagnostic))
-      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery uncertain'))
+      await waitFor(() => expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain'))
 
       act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: 'a-different-pane-request', submittedTurnId: 'other-pane-turn' }))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
@@ -2515,7 +2521,7 @@ describe('FreshAgentView', () => {
       } else {
         await waitFor(() => expect(document.querySelector('[data-agent-error="codex-unattributed"]')).toBeNull())
       }
-      expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery uncertain')
+      expect(document.querySelector('[data-agent-error="notice"] summary')).toHaveTextContent('Delivery is uncertain')
       expect(screen.queryByText('The provider warning was cleared.')).toBeNull()
       expect(queue.store.getState().freshAgent.sessions['freshcodex:codex:queue-session'].status).toBe('running')
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
@@ -14847,9 +14853,17 @@ describe('FreshAgentView', () => {
     })
 
     await waitFor(() => expect(composer).toHaveValue(provider === 'codex' ? 'please keep this\nnewer draft' : 'please keep this'))
-    expect(screen.getByText(message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')
-      ? `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`
-      : `Message not sent: ${reason}`)).toBeVisible()
+    if (message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')) {
+      const warning = within(screen.getByRole('region', { name: 'Agent errors' })).getByRole('alert', { name: 'Agent warning' })
+      const summary = warning.closest('summary')!
+      expect(summary).toHaveTextContent(/^Check the conversation before sending again\. Delivery is uncertain\./)
+      fireEvent.click(summary)
+      expect(within(summary.closest('details')!).getByText(
+        `Delivery uncertain (${sendFrame?.requestId}): ${reason}. Check the conversation before sending again.`,
+      )).toBeVisible()
+    } else {
+      expect(screen.getByText(`Message not sent: ${reason}`)).toBeVisible()
+    }
     expect(screen.getByRole('alert', { name: 'Agent warning' })).toBeVisible()
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
   })
@@ -16750,7 +16764,9 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
     })
 
     await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
-    expect(screen.getByText(UNDO_REFILL_NOTICE)).toBeInTheDocument()
+    const refillNotice = screen.getByRole('status', { name: 'Agent notices' })
+    expect(refillNotice.querySelector('summary')).toHaveTextContent(UNDO_REFILL_NOTICE)
+    expect(refillNotice.querySelector('[data-agent-notice="notice"]')).toHaveTextContent(UNDO_REFILL_NOTICE)
     // a11y: the refilled composer regains focus for immediate editing.
     await waitFor(() => expect(document.activeElement).toBe(getComposer()))
   })
@@ -19695,6 +19711,203 @@ describe('diff panel view wiring (ekc6)', () => {
     await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'true'))
     expect(screen.queryByText('Diff unavailable for this file.')).toBeNull()
   })
+
+  const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+  const sessionId = native.threadId
+  const inlineDiff = {
+    id: 'codex-turn:latest',
+    title: 'Turn changes',
+    diff: 'diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new',
+  }
+  const snapshot = FreshAgentSnapshotSchema.parse({
+    ...native,
+    status: 'idle',
+    capabilities: { ...native.capabilities, send: true },
+    diffs: [inlineDiff],
+    extensions: { codex: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+  })
+
+  async function mountDiffView() {
+    const store = createStore()
+    const locator = { sessionId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const currentSnapshot = { value: snapshot }
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => currentSnapshot.value)
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        ...locator,
+        createRequestId: 'req-owned-diff-drawer',
+        status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+
+    const changes = await screen.findByRole('button', { name: /^Diffs:/ })
+    const composer = await screen.findByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    await waitFor(() => expect(composer).toHaveFocus())
+    fireEvent.change(composer, { target: { value: 'Keep this draft during refresh' } })
+    return {
+      store,
+      locator,
+      changes,
+      composer,
+      draft: 'Keep this draft during refresh',
+      setStatus: (status: 'idle' | 'exited') => {
+        currentSnapshot.value = FreshAgentSnapshotSchema.parse({ ...currentSnapshot.value, status })
+        deliverSnapshotStatus(store, locator, status)
+      },
+    }
+  }
+
+  async function openDiffDrawer(changes: HTMLElement) {
+    await userEvent.click(changes)
+    const dialog = await screen.findByRole('dialog', { name: 'Changes' })
+    const fileToggle = within(dialog).getByRole('button', { name: 'Diff: Turn changes' })
+    return { dialog, fileToggle }
+  }
+
+  function deliverSnapshotStatus(
+    store: ReturnType<typeof createStore>,
+    locator: { sessionId: string; sessionType: 'freshcodex'; provider: 'codex' },
+    status: 'idle' | 'exited',
+  ) {
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event',
+        ...locator,
+        event: { type: 'freshAgent.session.snapshot', latestTurnId: null, status },
+      })
+    })
+  }
+
+  async function advanceFocusFrames() {
+    await act(async () => {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    })
+  }
+
+  it.each(['Close', 'file toggle', 'comment'] as const)(
+    'keeps the focused %s control in the owned drawer through retained session snapshots',
+    async (target) => {
+      const { changes, composer, draft, setStatus } = await mountDiffView()
+      const { dialog, fileToggle } = await openDiffDrawer(changes)
+      let control: HTMLElement
+      if (target === 'Close') {
+        control = within(dialog).getByRole('button', { name: 'Close', exact: true })
+      } else if (target === 'file toggle') {
+        control = fileToggle
+      } else {
+        await userEvent.click(fileToggle)
+        control = within(dialog).getAllByRole('button', { name: 'Comment on this line for the agent' }).at(-1)!
+      }
+      control.focus()
+      expect(control).toHaveFocus()
+      expect(composer).toHaveValue(draft)
+
+      for (const status of ['exited', 'idle'] as const) {
+        setStatus(status)
+        if (status === 'exited') expect(composer).toBeDisabled()
+        else expect(composer).toBeEnabled()
+        await advanceFocusFrames()
+        expect(control).toHaveFocus()
+        expect(composer).toHaveValue(draft)
+        expect(screen.getByRole('button', { name: /^Diffs:/ })).toBeInTheDocument()
+        expect(screen.getByRole('dialog', { name: 'Changes' })).toBeVisible()
+      }
+    },
+  )
+
+  it('keeps focus on an owned drawer control after an explicit focus-epoch bump', async () => {
+    const { store, changes, composer, draft } = await mountDiffView()
+    const { dialog } = await openDiffDrawer(changes)
+    const close = within(dialog).getByRole('button', { name: 'Close', exact: true })
+    close.focus()
+
+    act(() => store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1', focusNudge: true })))
+    await advanceFocusFrames()
+
+    expect(close).toHaveFocus()
+    expect(composer).toHaveValue(draft)
+  })
+
+  it('checks drawer ownership when a pending adoption frame runs after Changes opens', async () => {
+    const { changes, composer, draft, setStatus } = await mountDiffView()
+
+    // Exiting schedules a new pane-adoption frame. Open Changes synchronously
+    // before that frame runs, so callback-time ownership is exercised.
+    setStatus('exited')
+    expect(composer).toBeDisabled()
+    fireEvent.click(changes)
+    const dialog = screen.getByRole('dialog', { name: 'Changes' })
+    const close = within(dialog).getByRole('button', { name: 'Close', exact: true })
+    close.focus()
+    await advanceFocusFrames()
+
+    expect(close).toHaveFocus()
+    expect(composer).toHaveValue(draft)
+    setStatus('idle')
+    expect(composer).toBeEnabled()
+    await advanceFocusFrames()
+    expect(close).toHaveFocus()
+    expect(composer).toHaveValue(draft)
+  })
+
+  it('still adopts focus when a different pane owns the open Changes drawer', async () => {
+    const store = createStore()
+    const firstSessionId = 'thread-drawer-owner-one'
+    const secondSessionId = 'thread-drawer-owner-two'
+    const firstLocator = { sessionId: firstSessionId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const secondLocator = { sessionId: secondSessionId, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const contentFor = (locator: typeof firstLocator, createRequestId: string) => ({
+      kind: 'fresh-agent' as const,
+      ...locator,
+      createRequestId,
+      status: 'idle' as const,
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_sessionType, _provider, requestedSessionId) =>
+      FreshAgentSnapshotSchema.parse({
+        ...snapshot,
+        threadId: requestedSessionId,
+        sessionId: requestedSessionId,
+      }))
+    store.dispatch(sessionInit(firstLocator))
+    store.dispatch(sessionInit(secondLocator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: contentFor(firstLocator, 'req-drawer-owner-one') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newPaneId: 'pane-2',
+      newContent: contentFor(secondLocator, 'req-drawer-owner-two'),
+      activate: false,
+    }))
+    render(<Provider store={store}>
+      <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-2" />
+    </Provider>)
+
+    const firstRoot = document.querySelector('[data-context="fresh-agent"][data-pane-id="pane-1"]') as HTMLElement
+    const secondRoot = document.querySelector('[data-context="fresh-agent"][data-pane-id="pane-2"]') as HTMLElement
+    const firstComposer = within(firstRoot).getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(firstComposer).not.toBeDisabled())
+    await waitFor(() => expect(firstComposer).toHaveFocus())
+    await waitFor(() => expect(within(secondRoot).getByRole('button', { name: /^Diffs:/ })).toBeVisible())
+    await userEvent.click(within(secondRoot).getByRole('button', { name: /^Diffs:/ }))
+    const secondDrawer = await screen.findByRole('dialog', { name: 'Changes' })
+    const secondClose = within(secondDrawer).getByRole('button', { name: 'Close', exact: true })
+    expect(secondDrawer.closest('.fresh-agent-diff-drawer-overlay')).toHaveAttribute('data-pane-id', 'pane-2')
+    expect(secondClose).toHaveFocus()
+
+    act(() => store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1', focusNudge: true })))
+    await advanceFocusFrames()
+
+    expect(firstComposer).toHaveFocus()
+    expect(secondClose).not.toHaveFocus()
+  })
 })
 
 describe('task delegation open-session link (freshopencode tui parity)', () => {
@@ -19982,7 +20195,12 @@ describe('task6 hosted recovery in the mounted view', () => {
       deliver({ type: 'error', code: 'INTERNAL_ERROR', requestId: earlierId,
         message: 'CODEX_DELIVERY_AMBIGUOUS: native response was lost' })
       expect(earlierComposer).toHaveValue('Earlier request\nEarlier newer draft')
-      expect(earlier.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${earlierId})`)
+      const earlierWarning = earlier.getByRole('alert', { name: 'Agent warning' })
+      expect(earlierWarning).toHaveTextContent('Delivery is uncertain')
+      const earlierSummary = earlierWarning.closest('summary')!
+      fireEvent.click(earlierSummary)
+      const earlierDiagnostic = `Delivery uncertain (${earlierId}): native response was lost. Check the conversation before sending again.`
+      expect(within(earlierSummary.closest('details')!).getByText(earlierDiagnostic)).toBeVisible()
       expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
 
       send(later, laterComposer, 'Later request')
@@ -19999,7 +20217,8 @@ describe('task6 hosted recovery in the mounted view', () => {
         'Message not sent: Earlier input has unresolved native delivery; recover or inspect the conversation before sending again',
       )
       expect(earlierComposer).toHaveValue('Earlier request\nEarlier newer draft')
-      expect(earlier.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(`Delivery uncertain (${earlierId})`)
+      expect(earlier.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+      expect(within(earlierSummary.closest('details')!).getByText(earlierDiagnostic)).toBeVisible()
       expect(earlier.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
       // A repeated idle status is not evidence that the earlier input settled.
       act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
@@ -20137,9 +20356,17 @@ describe('task6 hosted recovery in the mounted view', () => {
       }
       act(() => { for (const handler of [...handlers]) handler(error) })
       await waitFor(() => expect(firstComposer).toHaveValue('First pane original\nFirst pane newer draft'))
-      expect(firstPane.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(outcome === 'refusal'
+      const firstWarning = firstPane.getByRole('alert', { name: 'Agent warning' })
+      expect(firstWarning).toHaveTextContent(outcome === 'refusal'
         ? 'Message not sent: native input refused'
-        : `Delivery uncertain (${firstSend.requestId}): native response was lost. Check the conversation before sending again.`)
+        : 'Delivery is uncertain')
+      if (outcome === 'uncertain delivery') {
+        const summary = firstWarning.closest('summary')!
+        fireEvent.click(summary)
+        expect(within(summary.closest('details')!).getByText(
+          `Delivery uncertain (${firstSend.requestId}): native response was lost. Check the conversation before sending again.`,
+        )).toBeVisible()
+      }
       expect(firstPane.getByText('First pane follow-up')).toBeVisible()
       expect(secondComposer).toHaveValue('Second pane newer draft')
       expect(secondPane.getByText('Second pane follow-up')).toBeVisible()
@@ -20239,7 +20466,7 @@ describe('task6 hosted recovery in the mounted view', () => {
       } else if (fallbackFirst) {
         deliver(fallback)
         await waitFor(() => expect(composer).toHaveValue('Original hosted request\nNewer draft'))
-        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery uncertain')
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
         // Edits made after the fallback must survive a later concrete receipt.
         fireEvent.change(composer, { target: { value: 'Original hosted request\nNewer draft, edited' } })
         deliver(concrete)
@@ -20258,7 +20485,7 @@ describe('task6 hosted recovery in the mounted view', () => {
       } else {
         expect(composer).toHaveValue(batched ? 'Original hosted request\nNewer draft'
           : fallbackFirst ? 'Original hosted request\nNewer draft, edited' : 'Newer draft')
-        expect(screen.queryByText(/Delivery uncertain/)).not.toBeInTheDocument()
+        expect(screen.queryByText(/Delivery is uncertain/)).not.toBeInTheDocument()
         if (fallbackFirst) expect(screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary'))
           .toHaveTextContent('Message accepted. Your restored draft was kept.')
         if (fallbackFirst) expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
