@@ -12,7 +12,21 @@ export DOCKER_CALLS
 export FRESHELL_SANDBOX_CACHE_PREFIX="freshell-external-admission-${TEST_TMP##*.}"
 P2_G01_RUN_ID='7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
 P2_G01_PNPM_STORE_VOLUME="freshell-p2g01-pnpm-${P2_G01_RUN_ID}"
-trap 'rm -rf -- "${TEST_TMP}" "${DESCRIPTOR_DIR}"' EXIT
+OUTER_PID=""
+cleanup_test_artifacts() {
+  local result=$?
+  if [ -n "${OUTER_PID}" ] && kill -0 "${OUTER_PID}" 2>/dev/null; then
+    kill -TERM "${OUTER_PID}" 2>/dev/null || true
+    wait "${OUTER_PID}" 2>/dev/null || true
+  fi
+  rm -rf -- "${DESCRIPTOR_DIR}"
+  if [ "${result}" -eq 0 ]; then
+    rm -rf -- "${TEST_TMP}"
+  else
+    printf 'preserved P2 sandbox test evidence: %s\n' "${TEST_TMP}" >&2
+  fi
+}
+trap cleanup_test_artifacts EXIT
 
 mkdir -p "${FAKE_BIN}"
 chmod 0700 "${DESCRIPTOR_DIR}"
@@ -38,29 +52,32 @@ case "${1:-}" in
           if [ "${!index}" = --filter ]; then
             next=$((index + 1))
             filter="${!next#name=}"
-            if [[ "${filter}" =~ ^\^freshell-p2g01-pnpm-[a-f0-9-]{36}\$$ ]]; then
-              volume="${filter#^}"
-              volume="${volume%\$}"
-              python3 - "${DOCKER_CALLS}" "${volume}" <<'PY'
+            if [ "${FRESHELL_TEST_DOCKER_FAIL_TARGET_CACHE_LIST:-0}" = 1 ] \
+              && [[ "${filter}" == freshell-sandbox-rust-target-v1-* ]]; then
+              exit 17
+            fi
+            python3 - "${DOCKER_CALLS}" "${filter}" <<'PY'
 import json
+import re
 import sys
 
-volume = sys.argv[2]
-present = False
+pattern = re.compile(sys.argv[2])
+volumes = set()
 for line in open(sys.argv[1], encoding="utf-8"):
     call = json.loads(line)
-    if call[:2] == ["volume", "rm"] and call[2:] == [volume]:
-        present = False
-    elif call and call[0] == "run" and any(
-        value.startswith(f"{volume}:/home/sandbox/.local/share/pnpm/store") for value in call
-    ):
-        present = True
-if present:
-    print(volume)
+    if call[:2] == ["volume", "rm"]:
+        volumes.discard(call[2])
+    elif call and call[0] == "run":
+        mounted = [value.split(":", 1)[0] for value in call
+                   if value.startswith("freshell-p2g01-pnpm-")
+                   and value.endswith(":/home/sandbox/.local/share/pnpm/store")]
+        for volume in mounted:
+            volumes.add(volume)
+            volumes.add(f"{volume}-lookalike")
+for volume in sorted(volumes):
+    if pattern.search(volume):
+        print(volume)
 PY
-            else
-              printf '%s\n' "${filter}"
-            fi
             exit 0
           fi
         done
@@ -79,10 +96,28 @@ PY
       if [ "${!index}" = --cidfile ]; then
         next=$((index + 1))
         printf '%064d\n' 1 >"${!next}"
-        exit 0
+        break
       fi
     done
-    exit 1
+    if [ "${FRESHELL_TEST_DOCKER_FAIL_PREPARATION:-0}" = 1 ] \
+      && [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" = preparation ]; then
+      exit 23
+    fi
+    if [ "${FRESHELL_TEST_DOCKER_BLOCK_PREPARATION:-0}" = 1 ] \
+      && [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" = preparation ]; then
+      : >"${FRESHELL_TEST_DOCKER_READY_FILE}"
+      sleeper=""
+      finish() {
+        [ -z "${sleeper}" ] || kill "${sleeper}" 2>/dev/null || true
+        [ -z "${sleeper}" ] || wait "${sleeper}" 2>/dev/null || true
+        exit 143
+      }
+      trap finish INT TERM HUP
+      sleep 60 &
+      sleeper=$!
+      wait "${sleeper}"
+    fi
+    exit 0
     ;;
   container)
     if [ "${2:-}" = inspect ]; then exit 1; fi
@@ -133,6 +168,17 @@ run_external_with_preparation() {
     FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}" \
     bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
       --external-browser "${DESCRIPTOR}"
+}
+
+assert_preparation_store_removed() {
+  local output_path="$1"
+  grep -q '"event":"sandbox_external_pnpm_store_settled".*"phase":"preparation".*"absent":true.*"removed":true' "${output_path}"
+  python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert [call for call in calls if call[:2] == ["volume", "rm"]] == [["volume", "rm", sys.argv[2]]]
+PY
 }
 
 P2_G01_TITLE='P2-G01: real browser shell survives ten graceful/abrupt web replacements'
@@ -227,6 +273,72 @@ assert store_cleanup == [{"severity": "info", "event": "sandbox_external_pnpm_st
                           "volume": sys.argv[3], "phase": "execution", "absent": True,
                           "removed": True}], store_cleanup
 assert [call for call in calls if call[:2] == ["volume", "rm"]] == [["volume", "rm", sys.argv[3]]]
+PY
+
+: >"${DOCKER_CALLS}"
+STATUS=0
+PATH="${FAKE_BIN}:${PATH}" FRESHELL_TEST_DOCKER_FAIL_PREPARATION=1 \
+  run_external_with_preparation >"${TEST_TMP}/prep-failed.stdout" 2>"${TEST_TMP}/prep-failed.stderr" || STATUS=$?
+test "${STATUS}" -ne 0
+assert_preparation_store_removed "${TEST_TMP}/prep-failed.stderr"
+
+: >"${DOCKER_CALLS}"
+READY_FILE="${TEST_TMP}/preparation-docker-started"
+STATUS=0
+PATH="${FAKE_BIN}:${PATH}" FRESHELL_TEST_DOCKER_BLOCK_PREPARATION=1 \
+  FRESHELL_TEST_DOCKER_READY_FILE="${READY_FILE}" \
+  FRESHELL_SANDBOX_P2_G01_RUN_ID="${P2_G01_RUN_ID}" \
+  FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}" \
+  bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
+    --external-browser "${DESCRIPTOR}" >"${TEST_TMP}/prep-signalled.stdout" 2>"${TEST_TMP}/prep-signalled.stderr" &
+OUTER_PID=$!
+python3 - "${READY_FILE}" "${OUTER_PID}" <<'PY'
+import os
+import sys
+import time
+
+ready, pid = sys.argv[1], int(sys.argv[2])
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    if os.path.exists(ready):
+        raise SystemExit(0)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.05)
+raise SystemExit("preparation Docker fixture did not reach its blocking run")
+PY
+test -f "${READY_FILE}"
+kill -TERM "${OUTER_PID}"
+wait "${OUTER_PID}" || STATUS=$?
+OUTER_PID=""
+test "${STATUS}" -eq 143
+assert_preparation_store_removed "${TEST_TMP}/prep-signalled.stderr"
+
+: >"${DOCKER_CALLS}"
+python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(["run", f"{sys.argv[2]}:/home/sandbox/.local/share/pnpm/store"]) + "\n")
+PY
+STATUS=0
+PATH="${FAKE_BIN}:${PATH}" FRESHELL_TEST_DOCKER_FAIL_TARGET_CACHE_LIST=1 \
+  FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
+  FRESHELL_SANDBOX_P2_G01_RUN_ID="${P2_G01_RUN_ID}" \
+  FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}" \
+  bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
+    --external-browser "${DESCRIPTOR}" >"${TEST_TMP}/execution-preflight-failed.stdout" \
+    2>"${TEST_TMP}/execution-preflight-failed.stderr" || STATUS=$?
+test "${STATUS}" -eq 1
+grep -q '"event":"sandbox_external_pnpm_store_settled".*"phase":"execution".*"absent":true.*"removed":true' \
+  "${TEST_TMP}/execution-preflight-failed.stderr"
+python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert [call for call in calls if call[:2] == ["volume", "rm"]] == [["volume", "rm", sys.argv[2]]]
 PY
 
 : >"${DOCKER_CALLS}"

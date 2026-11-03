@@ -8,6 +8,19 @@ export const P2_G01_SPEC = 'test/e2e-browser/specs/runtime-terminal-continuity-r
 export const P2_G01_TITLE = 'P2-G01: real browser shell survives ten graceful/abrupt web replacements'
 export const P2_G01_SANDBOX_OPT_IN = 'FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX'
 export const P2_G01_HANDOFF_CONTAINER_PATH = '/run/freshell-external-target.json'
+const P2_G01_ARTIFACT_ROOT = '/tmp/freshell-p2g01-artifacts'
+
+export function p2G01PlaywrightArtifactPaths(environment: NodeJS.ProcessEnv): {
+  outputDir: string
+  htmlReportDir: string
+} | undefined {
+  if (environment.FRESHELL_RUNTIME_EXTERNAL_SPEC !== P2_G01_SPEC
+    || environment.FRESHELL_RUNTIME_EXTERNAL_GREP !== P2_G01_TITLE) return undefined
+  return {
+    outputDir: path.join(P2_G01_ARTIFACT_ROOT, 'test-results'),
+    htmlReportDir: path.join(P2_G01_ARTIFACT_ROOT, 'html-report'),
+  }
+}
 
 export function p2G01PnpmStoreVolume(runId: string): string {
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(runId)) {
