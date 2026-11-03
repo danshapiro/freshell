@@ -4,6 +4,11 @@
 
 use super::*;
 
+pub(super) struct EstablishedBindingOptions<'a> {
+    pub(super) transition_claim: Option<&'a crate::identity_sink::BindingClaim>,
+    pub(super) settings_update: crate::identity_sink::SettingsUpdate,
+}
+
 impl FreshClaudeState {
     pub(super) async fn record_established_binding(
         &self,
@@ -12,8 +17,7 @@ impl FreshClaudeState {
         create_request_id: Option<&str>,
         provenance: Option<&crate::BindProvenance>,
         ticket: &Option<freshell_ownership::OperationTicket>,
-        transition_claim: Option<&crate::identity_sink::BindingClaim>,
-        settings_update: crate::identity_sink::SettingsUpdate,
+        options: EstablishedBindingOptions<'_>,
     ) -> std::io::Result<()> {
         let Some(sink) = self.identity_sink() else {
             return Ok(());
@@ -37,7 +41,7 @@ impl FreshClaudeState {
                     crate::identity_sink::BindingClaimKind::Starting,
                 )
             })
-            .or_else(|| transition_claim.cloned())
+            .or_else(|| options.transition_claim.cloned())
             .or_else(|| {
                 let _registry = self.ownership.as_ref()?;
                 let stamp =
@@ -71,7 +75,7 @@ impl FreshClaudeState {
         // instead of downgrading to a pair-only/unfenced binding write.
         if self.ownership.is_some()
             && ticket.is_none()
-            && transition_claim.is_none()
+            && options.transition_claim.is_none()
             && claim.is_none()
         {
             return Err(std::io::Error::other(
@@ -100,7 +104,7 @@ impl FreshClaudeState {
                 .or_else(|| generation.and(self.ownership.as_ref().map(|r| r.boot_epoch()))),
             observed_generation: claim.as_ref().map(|claim| claim.generation).or(generation),
             claim,
-            settings: settings_update,
+            settings: options.settings_update,
         })
         .await
     }
