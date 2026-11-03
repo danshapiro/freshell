@@ -1503,7 +1503,7 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
     let code = match error {
         ActorError::RequestConflict => RuntimeErrorCode::RequestIdConflict,
         ActorError::AmbiguousDispatch => RuntimeErrorCode::CommandAmbiguous,
-        ActorError::NativeIdentityMismatch => RuntimeErrorCode::RecoveryWrongIdentity,
+        ActorError::NativeIdentityMismatch { .. } => RuntimeErrorCode::RecoveryWrongIdentity,
         ActorError::UnknownDecision | ActorError::DecisionAlreadyResolved => {
             RuntimeErrorCode::InvalidRequest
         }
@@ -1523,6 +1523,28 @@ fn map_fresh_agent_open_error(
     error: freshell_agent_runtime::host_actor::ActorError,
 ) -> RuntimeError {
     use freshell_agent_runtime::host_actor::ActorError;
+    use freshell_runtime_protocol::{
+        FreshAgentIdentityMismatchFields, FreshAgentOpenFailureDiagnostic,
+        FreshAgentOpenFailureSubtype,
+    };
+    // Each subtype names the check class that refused the open. Provider
+    // error strings may contain request bodies, environment values, or
+    // credentials, so the payload stays typed and body-free: the only
+    // detail an identity check may attach is its compared field NAMES.
+    fn open_failed(
+        subtype: FreshAgentOpenFailureSubtype,
+        mismatched_fields: FreshAgentIdentityMismatchFields,
+    ) -> RuntimeError {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+        .with_fresh_agent_open_failure(FreshAgentOpenFailureDiagnostic {
+            subtype,
+            mismatched_fields,
+        })
+    }
     match error {
         ActorError::ProviderStartFailed { diagnostic } => RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
@@ -1532,11 +1554,35 @@ fn map_fresh_agent_open_error(
         )
         .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
         .with_fresh_agent_provider_start_diagnostic(diagnostic.into()),
-        _ => RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
-            "hosted fresh-agent provider failed to start",
-        )
-        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentOpenFailed),
+        ActorError::NativeIdentityMismatch { mismatched_fields } => open_failed(
+            FreshAgentOpenFailureSubtype::NativeIdentityMismatch,
+            mismatched_fields,
+        ),
+        ActorError::WriterBusy => {
+            open_failed(FreshAgentOpenFailureSubtype::WriterBusy, Default::default())
+        }
+        ActorError::Persistence(_) => open_failed(
+            FreshAgentOpenFailureSubtype::StateUnreadable,
+            Default::default(),
+        ),
+        ActorError::AmbiguousDispatch => open_failed(
+            FreshAgentOpenFailureSubtype::AmbiguousIdentity,
+            Default::default(),
+        ),
+        ActorError::InvalidProfile => open_failed(
+            FreshAgentOpenFailureSubtype::InvalidProfile,
+            Default::default(),
+        ),
+        ActorError::Transport(_) => {
+            open_failed(FreshAgentOpenFailureSubtype::Transport, Default::default())
+        }
+        ActorError::RequestConflict
+        | ActorError::UnknownDecision
+        | ActorError::DecisionAlreadyResolved
+        | ActorError::UnsupportedOperation => open_failed(
+            FreshAgentOpenFailureSubtype::Unclassified,
+            Default::default(),
+        ),
     }
 }
 
@@ -9763,6 +9809,78 @@ mod tests {
         );
         assert_eq!(other.message, "hosted fresh-agent provider failed to start");
         assert!(!other.message.contains(secret_detail));
+    }
+
+    #[test]
+    fn fresh_agent_open_failure_subtypes_are_typed_and_body_free() {
+        use freshell_agent_runtime::host_actor::ActorError;
+        use freshell_runtime_protocol::RuntimeErrorCode;
+
+        let cases = [
+            (ActorError::WriterBusy, "writer_busy"),
+            (
+                ActorError::Persistence("secret-state-detail".into()),
+                "state_unreadable",
+            ),
+            (ActorError::AmbiguousDispatch, "ambiguous_identity"),
+            (ActorError::InvalidProfile, "invalid_profile"),
+            (
+                ActorError::Transport("secret-transport-detail".into()),
+                "transport",
+            ),
+        ];
+        for (error, subtype) in cases {
+            let mapped = super::map_fresh_agent_open_error(error);
+            assert_eq!(mapped.code, RuntimeErrorCode::HostUnreachable);
+            let encoded = serde_json::to_value(&mapped).unwrap();
+            assert_eq!(
+                encoded["freshAgentOpenFailure"]["subtype"], subtype,
+                "every open failure must name its closed check class"
+            );
+            assert!(
+                encoded["freshAgentOpenFailure"]["mismatchedFields"].is_null(),
+                "only identity checks attach compared field names"
+            );
+            assert!(
+                !encoded.to_string().contains("secret-state-detail")
+                    && !encoded.to_string().contains("secret-transport-detail"),
+                "no provider prose may cross the host boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn native_identity_mismatch_open_failure_carries_redacted_field_names() {
+        use freshell_agent_runtime::host_actor::ActorError;
+        use freshell_runtime_protocol::{
+            FreshAgentIdentityMismatchField, FreshAgentIdentityMismatchFields,
+        };
+
+        let error = super::map_fresh_agent_open_error(ActorError::NativeIdentityMismatch {
+            mismatched_fields: FreshAgentIdentityMismatchFields(vec![
+                FreshAgentIdentityMismatchField::Cwd,
+                FreshAgentIdentityMismatchField::Effort,
+                FreshAgentIdentityMismatchField::PermissionMode,
+            ]),
+        });
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            encoded["diagnosticCode"], "FRESH_AGENT_OPEN_FAILED",
+            "the open diagnostic code must stay stable"
+        );
+        assert_eq!(
+            encoded["freshAgentOpenFailure"]["subtype"], "native_identity_mismatch",
+            "all NativeIdentityMismatch raise sites share the honest coarse subtype"
+        );
+        assert_eq!(
+            encoded["freshAgentOpenFailure"]["mismatchedFields"],
+            serde_json::json!(["cwd", "effort", "permission_mode"]),
+            "the raise site's compared field names must cross, names only"
+        );
+        assert_eq!(
+            encoded["message"],
+            "hosted fresh-agent provider failed to start"
+        );
     }
 
     #[cfg(unix)]

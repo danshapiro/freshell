@@ -1038,6 +1038,20 @@ tool_timeout_sec = 120
       return { ...metadata, copy }
     })
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
+    // Wait for the supervisor's post-provider-exit recovery for this soul to
+    // reach its terminal verdict BEFORE the recovery send, so the retained
+    // capture holds the real post-crash recovery sequence rather than a send
+    // that raced ahead of the timer-driven observer. Which blocked verdict is
+    // terminal depends on which side of the probe/archive race the observer's
+    // store probe lands: the replacement loop's RETRY_BUDGET block (probe
+    // pre-archive, three failed replacement opens) or the definitive
+    // store-absence block (probe post-archive, zero replacement attempts). The
+    // wait is event-conditioned on the supervisor's inventory recovery state,
+    // never a fixed sleep.
+    const blockedRecovery = await waitFor('supervisor post-crash recovery terminal blocked verdict for this soul', async () => {
+      const row = (await rig.inventory()).find((row: any) => row.freshAgentSessionId === created.sessionId)
+      return row && row.recoveryState === 'blocked' && row.recoveryReason ? row : undefined
+    }, 150_000)
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,

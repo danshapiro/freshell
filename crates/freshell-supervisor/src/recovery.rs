@@ -5891,7 +5891,7 @@ fn recovery_activation_failure_data(
     reason: RecoveryBlockReason,
     error: &RuntimeError,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut data = serde_json::json!({
         "soulId": soul_id,
         "priorIncarnationId": prior_incarnation_id,
         "replacementIncarnationId": replacement_incarnation_id,
@@ -5901,7 +5901,10 @@ fn recovery_activation_failure_data(
         "errorCode": error.code,
         "errorClass": "provider_activation_failed",
         "severity": "warn",
-    })
+    });
+    // The exact typed failure reason must survive the generic block verdict.
+    crate::service::apply_typed_failure_context(&mut data, error);
+    data
 }
 
 fn normalized_negative_evidence(
@@ -7433,7 +7436,7 @@ pub(crate) mod tests {
                                         ActorError::AmbiguousDispatch => {
                                             RuntimeErrorCode::CommandAmbiguous
                                         }
-                                        ActorError::NativeIdentityMismatch => {
+                                        ActorError::NativeIdentityMismatch { .. } => {
                                             RuntimeErrorCode::RecoveryWrongIdentity
                                         }
                                         _ => RuntimeErrorCode::HostUnreachable,
@@ -8441,6 +8444,55 @@ pub(crate) mod tests {
         assert_eq!(data["errorClass"], "provider_activation_failed");
         assert_eq!(data["severity"], "warn");
         assert!(!data.to_string().contains("operation not permitted"));
+    }
+
+    #[test]
+    fn recovery_activation_failure_data_carries_the_failure_reason_and_open_failure_subtype() {
+        let soul_id = SoulId::new();
+        let prior = IncarnationId::new();
+        let replacement = IncarnationId::new();
+        let attempt = RecoveryAttemptId::new();
+        let error = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start",
+        )
+        .with_diagnostic_code(
+            freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentOpenFailed,
+        )
+        .with_fresh_agent_open_failure(
+            freshell_runtime_protocol::FreshAgentOpenFailureDiagnostic {
+                subtype:
+                    freshell_runtime_protocol::FreshAgentOpenFailureSubtype::NativeIdentityMismatch,
+                mismatched_fields: freshell_runtime_protocol::FreshAgentIdentityMismatchFields(
+                    vec![
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchField::Cwd,
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchField::Effort,
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchField::PermissionMode,
+                    ],
+                ),
+            },
+        );
+
+        let data = recovery_activation_failure_data(
+            &soul_id,
+            &prior,
+            &replacement,
+            &attempt,
+            RecoveryPath::NativeResume,
+            RecoveryBlockReason::ProviderUnavailable,
+            &error,
+        );
+
+        assert_eq!(data["failureReason"], "FRESH_AGENT_OPEN_FAILED");
+        assert_eq!(data["openFailureSubtype"], "native_identity_mismatch");
+        assert_eq!(
+            data["openFailureMismatchedFields"],
+            serde_json::json!(["cwd", "effort", "permission_mode"])
+        );
+        assert!(data.get("errorMessage").is_none());
+        assert!(!data
+            .to_string()
+            .contains("hosted fresh-agent provider failed to start"));
     }
 
     #[test]

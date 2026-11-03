@@ -752,7 +752,10 @@ async fn proven_claude_clear_retires_actor_root_and_parent_fork_recovery() {
         *transport.current.lock().unwrap() = None;
         assert_eq!(
             actor.observe_native_identity(cleared.into()).await,
-            Err(ActorError::NativeIdentityMismatch),
+            Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ])),
             "a public rekey alone cannot replace the native root"
         );
         *transport.native_evidence.lock().unwrap() = Some(serde_json::json!({
@@ -761,7 +764,10 @@ async fn proven_claude_clear_retires_actor_root_and_parent_fork_recovery() {
         }));
         assert_eq!(
             actor.observe_native_identity(cleared.into()).await,
-            Err(ActorError::NativeIdentityMismatch),
+            Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ])),
             "a proof for another parent cannot replace the current root"
         );
         *transport.native_evidence.lock().unwrap() = Some(serde_json::json!({
@@ -794,12 +800,17 @@ async fn proven_claude_clear_retires_actor_root_and_parent_fork_recovery() {
         assert!(persisted.claude_fork_state.is_none());
         assert_eq!(
             actor.observe_native_identity(child.into()).await,
-            Err(ActorError::NativeIdentityMismatch)
+            Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ]))
         );
         actor.clone().stop().await.unwrap();
         assert_eq!(
             actor.observe_native_identity(cleared.into()).await,
-            Err(ActorError::NativeIdentityMismatch)
+            Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::ActorLifecycleState,
+            ]))
         );
     }
 }
@@ -2164,7 +2175,10 @@ async fn current_clear_checkpoint_remains_approvable_and_recoverable() {
     wrong["nativeBinding"]["nativeClear"]["previousNativeSessionId"] = "wrong-parent".into();
     assert_eq!(
         actor.record_permission("wrong-clear".into(), wrong).await,
-        Err(ActorError::NativeIdentityMismatch)
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::NativeSessionId,
+            FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+        ]))
     );
     actor
         .record_permission("clear-card".into(), payload.clone())
@@ -2228,7 +2242,10 @@ async fn native_checkpoint_permission_uses_sidecar_canonical_input_digest() {
             actor
                 .record_permission("changed-input".into(), changed)
                 .await,
-            Err(ActorError::NativeIdentityMismatch),
+            Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ])),
         );
         actor
             .record_permission("canonical-input".into(), payload)
@@ -2289,7 +2306,10 @@ async fn native_checkpoint_permission_matches_javascript_numbers_and_utf16_key_o
             actor
                 .record_permission("changed-input".into(), changed)
                 .await,
-            Err(ActorError::NativeIdentityMismatch),
+            Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ])),
         );
         actor
             .record_permission("javascript-input".into(), payload)
@@ -2356,7 +2376,9 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
     let evidence = current.native_evidence.lock().unwrap().take();
     assert_eq!(
         actor.resume_pending_native_permissions().await,
-        Err(ActorError::NativeIdentityMismatch)
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+        ]))
     );
     let mut wrong_root = evidence.clone().unwrap();
     wrong_root["launch"]["requestedNativeSessionId"] =
@@ -2364,7 +2386,10 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
     *current.native_evidence.lock().unwrap() = Some(wrong_root);
     assert_eq!(
         actor.resume_pending_native_permissions().await,
-        Err(ActorError::NativeIdentityMismatch)
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::NativeSessionId,
+            FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+        ]))
     );
     *current.native_evidence.lock().unwrap() = evidence;
     assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
@@ -2408,7 +2433,10 @@ async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_ope
     actor.clone().stop().await.unwrap();
     assert_eq!(
         actor.resume_pending_native_permissions().await,
-        Err(ActorError::NativeIdentityMismatch)
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::NativeSessionId,
+            FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+        ]))
     );
     assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
 }
@@ -2670,7 +2698,10 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
         FakeTransport::new("wrong"),
     )
     .await;
-    assert!(matches!(wrong, Err(ActorError::NativeIdentityMismatch)));
+    assert!(matches!(
+        wrong,
+        Err(ActorError::NativeIdentityMismatch { .. })
+    ));
 
     let mut wrong_profile = recovered_profile;
     wrong_profile.model = Some("different-model".into());
@@ -2680,7 +2711,44 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
         FakeTransport::new("claude-native-9"),
     )
     .await;
-    assert!(matches!(wrong, Err(ActorError::NativeIdentityMismatch)));
+    assert!(matches!(
+        wrong,
+        Err(ActorError::NativeIdentityMismatch { .. })
+    ));
+}
+
+#[tokio::test]
+async fn profile_mismatch_names_the_compared_field_without_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut durable = profile(FreshProvider::Codex, "codex-store", Some("codex-native-77"));
+    durable.permission_mode = Some("never".into());
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        durable.clone(),
+        FakeTransport::new("codex-native-77"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(actor.profile().await, durable);
+    drop(actor);
+    let mut stale = durable;
+    stale.permission_mode = Some("untrusted".into());
+    let mismatch =
+        match FreshAgentHostActor::open(dir.path(), stale, FakeTransport::new("codex-native-77"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a changed permission mode must refuse the reopen"),
+        };
+    let context = mismatch.to_string();
+    assert!(
+        context.contains("permission_mode"),
+        "the mismatch context must name the compared field: {context}"
+    );
+    assert!(
+        !context.contains("never") && !context.contains("untrusted"),
+        "field values must never cross the mismatch context: {context}"
+    );
 }
 
 #[tokio::test]
@@ -2788,7 +2856,11 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
         let result =
             FreshAgentHostActor::open(dir.path(), next_preparation.clone(), wrong_native.clone())
                 .await;
-        assert!(matches!(result, Err(ActorError::NativeIdentityMismatch)));
+        assert!(matches!(
+            result,
+            Err(ActorError::NativeIdentityMismatch { mismatched_fields })
+                if mismatched_fields.0 == vec![FreshAgentIdentityMismatchField::NativeSessionId]
+        ));
         assert_eq!(
             wrong_native.start_profiles.lock().unwrap().as_slice(),
             &[next_preparation]
@@ -2797,18 +2869,27 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
             fs::read(dir.path().join("fresh-agent-state.json")).unwrap() == before,
             "failed native identity verification must preserve the accepted preparation"
         );
-        for changed in [
-            "native",
-            "model",
-            "effort",
-            "cwd",
-            "plugins",
-            "store",
-            "runtime",
-            "permission",
-            "sandbox",
-            "secret-reference",
-            "context-absent",
+        for (changed, mismatched_field) in [
+            ("native", FreshAgentIdentityMismatchField::NativeSessionId),
+            ("model", FreshAgentIdentityMismatchField::Model),
+            ("effort", FreshAgentIdentityMismatchField::Effort),
+            ("cwd", FreshAgentIdentityMismatchField::Cwd),
+            ("plugins", FreshAgentIdentityMismatchField::Plugins),
+            ("store", FreshAgentIdentityMismatchField::ProviderStoreId),
+            ("runtime", FreshAgentIdentityMismatchField::RuntimeVariant),
+            (
+                "permission",
+                FreshAgentIdentityMismatchField::PermissionMode,
+            ),
+            ("sandbox", FreshAgentIdentityMismatchField::Sandbox),
+            (
+                "secret-reference",
+                FreshAgentIdentityMismatchField::ProviderSecretReferences,
+            ),
+            (
+                "context-absent",
+                FreshAgentIdentityMismatchField::ProviderLaunchContext,
+            ),
         ] {
             let mut wrong = refreshed.clone();
             match changed {
@@ -2836,8 +2917,10 @@ async fn current_provider_preparation_reopens_the_same_fresh_conversation() {
             let transport = FakeTransport::new("same-native");
             let result = FreshAgentHostActor::open(dir.path(), wrong, transport.clone()).await;
             assert!(
-                matches!(result, Err(ActorError::NativeIdentityMismatch)),
-                "{changed}"
+                matches!(result,
+                    Err(ActorError::NativeIdentityMismatch { mismatched_fields })
+                        if mismatched_fields.0 == vec![mismatched_field]),
+                "{changed} must name exactly its mismatched field"
             );
             assert_eq!(transport.starts.load(Ordering::SeqCst), 0, "{changed}");
             assert!(
@@ -3199,11 +3282,15 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
     assert_eq!(actor.observed_native_session_id().await, None);
     assert_eq!(
         actor.observe_native_identity("native-parent".into()).await,
-        Err(ActorError::NativeIdentityMismatch)
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::ActorLifecycleState,
+        ]))
     );
     assert_eq!(
         actor.observe_native_identity("native-child".into()).await,
-        Err(ActorError::NativeIdentityMismatch)
+        Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::ActorLifecycleState,
+        ]))
     );
     spawned.abort();
     let _ = spawned.await;
@@ -3214,7 +3301,9 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
             actor.fork(RequestId::new(), "native-parent".into(), None)
         )
         .await,
-        Ok(Err(ActorError::NativeIdentityMismatch)),
+        Ok(Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::ActorLifecycleState,
+        ]))),
         "an unsettled fork must reject another native mutation"
     );
     drop(actor);

@@ -9482,7 +9482,9 @@ export function query({ prompt, options }) {
         );
         assert_eq!(
             actor.resume_pending_native_permissions().await,
-            Err(freshell_agent_runtime::host_actor::ActorError::NativeIdentityMismatch),
+            Err(freshell_agent_runtime::host_actor::ActorError::identity_mismatch(&[
+                freshell_runtime_protocol::FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ])),
             "a saved checkpoint released in the announce-only window must refuse instead of bypassing the current native identity"
         );
     }

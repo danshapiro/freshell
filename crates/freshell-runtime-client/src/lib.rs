@@ -37,6 +37,8 @@ pub enum ClientError {
         message: String,
         diagnostic_code: Option<RuntimeDiagnosticCode>,
         fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
+        fresh_agent_open_failure:
+            Option<freshell_runtime_protocol::FreshAgentOpenFailureDiagnostic>,
     },
     #[error("runtime supervisor returned an unexpected result")]
     UnexpectedResult,
@@ -67,6 +69,18 @@ impl ClientError {
                 fresh_agent_provider_start_diagnostic,
                 ..
             } => *fresh_agent_provider_start_diagnostic,
+            _ => None,
+        }
+    }
+
+    pub fn fresh_agent_open_failure(
+        &self,
+    ) -> Option<&freshell_runtime_protocol::FreshAgentOpenFailureDiagnostic> {
+        match self {
+            Self::Runtime {
+                fresh_agent_open_failure,
+                ..
+            } => fresh_agent_open_failure.as_ref(),
             _ => None,
         }
     }
@@ -691,6 +705,7 @@ impl RuntimeClient {
                 message: error.message,
                 diagnostic_code: None,
                 fresh_agent_provider_start_diagnostic: None,
+                fresh_agent_open_failure: None,
             })?;
         let original = request.clone();
         match self
@@ -1552,6 +1567,7 @@ fn runtime_error(error: RuntimeError) -> ClientError {
         message: error.message,
         diagnostic_code: error.diagnostic_code,
         fresh_agent_provider_start_diagnostic: error.fresh_agent_provider_start_diagnostic,
+        fresh_agent_open_failure: error.fresh_agent_open_failure,
     }
 }
 
@@ -1584,6 +1600,46 @@ mod tests {
         assert_eq!(
             error.fresh_agent_provider_start_diagnostic(),
             Some(FreshAgentProviderStartDiagnostic::Authentication)
+        );
+    }
+
+    #[test]
+    fn client_error_preserves_typed_open_failure_diagnostics() {
+        let error = runtime_error(
+            RuntimeError::new(RuntimeErrorCode::HostUnreachable, "private provider detail")
+                .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+                .with_fresh_agent_open_failure(
+                    freshell_runtime_protocol::FreshAgentOpenFailureDiagnostic {
+                        subtype:
+                            freshell_runtime_protocol::FreshAgentOpenFailureSubtype::NativeIdentityMismatch,
+                        mismatched_fields:
+                            freshell_runtime_protocol::FreshAgentIdentityMismatchFields(vec![
+                                freshell_runtime_protocol::FreshAgentIdentityMismatchField::Cwd,
+                                freshell_runtime_protocol::FreshAgentIdentityMismatchField::Effort,
+                                freshell_runtime_protocol::FreshAgentIdentityMismatchField::PermissionMode,
+                            ]),
+                    },
+                ),
+        );
+
+        assert_eq!(
+            error.runtime_code(),
+            Some(RuntimeErrorCode::HostUnreachable)
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+        );
+        let diagnostic = error
+            .fresh_agent_open_failure()
+            .expect("the open-failure diagnostic must survive the conversion");
+        assert_eq!(
+            diagnostic.subtype,
+            freshell_runtime_protocol::FreshAgentOpenFailureSubtype::NativeIdentityMismatch
+        );
+        assert_eq!(
+            serde_json::to_value(&diagnostic.mismatched_fields).unwrap(),
+            serde_json::json!(["cwd", "effort", "permission_mode"])
         );
     }
 

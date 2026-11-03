@@ -9,10 +9,10 @@ pub use freshell_runtime_protocol::{
     NativeDispatchIdentity,
 };
 use freshell_runtime_protocol::{
-    CommandState, FreshAgentCapture, FreshAgentNativeNameError, FreshAgentNativeNameOperation,
-    FreshAgentNativeNameReply, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext, ProviderModelSelection,
-    ProviderSecretReference, ProviderSessionReference, RequestId,
+    CommandState, FreshAgentCapture, FreshAgentIdentityMismatchField, FreshAgentNativeNameError,
+    FreshAgentNativeNameOperation, FreshAgentNativeNameReply, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext,
+    ProviderModelSelection, ProviderSecretReference, ProviderSessionReference, RequestId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -424,8 +424,12 @@ pub enum ActorError {
     InvalidProfile,
     #[error("another writer owns this fresh-agent host state")]
     WriterBusy,
-    #[error("fresh-agent native identity mismatch")]
-    NativeIdentityMismatch,
+    #[error("fresh-agent native identity mismatch (mismatched fields: {mismatched_fields})")]
+    NativeIdentityMismatch {
+        /// Redacted names of the fields this raise site's check compared.
+        /// Only names ever leave the actor; values never do.
+        mismatched_fields: freshell_runtime_protocol::FreshAgentIdentityMismatchFields,
+    },
     #[error("request id was reused with different content")]
     RequestConflict,
     #[error("command dispatch is ambiguous and will not be replayed")]
@@ -442,6 +446,21 @@ pub enum ActorError {
     Transport(String),
     #[error("durable fresh-agent state failed: {0}")]
     Persistence(String),
+}
+
+impl ActorError {
+    /// Attaches the redacted names of the fields one native-identity check
+    /// compared. Each raise site knows exactly what its check compared;
+    /// values, provider prose, and secrets never join the payload.
+    pub fn identity_mismatch(
+        fields: &[freshell_runtime_protocol::FreshAgentIdentityMismatchField],
+    ) -> Self {
+        ActorError::NativeIdentityMismatch {
+            mismatched_fields: freshell_runtime_protocol::FreshAgentIdentityMismatchFields(
+                fields.to_vec(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +537,67 @@ struct PersistedCommand {
     operation_failure: Option<OperationFailureKind>,
 }
 
+/// Names every launch-profile field that differs between the durable
+/// journal and the incoming launch. The enumeration covers exactly the
+/// `FreshAgentProfile` fields, so a non-empty result is the same predicate
+/// as structural inequality — with the mismatched field names attached.
+/// Only names are reported; values never leave the comparison.
+fn profile_mismatched_fields(
+    loaded: &FreshAgentProfile,
+    expected: &FreshAgentProfile,
+) -> freshell_runtime_protocol::FreshAgentIdentityMismatchFields {
+    let mut fields = Vec::new();
+    if loaded.naming_handle != expected.naming_handle {
+        fields.push(FreshAgentIdentityMismatchField::NamingHandle);
+    }
+    if loaded.collaboration_mode != expected.collaboration_mode {
+        fields.push(FreshAgentIdentityMismatchField::CollaborationMode);
+    }
+    if loaded.provider != expected.provider {
+        fields.push(FreshAgentIdentityMismatchField::Provider);
+    }
+    if loaded.runtime_variant != expected.runtime_variant {
+        fields.push(FreshAgentIdentityMismatchField::RuntimeVariant);
+    }
+    if loaded.cwd != expected.cwd {
+        fields.push(FreshAgentIdentityMismatchField::Cwd);
+    }
+    if loaded.model != expected.model {
+        fields.push(FreshAgentIdentityMismatchField::Model);
+    }
+    if loaded.effort != expected.effort {
+        fields.push(FreshAgentIdentityMismatchField::Effort);
+    }
+    if loaded.permission_mode != expected.permission_mode {
+        fields.push(FreshAgentIdentityMismatchField::PermissionMode);
+    }
+    if loaded.sandbox != expected.sandbox {
+        fields.push(FreshAgentIdentityMismatchField::Sandbox);
+    }
+    if loaded.provider_store_id != expected.provider_store_id {
+        fields.push(FreshAgentIdentityMismatchField::ProviderStoreId);
+    }
+    if loaded.native_session_id != expected.native_session_id {
+        fields.push(FreshAgentIdentityMismatchField::NativeSessionId);
+    }
+    if loaded.plugins != expected.plugins {
+        fields.push(FreshAgentIdentityMismatchField::Plugins);
+    }
+    if loaded.model_selection != expected.model_selection {
+        fields.push(FreshAgentIdentityMismatchField::ModelSelection);
+    }
+    if loaded.session_ref != expected.session_ref {
+        fields.push(FreshAgentIdentityMismatchField::SessionRef);
+    }
+    if loaded.provider_launch_context != expected.provider_launch_context {
+        fields.push(FreshAgentIdentityMismatchField::ProviderLaunchContext);
+    }
+    if loaded.provider_secret_references != expected.provider_secret_references {
+        fields.push(FreshAgentIdentityMismatchField::ProviderSecretReferences);
+    }
+    freshell_runtime_protocol::FreshAgentIdentityMismatchFields(fields)
+}
+
 fn validate_claude_fork_state(
     context: &ClaudeForkState,
     profile: &FreshAgentProfile,
@@ -528,12 +608,15 @@ fn validate_claude_fork_state(
     ) || profile.native_session_id.as_deref() != Some(&context.native_session_id)
         || serde_json::to_vec(context).map_err(persist)?.len() > 32 * 1024 * 1024
     {
-        return Err(ActorError::NativeIdentityMismatch);
+        return Err(ActorError::identity_mismatch(&[
+            FreshAgentIdentityMismatchField::Provider,
+            FreshAgentIdentityMismatchField::NativeSessionId,
+        ]));
     }
     if let Some(recipe) = &context.recipe {
-        recipe
-            .validate(&context.native_session_id)
-            .map_err(|_| ActorError::NativeIdentityMismatch)?;
+        recipe.validate(&context.native_session_id).map_err(|_| {
+            ActorError::identity_mismatch(&[FreshAgentIdentityMismatchField::ForkRecipe])
+        })?;
     }
     Ok(())
 }
@@ -702,9 +785,17 @@ impl FreshAgentHostActor {
             .transport
             .native_identity_evidence()
             .await
-            .ok_or(ActorError::NativeIdentityMismatch)?;
+            .ok_or_else(|| {
+                ActorError::identity_mismatch(&[
+                    FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+                ])
+            })?;
         let launch: NativeIdentityLaunch = serde_json::from_value(evidence["launch"].clone())
-            .map_err(|_| ActorError::NativeIdentityMismatch)?;
+            .map_err(|_| {
+                ActorError::identity_mismatch(&[
+                    FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+                ])
+            })?;
         if expected.is_none()
             || observed != expected
             || launch.execution_generation == 0
@@ -717,7 +808,10 @@ impl FreshAgentHostActor {
                     .as_deref()
                     .is_some_and(|root| native_clear_matches_root(&evidence, root))
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ]));
         }
         if *release == NativeRecoveryRelease::Released {
             return Ok(());
@@ -819,15 +913,19 @@ impl FreshAgentHostActor {
                             .iter()
                             .filter(|reference| !reference.profile.is_configuration_file()))
                     {
-                        return Err(ActorError::NativeIdentityMismatch);
+                        return Err(ActorError::identity_mismatch(&[
+                            FreshAgentIdentityMismatchField::ProviderSecretReferences,
+                        ]));
                     }
                     expected_profile.provider_secret_references =
                         loaded.profile.provider_secret_references.clone();
                     expected_profile.provider_launch_context =
                         loaded.profile.provider_launch_context.clone();
                 }
-                if loaded.profile != expected_profile {
-                    return Err(ActorError::NativeIdentityMismatch);
+                let mismatched_fields =
+                    profile_mismatched_fields(&loaded.profile, &expected_profile);
+                if !mismatched_fields.is_empty() {
+                    return Err(ActorError::NativeIdentityMismatch { mismatched_fields });
                 }
                 loaded.profile.provider_launch_context = current_preparation;
                 loaded.profile.provider_secret_references = current_references;
@@ -897,7 +995,9 @@ impl FreshAgentHostActor {
         let observed_native_session_id = started.native_session_id.clone();
         if let Some(expected) = state.profile.native_session_id.as_deref() {
             if started.native_session_id.as_deref() != Some(expected) {
-                return Err(ActorError::NativeIdentityMismatch);
+                return Err(ActorError::identity_mismatch(&[
+                    FreshAgentIdentityMismatchField::NativeSessionId,
+                ]));
             }
         } else if let Some(native_session_id) = started.native_session_id {
             state.profile.native_session_id = Some(native_session_id.clone());
@@ -959,14 +1059,18 @@ impl FreshAgentHostActor {
 
     pub async fn prepare_native_readiness(&self) -> Result<(), ActorError> {
         if self.stopped.load(Ordering::SeqCst) {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::ActorLifecycleState,
+            ]));
         }
         self.transport
             .prepare_native_readiness()
             .await
             .map_err(ActorError::Transport)?;
         if self.stopped.load(Ordering::SeqCst) {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::ActorLifecycleState,
+            ]));
         }
         Ok(())
     }
@@ -1038,7 +1142,9 @@ impl FreshAgentHostActor {
         evidence: Option<Value>,
     ) -> Result<(), ActorError> {
         if native_session_id.is_empty() || native_session_id.chars().any(char::is_control) {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+            ]));
         }
         let mut state = self.state.lock().await;
         if self.native_identity_transition.load(Ordering::SeqCst)
@@ -1047,7 +1153,9 @@ impl FreshAgentHostActor {
             // Native operation acknowledgements settle a root transition. A
             // racing lifecycle event alone cannot adopt a child or revive its
             // retired parent while that operation is incomplete.
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::ActorLifecycleState,
+            ]));
         }
         match state.profile.native_session_id.as_deref() {
             Some(existing) if existing != native_session_id => {
@@ -1062,7 +1170,10 @@ impl FreshAgentHostActor {
                             == Some(native_session_id.as_str())
                 });
                 if !proven_clear {
-                    return Err(ActorError::NativeIdentityMismatch);
+                    return Err(ActorError::identity_mismatch(&[
+                        FreshAgentIdentityMismatchField::NativeSessionId,
+                        FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+                    ]));
                 }
                 state.profile.native_session_id = Some(native_session_id.clone());
                 if let Some(reference) = state.profile.session_ref.as_mut() {
@@ -1113,7 +1224,9 @@ impl FreshAgentHostActor {
         if self.native_identity_transition.load(Ordering::SeqCst)
             || self.stopped.load(Ordering::SeqCst)
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::ActorLifecycleState,
+            ]));
         }
         // Preserve the exact historical digest for legacy sends so a command
         // journal created before this field existed remains idempotent after
@@ -1313,10 +1426,14 @@ impl FreshAgentHostActor {
             if self.native_identity_transition.load(Ordering::SeqCst)
                 || self.stopped.load(Ordering::SeqCst)
             {
-                return Err(ActorError::NativeIdentityMismatch);
+                return Err(ActorError::identity_mismatch(&[
+                    FreshAgentIdentityMismatchField::ActorLifecycleState,
+                ]));
             }
             if state.profile.native_session_id.as_deref() != Some(parent_session_id.as_str()) {
-                return Err(ActorError::NativeIdentityMismatch);
+                return Err(ActorError::identity_mismatch(&[
+                    FreshAgentIdentityMismatchField::NativeSessionId,
+                ]));
             }
             state.commands.insert(
                 request_id.as_str().to_string(),
@@ -1485,7 +1602,9 @@ impl FreshAgentHostActor {
         if self.native_identity_transition.load(Ordering::SeqCst)
             || self.stopped.load(Ordering::SeqCst)
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::ActorLifecycleState,
+            ]));
         }
         let live_supported = self
             .transport
@@ -1716,7 +1835,11 @@ impl FreshAgentHostActor {
             || snapshot["provider"].as_str() != Some(provider)
             || snapshot["sessionType"].as_str() != Some(session_type)
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::Provider,
+                FreshAgentIdentityMismatchField::SessionType,
+            ]));
         }
         // Snapshots use the existing native-history reply allowance, including envelope overhead.
         if serde_json::to_vec(&snapshot)
@@ -1737,7 +1860,11 @@ impl FreshAgentHostActor {
             || before.native_session_id.is_none()
             || !self.transport.is_live().await
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::Provider,
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::TransportLiveness,
+            ]));
         }
         let value = self
             .transport
@@ -1751,7 +1878,13 @@ impl FreshAgentHostActor {
             || before.cwd != after.cwd
             || !self.transport.is_live().await
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::ProviderStoreId,
+                FreshAgentIdentityMismatchField::Provider,
+                FreshAgentIdentityMismatchField::Cwd,
+                FreshAgentIdentityMismatchField::TransportLiveness,
+            ]));
         }
         if serde_json::to_vec(&value)
             .map_err(|e| ActorError::Transport(e.to_string()))?
@@ -1809,7 +1942,11 @@ impl FreshAgentHostActor {
             || before.native_session_id.is_none()
             || !self.transport.is_live().await
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::Provider,
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::TransportLiveness,
+            ]));
         }
         let value = self
             .transport
@@ -1825,7 +1962,11 @@ impl FreshAgentHostActor {
                 && (value["snapshot"]["threadId"].as_str() != Some(child_thread_id)
                     || value["snapshot"]["provider"] != "codex"))
         {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::Provider,
+                FreshAgentIdentityMismatchField::TransportLiveness,
+            ]));
         }
         if serde_json::to_vec(&value)
             .map_err(|error| ActorError::Transport(error.to_string()))?
@@ -1934,7 +2075,10 @@ impl FreshAgentHostActor {
         let verified_checkpoint =
             current_native_checkpoint(&payload, current_root.as_deref(), current_evidence.as_ref());
         if payload.get("nativeCheckpoint").is_some() && verified_checkpoint.is_none() {
-            return Err(ActorError::NativeIdentityMismatch);
+            return Err(ActorError::identity_mismatch(&[
+                FreshAgentIdentityMismatchField::NativeSessionId,
+                FreshAgentIdentityMismatchField::NativeIdentityEvidence,
+            ]));
         }
         let mut state = self.state.lock().await;
         if let Some(existing) = state.decisions.get(&decision_id) {

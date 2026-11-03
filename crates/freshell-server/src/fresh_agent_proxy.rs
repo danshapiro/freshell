@@ -18,9 +18,9 @@ use freshell_protocol::{
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
-    FreshAgentProviderStartDiagnostic, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeDiagnosticCode,
-    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
+    FreshAgentOpenFailureSubtype, FreshAgentProviderStartDiagnostic, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId,
+    RuntimeDiagnosticCode, RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -208,11 +208,16 @@ impl HostedFreshAgentProxy {
             }
             None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
         };
-        if result.is_err() {
-            self.error_event(
+        if let Err(error) = result {
+            // The refusal frame keeps the human-readable message generic but
+            // must carry the supervisor's typed closed-enum reason: the
+            // recovery admission verdict, or the fresh-agent open-failure
+            // subtype the supervisor's activation diagnostics recorded.
+            self.error_event_code(
                 &provider,
                 &session_id,
                 session_type,
+                send_refusal_code(&error),
                 "managed fresh-agent input was not accepted",
             );
         }
@@ -2208,6 +2213,42 @@ fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'stati
         Some(RuntimeErrorCode::OperationImplementationUnavailable) => "IMPLEMENTATION_UNAVAILABLE",
         Some(RuntimeErrorCode::CommandAmbiguous) => "COMMAND_AMBIGUOUS",
         Some(RuntimeErrorCode::RequestIdConflict) => "REQUEST_ID_CONFLICT",
+        _ => "MANAGED_FRESH_AGENT_ERROR",
+    }
+}
+
+/// The typed closed-enum code for a refused managed send. Only fixed values
+/// from closed enums cross the wire here; the human-readable refusal message
+/// stays generic and no provider prose is included.
+fn send_refusal_code(error: &freshell_runtime_client::ClientError) -> &'static str {
+    match error {
+        freshell_runtime_client::ClientError::Runtime {
+            code: RuntimeErrorCode::RecoveryBlocked,
+            ..
+        } => "FRESH_AGENT_RECOVERY_BLOCKED",
+        // A blocked or recovering soul has no live incarnation, so the
+        // registry answers UnknownSoul before admission; this is a temporary
+        // refusal, never a lost-session verdict.
+        freshell_runtime_client::ClientError::Runtime {
+            code: RuntimeErrorCode::UnknownSoul,
+            ..
+        } => "FRESH_AGENT_SESSION_UNAVAILABLE",
+        freshell_runtime_client::ClientError::Runtime {
+            fresh_agent_open_failure: Some(diagnostic),
+            ..
+        } => match diagnostic.subtype {
+            FreshAgentOpenFailureSubtype::NativeIdentityMismatch => {
+                "FRESH_AGENT_OPEN_NATIVE_IDENTITY_MISMATCH"
+            }
+            FreshAgentOpenFailureSubtype::WriterBusy => "FRESH_AGENT_OPEN_WRITER_BUSY",
+            FreshAgentOpenFailureSubtype::StateUnreadable => "FRESH_AGENT_OPEN_STATE_UNREADABLE",
+            FreshAgentOpenFailureSubtype::AmbiguousIdentity => {
+                "FRESH_AGENT_OPEN_AMBIGUOUS_IDENTITY"
+            }
+            FreshAgentOpenFailureSubtype::InvalidProfile => "FRESH_AGENT_OPEN_INVALID_PROFILE",
+            FreshAgentOpenFailureSubtype::Transport => "FRESH_AGENT_OPEN_TRANSPORT",
+            FreshAgentOpenFailureSubtype::Unclassified => "FRESH_AGENT_OPEN_FAILED",
+        },
         _ => "MANAGED_FRESH_AGENT_ERROR",
     }
 }

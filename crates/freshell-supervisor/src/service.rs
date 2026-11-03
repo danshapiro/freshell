@@ -7413,6 +7413,56 @@ mod release_scope_tests {
                 .contains("private local preparation detail"));
         }
     }
+
+    #[test]
+    fn activation_failure_data_includes_the_typed_open_failure_subtype() {
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: LaunchNonce::new(),
+            state: LaunchState::Created,
+            intent_revision: 7,
+            existing_request: false,
+        };
+        let error = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start",
+        )
+        .with_diagnostic_code(
+            freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentOpenFailed,
+        )
+        .with_fresh_agent_open_failure(
+            freshell_runtime_protocol::FreshAgentOpenFailureDiagnostic {
+                subtype:
+                    freshell_runtime_protocol::FreshAgentOpenFailureSubtype::NativeIdentityMismatch,
+                mismatched_fields: freshell_runtime_protocol::FreshAgentIdentityMismatchFields(
+                    vec![
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchField::Cwd,
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchField::Effort,
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchField::PermissionMode,
+                    ],
+                ),
+            },
+        );
+
+        let data = activation_failure_data(
+            &prepared,
+            LaunchState::Starting,
+            "deliver_execution_grant",
+            &error,
+        );
+
+        assert_eq!(data["failureReason"], "FRESH_AGENT_OPEN_FAILED");
+        assert_eq!(data["openFailureSubtype"], "native_identity_mismatch");
+        assert_eq!(
+            data["openFailureMismatchedFields"],
+            serde_json::json!(["cwd", "effort", "permission_mode"])
+        );
+        assert!(data.get("errorMessage").is_none());
+        assert!(!data
+            .to_string()
+            .contains("hosted fresh-agent provider failed to start"));
+    }
 }
 
 #[cfg(test)]
@@ -9958,6 +10008,22 @@ fn append_event_locked(path: &Path, event: &str, data: serde_json::Value) {
     }
 }
 
+/// Adds the typed, redacted failure context to an activation-failure event.
+/// The closed diagnostic code names the failure class; the open-failure
+/// diagnostic adds the refusing check class and the compared field names —
+/// only ever names, never values, provider prose, or secrets.
+pub(crate) fn apply_typed_failure_context(data: &mut serde_json::Value, error: &RuntimeError) {
+    if let Some(reason) = error.diagnostic_code {
+        data["failureReason"] = serde_json::json!(reason);
+    }
+    if let Some(failure) = error.fresh_agent_open_failure.as_ref() {
+        data["openFailureSubtype"] = serde_json::json!(failure.subtype);
+        if !failure.mismatched_fields.is_empty() {
+            data["openFailureMismatchedFields"] = serde_json::json!(failure.mismatched_fields);
+        }
+    }
+}
+
 fn activation_failure_data(
     prepared: &PreparedLaunch,
     state: LaunchState,
@@ -9974,9 +10040,7 @@ fn activation_failure_data(
         "errorCode": error.code,
         "errorClass": "runtime_activation_failed",
     });
-    if let Some(reason) = error.diagnostic_code {
-        data["failureReason"] = serde_json::json!(reason);
-    }
+    apply_typed_failure_context(&mut data, error);
     data
 }
 

@@ -1231,6 +1231,135 @@ impl FreshAgentProviderStartDiagnostic {
     }
 }
 
+/// A closed, body-free reason that a managed fresh-agent actor failed to
+/// open. The value names the check class that refused the open — never a
+/// guessed inner cause. `NativeIdentityMismatch` arises from several
+/// distinct checks (profile comparison, native-start identity, resume
+/// fences), so all of its raise sites share the one honest coarse subtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAgentOpenFailureSubtype {
+    NativeIdentityMismatch,
+    WriterBusy,
+    StateUnreadable,
+    AmbiguousIdentity,
+    InvalidProfile,
+    Transport,
+    Unclassified,
+}
+
+impl FreshAgentOpenFailureSubtype {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeIdentityMismatch => "native_identity_mismatch",
+            Self::WriterBusy => "writer_busy",
+            Self::StateUnreadable => "state_unreadable",
+            Self::AmbiguousIdentity => "ambiguous_identity",
+            Self::InvalidProfile => "invalid_profile",
+            Self::Transport => "transport",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Redacted name of one thing a native-identity check compared. The set is
+/// closed: launch-profile fields, the actor lifecycle flags, and the
+/// transport identity evidence a check reads. Values, provider prose, and
+/// secrets never cross a boundary through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAgentIdentityMismatchField {
+    NamingHandle,
+    CollaborationMode,
+    Provider,
+    RuntimeVariant,
+    Cwd,
+    Model,
+    Effort,
+    PermissionMode,
+    Sandbox,
+    ProviderStoreId,
+    NativeSessionId,
+    Plugins,
+    ModelSelection,
+    SessionRef,
+    ProviderLaunchContext,
+    ProviderSecretReferences,
+    ForkRecipe,
+    NativeIdentityEvidence,
+    ActorLifecycleState,
+    SessionType,
+    TransportLiveness,
+}
+
+impl FreshAgentIdentityMismatchField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NamingHandle => "naming_handle",
+            Self::CollaborationMode => "collaboration_mode",
+            Self::Provider => "provider",
+            Self::RuntimeVariant => "runtime_variant",
+            Self::Cwd => "cwd",
+            Self::Model => "model",
+            Self::Effort => "effort",
+            Self::PermissionMode => "permission_mode",
+            Self::Sandbox => "sandbox",
+            Self::ProviderStoreId => "provider_store_id",
+            Self::NativeSessionId => "native_session_id",
+            Self::Plugins => "plugins",
+            Self::ModelSelection => "model_selection",
+            Self::SessionRef => "session_ref",
+            Self::ProviderLaunchContext => "provider_launch_context",
+            Self::ProviderSecretReferences => "provider_secret_references",
+            Self::ForkRecipe => "fork_recipe",
+            Self::NativeIdentityEvidence => "native_identity_evidence",
+            Self::ActorLifecycleState => "actor_lifecycle_state",
+            Self::SessionType => "session_type",
+            Self::TransportLiveness => "transport_liveness",
+        }
+    }
+}
+
+/// The redacted field names one native-identity check compared. Serializes
+/// as the plain name array; `Display` lists only the names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FreshAgentIdentityMismatchFields(pub Vec<FreshAgentIdentityMismatchField>);
+
+impl FreshAgentIdentityMismatchFields {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for FreshAgentIdentityMismatchFields {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = self.0.iter().map(|field| field.as_str());
+        if let Some(first) = names.next() {
+            formatter.write_str(first)?;
+            for name in names {
+                formatter.write_str(", ")?;
+                formatter.write_str(name)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Typed, redacted context for a managed fresh-agent open failure. The
+/// subtype names the refusing check class; the mismatched field names (only
+/// ever names, never values) say what an identity check compared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentOpenFailureDiagnostic {
+    pub subtype: FreshAgentOpenFailureSubtype,
+    #[serde(
+        default,
+        skip_serializing_if = "FreshAgentIdentityMismatchFields::is_empty"
+    )]
+    pub mismatched_fields: FreshAgentIdentityMismatchFields,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeLimits {
@@ -3522,6 +3651,8 @@ pub struct RuntimeError {
     pub diagnostic_code: Option<RuntimeDiagnosticCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_open_failure: Option<FreshAgentOpenFailureDiagnostic>,
 }
 
 impl RuntimeError {
@@ -3531,6 +3662,7 @@ impl RuntimeError {
             message: message.into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_open_failure: None,
         }
     }
 
@@ -3544,6 +3676,14 @@ impl RuntimeError {
         diagnostic: FreshAgentProviderStartDiagnostic,
     ) -> Self {
         self.fresh_agent_provider_start_diagnostic = Some(diagnostic);
+        self
+    }
+
+    pub fn with_fresh_agent_open_failure(
+        mut self,
+        diagnostic: FreshAgentOpenFailureDiagnostic,
+    ) -> Self {
+        self.fresh_agent_open_failure = Some(diagnostic);
         self
     }
 }
@@ -5559,6 +5699,62 @@ mod tests {
         assert!(undecorated
             .get("freshAgentProviderStartDiagnostic")
             .is_none());
+    }
+
+    #[test]
+    fn fresh_agent_open_failure_diagnostics_serialize_body_free_and_compatibly() {
+        let open_failure = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+        .with_fresh_agent_open_failure(FreshAgentOpenFailureDiagnostic {
+            subtype: FreshAgentOpenFailureSubtype::NativeIdentityMismatch,
+            mismatched_fields: FreshAgentIdentityMismatchFields(vec![
+                FreshAgentIdentityMismatchField::Cwd,
+                FreshAgentIdentityMismatchField::Effort,
+                FreshAgentIdentityMismatchField::PermissionMode,
+            ]),
+        });
+        let encoded = serde_json::to_value(&open_failure).unwrap();
+        assert_eq!(encoded["diagnosticCode"], "FRESH_AGENT_OPEN_FAILED");
+        assert_eq!(
+            encoded["freshAgentOpenFailure"]["subtype"],
+            "native_identity_mismatch"
+        );
+        assert_eq!(
+            encoded["freshAgentOpenFailure"]["mismatchedFields"],
+            serde_json::json!(["cwd", "effort", "permission_mode"])
+        );
+
+        let without_fields =
+            RuntimeError::new(RuntimeErrorCode::HostUnreachable, "legacy host error")
+                .with_fresh_agent_open_failure(FreshAgentOpenFailureDiagnostic {
+                    subtype: FreshAgentOpenFailureSubtype::WriterBusy,
+                    mismatched_fields: FreshAgentIdentityMismatchFields::default(),
+                });
+        let encoded_without_fields = serde_json::to_value(&without_fields).unwrap();
+        assert_eq!(
+            encoded_without_fields["freshAgentOpenFailure"]["subtype"],
+            "writer_busy"
+        );
+        assert!(encoded_without_fields["freshAgentOpenFailure"]
+            .get("mismatchedFields")
+            .is_none());
+
+        let old_payload = serde_json::json!({
+            "code": "HOST_UNREACHABLE",
+            "message": "legacy host error",
+        });
+        let decoded: RuntimeError = serde_json::from_value(old_payload).unwrap();
+        assert_eq!(decoded.fresh_agent_open_failure, None);
+
+        let undecorated = serde_json::to_value(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "legacy host error",
+        ))
+        .unwrap();
+        assert!(undecorated.get("freshAgentOpenFailure").is_none());
     }
 
     #[test]

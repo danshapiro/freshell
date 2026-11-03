@@ -2225,6 +2225,101 @@ async fn hosted_configure_rpc_failure_answers_a_typed_nested_error() {
 }
 
 #[tokio::test]
+async fn send_refusals_surface_typed_recovery_and_open_failure_codes() {
+    for (refusal, expected_code) in [
+        (
+            freshell_runtime_protocol::RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "fresh-agent input requires the current committed native identity",
+            ),
+            "FRESH_AGENT_RECOVERY_BLOCKED",
+        ),
+        (
+            // A blocked soul has no live incarnation, so the registry answers
+            // UnknownSoul before admission — the actual typed refusal class of
+            // the post-crash recovery sequence.
+            freshell_runtime_protocol::RuntimeError::new(
+                RuntimeErrorCode::UnknownSoul,
+                "private registry detail",
+            ),
+            "FRESH_AGENT_SESSION_UNAVAILABLE",
+        ),
+        (
+            freshell_runtime_protocol::RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "hosted fresh-agent provider failed to start",
+            )
+            .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+            .with_fresh_agent_open_failure(
+                freshell_runtime_protocol::FreshAgentOpenFailureDiagnostic {
+                    subtype: freshell_runtime_protocol::FreshAgentOpenFailureSubtype::NativeIdentityMismatch,
+                    mismatched_fields:
+                        freshell_runtime_protocol::FreshAgentIdentityMismatchFields(vec![
+                            freshell_runtime_protocol::FreshAgentIdentityMismatchField::PermissionMode,
+                        ]),
+                },
+            ),
+            "FRESH_AGENT_OPEN_NATIVE_IDENTITY_MISMATCH",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("send-refusal.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected_refusal = refusal.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let result = match request.body {
+                    AdminCommand::Health => Ok(AdminResult::Health {
+                        control_epoch: 77,
+                        installation_id: InstallationId::new(),
+                    }),
+                    AdminCommand::FreshAgentSend(_) => Err(expected_refusal.clone()),
+                    other => panic!("unexpected send-refusal request {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let (proxy, mut receiver) = configure_proxy(
+            &socket,
+            HashMap::from([(
+                ("codex".into(), "public-1".into()),
+                SoulId::parse("send-refusal-soul").unwrap(),
+            )]),
+        );
+        let message = serde_json::from_value(serde_json::json!({
+            "provider":"codex","sessionId":"public-1","sessionType":"freshcodex",
+            "text":"recovery prompt"
+        }))
+        .unwrap();
+        proxy
+            .handle(HostedFreshAgentCommand::Send(message))
+            .await;
+        server.await.unwrap();
+
+        let frame = receiver.try_recv().expect("a refused send is visible");
+        let ServerMessage::FreshAgentEvent(event) = serde_json::from_str(&frame).unwrap() else {
+            panic!("expected a nested fresh-agent event: {frame}")
+        };
+        assert_eq!(event.session_id, "public-1");
+        assert_eq!(event.event["type"], "freshAgent.error");
+        assert_eq!(
+            event.event["code"], expected_code,
+            "the refusal must name the supervisor's typed closed-enum reason"
+        );
+    }
+}
+
+#[tokio::test]
 async fn hosted_configure_for_an_unknown_soul_answers_a_nested_error_not_a_lost_session() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("supervisor.sock");
@@ -3087,6 +3182,7 @@ fn semantic_operation_failures_keep_typed_public_codes() {
             message: "redacted".into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_open_failure: None,
         }),
         "UNSUPPORTED_CAPABILITY"
     );
@@ -3096,6 +3192,7 @@ fn semantic_operation_failures_keep_typed_public_codes() {
             message: "redacted".into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_open_failure: None,
         }),
         "COMMAND_AMBIGUOUS"
     );
@@ -3105,6 +3202,7 @@ fn semantic_operation_failures_keep_typed_public_codes() {
             message: "redacted".into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_open_failure: None,
         }),
         "IMPLEMENTATION_UNAVAILABLE"
     );
