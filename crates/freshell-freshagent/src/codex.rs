@@ -1250,6 +1250,15 @@ impl ResumeSessionError {
     }
 }
 
+enum FreshAgentErrorContext<'a> {
+    Session,
+    Operation {
+        request_id: Option<&'a str>,
+        attempt_id: Option<&'a str>,
+        uncertain: bool,
+    },
+}
+
 impl FreshCodexState {
     /// Build the state around the shared broadcast bus + the current settings tree.
     pub fn new(
@@ -2497,7 +2506,12 @@ impl FreshCodexState {
     /// (locator resolution) and `message` is user-facing (the banner shows the message,
     /// never the code).
     fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str) {
-        self.emit_fresh_agent_error_inner(session_id, None, false, false, code, message, None);
+        self.emit_fresh_agent_error_inner(
+            session_id,
+            code,
+            message,
+            FreshAgentErrorContext::Session,
+        );
     }
 
     fn emit_fresh_agent_error_for_request(
@@ -2507,7 +2521,16 @@ impl FreshCodexState {
         code: &str,
         message: &str,
     ) {
-        self.emit_fresh_agent_error_inner(session_id, request_id, true, false, code, message, None);
+        self.emit_fresh_agent_error_inner(
+            session_id,
+            code,
+            message,
+            FreshAgentErrorContext::Operation {
+                request_id,
+                attempt_id: None,
+                uncertain: false,
+            },
+        );
     }
 
     fn emit_control_answer_error(
@@ -2520,12 +2543,13 @@ impl FreshCodexState {
     ) {
         self.emit_fresh_agent_error_inner(
             session_id,
-            Some(request_id),
-            true,
-            false,
             code,
             message,
-            operation_attempt_id,
+            FreshAgentErrorContext::Operation {
+                request_id: Some(request_id),
+                attempt_id: operation_attempt_id,
+                uncertain: false,
+            },
         );
     }
 
@@ -2555,18 +2579,24 @@ impl FreshCodexState {
         code: &str,
         message: &str,
     ) {
-        self.emit_fresh_agent_error_inner(session_id, request_id, true, true, code, message, None);
+        self.emit_fresh_agent_error_inner(
+            session_id,
+            code,
+            message,
+            FreshAgentErrorContext::Operation {
+                request_id,
+                attempt_id: None,
+                uncertain: true,
+            },
+        );
     }
 
     fn emit_fresh_agent_error_inner(
         &self,
         session_id: &str,
-        request_id: Option<&str>,
-        operation: bool,
-        uncertain: bool,
         code: &str,
         message: &str,
-        operation_attempt_id: Option<&str>,
+        context: FreshAgentErrorContext<'_>,
     ) {
         let mut event = json!({
             "type": "freshAgent.error",
@@ -2574,17 +2604,22 @@ impl FreshCodexState {
             "code": code,
             "message": message,
         });
-        if let Some(request_id) = request_id {
-            event["requestId"] = json!(request_id);
-        }
-        if operation {
+        if let FreshAgentErrorContext::Operation {
+            request_id,
+            attempt_id,
+            uncertain,
+        } = context
+        {
+            if let Some(request_id) = request_id {
+                event["requestId"] = json!(request_id);
+            }
             event["operationReceipt"] = json!(true);
-        }
-        if uncertain {
-            event["operationOutcomeUncertain"] = json!(true);
-        }
-        if let Some(operation_attempt_id) = operation_attempt_id {
-            event["operationAttemptId"] = json!(operation_attempt_id);
+            if uncertain {
+                event["operationOutcomeUncertain"] = json!(true);
+            }
+            if let Some(attempt_id) = attempt_id {
+                event["operationAttemptId"] = json!(attempt_id);
+            }
         }
         self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
             event,
