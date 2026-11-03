@@ -410,6 +410,37 @@ function gdbProgram(loader: string, libDir: string, gdbPath: string, dataDir: st
     '--data-directory', shellQuote(dataDir), '-nx', '--batch', '-x', shellQuote(scriptPath)].join(' ')
 }
 
+export function buildSupervisorObserverWrapper(command: string, paths: {
+  wrapperStartedPath: string
+  launchOutputPath: string
+  pidPath: string
+  exitPath: string
+}): string {
+  return [
+    'umask 077',
+    'ulimit -c 0',
+    'printf started > ' + shellQuote(paths.wrapperStartedPath),
+    command + ' > ' + shellQuote(paths.launchOutputPath) + ' 2>&1 & observer_pid=$!',
+    'printf "%s\\n" "$observer_pid" > ' + shellQuote(paths.pidPath),
+    'wait "$observer_pid"',
+    'status=$?',
+    'printf "%s\\n" "$status" > ' + shellQuote(paths.exitPath),
+    'exit "$status"',
+  ].join('; ')
+}
+
+export function buildSupervisorTargetWrapper(command: string, pidPath: string, exitPath: string): string {
+  return [
+    'ulimit -c 0',
+    command + ' & target=$!',
+    'printf "%s\\n" "$target" > ' + shellQuote(pidPath),
+    'wait "$target"',
+    'status=$?',
+    'printf "%s\\n" "$status" > ' + shellQuote(exitPath),
+    'exit "$status"',
+  ].join('; ')
+}
+
 function gdbScript(options: {
   pid: number
   libDir: string
@@ -731,18 +762,7 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
       observerFinalized = true
     }
     cleanupObserver = stopObserver
-    const observerWrapper = [
-      'umask 077',
-      'ulimit -c 0',
-      'printf started > ' + shellQuote(observer.wrapperStartedPath),
-      observerCommand + ' > ' + shellQuote(observer.launchOutputPath) + ' 2>&1 &',
-      'observer_pid=$!',
-      'printf "%s\\n" "$observer_pid" > ' + shellQuote(observer.pidPath),
-      'wait "$observer_pid"',
-      'status=$?',
-      'printf "%s\\n" "$status" > ' + shellQuote(observer.exitPath),
-      'exit "$status"',
-    ].join('; ')
+    const observerWrapper = buildSupervisorObserverWrapper(observerCommand, observer)
     failureOutputPaths = [observer.logPath, observer.launchOutputPath]
     failureStage = 'gdb_wrapper_start'
     rig.runtime.startOwnedContainerDetachedExact(containerId, ['/bin/sh', '-c', observerWrapper])
@@ -778,16 +798,11 @@ export async function startSupervisorCrashDiagnostics(rig: CrashCaptureRig): Pro
       for (const file of Object.values(paths)) {
         if (fs.existsSync(file)) fs.rmSync(file, { force: true })
       }
-      const targetWrapper = [
-        'ulimit -c 0',
-        shellQuote(helperBinary) + ' ' + mode + ' &',
-        'target=$!',
-        'printf "%s\\n" "$target" > ' + shellQuote(paths.pid),
-        'wait "$target"',
-        'status=$?',
-        'printf "%s\\n" "$status" > ' + shellQuote(paths.targetExit),
-        'exit "$status"',
-      ].join('; ')
+      const targetWrapper = buildSupervisorTargetWrapper(
+        shellQuote(helperBinary) + ' ' + mode,
+        paths.pid,
+        paths.targetExit,
+      )
       rig.runtime.startOwnedContainerDetachedExact(containerId, ['/bin/sh', '-c', targetWrapper])
       await waitForFile(paths.ready, 5_000)
       const targetPidText = fs.readFileSync(paths.pid, 'utf8').trim()

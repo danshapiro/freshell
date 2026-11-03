@@ -1,12 +1,155 @@
 import { describe, expect, it } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
 import {
+  buildSupervisorObserverWrapper,
+  buildSupervisorTargetWrapper,
   classifySupervisorGdbFailure,
   summarizeSupervisorGdbAttachFacts,
   summarizeSupervisorGdbFailureOutput,
   summarizeSupervisorGdbOutput,
 } from '../../helpers/supervisor-crash-diagnostics.js'
 
+async function waitForFile(filePath: string, child: ReturnType<typeof spawn>): Promise<void> {
+  const deadline = Date.now() + 1_500
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) return
+    if (child.exitCode !== null) {
+      throw new Error('wrapper exited before its marker (code=' + child.exitCode + ')')
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error('wrapper marker did not appear')
+}
+
+async function waitForExit(
+  promise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('wrapper did not exit')), 1_500)
+      timer.unref()
+    }),
+  ])
+}
+
 describe('supervisor crash diagnostic parsing', () => {
+  it.skipIf(process.platform === 'win32')('executes the exact detached observer and target wrappers and waits for their children', async () => {
+    const temporaryRoot = path.join(process.cwd(), '.test-tmp')
+    fs.mkdirSync(temporaryRoot, { recursive: true, mode: 0o700 })
+    const directory = fs.mkdtempSync(path.join(temporaryRoot, 'supervisor-gdb-wrapper-'))
+    const stubPath = path.join(directory, 'stub-child.sh')
+    fs.writeFileSync(stubPath, [
+      '#!/bin/sh',
+      'printf "%s\\n" "$1" > child-mode',
+      'printf "%s\\n" "$$" > child-self-pid',
+      'printf started > child-started',
+      'while [ ! -f release ]; do sleep 0.01; done',
+      'printf done > child-done',
+      'exit 7',
+      '',
+    ].join('\n'), { mode: 0o700 })
+    fs.chmodSync(stubPath, 0o700)
+
+    try {
+      const cases = [
+        {
+          kind: 'observer',
+          wrapperStartedPath: path.join(directory, 'wrapper-started'),
+          launchOutputPath: path.join(directory, 'launch-output'),
+          pidPath: path.join(directory, 'child.pid'),
+          exitPath: path.join(directory, 'child.exit'),
+          build: (paths: { wrapperStartedPath: string; launchOutputPath: string; pidPath: string; exitPath: string }) =>
+            buildSupervisorObserverWrapper('./stub-child.sh observer', paths),
+        },
+        {
+          kind: 'target',
+          wrapperStartedPath: undefined,
+          launchOutputPath: undefined,
+          pidPath: path.join(directory, 'target.pid'),
+          exitPath: path.join(directory, 'target.exit'),
+          build: (paths: { pidPath: string; exitPath: string }) =>
+            buildSupervisorTargetWrapper('./stub-child.sh segv', paths.pidPath, paths.exitPath),
+        },
+      ] as const
+
+      for (const wrapperCase of cases) {
+        for (const file of [
+          path.join(directory, 'child-mode'),
+          path.join(directory, 'child-self-pid'),
+          path.join(directory, 'child-started'),
+          path.join(directory, 'child-done'),
+          path.join(directory, 'release'),
+          wrapperCase.wrapperStartedPath,
+          wrapperCase.launchOutputPath,
+          wrapperCase.pidPath,
+          wrapperCase.exitPath,
+        ]) {
+          if (file && fs.existsSync(file)) fs.rmSync(file, { force: true })
+        }
+        const wrapper = wrapperCase.kind === 'observer'
+          ? wrapperCase.build({
+            wrapperStartedPath: wrapperCase.wrapperStartedPath!,
+            launchOutputPath: wrapperCase.launchOutputPath!,
+            pidPath: wrapperCase.pidPath,
+            exitPath: wrapperCase.exitPath,
+          })
+          : wrapperCase.build({ pidPath: wrapperCase.pidPath, exitPath: wrapperCase.exitPath })
+        const child = spawn('/bin/sh', ['-c', wrapper], {
+          cwd: directory,
+          detached: true,
+          stdio: 'ignore',
+        })
+        const completed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+          child.once('error', reject)
+          child.once('exit', (code, signal) => resolve({ code, signal }))
+        })
+
+        try {
+          if (wrapperCase.wrapperStartedPath) await waitForFile(wrapperCase.wrapperStartedPath, child)
+          await waitForFile(path.join(directory, 'child-started'), child)
+          expect(child.exitCode).toBeNull()
+          expect(fs.existsSync(wrapperCase.exitPath)).toBe(false)
+          expect(fs.readFileSync(path.join(directory, 'child-mode'), 'utf8').trim())
+            .toBe(wrapperCase.kind === 'observer' ? 'observer' : 'segv')
+
+          fs.writeFileSync(path.join(directory, 'release'), 'release')
+          expect(await waitForExit(completed)).toEqual({ code: 7, signal: null })
+          expect(fs.readFileSync(wrapperCase.exitPath, 'utf8').trim()).toBe('7')
+          expect(fs.readFileSync(path.join(directory, 'child-done'), 'utf8')).toBe('done')
+          const wrapperPid = Number(fs.readFileSync(wrapperCase.pidPath, 'utf8').trim())
+          const childPid = Number(fs.readFileSync(path.join(directory, 'child-self-pid'), 'utf8').trim())
+          expect(wrapperPid).toBeGreaterThan(1)
+          expect(wrapperPid).toBe(childPid)
+          expect(() => process.kill(childPid, 0)).toThrow(/ESRCH/)
+        } finally {
+          fs.writeFileSync(path.join(directory, 'release'), 'release')
+          const settleDeadline = Date.now() + 500
+          while (Date.now() < settleDeadline
+            && (child.exitCode === null
+              || (fs.existsSync(path.join(directory, 'child-started'))
+                && !fs.existsSync(path.join(directory, 'child-done'))))) {
+            await new Promise(resolve => setTimeout(resolve, 10))
+          }
+          const childStillRunning = fs.existsSync(path.join(directory, 'child-started'))
+            && !fs.existsSync(path.join(directory, 'child-done'))
+          if (child.pid !== undefined && (child.exitCode === null || childStillRunning)) {
+            try {
+              process.kill(-child.pid, 'SIGKILL')
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+            }
+          }
+          if (child.exitCode === null) await waitForExit(completed)
+        }
+      }
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('keeps signal, thread, and symbol evidence while removing addresses and paths', () => {
     const summary = summarizeSupervisorGdbOutput([
       'FRESHELL_GDB_ATTACHED',
