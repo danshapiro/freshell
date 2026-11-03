@@ -8,6 +8,7 @@ import panesReducer, {
   removeLayout,
   replacePane,
   updatePaneContent,
+  closePane,
 } from '@/store/panesSlice'
 import connectionReducer, { setSessionIndexReady, setStatus } from '@/store/connectionSlice'
 import type { PaneNode, ReconcileWarmingState, TerminalPaneContent } from '@/store/paneTypes'
@@ -767,6 +768,124 @@ describe('ReconcileWarmingRecoveryDriver', () => {
       // The rebound pane keeps its new identity untouched.
       expect(terminalContentOf(store).createRequestId).toBe('cr-new')
       expect(terminalContentOf(store).terminalId).toBeUndefined()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('with multiple parked panes, logs the failure warn only for the still-open pane when one closed mid-drive (focused review r5, minor)', () => {
+    // Focused review r5 (Minor): warming-ref membership alone is not proof
+    // a pane is still open under the verdict's identity. With MULTIPLE
+    // parked panes, closing ONE leaves its ref in the warming state (the
+    // state persists because the other pane remains); the reducer's
+    // identity guard correctly rejects the closed pane's stale error
+    // verdict, and the failure record must not fire for it — only for
+    // the still-open pane, with its cause and elapsed time.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 2, paneRefs: [ref('p1'), ref('p2')] },
+        paneIds: ['p1', 'p2'],
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      expect(req.panes).toHaveLength(2)
+      // Close p1 mid-drive: the warming state PERSISTS (p2 still parks),
+      // so p1's stale ref remains — and the in-flight drive holds
+      // single-flight (no re-drive for the survivor alone).
+      act(() => {
+        store.dispatch(closePane({ tabId: 'tab-1', paneId: 'p1' }))
+      })
+      expect(store.getState().panes.reconcileWarming).not.toBeNull()
+      expect(requests()).toHaveLength(1)
+      // The drive settles: an error verdict for the CLOSED p1 (rejected by
+      // the reducer's identity guard) AND a genuine error for p2.
+      deliverServerFrame(terminalErrorResultFor(req, 'session_store_unreadable'))
+      const text = warnText(warnSpy)
+      const failureRecords = text.match(/parked pane recovery failed/g) ?? []
+      // Exactly ONE failure record — for the still-open pane, with its
+      // cause and the drive's elapsed time.
+      expect(failureRecords).toHaveLength(1)
+      expect(text).toContain('parked pane recovery failed')
+      expect(text).toContain('tab-1:p2')
+      expect(text).toContain('cause=session_store_unreadable')
+      const elapsedMatch = text.match(/elapsedMs=(\d+)/)
+      expect(elapsedMatch).not.toBeNull()
+      const elapsedMs = Number(elapsedMatch![1])
+      expect(Number.isFinite(elapsedMs)).toBe(true)
+      expect(elapsedMs).toBeGreaterThanOrEqual(0)
+      // The closed pane's stale verdict is a CANCELED recovery — never a
+      // failure record.
+      expect(text).not.toContain('tab-1:p1')
+      // The still-open pane latched its honest error; the drive settled.
+      expect(terminalContentOf(store, 'p2').restoreError).toMatchObject({
+        reason: 'session_store_unreadable',
+      })
+      expect(store.getState().panes.reconcileWarming).toBeNull()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('with multiple parked panes, logs the failure warn only for the still-open pane when one rebound mid-drive (focused review r5, minor)', () => {
+    // Focused review r5 (Minor): the Replace-pane rebind race across
+    // MULTIPLE parked panes. The rebound pane keeps the paneId but carries
+    // a NEW createRequestId; its stale error verdict (for the
+    // replaced-away identity) is rejected by the reducer's identity
+    // guard, and the failure record must not fire for it — only for the
+    // still-open pane whose identity the verdict matches.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 2, paneRefs: [ref('p1'), ref('p2')] },
+        paneIds: ['p1', 'p2'],
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      expect(req.panes).toHaveLength(2)
+      // Rebind p1 mid-drive (same paneId, NEW content identity): the
+      // warming state PERSISTS (p2 still parks), so p1's stale ref
+      // remains, and the in-flight drive holds single-flight.
+      act(() => {
+        store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'p1' }))
+        store.dispatch(updatePaneContent({
+          tabId: 'tab-1',
+          paneId: 'p1',
+          content: {
+            kind: 'terminal',
+            mode: 'shell',
+            shell: 'system',
+            createRequestId: 'cr-new',
+            status: 'creating',
+          },
+        }))
+      })
+      expect(store.getState().panes.reconcileWarming).not.toBeNull()
+      expect(requests()).toHaveLength(1)
+      deliverServerFrame(terminalErrorResultFor(req, 'session_store_unreadable'))
+      const text = warnText(warnSpy)
+      const failureRecords = text.match(/parked pane recovery failed/g) ?? []
+      expect(failureRecords).toHaveLength(1)
+      expect(text).toContain('parked pane recovery failed')
+      expect(text).toContain('tab-1:p2')
+      expect(text).toContain('cause=session_store_unreadable')
+      const elapsedMatch = text.match(/elapsedMs=(\d+)/)
+      expect(elapsedMatch).not.toBeNull()
+      const elapsedMs = Number(elapsedMatch![1])
+      expect(Number.isFinite(elapsedMs)).toBe(true)
+      expect(elapsedMs).toBeGreaterThanOrEqual(0)
+      expect(text).not.toContain('tab-1:p1')
+      // The rebound pane keeps its new identity untouched (the stale
+      // verdict folded nothing); the still-open pane latched its honest
+      // error.
+      expect(terminalContentOf(store, 'p1').createRequestId).toBe('cr-new')
+      expect(terminalContentOf(store, 'p1').restoreError).toBeUndefined()
+      expect(terminalContentOf(store, 'p1').terminalId).toBeUndefined()
+      expect(terminalContentOf(store, 'p2').restoreError).toMatchObject({
+        reason: 'session_store_unreadable',
+      })
     } finally {
       warnSpy.mockRestore()
     }

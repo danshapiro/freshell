@@ -157,14 +157,25 @@ export function ReconcileWarmingRecoveryDriver(): null {
         if (msg.reconcileId !== request.reconcileId) return
         clearPending()
         // Focused review round 2, finding 3: correlate each verdict against
-        // the SETTLE-TIME warming state — the parked set as it stands at
-        // result arrival, after any mid-drive closure/rebind pruned it,
-        // BEFORE this drive's own folds mutate it. Only a pane still parked
+        // the SETTLE-TIME state — the parked set as it stands at result
+        // arrival, after any mid-drive closure/rebind pruned it, BEFORE
+        // this drive's own folds mutate it. Only a pane still parked
         // warming under the SAME createRequestId this drive sent is
         // recovery-relevant; a closed or rebound pane's stale verdict folds
         // nothing (the reducers' identity guard rejects it), and its
         // outcome is a CANCELED recovery, not a failed one.
-        const warmingAtSettle = store.getState().panes.reconcileWarming
+        // Focused r5 minor: warming-ref membership alone is not proof the
+        // pane is still open under that identity — with MULTIPLE parked
+        // panes, closing or rebinding ONE leaves its ref in the warming
+        // state (it persists while another pane remains). Capture the full
+        // settle state so the failure log below can mirror the reducer's
+        // identity guard (setPaneRestoreError's expectedCreateRequestId
+        // check) too: the pane must currently EXIST in the live layouts
+        // with the same createRequestId the verdict carries, so the log's
+        // predicate and the reducer's acceptance predicate can never
+        // disagree.
+        const stateAtSettle = store.getState()
+        const warmingAtSettle = stateAtSettle.panes.reconcileWarming
         const outcome = foldVerdicts(dispatch, request, msg)
         // Cardinality violation FIRST (mirror the banner handler): a
         // malformed result folds NOTHING — keep the banner + manual Retry.
@@ -190,9 +201,10 @@ export function ReconcileWarmingRecoveryDriver(): null {
         // a terminal outcome: it never produces a per-pane warn here (the
         // bounded backoff debug log and the gave-up aggregate warn at the
         // retry limit are its records), so nothing repeats per poll.
-        // Focused review round 2, finding 3: only panes STILL
-        // warming-relevant at settle (present in the settle-time warming
-        // map with the same createRequestId) get a failure record — a
+        // Focused review round 2, finding 3 + focused r5 minor: only panes
+        // STILL warming-relevant at settle get a failure record — present
+        // in the settle-time warming map with the same createRequestId AND
+        // still open in the live layouts under that same identity — a
         // pane closed or rebound mid-drive never does.
         for (const verdict of msg.verdicts) {
           const terminalFailureOutcome =
@@ -202,12 +214,27 @@ export function ReconcileWarmingRecoveryDriver(): null {
           if (!terminalFailureOutcome) continue
           const pane = request.panes.find((p) => p.paneKey === verdict.paneKey)
           if (!pane) continue
-          const stillWarmingAtSettle = warmingAtSettle?.paneRefs.some(
+          const warmingRefAtSettle = warmingAtSettle?.paneRefs.find(
             (r) =>
               paneKeyFor(r.tabId, r.paneId) === verdict.paneKey &&
               r.createRequestId === pane.createRequestId,
           )
-          if (!stillWarmingAtSettle) continue
+          if (!warmingRefAtSettle) continue
+          // Focused r5 minor: ALSO require the LIVE pane identity at
+          // settle — the pane exists in the live layouts (terminal or
+          // fresh-agent content at its tab/pane id) with the SAME
+          // createRequestId the verdict's fold passes as
+          // expectedCreateRequestId — mirroring setPaneRestoreError's
+          // identity guard exactly, so a pane closed or rebound mid-drive
+          // (whose stale verdict the reducer rejects) never gets a
+          // spurious failure record even when its ref still sits in the
+          // warming state behind another parked pane.
+          const settleContent = paneContentForRef(
+            stateAtSettle,
+            warmingRefAtSettle.tabId,
+            warmingRefAtSettle.paneId,
+          )
+          if (!settleContent || settleContent.createRequestId !== pane.createRequestId) continue
           log.warn(
             `parked pane recovery failed (verdict=${verdict.verdict}, cause=${verdict.reason ?? 'unknown'}, elapsedMs=${Date.now() - startedAt}, paneKey=${verdict.paneKey}, session=${pane.sessionRef ? `${pane.sessionRef.provider}:${pane.sessionRef.sessionId}` : '-'}, reconcileId=${request.reconcileId})`,
           )
