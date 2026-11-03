@@ -379,8 +379,14 @@ function shellQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'"
 }
 
-function gdbQuote(value: string): string {
-  return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+function gdbPathArgument(value: string): string {
+  // GDB's `set logging file` consumes the remainder as a literal filename;
+  // shell-style quotes become filename characters. These are run-owned,
+  // generated Linux paths, so accept only a plain absolute path token.
+  if (!path.isAbsolute(value) || path.normalize(value) !== value || !/^\/[A-Za-z0-9_./-]+$/.test(value)) {
+    throw new Error('GDB diagnostic path contains unsupported characters')
+  }
+  return value
 }
 
 async function waitForFile(
@@ -458,10 +464,10 @@ function gdbScript(options: {
     'set print frame-arguments none',
     'set print entry-values no',
     'set debuginfod enabled off',
-    'set auto-load safe-path ' + gdbQuote(options.libDir),
-    'set libthread-db-search-path ' + gdbQuote(options.libDir),
+    'set auto-load safe-path ' + gdbPathArgument(options.libDir),
+    'set libthread-db-search-path ' + gdbPathArgument(options.libDir),
     'set backtrace limit 24',
-    'set logging file ' + gdbQuote(options.logPath),
+    'set logging file ' + gdbPathArgument(options.logPath),
     'set logging overwrite on',
     'set logging redirect on',
     'set logging enabled on',
