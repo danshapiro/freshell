@@ -18124,4 +18124,95 @@ describe('unreadable-store notice line (session_store_unreadable, no-modal contr
     expect(terminalWriteStrings(term()).some((data) => data.includes('no longer exists on disk'))).toBe(false)
     expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
   })
+
+  it('reason transitions re-arm the writer: dead -> unreadable -> dead writes each new explanation on the same surface (delta fix focused review, finding 1)', async () => {
+    // The applied-write identity key must carry the notice-line REASON
+    // beside the pane identity: a pane whose verdict transitions
+    // durable_artifact_missing -> session_store_unreadable (or back) on the
+    // SAME identity and surface must re-write, so the verdict's CURRENT
+    // explanation supersedes the stale one. A pane-identity-only key lets
+    // the FIRST reason's at-apply record satisfy the writer forever, and
+    // the new explanation never lands.
+    const DEAD_BUFFER_LINE =
+      "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
+    const deadLineWrites = () =>
+      terminalWriteStrings(term()).filter((data) => data.includes(DEAD_BUFFER_LINE)).length
+
+    // Reload shape (un-anchored): the persisted DEAD latch alone explains
+    // nothing (the mint is persistence-stripped); the folds below re-fold
+    // each verdict with its mint, exactly as the boot reconcile does.
+    const { store } = await renderUnreadableNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+    expect(deadLineWrites()).toBe(0)
+    expect(noticeWriteCount()).toBe(0)
+
+    // Fold #1 — dead: the dead explanation line lands once.
+    act(() => {
+      store.dispatch(setPaneRestoreError({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      }))
+      store.dispatch(setPaneReconcileNotice({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        notice: DEAD_SESSION_RECONCILE_NOTICES.missing,
+      }))
+    })
+    await waitFor(() => {
+      expect(deadLineWrites()).toBe(1)
+    })
+    expect(noticeWriteCount()).toBe(0)
+
+    // REASON TRANSITION (the defect): the SAME pane identity and surface,
+    // a NEW verdict reason with its own mint. The new key re-arms the
+    // writer and the unreadable-store explanation is written.
+    act(() => {
+      store.dispatch(setPaneRestoreError({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        restoreError: buildRestoreError('session_store_unreadable'),
+      }))
+      store.dispatch(setPaneReconcileNotice({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        notice: SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
+      }))
+    })
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+
+    // And BACK: the verdict re-transition to dead writes the dead
+    // explanation anew (the unreadable record no longer satisfies the
+    // key).
+    act(() => {
+      store.dispatch(setPaneRestoreError({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      }))
+      store.dispatch(setPaneReconcileNotice({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        notice: DEAD_SESSION_RECONCILE_NOTICES.missing,
+      }))
+    })
+    await waitFor(() => {
+      expect(deadLineWrites()).toBe(2)
+    })
+    // The buffer carries both explanations (append-only; the newest line
+    // is the verdict's current copy) — and never either STORE mint copy.
+    const writes = terminalWriteStrings(term()).join('')
+    expect(writes).toContain(DEAD_BUFFER_LINE)
+    expect(writes).toContain(NOTICE_LINE)
+    expect(terminalWriteStrings(term()).some((data) => data.includes(DEAD_SESSION_RECONCILE_NOTICES.missing))).toBe(false)
+    expect(terminalWriteStrings(term()).some((data) => data.includes(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE))).toBe(false)
+  })
 })

@@ -464,10 +464,20 @@ function noticeLineRestoreErrorReason(
 /**
  * Idempotency identity for the dead-session notice line: a re-keyed pane
  * (Replace pane, respawn, identity repair) is a NEW identity whose next
- * death writes fresh; the same identity re-adjudicated is the same line.
+ * death writes fresh; the same identity re-adjudicated with the SAME
+ * reason is the same line. The notice-line REASON rides the key beside the
+ * pane identity (delta fix focused review, finding 1): a verdict
+ * transition durable_artifact_missing <-> session_store_unreadable on the
+ * SAME identity and surface produces a NEW key, so the writer re-arms and
+ * the verdict's CURRENT explanation is written — a pane-identity-only key
+ * let the first reason's at-apply record satisfy the invariant forever and
+ * the stale explanation survived the verdict change.
  */
-function deadSessionNoticeIdentityKey(content: TerminalPaneContent | null | undefined): string {
-  return `${content?.createRequestId ?? ''}|${content?.sessionRef?.sessionId ?? '-'}`
+function deadSessionNoticeIdentityKey(
+  content: TerminalPaneContent | null | undefined,
+  latchReason: 'durable_artifact_missing' | 'session_store_unreadable' | null,
+): string {
+  return `${content?.createRequestId ?? ''}|${content?.sessionRef?.sessionId ?? '-'}|${latchReason ?? '-'}`
 }
 
 type StartupProbeReplayDiscardState = {
@@ -990,8 +1000,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
   // dead-notice record, the notice line is (re-)issued — queue-ordered,
   // generation-adopting — into that surface. The at-apply record below
-  // (identity key `createRequestId|sessionId` + surface epoch + mint copy)
-  // is the loop guard: it only ever claims an epoch the line actually landed
+  // (identity key `createRequestId|sessionId|reason` + surface epoch + mint
+  // copy — the reason rides the key so a verdict transition re-arms the
+  // writer, delta fix focused review finding 1) is the loop guard: it only
+  // ever claims an epoch the line actually landed
   // on, so the skip branch is honest (skip ⟺ the line is on the current
   // surface). The epoch bumps at every xterm surface birth (init) and at
   // every beginMountedReconstruction reset completion — i.e. at every event
@@ -2037,7 +2049,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // stays in the store until a surface exists to write it.
       return
     }
-    const key = deadSessionNoticeIdentityKey(content)
+    // The key carries the latch REASON beside the pane identity (delta fix
+    // focused review, finding 1): a reason transition is a NEW key, so the
+    // at-apply record of the OTHER reason never satisfies this invariant —
+    // the writer re-arms and the new explanation is written.
+    const key = deadSessionNoticeIdentityKey(content, latchReason)
     if (deadSessionNoticeQueuedWriteIsLive(key)) {
       // A queued copy of this identity is still the current queue regime's
       // write: FIFO delivery is owed. The resident mint needs no action.
