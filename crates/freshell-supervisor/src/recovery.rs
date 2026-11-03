@@ -917,18 +917,20 @@ fn verified_stopped_repair_receipt(
 }
 
 enum ScheduledRecoveryPlan {
-    Finished(RecoveryResult),
-    Reserved {
-        request: RecoverRequest,
-        reserved: RecoveryRetry,
-        context: RecoveryContext,
-        discovery_error: Option<RuntimeError>,
-        recovery_guard: tokio::sync::OwnedMutexGuard<()>,
-    },
+    Finished(Box<RecoveryResult>),
+    Reserved(Box<ReservedRecoveryPlan>),
+}
+
+struct ReservedRecoveryPlan {
+    request: RecoverRequest,
+    reserved: RecoveryRetry,
+    context: RecoveryContext,
+    discovery_error: Option<RuntimeError>,
+    recovery_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 enum RecoveryReplacementPreparation {
-    Finished(RecoveryResult),
+    Finished(Box<RecoveryResult>),
     Prepared(Box<RecoveryReplacementPlan>),
 }
 
@@ -2866,14 +2868,15 @@ impl Supervisor {
             Box::pin(self.prepare_scheduled_recovery(request, only_due_retry, recovery_guard))
                 .await?;
         match plan {
-            ScheduledRecoveryPlan::Finished(result) => Ok(result),
-            ScheduledRecoveryPlan::Reserved {
-                request,
-                reserved,
-                context,
-                discovery_error,
-                recovery_guard,
-            } => {
+            ScheduledRecoveryPlan::Finished(result) => Ok(*result),
+            ScheduledRecoveryPlan::Reserved(plan) => {
+                let ReservedRecoveryPlan {
+                    request,
+                    reserved,
+                    context,
+                    discovery_error,
+                    recovery_guard,
+                } = *plan;
                 // Run the long attempt in its own Tokio poll stack. The
                 // per-soul guard moves with it, so cancellation cannot release
                 // the lifecycle lock while an activation task is still being
@@ -2922,7 +2925,7 @@ impl Supervisor {
     ) -> Result<ScheduledRecoveryPlan, RuntimeError> {
         macro_rules! finish {
             ($result:expr) => {
-                return Ok(ScheduledRecoveryPlan::Finished($result));
+                return Ok(ScheduledRecoveryPlan::Finished(Box::new($result)));
             };
         }
         #[cfg(test)]
@@ -3279,13 +3282,15 @@ impl Supervisor {
         .await;
         #[cfg(test)]
         automatic_retry_tests::crash_boundary("after_reservation_before_dispatch");
-        Ok(ScheduledRecoveryPlan::Reserved {
-            request,
-            reserved,
-            context,
-            discovery_error,
-            recovery_guard,
-        })
+        Ok(ScheduledRecoveryPlan::Reserved(Box::new(
+            ReservedRecoveryPlan {
+                request,
+                reserved,
+                context,
+                discovery_error,
+                recovery_guard,
+            },
+        )))
     }
 
     async fn settle_scheduled_recovery_attempt(
@@ -3690,7 +3695,7 @@ impl Supervisor {
         ))
         .await?;
         match outcome {
-            RecoveryReplacementPreparation::Finished(result) => Ok(result),
+            RecoveryReplacementPreparation::Finished(result) => Ok(*result),
             RecoveryReplacementPreparation::Prepared(plan) => {
                 Box::pin(self.activate_recovery_replacement(plan)).await
             }
@@ -3708,7 +3713,7 @@ impl Supervisor {
     ) -> Result<RecoveryReplacementPreparation, RuntimeError> {
         macro_rules! finish {
             ($result:expr) => {
-                return Ok(RecoveryReplacementPreparation::Finished($result));
+                return Ok(RecoveryReplacementPreparation::Finished(Box::new($result)));
             };
         }
         let recovery_started = Instant::now();

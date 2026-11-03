@@ -4445,7 +4445,7 @@ try {{
                     "the native resume decision must precede replacement start: {methods:?}"
                 ));
             }
-            if methods.iter().any(|method| *method == "turn/start")
+            if methods.contains(&"turn/start")
                 || recovery_rows
                     .iter()
                     .any(|row| row.to_string().contains("user prompt"))
@@ -4584,9 +4584,11 @@ try {{
         profile.native_session_id = Some("codex-cold-source-root".into());
 
         let setup = || {
-            let mut identity = HostedNativeIdentity::default();
-            identity.launch = Some(launch.clone());
-            identity.producer_launch = Some(launch.clone());
+            let mut identity = HostedNativeIdentity {
+                launch: Some(launch.clone()),
+                producer_launch: Some(launch.clone()),
+                ..HostedNativeIdentity::default()
+            };
             identity
                 .begin_cold_replacement(&profile, &authorization, "authorized-create")
                 .unwrap();

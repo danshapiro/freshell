@@ -5323,7 +5323,7 @@ pub enum HostCommand {
         /// Exact source/attempt authorization for the replacement-only
         /// Codex startup path. Ordinary launches never receive this permit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        native_readiness_recovery: Option<NativeReadinessRecoveryAuthorization>,
+        native_readiness_recovery: Option<Box<NativeReadinessRecoveryAuthorization>>,
     },
     Stop {
         incarnation_id: IncarnationId,
@@ -6572,6 +6572,84 @@ mod tests {
         let mut wrong_store = resume;
         wrong_store.provider_session.provider_store_id = "other-store".into();
         assert!(!authorization.is_valid_for(&launch, &wrong_store));
+    }
+
+    #[test]
+    fn boxed_native_readiness_authorization_keeps_the_grant_wire_shape() {
+        let launch = fresh_agent_launch(FreshProvider::Codex, "freshcodex");
+        let resume: ResumeSpec = serde_json::from_value(serde_json::json!({
+            "providerSession": {
+                "provider": "codex",
+                "providerStoreId": "soul-store-one",
+                "nativeSessionId": "native-one"
+            },
+            "mode": "freshcodex",
+            "runtimeVariant": "pinned-runtime-variant",
+            "program": "codex",
+            "resumeArgv": ["--resume", "native-one"],
+            "providerHome": "/home/freshell/provider",
+            "cwd": "/workspace/original",
+            "workspacePath": "/workspace/original",
+            "environment": {"HOME": "/home/freshell/provider"},
+            "creationSeedRef": "seed-one",
+            "checkpointRevision": 0,
+            "allocationState": "verified_durable",
+            "evidenceRevision": 7,
+            "neverDispatched": false
+        }))
+        .unwrap();
+        let source_launch = NativeIdentityLaunch {
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: "target-launch-nonce".into(),
+            evidence_revision: 7,
+            execution_generation: 3,
+            requested_native_session_id: Some("native-one".into()),
+        };
+        let authorization = NativeReadinessRecoveryAuthorization {
+            source_fence: NativeReadinessFence {
+                control_epoch: 2,
+                intent_revision: 4,
+                identity_revision: 6,
+                evidence_revision: 7,
+                native_import_revision: 0,
+                recovery_attempt_id: Some(RecoveryAttemptId::new()),
+                active_incarnation_id: source_launch.incarnation_id.clone(),
+            },
+            source_launch: source_launch.clone(),
+            prior_incarnation_id: IncarnationId::new(),
+            resume_spec_sha256: resume_spec_sha256(&resume),
+        };
+        let command = HostCommand::GrantExecution {
+            incarnation_id: source_launch.incarnation_id.clone(),
+            soul_id: SoulId::new(),
+            host_boot_id: HostBootId::new(),
+            control_epoch: 2,
+            execution_generation: 3,
+            grant_id: GrantId::new(),
+            fixture: None,
+            provider_path_inputs: ProviderPathInputs::default(),
+            terminal: None,
+            fresh_agent: Some(Box::new(launch)),
+            resume_spec: Some(Box::new(resume)),
+            dispatch_budget_ms: None,
+            native_identity_launch: Some(source_launch),
+            native_readiness_recovery: Some(Box::new(authorization.clone())),
+        };
+
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            encoded["params"]["native_readiness_recovery"],
+            serde_json::to_value(&authorization).unwrap()
+        );
+        let decoded: HostCommand = serde_json::from_value(encoded).unwrap();
+        let HostCommand::GrantExecution {
+            native_readiness_recovery: Some(decoded_authorization),
+            ..
+        } = decoded
+        else {
+            panic!("boxed recovery authorization must round-trip with its grant");
+        };
+        assert_eq!(*decoded_authorization, authorization);
     }
 
     #[test]

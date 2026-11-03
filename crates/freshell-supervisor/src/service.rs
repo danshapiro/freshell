@@ -6152,7 +6152,7 @@ impl Supervisor {
             };
         let command = HostCommand::GrantExecution {
             native_identity_launch: Some(native_identity_launch.clone()),
-            native_readiness_recovery: native_readiness_recovery.clone(),
+            native_readiness_recovery: native_readiness_recovery.clone().map(Box::new),
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
             host_boot_id: grant.host_boot_id.clone(),

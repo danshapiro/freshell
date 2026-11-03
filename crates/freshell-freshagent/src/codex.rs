@@ -32070,15 +32070,15 @@ pub(crate) mod tests {
             .filter_map(|row| row["method"].as_str())
             .collect::<Vec<_>>();
         assert!(
-            methods.iter().any(|method| *method == "thread/resume"),
+            methods.contains(&"thread/resume"),
             "resume attempt is required: {methods:?}"
         );
         assert!(
-            !methods.iter().any(|method| *method == "thread/start"),
+            !methods.contains(&"thread/start"),
             "unqualified errors cannot authorize minting: {methods:?}"
         );
         assert!(
-            !methods.iter().any(|method| *method == "turn/start"),
+            !methods.contains(&"turn/start"),
             "readiness must not dispatch user input: {methods:?}"
         );
         assert!(

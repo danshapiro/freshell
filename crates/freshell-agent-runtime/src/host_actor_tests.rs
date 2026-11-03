@@ -3349,7 +3349,7 @@ async fn cold_codex_missing_root_mints_once_and_replays_its_persisted_receipt() 
     );
     assert_eq!(
         transport.resume_specs.lock().unwrap().as_slice(),
-        &[resume_spec.clone()]
+        std::slice::from_ref(&resume_spec)
     );
     assert_eq!(
         transport.replacement_profiles.lock().unwrap()[0].cwd,
@@ -3786,7 +3786,7 @@ async fn cold_codex_later_incarnation_resumes_exact_next_profile_and_supersedes_
     assert_eq!(transport.ordinary_start_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         transport.ordinary_start_profiles.lock().unwrap().as_slice(),
-        &[fixture.committed_profile.clone()]
+        std::slice::from_ref(&fixture.committed_profile)
     );
     assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
 

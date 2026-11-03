@@ -118,6 +118,7 @@ pub enum NativeCallResult<T> {
     Confirmed(T),
     /// The supervisor's per-soul lifecycle fence was busy. No provider work
     /// was dispatched, so the worker can safely defer and take a fresh claim.
+    #[cfg(any(feature = "managed-runtime-v1", test))]
     LifecycleBusy,
     Undelivered(String),
     Ambiguous(String),
@@ -197,6 +198,7 @@ pub type NativeFuture<T> =
 pub enum NativeProbeResult {
     Available,
     Unavailable,
+    #[cfg(any(feature = "managed-runtime-v1", test))]
     LifecycleBusy,
 }
 
@@ -305,6 +307,7 @@ impl NativeCycleClaim {
 
 /// Result of releasing a native cycle after a pre-dispatch lifecycle refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "managed-runtime-v1", test))]
 pub(crate) enum NativeLifecycleDeferralResult {
     /// The exact current claim was released and a bounded retry was scheduled.
     Deferred {
@@ -642,6 +645,7 @@ async fn run(
                         tokio::time::sleep(WORKER_POLL_INTERVAL).await;
                         continue;
                     }
+                    #[cfg(any(feature = "managed-runtime-v1", test))]
                     NativeProbeResult::LifecycleBusy => {
                         // A typed probe refusal proves no provider operation
                         // was admitted. Record it in one exact-item
@@ -883,6 +887,7 @@ async fn run_cycle_with_item(
         .await
     {
         NativeCallResult::Confirmed(readback) => readback.title,
+        #[cfg(any(feature = "managed-runtime-v1", test))]
         NativeCallResult::LifecycleBusy => {
             defer_lifecycle_busy(names, &claim, "read", claim.cycle_charged, true).await;
             return;
@@ -975,6 +980,7 @@ async fn run_cycle_with_item(
             )
             .await;
         }
+        #[cfg(any(feature = "managed-runtime-v1", test))]
         NativeCallResult::LifecycleBusy => {
             defer_lifecycle_busy(names, &claim, "write", claim.cycle_charged, false).await;
             return;
@@ -1030,6 +1036,7 @@ async fn run_cycle_with_item(
             )
             .await;
         }
+        #[cfg(any(feature = "managed-runtime-v1", test))]
         NativeCallResult::LifecycleBusy => {
             // The acknowledged write has already happened. Keep its cycle
             // charge and retry only the fenced confirmation read.
@@ -1060,6 +1067,7 @@ async fn fold(names: &Arc<SessionNames>, claim: &NativeCycleClaim, outcome: Nati
     }
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 async fn defer_lifecycle_busy(
     names: &Arc<SessionNames>,
     claim: &NativeCycleClaim,
@@ -1129,6 +1137,7 @@ async fn defer_lifecycle_busy(
     }
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 async fn defer_lifecycle_busy_item(
     names: &Arc<SessionNames>,
     item: &NativeWorkItem,
@@ -1434,6 +1443,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
                     NativeCallResult::Confirmed(NativeNameReadback { title })
                 }
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
+                #[cfg(any(feature = "managed-runtime-v1", test))]
                 NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
@@ -1463,6 +1473,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
         Box::pin(async move {
             match adapter.exchange(attempt.target.location, request).await {
                 NativeCallResult::Confirmed(_) => NativeCallResult::Confirmed(()),
+                #[cfg(any(feature = "managed-runtime-v1", test))]
                 NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),

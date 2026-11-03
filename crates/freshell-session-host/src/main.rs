@@ -929,7 +929,8 @@ async fn dispatch_with_effects(
                         state,
                         GrantExecutionRequest {
                             native_identity_launch,
-                            native_readiness_recovery,
+                            native_readiness_recovery: native_readiness_recovery
+                                .map(|authorization| *authorization),
                             soul_id,
                             control_epoch,
                             execution_generation,
@@ -12524,7 +12525,7 @@ mod tests {
             host_boot_id: restarted_boot,
             state_dir: state.state_dir.clone(),
             secret: state.secret.clone(),
-            requested_limits: state.requested_limits.clone(),
+            requested_limits: state.requested_limits,
             control_fence: std::sync::Mutex::new(HostControlFence::from(&restarted_persisted)),
             persisted: Mutex::new(restarted_persisted),
             child: Mutex::new(None),
@@ -14560,7 +14561,7 @@ mod tests {
         let command = HostCommand::GrantExecution {
             provider_path_inputs: Default::default(),
             native_identity_launch: Some(native_launch),
-            native_readiness_recovery: Some(authorization),
+            native_readiness_recovery: Some(Box::new(authorization)),
             incarnation_id: state.incarnation_id.clone(),
             soul_id: SoulId::new(),
             host_boot_id: state.host_boot_id.clone(),

@@ -1374,17 +1374,15 @@ fn receipt_matches_startup_authorization(
     {
         return false;
     }
+    let census_references = std::slice::from_ref(&evidence.census_reference);
     crate::native_absence_census_matches(
         &evidence.provider,
         &evidence.provider_store_id,
         &evidence.native_session_id,
         evidence.evidence_revision,
         evidence.store_state,
-        &[evidence.census_reference.clone()],
-    ) && crate::native_absence_census_environment_matches(
-        resume_spec,
-        &[evidence.census_reference.clone()],
-    )
+        census_references,
+    ) && crate::native_absence_census_environment_matches(resume_spec, census_references)
 }
 
 async fn rebound_cold_readiness_receipt(

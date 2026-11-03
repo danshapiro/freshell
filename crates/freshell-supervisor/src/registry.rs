@@ -111,6 +111,49 @@ type StoppedRepairTargetReceiptFenceRow = (
     String,
     String,
 );
+type NativeReadinessAuthorizationSoulRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+);
+type NativeReadinessAuthorizationTargetRow = (
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    u64,
+    String,
+    Option<i64>,
+);
+type NativeReadinessReceiptCommitRow = (
+    String,
+    Option<String>,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -4783,9 +4826,7 @@ impl Registry {
 
             let (provider, provider_store_id, native_session_id, desired, recovery_state,
                 intent_revision, identity_revision, evidence_revision, native_import_revision,
-                attempt_raw, resume_raw):
-                (String, String, Option<String>, String, String, u64, u64, u64, u64,
-                    Option<String>, Option<String>) = tx.query_row(
+                attempt_raw, resume_raw): NativeReadinessAuthorizationSoulRow = tx.query_row(
                 "SELECT provider,provider_store_id,native_session_id,desired_state,recovery_state,\
                  intent_revision,identity_revision,evidence_revision,native_import_revision,\
                  recovery_attempt_id,resume_spec FROM souls WHERE soul_id=?1",
@@ -4811,8 +4852,7 @@ impl Registry {
                 return Err(RegistryError::NativeIdentityConflict);
             }
 
-            let target: (String, String, u64, Option<String>, Option<String>, Option<String>,
-                Option<String>, String, Option<String>, u64, String, Option<i64>) = tx.query_row(
+            let target: NativeReadinessAuthorizationTargetRow = tx.query_row(
                 "SELECT i.launch_state,i.launch_nonce,i.execution_generation,\
                  i.native_identity_launch,i.fresh_agent_spec,i.prior_incarnation_id,\
                  i.recovery_attempt_id,a.soul_id,a.prior_incarnation_id,a.intent_revision,\
@@ -4932,9 +4972,7 @@ impl Registry {
             }
             let target_incarnation_id = receipt.source_launch.incarnation_id.clone();
             let receipt_raw = serde_json::to_string(&receipt)?;
-            let current: (String, Option<String>, u64, u64, u64, u64, Option<String>,
-                Option<String>, Option<String>, Option<String>, Option<String>, String,
-                Option<String>, Option<String>) = tx.query_row(
+            let current: NativeReadinessReceiptCommitRow = tx.query_row(
                 "SELECT s.provider,s.native_session_id,s.intent_revision,s.identity_revision,\
                  s.evidence_revision,s.native_import_revision,s.recovery_attempt_id,\
                  s.resume_spec,i.native_identity_launch,i.native_identity_observation,\
@@ -11475,11 +11513,33 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn codex_settings_changes_update_stored_resume_profile_without_changing_evidence() {
-        let cases: [(bool, &str, Option<Option<String>>, Option<&str>); 2] = [
-            (false, "turn-model", Some(None), None),
-            (true, "configured-model", None, Some("low")),
+        struct SettingsChangeCase {
+            configure: bool,
+            model: &'static str,
+            effort: Option<Option<String>>,
+            expected_effort: Option<&'static str>,
+        }
+        let cases = [
+            SettingsChangeCase {
+                configure: false,
+                model: "turn-model",
+                effort: Some(None),
+                expected_effort: None,
+            },
+            SettingsChangeCase {
+                configure: true,
+                model: "configured-model",
+                effort: None,
+                expected_effort: Some("low"),
+            },
         ];
-        for (configure, model, effort, expected_effort) in cases {
+        for SettingsChangeCase {
+            configure,
+            model,
+            effort,
+            expected_effort,
+        } in cases
+        {
             let dir = tempfile::tempdir().unwrap();
             let registry = Registry::open(dir.path(), None).unwrap();
             let soul = SoulId::new();

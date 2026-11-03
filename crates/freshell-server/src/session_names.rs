@@ -183,7 +183,9 @@ pub(crate) const MAX_NATIVE_READS: u32 = 6;
 /// a durable cooldown. The window resets only when its scheduled retry is
 /// claimed, so restarting the worker cannot turn contention into a hot loop.
 pub(crate) const MAX_NATIVE_LIFECYCLE_BUSY_DEFERRALS: u32 = 6;
+#[cfg(any(feature = "managed-runtime-v1", test))]
 const NATIVE_LIFECYCLE_BUSY_RETRY_BASE_MS: i64 = 1_000;
+#[cfg(any(feature = "managed-runtime-v1", test))]
 pub(crate) const NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS: i64 = 60_000;
 /// Task 3: cycle 2 becomes ready at least this long after a cycle-1 failure.
 const NATIVE_CYCLE_RETRY_1_MS: i64 = 5_000;
@@ -1457,6 +1459,7 @@ impl SessionNames {
     /// ran. The deferral count and cooldown are durable; the three-cycle
     /// write limit remains per desired revision, while reads use a bounded
     /// window that restarts only after the lifecycle cooldown becomes due.
+    #[cfg(any(feature = "managed-runtime-v1", test))]
     pub(crate) fn defer_native_lifecycle_busy(
         &self,
         claim: crate::session_name_native::NativeCycleClaim,
@@ -1473,6 +1476,7 @@ impl SessionNames {
     /// a provider cycle. The snapshot identity, cooldown window, and due time
     /// are revalidated atomically so a stale probe cannot affect successor
     /// work, and process death cannot strand a claimed cycle before a refund.
+    #[cfg(any(feature = "managed-runtime-v1", test))]
     pub(crate) fn defer_native_lifecycle_busy_for_item(
         &self,
         item: crate::session_name_native::NativeWorkItem,
@@ -4331,11 +4335,13 @@ fn charge_native_read_decision(
     })
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 fn native_lifecycle_busy_retry_delay_ms(deferrals: u32) -> i64 {
     let exponent = deferrals.saturating_sub(1).min(3);
     NATIVE_LIFECYCLE_BUSY_RETRY_BASE_MS * (1_i64 << exponent)
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 fn defer_native_lifecycle_busy_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
@@ -4396,6 +4402,7 @@ fn defer_native_lifecycle_busy_decision(
     })
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 fn defer_native_lifecycle_busy_item_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
@@ -4432,6 +4439,7 @@ fn defer_native_lifecycle_busy_item_decision(
     })
 }
 
+#[cfg(any(feature = "managed-runtime-v1", test))]
 fn record_native_lifecycle_busy(
     state: &mut NativeWriteState,
     now_ms: i64,
