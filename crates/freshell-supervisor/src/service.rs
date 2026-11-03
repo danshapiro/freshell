@@ -891,7 +891,7 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
-            AdminCommand::Reopen(request) => Box::pin(self.reopen(envelope.request_id, request))
+            AdminCommand::Reopen(request) => Box::pin(self.reopen(request_id, request))
                 .await
                 .map(AdminResult::Reopen),
             AdminCommand::TerminalInput(request) => {
@@ -6733,6 +6733,7 @@ mod tests {
                                 fixture_evidence: serde_json::json!({"fixture":"reopen"}),
                                 native_session_id: None,
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             })
@@ -6757,6 +6758,7 @@ mod tests {
                                 native_identity_observation: (!probe.pause_observation)
                                     .then(|| observation.clone())
                                     .flatten(),
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             })
