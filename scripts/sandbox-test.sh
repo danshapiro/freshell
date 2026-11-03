@@ -320,8 +320,13 @@ PY
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
     fi
-    env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite \
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      env FRESHELL_SANDBOX_PREPARE_ONLY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=preparation \
+        bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite "${PREPARATION_COMMAND}" &
+    else
+      env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite \
       "${PREPARATION_COMMAND}" &
+    fi
     PREPARATION_PID=$!
     trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
     trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
@@ -338,7 +343,8 @@ PY
       if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
     fi
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
-      exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}"
+      exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
+        bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}"
     fi
     exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
   fi
@@ -464,6 +470,17 @@ sandbox_log() {
     "$1" "$2" "${OWNED_CONTAINER_NAME}" "$3" >&2
 }
 
+sandbox_completion_log() {
+  local phase="${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}"
+  case "${phase}" in
+    preparation|execution)
+      printf '{"severity":"%s","event":"%s","container":"%s","code":%s,"phase":"%s"}\n' \
+        "$1" "$2" "${OWNED_CONTAINER_NAME}" "$3" "${phase}" >&2
+      ;;
+    *) sandbox_log "$1" "$2" "$3" ;;
+  esac
+}
+
 # shellcheck disable=SC2317 # Reached by the installed EXIT/signal trap handlers.
 owned_docker_client_running() {
   [ -n "${DOCKER_CLIENT_PID}" ] \
@@ -587,10 +604,19 @@ finish_owned_sandbox() {
     printf '[sandbox] owned container %s could not be settled; control evidence retained at %q\n' \
       "${OWNED_CONTAINER_NAME}" "${OWNED_CONTROL_DIR}" >&2
   fi
+  case "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" in
+    preparation|execution)
+      if [ "${container_settled}" -eq 1 ]; then
+        sandbox_completion_log info sandbox_container_settled 0
+      else
+        sandbox_completion_log error sandbox_container_unsettled 1
+      fi
+      ;;
+  esac
   if [ "${result}" -eq 0 ]; then
-    sandbox_log info sandbox_workload_finished "${result}"
+    sandbox_completion_log info sandbox_workload_finished "${result}"
   else
-    sandbox_log error sandbox_workload_failed "${result}"
+    sandbox_completion_log error sandbox_workload_failed "${result}"
   fi
   exit "${result}"
 }

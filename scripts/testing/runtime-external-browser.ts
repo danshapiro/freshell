@@ -3405,8 +3405,8 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     const output = this.sandboxChild.output()
     this.sandboxChild = undefined
     const stdoutEvents = output.stdout.split(/\r?\n/).flatMap((line) => {
-        try { return [JSON.parse(line)] } catch { return [] }
-      })
+      try { return [JSON.parse(line)] } catch { return [] }
+    })
     const reporterEvents = stdoutEvents.filter((event): event is Record<string, unknown> =>
       Boolean(event) && typeof event === 'object' && !Array.isArray(event)
       && ['managed_external_case', 'managed_external_complete'].includes(String((event as Record<string, unknown>).event)))
@@ -3417,32 +3417,91 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       ? reportedCompletions[0].status as string : reportedCompletions.length === 1 ? 'invalid' : 'missing-or-duplicate'
     const completionCases = reportedCompletions.length === 1 && Number.isSafeInteger(reportedCompletions[0].cases)
       ? reportedCompletions[0].cases as number : null
-    const cleanupEvents = output.stderr.split(/\r?\n/).flatMap((line) => {
+    const stderrEvents = output.stderr.split(/\r?\n/).flatMap((line) => {
       try { return [JSON.parse(line) as Record<string, unknown>] } catch { return [] }
-    }).filter((event) => event.event === 'sandbox_workload_finished')
+    }).filter((event) => event && typeof event === 'object' && !Array.isArray(event))
+    const workloadEvents = stderrEvents.filter(event =>
+      event.event === 'sandbox_workload_finished' || event.event === 'sandbox_workload_failed')
+    const settlementEvents = stderrEvents.filter(event =>
+      event.event === 'sandbox_container_settled' || event.event === 'sandbox_container_unsettled')
+    const preparationWorkloads = workloadEvents.filter(event => event.phase === 'preparation')
+    const executionWorkloads = workloadEvents.filter(event => event.phase === 'execution')
+    const preparationSettlements = settlementEvents.filter(event => event.phase === 'preparation')
+    const executionSettlements = settlementEvents.filter(event => event.phase === 'execution')
+    const cleanupEventValid = (events: Record<string, unknown>[], phase: 'preparation' | 'execution') =>
+      events.length === 1 && events[0].event === 'sandbox_container_settled'
+      && events[0].phase === phase && events[0].severity === 'info' && events[0].code === 0
+      && typeof events[0].container === 'string' && /^freshell-sandbox-[A-Za-z0-9]{8}$/.test(events[0].container)
+    const workloadState = (events: Record<string, unknown>[]) => events.length === 1
+      && (events[0].event === 'sandbox_workload_finished' || events[0].event === 'sandbox_workload_failed')
+      && Number.isSafeInteger(events[0].code)
+      ? events[0].event === 'sandbox_workload_finished' && events[0].code === 0 ? 'finished' : 'failed'
+      : 'missing-or-duplicate'
     this.owner.runtime.recordLifecycle('external.sandbox_browser_reporter_observed', {
       runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, exitCode,
       reporterEventCount: reporterEvents.length, caseCount: reportedCases.length,
       completionCount: reportedCompletions.length, completionStatus, completionCases,
-      cleanupCompletionCount: cleanupEvents.length,
+      workloadPreparationState: workloadState(preparationWorkloads),
+      workloadExecutionState: workloadState(executionWorkloads),
+      cleanupCompletionCount: settlementEvents.length,
+      cleanupPreparationCount: preparationSettlements.length,
+      cleanupExecutionCount: executionSettlements.length,
+      cleanupFailureCount: settlementEvents.filter(event => event.event === 'sandbox_container_unsettled').length,
     })
-    const completed = cleanupEvents
-    if (completed.length !== 1 || completed[0].severity !== 'info' || completed[0].code !== 0
-      || typeof completed[0].container !== 'string' || !/^freshell-sandbox-[A-Za-z0-9]{8}$/.test(completed[0].container)) {
-      throw new Error('P2-G01 sandbox cleanup completion evidence is missing or invalid')
+    if (settlementEvents.length !== 2 || workloadEvents.length !== 2
+      || !cleanupEventValid(preparationSettlements, 'preparation') || !cleanupEventValid(executionSettlements, 'execution')
+      || preparationSettlements[0].container === executionSettlements[0].container
+      || preparationWorkloads.length !== 1 || executionWorkloads.length !== 1
+      || preparationWorkloads[0].container !== preparationSettlements[0].container
+      || executionWorkloads[0].container !== executionSettlements[0].container) {
+      this.captureP2G01SandboxOutput(output, 'container_settlement_evidence_invalid')
+      throw new Error('P2-G01 sandbox preparation or execution cleanup evidence is missing or invalid')
     }
-    if (exitCode !== 0) throw new Error('P2-G01 sandbox browser child failed')
-    const cases = parseExternalExecutionEvents(stdoutEvents, this.descriptor)
+    if (workloadState(preparationWorkloads) !== 'finished') {
+      this.captureP2G01SandboxOutput(output, 'preparation_workload_failed')
+      throw new Error('P2-G01 dependency preparation workload failed')
+    }
+    if (workloadState(executionWorkloads) !== 'finished' || exitCode !== 0) {
+      this.captureP2G01SandboxOutput(output, 'execution_workload_failed')
+      throw new Error('P2-G01 sandbox browser child failed')
+    }
+    let cases: ExternalBrowserCaseResult[]
+    try { cases = parseExternalExecutionEvents(stdoutEvents, this.descriptor) }
+    catch (error) {
+      this.captureP2G01SandboxOutput(output, 'reporter_completion_invalid')
+      throw error
+    }
     if (cases.length !== 1 || cases[0].status !== 'passed'
       || cases[0].file !== P2_G01_SPEC || cases[0].title.split(' › ').at(-1) !== P2_G01_TITLE) {
+      this.captureP2G01SandboxOutput(output, 'reported_case_identity_invalid')
       throw new Error('P2-G01 sandbox reporter did not prove exactly one matching pass')
     }
     this.owner.runtime.recordLifecycle('external.sandbox_browser_cleanup_verified', {
       runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha,
-      container: completed[0].container, admitted: cases.length, passed: cases.filter(row => row.status === 'passed').length,
+      preparationContainer: preparationSettlements[0].container, executionContainer: executionSettlements[0].container,
+      admitted: cases.length, passed: cases.filter(row => row.status === 'passed').length,
     })
     await this.removeSandboxHandoff()
     return { exitCode, cases }
+  }
+  private captureP2G01SandboxOutput(output: { stdout: string; stderr: string }, reason: string): void {
+    if (!this.owner || !this.descriptor) return
+    const redact = (value: string): string => {
+      let safe = value
+      for (const secret of [this.descriptor!.token, this.descriptor!.baseUrl, this.descriptor!.wsUrl]) {
+        if (secret) safe = safe.replaceAll(secret, '[redacted]')
+      }
+      safe = safe.replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, '$1[redacted]')
+      return safe.slice(-16_384)
+    }
+    const artifact = this.owner.runtime.writeArtifact('p2-g01-sandbox-output-private.json', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, reason,
+      stdout: redact(output.stdout), stderr: redact(output.stderr),
+    })
+    this.owner.runtime.recordLifecycle('external.sandbox_browser_failure_diagnostics_captured', {
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha,
+      artifact: path.basename(artifact), stdoutBytes: Buffer.byteLength(output.stdout), stderrBytes: Buffer.byteLength(output.stderr),
+    })
   }
   private async captureCloudDiagnostics(): Promise<void> {
     if (!this.cloud || !this.owner) return
