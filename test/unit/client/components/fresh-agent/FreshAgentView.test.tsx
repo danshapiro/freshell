@@ -2101,6 +2101,56 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(notice()).toBeNull())
     })
 
+    it.each([
+      [false, 'clears the old notice when no saved conversation remains'],
+      [true, 'retains the notice when the saved conversation is reconnecting'],
+    ])('%s: %s while the active session ID is absent', async (keepSavedIdentity) => {
+      const store = createStore()
+      const sessionId = 'notice-gap-thread-a'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'notice-gap-create-a', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'codex' as const, sessionId }, status: 'idle' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', sessionId, expect.anything(),
+      ))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId, sessionType: first.sessionType, provider: first.provider,
+          event: { type: 'freshAgent.notice', sessionId, level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      const notice = () => document.querySelector('[data-agent-error="notice"] summary')
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...first, sessionId: undefined, createRequestId: 'notice-gap-next-attempt',
+          resumeSessionId: keepSavedIdentity ? first.resumeSessionId : undefined,
+          sessionRef: keepSavedIdentity ? first.sessionRef : undefined,
+        },
+      })))
+      if (keepSavedIdentity) {
+        await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+      } else {
+        await waitFor(() => expect(notice()).toBeNull())
+      }
+    })
+
     it('does not revive a duplicate Codex notice after a same-session rebind', async () => {
       const store = createStore()
       const content = {
