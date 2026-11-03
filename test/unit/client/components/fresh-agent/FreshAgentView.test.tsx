@@ -2349,7 +2349,8 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
-    it('restores an uncertain send after the same conversation materializes', async () => {
+    it.each(['same batch', 'after render'] as const)(
+      'restores an uncertain send after the same conversation materializes (%s)', async (timing) => {
       const store = createStore()
       const placeholder = 'freshopencode-send-scope-placeholder'
       const durable = 'ses_send_scope_materialized'
@@ -2373,6 +2374,10 @@ describe('FreshAgentView', () => {
       expect(sent?.requestId).toBeTruthy()
 
       let listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const failure = {
+        type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost',
+      }
       act(() => {
         const message = {
           type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
@@ -2381,18 +2386,19 @@ describe('FreshAgentView', () => {
         }
         handleFreshAgentMessage(store.dispatch, message)
         listener(message)
+        if (timing === 'same batch') listener(failure)
       })
       await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(durable))
-      listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
-      act(() => listener({
-        type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
-        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost',
-      }))
+      if (timing === 'after render') {
+        listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        act(() => listener(failure))
+      }
 
       await waitFor(() => expect(composer).toHaveValue(sourcePrompt))
       expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
-    })
+      },
+    )
 
     it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
       const store = createStore()

@@ -281,6 +281,8 @@ function sameLocalEcho(a: LocalEcho | null | undefined, b: LocalEcho | null | un
 }
 
 type PendingSendMetadata = {
+  sourceSessionKey?: string
+  sourceCanonicalSessionKey?: string
   asyncQuestionKeys?: string[]
   checkpointAvailabilityScope?: string
   checkpointWorkspace?: NonNullable<FreshAgentPaneContent['checkpointWorkspace']>
@@ -954,7 +956,24 @@ type PaneNoticeSource = {
 
 type DeliveryNotice = PaneNotice & { requestId: string }
 
-function scopePaneNotice<T extends PaneNotice>(notice: T | null, liveSessionKey?: string, savedSessionKey?: string): T | null {
+type PaneSessionScope = { sourceSessionKey?: string; sourceCanonicalSessionKey?: string }
+
+function paneSessionScope(content: FreshAgentPaneContent): PaneSessionScope {
+  const sourceSessionKey = content.sessionId
+    ? makeFreshAgentSessionKey({ sessionId: content.sessionId, sessionType: content.sessionType, provider: content.provider })
+    : undefined
+  const savedSessionId = (content.sessionRef?.provider === content.provider
+    ? content.sessionRef.sessionId : undefined) ?? content.resumeSessionId
+  const sourceCanonicalSessionKey = savedSessionId
+    ? makeFreshAgentSessionKey({ sessionId: savedSessionId, sessionType: content.sessionType, provider: content.provider })
+    : undefined
+  return {
+    ...(sourceSessionKey ? { sourceSessionKey } : {}),
+    ...(sourceCanonicalSessionKey ? { sourceCanonicalSessionKey } : {}),
+  }
+}
+
+function scopePaneNotice<T extends PaneSessionScope>(notice: T | null, liveSessionKey?: string, savedSessionKey?: string): T | null {
   if (!notice?.sourceSessionKey) return notice
   if (notice.sourceSessionKey === liveSessionKey) {
     return !notice.sourceCanonicalSessionKey && savedSessionKey
@@ -2236,7 +2255,7 @@ export function FreshAgentView({
   }, [])
 
   const recordPendingSendMetadata = useCallback((requestId: string, patch: PendingSendMetadata) => {
-    const current = pendingSendMetadataRef.current.get(requestId) ?? {}
+    const current = pendingSendMetadataRef.current.get(requestId) ?? paneSessionScope(paneContentRef.current)
     const next: PendingSendMetadata = { ...current, ...patch }
     pendingSendMetadataRef.current.set(requestId, next)
     if (next.checkpointAvailabilityScope && next.checkpointOutcome) {
@@ -2296,6 +2315,7 @@ export function FreshAgentView({
     const current = paneContentRef.current
     recordPendingSendMetadata(retryRequestId, {
       text,
+      ...paneSessionScope(current),
       logicalAttemptId: nanoid(),
       busyEpoch: busyEpochRef.current,
       checkpointAvailabilityScope: checkpointAvailabilityScope(current),
@@ -3391,6 +3411,16 @@ export function FreshAgentView({
           : notice
         setNoticeState(rekeyNotice)
         setErrorNoticeState(rekeyNotice)
+        for (const [requestId, pending] of pendingSendMetadataRef.current) {
+          if (pending.sourceSessionKey === previousNoticeSessionKey) {
+            pendingSendMetadataRef.current.set(requestId, {
+              ...pending,
+              // Keep the old live key until React observes the new pane. An
+              // error can follow materialization in the same message batch.
+              sourceCanonicalSessionKey: canonicalNoticeSessionKey,
+            })
+          }
+        }
         const pendingDelivery = deliveryNoticeRef.current
         if (pendingDelivery?.sourceSessionKey === previousNoticeSessionKey) {
           const rekeyedDelivery = { ...pendingDelivery, sourceSessionKey: nextNoticeSessionKey, sourceCanonicalSessionKey: canonicalNoticeSessionKey }
@@ -3566,19 +3596,26 @@ export function FreshAgentView({
         // pendingSendMetadataRef entry are this pane's send failures. Frames
         // with no matching requestId are not ours -- leave them alone.
         const failedRequestId = typeof message.requestId === 'string' ? message.requestId : undefined
-        if (!failedRequestId || !pendingSendMetadataRef.current.has(failedRequestId)) return
+        if (!failedRequestId) return
+        const originalPending = pendingSendMetadataRef.current.get(failedRequestId)
+        if (!originalPending?.sourceSessionKey) return
         const current = paneContentRef.current
+        const currentScope = paneSessionScope(current)
+        const pending = scopePaneNotice(originalPending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)
+        // Top-level error frames contain no session locator. A request from a
+        // previous conversation must not restore its text or retry here.
+        if (!pending) return
+        if (pending !== originalPending) pendingSendMetadataRef.current.set(failedRequestId, pending)
         if (
           message.code === 'FRESH_AGENT_LOST_SESSION'
           && current.sessionType === 'freshopencode'
           && !lostSessionRetryRef.current.has(failedRequestId)
         ) {
-          const pendingMeta = pendingSendMetadataRef.current.get(failedRequestId)
           const cwd = freshOpenCodeRouteCwdRef.current
           const sessionId = current.sessionId
           // The ses_ guard keeps genuinely-invalid placeholder/non-durable
           // lost-session errors on the normal cleanup path below.
-          if (pendingMeta?.text && cwd && sessionId && sessionId.startsWith('ses_')) {
+          if (pending.text && cwd && sessionId && sessionId.startsWith('ses_')) {
             // kata b8ke (review I1): the retry's re-attach is a lifecycle
             // start — routed through the ONE fenced attach sender. While the
             // canonical session has diverged the retry is suppressed (no
@@ -3594,23 +3631,22 @@ export function FreshAgentView({
               pendingSendMetadataRef.current.delete(failedRequestId)
               const retryRequestId = nanoid()
               lostSessionRetryRef.current.add(retryRequestId)
-              resendPendingMessage(retryRequestId, pendingMeta.text, cwd)
+              resendPendingMessage(retryRequestId, pending.text, cwd)
               // Do NOT fall through: the echo stays visible while the retry is
               // in flight.
               return
             }
           }
         }
-        const pending = pendingSendMetadataRef.current.get(failedRequestId)
-        const failedText = pending?.text
-        const asyncQuestionKeys = pending?.asyncQuestionKeys
-        const wasAmbiguous = pending?.deliveryAmbiguous === true
+        const failedText = pending.text
+        const asyncQuestionKeys = pending.asyncQuestionKeys
+        const wasAmbiguous = pending.deliveryAmbiguous === true
         const ambiguous = typeof message.message === 'string'
           && (message.message.startsWith('FRESH_AGENT_DELIVERY_AMBIGUOUS:')
             || (current.provider === 'codex' && message.message.startsWith('CODEX_DELIVERY_AMBIGUOUS:')))
         // A concrete acceptance or a prior ambiguity wins over a repeated or
         // late uncertain fallback for this same request.
-        if (ambiguous && (wasAmbiguous || pending?.submittedTurnId || pending?.legacyAccepted)) return
+        if (ambiguous && (wasAmbiguous || pending.submittedTurnId || pending.legacyAccepted)) return
         if (asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, ambiguous ? 'ambiguous' as const : 'refused' as const])) }))
         if (ambiguous) {
           // Keep the receipt and queue reservation: a lost response can follow
@@ -3641,18 +3677,10 @@ export function FreshAgentView({
             ? `Delivery uncertain (${failedRequestId}): ${sendFailureReason(message.message)}. Check the conversation before sending again.`
             : `Message not sent: ${sendFailureReason(message.message)}`
           if (ambiguous) {
-            const savedSessionId = (current.sessionRef?.provider === current.provider
-              ? current.sessionRef.sessionId : undefined) ?? current.resumeSessionId
-            const sourceSessionKey = current.sessionId ? makeFreshAgentSessionKey({
-              sessionId: current.sessionId, sessionType: current.sessionType, provider: current.provider,
-            }) : undefined
-            const sourceCanonicalSessionKey = savedSessionId ? makeFreshAgentSessionKey({
-              sessionId: savedSessionId, sessionType: current.sessionType, provider: current.provider,
-            }) : undefined
             const pendingDelivery: DeliveryNotice = {
               requestId: failedRequestId, text: failureNotice, level: 'warning',
-              ...(sourceSessionKey ? { sourceSessionKey } : {}),
-              ...(sourceCanonicalSessionKey ? { sourceCanonicalSessionKey } : {}),
+              ...(pending.sourceSessionKey ? { sourceSessionKey: pending.sourceSessionKey } : {}),
+              ...(pending.sourceCanonicalSessionKey ? { sourceCanonicalSessionKey: pending.sourceCanonicalSessionKey } : {}),
             }
             deliveryNoticeRef.current = pendingDelivery
             setDeliveryNoticeState(pendingDelivery)
@@ -3661,7 +3689,10 @@ export function FreshAgentView({
               deliveryNoticeRef.current = null
               setDeliveryNoticeState(null)
             }
-            setNotice(failureNotice)
+            setNotice(failureNotice, 'warning', pending.sourceSessionKey ? {
+              sessionKey: pending.sourceSessionKey,
+              canonicalSessionKey: pending.sourceCanonicalSessionKey,
+            } : undefined)
           }
           log.warn(ambiguous ? 'fresh_agent.send_delivery_ambiguous' : 'fresh_agent.send_refused', {
             provider: current.provider,
@@ -4862,14 +4893,7 @@ export function FreshAgentView({
   // before its transcript lines land. This view never subscribes to the
   // tail's text — only to whether it shows anything, so the transcript's own
   // live strip yields to it and one live reel shows.
-  const liveSessionKey = paneContent.sessionId
-    ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
-    : undefined
-  const savedNoticeSessionId = (paneContent.sessionRef?.provider === paneContent.provider
-    ? paneContent.sessionRef.sessionId : undefined) ?? paneContent.resumeSessionId
-  const savedNoticeSessionKey = savedNoticeSessionId
-    ? makeFreshAgentSessionKey({ sessionId: savedNoticeSessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
-    : undefined
+  const { sourceSessionKey: liveSessionKey, sourceCanonicalSessionKey: savedNoticeSessionKey } = paneSessionScope(paneContent)
   const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
   const retainedSnapshot = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.retainedSnapshot : undefined)
   useEffect(() => {
@@ -5215,6 +5239,7 @@ export function FreshAgentView({
     if (asyncQuestionKeys.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(asyncQuestionKeys.map((key) => [key, 'sending' as const])) }))
     recordPendingSendMetadata(requestId, {
       text,
+      ...paneSessionScope(current),
       asyncQuestionKeys,
       logicalAttemptId,
       busyEpoch: busyEpochRef.current,
