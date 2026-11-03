@@ -494,6 +494,62 @@ for (const size of [
   })
 }
 
+for (const size of [{ width: 560, height: 320 }, { width: 390, height: 700 }]) {
+  test(`compact Codex capacity error stays reachable beside another error at ${size.width}x${size.height}`, async ({ freshellPage, page, terminal }) => {
+    void freshellPage
+    if (size.width === 390) await page.setViewportSize({ width: 390, height: 844 })
+    await terminal.waitForTerminal()
+    await seedCompactPane(page, { sessionType: 'freshcodex', provider: 'codex', populated: true, style: 'sans', theme: 'light' })
+    await page.evaluate(() => {
+      const h = window.__FRESHELL_TEST_HARNESS__!
+      const state = h.getState()
+      const tabId = state.tabs.activeTabId!
+      h.dispatch({ type: 'settings/updateSettingsLocal', payload: { sidebar: { collapsed: true } } })
+      h.dispatch({ type: 'panes/mergePaneContent', payload: { tabId, paneId: state.panes.activePane[tabId],
+        updates: { createError: undefined, closeError: 'Second actionable diagnostic' } } })
+    })
+    await fitRoot(page, { width: size.width })
+    await fitRoot(page, { height: size.height })
+
+    const pane = page.locator('.fresh-agent-pane:not(.fresh-agent-diff-drawer-overlay)').last()
+    const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+    const draft = 'Keep this unsent draft while checking the provider error'
+    await composer.fill(draft)
+    const providerMessage = 'Selected model is at capacity. Please try a different model.'
+    await page.evaluate(message => window.__FRESHELL_TEST_HARNESS__!.receiveWsMessage?.({
+      type: 'freshAgent.event', sessionId: 'compact-freshcodex', sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.error', code: 'CODEX_PROVIDER_ERROR', message },
+    }), providerMessage)
+
+    const errors = pane.getByRole('region', { name: 'Agent errors' })
+    await expect(errors.getByRole('img', { name: '2 errors' })).toHaveText('2')
+    const providerError = errors.locator('[data-agent-error="session"]')
+    const otherError = errors.locator('[data-agent-error="close"]')
+    const providerSummary = providerError.locator('summary')
+    const spaceGeometry = await logUsefulSpace(page)
+    await assertPaintedTogether([
+      providerSummary.getByRole('alert'),
+      otherError.locator('summary').getByRole('alert'),
+    ], spaceGeometry)
+    await assertUsefulSpace(page)
+    await expect(composer).toHaveValue(draft)
+
+    await hitAndClick(providerSummary)
+    const providerDetails = providerError.locator('.fresh-agent-banner-text')
+    await expect(providerDetails).toHaveText(`Agent error: ${providerMessage}`)
+    await providerDetails.scrollIntoViewIfNeeded()
+    await assertPainted(providerDetails)
+    await expect(composer).toHaveValue(draft)
+    await hitAndClick(providerSummary)
+
+    const requests = pane.getByRole('region', { name: 'Pending requests' })
+    await hitAndClick(requests.getByRole('button', { name: 'Yes', exact: true }))
+    await hitAndClick(requests.getByRole('button', { name: 'Allow tool use', exact: true }))
+    await expect(composer).toHaveValue(draft)
+    await assertUsefulSpace(page)
+  })
+}
+
 async function measurePainted(control: Locator) {
   const result = await control.evaluate(el => {
     const range = document.createRange()
