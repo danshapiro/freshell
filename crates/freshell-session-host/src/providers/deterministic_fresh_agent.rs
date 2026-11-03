@@ -44,6 +44,9 @@ struct FixtureState {
     native_session_id: String,
     dispatch_count: u64,
     completion_count: u64,
+    // Keep the attention clock for this native session across transport reopen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_codex_completion_at: Option<i64>,
     pending_decision_id: Option<String>,
     #[serde(default)]
     create_profile: Option<FreshAgentProfile>,
@@ -80,6 +83,7 @@ impl DeterministicFreshAgentTransport {
                 native_session_id: fixture_native_id(profile),
                 dispatch_count: 0,
                 completion_count: 0,
+                last_codex_completion_at: None,
                 pending_decision_id: None,
                 create_profile: None,
             }
@@ -151,13 +155,23 @@ impl DeterministicFreshAgentTransport {
     }
 
     async fn emit_completion(&self, request_id: &RequestId) -> Result<(), DispatchFailure> {
-        let (native_session_id, turn_id, message_id) = {
+        let (native_session_id, turn_id, message_id, codex_completion_at) = {
             let mut state = self.state.lock().await;
             state.completion_count = state.completion_count.saturating_add(1);
             let ordinal = state.completion_count;
             let turn_id = format!("turn-{}-{ordinal}", short_hash(request_id.as_str()));
             let message_id = format!("assistant-{}-{ordinal}", short_hash(&turn_id));
             let native = state.native_session_id.clone();
+            let codex_completion_at = if self.provider == FreshProvider::Codex {
+                let at = freshell_codex::next_monotonic_turn_complete_at(
+                    state.last_codex_completion_at,
+                    unix_millis() as i64,
+                );
+                state.last_codex_completion_at = Some(at);
+                Some(at)
+            } else {
+                None
+            };
             write_provider_state(
                 &self.state_dir,
                 &state,
@@ -167,7 +181,7 @@ impl DeterministicFreshAgentTransport {
             )
             .await
             .map_err(non_ambiguous)?;
-            (native, turn_id, message_id)
+            (native, turn_id, message_id, codex_completion_at)
         };
         let completion = json!({"provider":self.provider.as_str(), "nativeId":native_session_id,
             "turnId":turn_id, "messageId":message_id, "requestId":request_id.as_str(), "at":unix_millis()});
@@ -227,7 +241,7 @@ impl DeterministicFreshAgentTransport {
             })
             .await
             .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
-        let completion_event = if self.provider == FreshProvider::Codex {
+        let completion_event = if let Some(at) = codex_completion_at {
             json!({
                 "type":"freshAgent.event",
                 "provider":wire_provider,
@@ -236,7 +250,7 @@ impl DeterministicFreshAgentTransport {
                 "event":{
                     "type":"freshAgent.turn.complete",
                     "sessionId":native_session_id,
-                    "at":unix_millis(),
+                    "at":at,
                     "outcome":"completed"
                 }
             })
@@ -1453,6 +1467,7 @@ mod tests {
                 native_session_id: old_id.clone(),
                 dispatch_count: 7,
                 completion_count: 6,
+                last_codex_completion_at: None,
                 pending_decision_id: Some("pending-preserved".into()),
                 create_profile: Some(saved_profile.clone()),
             };
@@ -1594,6 +1609,87 @@ mod tests {
             .iter()
             .any(|record| record["type"] == "response_item" && record["payload"]["id"] == message));
         assert_eq!(transport.state.lock().await.completion_count, 1);
+    }
+
+    #[tokio::test]
+    async fn codex_fixture_completions_advance_the_session_clock_after_reopen() {
+        fn drain_provider_events(events: &mut mpsc::Receiver<AgentEvent>) -> Vec<Value> {
+            std::iter::from_fn(|| events.try_recv().ok())
+                .map(|event| match event {
+                    AgentEvent::Provider { payload } => payload,
+                    other => panic!("unexpected fixture event: {other:?}"),
+                })
+                .collect()
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("fixture");
+        let profile = initial_profile(FreshProvider::Codex);
+        let native = fixture_native_id(&profile);
+        fs::create_dir_all(&state_dir).unwrap();
+        // This is the saved fixture format from before completion clocks existed.
+        fs::write(
+            state_dir.join(STATE_FILE),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "nativeSessionId": native,
+                "dispatchCount": 0,
+                "completionCount": 0,
+                "pendingDecisionId": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let transport = DeterministicFreshAgentTransport::open(&state_dir, &profile, uid, gid)
+            .await
+            .unwrap();
+        assert_eq!(transport.state.lock().await.native_session_id, native);
+        // A future floor deterministically makes each real wall-clock reading
+        // older than the last delivered completion, without changing the clock.
+        let floor = unix_millis() as i64 + 24 * 60 * 60 * 1000;
+        transport.state.lock().await.last_codex_completion_at = Some(floor);
+        let mut events = transport.take_event_stream().unwrap();
+        for request in ["clock-first", "clock-second"] {
+            transport
+                .emit_completion(&RequestId::parse(request).unwrap())
+                .await
+                .unwrap();
+        }
+        let delivered = drain_provider_events(&mut events);
+        assert_eq!(delivered.len(), 4);
+        for (index, expected_at) in [(1, floor + 1), (3, floor + 2)] {
+            assert_eq!(
+                delivered[index - 1]["event"]["type"],
+                "fixture.provider_native.assistant_message"
+            );
+            let completion = &delivered[index];
+            assert_eq!(completion["type"], "freshAgent.event");
+            assert_eq!(completion["sessionId"], native);
+            assert_eq!(completion["event"]["type"], "freshAgent.turn.complete");
+            assert_eq!(completion["event"]["sessionId"], native);
+            assert_eq!(completion["event"]["at"], expected_at);
+        }
+        drop(transport);
+
+        let reopened = DeterministicFreshAgentTransport::open(&state_dir, &profile, uid, gid)
+            .await
+            .unwrap();
+        let mut events = reopened.take_event_stream().unwrap();
+        reopened
+            .emit_completion(&RequestId::parse("clock-reopened").unwrap())
+            .await
+            .unwrap();
+        let delivered = drain_provider_events(&mut events);
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(
+            delivered[0]["event"]["type"],
+            "fixture.provider_native.assistant_message"
+        );
+        assert_eq!(delivered[1]["event"]["type"], "freshAgent.turn.complete");
+        assert_eq!(delivered[1]["event"]["sessionId"], native);
+        assert_eq!(delivered[1]["event"]["at"], floor + 3);
     }
 
     #[tokio::test]
@@ -1825,6 +1921,7 @@ mod tests {
             native_session_id: "fixture-native-codex-exact".into(),
             dispatch_count: 3,
             completion_count: 2,
+            last_codex_completion_at: None,
             pending_decision_id: None,
             create_profile: None,
         };
