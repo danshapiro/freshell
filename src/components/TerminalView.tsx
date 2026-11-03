@@ -2167,6 +2167,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
   }, [terminalContent?.terminalId])
 
+  // The terminalId-keyed registry above intentionally follows the server's
+  // runtime handle. A restored dead-session pane has no such handle, but it
+  // still owns a mounted xterm surface where the no-modal notice is written.
+  // Keep a pane-keyed test accessor for that current surface as well; this is
+  // test instrumentation only and is removed with the component.
+  useEffect(() => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness) return
+
+    harness.registerTerminalBufferForPane?.(paneId, () => {
+      const t = termRef.current
+      if (!t) return ''
+      return terminalBufferText(t.buffer.active)
+    })
+    return () => harness.unregisterTerminalBufferForPane?.(paneId)
+  }, [paneId])
+
   // Sync visibility at commit phase (layout effect, not passive effect): a
   // passive effect would leave a window where a queued attach callback could
   // read a stale hiddenRef; a layout effect runs synchronously with the

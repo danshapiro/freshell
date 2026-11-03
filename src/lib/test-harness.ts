@@ -48,6 +48,8 @@ export interface FreshellTestHarness {
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isTerminalNetworkEffectsSuppressed: (paneId: string) => boolean
   getTerminalBuffer: (terminalId?: string) => string | null
+  /** Current xterm surface for a pane, including dead panes with no runtime terminalId. */
+  getTerminalBufferForPane?: (paneId: string) => string | null
   getTerminalSnapshot?: (terminalId: string) => TerminalSurfaceSnapshot | null
   registerTerminalSnapshot?: (terminalId: string, accessor: () => TerminalSurfaceSnapshot | null) => void
   unregisterTerminalSnapshot?: (terminalId: string) => void
@@ -75,6 +77,8 @@ export interface FreshellTestHarness {
   unregisterTerminalModes: (terminalId: string) => void
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
+  registerTerminalBufferForPane?: (paneId: string, accessor: () => string) => void
+  unregisterTerminalBufferForPane?: (paneId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
   getSentWsMessages?: () => unknown[]
   getSentWsMessagesWithTimestamps?: () => Array<{ __sentAt?: number; type?: string; requestId?: string }>
@@ -125,6 +129,11 @@ export function installTestHarness(
   // Registry of terminal buffer accessors, keyed by terminalId.
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
+  // Pane surfaces can outlive their runtime terminalId (for example, a
+  // dead-session pane restored after a browser reload). This registry is
+  // keyed by the stable pane identity so E2E checks can inspect that current
+  // surface without accidentally querying a stale terminalId.
+  const terminalPaneBuffers = new Map<string, () => string>()
   const terminalSnapshots = new Map<string, () => TerminalSurfaceSnapshot | null>()
   const terminalModes = new Map<string, () => {
     mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
@@ -182,6 +191,10 @@ export function installTestHarness(
       if (first.done) return null
       return first.value()
     },
+    getTerminalBufferForPane: (paneId: string) => {
+      const accessor = terminalPaneBuffers.get(paneId)
+      return accessor ? accessor() : null
+    },
     setFreshAgentNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => {
       if (suppressed) {
         suppressedFreshAgentPaneIds.add(paneId)
@@ -203,6 +216,12 @@ export function installTestHarness(
     },
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
+    },
+    registerTerminalBufferForPane: (paneId: string, accessor: () => string) => {
+      terminalPaneBuffers.set(paneId, accessor)
+    },
+    unregisterTerminalBufferForPane: (paneId: string) => {
+      terminalPaneBuffers.delete(paneId)
     },
     getTerminalModes: (terminalId?: string) => {
       if (terminalId) {

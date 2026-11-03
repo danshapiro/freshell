@@ -947,7 +947,11 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         }, { timeout: 60_000 }).toBe('durable_artifact_missing')
         await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
         await expect.poll(async () => {
-          const buffer = await harness.getTerminalBuffer(terminalId)
+          // The old terminalId is a runtime handle and is stripped when the
+          // browser reloads. The dead pane still has a current xterm surface,
+          // so inspect it by the stable pane identity rather than asking the
+          // harness for a no-longer-registered terminalId.
+          const buffer = await harness.getTerminalBufferForPane(paneId)
           return typeof buffer === 'string'
             ? buffer.split(DEAD_SESSION_BUFFER_NOTICE).length - 1
             : 0

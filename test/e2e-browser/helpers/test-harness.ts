@@ -383,6 +383,17 @@ export class TestHarness {
     }, terminalId)
   }
 
+  async getTerminalBufferForPane(paneId: string): Promise<string | null> {
+    return this.page.evaluate((id) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      if (!harness.getTerminalBufferForPane) {
+        throw new Error('Pane-scoped terminal buffer accessor is not available')
+      }
+      return harness.getTerminalBufferForPane(id)
+    }, paneId)
+  }
+
   async getPerfAuditSnapshot(): Promise<PerfAuditSnapshot | null> {
     return this.page.evaluate(() => {
       const harness = window.__FRESHELL_TEST_HARNESS__

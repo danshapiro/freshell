@@ -633,6 +633,50 @@ describe('TerminalView lifecycle updates', () => {
     }
   })
 
+  it('registers the current pane surface without a terminalId, keeps it across terminalId changes, and unregisters on unmount', async () => {
+    const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+    const emulator = new actual.Terminal({ cols: 40, rows: 8, allowProposedApi: true })
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      status: 'running',
+      restoreError: buildRestoreError('durable_artifact_missing'),
+      sessionRef: { provider: 'claude', sessionId: 'native-root' },
+    })
+    expect(paneContent.terminalId).toBeUndefined()
+    installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const getPaneBuffer = harness.getTerminalBufferForPane!
+    harness.setTerminalNetworkEffectsSuppressed(paneId, true)
+    const view = render(<Provider store={store}>
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+    </Provider>)
+    const term = terminalInstances.at(-1)!
+    term.buffer = emulator.buffer
+    try {
+      // A dead-session pane has a current xterm surface even though its old
+      // runtime terminalId was stripped during restore.
+      expect(getPaneBuffer(paneId)).toEqual(expect.any(String))
+      expect(harness.getTerminalBuffer('term-after-recovery')).toBeNull()
+
+      const output = 'PANE_SURFACE_BUFFER'
+      await new Promise<void>(done => emulator.write(`${output}\r\n`, done))
+      expect(getPaneBuffer(paneId)).toContain(output)
+
+      const recoveredContent = { ...paneContent, terminalId: 'term-after-recovery' }
+      view.rerender(<Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={recoveredContent} />
+      </Provider>)
+      expect(getPaneBuffer(paneId)).toContain(output)
+      expect(harness.getTerminalBuffer('term-after-recovery')).toContain(output)
+
+      view.unmount()
+      expect(getPaneBuffer(paneId)).toBeNull()
+      expect(harness.getTerminalBuffer('term-after-recovery')).toBeNull()
+    } finally {
+      view.unmount()
+      emulator.dispose()
+    }
+  })
+
   it('skips terminal create when the e2e harness suppresses terminal network effects for the pane', () => {
     window.__FRESHELL_TEST_HARNESS__ = {
       getState: vi.fn(),
