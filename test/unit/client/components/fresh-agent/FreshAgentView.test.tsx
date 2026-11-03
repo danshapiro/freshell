@@ -2784,6 +2784,9 @@ describe('FreshAgentView', () => {
         steer.assistantRow('shared-turn:row-1', 'The shared turn completed'),
         steer.userRow('shared-turn:row-2', prompt),
       ], 'The shared turn completed')
+      // The current idle snapshot is sufficient evidence. Do not let the
+      // unrelated stale-echo retry budget make this assertion pass later.
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2), { timeout: 10_000 })
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow up after steering' })
       expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
@@ -2815,7 +2818,6 @@ describe('FreshAgentView', () => {
       }
       expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
     })
-
 
     it.each([
       { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
