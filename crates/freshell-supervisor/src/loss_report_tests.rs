@@ -2224,6 +2224,74 @@ fn cleanup(prepared: &PreparedLoss) -> LossCleanupReport {
 }
 
 #[tokio::test]
+async fn verified_loss_cleanup_preserves_an_unadmitted_send_refusal() {
+    use crate::registry::InputJournalDisposition;
+    use freshell_runtime_protocol::RequestId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, initial) = prepared_context(dir.path()).await;
+    registry
+        .mark_recovery_blocked(
+            initial.soul_id.clone(),
+            None,
+            RecoveryBlockReason::StoreUnreadable,
+            Vec::new(),
+            initial.write_fence(),
+        )
+        .await
+        .unwrap();
+    let request = RequestId::parse("refused-before-loss").unwrap();
+    let refusal = registry
+        .refuse_blocked_unadmitted_input(
+            initial.soul_id.clone(),
+            request.clone(),
+            b"unsent prompt",
+            b"null",
+        )
+        .await
+        .unwrap()
+        .expect("the blocked input must be refused");
+    let blocked = registry
+        .recovery_context(initial.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked.accepted_command_count,
+        initial.accepted_command_count
+    );
+    let prepared = registry
+        .prepare_loss(decision_for(&registry, &blocked).unwrap())
+        .await
+        .unwrap();
+    registry
+        .finalize_loss_cleanup(
+            prepared.certificate.incident_id.clone(),
+            StopOutcome::VerifiedEmpty,
+            cleanup(&prepared),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registry
+            .recorded_input_outcome(
+                initial.soul_id.clone(),
+                request,
+                b"unsent prompt",
+                Some(b"null"),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Refused(refusal))
+    );
+    let after = registry.recovery_context(initial.soul_id).await.unwrap();
+    assert_eq!(after.accepted_command_count, initial.accepted_command_count);
+    assert_eq!(
+        after.dispatched_command_count,
+        initial.dispatched_command_count
+    );
+}
+
+#[tokio::test]
 async fn dispatched_missing_identity_cannot_certify_loss() {
     for (provider, mode) in [
         ("claude", "claude"),

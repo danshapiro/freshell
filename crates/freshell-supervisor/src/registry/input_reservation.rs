@@ -319,3 +319,7 @@ fn rejected_initial_observation(
     })?;
     Ok((soul, serde_json::from_str(&raw)?))
 }
+
+#[cfg(test)]
+#[path = "input_reservation_refused_tests.rs"]
+mod input_reservation_refused_tests;
