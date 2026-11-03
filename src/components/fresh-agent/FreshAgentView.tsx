@@ -5547,7 +5547,8 @@ export function FreshAgentView({
     const visibleErrors: FreshAgentError[] = [
       ...(displayedTransientError ? [{
         id: 'notice', renderKey: 'transient-notice', summary: noticeSummary ?? notice.text,
-        compactSummary: notice.level === 'warning' ? 'Warning' : 'Error', level: notice.level,
+        compactSummary: notice.level === 'warning' ? 'Warning' : 'Error',
+        level: notice.level === 'error' ? 'error' as const : 'warning' as const,
         content: verboseNotice || uncertainDelivery || noticeExpanded
           ? notice.level === 'error'
             ? <FreshAgentApprovalBanner text={notice.text} announce={false} onDismiss={() => setNoticeState(current => current === notice ? null : current)} />
