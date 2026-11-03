@@ -5215,7 +5215,7 @@ export function FreshAgentView({
       : verboseNotice ? `${notice.text.slice(0, 160)}…` : notice?.text
     const visibleErrors: FreshAgentError[] = [
       ...(notice && notice.level !== 'info' ? [{ id: 'notice', summary: noticeSummary ?? notice.text, level: notice.level, content: verboseNotice || uncertainDelivery ? <p>{notice.text}</p> : null, onToggle: setNoticeExpanded }] : []),
-    { id: 'create', summary: 'Agent could not start', content: (pendingCreateFailure || paneContent.createError ? (
+    { id: 'create', summary: 'Agent could not start', initiallyExpanded: true, content: (pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner
                     text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'}

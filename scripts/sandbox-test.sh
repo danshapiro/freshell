@@ -12,6 +12,7 @@
 #   scripts/sandbox-test.sh --native-tools <manifest-path> --receipt-dir <absolute-directory>
 #   scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex ..."
 #   scripts/sandbox-test.sh --runtime-suite --checkpoint-fixture "cargo test -p freshell-server --features managed-runtime-v1 --locked --test code_checkpoint_permissions"
+#   scripts/sandbox-test.sh --external-browser <private-p2-g01-descriptor.json>
 #
 # --runtime-suite prepares dependencies first, then runs the caller in the
 # stricter managed-runtime lifecycle mode: no network, no real provider corpus,
@@ -32,8 +33,73 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WORKSPACE_ROOT="${REPO_ROOT}"
 IMAGE_TAG="freshell-sandbox:latest"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
+PNPM_STORE_VOLUME="${CACHE_PREFIX}-pnpm-store"
+P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
+P2_G01_PNPM_STORE_VOLUME="${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}"
+
+cleanup_p2_g01_pnpm_store() {
+  local phase="$1"
+  local expected_volume="freshell-p2g01-pnpm-${P2_G01_RUN_ID}"
+  local listed_volume=""
+  local consumers=""
+  local removed=false
+  if ! [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+    || [ "${P2_G01_PNPM_STORE_VOLUME}" != "${expected_volume}" ] \
+    || [[ ! "${phase}" =~ ^(preparation|execution)$ ]]; then
+    printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","reason":"invalid_identity_or_phase"}\n' >&2
+    return 1
+  fi
+  if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")"; then
+    printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_list_failed"}\n' \
+      "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+    return 1
+  fi
+  if printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
+    if ! consumers="$(docker ps -aq --filter "volume=${expected_volume}")"; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"consumer_check_failed"}\n' \
+        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+      return 1
+    fi
+    if [ -n "${consumers}" ] || ! docker volume rm "${expected_volume}" >/dev/null; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_in_use_or_removal_failed"}\n' \
+        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+      return 1
+    fi
+    removed=true
+  fi
+  if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")" \
+    || printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
+    printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_absence_unconfirmed"}\n' \
+      "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+    return 1
+  fi
+  printf '{"severity":"info","event":"sandbox_external_pnpm_store_settled","runId":"%s","volume":"%s","phase":"%s","absent":true,"removed":%s}\n' \
+    "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" "${removed}" >&2
+}
+
+# The execution child inherits the run-scoped volume created during prep.
+# Install this before descriptor parsing so every failed re-entry can settle it.
+p2_g01_cleanup_on_error() {
+  local result=$?
+  trap - EXIT
+  if [ "${result}" -ne 0 ] && [ -n "${P2_G01_CLEANUP_PHASE:-}" ]; then
+    if ! cleanup_p2_g01_pnpm_store "${P2_G01_CLEANUP_PHASE}"; then
+      result=1
+    fi
+  fi
+  exit "${result}"
+}
+
+if [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" = 1 ] \
+  && [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" = execution ] \
+  && [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+  && [ "${P2_G01_PNPM_STORE_VOLUME}" = "freshell-p2g01-pnpm-${P2_G01_RUN_ID}" ]; then
+  P2_G01_CLEANUP_PHASE=execution
+  trap 'p2_g01_cleanup_on_error' EXIT
+fi
 
 if [ "${1:-}" = "--provider-mountpoints" ]; then
   shift
@@ -81,6 +147,63 @@ if [ "${1:-}" = "--native-tools" ]; then
     --output "${NATIVE_RECEIPT_DIR%/}/native-session-names.json"
 fi
 
+if [ "${1:-}" = "--workspace-root" ]; then
+  shift
+  REQUESTED_WORKSPACE_ROOT="${1:-}"
+  if [ -z "${REQUESTED_WORKSPACE_ROOT}" ] || [ ! -d "${REQUESTED_WORKSPACE_ROOT}" ]; then
+    echo '[sandbox] --workspace-root requires an existing worktree directory' >&2
+    exit 2
+  fi
+  case "${REQUESTED_WORKSPACE_ROOT}" in
+    /*) ;;
+    *) echo '[sandbox] --workspace-root must be absolute' >&2; exit 2 ;;
+  esac
+  WORKSPACE_ROOT="$(cd -- "${REQUESTED_WORKSPACE_ROOT}" && pwd -P)" || {
+    echo '[sandbox] could not resolve --workspace-root' >&2
+    exit 2
+  }
+  shift
+
+  TRUSTED_GIT_COMMON_DIR="$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  WORKSPACE_GIT_COMMON_DIR="$(git -C "${WORKSPACE_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  WORKSPACE_TOP="$(git -C "${WORKSPACE_ROOT}" rev-parse --show-toplevel 2>/dev/null || true)"
+  TRUSTED_GIT_COMMON_DIR="$(realpath -e "${TRUSTED_GIT_COMMON_DIR}" 2>/dev/null || true)"
+  WORKSPACE_GIT_COMMON_DIR="$(realpath -e "${WORKSPACE_GIT_COMMON_DIR}" 2>/dev/null || true)"
+  WORKSPACE_TOP="$(cd -- "${WORKSPACE_TOP}" 2>/dev/null && pwd -P)" || WORKSPACE_TOP=""
+  if [ -z "${TRUSTED_GIT_COMMON_DIR}" ] \
+    || [ "${WORKSPACE_GIT_COMMON_DIR}" != "${TRUSTED_GIT_COMMON_DIR}" ] \
+    || [ "${WORKSPACE_TOP}" != "${WORKSPACE_ROOT}" ]; then
+    echo '[sandbox] --workspace-root must be a worktree in the trusted wrapper repository' >&2
+    exit 2
+  fi
+fi
+
+# A linked worktree's .git file points to its per-worktree admin directory,
+# which in turn resolves its objects and refs through the shared Git common
+# directory. The workspace bind mount below does not expose that path. Mount only
+# the resolved common directory, at the same absolute path, and read-only so
+# Git can inspect this worktree without making host metadata writable.
+LINKED_WORKTREE_GIT_COMMON_DIR=""
+if [ -f "${WORKSPACE_ROOT}/.git" ]; then
+  WORKTREE_GIT_DIR="$(git -C "${WORKSPACE_ROOT}" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  WORKTREE_GIT_COMMON_DIR="$(git -C "${WORKSPACE_ROOT}" rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "${WORKTREE_GIT_DIR}" ] && [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
+    case "${WORKTREE_GIT_COMMON_DIR}" in
+      /*) ;;
+      *) WORKTREE_GIT_COMMON_DIR="${WORKSPACE_ROOT}/${WORKTREE_GIT_COMMON_DIR}" ;;
+    esac
+    WORKTREE_GIT_DIR="$(realpath -e "${WORKTREE_GIT_DIR}" 2>/dev/null || true)"
+    WORKTREE_GIT_COMMON_DIR="$(realpath -e "${WORKTREE_GIT_COMMON_DIR}" 2>/dev/null || true)"
+    case "${WORKTREE_GIT_DIR}" in
+      "${WORKTREE_GIT_COMMON_DIR}"/worktrees/*)
+        if [ -n "${WORKTREE_GIT_COMMON_DIR}" ]; then
+          LINKED_WORKTREE_GIT_COMMON_DIR="${WORKTREE_GIT_COMMON_DIR}"
+        fi
+        ;;
+    esac
+  fi
+fi
+
 SETTLE_ONLY=0
 if [ "${1:-}" = "--settle-owned" ]; then
   SETTLE_ONLY=1
@@ -95,6 +218,8 @@ else
   MOUNT_CORPUS=0
   RUNTIME_SUITE=0
   CHECKPOINT_FIXTURE=0
+  EXTERNAL_BROWSER=0
+  EXTERNAL_DESCRIPTOR_PATH=""
   while [ "$#" -gt 0 ]; do
     case "${1}" in
       --corpus)
@@ -108,6 +233,15 @@ else
       --checkpoint-fixture)
         CHECKPOINT_FIXTURE=1
         shift
+        ;;
+      --external-browser)
+        if [ "$#" -lt 2 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+          echo '[sandbox] --external-browser requires one private descriptor file' >&2
+          exit 2
+        fi
+        EXTERNAL_BROWSER=1
+        EXTERNAL_DESCRIPTOR_PATH="$2"
+        shift 2
         ;;
       --)
         shift
@@ -129,11 +263,132 @@ else
     exit 2
   fi
 
-  if [ "$#" -lt 1 ]; then
-    echo "usage: $0 [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
+  if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+    if [ "${MOUNT_CORPUS}" -eq 1 ] || [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${CHECKPOINT_FIXTURE}" -eq 1 ] || [ "$#" -ne 0 ]; then
+      echo '[sandbox] --external-browser accepts only its private descriptor and workspace root' >&2
+      exit 2
+    fi
+    if [[ "${EXTERNAL_DESCRIPTOR_PATH}" != /* ]] || [ ! -f "${EXTERNAL_DESCRIPTOR_PATH}" ] || [ -L "${EXTERNAL_DESCRIPTOR_PATH}" ]; then
+      echo '[sandbox] P2-G01 descriptor must be an absolute regular file' >&2
+      exit 2
+    fi
+    EXTERNAL_DESCRIPTOR_PATH="$(realpath -e "${EXTERNAL_DESCRIPTOR_PATH}")"
+    if [[ "${EXTERNAL_DESCRIPTOR_PATH}" == "${WORKSPACE_ROOT}"/* ]]; then
+      echo '[sandbox] P2-G01 descriptor must remain outside the worktree' >&2
+      exit 2
+    fi
+    DESCRIPTOR_FILE_MODE="$(stat -c '%a' "${EXTERNAL_DESCRIPTOR_PATH}")"
+    DESCRIPTOR_FILE_UID="$(stat -c '%u' "${EXTERNAL_DESCRIPTOR_PATH}")"
+    DESCRIPTOR_DIR="$(dirname "${EXTERNAL_DESCRIPTOR_PATH}")"
+    DESCRIPTOR_DIR_MODE="$(stat -c '%a' "${DESCRIPTOR_DIR}")"
+    DESCRIPTOR_DIR_UID="$(stat -c '%u' "${DESCRIPTOR_DIR}")"
+    if [ "${DESCRIPTOR_FILE_MODE}" != 444 ] || [ "${DESCRIPTOR_DIR_MODE}" != 700 ] \
+      || [ "${DESCRIPTOR_FILE_UID}" != "$(id -u)" ] || [ "${DESCRIPTOR_DIR_UID}" != "$(id -u)" ]; then
+      echo '[sandbox] P2-G01 descriptor must be caller-owned, read-only 0444 inside its private 0700 parent directory' >&2
+      exit 2
+    fi
+    python3 - "${EXTERNAL_DESCRIPTOR_PATH}" <<'PY'
+import json
+import re
+import sys
+from urllib.parse import urlsplit
+
+expected = {
+    "FRESHELL_E2E_TARGET_URL",
+    "FRESHELL_E2E_TARGET_WS_URL",
+    "FRESHELL_E2E_TARGET_TOKEN",
+    "FRESHELL_RUNTIME_EXTERNAL_RUN_ID",
+    "FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA",
+    "FRESHELL_RUNTIME_EXTERNAL_SPEC",
+    "FRESHELL_RUNTIME_EXTERNAL_GREP",
+}
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream)
+    assert isinstance(value, dict) and set(value) == expected
+    assert all(isinstance(value[key], str) and value[key] for key in expected)
+    assert len(value["FRESHELL_E2E_TARGET_TOKEN"]) <= 4096
+    http = urlsplit(value["FRESHELL_E2E_TARGET_URL"])
+    websocket = urlsplit(value["FRESHELL_E2E_TARGET_WS_URL"])
+    assert http.scheme == "https" and websocket.scheme == "wss"
+    assert http.hostname and http.hostname == websocket.hostname and http.port == websocket.port
+    assert http.path in ("", "/") and websocket.path == "/ws"
+    assert not any((http.username, http.password, http.query, http.fragment,
+                    websocket.username, websocket.password, websocket.query, websocket.fragment))
+    assert re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", value["FRESHELL_RUNTIME_EXTERNAL_RUN_ID"])
+    assert re.fullmatch(r"[a-f0-9]{40}", value["FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA"])
+    assert value["FRESHELL_RUNTIME_EXTERNAL_SPEC"] == "test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts"
+    assert value["FRESHELL_RUNTIME_EXTERNAL_GREP"] == "P2-G01: real browser shell survives ten graceful/abrupt web replacements"
+except (AssertionError, OSError, ValueError, json.JSONDecodeError):
+    print("[sandbox] P2-G01 descriptor is invalid or selects an unapproved case", file=sys.stderr)
+    raise SystemExit(2)
+PY
+    EXTERNAL_RUN_ID="$(python3 - "${EXTERNAL_DESCRIPTOR_PATH}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream)["FRESHELL_RUNTIME_EXTERNAL_RUN_ID"])
+PY
+)"
+    if [ "${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}" != "${EXTERNAL_RUN_ID}" ] \
+      || [ "${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}" != "freshell-p2g01-pnpm-${EXTERNAL_RUN_ID}" ]; then
+      echo '[sandbox] P2-G01 requires its owner run-bound disposable pnpm store' >&2
+      exit 2
+    fi
+    CMD='pnpm exec tsx scripts/testing/external-browser-sandbox.ts'
+  elif [ "$#" -lt 1 ]; then
+    echo "usage: $0 [--workspace-root <absolute-worktree>] [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
+    exit 2
+  else
+    CMD="$1"
+  fi
+
+  if [ -n "${P2_G01_RUN_ID}" ] || [ -n "${P2_G01_PNPM_STORE_VOLUME}" ]; then
+    if ! [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+      || [ "${P2_G01_PNPM_STORE_VOLUME}" != "freshell-p2g01-pnpm-${P2_G01_RUN_ID}" ] \
+      || { [ "${EXTERNAL_BROWSER}" -ne 1 ] && [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" != preparation ]; }; then
+      echo '[sandbox] P2-G01 pnpm store identity is invalid for this sandbox phase' >&2
+      exit 2
+    fi
+    PNPM_STORE_VOLUME="${P2_G01_PNPM_STORE_VOLUME}"
+  elif [[ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" =~ ^(preparation|execution)$ ]]; then
+    echo '[sandbox] P2-G01 sandbox phase requires its run-bound pnpm store identity' >&2
     exit 2
   fi
-  CMD="$1"
+
+  preparation_signal() {
+    local requested_signal="$1"
+    local result="$2"
+    if [ -z "${PREPARATION_PID:-}" ]; then
+      PREPARATION_PENDING_SIGNAL="${requested_signal}"
+      PREPARATION_PENDING_STATUS="${result}"
+      printf '{"severity":"info","event":"sandbox_preparation_signal_deferred","signal":"%s"}\n' \
+        "${requested_signal}" >&2
+      return
+    fi
+    trap '' INT TERM HUP
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      # The P2 preparation's parent EXIT handler settles its private store;
+      # TERM gives the owned sandbox wrapper its normal container cleanup path.
+      kill -TERM "${PREPARATION_PID}" 2>/dev/null || true
+    else
+      # Ordinary runtime-suite setup keeps forwarding the same signal it got.
+      kill -s "${requested_signal}" "${PREPARATION_PID}" 2>/dev/null || true
+    fi
+    wait "${PREPARATION_PID}" 2>/dev/null || true
+    exit "${result}"
+  }
+
+  if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+    P2_G01_CLEANUP_PHASE="${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-preparation}"
+    if [[ ! "${P2_G01_CLEANUP_PHASE}" =~ ^(preparation|execution)$ ]]; then
+      P2_G01_CLEANUP_PHASE="preparation"
+    fi
+    trap 'p2_g01_cleanup_on_error' EXIT
+  fi
+
+  STRICT_SANDBOX=0
+  if [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; then STRICT_SANDBOX=1; fi
 
   # Only the closed native Codex contract entrypoint receives its declared
   # sandbox construction policy. Every other runtime suite keeps Docker's
@@ -161,7 +416,7 @@ else
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
         node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
         CODEX_NATIVE_CONTRACT=1
-        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${REPO_ROOT}/.runtime-build/codex-contract/staged.json")"
+        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${WORKSPACE_ROOT}/.runtime-build/codex-contract/staged.json")"
         ;;
     esac
   fi
@@ -169,7 +424,7 @@ else
   # This exact stopped-repair route already owns its dedicated enclosure.
   if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "$#" -eq 1 ] && \
      [ "${CMD}" = "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored" ]; then
-    cd "${REPO_ROOT}"
+    cd "${WORKSPACE_ROOT}"
     exec pnpm exec tsx "${REPO_ROOT}/scripts/testing/task007-destructive-sandbox.ts"
   fi
   if [[ ! "${CACHE_PREFIX}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
@@ -179,20 +434,48 @@ else
 
   # Each phase runs the same owned wrapper lifecycle with its own name, CID,
   # guard and completed settlement. Only the fixed preparation has networking.
-  if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
+  if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
-    env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --runtime-suite \
-      'if [ -f Cargo.lock ]; then cargo fetch --locked; fi' &
+    PREPARATION_PID=""
+    PREPARATION_PENDING_SIGNAL=""
+    PREPARATION_PENDING_STATUS=0
+    # Arm handlers before launching the child. A signal in the fork-to-$! gap
+    # is saved and forwarded as soon as Bash records the preparation PID.
+    trap 'preparation_signal INT 130' INT
+    trap 'preparation_signal TERM 143' TERM
+    trap 'preparation_signal HUP 129' HUP
+    PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
+    fi
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      env FRESHELL_SANDBOX_PREPARE_ONLY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=preparation \
+        bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite "${PREPARATION_COMMAND}" &
+    else
+      env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite \
+      "${PREPARATION_COMMAND}" &
+    fi
     PREPARATION_PID=$!
-    trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
-    trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
-    trap 'kill -HUP "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 129' HUP
+    if [ -n "${PREPARATION_PENDING_SIGNAL}" ]; then
+      preparation_signal "${PREPARATION_PENDING_SIGNAL}" "${PREPARATION_PENDING_STATUS}"
+    fi
     PREPARATION_STATUS=0
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
     trap - INT TERM HUP
-    if [ "${PREPARATION_STATUS}" -ne 0 ]; then exit "${PREPARATION_STATUS}"; fi
-    CALLER_FLAGS=(--runtime-suite)
-    if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
+    if [ "${PREPARATION_STATUS}" -ne 0 ]; then
+      exit "${PREPARATION_STATUS}"
+    fi
+    CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}")
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      CALLER_FLAGS+=(--external-browser "${EXTERNAL_DESCRIPTOR_PATH}")
+    else
+      CALLER_FLAGS+=(--runtime-suite)
+      if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
+    fi
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
+        bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}"
+    fi
     exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
   fi
 
@@ -203,9 +486,9 @@ else
   target_cache_hash() {
     local hash_output
     if command -v sha256sum >/dev/null 2>&1; then
-      hash_output="$(printf '%s' "${REPO_ROOT}" | sha256sum)" || return 1
+      hash_output="$(printf '%s' "${WORKSPACE_ROOT}" | sha256sum)" || return 1
     elif command -v shasum >/dev/null 2>&1; then
-      hash_output="$(printf '%s' "${REPO_ROOT}" | shasum -a 256)" || return 1
+      hash_output="$(printf '%s' "${WORKSPACE_ROOT}" | shasum -a 256)" || return 1
     else
       return 1
     fi
@@ -288,9 +571,8 @@ PY
     "${REPO_ROOT}/scripts/sandbox-build.sh"
   fi
 
-  # Ordinary destructive tests keep the established dedicated bridge network.
-  # Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
-  # ever uses the host network.
+  # Ordinary destructive tests and the fixed P2-G01 external browser use only
+  # the established bridge. Ordinary --runtime-suite commands remain offline.
   NETWORK_ARGS=()
   if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
     NETWORK_ARGS=(--network none)
@@ -318,12 +600,23 @@ sandbox_log() {
     "$1" "$2" "${OWNED_CONTAINER_NAME}" "$3" >&2
 }
 
+sandbox_completion_log() {
+  local phase="${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}"
+  case "${phase}" in
+    preparation|execution)
+      printf '{"severity":"%s","event":"%s","container":"%s","code":%s,"phase":"%s"}\n' \
+        "$1" "$2" "${OWNED_CONTAINER_NAME}" "$3" "${phase}" >&2
+      ;;
+    *) sandbox_log "$1" "$2" "$3" ;;
+  esac
+}
+
 # shellcheck disable=SC2317 # Reached by the installed EXIT/signal trap handlers.
 owned_docker_client_running() {
   [ -n "${DOCKER_CLIENT_PID}" ] \
     && ps -p "${DOCKER_CLIENT_PID}" -o args= 2>/dev/null \
       | grep -F -- "--name ${OWNED_CONTAINER_NAME}" \
-      | grep -F -- "${REPO_ROOT}:/workspace" >/dev/null
+      | grep -F -- "${WORKSPACE_ROOT}:/workspace" >/dev/null
 }
 
 # shellcheck disable=SC2317 # Reached by the installed EXIT trap handler.
@@ -434,6 +727,10 @@ finish_owned_sandbox() {
       container_settled=0
     fi
   fi
+  if [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" = execution ] \
+    && [ -n "${P2_G01_RUN_ID}" ] && ! cleanup_p2_g01_pnpm_store execution; then
+    result=1
+  fi
   if [ "${container_settled}" -eq 1 ]; then
     rm -rf -- "${OWNED_CONTROL_DIR}" || result=1
   else
@@ -441,10 +738,19 @@ finish_owned_sandbox() {
     printf '[sandbox] owned container %s could not be settled; control evidence retained at %q\n' \
       "${OWNED_CONTAINER_NAME}" "${OWNED_CONTROL_DIR}" >&2
   fi
+  case "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" in
+    preparation|execution)
+      if [ "${container_settled}" -eq 1 ]; then
+        sandbox_completion_log info sandbox_container_settled 0
+      else
+        sandbox_completion_log error sandbox_container_unsettled 1
+      fi
+      ;;
+  esac
   if [ "${result}" -eq 0 ]; then
-    sandbox_log info sandbox_workload_finished "${result}"
+    sandbox_completion_log info sandbox_workload_finished "${result}"
   else
-    sandbox_log error sandbox_workload_failed "${result}"
+    sandbox_completion_log error sandbox_workload_failed "${result}"
   fi
   exit "${result}"
 }
@@ -476,9 +782,10 @@ trap 'interrupt_owned_sandbox 130 SIGINT' INT
 trap 'interrupt_owned_sandbox 143 SIGTERM' TERM
 trap 'interrupt_owned_sandbox 129 SIGHUP' HUP
 
-# Only the strict Rust route opts in. A detached owner guard survives the
-# unchanged coordinator's SIGKILL tree and settles this preallocated object.
-if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_OWNER_GUARD:-}" = "1" ]; then
+# A detached owner guard survives the unchanged coordinator's SIGKILL tree
+# and settles this preallocated object when the caller opts into that guard.
+if { [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; } \
+  && [ "${FRESHELL_SANDBOX_OWNER_GUARD:-}" = "1" ]; then
   OWNER_GUARD_PID="$(python3 "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" "${OWNED_CONTROL_DIR}" "$$" "${BASH_SOURCE[0]}")"
   printf '{"severity":"info","event":"sandbox_owner_guard_started","container":"%s","pid":%s}\n' \
     "${OWNED_CONTAINER_NAME}" "${OWNER_GUARD_PID}" >&2
@@ -491,10 +798,11 @@ DOCKER_ARGS=(
   "${NETWORK_ARGS[@]}"
   --pids-limit 512
   --memory 8g
-  -v "${REPO_ROOT}:/workspace"
+  -e GIT_OPTIONAL_LOCKS=0
+  -v "${WORKSPACE_ROOT}:/workspace"
   -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
   -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
-  -v "${CACHE_PREFIX}-pnpm-store:/home/sandbox/.local/share/pnpm/store"
+  -v "${PNPM_STORE_VOLUME}:/home/sandbox/.local/share/pnpm/store"
   --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/workspace/target,${TARGET_CACHE_LABEL_OPTIONS}"
   -v "${CACHE_PREFIX}-node-modules:/workspace/node_modules"
   # pnpm workspace members with their own dependencies get their own
@@ -506,7 +814,20 @@ DOCKER_ARGS=(
   -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
 )
 
-if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
+if [ -n "${LINKED_WORKTREE_GIT_COMMON_DIR}" ]; then
+  DOCKER_ARGS+=(
+    --mount "type=bind,src=${LINKED_WORKTREE_GIT_COMMON_DIR},dst=${LINKED_WORKTREE_GIT_COMMON_DIR},readonly"
+    # Rootless Docker presents the host-owned /workspace as container root,
+    # while the test command runs as the non-root sandbox user. Trust only
+    # this exact linked-worktree mount for Git's dubious-ownership check;
+    # nested fixture repositories remain subject to their own ownership.
+    -e GIT_CONFIG_COUNT=1
+    -e GIT_CONFIG_KEY_0=safe.directory
+    -e GIT_CONFIG_VALUE_0=/workspace
+  )
+fi
+
+if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
   # shellcheck disable=SC2054 # Commas belong to each single tmpfs option string.
   DOCKER_ARGS+=(
     --read-only
@@ -523,10 +844,14 @@ if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]
   )
   if [ "${CODEX_NATIVE_CONTRACT:-0}" -eq 1 ]; then
     DOCKER_ARGS+=(
-      --security-opt "seccomp=${REPO_ROOT}/.runtime-build/codex-contract/codex-policy.json"
+      --security-opt "seccomp=${WORKSPACE_ROOT}/.runtime-build/codex-contract/codex-policy.json"
       -e FRESHELL_CODEX_CONTRACT_POLICY=prepared
     )
   fi
+
+if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+  DOCKER_ARGS+=(--mount "type=bind,src=${EXTERNAL_DESCRIPTOR_PATH},dst=/run/freshell-external-target.json,readonly")
+fi
   if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
     DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)
   fi
@@ -545,7 +870,7 @@ fi
 # root (dockerd itself runs as root), before the container ever hands off to
 # its non-root user. A named volume layered under a path inside our
 # bind-mounted repo (e.g. a volume mount at /workspace/target) needs a mount point at
-# ${REPO_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
+# ${WORKSPACE_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
 # that path doesn't exist yet, so dockerd creates it — root-owned. That stub
 # then breaks host-side `cargo`/`pnpm` in this worktree with EACCES the next
 # time a human (not root) tries to write there.
@@ -559,14 +884,14 @@ for entry in "${DOCKER_ARGS[@]}"; do
     subpath="${entry#*:/workspace/}"
     subpath="${subpath%%:*}" # strip a trailing :ro/:rw suffix, if present
     if [ -n "${subpath}" ]; then
-      mkdir -p "${REPO_ROOT}/${subpath}"
+      mkdir -p "${WORKSPACE_ROOT}/${subpath}"
     fi
     ;;
   type=volume,*dst=/workspace/*)
     subpath="${entry#*dst=/workspace/}"
     subpath="${subpath%%,*}"
     if [ -n "${subpath}" ]; then
-      mkdir -p "${REPO_ROOT}/${subpath}"
+      mkdir -p "${WORKSPACE_ROOT}/${subpath}"
     fi
     ;;
   esac
@@ -587,9 +912,9 @@ DOCKER_CLIENT_PID=""
 # yet know to pre-create) still left a root-owned entry directly under the
 # repo root, fail loudly with a concrete remediation instead of leaving the
 # next `cargo build`/`pnpm install` on the host to fail with a bare EACCES.
-ROOT_DROPPINGS="$(find "${REPO_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
+ROOT_DROPPINGS="$(find "${WORKSPACE_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
 if [ -n "${ROOT_DROPPINGS}" ]; then
-  echo "[sandbox] ERROR: root-owned entries found directly under ${REPO_ROOT}:" >&2
+  echo "[sandbox] ERROR: root-owned entries found directly under ${WORKSPACE_ROOT}:" >&2
   echo "${ROOT_DROPPINGS}" >&2
   echo "[sandbox] dockerd (which runs as root) created these as bind-mount points." >&2
   echo "[sandbox] Remediation: sudo chown -R \"\$(id -u):\$(id -g)\" <path>, for each path listed above, then re-run." >&2

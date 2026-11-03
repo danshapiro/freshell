@@ -32,9 +32,9 @@ export function parseEnv(content: string): Record<string, string> {
   return env
 }
 
-function loadEnv(): Record<string, string> {
+function loadEnv(rootDir: string = resolve(__dirname, '..')): Record<string, string> {
   try {
-    const envPath = resolve(__dirname, '..', '.env')
+    const envPath = resolve(rootDir, '.env')
     const content = readFileSync(envPath, 'utf-8')
     return parseEnv(content)
   } catch {
@@ -135,29 +135,30 @@ function formatProductionConflictMessage(port: number, version?: string): string
     '  3. Run source-runtime/build checks from a linked worktree:',
     '     \x1b[36mcd .worktrees/{branch} && pnpm run test:source-runtime\x1b[0m',
     '     \x1b[36mcd .worktrees/{branch} && pnpm run build\x1b[0m',
-    '  4. Stop production, then build (only with explicit approval):',
-    '     \x1b[36mkill {PID} && pnpm run build\x1b[0m',
+    '  4. For routine managed web/client maintenance, run the updater from the host checkout (no reset approval):',
+    '     \x1b[36mpnpm exec tsx scripts/update-managed-runtime.ts\x1b[0m',
+    '     Reset-capable --all and --durable-only updates require the exact word APPROVED.',
     '',
   ].join('\n')
 }
 
-export async function main(): Promise<void> {
-  if (isLinkedWorktreeCheckout()) {
-    process.exit(0)
-  }
-
-  const env = loadEnv()
-  const port = parseInt(process.env.PORT || env.PORT || '3001', 10)
-
+export async function evaluatePrebuildBuildSafety(rootDir: string, port: number): Promise<{
+  exitCode: 0 | 1
+  message?: string
+}> {
+  if (isLinkedWorktreeCheckout(rootDir)) return { exitCode: 0 }
   const result = await checkProdRunning(port)
+  if (result.status !== 'running') return { exitCode: 0 }
+  return { exitCode: 1, message: formatProductionConflictMessage(port, result.version) }
+}
 
-  if (result.status !== 'running') {
-    // No production server detected — build is safe
-    process.exit(0)
-  }
-
-  console.error(formatProductionConflictMessage(port, result.version))
-  process.exit(1)
+export async function main(): Promise<void> {
+  const rootDir = resolve(__dirname, '..')
+  const env = loadEnv(rootDir)
+  const port = parseInt(process.env.PORT || env.PORT || '3001', 10)
+  const decision = await evaluatePrebuildBuildSafety(rootDir, port)
+  if (decision.message) console.error(decision.message)
+  process.exit(decision.exitCode)
 }
 
 // Only run when executed directly (not imported by tests)
