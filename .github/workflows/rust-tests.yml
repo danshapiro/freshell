@@ -1,106 +1,113 @@
-name: Rust Tests
+name: FreshAgent Rust failure proof
 
 on:
   workflow_dispatch:
-  pull_request:
 
 permissions:
   contents: read
 
-# Server-side enforcement for the class of red that landed via PR #795:
-# nothing between commit and main ran `cargo test`, so 11 failing freshagent
-# unit tests merged with every advisory check green. The pre-push gate now
-# runs targeted cargo tests locally (scripts/hooks/pre-push); this workflow
-# is the merge-time backstop that cannot be bypassed with --no-verify.
-#
-# The `gate` job always reports, so it can be a required status check without
-# blocking PRs that touch no Rust (a paths-filtered workflow would leave the
-# required check stuck on "Expected" forever).
+env:
+  FRESHELL_PROOF_FEATURE_COMMIT: cd38797d0d6728ad5541ca248273170dd7987195
 
 jobs:
-  changes:
+  claude-writer:
+    name: Full Claude writer integration test
     runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Detect Rust changes
-        id: filter
+          fetch-depth: 2
+      - name: Verify source tree
+        shell: bash
         run: |
-          # Manager and dependency configuration changes must exercise the
-          # Rust suite too: it spawns Node fixtures (the codex fake
-          # app-server imports `ws`) whose behavior depends on the installed
-          # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility. Scoped to the
-          # root and workspace members — the independent demo locks are
-          # not part of the workspace dependency tree.
-          # `github.base_ref` exists only for pull_request events; manual
-          # dispatch (the event-routing escape hatch) compares against the
-          # default branch instead.
-          BASE="${{ github.base_ref }}"
-          [ -n "$BASE" ] || BASE="main"
-          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  rust-tests:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-      - uses: Swatinem/rust-cache@v2
-      # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs the workspace dependencies installed
-      # or those tests die at fixture boot ("fake app-server exited before
-      # listening").
-      # Pinned revision of the v4 major; reads the exact version from the root
-      # packageManager pin (no floating duplicate).
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only "$FRESHELL_PROOF_FEATURE_COMMIT" HEAD)" = '.github/workflows/rust-tests.yml'
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies (Rust test fixtures)
-        run: pnpm install --frozen-lockfile
-      - name: Workspace tests
-        # Workspace feature unification turns freshell-codex's default-off
-        # `real-transport` feature ON in this step (freshell-ws,
-        # freshell-server, freshell-session-host, and freshell-freshagent all
-        # depend on freshell-codex with the feature), so the
-        # remote_proxy_relay integration tests run here without an explicit
-        # --features flag. A bare `cargo test -p freshell-codex` would skip
-        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
-        # reports 38 tests; the same -p invocation reports 0).
-        # Keep the gate red on any failure, but report failures in later
-        # crates in the same run instead of stopping at the first suite.
-        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
-
-  gate:
-    name: rust-gate
-    needs: [changes, rust-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Evaluate
+      - name: Run writer tests in the disposable runtime sandbox
+        shell: bash
         run: |
-          if [ "${{ needs.changes.outputs.rust }}" = "false" ]; then
-            echo "no Rust changes in this PR — rust tests skipped"
-            exit 0
-          fi
-          if [ "${{ needs.rust-tests.result }}" = "success" ]; then
-            echo "workspace rust tests passed"
-            exit 0
-          fi
-          echo "workspace rust tests failed or did not run"
-          exit 1
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/freshagent-rust-proof"
+          scripts/sandbox-test.sh --runtime-suite 'CARGO_BUILD_JOBS=2 cargo test --locked -p freshell-ws --test freshagent_claude_writer -- --nocapture' 2>&1 | tee "$RUNNER_TEMP/freshagent-rust-proof/claude-writer.log"
+      - name: Retain writer output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-writer-proof
+          path: ${{ runner.temp }}/freshagent-rust-proof/
+          if-no-files-found: warn
+          retention-days: 7
+
+  opencode-descriptors:
+    name: Repeated OpenCode descriptor test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only "$FRESHELL_PROOF_FEATURE_COMMIT" HEAD)" = '.github/workflows/rust-tests.yml'
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Repeat exact descriptor test in the disposable runtime sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/freshagent-rust-proof"
+          scripts/sandbox-test.sh --runtime-suite 'set -euo pipefail; for attempt in $(seq 1 10); do printf "descriptor attempt %s of 10\n" "$attempt"; CARGO_BUILD_JOBS=2 cargo test --locked -p freshell-sessions --lib opencode_transfer::native_source_inventory_tests::workspace_metadata_complete_export_measures_owned_process_pipe_and_drainer_peaks -- --exact --nocapture; done' 2>&1 | tee "$RUNNER_TEMP/freshagent-rust-proof/opencode-descriptors.log"
+      - name: Retain descriptor output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-descriptor-proof
+          path: ${{ runner.temp }}/freshagent-rust-proof/
+          if-no-files-found: warn
+          retention-days: 7
+
+  sessions-parallel:
+    name: Full sessions library with normal parallelism
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$FRESHELL_PROOF_FEATURE_COMMIT"
+          test "$(git diff --name-only "$FRESHELL_PROOF_FEATURE_COMMIT" HEAD)" = '.github/workflows/rust-tests.yml'
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run full sessions library in the disposable runtime sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/freshagent-rust-proof"
+          scripts/sandbox-test.sh --runtime-suite 'CARGO_BUILD_JOBS=2 cargo test --locked -p freshell-sessions --lib -- --nocapture' 2>&1 | tee "$RUNNER_TEMP/freshagent-rust-proof/sessions-parallel.log"
+      - name: Retain sessions output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sessions-parallel-proof
+          path: ${{ runner.temp }}/freshagent-rust-proof/
+          if-no-files-found: warn
+          retention-days: 7
