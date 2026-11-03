@@ -78,6 +78,13 @@ export const CLOUD_SKIP_SPECS = [
   // Environment-sensitive: checkpoint/rewind with fake codex sidecar
   // exceeds 120s timeout under cloud resource constraints
   'agent-checkpoint-rewind.spec.ts',
+  // The auto-restore-warming acceptance spec holds every boot's session
+  // index publish behind FRESHELL_TEST_SESSION_INDEX_STARTUP_HOLD_MS (15s
+  // per boot, twice per test) and ends in a stable-count settle (two
+  // samples >=5s apart): the bodies exceed the cloud 120s budget under
+  // 2-worker contention (same class as agent-checkpoint-rewind.spec.ts).
+  // The configured backend is local; the spec is executed there.
+  'reconcile-auto-restore-warming-rust.spec.ts',
   // Local-only receipts need provider binaries or a host Docker supervisor
   // and broker. Their positive selectors are exported by the base config.
   ...LOCAL_ONLY_SPECS.map(({ spec }) => spec),

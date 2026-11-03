@@ -91,24 +91,6 @@ async function flushPersistence(page: Page): Promise<void> {
 }
 
 /**
- * index_warming is EXPECTED on cold boots (the server's single 2s deferral is
- * far shorter than a worst-case index scan) and the warming banner's manual
- * "Retry now" is the DESIGNED recovery path (council rule 5). Poll bodies
- * call this so a slow index warm never wedges a settle-loop -- the retry only
- * succeeds once the server-side index actually resolves, so this cannot mask
- * a real failure.
- */
-async function retryWarmingIfVisible(page: Page): Promise<void> {
-  const banner = page.getByRole('status').filter({ hasText: /Waiting for session index/i }).first()
-  if (await banner.isVisible().catch(() => false)) {
-    await banner
-      .getByRole('button', { name: /Retry now/i })
-      .click({ force: true })
-      .catch(() => {})
-  }
-}
-
-/**
  * Idempotent home seed (setupHome re-runs on every boot/restart): the wizard
  * bypass config with claude enabled, PLUS the claude provider ROOT
  * (~/.claude/projects/<proj>) so the existence probe can warm -- a missing
@@ -280,15 +262,16 @@ function seedCodexAdoptionHome(
  * label anywhere on the page before the sessions index had listed the
  * fixture, clicking into a cold index whose resume create then never
  * associated the pane. Waiting for the id-addressed row guarantees the
- * index is warm BEFORE the click, and retryWarmingIfVisible is retried
- * inside both settle polls.
+ * index is warm BEFORE the click. Warming recovery is AUTOMATIC now (the
+ * ReconcileWarmingRecoveryDriver re-drives parked panes on session-index
+ * readiness), so no poll body clicks the banner's Retry -- a regression in
+ * the automatic recovery fails this spec instead of being masked.
  */
 async function openSeededCodexSession(
   page: Page,
   harness: TestHarness,
   sessionId: string,
 ): Promise<{ tabId: string; leafId: string }> {
-  await retryWarmingIfVisible(page)
   const sessionItem = page.locator(
     `[data-context="sidebar-session"][data-session-id="${sessionId}"]`,
   )
@@ -296,13 +279,11 @@ async function openSeededCodexSession(
   const tabCountBefore = await harness.getTabCount()
   await sessionItem.click()
   await expect(async () => {
-    await retryWarmingIfVisible(page)
     expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
   }).toPass({ timeout: 15_000 })
   const tabId = (await harness.getActiveTabId())!
   const leafId: string = await expect
     .poll(async () => {
-      await retryWarmingIfVisible(page)
       const layout = await harness.getPaneLayout(tabId)
       const leaf = findLeavesByMode(layout, 'codex').find(
         (l) => l?.content?.terminalId && l?.content?.sessionRef?.sessionId === sessionId,
@@ -517,7 +498,6 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
       //     terminalId, working terminal, no restoreError.
       await expect
         .poll(async () => {
-          await retryWarmingIfVisible(page)
           const l = await findLeafById(harness, tabId, shellLeaf.id)
           const tid = l?.content?.terminalId ?? null
           return tid && tid !== shellTerminalIdBefore && l?.content?.status === 'running' ? tid : null
@@ -530,7 +510,6 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
       //     pane sessionRef unchanged.
       await expect
         .poll(async () => {
-          await retryWarmingIfVisible(page)
           const l = await findLeafById(harness, tabId, claudeLeaf.id)
           const tid = l?.content?.terminalId ?? null
           return tid && tid !== claudeTerminalIdBefore ? tid : null
@@ -640,7 +619,6 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
       //    down).
       await expect
         .poll(async () => {
-          await retryWarmingIfVisible(page)
           const contents = await Promise.all(
             [paneA, paneB].map(async (p) => (await findLeafById(harness, p.tabId, p.leafId))?.content),
           )
@@ -671,7 +649,6 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
         const staleTerminalId = staleTerminalIds.get(pane.leafId)!
         await expect
           .poll(async () => {
-            await retryWarmingIfVisible(page)
             const buffer = (await harness.getTerminalBuffer(staleTerminalId)) ?? ''
             return countOccurrences(buffer, DEAD_SESSION_BUFFER_NOTICE)
           }, { timeout: 60_000 })
@@ -724,7 +701,6 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
         //     (persisted AND re-folded) stands.
         await expect
           .poll(async () => {
-            await retryWarmingIfVisible(page)
             return (await findLeafById(harness, pane.tabId, pane.leafId))?.content?.restoreError?.reason ?? null
           }, { timeout: 90_000 })
           .toBe('durable_artifact_missing')
@@ -918,7 +894,6 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
       //     'creating' wedge.
       await expect
         .poll(async () => {
-          await retryWarmingIfVisible(page)
           const leaves = await allTerminalLeaves(harness)
           const unsettled = leaves.filter((l) => {
             const c = l?.content
