@@ -3052,6 +3052,98 @@ describe('FreshAgentView', () => {
       expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
     })
 
+    it('settles a steered prompt when its exact text item shares a user row with a different input', async () => {
+      const prompt = 'The first steered input'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        { ...steer.userRow('shared-turn:row-2', prompt), items: [
+          { id: 'first-steered-item', kind: 'text' as const, text: prompt },
+          { id: 'second-steered-item', kind: 'text' as const, text: 'A different steered input' },
+        ] },
+      ]
+      await steer.releaseAcceptedRead('running', rows('Grouped inputs are running'))
+      await screen.findByText('Grouped inputs are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      fireEvent.change(steer.composer, { target: { value: 'Follow up after grouped inputs' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      await steer.refresh('idle', rows('Grouped inputs completed'), 'Grouped inputs completed')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2), { timeout: 10_000 })
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow up after grouped inputs' })
+    })
+
+    it('keeps an ambiguous steered echo when one user row has two identical matching inputs', async () => {
+      const prompt = 'Identical steered input from two clients'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        { ...steer.userRow('shared-turn:row-2', prompt), items: [
+          { id: 'first-identical-input', kind: 'text' as const, text: prompt },
+          { id: 'second-identical-input', kind: 'text' as const, text: prompt },
+        ] },
+      ]
+      await steer.releaseAcceptedRead('running', rows('Identical grouped inputs are running'))
+      await screen.findByText('Identical grouped inputs are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      for (let read = 0; read <= IDLE_INCOMPLETE_MAX_RETRIES; read++) {
+        const marker = `Identical grouped inputs completed ${read}`
+        await steer.refresh('idle', rows(marker), marker)
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+          requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+        })
+      }
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+    })
+
+    it('releases a hidden queued follow-up when a current idle snapshot replaces the old projection', async () => {
+      const store = createStore()
+      const locator = { sessionId: 'codex-replaced-projection', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const snapshot = (projectionId: string, status: 'idle' | 'running', revision: number) => FreshAgentSnapshotSchema.parse({
+        threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision, status, capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        turns: [{ id: 'earlier-turn', turnId: 'earlier-turn', role: 'assistant', summary: 'Earlier response',
+          items: [{ id: 'earlier-text', kind: 'text', text: 'Earlier response' }] }],
+        extensions: { codex: { projection: { id: projectionId, historyGeneration: 0, eventRevision: 0,
+          eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: ['earlier-turn'],
+          turnRows: { 'earlier-turn': ['earlier-turn'] }, turnOutputStates: {} } } },
+      })
+      const heldRead = createDeferred<ReturnType<typeof snapshot>>()
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(snapshot('old-projection', 'running', 1))
+        .mockImplementation(async () => { heldReadStarted = true; return heldRead.promise })
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'replaced-projection-create', status: 'running',
+        resumeSessionId: locator.sessionId, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      } }))
+      const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await screen.findByText('Earlier response')
+      const sessionKey = 'freshcodex:codex:codex-replaced-projection'
+      expect(store.getState().freshAgentLive.bySession[sessionKey].projection?.id).toBe('old-projection')
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Queued across projection replacement' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      await act(async () => heldRead.resolve(snapshot('new-projection', 'idle', 2)))
+      await waitFor(() => expect(store.getState().freshAgentLive.bySession[sessionKey].projection?.id).toBe('new-projection'))
+      expect(store.getState().freshAgent.sessions[sessionKey].status).toBe('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'Queued across projection replacement' })
+    })
+
     it.each([
       { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
       { label: 'ordinary acceptance arrives in the same batch as a landed snapshot', ambiguous: false },
