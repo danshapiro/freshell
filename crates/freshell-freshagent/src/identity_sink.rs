@@ -956,6 +956,7 @@ impl BindingWriteGuard {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        self.armed = true;
         self.startup_cleanup = Some(Box::pin(cleanup));
     }
 
@@ -1110,13 +1111,10 @@ impl Drop for BindingWriteGuard {
         if !self.armed {
             return;
         }
-        let (Some(ticket), Some(claim), Some(sink)) =
-            (self.ticket.take(), self.claim.clone(), self.sink.clone())
-        else {
-            return;
-        };
+        let claim = self.claim.clone();
+        let sink = self.sink.clone();
         let hold = RetainedRepairTicket {
-            ticket: Some(ticket),
+            ticket: self.ticket.take(),
             binding_hold: self.binding_hold.take(),
         };
         let map_hit_recovery = self.map_hit_recovery.take();
@@ -1126,6 +1124,10 @@ impl Drop for BindingWriteGuard {
             if let Some(cleanup) = startup_cleanup {
                 cleanup.await;
             }
+            let (Some(claim), Some(sink)) = (claim, sink) else {
+                hold.release();
+                return;
+            };
             let mut retry_delay = std::time::Duration::from_millis(250);
             if let Some(mut recovery) = map_hit_recovery {
                 loop {
@@ -1537,6 +1539,7 @@ struct BindingStallGate {
     entered_tx: std::sync::mpsc::Sender<()>,
     /// The test's release: the returned future resolves only after this.
     release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    fail: bool,
 }
 
 /// Task 3 cancellation regression hook: an exact failed-transition repair
@@ -1835,9 +1838,19 @@ impl FakeIdentitySink {
         provider: &str,
         session_id: &str,
     ) -> BindingStallHandles {
+        self.arm_binding_stall_result(provider, session_id, false)
+    }
+
+    pub(crate) fn arm_binding_stall_result(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+        fail: bool,
+    ) -> BindingStallHandles {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.binding_stall.lock().unwrap() = Some(BindingStallGate {
+            fail,
             key: (provider.into(), session_id.into()),
             entered_tx,
             release_rx: std::sync::Mutex::new(Some(release_rx)),
@@ -2097,20 +2110,24 @@ impl PaneIdentitySink for FakeIdentitySink {
                 gate.as_ref().and_then(|g| {
                     if g.key == (upsert.provider.clone(), upsert.session_id.clone()) {
                         let release_rx = g.release_rx.lock().unwrap().take();
-                        release_rx.map(|rx| (g.entered_tx.clone(), rx))
+                        release_rx.map(|rx| (g.entered_tx.clone(), rx, g.fail))
                     } else {
                         None
                     }
                 })
             };
-            if let Some((entered_tx, release_rx)) = stall_arm {
+            if let Some((entered_tx, release_rx, fail)) = stall_arm {
                 // One-shot: disarm so later writes for the key apply inline.
                 *self.binding_stall.lock().unwrap() = None;
                 self.apply_binding(upsert);
                 let _ = entered_tx.send(());
                 return Box::pin(async move {
                     let _ = release_rx.await;
-                    Ok(())
+                    if fail {
+                        Err(std::io::Error::other("binding failed after persistence"))
+                    } else {
+                        Ok(())
+                    }
                 });
             }
             self.apply_binding(upsert);
@@ -2798,6 +2815,32 @@ mod tests {
             generation,
             "binding-guard-test",
         )
+    }
+
+    #[tokio::test]
+    async fn registered_startup_cleanup_is_owned_without_registry_or_sink() {
+        for explicit in [false, true] {
+            let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finished = settled.clone();
+            let mut guard = BindingWriteGuard::new(None, None, None);
+            guard.settle_startup_before_repair(async move {
+                tokio::task::yield_now().await;
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            if explicit {
+                assert!(guard.repair_now().await);
+                drop(guard.finish());
+            } else {
+                drop(guard);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !settled.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("runtime cleanup is required independently of ledger/registry wiring");
+        }
     }
 
     #[tokio::test]

@@ -614,3 +614,225 @@ async fn a_confirmed_late_teardown_releases_the_lease_without_an_ownership_regis
     }
     state.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canceled_map_hit_public_create_keeps_the_incumbent_fenced_before_lookup() {
+    let _env_lock = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeSidecarEnv::install();
+    let (mut state, mut rx) = state_with_bus();
+    let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+    state.set_identity_sink(sink.clone());
+    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    state.set_ownership(registry.clone());
+    for session_type in ["claude", "kilroy"] {
+        let mut msg = dedup_create_msg(&format!("outer-lookup-owner-{session_type}"));
+        msg.session_type = if session_type == "kilroy" {
+            SessionType::Kilroy
+        } else {
+            SessionType::Freshclaude
+        };
+        state.handle_create(msg.clone(), None).await;
+        let created = await_claude_created(&mut rx, &msg.request_id).await;
+        let id = created["sessionId"].as_str().unwrap().to_string();
+        vacate_claude_owner_for_map_hit(&registry, &id);
+        let held = state.sessions.lock().await;
+        let incumbent = held[&id].ownership_id.clone();
+        let pid = held[&id].child.id().unwrap();
+        msg.request_id = format!("outer-lookup-adopt-{session_type}");
+        msg.resume_session_id = Some(id.clone());
+        let mut request = Box::pin(state.handle_create(msg, None));
+        assert!(futures_util::poll!(&mut request).is_pending());
+        assert!(matches!(
+            registry.observe(PROVIDER, &id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        drop(request);
+        let fenced = matches!(
+            registry.observe(PROVIDER, &id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        );
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        drop(held);
+        if !fenced {
+            state.shutdown().await;
+            panic!("public create cancellation released ownership over its living {session_type} incumbent");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                registry.observe(PROVIDER, &id).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the protected first lookup adopts the exact incumbent");
+        assert_eq!(state.sessions.lock().await[&id].ownership_id, incumbent);
+    }
+    assert!(sink.repairs.lock().unwrap().is_empty());
+    state.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_startup_claude_settles_before_repair_on_cancel_and_failure() {
+    let _env_lock = CLAUDE_ENV_LOCK.lock().await;
+    for cancel in [true, false] {
+        let env = FakeClaudeSidecarEnv::install_with_knobs(Some(1500), false);
+        let (mut state, _rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(sink.clone());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let msg = dedup_create_msg("registered-startup-cleanup");
+        let st = state.clone();
+        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        let request = env.create_request().await;
+        let id = request["sessionId"].as_str().unwrap().to_string();
+        let stall = sink.arm_binding_stall_result(PROVIDER, &id, !cancel);
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let held = state.sessions.lock().await;
+        let pid = held[&id].child.id().unwrap();
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        if cancel {
+            task.abort();
+        }
+        let _ = stall.release.send(());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fenced = matches!(
+            registry.observe(PROVIDER, &id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        );
+        let unrepaired = sink.repairs.lock().unwrap().is_empty();
+        drop(held);
+        if !fenced || !unrepaired {
+            state.shutdown().await;
+            panic!("cancel={cancel}: repair released a still-registered native runtime");
+        }
+        if cancel {
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(matches!(
+                task.await.unwrap(),
+                ClaudeCreateOutcome::Failed { .. }
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let vacant = matches!(
+                    registry.observe(PROVIDER, &id).state,
+                    freshell_ownership::OwnershipState::Vacant
+                );
+                let dead = crate::ownership_lane::partial_pid_confirmed_dead(pid);
+                assert!(!vacant || dead);
+                if vacant {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!state.sessions.lock().await.contains_key(&id));
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+        state.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_startup_claude_preserves_replacement_on_cancel_and_failure() {
+    let _env_lock = CLAUDE_ENV_LOCK.lock().await;
+    for cancel in [true, false] {
+        let env = FakeClaudeSidecarEnv::install_with_knobs(Some(500), false);
+        let (mut state, _rx) = state_with_bus();
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(sink.clone());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let task = {
+            let st = state.clone();
+            tokio::spawn(async move {
+                st.handle_create(dedup_create_msg("old-startup"), None)
+                    .await
+            })
+        };
+        let request = env.create_request().await;
+        let id = request["sessionId"].as_str().unwrap().to_string();
+        let stall = sink.arm_binding_stall_result(PROVIDER, &id, !cancel);
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let old = state.sessions.lock().await.remove(&id).unwrap();
+        let old_pid = old.child.id().unwrap();
+        let old_claim = sink
+            .bindings
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .claim
+            .clone()
+            .unwrap();
+        let ClaudeCreateOutcome::Created {
+            session_id: replacement_key,
+            ..
+        } = state
+            .handle_create(dedup_create_msg("replacement-startup"), None)
+            .await
+        else {
+            panic!("replacement startup succeeds")
+        };
+        let replacement = state
+            .sessions
+            .lock()
+            .await
+            .remove(&replacement_key)
+            .unwrap();
+        let replacement_id = replacement.ownership_id.clone();
+        let replacement_pid = replacement.child.id().unwrap();
+        state.sessions.lock().await.insert(id.clone(), replacement);
+        registry.fail(
+            PROVIDER,
+            &id,
+            &old_claim.operation_id,
+            old_claim.generation,
+            false,
+        );
+        let crate::ownership_lane::LaneClaim::Granted(ticket) =
+            state.begin_lane_claim_at(&id, "replacement-owner", None, "test")
+        else {
+            panic!("replacement claim")
+        };
+        state
+            .commit_lane_claim_at(&mut Some(ticket), &id, Some(replacement_pid))
+            .unwrap();
+        let owner = registry.observe(PROVIDER, &id);
+        if cancel {
+            task.abort();
+        }
+        let _ = stall.release.send(());
+        if cancel {
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(matches!(
+                task.await.unwrap(),
+                ClaudeCreateOutcome::Failed { .. }
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sink.repairs.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(crate::ownership_lane::partial_pid_confirmed_dead(old_pid));
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(
+            replacement_pid
+        ));
+        assert_eq!(
+            state.sessions.lock().await[&id].ownership_id,
+            replacement_id
+        );
+        assert_eq!(registry.observe(PROVIDER, &id), owner);
+        let _ = state.teardown_removed_session_logged(old).await;
+        state.shutdown().await;
+    }
+}

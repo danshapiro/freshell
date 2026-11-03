@@ -1247,6 +1247,42 @@ impl FreshClaudeState {
         false
     }
 
+    /// A registered-startup cleanup can own the removed session while its
+    /// native tree is still stopping. Join its exact recorded identity rather
+    /// than treating an absent map entry as confirmed process death.
+    fn unmapped_handoff_stop(&self, session_id: &str) -> crate::session_handoff::StopResult {
+        let recorded = self
+            .condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .get(session_id)
+            .cloned();
+        let Some(recorded) = recorded else {
+            return crate::session_handoff::StopResult::AlreadyGone;
+        };
+        let condemned = self.condemned_priors.clone();
+        let id = session_id.to_string();
+        crate::session_handoff::StopResult::NotConfirmed {
+            confirmation: Box::pin(async move {
+                let confirmed = crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                    &recorded,
+                    CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                )
+                .await;
+                if confirmed {
+                    let mut records = condemned.lock().expect("condemned priors lock");
+                    if records
+                        .get(&id)
+                        .is_some_and(|current| current.ownership_id == recorded.ownership_id)
+                    {
+                        records.remove(&id);
+                    }
+                }
+                confirmed
+            }),
+        }
+    }
+
     /// kata b8ke Task 6: the handoff runner's PRIOR-stop entry point. Thin
     /// `handle_kill`-shaped lane teardown for ONE session — NO coordinator
     /// stop (the runner owns the in-flight `Handoff`; `begin_stop` would be
@@ -1291,11 +1327,11 @@ impl FreshClaudeState {
             return crate::session_handoff::StopResult::PlatformLimited;
         }
         let Some(map_key) = self.resolve_session_key(session_id).await else {
-            return crate::session_handoff::StopResult::AlreadyGone;
+            return self.unmapped_handoff_stop(session_id);
         };
         let removed = self.sessions.lock().await.remove(&map_key);
         let Some(session) = removed else {
-            return crate::session_handoff::StopResult::AlreadyGone;
+            return self.unmapped_handoff_stop(session_id);
         };
         session.consumer.abort();
         // b8ke focused review FR3: the teardown's confirmed-death answer is
@@ -2110,18 +2146,19 @@ impl FreshClaudeState {
                     // (pre-e3r1 the ticket's drop restored Vacant while
                     // the runtime kept running — acknowledging a live
                     // writer with an unowned key licensed a SECOND writer).
-                    if self.has_live_session(sid).await {
+                    let mut guard = self.map_hit_binding_guard(ticket, sid, session_type);
+                    if guard.map_hit_runtime_present().await {
                         return self
-                            .adopt_live_create_with_starting_ticket(
+                            .adopt_live_create_with_binding_guard(
                                 &request_id,
                                 view_id.as_deref(),
                                 sid,
                                 session_type,
-                                Some(ticket),
+                                Some(guard),
                             )
                             .await;
                     }
-                    own_ticket = Some(ticket);
+                    own_ticket = guard.finish();
                     // b8ke delta round-2 F2: register the start's
                     // cancellation + settle with the watchdog (the
                     // machinery exists — the sidecar pid slot).
@@ -2475,84 +2512,110 @@ impl FreshClaudeState {
         session_type: &str,
         starting_ticket: Option<freshell_ownership::OperationTicket>,
     ) -> ClaudeCreateOutcome {
-        let no_ticket: Option<freshell_ownership::OperationTicket> = None;
-        let mut write_guard = starting_ticket.map(|ticket| {
-            let claim = crate::identity_sink::BindingClaim::from_ticket(
-                &ticket,
-                crate::identity_sink::BindingClaimKind::Starting,
-            );
-            let mut guard = crate::identity_sink::BindingWriteGuard::new(
-                Some(ticket),
-                claim.clone(),
-                self.identity_sink(),
-            );
-            // Establish this token under the held Starting claim, then
-            // compare the same sidecar on every retry. The recovery callback
-            // is installed before any await, including its first map lookup.
-            let runtime = Arc::new(std::sync::OnceLock::new());
-            let probe_runtime = runtime.clone();
-            let probe_state = self.clone();
-            let probe_id = durable.to_string();
-            let retry_state = self.clone();
-            let retry_id = durable.to_string();
-            let retry_type = session_type.to_string();
-            let commit_state = self.clone();
-            guard.recover_map_hit(
-                move || {
-                    let state = probe_state.clone();
-                    let id = probe_id.clone();
-                    let runtime = probe_runtime.clone();
-                    async move {
-                        let sessions = state.sessions.lock().await;
-                        let Some(key) = Self::session_key_in(&sessions, &id) else {
-                            return false;
-                        };
-                        let session = &sessions[&key];
-                        let expected = runtime.get_or_init(|| {
-                            (
-                                key.clone(),
-                                session.ownership_id.clone(),
-                                session.child.id(),
-                            )
-                        });
-                        expected.0 == key
-                            && expected.1 == session.ownership_id
-                            && expected.2 == session.child.id()
-                            && !expected
-                                .2
-                                .is_some_and(crate::ownership_lane::partial_pid_confirmed_dead)
-                    }
-                },
-                move || {
-                    let state = retry_state.clone();
-                    let id = retry_id.clone();
-                    let session_type = retry_type.clone();
-                    let claim = claim.clone();
-                    Box::pin(async move {
-                        state
-                            .record_established_binding(
-                                &id,
-                                &session_type,
-                                None,
-                                None,
-                                &None,
-                                binding::EstablishedBindingOptions {
-                                    transition_claim: claim.as_ref(),
-                                    settings_update: crate::identity_sink::SettingsUpdate::Keep,
-                                },
-                            )
-                            .await
-                    })
-                },
-                move |ticket| {
-                    let Some((key, _, pid)) = runtime.get() else {
-                        return Err(freshell_ownership::CommitOutcome::ForeignOperation);
+        let write_guard =
+            starting_ticket.map(|ticket| self.map_hit_binding_guard(ticket, durable, session_type));
+        self.adopt_live_create_with_binding_guard(
+            request_id,
+            view_id,
+            durable,
+            session_type,
+            write_guard,
+        )
+        .await
+    }
+
+    fn map_hit_binding_guard(
+        &self,
+        ticket: freshell_ownership::OperationTicket,
+        durable: &str,
+        session_type: &str,
+    ) -> crate::identity_sink::BindingWriteGuard {
+        let claim = crate::identity_sink::BindingClaim::from_ticket(
+            &ticket,
+            crate::identity_sink::BindingClaimKind::Starting,
+        );
+        let mut guard = crate::identity_sink::BindingWriteGuard::new(
+            Some(ticket),
+            claim.clone(),
+            self.identity_sink(),
+        );
+        // Establish this token under the held Starting claim, then
+        // compare the same sidecar on every retry. The recovery callback
+        // is installed before any await, including its first map lookup.
+        let runtime = Arc::new(std::sync::OnceLock::new());
+        let probe_runtime = runtime.clone();
+        let probe_state = self.clone();
+        let probe_id = durable.to_string();
+        let retry_state = self.clone();
+        let retry_id = durable.to_string();
+        let retry_type = session_type.to_string();
+        let commit_state = self.clone();
+        guard.recover_map_hit(
+            move || {
+                let state = probe_state.clone();
+                let id = probe_id.clone();
+                let runtime = probe_runtime.clone();
+                async move {
+                    let sessions = state.sessions.lock().await;
+                    let Some(key) = Self::session_key_in(&sessions, &id) else {
+                        return false;
                     };
-                    commit_state.commit_lane_claim_at(ticket, key, *pid)
-                },
-            );
-            guard
-        });
+                    let session = &sessions[&key];
+                    let expected = runtime.get_or_init(|| {
+                        (
+                            key.clone(),
+                            session.ownership_id.clone(),
+                            session.child.id(),
+                        )
+                    });
+                    expected.0 == key
+                        && expected.1 == session.ownership_id
+                        && expected.2 == session.child.id()
+                        && !expected
+                            .2
+                            .is_some_and(crate::ownership_lane::partial_pid_confirmed_dead)
+                }
+            },
+            move || {
+                let state = retry_state.clone();
+                let id = retry_id.clone();
+                let session_type = retry_type.clone();
+                let claim = claim.clone();
+                Box::pin(async move {
+                    state
+                        .record_established_binding(
+                            &id,
+                            &session_type,
+                            None,
+                            None,
+                            &None,
+                            binding::EstablishedBindingOptions {
+                                transition_claim: claim.as_ref(),
+                                settings_update: crate::identity_sink::SettingsUpdate::Keep,
+                            },
+                        )
+                        .await
+                })
+            },
+            move |ticket| {
+                let Some((key, _, pid)) = runtime.get() else {
+                    return Err(freshell_ownership::CommitOutcome::ForeignOperation);
+                };
+                commit_state.commit_lane_claim_at(ticket, key, *pid)
+            },
+        );
+        guard
+    }
+
+    async fn adopt_live_create_with_binding_guard(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+        durable: &str,
+        session_type: &str,
+        mut write_guard: Option<crate::identity_sink::BindingWriteGuard>,
+    ) -> ClaudeCreateOutcome {
+        let no_ticket: Option<freshell_ownership::OperationTicket> = None;
         if let Some(guard) = write_guard.as_mut() {
             if !guard.map_hit_runtime_present().await {
                 return self.fail_create(

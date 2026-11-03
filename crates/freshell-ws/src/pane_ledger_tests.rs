@@ -1294,6 +1294,72 @@ fn failed_transition_repair_leaves_legacy_rows_recoverable_after_restart() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn failed_transition_scans_preserve_unrelated_rows_and_retire_only_the_orphan() {
+    for boot in [true, false] {
+        let root = temp_root("failed-transition-scoped-scan");
+        let ledger = PaneLedger::new(Some(root.clone()));
+        let mut before = Vec::new();
+        for (id, operation, generation) in [
+            ("legacy", None, 8),
+            ("restored-prior", Some("prior-owner"), 8),
+            ("newer-owner", Some("new-owner"), 9),
+            ("orphan", Some("failed-start"), 8),
+        ] {
+            if let Some(operation) = operation {
+                record_claimed_identity(&ledger, "codex", id, operation, 1_000, 3, generation)
+                    .unwrap();
+            } else {
+                ledger
+                    .record_fresh_agent_binding(&fa_write_fenced("codex", id, 1_000, 3, generation))
+                    .unwrap();
+            }
+            let row = ledger.load_binding("codex", id).unwrap();
+            ledger
+                .repair_failed_transition_binding("codex", id, "failed-start", 3, 8, 1_100)
+                .unwrap();
+            // Model a crash between durable fence and row retirement. The
+            // untouched rows are unchanged; the exact orphan is still Bound.
+            ledger
+                .write_binding(&root, &mut ledger.guard(), &row)
+                .unwrap();
+            before.push((id, row));
+        }
+        drop(ledger);
+        let ledger = PaneLedger::new(Some(root.clone()));
+        let report = if boot {
+            ledger.boot_scan(1_200, &never_absent, None)
+        } else {
+            ledger.gc(1_200, &never_absent, None, None)
+        };
+        for (id, before) in before {
+            let row = ledger.load_binding("codex", id).unwrap();
+            if id == "orphan" {
+                assert_eq!(row.state, RowState::Retired);
+                assert_eq!(row.retired_reason, Some(RetiredReason::FailedTransition));
+                assert_eq!(row.owner_operation_id, before.owner_operation_id);
+            } else {
+                assert_eq!(
+                    row, before,
+                    "boot={boot}: failed transition does not own {id}"
+                );
+            }
+            assert_eq!(
+                PaneLedger::new(Some(root.clone()))
+                    .load_binding("codex", id)
+                    .unwrap(),
+                row
+            );
+        }
+        assert_eq!(report.kill_tombstone_enforced_retires.len(), 1);
+        assert_eq!(
+            report.kill_tombstone_enforced_retires[0].session_id,
+            "orphan"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// The repair's FENCE half, in the validated-then-canceled ordering: a
 /// late authoritative write whose bridge consult passed BEFORE the
 /// cancel (its pair is the failed transition's own) is suppressed
