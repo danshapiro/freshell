@@ -2332,6 +2332,100 @@ describe('FreshAgentView', () => {
       },
     )
 
+    it('does not adopt a previous conversation acceptance during a same-batch conversation switch', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'accepted-scope-a', sessionId: 'accepted-scope-thread-a',
+        sessionRef: { provider: 'codex' as const, sessionId: 'accepted-scope-thread-a' },
+        resumeSessionId: 'accepted-scope-thread-a', status: 'idle' as const,
+      }
+      const second = {
+        ...first, createRequestId: 'accepted-scope-b', sessionId: 'accepted-scope-thread-b',
+        sessionRef: { provider: 'codex' as const, sessionId: 'accepted-scope-thread-b' },
+        resumeSessionId: 'accepted-scope-thread-b',
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: 'Prompt from conversation A' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      fireEvent.change(composer, { target: { value: 'Keep the conversation B draft' } })
+
+      act(() => {
+        store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second }))
+        listener({ type: 'freshAgent.send.accepted', sessionId: first.sessionId,
+          sessionType: first.sessionType, provider: first.provider,
+          requestId: sent!.requestId, submittedTurnId: 'late-accepted-a' })
+      })
+
+      expect(getFreshAgentPaneContent(store).sessionId).toBe(second.sessionId)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      expect(composer).toHaveValue('Keep the conversation B draft')
+      expect(screen.queryByText('Message accepted. Your restored draft was kept.')).toBeNull()
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
+    it('accepts an uncertain send when its conversation materializes in the same batch', async () => {
+      const store = createStore()
+      const placeholder = 'freshopencode-late-accepted-placeholder'
+      const durable = 'ses_late_accepted_materialized'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'accepted-scope-materialize', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const sourcePrompt = 'Keep the materializing conversation prompt'
+      fireEvent.change(composer, { target: { value: sourcePrompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+
+      act(() => {
+        const materialized = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, materialized)
+        listener(materialized)
+        listener({ type: 'freshAgent.send.accepted', sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          requestId: sent!.requestId, submittedTurnId: 'materialized-accepted-turn' })
+      })
+
+      expect(getFreshAgentPaneContent(store).sessionId).toBe(durable)
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, text: sourcePrompt, submittedTurnId: 'materialized-accepted-turn',
+      })
+      expect(composer).toHaveValue(sourcePrompt)
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      expect(screen.getByText('Message accepted. Your restored draft was kept.')).toBeVisible()
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
     it('clears a send refusal when the pane switches to another conversation', async () => {
       const store = createStore()
       const first = {
