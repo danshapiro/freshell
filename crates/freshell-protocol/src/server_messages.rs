@@ -29,7 +29,9 @@ pub enum ServerMessage {
     #[serde(rename = "amplifier.activity.updated")]
     AmplifierActivityUpdated(AmplifierActivityUpdated),
     // Antigravity plan Task 8: the antigravity activity family — the
-    // amplifier family's additive twin (see EXTENSION_SERVER_MESSAGE_TYPES).
+    // amplifier family's additive twin. Additive via the frozen route —
+    // SERVER_MESSAGE_TYPES / the generated inventory carry it; no protocol
+    // version bump (nothing awaits it).
     #[serde(rename = "antigravity.activity.list.response")]
     AntigravityActivityListResponse(AntigravityActivityListResponse),
     #[serde(rename = "antigravity.activity.updated")]
@@ -136,9 +138,9 @@ pub enum ServerMessage {
     // marker: readiness state at handshake time already rides
     // `ready.sessionIndexReady`. Capability-gated at the forward site — a
     // connection whose hello did not negotiate `sessionIndexReadyV1` never
-    // receives the frame (frozen-client inertness). Extension surface
-    // until the next contract reconcile — see
-    // `EXTENSION_SERVER_MESSAGE_TYPES`.
+    // receives the frame (frozen-client inertness). Additive via the
+    // frozen route — SERVER_MESSAGE_TYPES / the regenerated inventory
+    // carry it; no protocol version bump (nothing awaits it).
     #[serde(rename = "sessions.index.ready")]
     SessionsIndexReady(SessionsIndexReady),
     #[serde(rename = "settings.updated")]
@@ -227,9 +229,11 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 73] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
+    "antigravity.activity.list.response",
+    "antigravity.activity.updated",
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",
@@ -272,6 +276,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
     "session.runtimeOwner",
     "session.status",
     "sessions.changed",
+    "sessions.index.ready",
     "settings.updated",
     "tabs.sync.ack",
     "tabs.sync.snapshot",
@@ -433,22 +438,8 @@ pub struct RuntimeViewChanged {
 /// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
 /// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 5] = [
-    "durability.degraded",
-    "freshAgent.recovery.stopped",
-    // Antigravity plan Task 8: the antigravity activity family (the
-    // amplifier family's additive twin; the generated frozen inventory is
-    // not regenerated in that task; promote on the next contract
-    // reconcile).
-    "antigravity.activity.list.response",
-    "antigravity.activity.updated",
-    // Auto-restore-warming Task 2: the capability-gated readiness marker
-    // broadcast (promotion path identical to the entries above — the Zod
-    // schema lands client-side in a later task, then
-    // `pnpm run contract:generate` promotes it into
-    // SERVER_MESSAGE_TYPES).
-    "sessions.index.ready",
-];
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 2] =
+    ["durability.degraded", "freshAgent.recovery.stopped"];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.
