@@ -519,6 +519,7 @@ impl Supervisor {
             | AdminCommand::Launch(_)
             | AdminCommand::OpenCodeTransfer(_)
             | AdminCommand::Stop(_)
+            | AdminCommand::Reopen(_)
             | AdminCommand::Inventory
             | AdminCommand::InventorySnapshot
             | AdminCommand::PendingViewProjections(_)
