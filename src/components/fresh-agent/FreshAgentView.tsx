@@ -1321,6 +1321,7 @@ export function FreshAgentView({
     codexProviderError?: boolean
   } | null>(null)
   const [noticeExpanded, setNoticeExpanded] = useState(false)
+  useEffect(() => { console.info('NOTICE_PARENT_STATE', JSON.stringify({ noticeExpanded, text: notice?.text })) }, [noticeExpanded, notice])
   const setNotice = useCallback((text: string | null, level: 'info' | 'warning' | 'error' = 'warning', source?: {
     sessionKey: string
     canonicalSessionKey?: string

@@ -1,4 +1,4 @@
-name: Notice toggle test diagnostic
+name: Notice toggle lifecycle diagnostic
 
 on:
   workflow_dispatch:
@@ -7,20 +7,20 @@ permissions:
   contents: read
 
 jobs:
-  notice-toggle-unit:
+  notice-toggle-lifecycle:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-      - name: Verify exact source commit
+      - name: Verify exact proof parent
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = 'bed8ed764b56e0c160f650042f42a4d9fe1cbb15'
-          printf '%s\n' '.github/workflows/rust-tests.yml' 'test/unit/client/components/fresh-agent/FreshAgentView.test.tsx' > "$RUNNER_TEMP/expected-files"
+          test "$(git rev-parse HEAD^)" = '4f59b101a15b8ab904cf26e586c4714ce7799616'
+          printf '%s\n' '.github/workflows/rust-tests.yml' 'src/components/fresh-agent/FreshAgentNoticeStack.tsx' 'src/components/fresh-agent/FreshAgentView.tsx' > "$RUNNER_TEMP/expected-files"
           git diff --name-only HEAD^ HEAD > "$RUNNER_TEMP/changed-files"
           diff -u "$RUNNER_TEMP/expected-files" "$RUNNER_TEMP/changed-files"
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4

@@ -11,11 +11,12 @@ function NoticeDisclosure({ children, errorId, onExpandedChange }: {
 }) {
   const [expanded, setExpanded] = useState(false)
   useLayoutEffect(() => {
+    console.info('DISCLOSURE_EFFECT', JSON.stringify({ errorId, expanded, handler: Boolean(onExpandedChange) }))
     onExpandedChange?.(expanded)
-    return () => onExpandedChange?.(false)
+    return () => { console.info('DISCLOSURE_CLEANUP', JSON.stringify({ errorId, expanded })); onExpandedChange?.(false) }
   }, [expanded, onExpandedChange])
 
-  return <details data-agent-error={errorId} onToggle={event => setExpanded(event.currentTarget.open)}>{children}</details>
+  return <details data-agent-error={errorId} onToggle={event => { console.info('DISCLOSURE_TOGGLE', JSON.stringify({ errorId, open: event.currentTarget.open })); setExpanded(event.currentTarget.open) }}>{children}</details>
 }
 
 /** Keep request controls separate; diagnostic bodies stay mounted across toggles. */
