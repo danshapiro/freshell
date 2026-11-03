@@ -6013,10 +6013,57 @@ mod workspace_metadata_test_hooks {
         count("spawn");
         process_spawned(pid);
     }
+
+    /// A freshly spawned process can still be the forked test executable while
+    /// its stdio is being installed. Wait for exec before attributing its open
+    /// descriptors to Git. A process that exits first has no live descriptors.
+    #[cfg(target_os = "linux")]
+    fn wait_for_child_exec(pid: u32, timeout: Duration) -> io::Result<bool> {
+        let current_exe = std::env::current_exe()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match fs::read_link(format!("/proc/{pid}/exe")) {
+                Ok(exe) if exe != current_exe => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("workspace Git child {pid} remained in the pre-exec test process"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Count all descriptors referencing a child's stdio pipes, including
+    /// duplicated descriptors and descriptors marked close-on-exec.
+    #[cfg(target_os = "linux")]
+    fn owned_pipe_fds(candidate: u32) -> io::Result<Vec<(String, PathBuf)>> {
+        let entries = fs::read_dir(format!("/proc/{candidate}/fd"))?;
+        let owned_pipe_targets: BTreeSet<_> = (0..3)
+            .filter_map(|fd| fs::read_link(format!("/proc/{candidate}/fd/{fd}")).ok())
+            .filter(|target| target.to_string_lossy().starts_with("pipe:"))
+            .collect();
+        Ok(entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                fs::read_link(entry.path())
+                    .ok()
+                    .map(|target| (entry.file_name().to_string_lossy().into_owned(), target))
+            })
+            .filter(|(_, target)| owned_pipe_targets.contains(target))
+            .collect())
+    }
+
     pub(super) fn process_spawned(pid: u32) {
         count("all_spawn");
         #[cfg(target_os = "linux")]
         {
+            wait_for_child_exec(pid, Duration::from_secs(5))
+                .expect("the spawned workspace Git child must reach exec or exit");
             let tid = unsafe { libc::syscall(libc::SYS_gettid) };
             let children = fs::read_to_string(format!("/proc/self/task/{tid}/children"))
                 .expect("owned test thread children");
@@ -6037,24 +6084,7 @@ mod workspace_metadata_test_hooks {
                 } else {
                     continue;
                 }
-                if let Ok(entries) = fs::read_dir(format!("/proc/{candidate}/fd")) {
-                    // The command owns its stdio pipes, not arbitrary pipe
-                    // descriptors inherited from another concurrent test.
-                    // Count every endpoint referencing those identities so
-                    // duplicated owned descriptors still exceed the bound.
-                    let owned_pipe_targets: BTreeSet<_> = (0..3)
-                        .filter_map(|fd| fs::read_link(format!("/proc/{candidate}/fd/{fd}")).ok())
-                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
-                        .collect();
-                    let owned_fds: Vec<_> = entries
-                        .filter_map(Result::ok)
-                        .filter_map(|entry| {
-                            fs::read_link(entry.path()).ok().map(|target| {
-                                (entry.file_name().to_string_lossy().into_owned(), target)
-                            })
-                        })
-                        .filter(|(_, target)| owned_pipe_targets.contains(target))
-                        .collect();
+                if let Ok(owned_fds) = owned_pipe_fds(candidate) {
                     pipes += owned_fds.len();
                     pipe_details.push((candidate, owned_fds));
                 }
@@ -6103,6 +6133,82 @@ mod workspace_metadata_test_hooks {
                 *peak = (*peak).max(live);
             }
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_readiness_reports_a_live_process_whose_executable_does_not_change() {
+        let pid = std::process::id();
+        let error = wait_for_child_exec(pid, Duration::from_millis(5))
+            .expect_err("an unchanged live executable must not be considered ready");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains(&pid.to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_pipe_meter_counts_a_close_on_exec_duplicate_in_an_execed_child() {
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        // Python's os.dup returns a close-on-exec descriptor. Keep the execed
+        // child alive so the real /proc meter can observe that duplicate.
+        let mut child = OwnedChild(
+            Command::new("python3")
+                .args([
+                    "-c",
+                    "import os,sys; fd=os.dup(1); print(fd,flush=True); sys.stdin.read(1)",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn held descriptor fixture"),
+        );
+        let input = child.0.stdin.take().expect("fixture stdin");
+        let output = child.0.stdout.take().expect("fixture stdout");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let duplicate = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("held child must report its duplicate")
+            .expect("read held child readiness");
+        reader.join().expect("join fixture readiness reader");
+        let duplicate = duplicate.trim();
+        assert!(!duplicate.is_empty());
+
+        let pid = child.0.id();
+        assert!(wait_for_child_exec(pid, Duration::from_secs(5)).unwrap());
+        let fds = owned_pipe_fds(pid).expect("read held child's owned pipes");
+        let stdout = fds.iter().find(|(fd, _)| fd == "1").expect("stdout pipe");
+        let duplicate_fd = fds
+            .iter()
+            .find(|(fd, _)| fd == duplicate)
+            .expect("duplicate must be counted");
+        assert_eq!(duplicate_fd.1, stdout.1);
+        assert!(fds.len() >= 2, "both descriptors must be counted: {fds:?}");
+        let fdinfo = fs::read_to_string(format!("/proc/{pid}/fdinfo/{duplicate}"))
+            .expect("read duplicate flags");
+        let flags = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .and_then(|value| u32::from_str_radix(value, 8).ok())
+            .expect("parse duplicate flags");
+        assert_ne!(flags & libc::O_CLOEXEC as u32, 0);
+
+        drop(input);
+        assert!(child.0.wait().expect("reap held fixture").success());
     }
 }
 
