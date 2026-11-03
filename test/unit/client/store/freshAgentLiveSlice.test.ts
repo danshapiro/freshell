@@ -482,6 +482,30 @@ describe('websocket routing into the live tail (transcript-live D3)', () => {
     expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
   })
 
+  it.each(['error-first', 'feedback-first'] as const)(
+    'retains error and non-error notices independently through materialization (%s)',
+    (order) => {
+      const store = createStore()
+      const error = { type: 'freshAgent.notice', level: 'error', code: 'PROVIDER_ERROR', message: 'Model at capacity' }
+      const feedback = { type: 'freshAgent.notice', level: 'warning', code: 'FOLLOWUP', message: 'Later feedback' }
+      for (const event of order === 'error-first' ? [error, feedback] : [feedback, error]) {
+        handleFreshAgentMessage(store.dispatch, frame(event))
+      }
+
+      const expectedError = { seq: order === 'error-first' ? 1 : 2, level: 'error', code: 'PROVIDER_ERROR', message: 'Model at capacity' }
+      const expectedFeedback = { seq: order === 'error-first' ? 2 : 1, level: 'warning', code: 'FOLLOWUP', message: 'Later feedback' }
+      expect(tail(store).errorNotice).toEqual(expectedError)
+      expect(tail(store).notice).toEqual(expectedFeedback)
+
+      store.dispatch(materializeSession({ ...locator, previousSessionId: 'live-1', sessionId: 'live-real' }))
+      expect(tail(store)).toBeUndefined()
+      expect(tail(store, 'freshclaude:claude:live-real')).toMatchObject({
+        errorNotice: expectedError,
+        notice: expectedFeedback,
+      })
+    },
+  )
+
   it('applies a session\'s pending stream events before a stopped recovery removes it, leaving no tail behind', () => {
     vi.useFakeTimers()
     const store = createStore()

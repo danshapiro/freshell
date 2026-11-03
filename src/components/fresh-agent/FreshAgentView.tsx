@@ -4932,21 +4932,29 @@ export function FreshAgentView({
   const liveNotice = useAppSelector((state) => (
     liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.notice : undefined
   ))
+  const liveErrorNotice = useAppSelector((state) => (
+    liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.errorNotice : undefined
+  ))
   const shownNoticeSeqRef = useRef(liveNotice?.seq ?? 0)
+  const shownErrorNoticeSeqRef = useRef(liveErrorNotice?.seq ?? 0)
   useEffect(() => {
-    if (!liveNotice || liveNotice.seq <= shownNoticeSeqRef.current) return
-    shownNoticeSeqRef.current = liveNotice.seq
-    // These notices update the retained diagnostic panel, independently of
-    // transient notices such as an uncertain delivery warning.
-    if (liveNotice.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
-      || liveNotice.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
-      || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR'
-      || liveNotice.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
-    const codexProviderError = paneContent.provider === 'codex' && liveNotice.code === 'CODEX_PROVIDER_ERROR'
-    setNotice(formatFreshAgentNotice(liveNotice), liveNotice.level, liveSessionKey ? {
-      sessionKey: liveSessionKey, canonicalSessionKey: savedNoticeSessionKey, codexProviderError,
-    } : undefined)
-  }, [liveNotice, liveSessionKey, paneContent.provider, savedNoticeSessionKey, setNotice])
+    const consume = (item: typeof liveNotice, seen: { current: number }) => {
+      if (!item || item.seq <= seen.current) return
+      seen.current = item.seq
+      // These notices update the retained diagnostic panel, independently of
+      // transient notices such as an uncertain delivery warning.
+      if (item.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
+        || item.code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
+        || item.code === 'CODEX_PENDING_PROVIDER_ERROR'
+        || item.code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED') return
+      const codexProviderError = paneContent.provider === 'codex' && item.code === 'CODEX_PROVIDER_ERROR'
+      setNotice(formatFreshAgentNotice(item), item.level, liveSessionKey ? {
+        sessionKey: liveSessionKey, canonicalSessionKey: savedNoticeSessionKey, codexProviderError,
+      } : undefined)
+    }
+    consume(liveNotice, shownNoticeSeqRef)
+    consume(liveErrorNotice, shownErrorNoticeSeqRef)
+  }, [liveNotice, liveErrorNotice, liveSessionKey, paneContent.provider, savedNoticeSessionKey, setNotice])
   useLayoutEffect(() => {
     setNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
     setErrorNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))

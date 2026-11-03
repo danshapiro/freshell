@@ -337,7 +337,10 @@ const freshAgentLiveSlice = createSlice({
     liveNoticeReceived(state, action: PayloadAction<FreshAgentSessionLocator & Omit<LiveNotice, 'seq'>>) {
       const { sessionId, sessionType, provider, ...notice } = action.payload
       state.noticeSeq += 1
-      sessionFor(state, { sessionId, sessionType, provider }).notice = { seq: state.noticeSeq, ...notice }
+      const session = sessionFor(state, { sessionId, sessionType, provider })
+      const current = { seq: state.noticeSeq, ...notice }
+      if (notice.level === 'error') session.errorNotice = current
+      else session.notice = current
     },
 
     /**
