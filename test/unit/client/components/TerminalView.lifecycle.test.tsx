@@ -193,7 +193,7 @@ import TerminalView, {
   isEngagementInput,
   RESERVE_RETRY_FLOOR_MS,
 } from '@/components/TerminalView'
-import { DEAD_SESSION_RECONCILE_NOTICES, deadSessionReconcileNoticeFor } from '@/lib/pane-reconcile'
+import { DEAD_SESSION_RECONCILE_NOTICES, deadSessionReconcileNoticeFor, SESSION_STORE_UNREADABLE_RECONCILE_NOTICE } from '@/lib/pane-reconcile'
 import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
@@ -17827,5 +17827,301 @@ describe('dead-session notice line (no-modal contract)', () => {
     // stand-down held across the whole navigation.
     expect(terminalWriteStrings(firstSurface).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
     expect(sentCreates()).toHaveLength(0)
+  })
+})
+
+// ── Unreadable-store notice line (auto-restore-warming delta fix, finding 1) ──
+// A TERMINAL pane latched error{session_store_unreadable} (the index
+// published but this identity's store could not be read) must not be a
+// silently dead pane: the fold mints a durable reconcileNotice copy beside
+// the restoreError latch — the dead-copy pattern — and the SAME
+// level-triggered notice-line machinery writes ONE honest in-buffer
+// explanation line into the pane's xterm surface, visible with no user
+// interaction, cleared with the latch by the recovery folds. The buffer
+// copy is reason-honest (it names the unreadable store, never a disk loss)
+// and the writer resolves it by LATCH CATEGORY (a dead mint under an
+// unreadable latch is not a copy source, and vice versa). The create lane
+// is NOT stood down for this reason (the dead-only stand-down doctrine):
+// the pane keeps its fail-open retry re-armed.
+describe('unreadable-store notice line (session_store_unreadable, no-modal contract)', () => {
+  let messageHandler: ((msg: any) => void) | null = null
+  let reconnectHandler: (() => void) | null = null
+
+  const TAB_ID = 'tab-unreadable-notice'
+  const PANE_ID = 'pane-unreadable-notice'
+  const TERMINAL_ID = 'term-unreadable-notice'
+  const PANE_KEY = `${TAB_ID}:${PANE_ID}`
+  const NOTICE_LINE =
+    "[This pane's saved session store could not be read - the session is preserved; reconnect to retry once the store is readable]"
+  const FRAMED_NOTICE = `\r\n${NOTICE_LINE}\r\n`
+
+  function setupUnreadableNoticePane(
+    contentExtra: Partial<TerminalPaneContent> = {},
+    panesExtra: Record<string, unknown> = {},
+  ) {
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-unreadable-notice',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      terminalId: TERMINAL_ID,
+      sessionRef: { provider: 'claude', sessionId: 'sess-unreadable-1' },
+      initialCwd: '/tmp',
+      ...contentExtra,
+    }
+    const root: PaneNode = { type: 'leaf', id: PANE_ID, content: paneContent }
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        extensions: extensionsReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: TAB_ID,
+            mode: paneContent.mode,
+            status: paneContent.status,
+            title: 'Claude',
+            titleSetByUser: false,
+            ...(paneContent.terminalId ? { terminalId: paneContent.terminalId } : {}),
+            createRequestId: paneContent.createRequestId,
+          }],
+          activeTabId: TAB_ID,
+        },
+        panes: {
+          layouts: { [TAB_ID]: root },
+          activePane: { [TAB_ID]: PANE_ID },
+          paneTitles: {},
+          ...panesExtra,
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        extensions: { entries: [] },
+      },
+    })
+    return { store, tabId: TAB_ID, paneId: PANE_ID, terminalId: TERMINAL_ID }
+  }
+
+  async function renderUnreadableNoticePane(
+    contentExtra: Partial<TerminalPaneContent> = {},
+    panesExtra: Record<string, unknown> = {},
+  ) {
+    const harness = setupUnreadableNoticePane(contentExtra, panesExtra)
+    render(
+      <Provider store={harness.store}>
+        <TerminalViewFromStore tabId={harness.tabId} paneId={harness.paneId} />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    return harness
+  }
+
+  function leafContent(store: ReturnType<typeof setupUnreadableNoticePane>['store']): TerminalPaneContent {
+    const layout = store.getState().panes.layouts[TAB_ID] as { type: 'leaf'; content: TerminalPaneContent }
+    return layout.content
+  }
+
+  function term() {
+    const instance = terminalInstances[0]
+    expect(instance, 'xterm surface must be mounted').toBeTruthy()
+    return instance
+  }
+
+  function noticeWriteCount(): number {
+    return terminalWriteStrings(term()).filter((data) => data.includes(NOTICE_LINE)).length
+  }
+
+  function sentCreates(): any[] {
+    return wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.create')
+  }
+
+  // Dispatch exactly what the fold's terminal session_store_unreadable arm
+  // dispatches (setPaneRestoreError + the unreadable-store reconcileNotice
+  // mint) — the fold level is pinned in pane-reconcile.test.ts.
+  function foldUnreadableVerdict(store: ReturnType<typeof setupUnreadableNoticePane>['store']) {
+    act(() => {
+      store.dispatch(setPaneRestoreError({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        restoreError: buildRestoreError('session_store_unreadable'),
+      }))
+      store.dispatch(setPaneReconcileNotice({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        notice: SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
+      }))
+    })
+  }
+
+  beforeEach(() => {
+    vi.useRealTimers()
+    clearLocalStorageForTest()
+    __resetTerminalCursorCacheForTests()
+    __resetLastSentViewportCacheForTests()
+    resetHydrationQueueForTests()
+    resetPersistedLayoutCacheForTests()
+    resetPersistFlushListenersForTests()
+    resetEnsureExtensionsRegistryCacheForTests()
+    latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
+    wsMocks.isReady = true
+    wsMocks.capabilities = {}
+    wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg.terminalId === 'string'
+        && typeof msg.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
+    })
+    wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
+      messageHandler = (msg: any) => callback(msg)
+      return () => { messageHandler = null }
+    })
+    wsMocks.onReconnect.mockImplementation((callback: () => void) => {
+      reconnectHandler = callback
+      return () => {
+        if (reconnectHandler === callback) reconnectHandler = null
+      }
+    })
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0)
+      return 1
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    terminalInstances.length = 0
+    runtimeMocks.instances.length = 0
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+    installPerfAuditBridge(null)
+    restoreMocks.consumeTerminalRestoreRequestId.mockReset()
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    terminalThemeMocks.getTerminalTheme.mockReset()
+    terminalThemeMocks.getTerminalTheme.mockReturnValue({})
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    clearLocalStorageForTest()
+    __resetTerminalCursorCacheForTests()
+    resetHydrationQueueForTests()
+    latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
+    messageHandler = null
+    reconnectHandler = null
+    installPerfAuditBridge(null)
+  })
+
+  it('no-terminalId shape (reload): the fold mints and the invariant writes the honest line once — and the create lane keeps the fail-open retry re-armed', async () => {
+    // Reload shape: only the persisted restoreError survives the reload
+    // (the mint is persistence-stripped). Same un-anchored shape as the
+    // dead notice's reload pin.
+    const { store } = await renderUnreadableNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('session_store_unreadable'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+
+    // The persisted latch alone explains nothing: no mint, no write.
+    expect(noticeWriteCount()).toBe(0)
+
+    // The boot reconcile re-folds the unreadable verdict (latch + mint).
+    foldUnreadableVerdict(store)
+
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+    expect(terminalWriteStrings(term()).filter((data) => data === FRAMED_NOTICE)).toHaveLength(1)
+    // The mint stays RESIDENT (the durable copy source) while the latch
+    // holds — never consumed at the write.
+    expect(leafContent(store).reconcileNotice).toBe(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE)
+    // The STORE copy is never the buffer line.
+    expect(terminalWriteStrings(term()).some((data) => data.includes(SESSION_STORE_UNREADABLE_RECONCILE_NOTICE))).toBe(false)
+
+    // NOT stood down (the dead-only stand-down doctrine): the fold cleared
+    // the pre-verdict pending mark, so the lifecycle effect re-fired into
+    // its create path and the pane keeps its automatic fail-open retry —
+    // a resume attempt carrying the retained identity (whose CLI owns
+    // surfacing the store failure).
+    await waitFor(() => {
+      expect(sentCreates()).toHaveLength(1)
+    })
+    expect(sentCreates()[0].requestId).toBe('req-unreadable-notice')
+    expect(sentCreates()[0].sessionRef).toMatchObject({ provider: 'claude', sessionId: 'sess-unreadable-1' })
+  })
+
+  it('clears on recovery: a respawn fold clears the latch AND the mint, and the recovery create fires normally', async () => {
+    const { store } = await renderUnreadableNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('session_store_unreadable'),
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+
+    foldUnreadableVerdict(store)
+    await waitFor(() => {
+      expect(noticeWriteCount()).toBe(1)
+    })
+    // The fail-open retry fired (create #1 — the not-stood-down eager
+    // create, pinned by the test above).
+    await waitFor(() => {
+      expect(sentCreates()).toHaveLength(1)
+    })
+
+    // The store became readable and the next reconcile derived respawn:
+    // the recovery fold clears the latch, and the durable mint goes WITH
+    // it (it lives exactly as long as the latch it explains). The respawn
+    // create fires normally with the server-named identity.
+    act(() => {
+      store.dispatch(resetPaneForReconcileCreate({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        intent: 'respawn',
+        sessionRef: { provider: 'claude', sessionId: 'sess-unreadable-1' },
+      }))
+    })
+    await waitFor(() => {
+      expect(sentCreates()).toHaveLength(2)
+    })
+    const respawnCreate = sentCreates()[1]
+    expect(respawnCreate.requestId).toBe('req-unreadable-notice')
+    expect(respawnCreate.sessionRef).toMatchObject({ provider: 'claude', sessionId: 'sess-unreadable-1' })
+    expect(leafContent(store).restoreError).toBeUndefined()
+    expect(leafContent(store).reconcileNotice).toBeUndefined()
+  })
+
+  it('category-honest copy source: a DEAD mint under the unreadable latch explains nothing (and never writes)', async () => {
+    // The writer resolves the copy by LATCH CATEGORY — a stale resident
+    // mint of the other category is not a copy source for this latch.
+    const { store } = await renderUnreadableNoticePane(
+      {
+        terminalId: undefined,
+        status: 'creating',
+        restoreError: buildRestoreError('session_store_unreadable'),
+        reconcileNotice: DEAD_SESSION_RECONCILE_NOTICES.missing,
+      },
+      { reconcilePendingPanes: { [PANE_KEY]: Date.now() } },
+    )
+
+    await act(async () => {})
+    expect(noticeWriteCount()).toBe(0)
+    // Neither the unreadable line nor the dead line was written.
+    expect(terminalWriteStrings(term()).some((data) => data.includes('no longer exists on disk'))).toBe(false)
+    expect(leafContent(store).reconcileNotice).toBe(DEAD_SESSION_RECONCILE_NOTICES.missing)
   })
 })

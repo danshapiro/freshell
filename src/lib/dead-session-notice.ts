@@ -1,5 +1,5 @@
 /**
- * Dead-session notice vocabulary (no-modal contract).
+ * Terminal restore-notice vocabulary (no-modal contract).
  *
  * The dead-copy `reconcileNotice` mint is the DURABLE copy source for a
  * dead-adjudicated terminal pane's one in-buffer explanation line: the
@@ -12,13 +12,21 @@
  * never persisted (persistMiddleware strips `reconcileNotice`), so a
  * reload re-folds the verdict and re-mints.
  *
+ * The unreadable-store mint (SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
+ * auto-restore-warming delta fix finding 1) is the sibling category: the
+ * terminal fold's error{session_store_unreadable} arm mints it beside the
+ * same-named restoreError latch, and TerminalView's notice-line machinery
+ * renders it the same way. Fresh-agent panes never mint either category
+ * (FreshAgentView renders the restoreError copy directly).
+ *
  * REASON-HONEST: the server also returns `dead_session` with reason
  * `respawn_exhausted` while the session file is PRESENT, so the fold
  * selects the copy from `verdict.reason`. Consumers match the mint by
- * CATEGORY through `isDeadSessionReconcileNotice` — never one string —
- * so the `invalid`-arm and reset notices can never trigger them. The
- * xterm buffer line is a SEPARATE shared const in TerminalView; these
- * copies stay store-side.
+ * CATEGORY through `isDeadSessionReconcileNotice` /
+ * `isSessionStoreUnreadableReconcileNotice` — never one string — so the
+ * `invalid`-arm and reset notices can never trigger them. The xterm
+ * buffer lines are SEPARATE shared consts in TerminalView; these copies
+ * stay store-side.
  */
 export const DEAD_SESSION_RECONCILE_NOTICES = {
   missing: 'Saved session no longer exists on disk.',
@@ -47,4 +55,32 @@ export function deadSessionReconcileNoticeFor(reason: string | undefined): strin
 export function isDeadSessionReconcileNotice(notice: string | undefined): boolean {
   return notice === DEAD_SESSION_RECONCILE_NOTICES.missing
     || notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
+}
+
+/**
+ * Unreadable-store notice copy (auto-restore-warming delta fix, finding 1):
+ * the terminal-pane sibling of the dead-copy mint. A pane whose verdict is
+ * error{session_store_unreadable} (the index PUBLISHED but this identity's
+ * store could not be read) gets ONE in-buffer explanation line through the
+ * SAME no-modal machinery — visible with no user interaction, cleared with
+ * the latch by the recovery folds. Plain and honest: names the unreadable
+ * store, says the session is preserved, says how recovery happens.
+ */
+export const SESSION_STORE_UNREADABLE_RECONCILE_NOTICE =
+  'Saved session store could not be read - the session was preserved; reconnecting will retry once the store is readable.'
+
+export function isSessionStoreUnreadableReconcileNotice(notice: string | undefined): boolean {
+  return notice === SESSION_STORE_UNREADABLE_RECONCILE_NOTICE
+}
+
+/**
+ * True for a DURABLE restore-notice mint (dead or unreadable-store): the
+ * copy stays RESIDENT in the pane content exactly as long as the
+ * restoreError latch it explains, and the recovery folds clear it together
+ * with the latch (foldLiveTerminalAttach / resetPaneForReconcileCreate).
+ * One-shot notices (corrected/duplicate/fresh/invalid copies) keep their
+ * own anchor-scoped lifecycle and are NOT durable mints.
+ */
+export function isDurableRestoreNoticeMint(notice: string | undefined): boolean {
+  return isDeadSessionReconcileNotice(notice) || isSessionStoreUnreadableReconcileNotice(notice)
 }

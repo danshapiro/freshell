@@ -40,8 +40,11 @@ import { clearSessionLost } from '@/store/freshAgentSlice'
 import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import {
   DEAD_SESSION_RECONCILE_NOTICES,
+  SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
   deadSessionReconcileNoticeFor,
   isDeadSessionReconcileNotice,
+  isDurableRestoreNoticeMint,
+  isSessionStoreUnreadableReconcileNotice,
 } from '@/lib/dead-session-notice'
 
 // The dead-copy mint vocabulary lives in its own leaf module
@@ -51,8 +54,11 @@ import {
 // mint vocabulary from the reconcile fold's module.
 export {
   DEAD_SESSION_RECONCILE_NOTICES,
+  SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
   deadSessionReconcileNoticeFor,
   isDeadSessionReconcileNotice,
+  isDurableRestoreNoticeMint,
+  isSessionStoreUnreadableReconcileNotice,
 }
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
@@ -651,6 +657,22 @@ export function foldVerdicts(
             tabId,
             paneId,
             restoreError: buildRestoreError('session_store_unreadable'),
+            expectedCreateRequestId: pane.createRequestId,
+          }))
+          // Delta fix finding 1: mint the VISIBLE explanation beside the
+          // latch — the dead-copy pattern. Without it a TERMINAL pane
+          // latched unreadable is a silently dead pane (nothing renders
+          // this reason in TerminalView; the warming banner has already
+          // cleared). The mint is the durable copy source for
+          // TerminalView's notice-line machinery: ONE in-buffer line,
+          // written with no user interaction, cleared with the latch by
+          // the recovery folds. The fresh-agent arm above does NOT mint
+          // (FreshAgentView renders this reason through
+          // getRestoreErrorMessage).
+          dispatch(setPaneReconcileNotice({
+            tabId,
+            paneId,
+            notice: SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
             expectedCreateRequestId: pane.createRequestId,
           }))
         } else {

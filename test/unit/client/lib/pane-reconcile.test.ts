@@ -37,6 +37,7 @@ import {
   isDeadSessionReconcileNotice,
   paneKeyFor,
   DEAD_SESSION_RECONCILE_NOTICES,
+  SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
 } from '@/lib/pane-reconcile'
 import { configureStore, type UnknownAction } from '@reduxjs/toolkit'
 import { ManagedRuntimeInventorySnapshotSchema } from '@shared/managed-runtime'
@@ -576,6 +577,17 @@ describe('foldVerdicts', () => {
       tabId: 'tab1',
       paneId: 'p1',
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'session_store_unreadable' },
+    })
+    // Delta fix finding 1: the terminal arm also mints the VISIBLE
+    // explanation (the dead-copy pattern) — a terminal pane latched
+    // unreadable must not be a silently dead pane. The mint is the durable
+    // copy source for TerminalView's notice-line machinery, cleared with
+    // the latch by the recovery folds.
+    expect(dispatched.countOf(setPaneReconcileNotice.type)).toBe(1)
+    expect(dispatched.lastPayloadOf(setPaneReconcileNotice.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      notice: SESSION_STORE_UNREADABLE_RECONCILE_NOTICE,
     })
   })
 
