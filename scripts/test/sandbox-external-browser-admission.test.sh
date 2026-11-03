@@ -130,6 +130,32 @@ exit 0
 SH
 chmod 0700 "${FAKE_BIN}/docker"
 
+cat >"${FAKE_BIN}/bash" <<'PY'
+#!/usr/bin/python3
+import os
+import signal
+import sys
+import time
+
+ready = os.environ.get("FRESHELL_TEST_PREPARATION_READY_FILE")
+signal_file = os.environ.get("FRESHELL_TEST_PREPARATION_SIGNAL_FILE")
+if os.environ.get("FRESHELL_SANDBOX_PREPARE_ONLY") == "1" and ready and signal_file:
+    def record(signum, _frame):
+        with open(signal_file, "w", encoding="utf-8") as stream:
+            stream.write(signal.Signals(signum).name)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, record)
+    signal.signal(signal.SIGHUP, record)
+    with open(ready, "w", encoding="utf-8"):
+        pass
+    while True:
+        time.sleep(1)
+
+os.execv("/bin/bash", ["bash", *sys.argv[1:]])
+PY
+chmod 0700 "${FAKE_BIN}/bash"
+
 write_descriptor() {
   local target_path="$1" selector="$2"
   if [ -e "${target_path}" ]; then
@@ -323,6 +349,83 @@ import sys
 with open(sys.argv[1], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(["run", f"{sys.argv[2]}:/home/sandbox/.local/share/pnpm/store"]) + "\n")
 PY
+write_descriptor "${DESCRIPTOR}" "${P2_G01_TITLE}|P2-G04"
+STATUS=0
+run_external >"${TEST_TMP}/execution-invalid-descriptor.stdout" \
+  2>"${TEST_TMP}/execution-invalid-descriptor.stderr" || STATUS=$?
+test "${STATUS}" -eq 2
+grep -q '"event":"sandbox_external_pnpm_store_settled".*"phase":"execution".*"absent":true.*"removed":true' \
+  "${TEST_TMP}/execution-invalid-descriptor.stderr"
+python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert [call for call in calls if call[:2] == ["volume", "rm"]] == [["volume", "rm", sys.argv[2]]]
+PY
+write_descriptor "${DESCRIPTOR}" "${P2_G01_TITLE}"
+
+run_ordinary_preparation_signal_case() {
+  local signal_name="$1" expected_status="$2" suffix="$3"
+  python3 - "${REPO_ROOT}" "${FAKE_BIN}" "${TEST_TMP}" "${signal_name}" "${expected_status}" "${suffix}" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+repo, fake_bin, test_tmp, signal_name, expected_code, suffix = sys.argv[1:]
+expected_code = int(expected_code)
+ready = pathlib.Path(test_tmp, f"runtime-{suffix}-ready")
+signal_file = pathlib.Path(test_tmp, f"runtime-{suffix}-signal")
+stdout_file = open(pathlib.Path(test_tmp, f"runtime-{suffix}.stdout"), "w", encoding="utf-8")
+stderr_file = open(pathlib.Path(test_tmp, f"runtime-{suffix}.stderr"), "w", encoding="utf-8")
+environment = os.environ.copy()
+environment.update({
+    "PATH": f"{fake_bin}:{environment.get('PATH', '')}",
+    "FRESHELL_TEST_PREPARATION_READY_FILE": str(ready),
+    "FRESHELL_TEST_PREPARATION_SIGNAL_FILE": str(signal_file),
+})
+
+def reset_test_signals():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+process = subprocess.Popen(
+    [str(pathlib.Path(fake_bin, "bash")), str(pathlib.Path(repo, "scripts/sandbox-test.sh")),
+     "--workspace-root", repo, "--runtime-suite", "true"],
+    env=environment, stdout=stdout_file, stderr=stderr_file, preexec_fn=reset_test_signals,
+)
+try:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if ready.exists(): break
+        if process.poll() is not None: raise AssertionError("outer runtime preparation exited before signal fixture")
+        time.sleep(0.05)
+    if not ready.exists(): raise AssertionError("ordinary runtime preparation did not reach signal fixture")
+    process.send_signal(getattr(signal, signal_name))
+    status = process.wait(timeout=15)
+    assert status == expected_code, f"{signal_name} produced exit {status}, expected {expected_code}"
+    assert signal_file.read_text(encoding="utf-8") == signal_name, "ordinary prep child received the wrong signal"
+finally:
+    if process.poll() is None:
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=15)
+    stdout_file.close()
+    stderr_file.close()
+PY
+}
+
+run_ordinary_preparation_signal_case SIGINT 130 int
+run_ordinary_preparation_signal_case SIGHUP 129 hup
+
+: >"${DOCKER_CALLS}"
+python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(["run", f"{sys.argv[2]}:/home/sandbox/.local/share/pnpm/store"]) + "\n")
+PY
 STATUS=0
 PATH="${FAKE_BIN}:${PATH}" FRESHELL_TEST_DOCKER_FAIL_TARGET_CACHE_LIST=1 \
   FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
@@ -347,7 +450,13 @@ STATUS=0
 run_external >"${TEST_TMP}/invalid.stdout" 2>"${TEST_TMP}/invalid.stderr" || STATUS=$?
 test "${STATUS}" -eq 2
 grep -qi 'P2-G01' "${TEST_TMP}/invalid.stderr"
-test ! -s "${DOCKER_CALLS}"
+python3 - "${DOCKER_CALLS}" <<'PY'
+import json
+import sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert not any(call and call[0] == "run" for call in calls), calls
+assert not any(call[:2] == ["volume", "rm"] for call in calls), calls
+PY
 
 write_descriptor "${DESCRIPTOR}" "${P2_G01_TITLE}"
 : >"${DOCKER_CALLS}"
