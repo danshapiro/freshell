@@ -2055,6 +2055,43 @@ describe('FreshAgentView', () => {
       }
     })
 
+    it.each([
+      ['info', 'error-first'],
+      ['info', 'feedback-first'],
+      ['warning', 'error-first'],
+      ['warning', 'feedback-first'],
+    ] as const)('preserves a provider error and %s notice delivered in one batch (%s)', async (level, order) => {
+      const queue = await setup('idle')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      const feedback = 'The provider sent additional feedback.'
+      const deliver = (event: Record<string, unknown>) => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      }
+      const deliverError = () => deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic })
+      const deliverFeedback = () => deliver({ type: 'freshAgent.notice', level, code: 'FOLLOWUP_NOTICE', message: feedback })
+
+      act(() => {
+        if (order === 'error-first') {
+          deliverError()
+          deliverFeedback()
+        } else {
+          deliverFeedback()
+          deliverError()
+        }
+      })
+
+      await waitFor(() => expect(screen.getByRole('alert', { name: diagnostic })).toBeVisible())
+      if (level === 'info') {
+        expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent(feedback)
+      } else {
+        expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent(feedback)
+      }
+    })
+
     it('keeps a provider error while an informational notice appears and expires', async () => {
       const queue = await setup('idle')
       const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
