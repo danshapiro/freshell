@@ -37,6 +37,69 @@ WORKSPACE_ROOT="${REPO_ROOT}"
 IMAGE_TAG="freshell-sandbox:latest"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
 PNPM_STORE_VOLUME="${CACHE_PREFIX}-pnpm-store"
+P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
+P2_G01_PNPM_STORE_VOLUME="${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}"
+
+cleanup_p2_g01_pnpm_store() {
+  local phase="$1"
+  local expected_volume="freshell-p2g01-pnpm-${P2_G01_RUN_ID}"
+  local listed_volume=""
+  local consumers=""
+  local removed=false
+  if ! [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+    || [ "${P2_G01_PNPM_STORE_VOLUME}" != "${expected_volume}" ] \
+    || [[ ! "${phase}" =~ ^(preparation|execution)$ ]]; then
+    printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","reason":"invalid_identity_or_phase"}\n' >&2
+    return 1
+  fi
+  if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")"; then
+    printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_list_failed"}\n' \
+      "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+    return 1
+  fi
+  if printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
+    if ! consumers="$(docker ps -aq --filter "volume=${expected_volume}")"; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"consumer_check_failed"}\n' \
+        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+      return 1
+    fi
+    if [ -n "${consumers}" ] || ! docker volume rm "${expected_volume}" >/dev/null; then
+      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_in_use_or_removal_failed"}\n' \
+        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+      return 1
+    fi
+    removed=true
+  fi
+  if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")" \
+    || printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
+    printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_absence_unconfirmed"}\n' \
+      "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
+    return 1
+  fi
+  printf '{"severity":"info","event":"sandbox_external_pnpm_store_settled","runId":"%s","volume":"%s","phase":"%s","absent":true,"removed":%s}\n' \
+    "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" "${removed}" >&2
+}
+
+# The execution child inherits the run-scoped volume created during prep.
+# Install this before descriptor parsing so every failed re-entry can settle it.
+p2_g01_cleanup_on_error() {
+  local result=$?
+  trap - EXIT
+  if [ "${result}" -ne 0 ] && [ -n "${P2_G01_CLEANUP_PHASE:-}" ]; then
+    if ! cleanup_p2_g01_pnpm_store "${P2_G01_CLEANUP_PHASE}"; then
+      result=1
+    fi
+  fi
+  exit "${result}"
+}
+
+if [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" = 1 ] \
+  && [ "${FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE:-}" = execution ] \
+  && [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+  && [ "${P2_G01_PNPM_STORE_VOLUME}" = "freshell-p2g01-pnpm-${P2_G01_RUN_ID}" ]; then
+  P2_G01_CLEANUP_PHASE=execution
+  trap 'p2_g01_cleanup_on_error' EXIT
+fi
 
 if [ "${1:-}" = "--provider-mountpoints" ]; then
   shift
@@ -280,8 +343,6 @@ PY
     CMD="$1"
   fi
 
-  P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
-  P2_G01_PNPM_STORE_VOLUME="${FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME:-}"
   if [ -n "${P2_G01_RUN_ID}" ] || [ -n "${P2_G01_PNPM_STORE_VOLUME}" ]; then
     if ! [[ "${P2_G01_RUN_ID}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
       || [ "${P2_G01_PNPM_STORE_VOLUME}" != "freshell-p2g01-pnpm-${P2_G01_RUN_ID}" ] \
@@ -294,61 +355,6 @@ PY
     echo '[sandbox] P2-G01 sandbox phase requires its run-bound pnpm store identity' >&2
     exit 2
   fi
-
-  cleanup_p2_g01_pnpm_store() {
-    local phase="$1"
-    local expected_volume="freshell-p2g01-pnpm-${P2_G01_RUN_ID}"
-    local listed_volume=""
-    local consumers=""
-    local removed=false
-    if [ -z "${P2_G01_RUN_ID}" ] || [ "${P2_G01_PNPM_STORE_VOLUME}" != "${expected_volume}" ] \
-      || [[ ! "${phase}" =~ ^(preparation|execution)$ ]]; then
-      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","reason":"invalid_identity_or_phase"}\n' >&2
-      return 1
-    fi
-    if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")"; then
-      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_list_failed"}\n' \
-        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
-      return 1
-    fi
-    if printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
-      if ! consumers="$(docker ps -aq --filter "volume=${expected_volume}")"; then
-        printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"consumer_check_failed"}\n' \
-          "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
-        return 1
-      fi
-      if [ -n "${consumers}" ] || ! docker volume rm "${expected_volume}" >/dev/null; then
-        printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_in_use_or_removal_failed"}\n' \
-          "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
-        return 1
-      fi
-      removed=true
-    fi
-    if ! listed_volume="$(docker volume ls --format '{{.Name}}' --filter "name=^${expected_volume}$")" \
-      || printf '%s\n' "${listed_volume}" | grep -Fxq -- "${expected_volume}"; then
-      printf '{"severity":"error","event":"sandbox_external_pnpm_store_cleanup_failed","runId":"%s","volume":"%s","phase":"%s","reason":"volume_absence_unconfirmed"}\n' \
-        "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" >&2
-      return 1
-    fi
-    printf '{"severity":"info","event":"sandbox_external_pnpm_store_settled","runId":"%s","volume":"%s","phase":"%s","absent":true,"removed":%s}\n' \
-      "${P2_G01_RUN_ID}" "${expected_volume}" "${phase}" "${removed}" >&2
-  }
-
-  # The external browser caller owns preparation as well as the eventual
-  # execution process. If setup exits before its sandbox EXIT handler is
-  # installed, retain the caller's failure and settle only its run-scoped
-  # store. Successful handoff uses exec below, so this trap does not remove
-  # the store between preparation and execution.
-  p2_g01_cleanup_on_error() {
-    local result=$?
-    trap - EXIT
-    if [ "${result}" -ne 0 ] && [ -n "${P2_G01_CLEANUP_PHASE:-}" ]; then
-      if ! cleanup_p2_g01_pnpm_store "${P2_G01_CLEANUP_PHASE}"; then
-        result=1
-      fi
-    fi
-    exit "${result}"
-  }
 
   p2_g01_preparation_signal() {
     local result="$1"
@@ -419,11 +425,13 @@ PY
   # guard and completed settlement. Only the fixed preparation has networking.
   if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
-    PREPARATION_PID=""
-    P2_G01_PENDING_SIGNAL=""
-    trap 'p2_g01_preparation_signal 130' INT
-    trap 'p2_g01_preparation_signal 143' TERM
-    trap 'p2_g01_preparation_signal 129' HUP
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      PREPARATION_PID=""
+      P2_G01_PENDING_SIGNAL=""
+      trap 'p2_g01_preparation_signal 130' INT
+      trap 'p2_g01_preparation_signal 143' TERM
+      trap 'p2_g01_preparation_signal 129' HUP
+    fi
     PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
@@ -436,8 +444,17 @@ PY
       "${PREPARATION_COMMAND}" &
     fi
     PREPARATION_PID=$!
-    if [ -n "${P2_G01_PENDING_SIGNAL}" ]; then
-      p2_g01_preparation_signal "${P2_G01_PENDING_SIGNAL}"
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      if [ -n "${P2_G01_PENDING_SIGNAL}" ]; then
+        p2_g01_preparation_signal "${P2_G01_PENDING_SIGNAL}"
+      fi
+    else
+      # Preserve the established signal forwarding for ordinary runtime-suite
+      # preparation. Only the external browser route needs the run-store
+      # settling handler above.
+      trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
+      trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
+      trap 'kill -HUP "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 129' HUP
     fi
     PREPARATION_STATUS=0
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
