@@ -29,6 +29,12 @@
 //   strictly-increasing USER_INPUT step indexes), and removes the
 //   conversation it created (brain/<id> + conversations/<id>.db) in a finally
 //   sweep — one real conversation created and then removed per gated run.
+//   The store scan is exhaustive: the binary's write root is not
+//   necessarily the seam's read root (the snap binary pins its store under
+//   $HOME/snap while the default root can also hold conversations, and a
+//   fresh install creates its root mid-run), so the tier snapshots,
+//   scans, and sweeps EVERY candidate root (the env override, the default
+//   root, and the snap root — deduplicated).
 //
 //   To run the gated tiers 3-4 (CLI settings precondition: both tiers pass
 //   the session-scoped `--settings '{"modelProvider":"gemini"}'` overlay for
@@ -120,25 +126,30 @@ describe('antigravity real launch smoke', () => {
     expect(stdout).toContain('antigravity-smoke-ok')
   }, 200_000)
 
-  // Resolves the store root the way the server's seam does
-  // (crates/freshell-sessions provider_layout.rs antigravity_home):
+  // Candidate store roots, in preference order. The SEAM resolves ONE
+  // root (crates/freshell-sessions provider_layout.rs antigravity_home:
   // FRESHELL_ANTIGRAVITY_HOME override > default root when it holds
-  // conversations > snap root when it does not. The snap binary pins its
-  // store under $HOME/snap regardless of a disposable HOME, so the live
-  // store is the snap root on this host (the contract-probe receipts).
-  async function resolveAgyStoreRoot(): Promise<string> {
-    if (process.env.FRESHELL_ANTIGRAVITY_HOME) return process.env.FRESHELL_ANTIGRAVITY_HOME
+  // conversations > snap root), but the binary's WRITE root is not
+  // necessarily the seam's read root: the snap binary pins its store
+  // under $HOME/snap regardless of a disposable HOME (the contract-probe
+  // receipts), while the same host can also hold conversations in the
+  // default root (or vice versa) — and a root that does not exist yet is
+  // created by the binary mid-run on a fresh install. The tier therefore
+  // scans EVERY candidate (deduplicated) instead of betting on one: a
+  // missing root simply contributes an empty snapshot/scan (the readdir
+  // catch), so a write root that materializes during the run is still
+  // found and still swept by the cleanup.
+  function agyStoreRootCandidates(): string[] {
     const home = os.homedir()
-    const defaultRoot = path.join(home, '.gemini', 'antigravity-cli')
-    const snapRoot = path.join(home, 'snap', 'antigravity-cli', 'common', '.gemini', 'antigravity-cli')
-    const hasConversations = async (root: string): Promise<boolean> => {
-      const brain = path.join(root, 'brain')
-      return await fs.readdir(brain).then((ids) => ids.length > 0).catch(() => false)
-    }
-    if (await hasConversations(defaultRoot)) return defaultRoot
-    if (await hasConversations(snapRoot)) return snapRoot
-    return defaultRoot
+    const candidates = [
+      process.env.FRESHELL_ANTIGRAVITY_HOME,
+      path.join(home, '.gemini', 'antigravity-cli'),
+      path.join(home, 'snap', 'antigravity-cli', 'common', '.gemini', 'antigravity-cli'),
+    ].filter((root): root is string => Boolean(root))
+    return [...new Set(candidates)]
   }
+
+  const brainDirOf = (root: string) => path.join(root, 'brain')
 
   const runResume = available && realEnabled && hasProviderKey
   const itResume = runResume ? it : it.skip
@@ -146,8 +157,15 @@ describe('antigravity real launch smoke', () => {
     'resumes a real conversation headlessly and appends to the same transcript',
     async () => {
       const nonce = `antigravity-smoke-resume-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const brainDir = path.join(await resolveAgyStoreRoot(), 'brain')
-      const before = new Set(await fs.readdir(brainDir).catch(() => [] as string[]))
+      // The binary's write root is not necessarily the seam's read root —
+      // scan EVERY candidate root (see agyStoreRootCandidates).
+      const roots = agyStoreRootCandidates()
+      // Per-root `before` snapshots: the freshness filter is scoped to
+      // each root's own pre-run conversation set.
+      const beforeByRoot = new Map<string, Set<string>>()
+      for (const root of roots) {
+        beforeByRoot.set(root, new Set(await fs.readdir(brainDirOf(root)).catch(() => [] as string[])))
+      }
       // EVERY fresh conversation whose transcript carries the nonce — the
       // cleanup sweep must remove them all even if the id resolution or any
       // later assertion fails (a failed tier run must not leave its scratch
@@ -162,27 +180,37 @@ describe('antigravity real launch smoke', () => {
       )
       expect(first.stdout).toContain(nonce)
 
-      // Find the NEW conversation(s) whose transcripts carry the nonce.
-      const after = await fs.readdir(brainDir)
-      const freshIds = after.filter((id) => !before.has(id))
+      // Find the NEW conversation(s) whose transcripts carry the nonce —
+      // in EVERY candidate root (the binary wrote to whichever root its
+      // installation pins; ids are root-independent, so the resume below
+      // works regardless of which root produced the hit).
       let convId: string | undefined
-      for (const id of freshIds) {
-        const body = await fs
-          .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
-          .catch(() => '')
-        if (body.includes(nonce)) {
-          nonceBearing.add(id)
-          convId ??= id
+      let transcriptPath: string | undefined
+      let freshCount = 0
+      for (const root of roots) {
+        const brainDir = brainDirOf(root)
+        const before = beforeByRoot.get(root) ?? new Set<string>()
+        const after = await fs.readdir(brainDir).catch(() => [] as string[])
+        const freshIds = after.filter((id) => !before.has(id))
+        freshCount += freshIds.length
+        for (const id of freshIds) {
+          const body = await fs
+            .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
+            .catch(() => '')
+          if (body.includes(nonce)) {
+            nonceBearing.add(id)
+            convId ??= id
+            transcriptPath ??= path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl')
+          }
         }
       }
-      expect(freshIds.length).toBeGreaterThanOrEqual(1)
+      expect(freshCount).toBeGreaterThanOrEqual(1)
       expect(convId, 'the new conversation whose transcript carries the nonce').toBeTruthy()
 
       // Binary record-schema pins on the run-owned transcript (the
       // corrected contract; evidence: real-binary-transcript-evidence.md).
-      const transcriptPath = path.join(brainDir, convId!, '.system_generated', 'logs', 'transcript.jsonl')
       const readRecords = async () =>
-        (await fs.readFile(transcriptPath, 'utf8'))
+        (await fs.readFile(transcriptPath!, 'utf8'))
           .trim()
           .split('\n')
           .map((line) => JSON.parse(line))
@@ -228,30 +256,37 @@ describe('antigravity real launch smoke', () => {
 
       // Cleanup (finally): this run owns every conversation it created (the
       // contract-probe hygiene precedent). Remove BOTH store trees for EVERY
-      // nonce-bearing fresh conversation — success or any failure (Task 1
-      // Step 7 parity): brain/<id> (the transcript) and
-      // conversations/<id>.db (the per-conversation sidecar db — verified
-      // present per conversation in the real store).
+      // nonce-bearing fresh conversation in EVERY candidate root — success or
+      // any failure (Task 1 Step 7 parity).
       } finally {
-        const storeRoot = await resolveAgyStoreRoot()
-        // Re-scan fresh conversations in the finally: a failure AFTER the CLI
-        // already created a conversation (the exact creation-then-429 mode the
-        // Task 1 receipts recorded on a quota-dead key) can throw before the
-        // in-try scan populates nonceBearing — without this re-scan that
-        // scratch conversation would leak in the live store. The nonce gate
-        // stays: this run removes only conversations carrying THIS run's
-        // unique nonce, never a concurrent user conversation.
-        const nowIds = await fs.readdir(brainDir).catch(() => [] as string[])
-        for (const id of nowIds) {
-          if (before.has(id) || nonceBearing.has(id)) continue
-          const body = await fs
-            .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
-            .catch(() => '')
-          if (body.includes(nonce)) nonceBearing.add(id)
+        // Re-scan fresh conversations in the finally, in EVERY candidate
+        // root (the binary's write root is not necessarily the seam's read
+        // root — a single-root re-scan can miss this run's scratch
+        // conversation on a host whose roots are split): a failure AFTER
+        // the CLI already created a conversation (the exact
+        // creation-then-429 mode the Task 1 receipts recorded on a
+        // quota-dead key) can throw before the in-try scan populates
+        // nonceBearing — without this re-scan that scratch conversation
+        // would leak in the live store. The nonce gate stays: this run
+        // removes only conversations carrying THIS run's unique nonce,
+        // never a concurrent user conversation.
+        for (const root of roots) {
+          const brainDir = brainDirOf(root)
+          const before = beforeByRoot.get(root) ?? new Set<string>()
+          const nowIds = await fs.readdir(brainDir).catch(() => [] as string[])
+          for (const id of nowIds) {
+            if (before.has(id) || nonceBearing.has(id)) continue
+            const body = await fs
+              .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
+              .catch(() => '')
+            if (body.includes(nonce)) nonceBearing.add(id)
+          }
         }
         for (const id of nonceBearing) {
-          await fs.rm(path.join(brainDir, id), { recursive: true, force: true }).catch(() => {})
-          await fs.rm(path.join(storeRoot, 'conversations', `${id}.db`), { force: true }).catch(() => {})
+          for (const root of roots) {
+            await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {})
+            await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {})
+          }
         }
       }
     },

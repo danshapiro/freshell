@@ -55,6 +55,7 @@ pub(crate) const AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS: i64 = 3_600_000;
 pub(crate) const SETTLE_REASON_CANCELLED: &str = "auto-resume cancelled";
 
 use crate::env_parse;
+use crate::terminal::RespawnOutcome;
 
 pub(crate) fn auto_resume_max_cycles() -> u32 {
     env_parse(
@@ -592,34 +593,89 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         replaces_terminal_id: ev.terminal_id.clone(),
                     };
                     match driver.respawn(&spec).await {
-                        Ok(new_tid) => {
-                            if driver
-                                .complete_claim(&provider, &session_id, &key, &new_tid)
-                                .await
-                            {
+                        Ok(outcome) => match outcome.identity {
+                            crate::terminal::RespawnedIdentity::Resumed
+                            | crate::terminal::RespawnedIdentity::MintedReplacement => {
+                                if driver
+                                    .complete_claim(
+                                        &provider,
+                                        &session_id,
+                                        &key,
+                                        &outcome.terminal_id,
+                                    )
+                                    .await
+                                {
+                                    driver.emit_replaced(
+                                        &ev.terminal_id,
+                                        &outcome.terminal_id,
+                                        ev.exit_code,
+                                        attempt,
+                                        max_attempts,
+                                    );
+                                    // One successful auto-resume = one breaker
+                                    // cycle (znhn item 2). Re-fetch the entry —
+                                    // the earlier borrow ended before the awaits.
+                                    attempts
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .cycles
+                                        .push(crate::terminal::now_ms());
+                                } else {
+                                    // Binding raced away between claim and completion; the
+                                    // driver already killed its own orphan child. No
+                                    // terminal.replaced — the pane stays settled exited.
+                                    driver.emit_settled(
+                                        &ev.terminal_id,
+                                        "lease_completion_lost",
+                                        None,
+                                    );
+                                    driver.log_settled(&ev.terminal_id, "lease_completion_lost");
+                                }
+                            }
+                            // The gate refused the recorded id and the respawn
+                            // launched an identity-less FRESH conversation
+                            // (no replacement id minted — codex/opencode/
+                            // antigravity). The pane DID come back, so the
+                            // replacement is announced — but the STALE
+                            // identity must not survive over the fresh
+                            // conversation: the claim is RELEASED, never
+                            // completed against the fresh terminal (GC3's
+                            // no-silent-replacement rule; the direct create
+                            // path refuses the same id with the typed
+                            // SESSION_MISSING error). The pane has NO saved
+                            // identity and binds the conversation the CLI
+                            // mints through the provider's natural rebind;
+                            // the respawn's Recovering notice (naming the
+                            // stale id) keeps the user informed.
+                            crate::terminal::RespawnedIdentity::FreshUnbound => {
+                                driver.fail_claim(&provider, &session_id, &key);
+                                tracing::info!(
+                                    old_terminal_id = %ev.terminal_id,
+                                    new_terminal_id = %outcome.terminal_id,
+                                    provider = %provider,
+                                    stale_session_id = %session_id,
+                                    "terminal.auto_resume.stale_identity_released: the resume \
+                                     gate refused the recorded session; the respawn launched an \
+                                     identity-less fresh conversation — the stale claim is \
+                                     released, never completed against it"
+                                );
                                 driver.emit_replaced(
                                     &ev.terminal_id,
-                                    &new_tid,
+                                    &outcome.terminal_id,
                                     ev.exit_code,
                                     attempt,
                                     max_attempts,
                                 );
-                                // One successful auto-resume = one breaker
-                                // cycle (znhn item 2). Re-fetch the entry —
-                                // the earlier borrow ended before the awaits.
+                                // The respawn still happened — one breaker cycle
+                                // (the fresh generation shares the createRequestId
+                                // and must stay inside the crash-loop bound).
                                 attempts
                                     .entry(key.clone())
                                     .or_default()
                                     .cycles
                                     .push(crate::terminal::now_ms());
-                            } else {
-                                // Binding raced away between claim and completion; the
-                                // driver already killed its own orphan child. No
-                                // terminal.replaced — the pane stays settled exited.
-                                driver.emit_settled(&ev.terminal_id, "lease_completion_lost", None);
-                                driver.log_settled(&ev.terminal_id, "lease_completion_lost");
                             }
-                        }
+                        },
                         Err(err) => {
                             driver.fail_claim(&provider, &session_id, &key);
                             tracing::warn!(terminal_id = %ev.terminal_id, error = %err, "terminal.auto_resume.respawn_failed");
@@ -723,10 +779,19 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     ) -> impl std::future::Future<Output = bool> + Send;
     /// Release a claim whose respawn failed (fail_session_ref_claim).
     fn fail_claim(&self, provider: &str, session_id: &str, create_request_id: &str);
+    /// Spawn the replacement terminal. The outcome's `identity` is the
+    /// claim disposition input: `Resumed`/`MintedReplacement` complete the
+    /// claimed lease against the new terminal; `FreshUnbound` (the gate
+    /// refused the recorded id and NO replacement id was minted —
+    /// codex/opencode/antigravity) MUST have the claim RELEASED
+    /// (`fail_claim`), never completed: the fresh terminal is an
+    /// identity-less fresh conversation, and the stale locator's lease
+    /// bound to it is exactly the silent replacement the direct create
+    /// path refuses (GC3).
     fn respawn(
         &self,
         req: &RespawnSpec,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<RespawnOutcome, String>> + Send;
     fn emit_recovering(
         &self,
         terminal_id: &str,
@@ -1314,7 +1379,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
     fn respawn(
         &self,
         req: &RespawnSpec,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<RespawnOutcome, String>> + Send {
         let state = self.state.clone();
         let req = crate::terminal::AgentRespawnRequest {
             mode: req.mode.clone(),
@@ -1766,7 +1831,7 @@ mod tests {
         claim_ok: bool,
         complete_ok: bool,
         panic_next_recovering: bool,
-        respawn_result: Result<String, String>,
+        respawn_result: Result<RespawnOutcome, String>,
         recovering: Vec<(String, u32, u32)>,
         replaced: Vec<(String, String, u32)>,
         respawns: Vec<RespawnSpec>,
@@ -1810,7 +1875,10 @@ mod tests {
                     claim_ok: true,
                     complete_ok: true,
                     panic_next_recovering: false,
-                    respawn_result: Ok("t-new".into()),
+                    respawn_result: Ok(RespawnOutcome {
+                        terminal_id: "t-new".into(),
+                        identity: crate::terminal::RespawnedIdentity::Resumed,
+                    }),
                     recovering: Vec::new(),
                     replaced: Vec::new(),
                     respawns: Vec::new(),
@@ -1846,7 +1914,7 @@ mod tests {
         fn set_complete_ok(&self, v: bool) {
             self.lock().complete_ok = v;
         }
-        fn set_respawn_result(&self, v: Result<String, String>) {
+        fn set_respawn_result(&self, v: Result<RespawnOutcome, String>) {
             self.lock().respawn_result = v;
         }
         fn set_panic_next_recovering(&self, v: bool) {
@@ -1990,7 +2058,7 @@ mod tests {
         fn respawn(
             &self,
             req: &RespawnSpec,
-        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        ) -> impl std::future::Future<Output = Result<RespawnOutcome, String>> + Send {
             let result = {
                 let mut s = self.lock();
                 s.respawns.push(req.clone());
@@ -2407,6 +2475,56 @@ mod tests {
         assert_eq!(
             fake.settled_frames(),
             vec![("t1".to_string(), "lease_completion_lost".to_string(), None)]
+        );
+    }
+
+    /// Focused repair round 1, Major 1 — the hub side of the antigravity
+    /// recovery-path discipline: a respawn that reports
+    /// `RespawnedIdentity::FreshUnbound` (the resume gate refused the
+    /// recorded id and NO replacement id was minted at spawn time —
+    /// codex/opencode/antigravity) must have its claim RELEASED
+    /// (`fail_claim`), NEVER completed against the fresh terminal —
+    /// completing it would re-bind the STALE identity over an
+    /// identity-less fresh conversation (GC3's silent replacement). The
+    /// pane still comes back: `terminal.replaced` IS emitted (recovery
+    /// is not refused) and the breaker cycle still counts (the fresh
+    /// generation shares the createRequestId and must stay inside the
+    /// crash-loop bound). No settle: the replacement is a success.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_unbound_respawn_releases_the_claim_and_still_replaces() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_respawn_result(Ok(RespawnOutcome {
+            terminal_id: "t-new".into(),
+            identity: crate::terminal::RespawnedIdentity::FreshUnbound,
+        }));
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "antigravity", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert_eq!(
+            fake.fail_calls(),
+            vec!["cr-1".to_string()],
+            "the stale locator's claim is RELEASED"
+        );
+        assert!(
+            fake.complete_calls().is_empty(),
+            "the stale locator's claim must never be completed against the \
+             identity-less fresh terminal"
+        );
+        assert_eq!(
+            fake.replaced_calls(),
+            vec![("t1".to_string(), "t-new".to_string(), 1u32)],
+            "the pane still comes back — terminal.replaced IS emitted"
+        );
+        assert!(
+            fake.settled_reasons().is_empty(),
+            "no settle: recovery was not refused: {:?}",
+            fake.settled_reasons()
         );
     }
 

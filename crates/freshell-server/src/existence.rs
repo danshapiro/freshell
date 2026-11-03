@@ -493,15 +493,15 @@ impl SessionExistenceProbe for IndexExistenceProbe {
 
     /// Gate-caller variant (trait doc): `exists()` plus (a) the EXPENSIVE
     /// codex by-id rollout walk (~1s on a real store) on a warm-Absent
-    /// answer, and (b) the antigravity Present/Unknown disk validation
-    /// (see the gate block below — activated 2026-11-03). The expensive
-    /// work lives HERE and not in `exists()` because `exists()` is
-    /// consulted inline on the sync reconcile path, whose IO discipline is
-    /// ~250ms per consult (see `opencode_db_locator`); gate callers run this
-    /// variant inside `tokio::task::spawn_blocking` (A13: never inline on
-    /// the async runtime). AD-4 is preserved exactly: cold-index codex
-    /// answers `Unknown` from `exists()`, and the walk only runs on
-    /// `Absent`, so it still NEVER runs on the cold path.
+    /// answer, and (b) the antigravity Present/Unknown/ProviderUnavailable
+    /// disk validation (see the gate block below — activated 2026-11-03).
+    /// The expensive work lives HERE and not in `exists()` because
+    /// `exists()` is consulted inline on the sync reconcile path, whose IO
+    /// discipline is ~250ms per consult (see `opencode_db_locator`); gate
+    /// callers run this variant inside `tokio::task::spawn_blocking` (A13:
+    /// never inline on the async runtime). AD-4 is preserved exactly:
+    /// cold-index codex answers `Unknown` from `exists()`, and the walk
+    /// only runs on `Absent`, so it still NEVER runs on the cold path.
     fn exists_for_gate(&self, provider: &str, session_id: &str) -> SessionExistence {
         let base = self.exists(provider, session_id);
         // Antigravity gate validation (activated 2026-11-03 on real-binary
@@ -511,17 +511,25 @@ impl SessionExistenceProbe for IndexExistenceProbe {
         // evidence for the resume gate — the index can be stale for a
         // conversation deleted from disk, and the cold window precedes
         // every warm-up, while the CLI's documented missing-ID behavior
-        // silently starts a FRESH conversation (GC3 violation). Validate
-        // both against the same on-disk by-id walk the Absent arm uses:
-        // disk Present confirms (and feeds the observed set — module-doc
-        // invariant), disk Absent corrects to Absent (typed refusal), disk
-        // Unreadable defers as Unknown (G28 fail-open). Absent itself needs
-        // no re-check — the warm-Absent arm at exists() already
-        // disk-verified it.
+        // silently starts a FRESH conversation (GC3 violation). The SAME
+        // hole holds for ProviderUnavailable (GC3 hole #3, focused review
+        // round 1): a cold index over a MISSING store root answers it from
+        // the root-existence pre-check, and passing it through fails open
+        // (map_existence → Unknown → Proceed) straight into the CLI's
+        // silent fresh conversation. Validate all three against the same
+        // on-disk by-id walk the Absent arm uses: disk Present confirms
+        // (and feeds the observed set — module-doc invariant), disk Absent
+        // corrects to Absent (typed refusal — over a missing store root
+        // the locator's `File::open` gives NotFound, positive absence: the
+        // CLI never ran on this machine), disk Unreadable defers as
+        // Unknown (G28 fail-open). Absent itself needs no re-check — the
+        // warm-Absent arm at exists() already disk-verified it.
         if provider == "antigravity" {
             if let Some(locator) = &self.antigravity_transcript_locator {
                 match base {
-                    SessionExistence::Present | SessionExistence::Unknown => {
+                    SessionExistence::Present
+                    | SessionExistence::Unknown
+                    | SessionExistence::ProviderUnavailable => {
                         return match locator(session_id) {
                             ByIdAnswer::Present => {
                                 self.observed

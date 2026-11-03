@@ -609,10 +609,18 @@ fn seed_parseable_agy_conversation(home: &std::path::Path, id: &str) -> std::pat
 /// cold answer the deferrable `Unknown`, never `ProviderUnavailable`) and
 /// the PRODUCTION by-id locator chained over the same home.
 fn gate_probe_over(home: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionIndex>) {
+    gate_probe_over_store(home)
+}
+
+/// [`gate_probe_over`] over an arbitrary store root — including one that
+/// does NOT exist (the never-ran-host shape): `main.rs` wires the source,
+/// the provider root, and the by-id locator over the SAME home, so the
+/// missing-root test mirrors that construction exactly.
+fn gate_probe_over_store(store: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionIndex>) {
     let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
         vec![
             Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
-                home.to_path_buf(),
+                store.to_path_buf(),
             )) as Arc<dyn SessionSource>,
         ],
         Duration::from_millis(50),
@@ -622,9 +630,9 @@ fn gate_probe_over(home: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionI
         IndexExistenceProbe::new(
             Arc::clone(&index),
             None,
-            HashMap::from([("antigravity".to_string(), home.to_path_buf())]),
+            HashMap::from([("antigravity".to_string(), store.to_path_buf())]),
         )
-        .with_antigravity_transcript_locator(antigravity_transcript_locator(home.to_path_buf())),
+        .with_antigravity_transcript_locator(antigravity_transcript_locator(store.to_path_buf())),
         index,
     )
 }
@@ -707,4 +715,42 @@ fn antigravity_cold_index_present_id_resumes() {
         "cold Unknown + disk Present ⇒ Present — the restore resumes through the cold window"
     );
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GC3 hole #3 closure (focused review round 1, Major 2): a cold index
+/// over a MISSING antigravity store root answers `ProviderUnavailable`
+/// from `exists()` (the root-existence pre-check — a root that does not
+/// exist never warms), and the gate variant must NOT pass that through:
+/// `map_existence` would fold it to Unknown → Proceed, the stale id would
+/// reach `agy`, and the CLI's documented missing-ID behavior silently
+/// starts a fresh conversation. The intercept arm disk-validates
+/// `ProviderUnavailable` too: the production locator's `File::open` over
+/// a missing store root gives `NotFound` → `ByIdAnswer::Absent` →
+/// POSITIVE absence (the CLI never ran on this machine — the walk ran and
+/// answered; not a deferral), so the gate answers the typed refusal. A
+/// genuinely UNREADABLE store still defers as Unknown (G28 fail-open) —
+/// pinned by `antigravity_unreadable_store_answers_unknown`. Plain
+/// #[test] (no tokio runtime) so kick_refresh no-ops and the index
+/// deterministically stays cold.
+#[test]
+fn antigravity_cold_index_missing_store_root_gate_answers_absent_not_unavailable() {
+    let parent = rv_temp_dir("gate-missing-store-parent");
+    let gone = parent.join("no-antigravity-store-here"); // never created
+    let (probe, _index) = gate_probe_over_store(&gone);
+    let stale_id = "11111111-2222-3333-4444-555555555559";
+    // Precondition: the base probe answers ProviderUnavailable for the
+    // missing root (the every-boot cold window over a never-ran host) —
+    // the exact answer the intercept arm must not pass through.
+    assert_eq!(
+        probe.exists("antigravity", stale_id),
+        SessionExistence::ProviderUnavailable,
+        "precondition: cold index + missing store root ⇒ ProviderUnavailable from exists()"
+    );
+    assert_eq!(
+        probe.exists_for_gate("antigravity", stale_id),
+        SessionExistence::Absent,
+        "the gate variant disk-validates ProviderUnavailable: the missing store root is \
+         positive absence (the typed refusal), never Unknown → Proceed"
+    );
+    let _ = std::fs::remove_dir_all(&parent);
 }

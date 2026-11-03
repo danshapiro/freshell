@@ -7912,8 +7912,51 @@ pub enum RespawnError {
     Spawn(std::io::Error),
 }
 
+/// How a successful respawn's identity relates to the RECORDED session id
+/// the orchestrator holds the locator claim for — the auto-resume hub's
+/// claim disposition input (focused repair round 1, Major 1).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespawnedIdentity {
+    /// The respawn resumed the exact recorded session id (the gate passed
+    /// or failed open) — the hub COMPLETES the claimed lease against the
+    /// new terminal.
+    Resumed,
+    /// The resume gate refused the recorded id (positively absent on
+    /// disk) and MINTED a replacement id at spawn time — the
+    /// fresh-id-minting providers (claude/amplifier): the new terminal
+    /// carries the minted id in every identity home. AD-3 (accepted,
+    /// scoped to the minters): the hub still completes the RECORDED
+    /// locator's claim against the new terminal — a later create
+    /// carrying the stale ref then adopts the replacement pane via
+    /// `BoundElsewhere` without door 1's notice (convergent; the only
+    /// cost is the missing notice on a rare second-order path).
+    MintedReplacement,
+    /// The gate refused the recorded id and NO replacement id exists at
+    /// spawn time (codex/opencode/antigravity): the respawn launched an
+    /// identity-less FRESH conversation. Completing the recorded
+    /// locator's claim against it would re-bind the STALE identity over
+    /// a conversation it does not name — the silent replacement the
+    /// direct create path refuses with the typed SESSION_MISSING error
+    /// (GC3). The hub must RELEASE the claim instead; the pane has NO
+    /// saved identity and binds the conversation the CLI mints through
+    /// the provider's natural rebind (the antigravity association sweep;
+    /// README's binding paragraph).
+    FreshUnbound,
+}
+
+/// A successful respawn: the new terminal id plus its identity disposition.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct RespawnOutcome {
+    pub terminal_id: String,
+    pub identity: RespawnedIdentity,
+}
+
 /// Spawns a replacement agent terminal from a server-side identity.
-/// Returns the NEW terminal id. Does NOT guard/lease — the orchestrator does.
+/// Returns the NEW terminal id and its identity disposition
+/// ([`RespawnOutcome`]) — the orchestrator's claim input. Does NOT
+/// guard/lease — the orchestrator does.
 ///
 /// Mirrors `handle_create`'s CLI branch step-for-step — same call order, same
 /// error handling, same `spawn_blocking` boundaries — minus the
@@ -7928,7 +7971,7 @@ pub enum RespawnError {
 pub async fn respawn_agent_terminal(
     state: &WsState,
     req: &AgentRespawnRequest,
-) -> Result<String, RespawnError> {
+) -> Result<RespawnOutcome, RespawnError> {
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     // Headless respawn: no wire `shell` field — the system shell, exactly
@@ -7985,6 +8028,19 @@ pub async fn respawn_agent_terminal(
     };
     let launch_intent = outcome.launch_intent;
     let resume_session_id = outcome.resume_session_id;
+    // Identity disposition for the orchestrator's claim (RespawnedIdentity):
+    // no stale id ⇒ the recorded session resumed; stale id + minted
+    // replacement ⇒ the AD-3 minter shape; stale id + NO replacement ⇒ the
+    // identity-less fresh conversation whose claim the hub must RELEASE.
+    let respawned_identity = if outcome.stale_session_id.is_some() {
+        if resume_session_id.is_some() {
+            RespawnedIdentity::MintedReplacement
+        } else {
+            RespawnedIdentity::FreshUnbound
+        }
+    } else {
+        RespawnedIdentity::Resumed
+    };
     if let Some(stale) = outcome.stale_session_id.as_deref() {
         tracing::warn!(
             mode = %req.mode,
@@ -8006,16 +8062,31 @@ pub async fn respawn_agent_terminal(
         // with the notice as reason. Reason prose is presentational-only per
         // the protocol doc; the typed fields carry no data change here.
         //
-        // Deliberate decision AD-3 (accepted, documented — no behavior
-        // change): after this gate-fired respawn, the auto-resume hub's
-        // `complete_claim` keeps the STALE locator's lease bound to the FRESH
-        // terminal (auto_resume.rs → registry.complete_session_ref_claim). A
-        // later `terminal.create` carrying the stale ref then adopts the
-        // fresh terminal via `BoundElsewhere` WITHOUT door 1's notice. This
-        // is convergent (no loop, no duplicate pane, the user reaches the
-        // fresh terminal); the only cost is a missing notice on a rare
-        // second-order path. Releasing/rebinding the lease would mean new
-        // registry API surface for no user-visible gain.
+        // Deliberate decision AD-3 (accepted, scoped to the FRESH-ID-MINTING
+        // providers — claude/amplifier): after a gate-fired respawn that
+        // MINTED a replacement id, the auto-resume hub's `complete_claim`
+        // keeps the STALE locator's lease bound to the FRESH terminal
+        // (auto_resume.rs → registry.complete_session_ref_claim). A later
+        // `terminal.create` carrying the stale ref then adopts the fresh
+        // terminal via `BoundElsewhere` WITHOUT door 1's notice. For the
+        // minters this is convergent (the fresh terminal carries the minted
+        // replacement id in every identity home — no loop, no duplicate
+        // pane, the user reaches the replacement pane); the only cost is a
+        // missing notice on a rare second-order path.
+        //
+        // The no-mint providers (codex/opencode/antigravity — the gate
+        // refuses the recorded id and NO replacement id exists at spawn
+        // time) are OUTSIDE that accepted decision: the respawn reports
+        // `RespawnedIdentity::FreshUnbound` and the hub RELEASES the stale
+        // locator's claim (`fail_claim`), NEVER completing it against the
+        // fresh terminal. Completing it would re-bind the STALE identity
+        // over an identity-less fresh conversation — the silent replacement
+        // the direct create path refuses with the typed SESSION_MISSING
+        // error (GC3). The pane comes back with NO saved identity and binds
+        // the conversation the CLI mints on its next clean typed prompt
+        // (the documented natural rebind; README's binding paragraph). The
+        // Recovering frame broadcast above (naming the stale id) keeps the
+        // user informed.
         let msg =
             freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
                 recovery_summary: None,
@@ -8408,8 +8479,13 @@ pub async fn respawn_agent_terminal(
 
     // Identity record for the new terminal (provider/session_id/cwd) + the
     // durable ledger binding (fsync — blocking pool, pane_ledger.rs:363
-    // doctrine), riding the same record shape `handle_create` seeds. A
-    // respawn always has a session id, so the record is always `Some`.
+    // doctrine), riding the same record shape `handle_create` seeds. The
+    // record itself always exists, but its session id does NOT: a
+    // gate-fired fresh respawn of a no-mint provider
+    // (codex/opencode/antigravity) carries `resume_session_id == None`,
+    // so the identity upsert and the ledger binding below are SKIPPED —
+    // the pane has NO saved identity and the natural rebind binds the
+    // conversation the CLI mints on its next clean typed prompt.
     let create_meta_record = terminal_meta_record_for_create(
         &terminal_id,
         &mode,
@@ -8504,7 +8580,10 @@ pub async fn respawn_agent_terminal(
         &state.broadcast_tx,
         create_meta_record,
     );
-    Ok(terminal_id)
+    Ok(RespawnOutcome {
+        terminal_id,
+        identity: respawned_identity,
+    })
 }
 
 /// Rust port of `isValidClaudeSessionId` (`shared/session-contract.ts:34,44-46`;

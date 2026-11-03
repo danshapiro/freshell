@@ -91,6 +91,17 @@
 //! runs inside the disposable Docker sandbox
 //! (`scripts/sandbox-test.sh "cargo test -p freshell-ws --test antigravity_session_rebind"`),
 //! never bare on the host.
+//!
+//! Sibling test `antigravity_crash_respawn_with_deleted_conversation_\
+//! releases_the_stale_identity` (focused repair round 1, Major 1): the
+//! GC3 recovery-path discipline — a bound pane whose conversation is
+//! deleted from disk and then crashes still respawns (bare, identity-less,
+//! Recovering notice naming the stale id), the stale ledger row stays
+//! retired, the hub releases the stale locator's claim (a later restore
+//! create answers the typed SESSION_MISSING refusal, never an adoption),
+//! and the natural rebind binds the fresh conversation on the next clean
+//! typed prompt. It runs its own server with a disk-wired existence probe
+//! (the suite above runs the fail-open NoIndexProbe).
 
 mod common;
 
@@ -99,6 +110,8 @@ use std::time::Duration;
 
 use common::log_capture::{self, CapturedEvent};
 use common::next_frame_of_type;
+use freshell_ws::existence::{SessionExistence, SessionExistenceProbe};
+use freshell_ws::pane_ledger::{RetiredReason, RowState};
 use freshell_ws::WsState;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -225,9 +238,14 @@ async fn wait_transcript_steps(path: &std::path::Path, pred: impl Fn(&[i64]) -> 
 ///
 /// Prompt texts driven through this fake avoid JSON metacharacters (the
 /// fixture records are hand-serialized in sh).
-fn write_fake_agy() -> std::path::PathBuf {
+///
+/// `tag` makes the script path unique PER TEST (cargo runs this file's
+/// tests in parallel threads sharing one pid — a shared path would have
+/// one test's cleanup `remove_file` the script out from under the other's
+/// live panes).
+fn write_fake_agy(tag: &str) -> std::path::PathBuf {
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-antigravity-rebind-fake-{}.sh",
+        "freshell-antigravity-rebind-fake-{tag}-{}.sh",
         std::process::id()
     ));
     let script = r#"#!/bin/sh
@@ -442,6 +460,25 @@ async fn spawn_antigravity_server(
     home: &std::path::Path,
     ledger_dir: &std::path::Path,
 ) -> AntigravityServer {
+    spawn_antigravity_server_with_probe(
+        cli_commands,
+        home,
+        ledger_dir,
+        Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+    )
+    .await
+}
+
+/// [`spawn_antigravity_server`] with a caller-chosen existence probe —
+/// the disk-wired gate scenarios need a probe that answers the brain
+/// tree's real disk truth (the `resume_validation_gate.rs` harness
+/// shape) instead of the suite-wide fail-open `NoIndexProbe`.
+async fn spawn_antigravity_server_with_probe(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    home: &std::path::Path,
+    ledger_dir: &std::path::Path,
+    probe: Arc<dyn SessionExistenceProbe>,
+) -> AntigravityServer {
     let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings = Arc::new(
@@ -507,7 +544,7 @@ async fn spawn_antigravity_server(
         opencode_locator: None,
         codex_locator: None,
         activity: Some(activity_hub.clone()),
-        session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
@@ -655,6 +692,69 @@ async fn send_resume_create(
     ))
     .await
     .expect("send terminal.create (resume)");
+}
+
+/// Send the resume create and await its ANSWER — whichever shape arrives
+/// first, the `terminal.created` success or the correlated `error`
+/// refusal (the discriminating gate probe: an adoption-shaped success
+/// fails the caller's refusal assertions with the full frame in the
+/// panic message, never a bare timeout).
+async fn create_resume_await_answer(
+    ws: &mut common::TestWs,
+    cwd: &str,
+    request_id: &str,
+    session_id: &str,
+) -> serde_json::Value {
+    send_resume_create(ws, cwd, request_id, session_id).await;
+    let deadline = tokio::time::Instant::now() + common::FRAME_BUDGET;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let matches_request = value["requestId"] == request_id;
+                    if matches_request
+                        && (value["type"] == "terminal.created" || value["type"] == "error")
+                    {
+                        return value;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("ws ended/errored awaiting resume answer: {other:?}"),
+        }
+    }
+    panic!("no created/error answer for {request_id} within the frame budget");
+}
+
+/// A gate probe wired to the suite's brain tree — the production by-id
+/// walk's shape (`antigravity_transcript_on_disk`): exists+readable ⇒
+/// Present, any missing path component ⇒ Absent, anything else ⇒
+/// Unknown. `ever_observed_on_disk` answers true (antigravity's gate has
+/// no zero-turn carve-out — Absent is SpawnFresh either way).
+struct DiskWiredAntigravityProbe {
+    brain_root: std::path::PathBuf,
+}
+impl SessionExistenceProbe for DiskWiredAntigravityProbe {
+    fn exists(&self, _provider: &str, session_id: &str) -> SessionExistence {
+        match std::fs::File::open(
+            self.brain_root
+                .join(session_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+        ) {
+            Ok(_) => SessionExistence::Present,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => SessionExistence::Absent,
+            Err(_) => SessionExistence::Unknown,
+        }
+    }
+    fn ever_observed(&self, _: &str, _: &str) -> bool {
+        true
+    }
+    fn ever_observed_on_disk(&self, _: &str, _: &str) -> bool {
+        true
+    }
 }
 
 /// Type a prompt and submit it: the text chunk, then the Enter byte.
@@ -814,7 +914,7 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     let logs = log_capture::install();
     // The fake `agy` script (written once; both servers point at it, and
     // the cleanup block removes it — it must not outlive the suite).
-    let fake_agy = write_fake_agy();
+    let fake_agy = write_fake_agy("suite");
 
     let server = spawn_antigravity_server(
         vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
@@ -1559,5 +1659,207 @@ async fn antigravity_exact_live_identity_rebind_suite() {
     server2.registry.kill(&tid4b);
     let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&argv_capture_2);
+    let _ = std::fs::remove_file(&fake_agy);
+}
+
+/// GC3 recovery-path closure (focused review round 1, Major 1): a bound
+/// pane whose conversation is DELETED from disk and then crashes must
+/// still come back — recovery is not refused — but the STALE identity
+/// must not survive over the fresh conversation the respawn starts:
+/// the gate refuses the deleted id at the respawn door (the stale ledger
+/// row stays retired, the stale id never reaches a respawn argv, the
+/// Recovering notice names it), the hub RELEASES the stale locator's
+/// claim instead of completing it against the fresh terminal, so NO live
+/// registry claim/bind exists for the stale id — proven behaviorally by
+/// a later restore create carrying the stale id, which answers the typed
+/// SESSION_MISSING refusal exactly like the direct create door, NEVER
+/// the BoundElsewhere adoption of the identity-less fresh terminal (the
+/// silent replacement this test forbids). The pane has NO saved identity
+/// until its next clean typed prompt, when the natural rebind (README's
+/// binding paragraph) binds the FRESH conversation the CLI minted.
+#[tokio::test(flavor = "multi_thread")]
+async fn antigravity_crash_respawn_with_deleted_conversation_releases_the_stale_identity() {
+    let home = tempfile::tempdir().expect("antigravity home tempdir");
+    let cwd_dir = tempfile::tempdir().expect("pane cwd tempdir");
+    let ledger_dir = tempfile::tempdir().expect("pane ledger tempdir");
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+    let argv_capture = std::env::temp_dir().join(format!(
+        "freshell-antigravity-rebind-argv-stale-crash-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&argv_capture);
+    let fake_agy = write_fake_agy("stale-crash");
+
+    let probe = Arc::new(DiskWiredAntigravityProbe {
+        brain_root: home.path().join("brain"),
+    });
+    let server = spawn_antigravity_server_with_probe(
+        vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
+        home.path(),
+        ledger_dir.path(),
+        probe.clone(),
+    )
+    .await;
+    let mut ws = common::connect_and_capture_inventory(&server.url).await.0;
+
+    // 1. Bind a conversation the normal way: create, clean prompt, adopt.
+    let tid = create_pane(&mut ws, &cwd, "req-agy-stale-crash").await;
+    submit_prompt(&mut ws, &tid, "stale crash phase prompt november").await;
+    let adopted = next_associated_frame(&mut ws, &tid, "stale-crash-adopt").await;
+    let conv = conv_of(&tid);
+    assert_eq!(
+        adopted["sessionRef"]["sessionId"], conv,
+        "the pane adopts its own conversation first: {adopted}"
+    );
+    assert!(
+        server
+            .state
+            .pane_ledger
+            .lookup_by_session("antigravity", &conv)
+            .is_some_and(|r| r.row.live_terminal_id.as_deref() == Some(tid.as_str())),
+        "the durable binding row names the live pane"
+    );
+
+    // 2. The conversation is deleted from disk (the data-loss shape) —
+    //    the disk-wired gate probe now answers positive absence for it.
+    std::fs::remove_dir_all(home.path().join("brain").join(&conv))
+        .expect("delete the conversation directory");
+    assert_eq!(
+        probe.exists("antigravity", &conv),
+        SessionExistence::Absent,
+        "precondition: the deleted conversation is positively absent on disk"
+    );
+
+    // 3. The pane crashes (spontaneous exit 1) on a second connection.
+    let mut ws2 = common::connect_and_capture_inventory(&server.url).await.0;
+    common::send_input(&mut ws2, &tid, "/crash").await;
+    common::send_input(&mut ws2, &tid, "\r").await;
+
+    // 4. Recovery is NOT refused: the pane comes back — the replaced
+    //    frame names the new terminal.
+    let replaced = next_frame_of_type(&mut ws, "terminal.replaced").await;
+    assert_eq!(replaced["oldTerminalId"], tid.as_str(), "{replaced}");
+    let new_tid = replaced["newTerminalId"]
+        .as_str()
+        .expect("new terminal id")
+        .to_string();
+
+    // 5. The Recovering notice naming the stale id was broadcast (the
+    //    respawn's gate block) — the user is informed, on the record.
+    assert!(
+        frame_seen_within(&mut ws2, Duration::from_secs(10), |v| {
+            v["type"] == "terminal.status"
+                && v["status"] == "recovering"
+                && v["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains(conv.as_str()))
+        })
+        .await,
+        "the respawn's Recovering frame must name the refused stale id"
+    );
+
+    // 6. The stale id never reached a respawn argv (the gate refused it):
+    //    the original spawn plus the bare respawn — two rows, neither
+    //    carrying the deleted conversation pair.
+    let rows = wait_argv_rows(&argv_capture, |rows| rows.len() >= 2).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "exactly the original spawn + the respawn: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| conversation_pair_position(r, &conv).is_none()),
+        "the deleted conversation id must never reach a respawn argv: {rows:?}"
+    );
+
+    // 7. The new terminal is IDENTITY-LESS: no resume id, no identity
+    //    row — the pane has no saved identity for the stale conversation.
+    assert_eq!(
+        registry_resume_id(&server.registry, &new_tid),
+        None,
+        "the respawned pane carries no resume id"
+    );
+    assert!(
+        server.state.identity.session_ref_for(&new_tid).is_none(),
+        "the respawned pane seeds no identity row"
+    );
+
+    // 8. The stale ledger row stays retired SessionMissing — the respawn
+    //    gate retired it and nothing re-minted it.
+    let stale_row = server
+        .state
+        .pane_ledger
+        .load_binding("antigravity", &conv)
+        .expect("stale row still exists (retired, not deleted)");
+    assert_eq!(stale_row.state, RowState::Retired);
+    assert_eq!(
+        stale_row.retired_reason,
+        Some(RetiredReason::SessionMissing)
+    );
+
+    // 9. NO live registry claim/bind for the stale id — the behavioral
+    //    proof: a negotiated (paneReconcileV1) restore create carrying the
+    //    stale id answers the typed SESSION_MISSING refusal exactly like
+    //    the direct create door. A surviving session-ref binding would
+    //    instead ADOPT the fresh terminal via BoundElsewhere
+    //    (terminal.created naming the identity-less replacement) — the
+    //    silent replacement over a fresh conversation this test forbids.
+    //    (The claim runs only for negotiated connections —
+    //    terminal.rs's pane_reconcile_v1 gate — so the probe MUST
+    //    negotiate, or the binding would be invisible to it.)
+    let (mut ws_v1, _inv) = common::connect_with_hello(
+        &server.url,
+        serde_json::json!({
+            "type": "hello",
+            "token": common::AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities": { "paneReconcileV1": true },
+        }),
+    )
+    .await;
+    let answer =
+        create_resume_await_answer(&mut ws_v1, &cwd, "req-agy-stale-crash-refuse", &conv).await;
+    assert_eq!(
+        answer["type"], "error",
+        "the stale id must answer the typed refusal, never an adoption: {answer}"
+    );
+    assert_eq!(answer["code"], "SESSION_MISSING", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(conv.as_str()),
+        "the refusal names the stale id: {answer}"
+    );
+
+    // 10. The natural rebind: the pane's next clean typed prompt lands in
+    //     the CLI's FRESH conversation and the locator binds it — the
+    //     documented path by which the identity-less pane regains an
+    //     identity, never the stale id.
+    submit_prompt(
+        &mut ws,
+        &new_tid,
+        "fresh conversation after the stale crash oscar",
+    )
+    .await;
+    let rebound = next_associated_frame(&mut ws, &new_tid, "stale-crash-fresh-rebind").await;
+    let fresh_conv = conv_of(&new_tid);
+    assert_ne!(fresh_conv, conv);
+    assert_eq!(
+        rebound["sessionRef"]["sessionId"], fresh_conv,
+        "the natural rebind binds the CLI's fresh conversation: {rebound}"
+    );
+    assert!(
+        server
+            .state
+            .identity
+            .session_ref_for(&new_tid)
+            .is_some_and(|r| r.provider == "antigravity" && r.session_id == fresh_conv),
+        "the identity row follows the natural rebind"
+    );
+
+    server.registry.kill(&new_tid);
+    let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&fake_agy);
 }
