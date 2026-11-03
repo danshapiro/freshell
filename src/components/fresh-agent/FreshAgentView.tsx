@@ -3558,10 +3558,36 @@ export function FreshAgentView({
               : { text: 'Message accepted. Your restored draft was kept.', level: 'info', prominent: true, ...currentScope })
           }
           const outgoing = outgoingTurnRef.current
-          if ((!echo || echo.requestId === message.requestId) && outgoing?.requestId === message.requestId) {
+          const echoSlotAvailable = (!echo || echo.requestId === message.requestId)
+            && (!current.pendingLocalEcho || current.pendingLocalEcho.requestId === message.requestId)
+          if (echoSlotAvailable && outgoing?.requestId === message.requestId) {
             setLocalEcho({ requestId: outgoing.requestId, text: outgoing.text,
               previousTurnKeys: outgoing.previousTurns.map(getTurnKey),
               ...(submittedTurnId ? { submittedTurnId } : {}) })
+          } else if (echoSlotAvailable && !outgoing && pending.text
+            && localEchoSendBoundaryRef.current?.requestId === message.requestId) {
+            // A busy-to-idle transition can retire the outgoing ref before a
+            // delayed receipt. Recover this request's echo from its retained
+            // text and original boundary unless the transcript has landed.
+            const boundary = localEchoSendBoundaryRef.current.turnKeys
+            const recoveredEcho = { requestId: message.requestId, text: pending.text,
+              previousTurnKeys: [...boundary], ...(submittedTurnId ? { submittedTurnId } : {}) }
+            const snapshot = snapshotRef.current
+            const snapshotIdentity = snapshot ? getSnapshotIdentity(snapshot) : null
+            const sameSnapshotConversation = snapshotIdentity && (
+              snapshotIdentity === originalPending?.sourceSessionKey
+              || snapshotIdentity === currentScope.sourceSessionKey
+              || snapshotIdentity === currentScope.sourceCanonicalSessionKey
+            )
+            const projection = currentScope.sourceSessionKey
+              ? appStore.getState().freshAgentLive?.bySession[currentScope.sourceSessionKey]?.projection
+              : undefined
+            const turns = snapshot && sameSnapshotConversation
+              ? mergeFreshAgentTranscriptProjection(snapshot, projection)
+              : projection?.turns ?? []
+            if (!localEchoLanded(turns, recoveredEcho, pending, {
+              allowTextMatch: true, previousTurnKeys: new Set(boundary),
+            })) setLocalEcho(recoveredEcho)
           }
         }
         if (pending?.asyncQuestionKeys?.length) setAsyncQuestionStatuses((previous) => ({ ...previous, ...Object.fromEntries(pending.asyncQuestionKeys!.map((key) => [key, 'accepted' as const])) }))
@@ -3582,7 +3608,8 @@ export function FreshAgentView({
           if (outgoingTurnRef.current?.requestId === message.requestId) {
             outgoingTurnRef.current.submittedTurnId = submittedTurnId
           }
-          if (echo?.requestId === message.requestId) {
+          if (echo?.requestId === message.requestId
+            && (!current.pendingLocalEcho || current.pendingLocalEcho.requestId === message.requestId)) {
             setLocalEcho({ ...echo, submittedTurnId })
           }
         } else {
