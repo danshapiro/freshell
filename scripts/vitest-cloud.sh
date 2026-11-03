@@ -559,6 +559,9 @@ cmd_run() {
   local execute_exit=0
   # Use ^@^ delimiter for --update-env-vars to handle commas in JSON arrays.
   local env_overrides="^@^TEST_MODE=vitest@VITEST_CONFIGS=${configs}@VITEST_ARGS_JSON=${vitest_args_json}"
+  if [[ "${FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT:-}" == "1" ]]; then
+    env_overrides="${env_overrides}@FRESHELL_CODEX_CONTRACT_CAPTURE_STDOUT=1"
+  fi
   execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" \
     --tasks="$shards" \
     --task-timeout="$timeout" \
