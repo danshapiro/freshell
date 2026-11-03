@@ -2560,6 +2560,68 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
+    it('does not resurrect a landed echo when uncertainty and acceptance arrive in the same batch', async () => {
+      const store = createStore()
+      const sessionId = 'ses_landed_batched_receipts'
+      const prompt = 'The prompt already saved before both receipts'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'landed-batched-receipts', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'opencode' as const, sessionId }, status: 'idle' as const,
+      }
+      const snapshot = (landed: boolean) => ({
+        status: landed ? 'running' : 'idle', threadId: sessionId,
+        sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
+        turns: landed ? [{ id: 'landed-batched-turn', turnId: 'landed-batched-turn', role: 'user',
+          items: [{ id: 'landed-batched-text', kind: 'text', text: prompt }] }] : [],
+        extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+      })
+      const landedRead = createDeferred<ReturnType<typeof snapshot>>()
+      let holdRead = false
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        if (holdRead) {
+          heldReadStarted = true
+          return landedRead.promise
+        }
+        return snapshot(false)
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho?.requestId).toBe(sent!.requestId)
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+
+      holdRead = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      await act(async () => {
+        landedRead.resolve(snapshot(true))
+        for (let step = 0; step < 30 && getFreshAgentPaneContent(store).pendingLocalEcho; step++) {
+          await Promise.resolve()
+        }
+        expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+        listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+          message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' })
+        listener({ type: 'freshAgent.send.accepted', sessionId,
+          sessionType: content.sessionType, provider: content.provider,
+          requestId: sent!.requestId, submittedTurnId: 'landed-batched-turn' })
+      })
+
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      const rows = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(rows).toHaveLength(1)
+      expect(within(rows[0]).getByText(prompt)).toBeVisible()
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      expect(composer).toHaveValue(prompt)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
     it('clears a send refusal when the pane switches to another conversation', async () => {
       const store = createStore()
       const first = {
