@@ -2564,23 +2564,16 @@ impl Supervisor {
             Err(error @ RegistryError::UnknownSoul(_)) => {
                 let blocked = self
                     .registry
-                    .blocked_unadmitted_input_reason(soul_id.clone(), request_id.clone())
+                    .refuse_blocked_unadmitted_input(
+                        soul_id.clone(),
+                        request_id.clone(),
+                        text.as_bytes(),
+                        &settings_correlation,
+                    )
                     .await
                     .map_err(map_registry)?;
-                if let Some(reason) = blocked {
-                    let message = match reason.filter(|reason| !reason.is_empty()) {
-                        Some(reason) => format!(
-                            "The hosted session is blocked during recovery ({reason}); this message was not sent."
-                        ),
-                        None => "The hosted session is blocked during recovery; this message was not sent.".into(),
-                    };
-                    return Err(fresh_send_refusal_error(
-                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
-                            outcome:
-                                freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
-                            message: Some(message),
-                        },
-                    ));
+                if let Some(diagnostic) = blocked {
+                    return Err(fresh_send_refusal_error(diagnostic));
                 }
                 return Err(map_registry(error));
             }

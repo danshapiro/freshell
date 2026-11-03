@@ -1967,7 +1967,7 @@ impl Registry {
                         tx.commit()?;
                         return Ok((InputJournalDisposition::Ambiguous, recorded_incarnation));
                     }
-                    "refused" => {
+                    "refused" | "refused_before_admission" => {
                         let diagnostic = parse_fresh_input_refusal(refusal)?;
                         tx.commit()?;
                         return Ok((InputJournalDisposition::Refused(diagnostic), recorded_incarnation));
@@ -2043,7 +2043,7 @@ impl Registry {
             match state.as_str() {
                 "completed" => Ok(Some(InputJournalDisposition::Completed)),
                 "dispatching" | "ambiguous" => Ok(Some(InputJournalDisposition::Ambiguous)),
-                "refused" => Ok(Some(InputJournalDisposition::Refused(parse_fresh_input_refusal(refusal)?))),
+                "refused" | "refused_before_admission" => Ok(Some(InputJournalDisposition::Refused(parse_fresh_input_refusal(refusal)?))),
                 "queued" => Ok(None),
                 _ => Err(RegistryError::Integrity(format!("unknown input command state {state}"))),
             }
@@ -2051,21 +2051,48 @@ impl Registry {
         .await
     }
 
-    /// The outer option identifies a blocked soul with no journal entry for
-    /// this request. The inner option is its available recovery reason.
-    pub(crate) async fn blocked_unadmitted_input_reason(
+    /// Record a refusal only when the blocked soul has no prior input for
+    /// this request. The refusal is never queued or counted as admitted work.
+    pub(crate) async fn refuse_blocked_unadmitted_input(
         &self,
         soul_id: SoulId,
         request_id: RequestId,
-    ) -> Result<Option<Option<String>>, RegistryError> {
-        self.run_blocking(move |conn| {
-            conn.query_row(
+        data: &[u8],
+        correlation: &[u8],
+    ) -> Result<Option<freshell_runtime_protocol::FreshAgentSendDiagnostic>, RegistryError> {
+        let payload_digest = input_payload_digest(data, Some(correlation));
+        let protected_payload = data.to_vec();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let reason: Option<Option<String>> = tx.query_row(
                 "SELECT s.recovery_reason FROM souls s WHERE s.soul_id=?1 AND s.desired_state='running' AND s.recovery_state='blocked' AND NOT EXISTS (SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id AND c.request_id=?2)",
                 params![soul_id.as_str(), request_id.as_str()],
                 |row| row.get(0),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+            let Some(reason) = reason else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let incarnation = load_recovery_prior_incarnation(&tx, &soul_id, false)?;
+            let message = match reason.filter(|reason| !reason.is_empty()) {
+                Some(reason) => format!(
+                    "The hosted session is blocked during recovery ({reason}); this message was not sent."
+                ),
+                None => "The hosted session is blocked during recovery; this message was not sent.".into(),
+            };
+            let diagnostic = freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                message: Some(message),
+            };
+            let encoded = serde_json::to_string(&diagnostic)?;
+            let now = now_millis();
+            tx.execute(
+                "INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,fresh_agent_send_refusal,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'refused_before_admission',?6,?7,?7)",
+                params![soul_id.as_str(), request_id.as_str(), payload_digest, protected_payload, incarnation.as_str(), encoded, now],
+            )?;
+            tx.commit()?;
+            Ok(Some(diagnostic))
         })
         .await
     }
@@ -6625,7 +6652,7 @@ fn load_recovery_context(
     let prior_handle = load_owned_handle(conn, installation, &incarnation_id)?;
     let (accepted_command_count, completed_command_count, dispatched_count): (u64, u64, u64) =
         conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN state='completed' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state IN ('dispatching','completed','ambiguous') THEN 1 ELSE 0 END),0) FROM input_commands WHERE soul_id=?1",
+            "SELECT COALESCE(SUM(CASE WHEN state!='refused_before_admission' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state='completed' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN state IN ('dispatching','completed','ambiguous') THEN 1 ELSE 0 END),0) FROM input_commands WHERE soul_id=?1",
             params![soul_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
