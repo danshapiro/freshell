@@ -55,15 +55,9 @@
 //! read or the 2 s tick adopts the change; the tick's full read queues for
 //! the local turn like every transaction.
 //!
-//! Task 2 constructs this store in `main.rs`; Tasks 3–4 consume
-//! [`SessionNames::try_background_guard`] for the serial worker.
+//! `main.rs` constructs this store; the serial native/generation worker uses
+//! [`SessionNames::try_background_guard`] to coordinate background work.
 
-// Unified agent names Task 2: the store is constructed and wired in `main`
-// (routes/sinks/tick/publisher), so no module-level dead-code allow remains.
-// The Tasks 3–4 seams below (`offer`'s automatic-name path, the generation
-// series, the background worker guard) carry item-level allows until their
-// wiring tasks land.
-//
 // `NameError::Conflict` deliberately carries the accepted record so route
 // callers can answer a CAS conflict with the current winner instead of an
 // invisible overwrite — the large Err payload is the design (same rationale
@@ -527,8 +521,8 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The data-dir-keyed test clock offset ([`TestHook::ClockOffsetMs`]) — the
-/// store's internal clock injection for the generation retry arithmetic.
+/// The data-dir-keyed test clock offset ([`TestHook::ClockOffsetMs`]), added
+/// to wall-clock time or a test's frozen base time for retry arithmetic.
 fn clock_offset_ms(data_dir: &Path) -> i64 {
     #[cfg(test)]
     {
@@ -547,8 +541,15 @@ fn clock_offset_ms(data_dir: &Path) -> i64 {
 }
 
 /// The store's decision clock for `data_dir`: wall-clock now plus the
-/// data-dir-keyed test offset.
+/// data-dir-keyed test offset. Tests can freeze the base time as well, so
+/// arbitrary host delays cannot cross an eligibility boundary.
 fn effective_now_ms(data_dir: &Path) -> i64 {
+    #[cfg(test)]
+    if let Some(TestHook::FrozenClockMs(now)) =
+        take_matching_hook(data_dir, |hook| matches!(hook, TestHook::FrozenClockMs(_)))
+    {
+        return now + clock_offset_ms(data_dir);
+    }
     now_ms() + clock_offset_ms(data_dir)
 }
 
@@ -610,10 +611,6 @@ impl PublishSpec {
 /// Context handed to every decision closure.
 struct TxnMeta {
     now_ms: i64,
-    /// The data-dir-keyed native retry-floor override
-    /// ([`TestHook::NativeRetryFloorMs`]); always `None` in production (the
-    /// helper is test-only).
-    native_retry_floor: Option<i64>,
     /// Name-reliability Task 4: the store's staged native baselines (read
     /// as if persisted; written by the decisions that only stage).
     staged_baselines: Arc<StagedNativeBaselines>,
@@ -688,13 +685,11 @@ pub struct SessionNames {
     core: Arc<NamesCore>,
 }
 
-/// Ownership of the `.session-names-worker.lock` sidecar (Tasks 3–4): one
+/// Ownership of the `.session-names-worker.lock` sidecar: one
 /// actual ready background operation across cooperating same-home processes
 /// holds it. Acquire worker THEN document, never the reverse. The guard
 /// never acquires the document lock, cannot be cloned, and is never
 /// released through a detached timeout — it lives until its owner drops it.
-// Tasks 3–4 seam: no caller until the background worker lands.
-#[allow(dead_code)]
 pub(crate) struct BackgroundGuard {
     _lock: HeldSidecarLock,
 }
@@ -798,10 +793,8 @@ impl SessionNames {
         self.core.tx.subscribe()
     }
 
-    /// Try to take the background worker lock (Tasks 3–4). `Ok(None)` means
+    /// Try to take the background worker lock. `Ok(None)` means
     /// another cooperating process holds it; lock failures are errors.
-    // Tasks 3–4 seam: no caller until the background worker lands.
-    #[allow(dead_code)]
     pub(crate) fn try_background_guard(&self) -> Result<Option<BackgroundGuard>, NameError> {
         let file = open_lock_file(&self.core.worker_lock_path)?;
         match file.try_lock() {
@@ -818,11 +811,9 @@ impl SessionNames {
         }
     }
 
-    /// Internal automatic/migration offer seam: arbitrary callers cannot
-    /// reach this through HTTP (routes land in Task 2 and never accept
-    /// `freshell_ai`/`legacy_protected` from clients).
-    // Tasks 3–4 seam: the automatic-name pipeline (first-message/AI offers)
-    // is the next wiring task.
+    /// Internal automatic/migration offer helper: HTTP routes never accept
+    /// `freshell_ai`/`legacy_protected` from clients.
+    // Kept for store contract tests; production generators use claim/fold.
     #[allow(dead_code)]
     pub(crate) fn offer(
         &self,
@@ -929,8 +920,6 @@ impl SessionNames {
     /// `Ok(None)` = the series is not claimable right now (absent, not yet
     /// due, already in flight, exhausted, or the record's accepted source
     /// is protected) — nothing was consumed.
-    // Tasks 3–4 seam: the generation worker lands next.
-    #[allow(dead_code)]
     pub(crate) fn claim_generation_start(
         &self,
         target: SessionNameRef,
@@ -952,8 +941,6 @@ impl SessionNames {
     /// 2) without consuming another start, or exhaust the series at the
     /// cap; capability and quota outcomes refund the start
     /// (name-reliability Task 6).
-    // Tasks 3–4 seam: the generation worker lands next.
-    #[allow(dead_code)]
     pub(crate) fn fold_generation_outcome(
         &self,
         target: SessionNameRef,
@@ -1865,7 +1852,6 @@ where
 
     let meta = TxnMeta {
         now_ms: effective_now_ms(&core.data_dir),
-        native_retry_floor: take_native_retry_floor(&core.data_dir),
         staged_baselines: Arc::clone(&core.staged_baselines),
         input_refusals: InputRefusals::default(),
     };
@@ -2248,16 +2234,15 @@ pub(crate) enum TestHook {
     /// `HoldLock`, and gives up after [`HELD_LOCK_RELEASE_BOUND`] so a test
     /// that never releases cannot wedge the lane.
     HoldLockUntilReleased,
-    /// Task 3: override the native cycle retry floors (both delays) for the
-    /// data dir — the bounded-allowance tests pin exhaustion without
-    /// wall-clock waits. Persists until cleared (like the failure injections).
-    NativeRetryFloorMs(i64),
-    /// Task 4: a persistent wall-clock OFFSET for the data dir — the store's
-    /// decision clock (`TxnMeta::now_ms` and the generation due-reads)
-    /// reports `system_now + offset`, so clock-controlled tests pin the
-    /// retry-schedule arithmetic (immediately ready / +30s / +5min) and
-    /// advance virtual time without sleeping. Data-dir-keyed like every
-    /// other hook, so parallel tests never cross-contaminate.
+    /// Freeze the decision clock's base time for this data dir. Persists
+    /// until cleared, so store transactions and due snapshots see exactly
+    /// the same instant regardless of host scheduling or filesystem delays.
+    /// `ClockOffsetMs`, when present, is added to this frozen base.
+    FrozenClockMs(i64),
+    /// A persistent clock offset for this data dir. The decision clock
+    /// (`TxnMeta::now_ms` and the due snapshots) reports `system_now + offset`
+    /// unless `FrozenClockMs` supplies the base time. Tests can advance retry
+    /// eligibility without sleeping; other data dirs are unaffected.
     ClockOffsetMs(i64),
     /// Name-reliability Task 11: shorten (or lengthen) the stamp peek's
     /// periodic full-check interval for the data dir. Persists until
@@ -2413,24 +2398,6 @@ fn test_fail_reconcile(data_dir: &Path) -> bool {
     {
         let _ = data_dir;
         false
-    }
-}
-
-/// The data-dir-keyed native retry-floor override (Task 3 tests only).
-fn take_native_retry_floor(data_dir: &Path) -> Option<i64> {
-    #[cfg(test)]
-    {
-        take_matching_hook(data_dir, |h| matches!(h, TestHook::NativeRetryFloorMs(_))).and_then(
-            |hook| match hook {
-                TestHook::NativeRetryFloorMs(ms) => Some(ms),
-                _ => None,
-            },
-        )
-    }
-    #[cfg(not(test))]
-    {
-        let _ = data_dir;
-        None
     }
 }
 
@@ -3909,13 +3876,9 @@ fn native_route_of(document: &StoredDocument, key: &str) -> Option<(NativeLocati
 /// The retry delay that makes the next remaining cycle eligible after the
 /// cycle-1/cycle-2 failure ("minimum five seconds after cycle 1 failure, then
 /// 30 seconds after cycle 2 failure"). These are eligibility delays, not
-/// queue latency guarantees. Tests override the floor through the data-dir
-/// keyed [`TestHook::NativeRetryFloorMs`] so the bounded-allowance math is
-/// pinnable without wall-clock waits.
-fn native_retry_delay_ms(meta: &TxnMeta, cycles_consumed: u32) -> Option<i64> {
-    if let Some(floor) = meta.native_retry_floor {
-        return (cycles_consumed < MAX_NATIVE_CYCLES).then_some(floor);
-    }
+/// queue latency guarantees. Clock-controlled tests exercise these same
+/// floors without wall-clock waits.
+fn native_retry_delay_ms(cycles_consumed: u32) -> Option<i64> {
     match cycles_consumed {
         1 => Some(NATIVE_CYCLE_RETRY_1_MS),
         2 => Some(NATIVE_CYCLE_RETRY_2_MS),
@@ -4111,13 +4074,12 @@ fn fold_native_outcome_decision(
         now: i64,
         exhausted: bool,
         cycles_consumed: u32,
-        meta: &TxnMeta,
     ) {
         if exhausted {
             // Exhaustion is FINAL for this revision.
             state.settled = true;
             state.next_due = None;
-        } else if let Some(delay) = native_retry_delay_ms(meta, cycles_consumed) {
+        } else if let Some(delay) = native_retry_delay_ms(cycles_consumed) {
             state.next_due = Some(now + delay);
         }
     }
@@ -4160,7 +4122,7 @@ fn fold_native_outcome_decision(
                 } else {
                     "divergent native title at the attempted location".to_string()
                 });
-                schedule_native_retry(state, now, exhausted, cycles_consumed, meta);
+                schedule_native_retry(state, now, exhausted, cycles_consumed);
             }
         }
         NativeOutcomeFold::WriteAcknowledged { receipt } => {
@@ -4174,13 +4136,13 @@ fn fold_native_outcome_decision(
         NativeOutcomeFold::Undelivered { reason } => {
             state.status = NativeSyncStatus::Unsynced;
             state.unsynced_reason = Some(reason);
-            schedule_native_retry(state, now, exhausted, cycles_consumed, meta);
+            schedule_native_retry(state, now, exhausted, cycles_consumed);
         }
         NativeOutcomeFold::Ambiguous { reason } => {
             state.ambiguous = true;
             state.status = NativeSyncStatus::Unsynced;
             state.unsynced_reason = Some(reason);
-            schedule_native_retry(state, now, exhausted, cycles_consumed, meta);
+            schedule_native_retry(state, now, exhausted, cycles_consumed);
         }
         NativeOutcomeFold::Unsupported { reason } => {
             state.status = NativeSyncStatus::Unsupported;

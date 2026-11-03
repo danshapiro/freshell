@@ -29,6 +29,94 @@ await import(${JSON.stringify(source)})
   await fs.chmod(file, 0o755)
 }
 
+for (const lifecycleFirst of [false, true]) test(`Freshcodex keeps the provider failure visible live and after reload${lifecycleFirst ? ' when status arrives first' : ''}`, async ({ browser }) => {
+  test.setTimeout(180_000)
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshcodex-error-'))
+  const wrapper = path.join(root, 'codex.mjs')
+  const providerMessage = 'Selected model is at capacity. Please try a different model.'
+  await installNativeWrapper(wrapper)
+  const server = new RustServer({ env: {
+    CODEX_CMD: wrapper,
+    FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+    FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+      recordTurns: true,
+      terminalItemsView: 'notLoaded',
+      turnFailure: { message: providerMessage, codexErrorInfo: 'serverOverloaded' },
+      failureLifecycleFirst: lifecycleFirst,
+    }),
+  }, setupHome: async (home) => {
+    await fs.mkdir(path.join(home, '.freshell'), { recursive: true })
+    await fs.writeFile(path.join(home, '.freshell/config.json'), JSON.stringify({ version: 1, settings: {
+      freshAgent: { enabled: true }, codingCli: { enabledProviders: ['codex'] },
+    } }))
+  } })
+  let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
+  let releaseHistory = () => {}
+  try {
+    const info = await server.start()
+    const owned = await createFreshE2ePage(browser, info)
+    context = owned.context
+    const page = owned.page
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve })
+    let holdHistory = false
+    let heldHistoryReads = 0
+    // Install the gate before opening the pane, so a request already in
+    // flight when the turn starts cannot supply the failure to the browser.
+    await page.route('**/api/fresh-agent/threads/**', async (route) => {
+      try {
+        const response = await route.fetch()
+        if (holdHistory) {
+          heldHistoryReads += 1
+          await historyGate
+        }
+        await route.fulfill({ response })
+      } catch {
+        // The page may close while an intentionally held request is pending.
+      }
+    })
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'connection/setAvailableClis', payload: { claude: false, codex: true } }))
+    const picker = await openPanePicker(page)
+    await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+    const directory = page.getByRole('combobox', { name: 'Starting directory for Freshcodex' })
+    await directory.fill(root)
+    await directory.press('Enter')
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled({ timeout: 30_000 })
+
+    // A failed completion must render before a history refresh can supply it.
+    holdHistory = true
+    await composer.fill('Continue this conversation')
+    await composer.press('Enter')
+    const error = pane.getByTestId('fresh-agent-turn-error')
+    await expect(error).toBeVisible({ timeout: 30_000 })
+    await expect.poll(() => heldHistoryReads, { timeout: 30_000 }).toBeGreaterThan(0)
+    await expect(error).toContainText(providerMessage)
+    await expect(pane.getByText('Codex completed this turn without recording an assistant response.')).toHaveCount(0)
+    await page.waitForTimeout(6_200)
+    await expect(error).toContainText(providerMessage)
+
+    holdHistory = false
+    releaseHistory()
+    await page.unroute('**/api/fresh-agent/threads/**')
+    await page.reload()
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    await expect(error).toBeVisible({ timeout: 30_000 })
+    await expect(error).toContainText(providerMessage)
+    await expect(pane.getByText('Codex completed this turn without recording an assistant response.')).toHaveCount(0)
+  } finally {
+    releaseHistory()
+    await context?.close().catch(() => {})
+    await server.stop()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 for (const terminalItemsView of ['summary', 'notLoaded']) test(`Freshcodex shows native text and command progress before ${terminalItemsView} completion, isolates hidden panes, then restores one saved answer`, async ({ browser }) => {
   test.setTimeout(180_000)
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshcodex-live-'))
@@ -444,11 +532,26 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
     await composer.fill(prompt)
     await composer.press('Enter')
     const firstTurn = pane.locator('[data-turn-role="user"]', { hasText: prompt })
+    const tabId = await harness.getActiveTabId()
+    const paneId = await pane.getAttribute('data-pane-id')
+    expect(tabId).toBeTruthy()
+    expect(paneId).toBeTruthy()
+    let checkpointOutcomes: any[] = []
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabId!)
+      const findPane = (node: any): any => node?.type === 'leaf'
+        ? (node.id === paneId ? node : undefined)
+        : node?.children?.map(findPane).find(Boolean)
+      checkpointOutcomes = findPane(layout)?.content?.checkpointOutcomes ?? []
+      return checkpointOutcomes.length
+    }, { timeout: 30_000, message: 'the first accepted turn has a settled checkpoint outcome' }).toBe(1)
+    expect(checkpointOutcomes[0].status, JSON.stringify(checkpointOutcomes)).toBe('available')
+    await expect(pane.getByText('Fixture turn', { exact: true })).toHaveCount(1, { timeout: 30_000 })
+    // Require the settled checkpoint's rewind action to be usable.
     await firstTurn.hover()
-    const rewind = firstTurn.getByRole('button', { name: 'Rewind code to here' })
+    const rewind = firstTurn.getByRole('button', { name: 'Rewind code to here', exact: true })
     await expect(rewind).toBeVisible({ timeout: 30_000 })
     await expect(rewind).toBeEnabled({ timeout: 30_000 })
-    await expect(pane.getByText('Fixture turn', { exact: true })).toHaveCount(1, { timeout: 30_000 })
     const command = "pwd; printf 'after command\\n' > state.txt; printf command-output-canary"
     const executed = page.waitForResponse(response => response.url().includes('/api/fresh-agent/exec') && response.request().method() === 'POST')
     await composer.fill(`!${command}`)
@@ -465,6 +568,13 @@ test('Freshcodex runs !command in its selected directory, keeps file effects thr
     const forwarded = starts[1].params.input.find((item: any) => item.type === 'text').text
     expect(forwarded).toContain(`in ${cwd}. Output:`)
     expect(forwarded).toContain(`${cwd}\ncommand-output-canary`)
+    await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabId!)
+      const findPane = (node: any): any => node?.type === 'leaf'
+        ? (node.id === paneId ? node : undefined)
+        : node?.children?.map(findPane).find(Boolean)
+      return findPane(layout)?.content?.status ?? null
+    }, { timeout: 30_000, message: 'the command turn settles before conversation undo' }).toBe('idle')
     await composer.fill('/undo')
     await composer.press('Enter')
     await expect(composer).toHaveValue(forwarded, { timeout: 30_000 })

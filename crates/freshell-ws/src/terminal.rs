@@ -86,6 +86,10 @@ mod terminal_launch_prep_tests;
 mod managed_fixture_denies_host_pty;
 
 #[cfg(test)]
+#[path = "terminal_keepalive_tests.rs"]
+mod terminal_keepalive_tests;
+
+#[cfg(test)]
 #[path = "terminal_managed_input_tests.rs"]
 mod terminal_managed_input_tests;
 
@@ -113,6 +117,79 @@ pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
         Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
     }
+}
+
+const HOST_AGENT_MAINTENANCE_MESSAGE: &str =
+    "Host coding-agent starts are temporarily paused for maintenance; retry shortly.";
+
+fn host_agent_maintenance_error(request_id: Option<String>) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
+        code: ErrorCode::RateLimited,
+        message: HOST_AGENT_MAINTENANCE_MESSAGE.to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id,
+        retry_after_ms: Some(1000),
+        terminal_exit_code: None,
+        terminal_id: None,
+        live_terminal_id: None,
+    })
+}
+
+fn fresh_agent_maintenance_error(request_id: String) -> ServerMessage {
+    ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+        code: "HOST_AGENT_MAINTENANCE".to_string(),
+        message: HOST_AGENT_MAINTENANCE_MESSAGE.to_string(),
+        request_id,
+        retryable: Some(true),
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
+    })
+}
+
+async fn dispatch_hosted_fresh_agent(
+    message: &ClientMessage,
+    ws_tx: &mut WsSink,
+    admission: &freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
+    gateway: Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+) -> Option<bool> {
+    let crate::hosted_fresh_agent::HostedRoute::Gateway(command) =
+        crate::hosted_fresh_agent::hosted_route(message)
+    else {
+        return None;
+    };
+
+    let host_agent_permit = match command.as_ref() {
+        crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) => {
+            match admission.try_admit() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Some(
+                        send(
+                            ws_tx,
+                            &fresh_agent_maintenance_error(create.request_id.clone()),
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+        _ => None,
+    };
+    let task = gateway.dispatch(*command);
+    tokio::spawn(async move {
+        // Keep maintenance admission active through the hosted provider's
+        // create future, so quiesce cannot report drained while it is running.
+        let _host_agent_permit = host_agent_permit;
+        task.await;
+    });
+    Some(true)
 }
 
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
@@ -515,6 +592,10 @@ async fn run_loop(
     // real cadence starts one full interval out, matching the original.
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping_ticker.tick().await;
+    // Only a scoped unit-test connection can replace timer scheduling; the
+    // real keepalive state machine and inbound Pong arm are shared unchanged.
+    #[cfg(test)]
+    let mut ping_ticker = terminal_keepalive_tests::TickSource::new(ping_ticker);
     let mut keepalive = connection_writer::Keepalive::default();
 
     // Managed-runtime output is drained continuously by the session host. While
@@ -1111,8 +1192,17 @@ async fn handle_client_text(
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
     // consumed by the external gateway when installed. It is never allowed
     // to fall through and mint a competing web-owned provider writer.
-    if crate::hosted_fresh_agent::dispatch_if_installed(&message) {
-        return true;
+    if let Some(gateway) = crate::hosted_fresh_agent::installed_gateway() {
+        if let Some(handled) = dispatch_hosted_fresh_agent(
+            &message,
+            ws_tx,
+            &state.fresh_opencode.host_agent_admission(),
+            gateway,
+        )
+        .await
+        {
+            return handled;
+        }
     }
     match message {
         ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
@@ -1230,6 +1320,24 @@ async fn handle_client_text(
                 }
                 crate::create_dedupe::DedupeDecision::Proceed => {}
             }
+            // Shell PTYs retain their existing behavior. Coding CLI creates
+            // must acquire maintenance admission before they queue or enter
+            // launch planning, so quiesce either drains them or refuses them.
+            let host_agent_permit = if create.mode != "shell" {
+                match state.fresh_opencode.host_agent_admission().try_admit() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        state.create_dedupe.clear_if_in_flight(&create.request_id);
+                        return crate::terminal::send(
+                            ws_tx,
+                            &host_agent_maintenance_error(Some(create.request_id.clone())),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                None
+            };
             if create.restore == Some(true) {
                 // restore:true bypasses the per-connection rate limiter —
                 // neither checked nor recorded (legacy `if (!m.restore)`) —
@@ -1237,6 +1345,7 @@ async fn handle_client_text(
                 // task (spawn-to-settled permit, cancellable).
                 crate::create_gate::spawn_gated_restore_create(
                     create,
+                    host_agent_permit,
                     state,
                     conn_sink,
                     create_cancel_rx.clone(),
@@ -1258,6 +1367,7 @@ async fn handle_client_text(
                     state,
                     conn_identity,
                     asserted_at,
+                    host_agent_permit,
                 )) {
                     Ok(()) => true,
                     Err(error) => {
@@ -1805,7 +1915,7 @@ async fn handle_client_text(
                     .await
                 {
                     if let Some(reason) = managed_input_blocked_reason(&error) {
-                        return send(
+                        return crate::terminal::send(
                             ws_tx,
                             &managed_runtime_input_blocked(&input.terminal_id, reason),
                         )
@@ -1912,6 +2022,17 @@ async fn handle_client_text(
                 let Some(create) = freshell_protocol::direct_provider_create(create) else {
                     return true;
                 };
+                let host_agent_permit =
+                    match state.fresh_opencode.host_agent_admission().try_admit() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return send(
+                                ws_tx,
+                                &fresh_agent_maintenance_error(create.request_id.clone()),
+                            )
+                            .await;
+                        }
+                    };
                 // D8 (restore-open-sessions-only): thread this connection's
                 // provenance (hello identity + the create's `tabId`) down the
                 // provider `handle_create` chain so the identity-sink binding
@@ -1928,23 +2049,32 @@ async fn handle_client_text(
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
                         tokio::spawn(
-                            async move { fresh_codex.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_codex.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(
-                            async move { fresh_claude.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_claude.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
                         tokio::spawn(
-                            async move { fresh_opencode.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_opencode.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     _ => unreachable!("direct_provider_create only accepts direct providers"),
@@ -1984,27 +2114,47 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
+            let host_agent_permit =
+                if attach.provider == freshell_protocol::AgentProvider::Amplifier {
+                    None
+                } else {
+                    match state.fresh_opencode.host_agent_admission().try_admit() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            return send(ws_tx, &host_agent_maintenance_error(None)).await;
+                        }
+                    }
+                };
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move { fresh_codex.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_codex.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
                     let reply = conn_sink.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_attach(attach, reply).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_claude.handle_attach(attach, reply).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
                     tokio::spawn(
-                        async move { fresh_opencode.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_opencode.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 _ => {}
@@ -2012,6 +2162,21 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentSend(send) => {
+            let host_agent_permit = if send.provider == freshell_protocol::AgentProvider::Amplifier
+            {
+                None
+            } else {
+                match state.fresh_opencode.host_agent_admission().try_admit() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        return crate::terminal::send(
+                            ws_tx,
+                            &host_agent_maintenance_error(send.request_id.clone()),
+                        )
+                        .await;
+                    }
+                }
+            };
             if send.checkpoint_intent.is_some() {
                 if let Some(service) = state.checkpoint_send.service.clone() {
                     let captured_send = send.clone();
@@ -2019,6 +2184,7 @@ async fn handle_client_text(
                         freshell_protocol::AgentProvider::Codex => {
                             let fresh_codex = state.fresh_codex.clone();
                             Box::pin(async move {
+                                let _host_agent_permit = host_agent_permit;
                                 fresh_codex.handle_send(send).await;
                             })
                         }
@@ -2026,12 +2192,16 @@ async fn handle_client_text(
                             let fresh_claude = state.fresh_claude.clone();
                             // The WS lane answers on the bus; the outcome is for in-process callers.
                             Box::pin(async move {
+                                let _host_agent_permit = host_agent_permit;
                                 fresh_claude.handle_send(send).await;
                             })
                         }
                         freshell_protocol::AgentProvider::Opencode => {
                             let fresh_opencode = state.fresh_opencode.clone();
-                            Box::pin(async move { fresh_opencode.handle_send(send).await })
+                            Box::pin(async move {
+                                let _host_agent_permit = host_agent_permit;
+                                fresh_opencode.handle_send(send).await
+                            })
                         }
                         freshell_protocol::AgentProvider::Amplifier => Box::pin(async {}),
                         // Antigravity plan Task 8: no fresh-agent runtime
@@ -2051,23 +2221,32 @@ async fn handle_client_text(
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move { fresh_codex.handle_send(send).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_codex.handle_send(send).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_send(send).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_claude.handle_send(send).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 // Batch D PR-2: materialize-or-send (the continuity fix) runs here.
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
                     tokio::spawn(
-                        async move { fresh_opencode.handle_send(send).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _host_agent_permit = host_agent_permit;
+                            fresh_opencode.handle_send(send).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 // `amplifier` exists on AgentProvider for the TERM-16
@@ -9550,18 +9729,12 @@ async fn handle_attach(
     // `attach.ready` from the shared identity registry (create-time
     // resume ids AND locator-associated ids both live here); the
     // registry crate is identity-agnostic, so it's resolved here.
-    let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
-
     // TERM-07 (`broker.ts:358-397` parity): the session-identity guard lives
     // here because this crate owns the identity registry. When it permits the
     // geometry, the registry applies it AND installs this subscriber in one
     // terminal-state handoff. That prevents concurrent first viewers from
     // both observing an empty subscriber map and silently replacing each
     // other's PTY dimensions before either attach reaches replay.
-    let geometry_identity_ok = attach_geometry_identity_ok(
-        attach.expected_session_ref.as_ref(),
-        canonical_session_ref.as_ref(),
-    );
     // TERM-07 seam: the client's replay-budget request rides both paths.
     let max_replay_bytes = attach.max_replay_bytes;
     // Round-2 finding F3: the negotiated forward-page upper bound rides
@@ -9573,51 +9746,98 @@ async fn handle_attach(
     // would race the very natural exit it exists to sequence), so a
     // natural exit while the deferral is armed can move this connection's
     // session into its exit-drain.
-    let paced_options = freshell_terminal::PacedAttachOptions {
-        replay_page_bytes: attach.replay_page_bytes,
-        paced_exit_notify,
+    let attach_registered = || {
+        let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
+        let geometry_identity_ok = attach_geometry_identity_ok(
+            attach.expected_session_ref.as_ref(),
+            canonical_session_ref.as_ref(),
+        );
+        let paced_options = freshell_terminal::PacedAttachOptions {
+            replay_page_bytes: attach.replay_page_bytes,
+            paced_exit_notify: paced_exit_notify.clone(),
+        };
+        let outcome = if geometry_identity_ok {
+            let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
+            let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
+            // `paced_terminal_replay_v1` gates the paced replay core
+            // (responsive-terminal-restore): a negotiated attach with an
+            // attachRequestId to a Running terminal returns the paced session
+            // start; every other shape keeps the legacy inline replay.
+            state.registry.attach_with_geometry(
+                &attach.terminal_id,
+                conn_id,
+                Arc::clone(conn_sink),
+                attach.attach_request_id.clone(),
+                attach.since_seq.unwrap_or(0),
+                terminal_output_batch_v1,
+                paced_terminal_replay_v1,
+                canonical_session_ref,
+                // Mode replay-sync: the client's positive surface-fresh marker
+                // (xterm recreation / user reset). Forwards the wire field 1:1; the
+                // registry owns the emit-vs-skip gating.
+                attach.surface_reset,
+                max_replay_bytes,
+                attach.intent,
+                cols,
+                rows,
+                paced_options,
+            )
+        } else {
+            state.registry.attach(
+                &attach.terminal_id,
+                conn_id,
+                Arc::clone(conn_sink),
+                attach.attach_request_id.clone(),
+                attach.since_seq.unwrap_or(0),
+                terminal_output_batch_v1,
+                paced_terminal_replay_v1,
+                canonical_session_ref,
+                attach.surface_reset,
+                max_replay_bytes,
+                paced_options,
+            )
+        };
+        (outcome, geometry_identity_ok)
     };
-    let outcome = if geometry_identity_ok {
-        let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
-        let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
-        // `paced_terminal_replay_v1` gates the paced replay core
-        // (responsive-terminal-restore): a negotiated attach with an
-        // attachRequestId to a Running terminal returns the paced session
-        // start; every other shape keeps the legacy inline replay.
-        state.registry.attach_with_geometry(
-            &attach.terminal_id,
-            conn_id,
-            Arc::clone(conn_sink),
-            attach.attach_request_id.clone(),
-            attach.since_seq.unwrap_or(0),
-            terminal_output_batch_v1,
-            paced_terminal_replay_v1,
-            canonical_session_ref,
-            // Mode replay-sync: the client's positive surface-fresh marker
-            // (xterm recreation / user reset). Forwards the wire field 1:1; the
-            // registry owns the emit-vs-skip gating.
-            attach.surface_reset,
-            max_replay_bytes,
-            attach.intent,
-            cols,
-            rows,
-            paced_options,
-        )
-    } else {
-        state.registry.attach(
-            &attach.terminal_id,
-            conn_id,
-            Arc::clone(conn_sink),
-            attach.attach_request_id.clone(),
-            attach.since_seq.unwrap_or(0),
-            terminal_output_batch_v1,
-            paced_terminal_replay_v1,
-            canonical_session_ref,
-            attach.surface_reset,
-            max_replay_bytes,
-            paced_options,
-        )
-    };
+    let (mut outcome, mut geometry_identity_ok) = attach_registered();
+
+    // A web-only update starts with an empty local registry while the
+    // supervisor still owns managed terminals. Reconstruct only the exact
+    // requested facade after the ordinary attach misses, then retry through
+    // the normal replay/geometry path. Never adopt based on a provider
+    // session id or a broad inventory scan.
+    if !outcome.found
+        && state.registry.managed_runtime_connection(conn_id)
+        && state.registry.has_managed_controller()
+    {
+        match state
+            .registry
+            .adopt_managed_for_reconcile(&attach.terminal_id, None, |mode| {
+                crate::terminal_naming::mode_title(state.cli_commands.as_ref(), mode)
+            })
+            .await
+        {
+            Ok(true) => {
+                if let Err(error) =
+                    refresh_managed_output_and_associate(state, &attach.terminal_id, 256 * 1024)
+                        .await
+                {
+                    return AttachReply::Error(Box::new(managed_runtime_error(
+                        &attach.terminal_id,
+                        &format!("output replay failed after attach recovery: {error}"),
+                    )));
+                }
+                (outcome, geometry_identity_ok) = attach_registered();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return AttachReply::Error(Box::new(managed_runtime_error(
+                    &attach.terminal_id,
+                    &format!("managed terminal lookup failed during attach recovery: {error}"),
+                )));
+            }
+        }
+    }
     // Read ownership and replay are already established. Project only the
     // registry's accepted canonical dimensions; a secondary viewer cannot
     // substitute its requested size. A refused or slow host command must not
@@ -13752,6 +13972,257 @@ mod pane_reconcile_gate_tests {
         drop(interactive_create_rx);
     }
 }
+
+#[cfg(test)]
+mod host_agent_admission_tests {
+    use super::*;
+    use freshell_freshagent::host_agent_admission::HostAgentAdmissionGate;
+    use futures::future::BoxFuture;
+
+    struct HostedCreateGateway {
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+        deliveries: StdMutex<Vec<crate::hosted_fresh_agent::HostedFreshAgentCommand>>,
+        hold: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        settled: tokio::sync::Notify,
+    }
+
+    impl crate::hosted_fresh_agent::HostedFreshAgentGateway for HostedCreateGateway {
+        fn dispatch(
+            self: Arc<Self>,
+            command: crate::hosted_fresh_agent::HostedFreshAgentCommand,
+        ) -> BoxFuture<'static, ()> {
+            if let crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) = &command {
+                let _ = self.broadcast_tx.send(
+                    serde_json::json!({
+                        "type": "freshAgent.created",
+                        "provider": "codex",
+                        "runtimeProvider": "codex",
+                        "sessionId": "hosted-session-1",
+                        "sessionType": "freshcodex",
+                        "requestId": create.request_id,
+                    })
+                    .to_string(),
+                );
+            }
+            self.deliveries.lock().unwrap().push(command);
+            let hold = self.hold.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    let _ = hold.await;
+                }
+                self.settled.notify_one();
+            })
+        }
+    }
+
+    async fn dispatch(
+        text: &str,
+        ws_tx: &mut WsSink,
+        state: &WsState,
+        interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
+        create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        let conn_sink: FrameSink = Arc::new(|_| {});
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+        let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+        handle_client_text(
+            text,
+            ws_tx,
+            state,
+            9,
+            &conn_sink,
+            false,
+            false,
+            false,
+            false,
+            interactive_create_tx,
+            create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+            &mut conn_identity,
+            &mut paced_sessions,
+            &None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn maintenance_gate_refuses_ws_terminal_restore_and_fresh_agent_revivals() {
+        use std::time::Duration;
+
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let state = super::pane_reconcile_gate_tests::state();
+        state.fresh_codex.set_enabled(true);
+        let gate: HostAgentAdmissionGate = state.fresh_opencode.host_agent_admission();
+        let lease = gate
+            .begin_quiesce("ws-maintenance-test", Duration::from_secs(30))
+            .unwrap();
+        gate.drain(&lease, Duration::from_secs(1)).await.unwrap();
+
+        let (interactive_create_tx, mut interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(8);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+
+        for (request_id, restore) in [
+            ("interactive-maintenance", false),
+            ("restore-maintenance", true),
+        ] {
+            let text = serde_json::json!({
+                "type":"terminal.create", "requestId":request_id,
+                "mode":"claude", "shell":"system", "restore":restore
+            })
+            .to_string();
+            assert!(
+                dispatch(
+                    &text,
+                    &mut ws_tx,
+                    &state,
+                    &interactive_create_tx,
+                    &create_cancel_rx,
+                )
+                .await
+            );
+            let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+            assert_eq!(refusal["type"], "error");
+            assert_eq!(refusal["code"], "RATE_LIMITED");
+            assert_eq!(refusal["requestId"], request_id);
+            assert_eq!(refusal["retryAfterMs"], 1000);
+            assert!(!state.create_dedupe.is_in_flight(request_id));
+        }
+        assert!(interactive_create_rx.try_recv().is_err());
+
+        for text in [
+            r#"{"type":"freshAgent.create","provider":"codex","sessionType":"freshcodex","requestId":"create-maintenance"}"#,
+            r#"{"type":"freshAgent.send","provider":"codex","sessionId":"codex-maintenance-session","sessionType":"freshcodex","text":"resume","requestId":"send-maintenance"}"#,
+            r#"{"type":"freshAgent.attach","provider":"codex","sessionId":"codex-maintenance-session","sessionType":"freshcodex"}"#,
+        ] {
+            assert!(
+                dispatch(
+                    text,
+                    &mut ws_tx,
+                    &state,
+                    &interactive_create_tx,
+                    &create_cancel_rx,
+                )
+                .await
+            );
+            let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+            if refusal["type"] == "freshAgent.create.failed" {
+                assert_eq!(refusal["code"], "HOST_AGENT_MAINTENANCE");
+                assert_eq!(refusal["retryable"], true);
+            } else {
+                assert_eq!(refusal["type"], "error");
+                assert_eq!(refusal["code"], "RATE_LIMITED");
+                assert_eq!(refusal["retryAfterMs"], 1000);
+            }
+        }
+
+        assert_eq!(gate.status().phase, "quiesced");
+        gate.release(&lease).unwrap();
+        assert!(gate.try_admit().is_ok());
+    }
+
+    #[tokio::test]
+    async fn hosted_fresh_agent_create_obeys_quiesce_and_holds_permit_until_dispatch_settles() {
+        use std::time::Duration;
+
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let state = super::pane_reconcile_gate_tests::state();
+        let gate = state.fresh_opencode.host_agent_admission();
+        let lease = gate
+            .begin_quiesce("hosted-ws-maintenance-test", Duration::from_secs(30))
+            .unwrap();
+        gate.drain(&lease, Duration::from_secs(1)).await.unwrap();
+
+        let mut broadcasts = state.broadcast_tx.subscribe();
+        let (release_gateway_tx, release_gateway_rx) = tokio::sync::oneshot::channel();
+        let gateway = Arc::new(HostedCreateGateway {
+            broadcast_tx: Arc::clone(&state.broadcast_tx),
+            deliveries: StdMutex::new(Vec::new()),
+            hold: StdMutex::new(Some(release_gateway_rx)),
+            settled: tokio::sync::Notify::new(),
+        });
+
+        let rejected_request: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "freshAgent.create",
+            "provider": "codex",
+            "sessionType": "freshcodex",
+            "requestId": "hosted-create-quiesced",
+        }))
+        .expect("hosted freshAgent.create frame decodes");
+        let handled = super::dispatch_hosted_fresh_agent(
+            &rejected_request,
+            &mut ws_tx,
+            &gate,
+            Arc::clone(&gateway) as Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+        )
+        .await;
+        assert_eq!(handled, Some(true));
+
+        assert!(
+            gateway.deliveries.lock().unwrap().is_empty(),
+            "quiesced maintenance must refuse hosted creates before gateway dispatch"
+        );
+        assert_eq!(gate.status().active_permits, 0);
+        let refusal = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+        assert_eq!(refusal["type"], "freshAgent.create.failed");
+        assert_eq!(refusal["requestId"], "hosted-create-quiesced");
+        assert_eq!(refusal["code"], "HOST_AGENT_MAINTENANCE");
+        assert_eq!(refusal["retryable"], true);
+        assert!(matches!(
+            broadcasts.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        gate.release(&lease).unwrap();
+        let admitted_request: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "freshAgent.create",
+            "provider": "codex",
+            "sessionType": "freshcodex",
+            "requestId": "hosted-create-admitted",
+        }))
+        .expect("hosted freshAgent.create frame decodes");
+        let handled = super::dispatch_hosted_fresh_agent(
+            &admitted_request,
+            &mut ws_tx,
+            &gate,
+            Arc::clone(&gateway) as Arc<dyn crate::hosted_fresh_agent::HostedFreshAgentGateway>,
+        )
+        .await;
+        assert_eq!(handled, Some(true));
+
+        let created = tokio::time::timeout(Duration::from_secs(1), broadcasts.recv())
+            .await
+            .expect("hosted gateway published a created acknowledgement")
+            .expect("created acknowledgement broadcast remains open");
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        assert_eq!(created["type"], "freshAgent.created");
+        assert_eq!(created["requestId"], "hosted-create-admitted");
+
+        {
+            let deliveries = gateway.deliveries.lock().unwrap();
+            assert_eq!(deliveries.len(), 1);
+            match &deliveries[0] {
+                crate::hosted_fresh_agent::HostedFreshAgentCommand::Create(create) => {
+                    assert_eq!(create.request_id, "hosted-create-admitted");
+                }
+                other => panic!("expected one hosted create delivery, got {other:?}"),
+            }
+        }
+        assert_eq!(gate.status().active_permits, 1);
+
+        release_gateway_tx
+            .send(())
+            .expect("hosted create future is still waiting");
+        tokio::time::timeout(Duration::from_secs(1), gateway.settled.notified())
+            .await
+            .expect("hosted create future settled");
+        assert_eq!(gate.status().active_permits, 0);
+    }
+}
+
 #[cfg(test)]
 mod managed_output_order_tests {
     use super::*;
@@ -13762,6 +14233,7 @@ mod managed_output_order_tests {
 
     struct ManagedOutputFixture {
         output: ManagedOutputRead,
+        lookup_descriptor: Option<ManagedTerminalDescriptor>,
         resize_result: StdMutex<Result<(), String>>,
         resizes: StdMutex<Vec<(String, u16, u16)>>,
         resize_completed: Arc<std::sync::atomic::AtomicUsize>,
@@ -13774,6 +14246,7 @@ mod managed_output_order_tests {
         fn new(output: ManagedOutputRead) -> Self {
             Self {
                 output,
+                lookup_descriptor: None,
                 resize_result: StdMutex::new(Err("unused resize".into())),
                 resizes: StdMutex::new(Vec::new()),
                 resize_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -14392,10 +14865,16 @@ mod managed_output_order_tests {
     impl ManagedTerminalController for ManagedOutputFixture {
         fn lookup_terminal<'a>(
             &'a self,
-            _: &'a str,
+            terminal_id: &'a str,
             _: Option<String>,
         ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
-            Box::pin(async { Err("unused lookup".into()) })
+            Box::pin(async move {
+                Ok(self
+                    .lookup_descriptor
+                    .as_ref()
+                    .filter(|descriptor| descriptor.terminal_id == terminal_id)
+                    .cloned())
+            })
         }
 
         fn launch<'a>(
@@ -14468,6 +14947,126 @@ mod managed_output_order_tests {
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
             Box::pin(async { Ok(self.output.clone()) })
         }
+    }
+
+    #[tokio::test]
+    async fn cold_registry_attach_adopts_exact_managed_opencode_view_before_resume_gate() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id = "T-cold-managed-opencode";
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-cold-opencode".into(),
+            incarnation_id: "incarnation-cold-opencode".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "stream-cold-opencode".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("sesColdOpenCode".into()),
+            create_request_id: Some("create-cold-opencode".into()),
+        };
+        let output = ManagedOutputRead {
+            lifecycle: Some(ManagedLifecycle {
+                state: ManagedLifecycleState::Running,
+                recovery_summary: None,
+            }),
+            completion: None,
+            stream_epoch: Some(descriptor.stream_id.clone()),
+            incarnation_id: Some(descriptor.incarnation_id.clone()),
+            reset_required: false,
+            truncated: false,
+            retained_from_seq: 0,
+            head_seq: 0,
+            exit_code: None,
+            native_session_id: descriptor.resume_session_id.clone(),
+            chunks: vec![],
+            opencode_activity: None,
+            codex_activity: None,
+        };
+        // The retained supervisor inventory is the only source of the
+        // descriptor; the new web process starts with an empty registry.
+        let controller = Arc::new(ManagedOutputFixture {
+            output,
+            lookup_descriptor: Some(descriptor.clone()),
+            resize_result: StdMutex::new(Ok(())),
+            resizes: StdMutex::new(Vec::new()),
+            resize_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            resize_gate: StdMutex::new(None),
+            resize_reply_gate: StdMutex::new(None),
+            host_geometry: Arc::new(StdMutex::new((80, 24))),
+        });
+        state.registry.set_managed_controller(Some(controller));
+        let conn_id = 41;
+        state.registry.set_managed_runtime_connection(conn_id, true);
+
+        let (mut ws_tx, _client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let frames = Arc::new(StdMutex::new(Vec::<ServerMessage>::new()));
+        let captured = Arc::clone(&frames);
+        let conn_sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+        let (interactive_create_tx, _interactive_create_rx) = mpsc::channel(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+        let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+
+        assert!(
+            handle_client_text(
+                &serde_json::json!({
+                    "type": "terminal.attach",
+                    "terminalId": terminal_id,
+                    "intent": "viewport_hydrate",
+                    "cols": 80,
+                    "rows": 24,
+                    "sinceSeq": 0,
+                    "attachRequestId": "attach-cold-opencode",
+                })
+                .to_string(),
+                &mut ws_tx,
+                &state,
+                conn_id,
+                &conn_sink,
+                false,
+                false,
+                false,
+                false,
+                &interactive_create_tx,
+                &create_cancel_rx,
+                &mut host_stats_last_refresh_at,
+                &mut conn_identity,
+                &mut paced_sessions,
+                &None,
+            )
+            .await
+        );
+        assert!(
+            frames.lock().unwrap().iter().any(|frame| matches!(
+                frame,
+                ServerMessage::TerminalAttachReady(ready) if ready.terminal_id == terminal_id
+            )),
+            "the first attach must restore the facade from exact supervisor inventory"
+        );
+        assert_eq!(
+            state
+                .registry
+                .live_session_owner(Some(&state.identity), "opencode", "sesColdOpenCode"),
+            Some(terminal_id.to_string()),
+            "the attached managed session must be visible to exact resume gating"
+        );
+
+        let mut resume_id = Some("sesColdOpenCode".to_string());
+        let mut launch_intent = super::LaunchIntent::Resume;
+        let mut claude_prealloc = false;
+        let gate = super::gate_wire_resume(
+            &state,
+            "opencode",
+            &mut resume_id,
+            &mut launch_intent,
+            &mut claude_prealloc,
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
+        )
+        .await;
+        assert!(gate.stale_session_id.is_none());
+        assert!(!gate.recovery_blocked);
+        assert_eq!(resume_id.as_deref(), Some("sesColdOpenCode"));
     }
 
     struct ExitedOpenCodeRead {

@@ -33,6 +33,9 @@ pub(super) struct Job {
     // latency must not fabricate attribution freshness).
     conn_identity: crate::terminal::ConnectionIdentity,
     asserted_at: i64,
+    /// Held from WS admission through `handle_create` settlement and terminal
+    /// identity publication. Shell creates carry `None` and remain unchanged.
+    _host_agent_permit: Option<freshell_freshagent::host_agent_admission::HostAgentAdmissionPermit>,
 }
 
 impl Job {
@@ -41,6 +44,9 @@ impl Job {
         state: &WsState,
         conn_identity: &crate::terminal::ConnectionIdentity,
         asserted_at: i64,
+        host_agent_permit: Option<
+            freshell_freshagent::host_agent_admission::HostAgentAdmissionPermit,
+        >,
     ) -> Self {
         Self {
             generation: state.create_dedupe.in_flight_generation(&create.request_id),
@@ -49,6 +55,7 @@ impl Job {
             state: state.clone(),
             conn_identity: conn_identity.clone(),
             asserted_at,
+            _host_agent_permit: host_agent_permit,
         }
     }
 }

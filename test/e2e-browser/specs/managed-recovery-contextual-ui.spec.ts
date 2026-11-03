@@ -45,10 +45,10 @@ async function paneContent(page: Page) {
   })
 }
 
-async function installPane(page: Page, kind: PaneKind, recoveryState: RecoveryState, missingSoul = false, staleStatus?: 'running' | 'starting') {
+async function installPane(page: Page, kind: PaneKind, recoveryState: RecoveryState, missingSoul = false, staleStatus?: 'running' | 'starting', sessionId = SESSION_ID) {
   await page.route('**/api/runtime/notices?**', (route) => route.fulfill({ json: { notices: [] } }))
   if (!missingSoul) await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({ json: {
-    sessionType: 'freshcodex', provider: 'codex', sessionId: SESSION_ID, threadId: SESSION_ID,
+    sessionType: 'freshcodex', provider: 'codex', sessionId, threadId: sessionId,
     revision: 1, latestTurnId: null, status: 'idle',
     capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
     settings: { model: FRESHCODEX_DEFAULT_MODEL, effort: 'low' },
@@ -59,7 +59,7 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     extensions: {},
   } }))
   await page.route(`**/api/runtime/souls/${SOUL_ID}/history`, (route) => route.fulfill({ json: {
-    ...nativeCodexHistory, threadId: SESSION_ID,
+    ...nativeCodexHistory, threadId: sessionId,
     turns: nativeCodexHistory.turns.map((turn) => ({ ...turn, items: turn.items.map((item) => (
       turn.role === 'assistant' && item.kind === 'text' ? { ...item, text: SAVED_HISTORY_TEXT } : item
     )) })),
@@ -105,7 +105,7 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content } })
     harness.clearSentWsMessages?.()
   }, {
-    kind, summary: recoverySummary(recoveryState), sessionId: SESSION_ID, soulId: SOUL_ID,
+    kind, summary: recoverySummary(recoveryState), sessionId, soulId: SOUL_ID,
     revision: INTENT_REVISION, createRequestId: CREATE_REQUEST_ID, model: FRESHCODEX_DEFAULT_MODEL, missingSoul, staleStatus,
   })
 }
@@ -277,6 +277,35 @@ test('background notices failure stays quiet and preserves an existing cleanup w
   await expect(popup).not.toContainText('Background notices refused')
   await expect(popup.getByRole('button', { name: 'Details', exact: true })).toBeVisible()
   await expect(popup.getByRole('button', { name: 'Dismiss', exact: true })).toBeVisible()
+})
+
+test('freshcodex: reopening native saved history shows the provider failure without a running app server', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
+  void freshellPage
+  await terminal.waitForTerminal()
+  const sessionId = 'd4430000-0000-4444-8444-000000000092'
+  const turnId = 'saved-capacity-turn'
+  const providerMessage = 'Selected model is at capacity. Please try a different model.'
+  const sessions = path.join(serverInfo.homeDir, '.codex', 'sessions', '2026', '03', '02')
+  await fs.mkdir(sessions, { recursive: true })
+  const rollout = path.join(sessions, `rollout-${sessionId}.jsonl`)
+  const records = [
+    { timestamp: '2026-03-02T12:00:00.000Z', type: 'session_meta', payload: { id: sessionId, cwd: serverInfo.homeDir } },
+    { timestamp: '2026-03-02T12:00:01.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+    { timestamp: '2026-03-02T12:00:02.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue the saved conversation' }] } },
+    { timestamp: '2026-03-02T12:00:03.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: null, error: { message: providerMessage, codex_error_info: 'server_overloaded' } } },
+  ]
+  await fs.writeFile(rollout, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
+
+  const historyRead = page.waitForResponse((response) => response.url().includes(`/api/fresh-agent/threads/freshcodex/codex/${sessionId}`))
+  await installPane(page, 'fresh-agent', 'lost', true, undefined, sessionId)
+  const response = await historyRead
+  expect(response.status()).toBe(200)
+  const snapshot = await response.json()
+  expect(snapshot.extensions.codex).toMatchObject({ nativeHistoryAvailable: true, ownerKind: 'vacant' })
+  await expect(page.getByTestId('fresh-agent-turn-error').getByText(providerMessage, { exact: true })).toBeVisible()
+  await expect(page.getByText('Codex completed this turn without recording an assistant response.')).toHaveCount(0)
+  const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
+  expect(messages.filter((message) => ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send'].includes(message.type ?? ''))).toEqual([])
 })
 
 test('fresh-agent: cold lost pane without a soul retains saved history and a close warning after refused start-new', async ({ freshellPage, page, terminal, harness, serverInfo }) => {

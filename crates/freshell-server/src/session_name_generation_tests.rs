@@ -2553,6 +2553,7 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
 
 const ROLE_ENV: &str = "FRESHELL_TEST_SGEN_ROLE";
 const DIR_ENV: &str = "FRESHELL_TEST_SGEN_DIR";
+const CONTENTION_RETRY_NOW_MS: i64 = 1_700_000_000_000;
 
 fn child_env(dir: &Path, role: &str) -> std::process::Command {
     let exe = std::env::current_exe().expect("test binary path");
@@ -2575,6 +2576,11 @@ fn child_env(dir: &Path, role: &str) -> std::process::Command {
 /// the parent can prove what completes while a provider operation is held.
 async fn run_worker_child_role(role: &str, dir: &Path) {
     let stop_path = dir.join("child-stop");
+    if role == "failing_worker" {
+        // Hooks are process-local: the retry worker must install the same
+        // frozen clock as its parent before opening the shared store.
+        set_test_hooks(dir, vec![TestHook::FrozenClockMs(CONTENTION_RETRY_NOW_MS)]);
+    }
     let store = open_store(dir);
     if role == "worker" {
         std::fs::write(dir.join("child-ready"), b"ready").expect("signal child store open");
@@ -2817,6 +2823,13 @@ async fn worker_contention() {
     // -- Part 3: no worker lock is held across a retry delay ---------------
     let retry_dir = temp_data_dir();
     let retry_data = retry_dir.path().to_path_buf();
+    // Keep the first retry in the future regardless of parent starvation.
+    // Otherwise the child can consume attempt two before the parent ever
+    // observes the exact consumed == 1 state below.
+    set_test_hooks(
+        &retry_data,
+        vec![TestHook::FrozenClockMs(CONTENTION_RETRY_NOW_MS)],
+    );
     let retry_store = open_store(&retry_data);
     let retry_target = pending("h-retry-delay");
     ensure_pending(
@@ -2843,6 +2856,11 @@ async fn worker_contention() {
         if generation_consumed(&doc, &retry_target) == 1
             && generation_next_due(&doc, &retry_target).is_some()
         {
+            assert_eq!(
+                generation_next_due(&doc, &retry_target),
+                Some(CONTENTION_RETRY_NOW_MS + GENERATION_RETRY_1_MS),
+                "the child schedules its retry on the frozen decision clock"
+            );
             break;
         }
         assert!(
@@ -2851,9 +2869,9 @@ async fn worker_contention() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // The retry delay (30s out) holds neither lock: this process can take
-    // the worker guard within a bounded window (the child only ever holds it
-    // around an actual dispatch, never across the delay).
+    // The retry remains 30s ahead on the frozen decision clock and holds
+    // neither lock: this process can take the worker guard within a bounded
+    // window (the child only holds it around a dispatch, not the delay).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let guard = loop {
         match retry_store
@@ -2873,5 +2891,6 @@ async fn worker_contention() {
     drop(guard);
     std::fs::write(retry_data.join("child-stop"), b"stop").unwrap();
     let output = retry_child.wait_with_output().expect("retry child exits");
+    clear_test_hooks(&retry_data);
     assert!(output.status.success());
 }

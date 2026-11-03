@@ -29,6 +29,8 @@ describe('distribution fixture visibility', () => {
       }
 
       const init = spawnSync('git', ['init', '--quiet'], {
+        timeout: 30_000,
+        killSignal: 'SIGKILL',
         cwd: fixtureRoot,
         encoding: 'utf8',
       })
@@ -37,6 +39,8 @@ describe('distribution fixture visibility', () => {
 
       for (const fixturePath of fixturePaths) {
         const result = spawnSync('git', ['check-ignore', '--quiet', '--no-index', fixturePath], {
+          timeout: 30_000,
+          killSignal: 'SIGKILL',
           cwd: fixtureRoot,
           encoding: 'utf8',
         })

@@ -43,7 +43,7 @@ use freshell_protocol::{ServerMessage, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL
 
 use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
-use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
+use crate::terminal_tabs::{spawn_terminal_pane_with_admission, TerminalSpawnResult};
 use crate::{
     approx_json, authorized, fail_json, ok_json, parse_required_name, rest_agent_mode,
     rest_lane_failure, FreshAgentState, PaneEntry, PaneNameResolution,
@@ -162,6 +162,27 @@ pub(crate) async fn split_pane(
             LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
         );
     }
+
+    let fresh_agent = body.get("agent").and_then(Value::as_str);
+    let needs_host_admission = if let Some(agent) = fresh_agent {
+        rest_agent_mode(agent).is_some()
+    } else {
+        !body
+            .get("hostStats")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && body.get("browser").and_then(Value::as_str).is_none()
+            && body.get("editor").and_then(Value::as_str).is_none()
+            && body.get("mode").and_then(Value::as_str).unwrap_or("shell") != "shell"
+    };
+    let host_agent_permit = if needs_host_admission {
+        match crate::try_host_agent_admission(&state) {
+            Ok(permit) => Some(std::sync::Arc::new(permit)),
+            Err(response) => return *response,
+        }
+    } else {
+        None
+    };
 
     let pane_id = match resolve_pane_target(&state, &raw_pane_id) {
         PaneTarget::Pane { pane_id, .. } => pane_id,
@@ -316,7 +337,15 @@ pub(crate) async fn split_pane(
             .insert(new_pane_id.clone(), content.clone());
         content
     } else {
-        match spawn_terminal_pane(&state, &body, &tab_id, &new_pane_id).await {
+        match spawn_terminal_pane_with_admission(
+            &state,
+            &body,
+            &tab_id,
+            &new_pane_id,
+            host_agent_permit.clone(),
+        )
+        .await
+        {
             Ok(TerminalSpawnResult { pane_content, .. }) => pane_content,
             Err(resp) => return *resp,
         }
@@ -951,6 +980,16 @@ pub(crate) async fn respawn_pane(
         );
     }
 
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("shell");
+    let host_agent_permit = if mode == "shell" {
+        None
+    } else {
+        match crate::try_host_agent_admission(&state) {
+            Ok(permit) => Some(std::sync::Arc::new(permit)),
+            Err(response) => return *response,
+        }
+    };
+
     let tab_id = pane_tab_from_cache_or_layout(&state, &pane_id);
     // Round-1 review: an authoritative registry misses only when no connected
     // browser has synced the pane -- ask the owner client to re-sync before
@@ -972,7 +1011,15 @@ pub(crate) async fn respawn_pane(
         },
     };
 
-    let spawned = match spawn_terminal_pane(&state, &body, &tab_id, &pane_id).await {
+    let spawned = match spawn_terminal_pane_with_admission(
+        &state,
+        &body,
+        &tab_id,
+        &pane_id,
+        host_agent_permit.clone(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(resp) => return *resp,
     };

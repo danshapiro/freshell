@@ -635,13 +635,16 @@ async fn matching_pre_write_read_synchronizes_without_a_write() {
 #[tokio::test]
 async fn undelivered_failures_bound_at_three_cycles_six_reads_and_exhaust_permanently() {
     let dir = temp_data_dir();
-    // Shrink the 5s/30s retry floors so the bounded-allowance math is
-    // observable without wall-clock waits (the production floors are pinned
-    // by their constants; this hook only accelerates eligibility).
-    crate::session_names::set_test_hooks(
-        dir.path(),
-        vec![crate::session_names::TestHook::NativeRetryFloorMs(2_000)],
-    );
+    // Freeze the decision clock, including timestamps captured before
+    // fsync, so host pressure cannot make a retry eligible unexpectedly.
+    let set_now = |now| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![crate::session_names::TestHook::FrozenClockMs(now)],
+        );
+    };
+    let mut now = 1_700_000_000_000_i64;
+    set_now(now);
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-exhaust", "/h/.claude").await;
     let backend = ScriptedBackend::new(vec![
@@ -661,33 +664,47 @@ async fn undelivered_failures_bound_at_three_cycles_six_reads_and_exhaust_perman
     assert_eq!(sync.status, NativeSyncStatus::Unsynced);
     assert!(sync.reason.unwrap().contains("connect refusal"));
 
-    // Cycle 2 is not ready until the retry floor elapses.
-    assert!(
-        store.native_work_snapshot().is_empty(),
-        "cycle 2 waits for the retry floor"
-    );
-    assert!(
-        store
-            .claim_native_cycle(target.clone(), "r2".to_string())
-            .await
-            .unwrap()
-            .is_none(),
-        "not yet due consumes nothing"
-    );
-    // The 2s floor gives the not-yet-due asserts above real margin: a
-    // parallel-workspace run can starve a single await well past a 60ms
-    // floor (observed twice under full-suite load), which made the
-    // "cycle 2 waits for the retry floor" assert fail on working code.
-    tokio::time::sleep(Duration::from_millis(2_050)).await;
+    // Exercise the real 5s/30s floors at their exact boundaries. Neither a
+    // snapshot nor a claim may admit a retry one millisecond early.
+    for (cycle, delay_ms) in [(2_u32, 5_000_i64), (3, 30_000)] {
+        let due = now + delay_ms;
+        assert_eq!(
+            native_entry_of(&document_json(dir.path()))["nextDue"].as_i64(),
+            Some(due),
+            "cycle {cycle} uses the production retry floor"
+        );
+        set_now(due - 1);
+        assert!(
+            store.native_work_snapshot().is_empty(),
+            "cycle {cycle} is not ready before its retry floor"
+        );
+        assert!(
+            store
+                .claim_native_cycle(target.clone(), format!("too-early-{cycle}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a not-yet-due claim consumes nothing"
+        );
 
-    // Exhaust cycles 2 and 3 through the real dispatch loop.
-    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
-    tokio::time::sleep(Duration::from_millis(2_050)).await;
-    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+        set_now(due);
+        assert!(
+            store
+                .native_work_snapshot()
+                .iter()
+                .any(|item| item.target == target),
+            "cycle {cycle} is ready at its retry floor"
+        );
+        super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+        assert_eq!(backend.writes(), cycle);
+        assert_eq!(backend.reads(), cycle);
+        now = due;
+    }
     assert_eq!(backend.writes(), 3, "at most three writes per revision");
     assert_eq!(backend.reads(), 3);
 
-    // Cycle 4: exhaustion is final.
+    // Cycle 4: exhaustion is final even after advancing another day.
+    set_now(now + 24 * 60 * 60 * 1_000);
     assert!(
         store
             .claim_native_cycle(target.clone(), "r4".to_string())
@@ -1390,24 +1407,28 @@ async fn the_selector_orders_due_work_by_earliest_next_due() {
     );
 }
 
-/// Delta-review round 3, finding 7: `native_work_snapshot` must read the
-/// same test-offset-aware decision clock (`effective_now_ms`) as its
-/// sibling `generation_work_snapshot`. The real-clock `now_ms()` made the
-/// due filter ignore the `ClockOffsetMs` hook, so a clock-controlled
-/// native test could never advance virtual time through the snapshot's due
-/// gate (the claim path already uses the effective clock via TxnMeta).
+/// `native_work_snapshot` and the transaction claim must use the same
+/// offset-aware decision clock. A frozen base makes both sides of the real
+/// retry floor independent of wall-clock time and filesystem latency.
 #[tokio::test]
 async fn native_work_snapshot_reads_the_test_offset_aware_clock() {
     let dir = temp_data_dir();
-    crate::session_names::set_test_hooks(
-        dir.path(),
-        vec![crate::session_names::TestHook::NativeRetryFloorMs(2_000)],
-    );
+    let start_ms = 1_700_000_000_000_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-clock", "/h/.claude").await;
 
-    // Consume cycle 1 and fold an undelivered failure: the retry becomes due
-    // 60ms after the fold (the effective decision clock stamps the fold).
+    // Consume cycle 1 and fold an undelivered failure at the frozen instant:
+    // the second cycle becomes due exactly five seconds after the fold.
     let claim = store
         .claim_native_cycle(target.clone(), "cycle-1".to_string())
         .await
@@ -1424,27 +1445,42 @@ async fn native_work_snapshot_reads_the_test_offset_aware_clock() {
         )
         .await
         .expect("failure folds a record update");
-
-    // Not yet due on the wall clock: the snapshot stays empty.
-    assert!(
-        store.native_work_snapshot().is_empty(),
-        "cycle 2 waits for the retry floor"
+    assert_eq!(
+        native_entry_of(&document_json(dir.path()))["nextDue"].as_i64(),
+        Some(start_ms + 5_000)
     );
 
-    // Advance virtual time past the floor: the offset-aware due filter must
-    // admit the retry (the real wall clock has NOT moved 60s).
-    crate::session_names::set_test_hooks(
-        dir.path(),
-        vec![
-            crate::session_names::TestHook::NativeRetryFloorMs(2_000),
-            crate::session_names::TestHook::ClockOffsetMs(60_000),
-        ],
-    );
+    for offset in [0, 4_999] {
+        set_offset(offset);
+        assert!(
+            store.native_work_snapshot().is_empty(),
+            "cycle 2 waits for its retry floor at offset {offset}"
+        );
+        assert!(
+            store
+                .claim_native_cycle(target.clone(), format!("too-early-{offset}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the claim agrees with the snapshot before the retry floor"
+        );
+    }
+
+    // Only the test offset advances: both the snapshot and the claim become
+    // ready exactly at the production floor, without a wall-clock wait.
+    set_offset(5_000);
     let items = store.native_work_snapshot();
     assert!(
         items.iter().any(|item| item.target == target),
         "the offset-aware clock admits the due native retry"
     );
+    let claim = store
+        .claim_native_cycle(target, "cycle-2".to_string())
+        .await
+        .unwrap()
+        .expect("cycle 2 claims exactly at the retry floor");
+    assert_eq!(claim.cycle, 2);
+    crate::session_names::clear_test_hooks(dir.path());
 }
 
 // ---------------------------------------------------------------------------

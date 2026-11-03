@@ -20,14 +20,47 @@ function writeFakeTsx(root: string): string {
   return tsx
 }
 
-function gitInit(dir: string): void {
-  const res = spawnSync('git', ['init', '-q', '-b', 'main'], {
+function runGit(dir: string, args: string[]): void {
+  const env = { ...process.env }
+  // A caller such as a Git hook may export repository locations. Fixture
+  // commands must only operate on the repository selected by their cwd.
+  for (const name of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) {
+    delete env[name]
+  }
+  const res = spawnSync('git', args, {
     cwd: dir,
+    env,
     encoding: 'utf8',
     timeout: SPAWN_TIMEOUT_MS,
     killSignal: 'SIGKILL',
   })
-  if (res.status !== 0) throw new Error(`git init failed in fixture: ${res.stderr}`)
+  if (res.error) throw new Error(`git ${args.join(' ')} failed in fixture: ${res.error.message}`, { cause: res.error })
+  if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed in fixture (status=${res.status}, signal=${res.signal}): ${res.stderr}`)
+}
+
+function gitInit(dir: string): void {
+  runGit(dir, ['init', '-q', '-b', 'main'])
+}
+
+function makeLinkedWorktree(parent: string): { owningRoot: string; worktreeRoot: string } {
+  const owningRoot = path.join(parent, 'owner')
+  const worktreeRoot = path.join(parent, 'linked')
+  const hooksDir = path.join(parent, 'empty-hooks')
+  fs.mkdirSync(owningRoot)
+  fs.mkdirSync(hooksDir)
+  gitInit(owningRoot)
+  // A linked worktree needs one commit. Keep its identity and execution
+  // settings on these fixture commands; no developer Git config is changed.
+  runGit(owningRoot, [
+    '-c', 'user.name=tsx resolution fixture',
+    '-c', 'user.email=tsx-resolution-fixture@example.invalid',
+    '-c', 'commit.gpgsign=false',
+    '-c', `core.hooksPath=${hooksDir}`,
+    'commit', '--allow-empty', '-q', '-m', 'fixture root',
+  ])
+  runGit(owningRoot, ['-c', `core.hooksPath=${hooksDir}`, 'worktree', 'add', '--detach', '--quiet', worktreeRoot])
+  fs.writeFileSync(path.join(worktreeRoot, 'package.json'), '{ "private": true }\n')
+  return { owningRoot, worktreeRoot }
 }
 
 describe('resolveOwningTsx', () => {
@@ -66,6 +99,38 @@ describe('resolveOwningTsx', () => {
     }
   })
 
+  it('prefers the common-dir owning checkout runtime over a linked worktree runtime when both exist', () => {
+    const parent = makeTempDir('tsx-resolve-worktree-owner-')
+    try {
+      const { owningRoot, worktreeRoot } = makeLinkedWorktree(parent)
+      const owningTsx = writeFakeTsx(owningRoot)
+      const worktreeTsx = writeFakeTsx(worktreeRoot)
+      const start = path.join(worktreeRoot, 'test', 'unit', 'scripts')
+      fs.mkdirSync(start, { recursive: true })
+
+      const resolved = resolveOwningTsx(start)
+      expect(resolved).toBe(owningTsx)
+      expect(resolved).not.toBe(worktreeTsx)
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to the linked worktree package runtime when the owning checkout runtime is missing', () => {
+    const parent = makeTempDir('tsx-resolve-worktree-fallback-')
+    try {
+      const { owningRoot, worktreeRoot } = makeLinkedWorktree(parent)
+      const worktreeTsx = writeFakeTsx(worktreeRoot)
+      const start = path.join(worktreeRoot, 'test', 'unit', 'scripts')
+      fs.mkdirSync(start, { recursive: true })
+      expect(fs.existsSync(path.join(owningRoot, 'node_modules', '.bin', 'tsx'))).toBe(false)
+
+      expect(resolveOwningTsx(start)).toBe(worktreeTsx)
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
   it('throws a clear error naming both strategies when no ancestor has package.json', () => {
     const root = makeTempDir('tsx-resolve-bare-')
     try {
@@ -91,24 +156,12 @@ describe('resolveOwningTsx', () => {
     }
   })
 
-  it('resolves an absolute, existing tsx for the running test tree (owning checkout in git checkouts)', () => {
+  it('resolves an absolute, existing tsx for the running test tree', () => {
     const resolved = resolveOwningTsx(import.meta.dirname)
     expect(path.isAbsolute(resolved)).toBe(true)
     expect(resolved.endsWith(path.join('node_modules', '.bin', 'tsx'))).toBe(true)
     expect(fs.existsSync(resolved)).toBe(true)
-    // In a git checkout (local dev and CI), pin the owning-checkout path
-    // exactly — this is the behavior rust-test-targets.test.ts depends on.
-    // Gitless images (the cloud test image ships no .git) skip only this
-    // equality pin; the invariants above still hold via the walk-up.
-    const probe = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
-      cwd: import.meta.dirname,
-      encoding: 'utf8',
-      timeout: SPAWN_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-    })
-    if (probe.status === 0 && (probe.stdout ?? '').trim()) {
-      const owningRoot = (probe.stdout ?? '').trim().replace(/\/\.git$/, '')
-      expect(resolved).toBe(path.join(owningRoot, 'node_modules', '.bin', 'tsx'))
-    }
+    // Exact strategy precedence is covered by the owned fixtures above.
+    // This checkout may intentionally install dependencies only in a worktree.
   })
 })

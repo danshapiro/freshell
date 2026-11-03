@@ -83,7 +83,7 @@ Package manager: this repo runs on pnpm, pinned exactly (see [Package Manager (p
 - The Rust binary is `target/release/freshell-server` (or `.exe` on Windows). It is the only Freshell backend executable.
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
-- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation. The live self-hosted server is the Rust server on port 3001 (see below).
+- For managed-runtime maintenance, use `scripts/update-managed-runtime.ts` from a host shell. It currently supports systemd-owned deployments only. The default mode updates the web client and restarts only the web service; it does not restart the supervisor or reset managed sessions. The launcher refuses `--stop` and `--restart` for a running managed server because it cannot safely check pane ownership. A launcher-owned managed server has no live update path here; preserve its running work and use a deliberate recovery procedure. `--all` and `--durable-only` reset managed coding sessions and require the exact word `APPROVED` after the updater identifies the selected mode. See the [managed-runtime update runbook](docs/development/self-hosted-launch-runbook.md#managed-runtime-update-modes).
 
 ## Rust Server (Self-Hosted Production)
 
@@ -98,14 +98,14 @@ scripts/launch-rust.sh                 # build client + Rust server, start on po
 scripts/launch-rust.sh --port 3499     # any other port (e.g. testing from a worktree)
 scripts/launch-rust.sh --client-only   # rebuild dist/client ONLY (no restart needed)
 scripts/launch-rust.sh --skip-build    # start without rebuilding
-scripts/launch-rust.sh --restart       # stop the pid-file-verified instance, then start
-scripts/launch-rust.sh --stop          # stop the pid-file-verified instance
+scripts/launch-rust.sh --restart       # non-managed instances only
+scripts/launch-rust.sh --stop          # non-managed instances only
 ```
 
 Key facts:
 
-- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart** (and therefore without needing "APPROVED"). Server-side (Rust) changes DO require a restart.
-- **Restarting the live 3001 server still requires the user's explicit "APPROVED"** — `--restart`/`--stop` exist for approved deploys and for scratch instances on other ports, not as a license to bounce production.
+- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart**. Server-side (Rust) changes DO require a restart.
+- Managed live `--stop`/`--restart` are refused; managed-runtime updates use the systemd-only updater modes documented above, and reset-capable modes ask for `APPROVED` based on the selected mode.
 - The script is safe by construction: it only ever kills PIDs from its own pid file, after verifying the process is this repo's `freshell-server` binary (cwd + args match); if the port is held by anything else it refuses. Logs go to `~/.freshell/logs/rust-server-<port>.log`, pid to `~/.freshell/rust-server-<port>.pid`.
 - The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
 - The startup log line self-identifies the binary that produced it: `[<ISO-8601 UTC timestamp>] freshell-server listening on http://0.0.0.0:<port> (ws://0.0.0.0:<port>/ws) [pid <pid>] [commit <sha>] [dirty <true|false|unknown>]`. Use it (or `~/.freshell/logs/rust-server-3001.log`) to check what the running server was built from when asking "are we running change X?".
@@ -114,7 +114,9 @@ Key facts:
   session (`setsid`, stdin from `/dev/null`). Closing the launching shell
   does NOT stop the server or its child agent terminals (this fixed the
   SIGTERM/SIGHUP cascades visible as `shutdown_forensics` events). Stop it
-  only via `scripts/launch-rust.sh --stop [--port N]`. CAVEAT: WSL2 shuts
+  only via `scripts/launch-rust.sh --stop [--port N]` for non-managed servers;
+  managed servers refuse launcher stop and use the managed-runtime guidance
+  above. CAVEAT: WSL2 shuts
   the whole VM down shortly after the LAST console/interop handle closes —
   no launcher-side detachment survives that.
 - **systemd user unit (recommended for unattended operation):** install
@@ -337,6 +339,10 @@ Managed provider environment and recovery repair: [implementation plan](docs/pla
 Freshcodex completion: [implementation plan](docs/plans/2026-10-25-freshcodex-complete.md). Managed native runtime: [qualification and ownership](docs/development/codex-native-runtime.md).
 Google coding CLI support (Antigravity CLI and existing Gemini CLI compatibility): [implementation plan](docs/plans/2026-10-29-google-cli-first-class-support.md).
 
+Background pane viewport screenshots: [implementation plan](docs/plans/2026-11-01-viewport-screenshots.md).
+
 Fresh Agent compact panels: [implementation plan](docs/plans/2026-11-01-fresh-agent-compact-panels.md).
+
+Fresh Agent review polish (findings 7–12): [implementation plan](docs/plans/2026-11-01-fresh-agent-review-polish.md).
 
 When idle-waiting on subagents, always call `wait_agent` with `timeout_ms=3600000` (the 1-hour maximum). `wait_agent` wakes immediately on any subagent message or completion, so long timeouts add no latency — but every wait return (including a no-op timeout) costs a full model turn that re-sends the entire context. Never poll on shorter timeouts. Have workers `send_message` to `/root` at milestones so the parent wakes exactly when there is news.

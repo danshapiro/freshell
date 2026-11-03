@@ -90,20 +90,15 @@ function timestampsAfter(timestamps: number[], atMs: number): number[] {
 }
 
 async function selectShellFromPicker(page: Page): Promise<void> {
-  if (await page.locator('.xterm').first().isVisible().catch(() => false)) return
-  await page.waitForTimeout(500)
-  if (await page.locator('.xterm').first().isVisible().catch(() => false)) return
-
-  for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-    const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-    if (await button.first().isVisible().catch(() => false)) {
-      await button.first().click()
-      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })
-      return
-    }
-  }
-
-  throw new Error('Could not create a terminal from the pane picker')
+  const terminal = page.locator('.xterm').first()
+  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+  // Boot may already own a terminal. Observe one of the actual ready surfaces
+  // instead of assuming the picker has settled after a 500ms sleep.
+  await expect.poll(async () => await terminal.isVisible() || await picker.isVisible()).toBe(true)
+  if (await terminal.isVisible()) return
+  await picker.getByRole('button', { name: /^(Shell|WSL|CMD|PowerShell|Bash)$/i })
+    .first().press('Enter')
+  await expect(terminal).toBeVisible({ timeout: 30_000 })
 }
 
 async function getActiveTerminalId(harness: TestHarness): Promise<string> {

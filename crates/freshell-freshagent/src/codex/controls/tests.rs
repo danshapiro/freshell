@@ -1,6 +1,8 @@
 use super::*;
 use crate::codex::tests::{insert_fake_session_with_real_consumer, spawn_sleeper, state_with_bus};
 use freshell_codex::ChannelPeer;
+#[cfg(unix)]
+use freshell_codex::WsTransport;
 
 #[cfg(unix)]
 mod optional_native_display;
@@ -700,6 +702,12 @@ async fn codex_user_controls_resolved_and_interrupted_requests_clear_without_com
         "turn/completed",
         json!({"threadId":"thread-1","turnId":"turn-1","status":"interrupted"}),
     );
+    assert_eq!(event(&mut rx).await["type"], "freshAgent.session.init");
+    let patch = event(&mut rx).await;
+    assert_eq!(patch["type"], "freshAgent.transcript.patch");
+    assert!(patch["ops"].as_array().unwrap().iter().any(|op| {
+        op["op"] == "settleTurn" && op["nativeTurnId"] == "turn-1" && op["status"] == "interrupted"
+    }));
     assert_eq!(
         event(&mut rx).await["type"],
         "freshAgent.permission.cancelled"
@@ -1577,10 +1585,49 @@ async fn task6_shutdown(state: &FreshCodexState, peer: ChannelPeer) {
         .expect("fixture shutdown");
 }
 
+/// Models the killed native process closing its socket while retaining the
+/// peer handle so the test can attempt late frames after EOF.
+#[cfg(unix)]
+struct ExitClosingChannel {
+    inner: Arc<freshell_codex::ChannelTransport>,
+    exited: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(unix)]
+impl WsTransport for ExitClosingChannel {
+    fn send(&self, text: String) -> freshell_codex::BoxFuture<'_, Result<(), String>> {
+        self.inner.send(text)
+    }
+
+    fn recv(&self) -> freshell_codex::BoxFuture<'_, Option<String>> {
+        let mut exited = self.exited.clone();
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                frame = self.inner.recv() => frame,
+                _ = async {
+                    if !*exited.borrow() {
+                        let _ = exited.changed().await;
+                    }
+                } => None,
+            }
+        })
+    }
+
+    fn close(&self) -> freshell_codex::BoxFuture<'_, ()> {
+        self.inner.close()
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn task6_native_death_retains_finite_output_and_completion_but_no_dead_control() {
     let (transport, peer) = freshell_codex::new_channel_transport();
+    let (exit_tx, exit_rx) = tokio::sync::watch::channel(false);
+    let transport = Arc::new(ExitClosingChannel {
+        inner: transport,
+        exited: exit_rx,
+    });
     let (client, notifications) = CodexAppServerClient::connect(transport);
     let (state, mut rx) = state_with_bus();
     let child = spawn_sleeper();
@@ -1610,6 +1657,7 @@ async fn task6_native_death_retains_finite_output_and_completion_but_no_dead_con
     // This exact PID is the fixture child just transferred to its watcher.
     // The entire test runs in the strict disposable process-kill sandbox.
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    exit_tx.send_replace(true);
     let complete = loop {
         let next = event(&mut rx).await;
         if next["type"] == "freshAgent.turn.complete" {

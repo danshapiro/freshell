@@ -18,7 +18,7 @@ function runContainerLayoutFixture(fixture: string, runtimeOnly = false) {
   return spawnSync(
     'bash',
     [path.join(PROJECT_ROOT, 'scripts/verify-container-layout.sh'), '--fixture', fixturePath, ...runtimeFlag],
-    { cwd: PROJECT_ROOT, encoding: 'utf8' },
+    { timeout: 30_000, killSignal: 'SIGKILL', cwd: PROJECT_ROOT, encoding: 'utf8' },
   )
 }
 

@@ -134,15 +134,63 @@ pub(super) async fn fixture_fresh_soul_with_cleanup(
     native_id: &str,
     verified_empty: bool,
 ) -> (Registry, RuntimeView) {
+    fixture_soul_with_cleanup(
+        root,
+        certify_loss,
+        provider,
+        Some(session_type),
+        native_id,
+        verified_empty,
+    )
+    .await
+}
+
+pub(super) async fn fixture_terminal_soul_with_cleanup(
+    root: &std::path::Path,
+    certify_loss: bool,
+    provider: &str,
+    native_id: &str,
+    verified_empty: bool,
+) -> (Registry, RuntimeView) {
+    fixture_soul_with_cleanup(
+        root,
+        certify_loss,
+        provider,
+        None,
+        native_id,
+        verified_empty,
+    )
+    .await
+}
+
+async fn fixture_soul_with_cleanup(
+    root: &std::path::Path,
+    certify_loss: bool,
+    provider: &str,
+    session_type: Option<&str>,
+    native_id: &str,
+    verified_empty: bool,
+) -> (Registry, RuntimeView) {
     let registry = Registry::open(root, None).unwrap();
     let soul_id = SoulId::new();
-    let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
-        "sessionId": "fresh-retained-thread", "provider": provider, "sessionType": session_type,
-        "runtimeVariant": provider, "providerStoreId": "store-test", "cwd": "/workspace",
-        "workspacePath": "/workspace", "runAsUid": 1000, "runAsGid": 1000,
-        "nativeSessionId": native_id
-    }))
-    .unwrap();
+    let fresh_agent = session_type.map(|session_type| {
+        serde_json::from_value(json!({
+            "sessionId": "fresh-retained-thread", "provider": provider, "sessionType": session_type,
+            "runtimeVariant": provider, "providerStoreId": "store-test", "cwd": "/workspace",
+            "workspacePath": "/workspace", "runAsUid": 1000, "runAsGid": 1000,
+            "nativeSessionId": native_id
+        }))
+        .unwrap()
+    });
+    let terminal = session_type.is_none().then(|| {
+        serde_json::from_value(json!({
+            "terminalId": "managed-terminal", "streamId": "managed-stream", "mode": provider,
+            "program": provider, "env":{"HOME":"/home/freshell/provider"}, "cwd": "/workspace", "runAsUid": 1000, "runAsGid": 1000,
+            "cols": 120, "rows": 30, "projectKey": "workspace", "workspacePath": "/workspace",
+            "createRequestId": "managed-terminal-create", "resumeSessionId": native_id
+        }))
+        .unwrap()
+    });
     let prepared = registry
         .prepare_launch(LaunchPreparation {
             soul_id: soul_id.clone(),
@@ -156,8 +204,8 @@ pub(super) async fn fixture_fresh_soul_with_cleanup(
             profile: RuntimeProfile::Custom,
             project_key: "workspace".into(),
             fixture: None,
-            terminal: None,
-            fresh_agent: Some(fresh_agent),
+            terminal,
+            fresh_agent,
             view_intent: None,
             admission: AdmissionPolicy::default(),
         })
@@ -204,7 +252,11 @@ pub(super) async fn fixture_fresh_soul_with_cleanup(
                 incarnation_id: launch.incarnation_id,
                 launch_nonce: launch.launch_nonce,
                 evidence_revision: launch.evidence_revision,
-                source: NativeIdentitySource::FreshProviderHandshake,
+                source: match (session_type, provider) {
+                    (None, "codex") => NativeIdentitySource::CodexAppServer,
+                    (None, "opencode") => NativeIdentitySource::OpencodeTui,
+                    _ => NativeIdentitySource::FreshProviderHandshake,
+                },
                 evidence_digest: "a".repeat(64),
             },
             context.write_fence(),
@@ -297,6 +349,11 @@ pub(super) async fn fixture_fresh_soul_with_cleanup(
         ),
     ]
     .into_iter()
+    .filter(|(path, _, _)| {
+        freshell_agent_runtime::recovery_paths(provider)
+            .unwrap()
+            .contains(path)
+    })
     .map(|(path, store_state, reason)| RecoveryPathEvidence {
         path,
         store_state: if path == RecoveryPath::NativeResume {
