@@ -189,9 +189,6 @@ type ProviderPathInputBindings = HashMap<
 >;
 pub(crate) type LiveResumeEvidenceKey = (String, String, Option<String>);
 
-#[cfg(test)]
-use crate::registry::OrdinaryStopTimings;
-
 #[derive(Clone)]
 pub struct Supervisor {
     pub(crate) registry: Registry,
@@ -212,8 +209,6 @@ pub struct Supervisor {
     /// Reply budgets for supervisor→session-host commands, read once.
     pub(crate) host_command_budgets: HostCommandBudgets,
     pub(crate) provider_callback_budgets: ProviderCallbackBudgets,
-    #[cfg(test)]
-    ordinary_stop_timings: Option<OrdinaryStopTimings>,
 }
 
 impl Supervisor {
@@ -275,18 +270,11 @@ impl Supervisor {
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
             host_command_budgets: HostCommandBudgets::from_env(),
             provider_callback_budgets: ProviderCallbackBudgets::default(),
-            #[cfg(test)]
-            ordinary_stop_timings: None,
         })
     }
 
     pub fn registry(&self) -> &Registry {
         &self.registry
-    }
-
-    #[cfg(test)]
-    fn note_ordinary_stop_time(&self, stage: &'static str) {
-        crate::registry::note_ordinary_stop_time(&self.ordinary_stop_timings, stage);
     }
 
     pub(crate) async fn lifecycle_lock(&self, soul_id: &SoulId) -> Arc<Mutex<()>> {
@@ -4592,14 +4580,7 @@ impl Supervisor {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let outcome = self.finish_stop_handle(&handle).await?;
-        #[cfg(test)]
-        self.note_ordinary_stop_time("final_view_started");
         let view = find_view(&self.registry, handle.incarnation_id()).await?;
-        #[cfg(test)]
-        self.note_ordinary_stop_time("final_view_finished");
-        drop(_lifecycle_guard);
-        #[cfg(test)]
-        self.note_ordinary_stop_time("lifecycle_guard_released");
         Ok((outcome, view))
     }
 
@@ -4611,10 +4592,6 @@ impl Supervisor {
         reason: &str,
     ) {
         let fence = handle.stop_fence().ok();
-        #[cfg(test)]
-        if event == "supervisor.stop_outcome" {
-            self.note_ordinary_stop_time("outcome_log_started");
-        }
         append_event(
             &self.config.lifecycle_log,
             event,
@@ -4625,10 +4602,6 @@ impl Supervisor {
                 "controlEpoch":self.registry.control_epoch(), "reason":reason,
             }),
         );
-        #[cfg(test)]
-        if event == "supervisor.stop_outcome" {
-            self.note_ordinary_stop_time("outcome_log_finished");
-        }
     }
 
     /// The caller owns the lifecycle lock. This continues the captured Stop;
@@ -4665,14 +4638,10 @@ impl Supervisor {
             }
             // The same transaction persists the typed outcome, releases the
             // writer, and records the exact pending revoke before external IO.
-            #[cfg(test)]
-            self.note_ordinary_stop_time("outcome_transaction_started");
             self.registry
                 .record_ordinary_stop_outcome(handle, outcome)
                 .await
                 .map_err(map_registry)?;
-            #[cfg(test)]
-            self.note_ordinary_stop_time("outcome_transaction_finished");
             stop_crash_boundary("ordinary_stop_after_outcome");
             outcome
         };
@@ -4745,21 +4714,10 @@ impl Supervisor {
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        #[cfg(test)]
+        match self
+            .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
+            .await
         {
-            self.note_ordinary_stop_time("initial_inspection_started");
-            if let Some(timings) = &self.ordinary_stop_timings {
-                timings
-                    .lock()
-                    .unwrap()
-                    .push(("initial_inspection_deadline", deadline.into_std()));
-            }
-        }
-        let inspection = self.verify_empty_before_classified(handle, deadline).await;
-        #[cfg(test)]
-        self.note_ordinary_stop_time("initial_inspection_returned");
-        match inspection {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
             Err(error) => {
@@ -4890,8 +4848,6 @@ impl Supervisor {
         status: Option<u16>,
     ) {
         let fence = handle.stop_fence().ok();
-        #[cfg(test)]
-        self.note_ordinary_stop_time("stage_log_started");
         append_event(
             &self.config.lifecycle_log,
             "supervisor.stop_stage_failed",
@@ -4902,8 +4858,6 @@ impl Supervisor {
                 "errorCode":code, "httpStatus":status,
             }),
         );
-        #[cfg(test)]
-        self.note_ordinary_stop_time("stage_log_finished");
     }
 
     fn stop_runtime_stage_failed(
@@ -12258,19 +12212,20 @@ mod interrupted_transaction_tests {
         if std::env::var(child_env).as_deref() == Ok("1") {
             return false;
         }
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test_name, "--nocapture"])
-                .env(child_env, "1")
-                .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
-                .output()
-                .unwrap()
-        })
-        .await
-        .unwrap();
+        // The coordinator owns a nested silence child. Let that child's own
+        // watchdog reap it before the coordinator's longer watchdog expires.
+        let seconds = match child_env {
+            "FRESHELL_DOCKER_SILENCE_COORDINATOR_TEST_CHILD" => 120,
+            // This coordinator runs three cases, each with its existing 35s
+            // guard. Leave its final inner watchdog time to reap its child.
+            "FRESHELL_RECOVERY_SILENCE_COORDINATOR_TEST_CHILD" => 170,
+            _ => 90,
+        };
+        let (output, timed_out) =
+            docker_stop_test_child_output(child_env, test_name, Duration::from_secs(seconds)).await;
         assert!(
-            output.status.success(),
-            "{}\n{}",
+            !timed_out && output.status.success(),
+            "exact Docker child timed_out={timed_out}\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -12284,23 +12239,120 @@ mod interrupted_transaction_tests {
         true
     }
 
-    fn ordinary_stop_timing_snapshot(
-        timings: &OrdinaryStopTimings,
-        accepted_at: Option<std::time::Instant>,
-    ) -> Vec<serde_json::Value> {
-        timings
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(stage, at)| {
-                let elapsed = accepted_at.map(|accepted| {
-                    at.checked_duration_since(accepted)
-                        .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
-                        .unwrap_or_else(|| -accepted.duration_since(*at).as_secs_f64() * 1000.0)
-                });
-                serde_json::json!({"stage":stage, "elapsedMs":elapsed})
+    async fn docker_stop_test_child_output(
+        child_env: &'static str,
+        test_name: &'static str,
+        limit: Duration,
+    ) -> (std::process::Output, bool) {
+        tokio::task::spawn_blocking(move || {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(child_env, "1")
+                .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Drain both pipes while polling the real clock: neither a full
+            // pipe nor paused Tokio time can defeat this exact-child bound.
+            let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    pipe.read_to_end(&mut bytes).unwrap();
+                    bytes
+                })
+            };
+            let stdout = drain(Box::new(child.stdout.take().unwrap()));
+            let stderr = drain(Box::new(child.stderr.take().unwrap()));
+            let deadline = std::time::Instant::now() + limit;
+            let (status, timed_out) = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break (status, false);
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break (child.wait().unwrap(), true);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            (
+                std::process::Output {
+                    status,
+                    stdout: stdout.join().unwrap(),
+                    stderr: stderr.join().unwrap(),
+                },
+                timed_out,
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn docker_stop_child_watchdog_reaps_a_blocked_child() {
+        const CHILD: &str = "FRESHELL_DOCKER_WATCHDOG_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok("1") {
+            // More than pipe capacity on both streams proves concurrent
+            // draining. A blocking worker also inhibits paused auto-advance.
+            tokio::time::pause();
+            tokio::task::spawn_blocking(|| {
+                eprint!("{}", "e".repeat(128 * 1024));
+                println!("{}", "o".repeat(128 * 1024));
+                eprintln!("watchdog fixture ready");
+                loop {
+                    std::thread::park();
+                }
             })
-            .collect()
+            .await
+            .unwrap();
+            unreachable!();
+        }
+        let (output, timed_out) = docker_stop_test_child_output(
+            CHILD,
+            "service::interrupted_transaction_tests::docker_stop_child_watchdog_reaps_a_blocked_child",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(timed_out, "a blocked child must hit the real watchdog");
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+        assert!(output.stdout.len() >= 128 * 1024);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("watchdog fixture ready"));
+    }
+
+    fn stop_custody(supervisor: &Supervisor, handle: &OwnedRuntimeHandle) -> (u64, u64) {
+        Connection::open(supervisor.registry.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM writer_claims WHERE incarnation_id=?1),\
+                 (SELECT count(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [handle.incarnation_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    // A normal concurrent SQLite writer can delay durable Stop bookkeeping
+    // without violating the independently bounded Docker exchange.
+    fn stop_outcome_writer(
+        supervisor: &Supervisor,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let connection = Connection::open(supervisor.registry.database_path()).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        let (start, started) = std::sync::mpsc::channel();
+        let (acquired, ready) = tokio::sync::oneshot::channel();
+        let holder = std::thread::spawn(move || {
+            started.recv_timeout(Duration::from_secs(15)).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let release_at = std::time::Instant::now() + Duration::from_millis(4_400);
+            let _ = acquired.send(());
+            std::thread::sleep(release_at.saturating_duration_since(std::time::Instant::now()));
+            connection.execute_batch("ROLLBACK").unwrap();
+        });
+        (start, ready, holder)
     }
 
     async fn complete_ordinary_stop_docker_silence() {
@@ -12315,150 +12367,81 @@ mod interrupted_transaction_tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut supervisor = open(dir.path());
-            let stop_timings = Arc::new(StdMutex::new(Vec::with_capacity(128)));
-            supervisor.ordinary_stop_timings = Some(stop_timings.clone());
-            supervisor.registry.ordinary_stop_timings = Some(stop_timings.clone());
             let id = seed(&supervisor, dir.path(), false).await;
             let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
             fixture.state.lock().unwrap().silence = Some(point);
             let fixture_host = host(&supervisor, dir.path()).await;
             let lock = supervisor.lifecycle_lock(&id).await;
-            let mut stopping = {
+            let writer = (point == "initial_inspect").then(|| stop_outcome_writer(&supervisor));
+            let stopping = {
                 let supervisor = supervisor.clone();
                 let id = id.clone();
-                tokio::spawn(async move {
-                    let result = supervisor.stop(id, Some(1)).await;
-                    supervisor.note_ordinary_stop_time("stop_returned");
-                    result
-                })
+                tokio::spawn(async move { supervisor.stop(id, Some(1)).await })
             };
-            // Measure the backend budget from an actual accepted inspection.
-            // Parallel suite setup can queue SQLite intent commits before any
-            // backend future exists; that is not time spent awaiting Docker.
-            tokio::time::timeout(Duration::from_secs(15), async {
-                while !fixture
-                    .state
-                    .lock()
-                    .unwrap()
-                    .requests
-                    .iter()
-                    .any(|r| r.contains("/json "))
-                {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            let acceptance_wait_exited = std::time::Instant::now();
-            let limit = Duration::from_secs(if point.starts_with("force_") { 7 } else { 4 });
-            let result_deadline = Instant::now() + limit;
+            // Real setup and earlier Stop stages finish before freezing time.
+            // Synchronize on the configured silent exchange, not the initial
+            // inspection when this case silences a later request/observation.
+            tokio::time::timeout(Duration::from_secs(15), fixture.silent_accepted.notified())
+                .await
+                .expect("Stop must reach its configured real silent exchange");
+            let holder = if let Some((start, acquired, holder)) = writer {
+                start.send(()).unwrap();
+                acquired.await.unwrap();
+                Some(holder)
+            } else {
+                None
+            };
+            let phase_started = fixture
+                .state
+                .lock()
+                .unwrap()
+                .silence_phase_started_at
+                .unwrap();
+            // Pinned Tokio rounds timer deadlines to milliseconds. This is
+            // timer precision, with no allowance for durable bookkeeping.
+            let backend_limit = Duration::from_secs(3) + Duration::from_millis(1);
+            tokio::time::pause();
+            let disconnected = tokio::time::timeout_at(
+                phase_started + backend_limit,
+                fixture.silent_disconnected.notified(),
+            )
+            .await;
+            let backend_elapsed = fixture
+                .state
+                .lock()
+                .unwrap()
+                .silent_eof_at
+                .map(|at| at.duration_since(phase_started));
+            // Later stages can issue healthy real Unix exchanges. Resume
+            // before those exchanges, durable bookkeeping and continuation;
+            // the independent real child watchdog bounds their liveness.
+            tokio::time::resume();
+            if disconnected.is_err()
+                || backend_elapsed.is_none_or(|elapsed| elapsed > backend_limit)
             {
-                let mut timings = stop_timings.lock().unwrap();
-                timings.push(("acceptance_wait_exited", acceptance_wait_exited));
-                timings.push(("result_deadline", result_deadline.into_std()));
-            }
-            let result = tokio::time::timeout_at(result_deadline, &mut stopping).await;
-            supervisor.note_ordinary_stop_time("result_sampled");
-            if result.is_err() {
-                // The timeout does not own/cancel the foreground Stop. Prove
-                // that it is still the old lock holder, then reap our task.
-                let lock_held = lock.try_lock().is_err();
-                assert!(lock_held);
-                let (accepted_at, transport) = {
-                    let state = fixture.state.lock().unwrap();
-                    let sampled_at = std::time::Instant::now();
-                    let accepted_at = state.first_inspection_at;
-                    (
-                        accepted_at,
-                        serde_json::json!({
-                            "acceptedInspectionElapsedMs": accepted_at.map(|at| sampled_at.duration_since(at).as_secs_f64() * 1000.0),
-                            "firstSilentEofElapsedMs": state.first_silent_eof_at.zip(accepted_at).map(|(eof, accepted)| eof.duration_since(accepted).as_secs_f64() * 1000.0),
-                            "disconnected": state.disconnected,
-                            "lifecycleLockHeld": lock_held,
-                        }),
-                    )
-                };
-                // This independent reader never uses the Registry's writable
-                // connection setup or extends the original Stop deadline.
-                // Its snapshot can be later than the transport/lock sample.
-                let database = supervisor.registry.database_path().to_path_buf();
-                let soul = id.as_str().to_owned();
-                let mut reader = tokio::task::spawn_blocking(move || {
-                    let started_at = std::time::Instant::now();
-                    let projection = (|| -> rusqlite::Result<serde_json::Value> {
-                        let connection = Connection::open_with_flags(
-                            database,
-                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                        )?;
-                        connection.busy_timeout(Duration::from_millis(25))?;
-                        connection.pragma_update(None, "query_only", true)?;
-                        connection.query_row(
-                            "SELECT p.incarnation_id,p.outcome,p.settled,p.intent_revision,p.execution_generation,w.count \
-                             FROM (SELECT count(*) AS count FROM writer_claims WHERE soul_id=?1) w \
-                             LEFT JOIN ordinary_stops p ON p.soul_id=?1 AND p.intent_revision=2",
-                            [soul],
-                            |row| {
-                                let incarnation: Option<String> = row.get(0)?;
-                                Ok(serde_json::json!({
-                                    "status":"observed", "rowPresent":incarnation.is_some(),
-                                    "incarnationId":incarnation,
-                                    "outcome":row.get::<_, Option<String>>(1)?,
-                                    "settled":row.get::<_, Option<bool>>(2)?,
-                                    "intentRevision":row.get::<_, Option<u64>>(3)?,
-                                    "executionGeneration":row.get::<_, Option<u64>>(4)?,
-                                    "writerCount":row.get::<_, u64>(5)?,
-                                }))
-                            },
-                        )
-                    })();
-                    serde_json::json!({
-                        "readStartedElapsedMs":accepted_at.map(|at| started_at.duration_since(at).as_secs_f64() * 1000.0),
-                        "readFinishedElapsedMs":accepted_at.map(|at| at.elapsed().as_secs_f64() * 1000.0),
-                        "projection":projection.unwrap_or_else(|_| serde_json::json!({"status":"unknown","reason":"query_error"})),
-                    })
+                let diagnostic = serde_json::json!({
+                    "severity":"error", "event":"test.ordinary_stop.failure_stage",
+                    "soulId":id, "phase":point,
+                    "backendLimitMs":backend_limit.as_millis(),
+                    "backendElapsedMs":backend_elapsed.map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+                    "silentEof":disconnected.is_ok(),
+                    "lifecycleLockHeld":lock.try_lock().is_err(),
                 });
-                let read = tokio::time::timeout(Duration::from_millis(100), &mut reader).await;
-                let reader_pending = read.is_err();
-                let registry = match read {
-                    Ok(Ok(snapshot)) => snapshot,
-                    Ok(Err(_)) => {
-                        serde_json::json!({"status":"unknown","reason":"reader_join_error"})
-                    }
-                    Err(_) => serde_json::json!({"status":"unknown","reason":"read_timeout"}),
-                };
-                let timings = ordinary_stop_timing_snapshot(&stop_timings, accepted_at);
                 stopping.abort();
                 let _ = stopping.await;
+                if let Some(holder) = holder {
+                    holder.join().unwrap();
+                }
                 close(fixture_host).await;
                 fixture.close().await;
-                // A timed-out blocking read remains owned: join it before the
-                // fixture directory is dropped, but keep its snapshot UNKNOWN.
-                if reader_pending {
-                    let _ = reader.await;
-                }
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "severity":"error", "event":"test.ordinary_stop.failure_stage",
-                        "soulId":id, "phase":point, "resultDeadlineMs":limit.as_millis(),
-                        "registryReadDeadlineMs":100, "transport":transport, "registry":registry,
-                        "timings":timings,
-                    })
-                );
-                failures.push(format!(
-                    "{point}: foreground Stop retained its lifecycle lock beyond {limit:?}"
-                ));
+                eprintln!("{diagnostic}");
+                failures.push(format!("{point}: backend exceeded its 3s phase"));
                 continue;
             }
-            let (outcome, view) = result.unwrap().unwrap().unwrap();
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "severity":"debug", "event":"test.ordinary_stop.timings", "phase":point,
-                    "timings":ordinary_stop_timing_snapshot(&stop_timings,
-                        fixture.state.lock().unwrap().first_inspection_at),
-                })
-            );
+            let (outcome, view) = stopping.await.unwrap().unwrap();
+            if let Some(holder) = holder {
+                holder.join().unwrap();
+            }
             let expected = if point == "error_observation" {
                 StopOutcome::TerminationUnconfirmed
             } else {
@@ -12507,6 +12490,9 @@ mod interrupted_transaction_tests {
             let progress = supervisor.registry.stop_progress(&handle).await.unwrap();
             assert_eq!(progress.outcome, Some(expected));
             assert!(!progress.settled);
+            let custody = stop_custody(&supervisor, &handle);
+            assert_eq!(custody, (1, 1), "unverified cleanup must retain custody");
+            assert_eq!(handle.stop_fence().unwrap().execution_generation, 0);
             assert_retained(&supervisor, dir.path(), 2).await;
             tokio::time::timeout(Duration::from_secs(1), async {
                 while fixture.state.lock().unwrap().disconnected == 0 {
@@ -12525,7 +12511,13 @@ mod interrupted_transaction_tests {
                 .unwrap()
                 .unwrap();
             let progress = supervisor.registry.stop_progress(&handle).await.unwrap();
-            assert_eq!(progress.outcome, Some(StopOutcome::VerifiedEmpty));
+            assert_eq!(
+                progress.outcome,
+                Some(StopOutcome::VerifiedEmpty),
+                "{point}: retry requests={:?}; events={}",
+                fixture.state.lock().unwrap().requests,
+                std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap(),
+            );
             assert!(progress.settled);
             assert!(supervisor
                 .registry
@@ -12534,11 +12526,8 @@ mod interrupted_transaction_tests {
                 .unwrap()
                 .is_empty());
             assert_retained(&supervisor, dir.path(), 2).await;
-            let writers: u64 = Connection::open(supervisor.registry.database_path())
-                .unwrap()
-                .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(writers, 0);
+            let custody = stop_custody(&supervisor, &handle);
+            assert_eq!(custody, (0, 0));
             assert!(!fixture
                 .state
                 .lock()
@@ -12546,7 +12535,7 @@ mod interrupted_transaction_tests {
                 .requests
                 .iter()
                 .any(|r| r.contains("/start") || r.contains("/create")));
-            eprintln!("bounded silent Docker {point}; same-intent observer completion verified");
+            eprintln!("bounded silent Docker {point}; 3s phase, custody and same-intent completion verified");
             close(fixture_host).await;
             fixture.close().await;
         }

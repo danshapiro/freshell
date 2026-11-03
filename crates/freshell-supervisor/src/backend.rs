@@ -2339,6 +2339,8 @@ pub(crate) mod tests {
         pub(crate) backend: DockerEngineBackend,
         pub(crate) digest: String,
         pub(crate) state: std::sync::Arc<std::sync::Mutex<StopDockerState>>,
+        pub(crate) silent_accepted: std::sync::Arc<tokio::sync::Notify>,
+        pub(crate) silent_disconnected: std::sync::Arc<tokio::sync::Notify>,
         shutdown: tokio::sync::oneshot::Sender<()>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -2355,6 +2357,8 @@ pub(crate) mod tests {
         pub(crate) disconnected: usize,
         pub(crate) first_inspection_at: Option<std::time::Instant>,
         pub(crate) first_silent_eof_at: Option<std::time::Instant>,
+        pub(crate) silence_phase_started_at: Option<tokio::time::Instant>,
+        pub(crate) silent_eof_at: Option<tokio::time::Instant>,
     }
 
     impl StopDockerFixture {
@@ -2421,7 +2425,13 @@ pub(crate) mod tests {
                 disconnected: 0,
                 first_inspection_at: None,
                 first_silent_eof_at: None,
+                silence_phase_started_at: None,
+                silent_eof_at: None,
             }));
+            let silent_accepted = std::sync::Arc::new(tokio::sync::Notify::new());
+            let silent_disconnected = std::sync::Arc::new(tokio::sync::Notify::new());
+            let silence_accepted = silent_accepted.clone();
+            let disconnected = silent_disconnected.clone();
             let socket = root.join("docker-stop.sock");
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
             let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -2439,6 +2449,8 @@ pub(crate) mod tests {
                             let (mut stream, _) = accepted.unwrap();
                             let state = server_state.clone();
                             let container = container_id.clone();
+                            let silence_accepted = silence_accepted.clone();
+                            let disconnected = disconnected.clone();
                             connections.spawn(async move {
                                 let mut header = Vec::new();
                                 while !header.ends_with(b"\r\n\r\n") {
@@ -2486,6 +2498,19 @@ pub(crate) mod tests {
                                         Some("error_observation") => inspect && after_stop,
                                         _ => false,
                                     };
+                                    // Keep the first observation's clock anchor: a
+                                    // later silent poll must not renew its budget.
+                                    let phase_started = match state.silence {
+                                        Some("graceful_observation" | "error_observation") => inspect && after_stop,
+                                        Some("force_observation") => inspect && after_force,
+                                        _ => silent,
+                                    };
+                                    if phase_started {
+                                        state.silence_phase_started_at.get_or_insert_with(tokio::time::Instant::now);
+                                    }
+                                    if silent {
+                                        silence_accepted.notify_one();
+                                    }
                                     state.requests.push(request.clone());
                                     let (status, response) = if request == format!("GET {DOCKER_API}/info HTTP/1.1") {
                                         (200, json!({"ID":state.daemon_id,"SecurityOptions":["name=rootless"]}))
@@ -2528,6 +2553,8 @@ pub(crate) mod tests {
                                     let mut state = state.lock().unwrap();
                                     state.disconnected += 1;
                                     state.first_silent_eof_at.get_or_insert_with(std::time::Instant::now);
+                                    state.silent_eof_at.get_or_insert_with(tokio::time::Instant::now);
+                                    disconnected.notify_one();
                                 } else {
                                     if let Some(delay) = stop_delay {
                                         tokio::time::sleep(delay).await;
@@ -2553,6 +2580,8 @@ pub(crate) mod tests {
                 backend: DockerEngineBackend::new(socket),
                 digest: immutable_digest_from_handle(handle).unwrap(),
                 state,
+                silent_accepted,
+                silent_disconnected,
                 shutdown,
                 task,
             }

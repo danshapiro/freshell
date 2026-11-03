@@ -23,20 +23,6 @@ use std::{
 };
 
 pub const SCHEMA_VERSION: u32 = 19;
-
-#[cfg(test)]
-pub(crate) type OrdinaryStopTimings =
-    Arc<std::sync::Mutex<Vec<(&'static str, std::time::Instant)>>>;
-
-#[cfg(test)]
-pub(crate) fn note_ordinary_stop_time(timings: &Option<OrdinaryStopTimings>, stage: &'static str) {
-    if let Some(timings) = timings {
-        timings
-            .lock()
-            .unwrap()
-            .push((stage, std::time::Instant::now()));
-    }
-}
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -187,8 +173,6 @@ pub struct Registry {
     inner: Arc<RegistryInner>,
     #[cfg(test)]
     pub(crate) retry_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
-    #[cfg(test)]
-    pub(crate) ordinary_stop_timings: Option<OrdinaryStopTimings>,
 }
 
 struct RegistryInner {
@@ -887,8 +871,6 @@ impl Registry {
         Ok(Self {
             #[cfg(test)]
             retry_clock: None,
-            #[cfg(test)]
-            ordinary_stop_timings: None,
             inner: Arc::new(RegistryInner {
                 db_path,
                 installation_id,
@@ -1762,8 +1744,6 @@ impl Registry {
         outcome: StopOutcome,
     ) -> Result<(), RegistryError> {
         let handle = handle.clone();
-        #[cfg(test)]
-        let timings = self.ordinary_stop_timings.clone();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let progress = validate_ordinary_stop(&tx, &handle)?;
@@ -1774,8 +1754,6 @@ impl Registry {
                     params![stop_outcome_name(outcome),pending,outcome == StopOutcome::VerifiedEmpty && !pending,now_millis(),handle.soul_id().as_str(),handle.incarnation_id().as_str(),handle.stop_fence()?.intent_revision])?;
             }
             tx.commit()?;
-            #[cfg(test)]
-            note_ordinary_stop_time(&timings, "outcome_transaction_committed");
             Ok(())
         }).await
     }
@@ -4227,15 +4205,7 @@ impl Registry {
     }
 
     pub async fn inventory(&self) -> Result<Vec<RuntimeView>, RegistryError> {
-        #[cfg(test)]
-        let timings = self.ordinary_stop_timings.clone();
-        self.run_blocking(move |conn| {
-            let inventory = load_inventory(&conn)?;
-            #[cfg(test)]
-            note_ordinary_stop_time(&timings, "inventory_read_completed");
-            Ok(inventory)
-        })
-        .await
+        self.run_blocking(move |conn| load_inventory(&conn)).await
     }
 
     /// Transfer stages remain pinned while a prepared or retryable launch can
@@ -4333,21 +4303,8 @@ impl Registry {
         F: FnOnce(Connection) -> Result<T, RegistryError> + Send + 'static,
     {
         let path = self.inner.db_path.clone();
-        #[cfg(test)]
-        let timings = self.ordinary_stop_timings.clone();
         tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            note_ordinary_stop_time(&timings, "registry_worker_entered");
             let conn = open_connection(&path)?;
-            #[cfg(test)]
-            note_ordinary_stop_time(&timings, "registry_connection_opened");
-            #[cfg(test)]
-            {
-                let result = f(conn);
-                note_ordinary_stop_time(&timings, "registry_worker_returned");
-                result
-            }
-            #[cfg(not(test))]
             f(conn)
         })
         .await
