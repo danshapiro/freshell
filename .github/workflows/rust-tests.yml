@@ -1,106 +1,429 @@
-name: Rust Tests
+name: FreshAgent merged-head sandboxed Rust proof
 
 on:
   workflow_dispatch:
-  pull_request:
 
 permissions:
   contents: read
 
-# Server-side enforcement for the class of red that landed via PR #795:
-# nothing between commit and main ran `cargo test`, so 11 failing freshagent
-# unit tests merged with every advisory check green. The pre-push gate now
-# runs targeted cargo tests locally (scripts/hooks/pre-push); this workflow
-# is the merge-time backstop that cannot be bypassed with --no-verify.
-#
-# The `gate` job always reports, so it can be a required status check without
-# blocking PRs that touch no Rust (a paths-filtered workflow would leave the
-# required check stuck on "Expected" forever).
+env:
+  SOURCE_SHA: ad7ca113fe764c55b9c3061b8aa77575b1bd38be
+  EVIDENCE_DIR: test-results/freshagent-rust-sandbox-proof
+  FRESHELL_SANDBOX_CACHE_PREFIX: freshagent-rust-proof-${{ github.run_id }}-${{ github.run_attempt }}
+  CI: 'true'
+  NO_COLOR: '1'
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+  rust-sandbox:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Detect Rust changes
-        id: filter
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact source
+        shell: bash
         run: |
-          # Manager and dependency configuration changes must exercise the
-          # Rust suite too: it spawns Node fixtures (the codex fake
-          # app-server imports `ws`) whose behavior depends on the installed
-          # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility. Scoped to the
-          # root and workspace members — the independent demo locks are
-          # not part of the workspace dependency tree.
-          # `github.base_ref` exists only for pull_request events; manual
-          # dispatch (the event-routing escape hatch) compares against the
-          # default branch instead.
-          BASE="${{ github.base_ref }}"
-          [ -n "$BASE" ] || BASE="main"
-          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  rust-tests:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-      - uses: Swatinem/rust-cache@v2
-      # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs the workspace dependencies installed
-      # or those tests die at fixture boot ("fake app-server exited before
-      # listening").
-      # Pinned revision of the v4 major; reads the exact version from the root
-      # packageManager pin (no floating duplicate).
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/proof-sha.txt"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_SHA"
+          test "$(git diff --name-only "$SOURCE_SHA" HEAD)" = '.github/workflows/rust-tests.yml'
+          git checkout --detach "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD | tee "$EVIDENCE_DIR/source-sha.txt"
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies (Rust test fixtures)
-        run: pnpm install --frozen-lockfile
-      - name: Workspace tests
-        # Workspace feature unification turns freshell-codex's default-off
-        # `real-transport` feature ON in this step (freshell-ws,
-        # freshell-server, freshell-session-host, and freshell-freshagent all
-        # depend on freshell-codex with the feature), so the
-        # remote_proxy_relay integration tests run here without an explicit
-        # --features flag. A bare `cargo test -p freshell-codex` would skip
-        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
-        # reports 38 tests; the same -p invocation reports 0).
-        # Keep the gate red on any failure, but report failures in later
-        # crates in the same run instead of stopping at the first suite.
-        run: cargo test --workspace --exclude freshell-tauri --locked --no-fail-fast
-
-  gate:
-    name: rust-gate
-    needs: [changes, rust-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Evaluate
+      - name: Install exact workspace dependencies
+        shell: bash
         run: |
-          if [ "${{ needs.changes.outputs.rust }}" = "false" ]; then
-            echo "no Rust changes in this PR — rust tests skipped"
-            exit 0
-          fi
-          if [ "${{ needs.rust-tests.result }}" = "success" ]; then
-            echo "workspace rust tests passed"
-            exit 0
-          fi
-          echo "workspace rust tests failed or did not run"
-          exit 1
+          set -euo pipefail
+          node --version | tee "$EVIDENCE_DIR/node-version.txt"
+          pnpm --version | tee "$EVIDENCE_DIR/pnpm-version.txt"
+          test "$(pnpm --version)" = '10.34.5'
+          pnpm install --frozen-lockfile
+      - name: Record isolated runner and Docker baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$GITHUB_WORKSPACE" | tee "$EVIDENCE_DIR/disk-before.txt"
+          docker version | tee "$EVIDENCE_DIR/docker-version.txt"
+          docker info --format '{{json .}}' > "$EVIDENCE_DIR/docker-info.json"
+          docker ps -aq --no-trunc | sort > "$EVIDENCE_DIR/containers-before.txt"
+          docker volume ls --format '{{.Name}}' | sort > "$EVIDENCE_DIR/volumes-before.txt"
+          docker network ls --format '{{.Name}}' | sort > "$EVIDENCE_DIR/networks-before.txt"
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          directory = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          baseline = set((directory / 'volumes-before.txt').read_text().splitlines())
+          workspace = os.path.realpath(os.environ['GITHUB_WORKSPACE'])
+          digest = hashlib.sha256(workspace.encode()).hexdigest()
+          prefix = os.environ['FRESHELL_SANDBOX_CACHE_PREFIX']
+          candidates = [prefix + suffix for suffix in ('-cargo-registry', '-cargo-git', '-pnpm-store', '-node-modules', '-sidecar-node-modules', '-mcp-node-modules', '-playwright-cache')]
+          candidates.append('freshell-sandbox-rust-target-v1-' + digest[:24])
+          collision = sorted(baseline.intersection(candidates))
+          if collision:
+              raise SystemExit('Refusing to use pre-existing proof volumes: ' + repr(collision))
+          PY
+      - name: Run full Rust suite in the strict Docker sandbox
+        shell: bash
+        env:
+          FRESHELL_RUST_TEST_SANDBOX: '1'
+        run: |
+          exec python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import signal
+          import subprocess
+          import sys
+          import time
+          
+          evidence = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          evidence.mkdir(parents=True, exist_ok=True)
+          log_path = evidence / 'rust-tests.log'
+          state_path = evidence / 'supervisor.json'
+          interesting = {'rust_test_sandbox_route_selected', 'sandbox_owner_guard_started', 'sandbox_workload_started',
+                         'sandbox_workload_finished', 'sandbox_workload_failed', 'sandbox_owner_guard_unsettled',
+                         'sandbox_owned_container_unsettled', 'rust_test_temp_created', 'provider_recovery_selector_finished'}
+          state = {'events': [], 'inspection': None, 'preparationInspection': None, 'errors': [], 'signal': None,
+                   'signalEscalated': False, 'runnerJoined': False, 'testExit': None}
+          child = None
+          signal_deadline = None
+          
+          def send_group(signum):
+              if child is not None:
+                  try:
+                      os.killpg(child.pid, signum)
+                  except ProcessLookupError:
+                      pass
+          
+          def request_stop(reason):
+              global signal_deadline
+              state['errors'].append(reason)
+              if signal_deadline is None:
+                  signal_deadline = time.monotonic() + 4
+              send_group(signal.SIGTERM)
+          
+          def handle_signal(signum, _frame):
+              global signal_deadline
+              if state['signal'] is None:
+                  state['signal'] = signal.Signals(signum).name
+                  signal_deadline = time.monotonic() + 4
+                  send_group(signum)
+              else:
+                  state['signalEscalated'] = True
+                  signal_deadline = time.monotonic()
+                  send_group(signal.SIGKILL)
+          
+          for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+              signal.signal(signum, handle_signal)
+          
+          offset = 0
+          partial = b''
+          def collect_events():
+              global offset, partial
+              with log_path.open('rb') as stream:
+                  stream.seek(offset)
+                  data = stream.read()
+                  offset = stream.tell()
+              lines = (partial + data).split(b'\n')
+              partial = lines.pop()
+              for line in lines:
+                  try:
+                      row = json.loads(line)
+                  except (ValueError, UnicodeDecodeError):
+                      continue
+                  if isinstance(row, dict) and row.get('event') in interesting:
+                      state['events'].append(row)
+          
+          def inspect_preparation():
+              guards = [row.get('container') for row in state['events'] if row.get('event') == 'sandbox_owner_guard_started']
+              if not guards or state['preparationInspection'] is not None:
+                  return
+              name = guards[0]
+              if not isinstance(name, str) or not name.startswith('freshell-sandbox-') or not name[len('freshell-sandbox-'):].isalnum():
+                  return
+              try:
+                  result = subprocess.run(['docker', 'inspect', name], text=True, capture_output=True, timeout=2)
+                  if result.returncode:
+                      return
+                  row = json.loads(result.stdout)[0]
+                  state['preparationInspection'] = {'container': name, 'running': row['State']['Running'],
+                      'expectedImage': row['Config']['Image'] == 'freshell-sandbox:latest',
+                      'network': row['HostConfig']['NetworkMode'], 'readOnlyRoot': row['HostConfig']['ReadonlyRootfs']}
+              except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+                  pass
+          
+          def inspect_execution():
+              guards = [row.get('container') for row in state['events'] if row.get('event') == 'sandbox_owner_guard_started']
+              if len(guards) < 2 or state['inspection'] is not None or state['errors']:
+                  return
+              name = guards[1]
+              if not isinstance(name, str) or not name.startswith('freshell-sandbox-') or not name[len('freshell-sandbox-'):].isalnum():
+                  request_stop('invalid execution container identity')
+                  return
+              try:
+                  result = subprocess.run(['docker', 'inspect', name], text=True, capture_output=True, timeout=2)
+                  if result.returncode:
+                      return
+                  row = json.loads(result.stdout)[0]
+                  host = row['HostConfig']
+                  mounts = [{'type': m['Type'], 'name': m.get('Name'), 'source': m['Source'],
+                             'destination': m['Destination'], 'rw': m['RW']} for m in row['Mounts']]
+                  workspace = os.path.realpath(os.environ['GITHUB_WORKSPACE'])
+                  digest = hashlib.sha256(workspace.encode()).hexdigest()
+                  prefix = os.environ['FRESHELL_SANDBOX_CACHE_PREFIX']
+                  target = 'freshell-sandbox-rust-target-v1-' + digest[:24]
+                  expected = {
+                      '/workspace': ('bind', workspace),
+                      '/usr/local/cargo/registry': ('volume', prefix + '-cargo-registry'),
+                      '/usr/local/cargo/git': ('volume', prefix + '-cargo-git'),
+                      '/home/sandbox/.local/share/pnpm/store': ('volume', prefix + '-pnpm-store'),
+                      '/workspace/target': ('volume', target),
+                      '/freshell-test-artifacts': ('volume', target),
+                      '/workspace/node_modules': ('volume', prefix + '-node-modules'),
+                      '/workspace/crates/freshell-claude-sidecar/node_modules': ('volume', prefix + '-sidecar-node-modules'),
+                      '/workspace/packages/freshell-mcp-runtime/node_modules': ('volume', prefix + '-mcp-node-modules'),
+                      '/home/sandbox/.cache/ms-playwright': ('volume', prefix + '-playwright-cache'),
+                  }
+                  actual = {mount['destination']: (mount['type'], os.path.realpath(mount['source']) if mount['type'] == 'bind' else mount['name'])
+                            for mount in mounts}
+                  checks = {
+                      'running': row['State']['Running'], 'expectedImage': row['Config']['Image'] == 'freshell-sandbox:latest',
+                      'networkNone': host['NetworkMode'] == 'none', 'readOnlyRoot': host['ReadonlyRootfs'],
+                      'noNewPrivileges': any(option in ('no-new-privileges', 'no-new-privileges:true') for option in host.get('SecurityOpt') or []),
+                      'privatePidNamespace': host['PidMode'] != 'host', 'notPrivileged': not host['Privileged'],
+                      'exactExpectedMounts': len(actual) == len(mounts) and actual == expected,
+                      'noDirectDockerSocketMount': not any('docker.sock' in str(mount) for mount in mounts),
+                      'memoryLimit': host['Memory'] == 8 * 1024 * 1024 * 1024, 'pidLimit': host['PidsLimit'] == 512,
+                  }
+                  state['inspection'] = {'container': name, 'checks': checks, 'mounts': mounts,
+                                         'socketScope': 'Checks exact direct mounts; sockets inside mounted directories are not enumerated.'}
+                  (evidence / 'sandbox-inspect.json').write_text(json.dumps(state['inspection'], indent=2) + '\n')
+                  if not all(checks.values()):
+                      request_stop('strict execution container failed inspection')
+              except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError) as error:
+                  request_stop('execution inspection failed: ' + str(error))
+          
+          try:
+              source = subprocess.run(['git', 'rev-parse', 'HEAD'], text=True, capture_output=True, check=True).stdout.strip()
+              if source != os.environ['SOURCE_SHA']:
+                  raise RuntimeError('source SHA changed before execution')
+              if state['signal'] is not None:
+                  raise RuntimeError('signal received before execution')
+              with log_path.open('wb') as output:
+                  child = subprocess.Popen(['pnpm', 'run', 'test:rust'], stdout=output, stderr=subprocess.STDOUT,
+                                           start_new_session=True, env=os.environ.copy())
+                  if state['signal'] is not None:
+                      send_group(getattr(signal, state['signal']))
+                  heartbeat = time.monotonic()
+                  while child.poll() is None:
+                      collect_events()
+                      inspect_preparation()
+                      inspect_execution()
+                      if signal_deadline is not None and time.monotonic() >= signal_deadline:
+                          state['errors'].append('runner did not settle after signal')
+                          send_group(signal.SIGKILL)
+                          break
+                      if time.monotonic() - heartbeat >= 30:
+                          print('sandboxed Rust runner remains active', flush=True)
+                          heartbeat = time.monotonic()
+                      time.sleep(1)
+          finally:
+              if child is not None:
+                  if child.poll() is None:
+                      send_group(signal.SIGTERM)
+                      try:
+                          child.wait(timeout=2 if state['signal'] is not None else 4)
+                      except subprocess.TimeoutExpired:
+                          state['errors'].append('runner required forced termination')
+                          send_group(signal.SIGKILL)
+                  try:
+                      child.wait(timeout=1)
+                      state['runnerJoined'] = True
+                      state['testExit'] = child.returncode
+                  except subprocess.TimeoutExpired:
+                      state['errors'].append('runner could not be joined after termination')
+                  if state['runnerJoined']:
+                      try:
+                          os.killpg(child.pid, 0)
+                      except ProcessLookupError:
+                          state['runnerGroupSettled'] = True
+                      else:
+                          state['errors'].append('runner process group still exists after join')
+                          send_group(signal.SIGKILL if state['signal'] is not None else signal.SIGTERM)
+                          deadline = time.monotonic() + (0.5 if state['signal'] is not None else 2)
+                          while time.monotonic() < deadline:
+                              try:
+                                  os.killpg(child.pid, 0)
+                              except ProcessLookupError:
+                                  state['runnerGroupSettled'] = True
+                                  break
+                              time.sleep(0.1)
+                          else:
+                              send_group(signal.SIGKILL)
+                              state['runnerGroupSettled'] = False
+              if log_path.exists():
+                  collect_events()
+              names = [row.get('event') for row in state['events']]
+              if 'rust_test_sandbox_route_selected' not in names or 'rust_test_temp_created' not in names:
+                  state['errors'].append('sandbox route or inner runner not observed')
+              if state['inspection'] is None:
+                  state['errors'].append('strict execution container not inspected')
+              if state['testExit'] == 0 and 'provider_recovery_selector_finished' not in names:
+                  state['errors'].append('provider recovery suite completion missing')
+              state_path.write_text(json.dumps(state, indent=2) + '\n')
+              print(json.dumps({'runnerJoined': state['runnerJoined'], 'testExit': state['testExit'],
+                                'signal': state['signal'], 'errors': state['errors']}), flush=True)
+              if log_path.exists() and (state['testExit'] != 0 or state['errors']):
+                  print('Last output from sandboxed Rust runner:', flush=True)
+                  print('\n'.join(log_path.read_text(errors='replace').splitlines()[-120:]), flush=True)
+          
+          if state['signal'] is not None or state['testExit'] != 0 or state['errors']:
+              raise SystemExit(1)
+          PY
+      - name: Record and clean only this proof's sandbox resources
+        if: always()
+        shell: bash
+        run: |
+          exec python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import time
+          
+          evidence = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          evidence.mkdir(parents=True, exist_ok=True)
+          receipt = {'containers': [], 'removedVolumes': [], 'networkRemoved': False, 'errors': []}
+          
+          def call(args):
+              return subprocess.run(args, text=True, capture_output=True, timeout=15)
+          
+          def read_set(name):
+              return set((evidence / name).read_text().splitlines())
+          
+          try:
+              state = json.loads((evidence / 'supervisor.json').read_text())
+              if not state.get('runnerJoined') or not state.get('runnerGroupSettled'):
+                  receipt['errors'].append('runner and its process group were not proven settled')
+              events = state['events']
+              guards = [row.get('container') for row in events if row.get('event') == 'sandbox_owner_guard_started']
+              starts = [row.get('container') for row in events if row.get('event') == 'sandbox_workload_started']
+              completions = [row.get('container') for row in events if row.get('event') in ('sandbox_workload_finished', 'sandbox_workload_failed')]
+              unsettled = [row for row in events if row.get('event') in ('sandbox_owner_guard_unsettled', 'sandbox_owned_container_unsettled')]
+              inspection = state.get('inspection') or {}
+              preparation = state.get('preparationInspection') or {}
+              names = set(guards + starts + completions + [row.get('container') for row in unsettled])
+              if inspection.get('container') is not None:
+                  names.add(inspection['container'])
+              if preparation.get('container') is not None:
+                  names.add(preparation['container'])
+              valid_names = all(isinstance(name, str) and re.fullmatch(r'freshell-sandbox-[a-zA-Z0-9]+', name) for name in names)
+              shared = valid_names and set(guards) == set(starts) == set(completions) == names
+              execution = (shared and len(guards) == len(starts) == len(completions) == 2 and len(set(guards)) == 2
+                           and inspection.get('container') == guards[1] and all((inspection.get('checks') or {}).values())
+                           and bool(inspection.get('checks')))
+              failed_rows = [row for row in events if row.get('event') == 'sandbox_workload_failed']
+              preparation_failed = (shared and len(guards) == len(starts) == len(completions) == 1
+                  and preparation.get('container') == guards[0] and preparation.get('running') and preparation.get('expectedImage')
+                  and preparation.get('network') == 'freshell-sandbox' and preparation.get('readOnlyRoot') is False
+                  and len(failed_rows) == 1 and failed_rows[0].get('container') == guards[0]
+                  and isinstance(failed_rows[0].get('code'), int) and failed_rows[0]['code'] != 0
+                  and isinstance(state.get('testExit'), int) and state['testExit'] != 0 and state.get('signal') is None
+                  and not inspection and not any(row.get('event') == 'rust_test_temp_created' for row in events))
+              complete = execution or preparation_failed
+              receipt['identityEvidenceComplete'] = complete
+              receipt['executionContainer'] = inspection.get('container')
+              receipt['phase'] = 'execution' if execution else 'preparation-failed' if preparation_failed else 'unconfirmed'
+              receipt['testExit'] = state.get('testExit')
+              if not complete:
+                  receipt['errors'].append('container identities or execution inspection are incomplete')
+              if unsettled:
+                  receipt['errors'].append('sandbox guard or owned container reported unsettled')
+              names = sorted(name for name in names if isinstance(name, str) and re.fullmatch(r'freshell-sandbox-[a-zA-Z0-9]+', name))
+              baseline = read_set('containers-before.txt')
+              deadline = time.monotonic() + 30
+              while True:
+                  listed = call(['docker', 'ps', '-aq', '--no-trunc'])
+                  if listed.returncode:
+                      raise RuntimeError('unable to list Docker containers: ' + listed.stderr.strip())
+                  new_ids = sorted(set(listed.stdout.splitlines()) - baseline)
+                  checks = []
+                  for name in names:
+                      result = call(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'name=^/' + name + '$'])
+                      if result.returncode:
+                          raise RuntimeError('unable to check container ' + name + ': ' + result.stderr.strip())
+                      checks.append({'name': name, 'remaining': result.stdout.splitlines()})
+                  if not new_ids and all(not item['remaining'] for item in checks):
+                      break
+                  if time.monotonic() >= deadline:
+                      break
+                  time.sleep(1)
+              receipt['containers'] = checks
+              receipt['newContainerIds'] = new_ids
+              if new_ids or any(item['remaining'] for item in checks):
+                  receipt['errors'].append('new or named containers were not proven absent')
+              if not receipt['errors']:
+                  before = read_set('volumes-before.txt')
+                  workspace = os.path.realpath(os.environ['GITHUB_WORKSPACE'])
+                  digest = hashlib.sha256(workspace.encode()).hexdigest()
+                  prefix = os.environ['FRESHELL_SANDBOX_CACHE_PREFIX']
+                  candidates = [prefix + suffix for suffix in ('-cargo-registry', '-cargo-git', '-pnpm-store', '-node-modules', '-sidecar-node-modules', '-mcp-node-modules', '-playwright-cache')]
+                  target = 'freshell-sandbox-rust-target-v1-' + digest[:24]
+                  candidates.append(target)
+                  listed = call(['docker', 'volume', 'ls', '--format', '{{.Name}}'])
+                  if listed.returncode:
+                      raise RuntimeError('unable to list Docker volumes')
+                  present = set(listed.stdout.splitlines())
+                  for volume in candidates:
+                      if volume in before or volume not in present:
+                          continue
+                      if volume == target:
+                          inspected = call(['docker', 'volume', 'inspect', volume])
+                          if inspected.returncode:
+                              raise RuntimeError('unable to inspect target volume')
+                          labels = json.loads(inspected.stdout)[0]['Labels'] or {}
+                          if labels.get('com.freshell.cache.worktree-sha256') != digest or labels.get('com.freshell.cache.owner') != 'freshell':
+                              raise RuntimeError('target volume identity mismatch: ' + volume)
+                      removed = call(['docker', 'volume', 'rm', volume])
+                      if removed.returncode:
+                          raise RuntimeError('volume removal failed: ' + volume + ': ' + removed.stderr.strip())
+                      receipt['removedVolumes'].append(volume)
+                  after = call(['docker', 'volume', 'ls', '--format', '{{.Name}}'])
+                  if after.returncode or (set(after.stdout.splitlines()) - before).intersection(candidates):
+                      raise RuntimeError('proof volumes not proven absent')
+                  if 'freshell-sandbox' not in read_set('networks-before.txt'):
+                      networks = call(['docker', 'network', 'ls', '--format', '{{.Name}}'])
+                      if networks.returncode:
+                          raise RuntimeError('unable to list Docker networks')
+                      if 'freshell-sandbox' in networks.stdout.splitlines():
+                          removed = call(['docker', 'network', 'rm', 'freshell-sandbox'])
+                          if removed.returncode:
+                              raise RuntimeError('sandbox network removal failed: ' + removed.stderr.strip())
+                          receipt['networkRemoved'] = True
+          except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, RuntimeError) as error:
+              receipt['errors'].append(str(error))
+          
+          receipt['ok'] = not receipt['errors']
+          (evidence / 'cleanup.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt), flush=True)
+          raise SystemExit(0 if receipt['ok'] else 1)
+          PY
+      - name: Preserve sandbox proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freshagent-sandboxed-rust-ad7ca113f
+          path: test-results/freshagent-rust-sandbox-proof/
+          if-no-files-found: error
+          retention-days: 7
