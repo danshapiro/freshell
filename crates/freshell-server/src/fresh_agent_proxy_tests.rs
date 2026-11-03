@@ -1661,18 +1661,16 @@ async fn hosted_created_frame_uses_the_public_request_identity() {
         checkpoint_barrier: OnceLock::new(),
         ownership: OnceLock::new(),
     };
-    proxy
-        .forward_host_event(
-            AgentEvent::Provider {
-                payload: serde_json::json!({
-                    "type":"freshAgent.created", "requestId":"host-internal", "sessionId":"native"
-                }),
-            },
-            "claude",
-            "public",
-            "freshclaude",
-        )
-        .await;
+    proxy.forward_host_event(
+        AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.created", "requestId":"host-internal", "sessionId":"native"
+            }),
+        },
+        "claude",
+        "public",
+        "freshclaude",
+    );
     assert!(
         receiver.try_recv().is_err(),
         "internal create ID must not reach the client"
@@ -2830,7 +2828,11 @@ async fn codex_resumed_presentation_receives_retained_state_and_controls() {
                 "source":{"soulId":"codex-journal-soul","incarnationId":"journal-incarnation","hostBootId":"journal-boot","projectionId":"owned","ownerEpoch":0,"ownerGeneration":0},
                 "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-b","turns":[{"id":"retained-turn"}]},
                 "attentionMarks":[],
-                "pendingControls":[{"type":"freshAgent.permission.request","sessionId":"native-b","requestId":"pending-control"}]
+                "pendingControls":[
+                    {"type":"freshAgent.permission.request","sessionId":"native-b","requestId":"pending-control"},
+                    {"type":"freshAgent.question.request","sessionId":"native-b","requestId":"pending-question"},
+                    {"type":"freshAgent.elicitation.request","sessionId":"native-b","requestId":"pending-elicitation"}
+                ]
             })),
         };
         let (_dir, proxy, mut frames, server) =
@@ -2867,7 +2869,7 @@ async fn codex_resumed_presentation_receives_retained_state_and_controls() {
         };
         let mut received = Vec::<serde_json::Value>::new();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while received.len() < expected.len() * 3 {
+            while received.len() < expected.len() * 5 {
                 received.push(serde_json::from_str(&frames.recv().await.unwrap()).unwrap());
             }
         }).await.expect("every selected presentation must receive materialization, retained state and pending controls");
@@ -2880,7 +2882,10 @@ async fn codex_resumed_presentation_receives_retained_state_and_controls() {
             assert!(received.iter().any(|frame| frame["sessionId"] == *id
                 && frame["event"]["retainedState"]["snapshot"]["threadId"] == "native-b"
                 && frame["event"]["retainedState"]["snapshot"]["turns"][0]["id"]
-                    == "retained-turn"));
+                    == "retained-turn"
+                && frame["event"]["retainedState"]["snapshot"]
+                    .get("pendingApprovals")
+                    .is_none()));
             assert!(
                 received.iter().any(|frame| frame["sessionId"] == *id
                     && frame["event"]["type"] == "freshAgent.permission.request"
@@ -2888,6 +2893,18 @@ async fn codex_resumed_presentation_receives_retained_state_and_controls() {
                     && frame["event"]["requestId"] == "pending-control"),
                 "the pending control must address its presentation {id}"
             );
+            for (kind, request) in [
+                ("question", "pending-question"),
+                ("elicitation", "pending-elicitation"),
+            ] {
+                assert!(
+                    received.iter().any(|frame| frame["sessionId"] == *id
+                        && frame["event"]["type"] == format!("freshAgent.{kind}.request")
+                        && frame["event"]["sessionId"] == *id
+                        && frame["event"]["requestId"] == request),
+                    "the accepted {kind} must address its presentation {id}"
+                );
+            }
         }
         assert!(received
             .iter()
@@ -5310,6 +5327,8 @@ mod readiness_tests;
 
 #[path = "fresh_agent_proxy_materialization_tests.rs"]
 mod materialization_tests;
+#[path = "fresh_agent_proxy_review_repairs_tests.rs"]
+mod review_repairs;
 
 // The provider and host socket below are simulated; the actor, supervisor,
 // registry, runtime client, and gateway poller are the production paths.
@@ -5333,16 +5352,26 @@ mod codex_replacement_realpath {
         service::{Supervisor, SupervisorConfig},
     };
     use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::{
         sync::{mpsc, oneshot},
         task::JoinSet,
     };
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeOutcome {
+        Accepted,
+        Refused,
+        Ambiguous,
+    }
+
     struct FakeNative {
         source: mpsc::Sender<AgentEvent>,
         stream: StdMutex<Option<mpsc::Receiver<AgentEvent>>>,
         release: Mutex<Option<oneshot::Receiver<()>>>,
+        outcome: NativeOutcome,
+        resolutions: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -5361,6 +5390,22 @@ mod codex_replacement_realpath {
         ) -> Result<DispatchAck, DispatchFailure> {
             assert_eq!(request.as_str(), "replacement-through-supervisor");
             assert_eq!(profile.native_session_id.as_deref(), Some("native-a"));
+            // The real bridge converts these three raw provider controls to
+            // PermissionRequested before they enter the actor journal.
+            for kind in ["permission", "question", "elicitation"] {
+                let decision_id = format!("{kind}-b");
+                self.source
+                    .send(AgentEvent::PermissionRequested {
+                        decision_id: decision_id.clone(),
+                        payload: serde_json::json!({"type":format!("freshAgent.{kind}.request"),
+                        "sessionId":"native-b", "requestId":decision_id}),
+                    })
+                    .await
+                    .map_err(|_| DispatchFailure {
+                        message: "actor event stream closed".into(),
+                        acceptance_ambiguous: false,
+                    })?;
+            }
             for payload in [
                 serde_json::json!({"type":"freshAgent.session.materialized", "provider":"codex",
                     "sessionType":"freshcodex", "previousSessionId":"native-a", "sessionId":"native-b",
@@ -5387,6 +5432,21 @@ mod codex_replacement_realpath {
                 message: "native acknowledgment not released".into(),
                 acceptance_ambiguous: true,
             })?;
+            match self.outcome {
+                NativeOutcome::Refused => {
+                    return Err(DispatchFailure {
+                        message: "native dispatch refused".into(),
+                        acceptance_ambiguous: false,
+                    })
+                }
+                NativeOutcome::Ambiguous => {
+                    return Err(DispatchFailure {
+                        message: "native dispatch outcome unknown".into(),
+                        acceptance_ambiguous: true,
+                    })
+                }
+                NativeOutcome::Accepted => {}
+            }
             Ok(DispatchAck {
                 provider_ack_id: Some("replacement-turn".into()),
                 native_identity: Some(NativeDispatchIdentity {
@@ -5402,7 +5462,8 @@ mod codex_replacement_realpath {
             _: &str,
             _: serde_json::Value,
         ) -> Result<(), DispatchFailure> {
-            unreachable!("no permission request")
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
         async fn interrupt(&self) -> Result<(), String> {
             unreachable!("no interrupt")
@@ -5508,12 +5569,20 @@ mod codex_replacement_realpath {
                             }
                             HostCommand::Status { incarnation_id } => {
                                 assert_eq!(incarnation_id, host.incarnation);
+                                let native = host.actor.profile().await.native_session_id;
+                                let mut observation = host.observation.clone();
+                                if native.as_deref() == Some("native-b") {
+                                    // The real host advances its binding when the accepted
+                                    // replacement changes the supervisor's launch revision.
+                                    observation.native_session_id = "native-b".into();
+                                    observation.evidence_revision += 1;
+                                }
                                 HostResult::Status {
                                     host_boot_id: host.boot.clone(), worker_pid: Some(123), worker_launch_count: 1,
                                     max_control_epoch: host.epoch, max_execution_generation: host.generation,
                                     fixture_evidence: serde_json::json!({}), exited: false,
-                                    native_session_id: Some("native-a".into()),
-                                    native_identity_observation: Some(host.observation.clone()),
+                                    native_session_id: native,
+                                    native_identity_observation: Some(observation),
                                     opencode_transfer_receipt: None, opencode_adoption: Default::default(),
                                 }
                             }
@@ -5559,6 +5628,17 @@ mod codex_replacement_realpath {
                                 let batch = host.actor.read_events(after_sequence, max_events as usize).await;
                                 host.reads.lock().unwrap().push(HostRead { after: after_sequence, batch: batch.clone() });
                                 HostResult::FreshAgentEvents(batch)
+                            }
+                            HostCommand::FreshAgentResolve { incarnation_id, decision_id, decision } => {
+                                assert_eq!(incarnation_id, host.incarnation);
+                                if host.actor.resolve_permission(&decision_id, decision).await.is_err() {
+                                    let result = Err(freshell_runtime_protocol::RuntimeError::new(
+                                        RuntimeErrorCode::HostUnreachable, "owned fake control was refused"));
+                                    write_frame(&mut stream, &HostReply { request_id: request.request_id, result }).await.unwrap();
+                                    return;
+                                }
+                                HostResult::FreshAgentCommand { state:CommandState::Completed, native_session_id:None,
+                                    claude_fork:None, native_identity:None }
                             }
                             other => panic!("unexpected in-process host command: {other:?}"),
                         };
@@ -5615,15 +5695,25 @@ mod codex_replacement_realpath {
 
     #[tokio::test]
     async fn codex_accepted_replacement_crosses_supervisor_actor_poller() {
-        accepted_replacement_across_realpath(false).await;
+        replacement_across_realpath(false, NativeOutcome::Accepted).await;
     }
 
     #[tokio::test]
     async fn codex_late_accepted_replacement_reconciles_after_lost_reply() {
-        accepted_replacement_across_realpath(true).await;
+        replacement_across_realpath(true, NativeOutcome::Accepted).await;
     }
 
-    async fn accepted_replacement_across_realpath(lose_send_reply: bool) {
+    #[tokio::test]
+    async fn review_refused_replacement_controls_remain_hidden_and_unactionable() {
+        replacement_across_realpath(true, NativeOutcome::Refused).await;
+    }
+
+    #[tokio::test]
+    async fn review_ambiguous_replacement_controls_remain_hidden_and_unactionable() {
+        replacement_across_realpath(true, NativeOutcome::Ambiguous).await;
+    }
+
+    async fn replacement_across_realpath(lose_send_reply: bool, outcome: NativeOutcome) {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().to_string_lossy().into_owned();
         let runtime = root.path().join("runtime");
@@ -5727,10 +5817,13 @@ mod codex_replacement_realpath {
 
         let (source, stream) = mpsc::channel(16);
         let (release_tx, release_rx) = oneshot::channel();
+        let resolutions = Arc::new(AtomicUsize::new(0));
         let native = Arc::new(FakeNative {
             source: source.clone(),
             stream: StdMutex::new(Some(stream)),
             release: Mutex::new(Some(release_rx)),
+            outcome,
+            resolutions: resolutions.clone(),
         });
         let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
             "provider":"codex", "runtimeVariant":"codex", "cwd":workspace, "providerStoreId":"realpath-store",
@@ -5822,7 +5915,8 @@ mod codex_replacement_realpath {
             loop {
                 let batch = actor.read_events(cursor, 64).await;
                 if batch.events.iter().filter(|row| matches!(&row.event, AgentEvent::Provider { payload }
-                    if payload["type"] == "freshAgent.session.materialized" || payload["event"]["code"] == "THREAD_MEMORY_LOST")).count() == 2 {
+                    if payload["type"] == "freshAgent.session.materialized" || payload["event"]["code"] == "THREAD_MEMORY_LOST")).count() == 2
+                    && batch.events.iter().filter(|row| matches!(&row.event, AgentEvent::PermissionRequested { .. })).count() == 3 {
                     break batch;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5851,11 +5945,34 @@ mod codex_replacement_realpath {
                 let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
                 assert_ne!(frame["type"], "freshAgent.session.materialized", "an unresolved replacement must not rekey the pane");
                 assert_ne!(frame["event"]["code"], "THREAD_MEMORY_LOST", "an unresolved replacement must not publish its warning");
+                assert!(!frame["event"]["type"].as_str().is_some_and(|kind| kind.ends_with(".request")), "unaccepted controls must not reach the old pane: {frame}");
             }
         }
         release.take().unwrap().send(()).unwrap();
         if let Some(send) = send_task.take() {
             settle_task(send, "gateway send").await.unwrap();
+        }
+        if outcome != NativeOutcome::Accepted {
+            let last_staged = staged.events.iter().map(|event| event.sequence).max().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let batch = actor.read_events(cursor, 64).await;
+                    if !batch.native_dispatch_in_flight && reads.lock().unwrap().iter().any(|read| read.after >= last_staged) { break; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("the refused or ambiguous native dispatch must settle and drain its provisional journal");
+            assert_eq!(actor.profile().await.native_session_id.as_deref(), Some("native-a"));
+            assert_eq!(registry.recovery_context(soul.clone()).await.unwrap().native_session_id.as_deref(), Some("native-a"));
+            while let Ok(frame) = public.try_recv() {
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert!(!frame["event"]["type"].as_str().is_some_and(|kind| kind.ends_with(".request")), "refused/ambiguous controls must stay hidden: {frame}");
+            }
+            for kind in ["permission", "question", "elicitation"] {
+                proxy.resolve_decision(AgentProvider::Codex, "managed-public".into(), SessionType::Freshcodex,
+                    format!("{kind}-b"), serde_json::json!({"decision":"accept"})).await;
+            }
+            assert_eq!(resolutions.load(Ordering::SeqCst), 0, "refused/ambiguous B controls must not be actionable under A");
+            return;
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -5913,6 +6030,12 @@ mod codex_replacement_realpath {
         assert_eq!(materialized["sessionRef"]["sessionId"], "native-b");
         let pane = materialized["sessionId"].as_str().unwrap();
         assert_eq!(pane, "managed-public", "accepted recovery preserves the public presentation key");
+        for kind in ["permission", "question", "elicitation"] {
+            let index = frames.iter().position(|frame| frame["sessionId"] == pane
+                && frame["event"]["requestId"] == format!("{kind}-b"))
+                .unwrap_or_else(|| panic!("accepted {kind} control must reach the original pane: {frames:?}"));
+            assert!(materialized_index < index, "the original pane must see B before its controls");
+        }
         for frame in frames.iter().filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"
             || frame["event"]["type"] == "freshAgent.turn.complete") {
             assert_eq!(frame["sessionId"], pane, "warning and completion must address the pane told about B");
@@ -5949,6 +6072,15 @@ mod codex_replacement_realpath {
         }).await.expect("the resumed pane must receive accepted materialization and retained journal events");
         assert!(!replay.iter().any(|frame| frame["sessionId"] == "managed-public"),
             "a resume replay must not replay the old pane's stream");
+        for kind in ["permission", "question", "elicitation"] {
+            assert!(replay.iter().any(|frame| frame["sessionId"] == resumed_pane
+                && frame["event"]["sessionId"] == resumed_pane
+                && frame["event"]["requestId"] == format!("{kind}-b")),
+                "accepted {kind} control must reach the resumed pane: {replay:?}");
+            proxy.resolve_decision(AgentProvider::Codex, resumed_pane.clone(), SessionType::Freshcodex,
+                format!("{kind}-b"), serde_json::json!({"decision":"accept"})).await;
+        }
+        assert_eq!(resolutions.load(Ordering::SeqCst), 3, "accepted B controls remain actionable");
         source.send(AgentEvent::Provider { payload: serde_json::json!({
             "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-b",
             "event":{"type":"freshAgent.status", "sessionId":"native-b", "status":"resume-marker"}

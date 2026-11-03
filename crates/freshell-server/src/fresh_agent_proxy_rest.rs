@@ -167,11 +167,35 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 })
             }
         };
-        let view = inventory.iter().rev().find(|view| {
-            view.provider.as_deref() == Some(runtime_provider.as_str())
-                && (view.fresh_agent_session_id.as_deref() == Some(&request.session_id)
-                    || view.native_session_id.as_deref() == Some(&request.session_id))
-        });
+        let mapped = if runtime_provider == FreshProvider::Codex {
+            let existing = self.aliases.lock().await.get(&alias_key).cloned();
+            if existing.is_some() {
+                existing
+            } else {
+                self.reserve_displaced_codex_presentation(&inventory, &request.session_id)
+                    .await
+                    .map_err(|_| ManagedUnavailable)?
+            }
+        } else {
+            None
+        };
+        let view = if let Some(soul) = mapped {
+            Some(
+                inventory
+                    .iter()
+                    .find(|view| {
+                        view.soul_id == soul
+                            && view.provider.as_deref() == Some(runtime_provider.as_str())
+                    })
+                    .ok_or(ManagedUnavailable)?,
+            )
+        } else {
+            inventory.iter().rev().find(|view| {
+                view.provider.as_deref() == Some(runtime_provider.as_str())
+                    && (view.fresh_agent_session_id.as_deref() == Some(&request.session_id)
+                        || view.native_session_id.as_deref() == Some(&request.session_id))
+            })
+        };
         let Some(view) = view else {
             return Ok(None);
         };
@@ -266,7 +290,6 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
     ) -> Result<RestLaneCreated, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
-        let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
         let message = freshell_protocol::FreshAgentCreate {
             collaboration_mode: request.collaboration_mode,
             pane_id: request.pane_id,
@@ -291,21 +314,13 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             tab_id: request.tab_id,
             naming_handle: request.naming_handle,
         };
-        let session_id = presentation_id_for_create(
-            &runtime_provider,
-            &message.request_id,
-            message
-                .session_ref
-                .as_ref()
-                .map(|value| value.session_id.as_str()),
-        );
-        let cleanup_token = self
-            .create(message)
-            .await?
+        let created = self.create(message).await?;
+        let cleanup_token = created
+            .cleanup_receipt
             .map(|receipt| serde_json::to_string(&receipt).map_err(|_| ()))
             .transpose()?;
         Ok(RestLaneCreated {
-            session_id,
+            session_id: created.session_id,
             cleanup_token,
             ..Default::default()
         })
