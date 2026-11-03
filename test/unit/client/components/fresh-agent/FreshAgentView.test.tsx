@@ -2819,6 +2819,104 @@ describe('FreshAgentView', () => {
       expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
     })
 
+    it('keeps an ambiguous steered echo when an idle status update races a snapshot', async () => {
+      const prompt = 'Two clients sent this steered message'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      const locator = { sessionId: 'codex-shared-native-turn', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        steer.userRow('shared-turn:row-2', prompt),
+        steer.assistantRow('shared-turn:row-3', 'Intervening response'),
+        steer.userRow('shared-turn:row-4', prompt),
+      ]
+      steer.accept()
+      await steer.releaseAcceptedRead('running', rows('Shared turn before idle'))
+      await screen.findByText('Shared turn before idle')
+      act(() => steer.store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+      for (let read = 0; read < IDLE_INCOMPLETE_MAX_RETRIES; read++) {
+        const marker = `Ambiguous stable idle ${read}`
+        await steer.refresh('idle', rows(marker), marker)
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      }
+
+      const heldRead = createDeferred<unknown>()
+      let heldReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        heldReadStarted = true
+        return heldRead.promise
+      })
+      act(() => steer.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(heldReadStarted).toBe(true))
+      const sessionKey = 'freshcodex:codex:codex-shared-native-turn'
+      const before = steer.store.getState().freshAgent.sessions[sessionKey]
+      expect(before.status).toBe('idle')
+      act(() => steer.store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+      expect(steer.store.getState().freshAgent.sessions[sessionKey].statusVersion).toBe((before.statusVersion ?? 0) + 1)
+      await act(async () => heldRead.resolve({
+        status: 'idle', threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision: 10_000, capabilities: { send: true, interrupt: true },
+        turns: rows('Ambiguous snapshot after repeated idle status'),
+      }))
+      await screen.findByText('Ambiguous snapshot after repeated idle status')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
+    })
+
+    it('keeps a steered echo visible beside an earlier row from the live projection', async () => {
+      const store = createStore()
+      const locator = { sessionId: 'codex-projection-boundary', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const projectionId = 'live-boundary-source'
+      const initial = FreshAgentSnapshotSchema.parse({
+        threadId: locator.sessionId, sessionType: locator.sessionType, provider: locator.provider,
+        revision: 1, status: 'idle', capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, turns: [],
+        extensions: { codex: { projection: { id: projectionId, historyGeneration: 0, eventRevision: 0,
+          eventOwnedTurnIds: [], nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: {}, turnOutputStates: {} } } },
+      })
+      const heldRead = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(initial).mockReturnValue(heldRead.promise)
+      store.dispatch(sessionInit(locator))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'projection-boundary-create', status: 'idle',
+        resumeSessionId: locator.sessionId, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const earlierText = 'Earlier user message already visible live'
+      const patch = { type: 'freshAgent.event', ...locator, event: {
+        type: 'freshAgent.transcript.patch', sessionId: locator.sessionId, projectionId, historyGeneration: 0, afterRevision: 0,
+        ops: [{ op: 'resetTurn', nativeTurnId: 'shared-turn', revision: 1, turns: [{
+          id: 'shared-turn', turnId: 'shared-turn', nativeTurnId: 'shared-turn', role: 'user', summary: earlierText,
+          items: [{ id: 'earlier-user-text', kind: 'text', text: earlierText }],
+        }] }],
+      } }
+      act(() => {
+        handleFreshAgentMessage(store.dispatch, patch)
+        listener(patch)
+      })
+      await screen.findByText(earlierText)
+      expect(store.getState().freshAgentLive.bySession['freshcodex:codex:codex-projection-boundary'].projection?.turns).toHaveLength(1)
+      const prompt = 'The new steered message'
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+        requestId: sent!.requestId, submittedTurnId: 'shared-turn' }))
+      const users = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(users).toHaveLength(2)
+      expect(within(users[0]).getByText(earlierText)).toBeVisible()
+      expect(within(users[1]).getByText(prompt)).toBeVisible()
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
+        requestId: sent!.requestId, submittedTurnId: 'shared-turn', previousTurnKeys: ['shared-turn'],
+      })
+    })
+
     it.each([
       { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
       { label: 'ordinary acceptance arrives in the same batch as a landed snapshot', ambiguous: false },
