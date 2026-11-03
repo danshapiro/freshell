@@ -106,7 +106,7 @@ impl HostedCodexNameBackend {
         // This reply proves no host/native operation was dispatched. A later
         // inventory change cannot turn that refusal into an ambiguous write.
         if matches!(reply, Reply::Failed(NameError::LifecycleBusy)) {
-            return Err(NativeClassified::LifecycleBusy);
+            return Ok(reply);
         }
         let inventory = self
             .client
@@ -128,12 +128,12 @@ impl HostedCodexNameBackend {
     }
 }
 
-fn classify_name_error(error: NameError, method: &str) -> NativeClassified {
+fn classify_name_error<T>(error: NameError, method: &str) -> NativeCallResult<T> {
     use freshell_codex::app_server::CodexAppServerError as Error;
     let method = method.to_string();
     let error = match error {
-        NameError::LifecycleBusy => return NativeClassified::LifecycleBusy,
-        NameError::Unavailable { message } => return NativeClassified::Undelivered(message),
+        NameError::LifecycleBusy => return NativeCallResult::LifecycleBusy,
+        NameError::Unavailable { message } => return NativeCallResult::Undelivered(message),
         NameError::Rpc { code, message } => Error::Rpc {
             method,
             error: Box::new(freshell_codex::protocol::RpcError {
@@ -147,7 +147,7 @@ fn classify_name_error(error: NameError, method: &str) -> NativeClassified {
         NameError::Transport { message } => Error::Transport { method, message },
         NameError::InvalidResponse { detail } => Error::InvalidResponse { method, detail },
     };
-    classify_codex_error(error, "native metadata")
+    classify_codex_error(error, "native metadata").into_call()
 }
 
 impl NativeNameBackend for HostedCodexNameBackend {
@@ -158,7 +158,7 @@ impl NativeNameBackend for HostedCodexNameBackend {
                 Ok(Reply::Title(title)) => {
                     NativeCallResult::Confirmed(NativeNameReadback { title })
                 }
-                Ok(Reply::Failed(error)) => classify_name_error(error, "thread/read").into_call(),
+                Ok(Reply::Failed(error)) => classify_name_error(error, "thread/read"),
                 Err(error) => error.into_call(),
                 _ => NativeCallResult::Ambiguous("unexpected native name read reply".into()),
             }
@@ -178,9 +178,7 @@ impl NativeNameBackend for HostedCodexNameBackend {
                 .await
             {
                 Ok(Reply::Renamed) => NativeCallResult::Confirmed(()),
-                Ok(Reply::Failed(error)) => {
-                    classify_name_error(error, "thread/name/set").into_call()
-                }
+                Ok(Reply::Failed(error)) => classify_name_error(error, "thread/name/set"),
                 Err(error) => error.into_call(),
                 _ => NativeCallResult::Ambiguous("unexpected native name write reply".into()),
             }

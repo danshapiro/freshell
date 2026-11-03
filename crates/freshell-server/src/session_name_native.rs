@@ -134,7 +134,6 @@ pub enum NativeCallResult<T> {
 /// it into the operation's own `NativeCallResult<T>`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeClassified {
-    LifecycleBusy,
     Undelivered(String),
     Ambiguous(String),
     Unsupported(String),
@@ -143,7 +142,6 @@ pub enum NativeClassified {
 impl NativeClassified {
     pub(crate) fn into_call<T>(self) -> NativeCallResult<T> {
         match self {
-            Self::LifecycleBusy => NativeCallResult::LifecycleBusy,
             Self::Undelivered(reason) => NativeCallResult::Undelivered(reason),
             Self::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
             Self::Unsupported(reason) => NativeCallResult::Unsupported(reason),

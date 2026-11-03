@@ -407,7 +407,7 @@ async fn hosted_explicit_resume_restores_ended_query_before_created_and_one_orig
     let commands = &fixture.commands;
     let control_socket = &fixture.control_socket;
     let (proxy, mut receiver) = configure_proxy(
-        &control_socket,
+        control_socket,
         HashMap::from([(("claude".into(), NATIVE.into()), soul.clone())]),
     );
     Arc::clone(&proxy).handle(HostedFreshAgentCommand::Attach(serde_json::from_value(serde_json::json!({
@@ -463,8 +463,7 @@ async fn hosted_explicit_resume_restores_ended_query_before_created_and_one_orig
     .expect("resumed pane must receive both Created and current usable status");
     let visible_status = frames
         .iter()
-        .filter(|frame| frame["event"]["type"] == "freshAgent.status")
-        .last()
+        .rfind(|frame| frame["event"]["type"] == "freshAgent.status")
         .unwrap();
     assert_eq!(
         visible_status["event"]["status"], "idle",
@@ -482,20 +481,21 @@ async fn hosted_explicit_resume_restores_ended_query_before_created_and_one_orig
         "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude", "requestId":"original-browser-input",
         "text":"one original browser input", "cwd":workspace,
     })).unwrap())).await;
-    let calls = commands.lock().unwrap();
-    let sends: Vec<_> = calls
-        .iter()
-        .filter(|command| matches!(command, HostCommand::FreshAgentSend { .. }))
-        .collect();
-    assert_eq!(
-        sends.len(),
-        1,
-        "one original input reaches the recovered native owner"
-    );
-    assert!(!calls
-        .iter()
-        .any(|command| matches!(command, HostCommand::FreshAgentResumePending { .. })));
-    drop(calls);
+    {
+        let calls = commands.lock().unwrap();
+        let sends: Vec<_> = calls
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentSend { .. }))
+            .collect();
+        assert_eq!(
+            sends.len(),
+            1,
+            "one original input reaches the recovered native owner"
+        );
+        assert!(!calls
+            .iter()
+            .any(|command| matches!(command, HostCommand::FreshAgentResumePending { .. })));
+    }
     let inventory = registry.inventory().await.unwrap();
     assert_eq!(inventory.len(), 1);
     assert_eq!(inventory[0].soul_id, soul);
