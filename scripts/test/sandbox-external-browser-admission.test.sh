@@ -93,7 +93,13 @@ PY
 }
 
 run_external() {
-  PATH="${FAKE_BIN}:${PATH}" FRESHELL_SANDBOX_DEPENDENCIES_READY=1 \
+  PATH="${FAKE_BIN}:${PATH}" FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
+    bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
+      --external-browser "${DESCRIPTOR}"
+}
+
+run_external_with_preparation() {
+  PATH="${FAKE_BIN}:${PATH}" \
     bash "${REPO_ROOT}/scripts/sandbox-test.sh" --workspace-root "${REPO_ROOT}" \
       --external-browser "${DESCRIPTOR}"
 }
@@ -108,6 +114,8 @@ if [ "${STATUS}" -ne 0 ]; then
   exit 1
 fi
 grep -q '"event":"sandbox_workload_finished"' "${TEST_TMP}/valid.stderr"
+grep -q '"phase":"execution"' "${TEST_TMP}/valid.stderr"
+grep -q '"event":"sandbox_container_settled"' "${TEST_TMP}/valid.stderr"
 
 GIT_COMMON_DIR="$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir)"
 GIT_COMMON_DIR="$(realpath -e "${GIT_COMMON_DIR}")"
@@ -138,6 +146,37 @@ for forbidden in ("sandbox-test-bearer-sentinel", "DOCKER_HOST", "/var/run/docke
                   "GOOGLE_APPLICATION_CREDENTIALS"):
     assert forbidden not in joined, f"forbidden host authority reached Docker argv: {forbidden}"
 assert not any(value.startswith(("FRESHELL_E2E_TARGET_", "FRESHELL_RUNTIME_EXTERNAL_")) for value in args)
+PY
+
+: >"${DOCKER_CALLS}"
+STATUS=0
+run_external_with_preparation >"${TEST_TMP}/prepared.stdout" 2>"${TEST_TMP}/prepared.stderr" || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+  cat "${TEST_TMP}/prepared.stdout" "${TEST_TMP}/prepared.stderr" >&2
+  echo 'FAIL: the P2-G01 preparation plus execution phases did not settle successfully' >&2
+  exit 1
+fi
+python3 - "${DOCKER_CALLS}" "${DESCRIPTOR}" "${TEST_TMP}/prepared.stderr" <<'PY'
+import json
+import sys
+
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+runs = [call for call in calls if call and call[0] == "run"]
+assert len(runs) == 2, f"expected separate preparation and execution containers, saw {len(runs)}"
+prepared, executed = runs
+assert prepared.count("--network") == 1 and prepared[prepared.index("--network") + 1] == "freshell-sandbox"
+assert executed.count("--network") == 1 and executed[executed.index("--network") + 1] == "freshell-sandbox"
+assert not any("/run/freshell-external-target.json" in arg for arg in prepared)
+assert f"type=bind,src={sys.argv[2]},dst=/run/freshell-external-target.json,readonly" in executed
+events = [json.loads(line) for line in open(sys.argv[3], encoding="utf-8")
+          if line.strip().startswith("{")]
+finished = [row for row in events if row.get("event") == "sandbox_workload_finished"]
+assert [row.get("phase") for row in finished] == ["preparation", "execution"], finished
+assert all(row.get("code") == 0 for row in finished)
+assert len({row.get("container") for row in finished}) == 2
+settled = [row for row in events if row.get("event") == "sandbox_container_settled"]
+assert [row.get("phase") for row in settled] == ["preparation", "execution"], settled
+assert all(row.get("code") == 0 and row.get("severity") == "info" for row in settled)
 PY
 
 : >"${DOCKER_CALLS}"

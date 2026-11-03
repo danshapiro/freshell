@@ -1190,7 +1190,8 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
     { severity: 'info', runId: ownedDescriptor.runId, candidateSha, event: 'managed_external_complete', status: 'passed', cases: 1 },
   ].map(event => JSON.stringify(event)).join('\n') + '\n'
   const lifecycle = () => {
-    const runtime = { runId: ownedDescriptor.runId, candidateSha: ownedDescriptor.candidateSha, recordLifecycle: vi.fn() }
+    const runtime = { runId: ownedDescriptor.runId, candidateSha: ownedDescriptor.candidateSha,
+      recordLifecycle: vi.fn(), writeArtifact: vi.fn().mockReturnValue('evidence/p2-g01-sandbox-output-private.json') }
     const owner = { runtime, stop: vi.fn().mockResolvedValue({ ok: true, errors: [] }) }
     const tunnel = { assertAlive: vi.fn(), stop: vi.fn().mockResolvedValue(undefined) }
     const environment = { HOME: '/home/dan', PATH: '/usr/bin:/bin', TMPDIR: os.tmpdir(),
@@ -1209,8 +1210,16 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
       output: () => ({
         stdout: `${JSON.stringify({ severity: 'info', event: 'managed_external_complete',
           runId: ownedDescriptor.runId, candidateSha: ownedDescriptor.candidateSha, status: 'passed', cases: 0 })}\n`,
-        stderr: `${JSON.stringify({ severity: 'info', event: 'sandbox_workload_finished',
-          container: 'freshell-sandbox-abcd1234', code: 0 })}\n`,
+        stderr: [
+          { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation',
+            container: 'freshell-sandbox-abcd1234', code: 0 },
+          { severity: 'info', event: 'sandbox_container_settled', phase: 'execution',
+            container: 'freshell-sandbox-efgh5678', code: 0 },
+          { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation',
+            container: 'freshell-sandbox-abcd1234', code: 0 },
+          { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution',
+            container: 'freshell-sandbox-efgh5678', code: 0 },
+        ].map(event => JSON.stringify(event)).join('\n') + '\n',
       }),
     }
     const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
@@ -1227,11 +1236,18 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
         completionCount: 1,
         completionStatus: 'passed',
         completionCases: 0,
-        cleanupCompletionCount: 1,
+        workloadPreparationState: 'finished',
+        workloadExecutionState: 'finished',
+        cleanupCompletionCount: 2,
+        cleanupPreparationCount: 1,
+        cleanupExecutionCount: 1,
+        cleanupFailureCount: 0,
       })
+    } finally {
       const cleanup = await value.abort()
       expect(cleanup.ok).toBe(true)
-    } finally { create.mockRestore() }
+      create.mockRestore()
+    }
   })
 
   it('uses a private descriptor mount, passes no bearer value in host argv/env, and removes it after wrapper settlement', async () => {
@@ -1244,8 +1260,16 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
       alive: () => false,
       wait: vi.fn().mockResolvedValue(0),
       stop: stopped,
-      output: () => ({ stdout: executionEvents(), stderr: `${JSON.stringify({ severity: 'info',
-        event: 'sandbox_workload_finished', container: 'freshell-sandbox-abcd1234', code: 0 })}\n` }),
+      output: () => ({ stdout: executionEvents(), stderr: [
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation',
+          container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'execution',
+          container: 'freshell-sandbox-efgh5678', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation',
+          container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution',
+          container: 'freshell-sandbox-efgh5678', code: 0 },
+      ].map(event => JSON.stringify(event)).join('\n') + '\n' }),
     }
     const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockImplementation(async (executable, args, cwd, childEnvironment) => {
       handoffFile = args.at(-1)!
@@ -1276,6 +1300,40 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
       expect(stopped).toHaveBeenCalledOnce()
       expect(fs.existsSync(handoffFile)).toBe(false)
     } finally { create.mockRestore() }
+  })
+
+  it('keeps private nonzero child diagnostics redacted and bound to each settled sandbox phase', async () => {
+    const { value, owner } = lifecycle()
+    const stderr = [
+      { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+      { severity: 'info', event: 'sandbox_container_settled', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 0 },
+      { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+      { severity: 'error', event: 'sandbox_workload_failed', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 1 },
+    ].map(event => JSON.stringify(event)).join('\n') + '\n'
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(1),
+      stop: vi.fn().mockResolvedValue(undefined),
+      output: () => ({ stdout: `target ${ownedDescriptor.token} ${ownedDescriptor.baseUrl}`, stderr }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).rejects.toThrow(/browser child failed/i)
+      expect(owner.runtime.writeArtifact).toHaveBeenCalledOnce()
+      expect(owner.runtime.writeArtifact).toHaveBeenCalledWith('p2-g01-sandbox-output-private.json', expect.objectContaining({
+        runId: ownedDescriptor.runId,
+        candidateSha: ownedDescriptor.candidateSha,
+        reason: 'execution_workload_failed',
+      }))
+      const saved = owner.runtime.writeArtifact.mock.calls[0][1]
+      expect(JSON.stringify(saved)).not.toContain(ownedDescriptor.token)
+      expect(JSON.stringify(saved)).not.toContain(ownedDescriptor.baseUrl)
+    } finally {
+      await value.abort()
+      create.mockRestore()
+    }
   })
 
   it('retains the descriptor until cancelled child settlement, then removes it during owner abort', async () => {
