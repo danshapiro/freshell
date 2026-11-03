@@ -365,7 +365,9 @@ impl Supervisor {
             || !status.exited
             || status.worker_pid.is_none()
             || status.host_boot_id != host.host_boot_id
-            || status.max_control_epoch != context.control_epoch
+            // A reattached host can still carry its original grant epoch.
+            // Only a newer controller's fence revokes this controller.
+            || status.max_control_epoch > context.control_epoch
             || launch.execution_generation != status.max_execution_generation
             || launch.launch_nonce != context.prior_handle.launch_nonce().as_str()
             || source.incarnation_id != *context.prior_handle.incarnation_id()

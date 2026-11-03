@@ -2862,29 +2862,54 @@ async fn prepare_same_root_codex_native(state: &HostState) -> Result<(), Runtime
         .await
         .map_err(map_actor_error)?;
     let current = state.persisted.lock().await.clone();
-    if current.native_identity_launch != before.native_identity_launch
-        || current.max_execution_generation != before.max_execution_generation
-        || current.max_control_epoch != before.max_control_epoch
-        || current.host_boot_id != before.host_boot_id
-        || !state
-            .control_fence
-            .lock()
-            .unwrap()
-            .is_current_running(current.max_control_epoch, current.max_execution_generation)
-        || !state
-            .fresh_agent
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|attached| Arc::ptr_eq(attached, &actor))
-        || current_native_observation(state, &current)
-            .await
-            .is_none_or(|proof| proof.native_session_id != source.native_session_id)
+    let revoked = if current.native_identity_launch != before.native_identity_launch {
+        Some("launch_changed")
+    } else if current.max_execution_generation != before.max_execution_generation {
+        Some("execution_generation_changed")
+    } else if current.max_control_epoch != before.max_control_epoch {
+        Some("control_epoch_changed")
+    } else if current.host_boot_id != before.host_boot_id {
+        Some("host_boot_changed")
+    } else if !state
+        .control_fence
+        .lock()
+        .unwrap()
+        .is_current_running(current.max_control_epoch, current.max_execution_generation)
     {
+        Some("control_revoked")
+    } else if !state
+        .fresh_agent
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|attached| Arc::ptr_eq(attached, &actor))
+    {
+        Some("actor_replaced")
+    } else if current_native_observation(state, &current)
+        .await
+        .is_none_or(|proof| proof.native_session_id != source.native_session_id)
+    {
+        Some("native_proof_changed")
+    } else {
+        None
+    };
+    if let Some(reason) = revoked {
         // A changed launch/control fence revokes this preparation. It may
         // have registered after the earlier owner was stopped or replaced.
+        append_event_with_secret(
+            &state.state_dir,
+            &state.secret,
+            "host.fresh_agent.same_root_preparation_revoked",
+            serde_json::json!({"severity":"warn", "incarnationId":state.incarnation_id,
+                "controlEpoch":current.max_control_epoch,
+                "executionGeneration":current.max_execution_generation, "reason":reason}),
+        )
+        .ok();
         actor.stop().await.map_err(map_actor_error)?;
-        return Err(refuse());
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            format!("same-root native preparation was revoked: {reason}"),
+        ));
     }
     Ok(())
 }

@@ -15,10 +15,10 @@ use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
     HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
-    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RequestId,
-    ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch,
-    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult,
-    CONTROL_PROTOCOL_VERSION,
+    NativeIdentityObservation, OpenCodeTransferAction, OpenCodeTransferReadinessReceipt,
+    OpenCodeTransferResult, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
+    RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -251,6 +251,9 @@ pub struct Supervisor {
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Bounds repeated provider-store probes for an unchanged live identity.
     pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
+    /// Observer-only log deduplication; never used as recovery authority.
+    pub(crate) retained_codex_observations:
+        Arc<StdMutex<HashMap<SoulId, NativeIdentityObservation>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
     provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
     /// Reply budgets for supervisor→session-host commands, read once.
@@ -313,6 +316,7 @@ impl Supervisor {
             opencode_transfer_lifecycle_lock: Arc::new(Mutex::new(())),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
+            retained_codex_observations: Arc::new(StdMutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
             host_command_budgets: HostCommandBudgets::from_env(),
@@ -2993,7 +2997,7 @@ impl Supervisor {
                 let proof = crate::recovery::current_native_observation(&current, &status)
                     .filter(|_| {
                         status.host_boot_id == host.host_boot_id
-                            && status.max_control_epoch == current.control_epoch
+                            && status.max_control_epoch <= current.control_epoch
                             && status.worker_pid.is_some()
                             && !status.exited
                     })

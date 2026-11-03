@@ -8,7 +8,7 @@ use freshell_runtime_protocol::{
     NativeIdentitySource,
 };
 use rusqlite::{params, Connection};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::{net::UnixListener, sync::Notify, task::JoinHandle};
 
 #[derive(Default)]
@@ -16,6 +16,9 @@ struct CountedBackend {
     ended: AtomicBool,
     stops: AtomicUsize,
     creates: AtomicUsize,
+    hold_inspection: AtomicBool,
+    inspecting: Notify,
+    release_inspection: Notify,
 }
 
 #[async_trait::async_trait]
@@ -24,6 +27,10 @@ impl RuntimeBackend for CountedBackend {
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<BackendInspection, BackendError> {
+        if self.hold_inspection.load(Ordering::SeqCst) {
+            self.inspecting.notify_one();
+            self.release_inspection.notified().await;
+        }
         Ok(BackendInspection {
             state: if self.ended.load(Ordering::SeqCst) {
                 BackendRuntimeState::Exited
@@ -81,6 +88,7 @@ struct ControlledCodex {
     inputs: Arc<AtomicUsize>,
     prepares: Arc<AtomicUsize>,
     compacts: Arc<AtomicUsize>,
+    statuses: Arc<AtomicUsize>,
     hold_ack: Arc<AtomicBool>,
     sending: Arc<Notify>,
     release: Arc<Notify>,
@@ -89,11 +97,15 @@ struct ControlledCodex {
     capability: Arc<AtomicBool>,
     bad_ack: Arc<AtomicBool>,
     prepare_refuse: Arc<AtomicBool>,
+    host_epoch: Arc<AtomicU64>,
     peer: JoinHandle<()>,
 }
 
 impl ControlledCodex {
     async fn new() -> Self {
+        Self::with_registry_reopen(false).await
+    }
+    async fn with_registry_reopen(reopen: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let registry = Registry::open(root.path().join("registry"), None).unwrap();
         let soul = SoulId::new();
@@ -170,6 +182,7 @@ impl ControlledCodex {
         let inputs = Arc::new(AtomicUsize::new(0));
         let prepares = Arc::new(AtomicUsize::new(0));
         let compacts = Arc::new(AtomicUsize::new(0));
+        let statuses = Arc::new(AtomicUsize::new(0));
         let hold_ack = Arc::new(AtomicBool::new(false));
         let sending = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -178,6 +191,7 @@ impl ControlledCodex {
         let capability = Arc::new(AtomicBool::new(true));
         let bad_ack = Arc::new(AtomicBool::new(false));
         let prepare_refuse = Arc::new(AtomicBool::new(false));
+        let host_epoch = Arc::new(AtomicU64::new(registry.control_epoch()));
         let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
         let peer = {
             let source = source.clone();
@@ -185,6 +199,7 @@ impl ControlledCodex {
             let inputs = inputs.clone();
             let prepares = prepares.clone();
             let compacts = compacts.clone();
+            let statuses = statuses.clone();
             let hold_ack = hold_ack.clone();
             let sending = sending.clone();
             let release = release.clone();
@@ -193,7 +208,7 @@ impl ControlledCodex {
             let capability = capability.clone();
             let bad_ack = bad_ack.clone();
             let prepare_refuse = prepare_refuse.clone();
-            let epoch = registry.control_epoch();
+            let host_epoch = host_epoch.clone();
             tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -202,6 +217,7 @@ impl ControlledCodex {
                     let inputs = inputs.clone();
                     let prepares = prepares.clone();
                     let compacts = compacts.clone();
+                    let statuses = statuses.clone();
                     let hold_ack = hold_ack.clone();
                     let sending = sending.clone();
                     let release = release.clone();
@@ -212,6 +228,7 @@ impl ControlledCodex {
                     let capability = capability.clone();
                     let bad_ack = bad_ack.clone();
                     let prepare_refuse = prepare_refuse.clone();
+                    let host_epoch = host_epoch.clone();
                     tokio::spawn(async move {
                         let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
                         if !matches!(request.body, HostCommand::Hello { .. }) {
@@ -254,6 +271,7 @@ impl ControlledCodex {
                                 effective_limits: context.requested_limits,
                             },
                             HostCommand::Status { .. } => {
+                                statuses.fetch_add(1, Ordering::SeqCst);
                                 let ended = exited.load(Ordering::SeqCst);
                                 let observation = source.lock().unwrap().clone();
                                 HostResult::Status {
@@ -268,7 +286,7 @@ impl ControlledCodex {
                                     host_boot_id: boot,
                                     worker_pid: worker.load(Ordering::SeqCst).then_some(123),
                                     worker_launch_count: 1,
-                                    max_control_epoch: epoch,
+                                    max_control_epoch: host_epoch.load(Ordering::SeqCst),
                                     max_execution_generation: 1,
                                     fixture_evidence: serde_json::json!({"workload":"fresh-agent"}),
                                     exited: ended,
@@ -381,6 +399,13 @@ impl ControlledCodex {
                 }
             })
         };
+        let registry = if reopen {
+            let registry_root = registry.registry_root().to_path_buf();
+            drop(registry);
+            Registry::open(registry_root, None).unwrap()
+        } else {
+            registry
+        };
         let backend = Arc::new(CountedBackend::default());
         let supervisor = Supervisor::new(
             registry,
@@ -408,6 +433,7 @@ impl ControlledCodex {
             inputs,
             prepares,
             compacts,
+            statuses,
             hold_ack,
             sending,
             release,
@@ -416,6 +442,7 @@ impl ControlledCodex {
             capability,
             bad_ack,
             prepare_refuse,
+            host_epoch,
             peer,
         }
     }
@@ -503,6 +530,143 @@ impl ControlledCodex {
             "retained actor classification spends no recovery attempt"
         );
     }
+}
+
+#[tokio::test]
+async fn registry_reopen_observer_retains_older_live_host() {
+    let fixture = ControlledCodex::with_registry_reopen(true).await;
+    assert_eq!(
+        fixture.host_epoch.load(Ordering::SeqCst) + 1,
+        fixture.supervisor.registry.control_epoch()
+    );
+    fixture.supervisor.observe_once().await.unwrap();
+    fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn registry_reopen_public_send_recovers_older_live_host() {
+    let fixture = ControlledCodex::with_registry_reopen(true).await;
+    fixture.send(RequestId::new()).await.unwrap();
+    fixture.send(RequestId::new()).await.unwrap();
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 2);
+    fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn registry_reopen_public_compact_prepares_older_live_host() {
+    let fixture = ControlledCodex::with_registry_reopen(true).await;
+    fixture.compact().await.unwrap();
+    assert_eq!(fixture.prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.compacts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn newer_host_controller_refuses_retained_recovery() {
+    let fixture = ControlledCodex::with_registry_reopen(true).await;
+    fixture.host_epoch.store(
+        fixture.supervisor.registry.control_epoch() + 1,
+        Ordering::SeqCst,
+    );
+    assert!(fixture.send(RequestId::new()).await.is_err());
+    assert!(fixture.compact().await.is_err());
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.prepares.load(Ordering::SeqCst), 0);
+    fixture.supervisor.observe_once().await.unwrap();
+    assert_eq!(fixture.attempts(), 1);
+    assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn backend_inspection_does_not_block_public_send() {
+    let fixture = Arc::new(ControlledCodex::new().await);
+    fixture
+        .backend
+        .hold_inspection
+        .store(true, Ordering::SeqCst);
+    let observer = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.supervisor.observe_once().await })
+    };
+    fixture.backend.inspecting.notified().await;
+    let result = tokio::time::timeout(Duration::from_secs(2), fixture.send(RequestId::new())).await;
+    fixture
+        .backend
+        .hold_inspection
+        .store(false, Ordering::SeqCst);
+    fixture.backend.release_inspection.notify_one();
+    observer.await.unwrap().unwrap();
+    result
+        .expect("public SEND must complete while backend inspection remains held")
+        .unwrap();
+    assert_eq!(fixture.inputs.load(Ordering::SeqCst), 1);
+    fixture.assert_retained().await;
+}
+
+#[tokio::test]
+async fn backend_inspection_rechecks_current_owner_before_host_calls() {
+    let fixture = Arc::new(ControlledCodex::new().await);
+    fixture
+        .backend
+        .hold_inspection
+        .store(true, Ordering::SeqCst);
+    let observer = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.supervisor.observe_once().await })
+    };
+    fixture.backend.inspecting.notified().await;
+    fixture
+        .supervisor
+        .registry
+        .begin_stop(fixture.soul.clone())
+        .await
+        .unwrap();
+    fixture
+        .backend
+        .hold_inspection
+        .store(false, Ordering::SeqCst);
+    fixture.backend.release_inspection.notify_one();
+    observer.await.unwrap().unwrap();
+    assert_eq!(
+        fixture.statuses.load(Ordering::SeqCst),
+        0,
+        "stale backend observation must not contact the revoked owner"
+    );
+    assert_eq!(fixture.attempts(), 0);
+    assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn observer_logs_retention_transitions_once_per_state() {
+    let fixture = ControlledCodex::new().await;
+    for _ in 0..3 {
+        fixture.supervisor.observe_once().await.unwrap();
+    }
+    fixture.send(RequestId::new()).await.unwrap();
+    for _ in 0..3 {
+        fixture.supervisor.observe_once().await.unwrap();
+    }
+    let events = std::fs::read_to_string(&fixture.supervisor.config.lifecycle_log).unwrap();
+    let transitions = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "supervisor.runtime_observer.retained_codex_actor")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        transitions.len(),
+        2,
+        "one entry and one exit, without per-tick repetition"
+    );
+    assert_eq!(transitions[0]["data"]["retained"], true);
+    assert_eq!(transitions[1]["data"]["retained"], false);
+    for event in transitions {
+        assert_eq!(event["data"]["severity"], "info");
+        assert_eq!(event["data"]["soulId"], fixture.soul.as_str());
+        assert_eq!(event["data"]["incarnationId"], fixture.incarnation.as_str());
+        assert_eq!(event["data"]["nativeSessionId"], "native-parent");
+    }
+    fixture.assert_retained().await;
 }
 impl Drop for ControlledCodex {
     fn drop(&mut self) {
@@ -654,6 +818,7 @@ async fn public_compact_rechecks_writer_and_generation_after_held_readiness() {
         "intent",
         "stopped",
         "capability",
+        "future-control-epoch",
     ] {
         let fixture = Arc::new(ControlledCodex::new().await);
         fixture.hold_ack.store(true, Ordering::SeqCst);
@@ -695,6 +860,10 @@ async fn public_compact_rechecks_writer_and_generation_after_held_readiness() {
                     .unwrap();
             }
             "capability" => fixture.capability.store(false, Ordering::SeqCst),
+            "future-control-epoch" => fixture.host_epoch.store(
+                fixture.supervisor.registry.control_epoch() + 1,
+                Ordering::SeqCst,
+            ),
             _ => unreachable!(),
         }
         fixture.release.notify_one();

@@ -5052,10 +5052,7 @@ await import(parameters.source)
                     .launch_nonce = "changed-during-readiness".into();
             }
             std::fs::write(&release, b"release").unwrap();
-            assert!(
-                preparation.await.unwrap().is_err(),
-                "late {case} completion must refuse"
-            );
+            let error = preparation.await.unwrap().unwrap_err();
             assert_eq!(actor.profile().await, before);
             assert!(
                 actor.observed_native_session_id().await.is_none(),
@@ -5088,6 +5085,37 @@ await import(parameters.source)
             assert!(!rows
                 .iter()
                 .any(|row| row["method"] == "thread/compact/start"));
+            if case != "stop" {
+                assert_eq!(
+                    error.code,
+                    freshell_runtime_protocol::RuntimeErrorCode::RecoveryWrongIdentity
+                );
+                assert!(
+                    error.message.contains("preparation was revoked"),
+                    "{case}: {error:?}"
+                );
+                let events =
+                    std::fs::read_to_string(host.state_dir.join("host-lifecycle.jsonl")).unwrap();
+                let event = events
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .find(|event| {
+                        event["event"] == "host.fresh_agent.same_root_preparation_revoked"
+                    })
+                    .expect(
+                        "revoked completed preparation must explain why the runtime was stopped",
+                    );
+                assert_eq!(event["data"]["severity"], "warn");
+                assert_eq!(
+                    event["data"]["reason"],
+                    match case {
+                        "launch" => "launch_changed",
+                        "control" => "control_revoked",
+                        "membership" => "actor_replaced",
+                        _ => unreachable!(),
+                    }
+                );
+            }
             if case != "stop" {
                 actor.stop().await.unwrap();
             }

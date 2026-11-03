@@ -118,7 +118,7 @@ const DISCOVERY_RETRY_WINDOW: Duration = Duration::from_secs(30);
 /// preserved here — never reduced to a generic timeout.
 /// `LifecycleBusy` proves that no host/native operation was dispatched. Its
 /// bounded phase retries share one charge and receipt; terminal contention
-/// refunds only the undispatched phase, retaining real reads and write ACKs.
+/// consumes the finite cycle while retaining real reads and write ACKs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCallResult<T> {
     Confirmed(T),
