@@ -165,6 +165,22 @@ export function ReconcileWarmingRecoveryDriver(): null {
           )
           return
         }
+        // Delta fix finding 2: TERMINAL outcomes are warn-level (the
+        // production client-logger default records warn, suppresses info).
+        // A parked pane THIS drive sent resolving to an error verdict is a
+        // failure transition — log it once per drive result with the pane
+        // and session identifiers and the failure cause. A still-warming
+        // verdict is the unchanged WAIT, not a terminal outcome: it never
+        // produces a per-pane warn here (the bounded backoff debug log and
+        // the gave-up aggregate warn at the retry limit are its records),
+        // so nothing repeats per poll.
+        for (const verdict of msg.verdicts) {
+          if (verdict.verdict !== 'error' || verdict.reason === 'index_warming') continue
+          const claim = request.panes.find((p) => p.paneKey === verdict.paneKey)?.sessionRef
+          log.warn(
+            `parked pane resolved to an error (cause=${verdict.reason ?? 'unknown'}, paneKey=${verdict.paneKey}, session=${claim ? `${claim.provider}:${claim.sessionId}` : '-'}, reconcileId=${request.reconcileId})`,
+          )
+        }
         if (outcome.warming === 0) {
           dispatch(clearReconcileWarming())
           log.info(

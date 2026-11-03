@@ -236,6 +236,67 @@ describe('ReconcileWarmingRecoveryDriver', () => {
     expect(terminalContentOf(store).status).toBe('running')
   })
 
+  it('logs the terminal outcome at warn when its own drive folds an error verdict for a pane it drove', () => {
+    // Delta fix finding 2: production (client-logger default level `warn`)
+    // must record that a parked pane it drove resolved to an ERROR — the
+    // honest failure transition, with the pane/session identifiers and the
+    // failure cause. The happy-path settle stays info; only terminal
+    // outcomes (exhaustion, watchdog, refusal, and per-pane error folds)
+    // are warn.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 1, paneRefs: [ref('p1')] },
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      deliverServerFrame({
+        type: 'pane.reconcile.result',
+        reconcileId: req.reconcileId,
+        bootId: 'boot-1',
+        serverInstanceId: 'srv-1',
+        verdicts: [{
+          paneKey: 'tab-1:p1',
+          verdict: 'error',
+          reason: 'session_store_unreadable',
+        }],
+      })
+      // The fold latched the honest per-pane error and cleared the banner.
+      expect(store.getState().panes.reconcileWarming).toBeNull()
+      expect(terminalContentOf(store).restoreError).toMatchObject({
+        reason: 'session_store_unreadable',
+      })
+      const text = warnText(warnSpy)
+      expect(text).toContain('tab-1:p1')
+      expect(text).toContain('claude:sess-p1')
+      expect(text).toContain('cause=session_store_unreadable')
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('does not log a per-pane failure warn for a still-warming re-drive (the wait is not a terminal outcome)', async () => {
+    vi.useFakeTimers()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      renderDriver({
+        reconcileWarming: { count: 1, paneRefs: [ref('p1')] },
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      deliverServerFrame(stillWarmingResultFor(req))
+      // Still-warming is the unchanged WAIT: bounded backoff, no per-pane
+      // failure warn (transitions only — the gave-up warn at the retry
+      // limit is the wait's own terminal record, pinned elsewhere).
+      expect(warnText(warnSpy)).not.toContain('resolved to an error')
+      expect(warnText(warnSpy)).not.toContain('gave up')
+    } finally {
+      warnSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
   it('keeps the banner on a cardinality-violation result instead of clearing (checks violation before warming===0)', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {

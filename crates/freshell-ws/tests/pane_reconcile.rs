@@ -50,6 +50,11 @@ use tracing_subscriber::Layer;
 #[derive(Debug, Clone, Default)]
 struct CapturedEvent {
     message: String,
+    /// `"DEBUG" | "INFO" | "WARN" | "ERROR"` — pinned by the
+    /// auto-restore-warming delta fix (finding 2): the recovery transition
+    /// events carry structured severity (the failure-resolution arm is
+    /// WARN, the clean-resolution arm INFO).
+    level: String,
     fields: BTreeMap<String, String>,
 }
 
@@ -107,6 +112,7 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
             .expect("capture lock")
             .push(CapturedEvent {
                 message: visitor.message,
+                level: event.metadata().level().to_string(),
                 fields: visitor.fields,
             });
     }
@@ -793,10 +799,13 @@ async fn frozen_client_create_path_is_deduped_same_as_negotiating_clients() {
 /// warming-never-completes (council red test): a probe pinned to Unknown
 /// forever must yield error{index_warming} after ONE bounded deferral —
 /// never a hang, never a fake fresh/dead_session. The server-side
-/// `pane_reconcile.index_warming` transition log fires exactly twice for
-/// such a request: once when the deferral arms, once more because the
-/// post-deferral re-derivation STILL answers warming (never per poll —
-/// there is no poll; the deferral is single-shot by construction).
+/// `pane_reconcile.index_warming` transition log fires exactly ONCE for
+/// such a request (when the deferral arms — never per poll; the deferral
+/// is single-shot by construction), carrying the DEFERRING panes' keys
+/// and session claims, and the post-deferral resolution is recorded by
+/// exactly ONE `pane_reconcile.index_warming_resolved` event at WARN with
+/// the per-pane failure cause (auto-restore-warming delta fix, finding 2:
+/// pane/session identifiers, duration, and final failure cause).
 #[tokio::test]
 async fn warming_never_completes_yields_error_index_warming() {
     let (events, _guard) = capture();
@@ -823,31 +832,70 @@ async fn warming_never_completes_yields_error_index_warming() {
     let warming_events = events_by_name(&events, "pane_reconcile.index_warming");
     assert_eq!(
         warming_events.len(),
-        2,
-        "deferral arm + still-warming-after-derivation, never more: {warming_events:?}"
+        1,
+        "the deferral arm logs exactly once per request — the post-deferral record is the resolution event below: {warming_events:?}"
     );
-    for event in &warming_events {
-        assert_eq!(
-            event.message,
-            "pane reconcile deferred: session index warming"
-        );
-        assert_eq!(
-            event.fields.get("reconcile_id").map(String::as_str),
-            Some("rec-warming")
-        );
-        assert_eq!(
-            event.fields.get("pane_count").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            event.fields.get("budget_ms").map(String::as_str),
-            Some("50")
-        );
-        assert!(
-            event.fields.contains_key("connection_id"),
-            "the event must identify the connection: {event:?}"
-        );
-    }
+    let arm = &warming_events[0];
+    assert_eq!(
+        arm.message,
+        "pane reconcile deferred: session index warming"
+    );
+    assert_eq!(
+        arm.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(arm.fields.get("pane_count").map(String::as_str), Some("1"));
+    assert_eq!(arm.fields.get("budget_ms").map(String::as_str), Some("50"));
+    assert!(
+        arm.fields.contains_key("connection_id"),
+        "the event must identify the connection: {arm:?}"
+    );
+    // Delta fix finding 2: the arm event names the panes it is deferring
+    // and the session identities they claim.
+    assert_eq!(
+        arm.fields.get("pane_keys").map(String::as_str),
+        Some("pk-warm"),
+        "the deferred pane's key is logged: {arm:?}"
+    );
+    assert_eq!(
+        arm.fields.get("sessions").map(String::as_str),
+        Some("claude:sess-1"),
+        "the deferred pane's session claim is logged: {arm:?}"
+    );
+    // The post-deferral resolution: ONE event, WARN (the request's deferred
+    // panes ended in a failure state), with the per-pane failure cause and
+    // the deferral duration.
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event per deferred request: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(resolved.level, "WARN", "still-warming is a failure record");
+    assert_eq!(
+        resolved.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("false"),
+        "the re-derivation still answered warming: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some("pk-warm:index_warming"),
+        "the per-pane failure cause is logged: {resolved:?}"
+    );
+    assert!(
+        resolved
+            .fields
+            .get("elapsed_ms")
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("elapsed_ms is a number")
+            >= 50,
+        "the deferral duration is recorded: {resolved:?}"
+    );
 }
 
 /// A known provider with no home on this machine is NOT warming — it gets
@@ -918,9 +966,10 @@ async fn unreadable_store_is_immediate_and_honest_never_deferred() {
 }
 
 /// The deferral is real: index warms during the wait -> the SECOND derivation
-/// answers with the warm verdict, not error. The transition log fires
-/// exactly ONCE for the request — the deferral arm — and the still-warming
-/// follow-up never fires because the re-derivation resolved.
+/// answers with the warm verdict, not error. The transition logs fire
+/// exactly ONCE each for the request — the deferral arm, then the
+/// resolution event at INFO (warming cleared, no unresolved pane) — never
+/// per poll.
 #[tokio::test]
 async fn warming_resolves_during_deferral_rederives() {
     let (events, _guard) = capture();
@@ -967,6 +1016,99 @@ async fn warming_resolves_during_deferral_rederives() {
     assert!(
         event.fields.contains_key("connection_id"),
         "the event must identify the connection: {event:?}"
+    );
+    assert_eq!(
+        event.fields.get("pane_keys").map(String::as_str),
+        Some("pk-warm"),
+        "the deferred pane's key is logged: {event:?}"
+    );
+    assert_eq!(
+        event.fields.get("sessions").map(String::as_str),
+        Some("claude:sess-2"),
+        "the deferred pane's session claim is logged: {event:?}"
+    );
+    // Delta fix finding 2: the resolution transition is recorded once, at
+    // INFO (the deferred pane resolved cleanly — no failure cause).
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event per deferred request: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(resolved.level, "INFO", "clean resolution is not a failure");
+    assert_eq!(
+        resolved.fields.get("reconcile_id").map(String::as_str),
+        Some("rec-warming")
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("true"),
+        "the re-derivation resolved the deferred pane: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some(""),
+        "no pane resolved-to-error, so no failure causes: {resolved:?}"
+    );
+    assert!(
+        resolved.fields.contains_key("elapsed_ms"),
+        "the deferral duration is recorded: {resolved:?}"
+    );
+}
+
+/// Delta fix finding 2: a deferred pane that re-derives to a NON-warming
+/// error verdict (e.g. the honest session_store_unreadable once the index
+/// published but the store cannot be read) is a failure transition — the
+/// resolution event logs at WARN with the per-pane failure cause.
+#[tokio::test]
+async fn warming_resolves_to_error_verdict_logs_the_per_pane_failure_cause() {
+    let (events, _guard) = capture();
+    // First call Unknown (parks behind the deferral), then Unreadable (the
+    // index published but this identity's store could not be read).
+    let probe = FlippingProbe::new(vec![
+        freshell_ws::existence::SessionExistence::Unknown,
+        freshell_ws::existence::SessionExistence::Unreadable,
+    ]);
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 50
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    ws.send(reconcile_request_with_session_ref(
+        "claude",
+        "sess-locked-2",
+    ))
+    .await
+    .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert_eq!(result["verdicts"][0]["verdict"], "error");
+    assert_eq!(result["verdicts"][0]["reason"], "session_store_unreadable");
+    assert_eq!(
+        events_by_name(&events, "pane_reconcile.index_warming").len(),
+        1,
+        "the deferral arm logged once"
+    );
+    let resolution_events = events_by_name(&events, "pane_reconcile.index_warming_resolved");
+    assert_eq!(
+        resolution_events.len(),
+        1,
+        "exactly one resolution event: {resolution_events:?}"
+    );
+    let resolved = &resolution_events[0];
+    assert_eq!(
+        resolved.level, "WARN",
+        "an error verdict is a failure record"
+    );
+    assert_eq!(
+        resolved.fields.get("unresolved_panes").map(String::as_str),
+        Some("pk-warm:session_store_unreadable"),
+        "the per-pane failure cause names the honest verdict reason: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.fields.get("warming_cleared").map(String::as_str),
+        Some("true"),
+        "no pane still answers warming — the failure is the unreadable store, not a wait: {resolved:?}"
     );
 }
 

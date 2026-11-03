@@ -8884,18 +8884,60 @@ async fn handle_pane_reconcile(
         // SERVER-SIDE, where the default RUST_LOG records INFO. Once per
         // request by construction — the deferral is single-shot, so this
         // can never become a per-poll log (the same unchanged wait is
-        // never re-logged).
-        let log_index_warming = |verdicts: &[freshell_protocol::PaneVerdict]| {
-            tracing::info!(
-                event = "pane_reconcile.index_warming",
-                connection_id = conn_id,
-                reconcile_id = %request.reconcile_id,
-                pane_count = verdicts.iter().filter(|v| is_index_warming(v)).count(),
-                budget_ms = state.reconcile_deferral_budget_ms,
-                "pane reconcile deferred: session index warming"
-            );
+        // never re-logged). Delta fix finding 2: the arm event also names
+        // the panes it is deferring (pane keys + the session identities
+        // they claim — read from the REQUEST, the authoritative claim
+        // source; a pane with no claim logs `-`), and the post-deferral
+        // resolution is recorded by exactly ONE
+        // `pane_reconcile.index_warming_resolved` event below (severity by
+        // outcome: WARN when a deferred pane ended in a failure state,
+        // INFO on clean resolution) carrying the per-pane failure causes
+        // and the deferral duration.
+        let session_claim = |key: &str| -> String {
+            request
+                .panes
+                .iter()
+                .find(|p| p.pane_key == key)
+                .map(|p| {
+                    p.session_ref
+                        .as_ref()
+                        .map(|s| format!("{}:{}", s.provider, s.session_id))
+                        // The same promotion the reconcile door applies to a
+                        // legacy claim (reconcile.rs `promoted_legacy_claim`):
+                        // a non-shell mode + resumeSessionId pair IS a session
+                        // claim. A pane with no claim of either shape logs `-`.
+                        .or_else(|| {
+                            p.resume_session_id
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .and(p.mode.as_deref().filter(|m| !m.is_empty() && *m != "shell"))
+                                .map(|m| {
+                                    format!(
+                                        "{m}:{}",
+                                        p.resume_session_id.as_deref().unwrap_or_default()
+                                    )
+                                })
+                        })
+                        .unwrap_or_else(|| "-".to_string())
+                })
+                .unwrap_or_else(|| "-".to_string())
         };
-        log_index_warming(&verdicts);
+        let deferred: Vec<(String, String)> = verdicts
+            .iter()
+            .filter(|v| is_index_warming(v))
+            .map(|v| (v.pane_key.clone(), session_claim(&v.pane_key)))
+            .collect();
+        tracing::info!(
+            event = "pane_reconcile.index_warming",
+            connection_id = conn_id,
+            reconcile_id = %request.reconcile_id,
+            pane_count = deferred.len(),
+            pane_keys = %deferred.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(","),
+            sessions = %deferred.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(","),
+            budget_ms = state.reconcile_deferral_budget_ms,
+            "pane reconcile deferred: session index warming"
+        );
+        let deferred_started = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_millis(
             state.reconcile_deferral_budget_ms,
         ))
@@ -8913,11 +8955,50 @@ async fn handle_pane_reconcile(
                 .await;
             }
         };
-        if warming(&verdicts) {
-            // The bounded deferral expired and the index is STILL warming —
-            // the request's final state, logged once more (the answer below
-            // carries the per-pane error{index_warming} verdicts).
-            log_index_warming(&verdicts);
+        // Delta fix finding 2: the request's post-deferral resolution record,
+        // fired exactly ONCE per deferred request. `warming_cleared` says
+        // whether any deferred pane still answers warming; the per-pane
+        // failure cause names every deferred pane whose re-derived verdict
+        // is an ERROR (still index_warming, the honest
+        // session_store_unreadable, provider_unavailable, ...) so a failed
+        // recovery is traceable to a specific pane and session from the
+        // server log alone. Severity is outcome-structured: WARN when any
+        // deferred pane ended in a failure state, INFO on clean resolution.
+        let deferred_keys: Vec<String> = deferred.iter().map(|(k, _)| k.clone()).collect();
+        let unresolved_panes: Vec<String> = verdicts
+            .iter()
+            .filter(|v| {
+                deferred_keys.contains(&v.pane_key)
+                    && matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
+            })
+            .map(|v| format!("{}:{}", v.pane_key, v.reason.as_deref().unwrap_or("-")))
+            .collect();
+        let warming_cleared = !verdicts
+            .iter()
+            .any(|v| deferred_keys.contains(&v.pane_key) && is_index_warming(v));
+        let elapsed_ms = deferred_started.elapsed().as_millis() as u64;
+        if unresolved_panes.is_empty() {
+            tracing::info!(
+                event = "pane_reconcile.index_warming_resolved",
+                connection_id = conn_id,
+                reconcile_id = %request.reconcile_id,
+                pane_count = deferred_keys.len(),
+                warming_cleared,
+                unresolved_panes = "",
+                elapsed_ms,
+                "pane reconcile warming resolved"
+            );
+        } else {
+            tracing::warn!(
+                event = "pane_reconcile.index_warming_resolved",
+                connection_id = conn_id,
+                reconcile_id = %request.reconcile_id,
+                pane_count = deferred_keys.len(),
+                warming_cleared,
+                unresolved_panes = %unresolved_panes.join(","),
+                elapsed_ms,
+                "pane reconcile warming resolved with failures"
+            );
         }
     }
     // A `dead_session` verdict parks the pane in the client's dead-sessions
