@@ -481,10 +481,10 @@ export function unboundRewindAvailability(
     : { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
 }
 
-// True while this pane has a composer send whose checkpoint capture has not
-// yet been identity-enriched AND whose dispatch busy window is still the
-// pane's CURRENT busy window. The barrier-time outcome frame carries the
-// send's logicalAttemptId but no native row ids; the identity-enriched
+// True while the current conversation has a composer send whose checkpoint
+// capture has not yet been identity-enriched AND whose dispatch busy window
+// is still the pane's CURRENT busy window. The barrier-time outcome frame
+// carries the send's logicalAttemptId but no native row ids; the identity-enriched
 // outcome adds nativeTurnId. An attempt's outcome counts as "capture in
 // flight" ONLY while the capture SUCCEEDED (status exactly 'available') and
 // its identity observation is still pending (no nativeTurnId) — covering
@@ -519,8 +519,13 @@ function paneCaptureInFlight(
   pendingSends: ReadonlyMap<string, PendingSendMetadata>,
   paneOutcomes: readonly FreshAgentCheckpointOutcome[] | undefined,
   currentBusyEpoch: number,
+  liveSessionKey?: string,
+  savedSessionKey?: string,
 ): boolean {
   for (const [requestId, metadata] of pendingSends) {
+    // An unresolved send from another conversation is not evidence of a
+    // checkpoint capture here. The saved key preserves verified rebinds.
+    if (!metadata.sourceSessionKey || !scopeToPaneSession(metadata, liveSessionKey, savedSessionKey)) continue
     if (!metadata.logicalAttemptId) continue
     if (metadata.busyEpoch !== currentBusyEpoch) continue
     const metadataOutcome = metadata.checkpointOutcome
@@ -973,16 +978,16 @@ function paneSessionScope(content: FreshAgentPaneContent): PaneSessionScope {
   }
 }
 
-function scopePaneNotice<T extends PaneSessionScope>(notice: T | null, liveSessionKey?: string, savedSessionKey?: string): T | null {
-  if (!notice?.sourceSessionKey) return notice
-  if (notice.sourceSessionKey === liveSessionKey) {
-    return !notice.sourceCanonicalSessionKey && savedSessionKey
-      ? { ...notice, sourceCanonicalSessionKey: savedSessionKey }
-      : notice
+function scopeToPaneSession<T extends PaneSessionScope>(value: T | null, liveSessionKey?: string, savedSessionKey?: string): T | null {
+  if (!value?.sourceSessionKey) return value
+  if (value.sourceSessionKey === liveSessionKey) {
+    return !value.sourceCanonicalSessionKey && savedSessionKey
+      ? { ...value, sourceCanonicalSessionKey: savedSessionKey }
+      : value
   }
   const sameSavedConversation = savedSessionKey
-    && (savedSessionKey === notice.sourceSessionKey || savedSessionKey === notice.sourceCanonicalSessionKey)
-  if (sameSavedConversation) return liveSessionKey ? { ...notice, sourceSessionKey: liveSessionKey } : notice
+    && (savedSessionKey === value.sourceSessionKey || savedSessionKey === value.sourceCanonicalSessionKey)
+  if (sameSavedConversation) return liveSessionKey ? { ...value, sourceSessionKey: liveSessionKey } : value
   return null
 }
 
@@ -3601,7 +3606,7 @@ export function FreshAgentView({
         if (!originalPending?.sourceSessionKey) return
         const current = paneContentRef.current
         const currentScope = paneSessionScope(current)
-        const pending = scopePaneNotice(originalPending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)
+        const pending = scopeToPaneSession(originalPending, currentScope.sourceSessionKey, currentScope.sourceCanonicalSessionKey)
         // Top-level error frames contain no session locator. A request from a
         // previous conversation must not restore its text or retry here.
         if (!pending) return
@@ -4793,7 +4798,11 @@ export function FreshAgentView({
   // busy retires it (the epoch moves past every entry dispatched in the
   // window that just ended). Fed through getRewindAvailability's deps so
   // the memoized transcript re-renders when the flag flips.
-  const captureInFlight = paneCaptureInFlight(pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current)
+  const { sourceSessionKey: liveSessionKey, sourceCanonicalSessionKey: savedNoticeSessionKey } = paneSessionScope(paneContent)
+  const captureInFlight = paneCaptureInFlight(
+    pendingSendMetadataRef.current, paneContent.checkpointOutcomes, busyEpochRef.current,
+    liveSessionKey, savedNoticeSessionKey,
+  )
   const newestUserTurnKey = useMemo(() => {
     // The transcript renders turns through its display pipeline — opencode-pty
     // notification rows reclassify to agent text, synthetic tool-result rows
@@ -4893,7 +4902,6 @@ export function FreshAgentView({
   // before its transcript lines land. This view never subscribes to the
   // tail's text — only to whether it shows anything, so the transcript's own
   // live strip yields to it and one live reel shows.
-  const { sourceSessionKey: liveSessionKey, sourceCanonicalSessionKey: savedNoticeSessionKey } = paneSessionScope(paneContent)
   const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
   const retainedSnapshot = useAppSelector((state) => liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.retainedSnapshot : undefined)
   useEffect(() => {
@@ -4977,10 +4985,10 @@ export function FreshAgentView({
     consume(liveErrorNotice, shownErrorNoticeSeqRef)
   }, [liveNotice, liveErrorNotice, liveSessionKey, paneContent.provider, savedNoticeSessionKey, setNotice])
   useLayoutEffect(() => {
-    setNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
-    setErrorNoticeState(current => scopePaneNotice(current, liveSessionKey, savedNoticeSessionKey))
+    setNoticeState(current => scopeToPaneSession(current, liveSessionKey, savedNoticeSessionKey))
+    setErrorNoticeState(current => scopeToPaneSession(current, liveSessionKey, savedNoticeSessionKey))
     const currentDelivery = deliveryNoticeRef.current
-    const scopedDelivery = scopePaneNotice(currentDelivery, liveSessionKey, savedNoticeSessionKey)
+    const scopedDelivery = scopeToPaneSession(currentDelivery, liveSessionKey, savedNoticeSessionKey)
     if (scopedDelivery !== currentDelivery) {
       deliveryNoticeRef.current = scopedDelivery
       setDeliveryNoticeState(scopedDelivery)
