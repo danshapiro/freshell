@@ -5474,6 +5474,9 @@ impl Supervisor {
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await
             .map_err(|error| error.message)?;
+        let codex_input = handle
+            .fresh_agent()
+            .is_some_and(|agent| agent.provider == freshell_runtime_protocol::FreshProvider::Codex);
         loop {
             let Some(command) = self
                 .registry
@@ -5519,6 +5522,19 @@ impl Supervisor {
                         .mark_input_completed(soul_id.clone(), request_id)
                         .await
                         .map_err(|error| error.to_string())?;
+                }
+                Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::Cancelled,
+                    ..
+                }) if codex_input => {
+                    self.registry
+                        .mark_input_cancelled(soul_id.clone(), request_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Err(
+                        "queued input was refused by the provider; the prompt will not be replayed"
+                            .into(),
+                    );
                 }
                 Ok(HostResult::TerminalInput { state })
                 | Ok(HostResult::FreshAgentCommand { state, .. }) => {
@@ -6470,6 +6486,151 @@ pub(crate) mod tests {
     use freshell_runtime_protocol::{
         FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
     };
+
+    #[tokio::test]
+    async fn queued_fresh_input_keeps_definite_refusal_distinct_from_ambiguity() {
+        use crate::registry::InputJournalDisposition;
+        use freshell_runtime_protocol::{
+            host_proof, read_frame, write_frame, ControlRole, Envelope, HostBootId, HostReply,
+        };
+        for (codex, state, expected) in [
+            (
+                true,
+                CommandState::Cancelled,
+                InputJournalDisposition::Cancelled,
+            ),
+            (
+                true,
+                CommandState::Ambiguous,
+                InputJournalDisposition::Ambiguous,
+            ),
+            (
+                false,
+                CommandState::Cancelled,
+                InputJournalDisposition::Ambiguous,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry =
+                crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared = crate::registry::tests::materialize_fresh_runtime(
+                &registry,
+                soul.clone(),
+                dir.path(),
+            )
+            .await;
+            let runtime = dir.path().join("owned-host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = rusqlite::Connection::open(registry.database_path()).unwrap();
+            if codex {
+                let mut spec = registry
+                    .active_handle_for_soul(soul.clone())
+                    .await
+                    .unwrap()
+                    .fresh_agent()
+                    .unwrap()
+                    .clone();
+                spec.provider = FreshProvider::Codex;
+                spec.session_type = "freshcodex".into();
+                conn.execute(
+                    "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                    rusqlite::params![
+                        serde_json::to_string(&spec).unwrap(),
+                        prepared.incarnation_id.as_str()
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
+                rusqlite::params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+            )
+            .unwrap();
+            let request_id = RequestId::new();
+            registry
+                .begin_input(soul.clone(), request_id.clone(), b"queued input", None)
+                .await
+                .unwrap();
+            let limits = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .requested_limits;
+            let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let server = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec![],
+                            effective_limits: limits,
+                        },
+                        HostCommand::FreshAgentSend { .. } => HostResult::FreshAgentCommand {
+                            state,
+                            native_session_id: None,
+                            native_identity: None,
+                            claude_fork: None,
+                        },
+                        other => panic!("unexpected host command: {other:?}"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let supervisor = supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            assert!(supervisor
+                .replay_queued_inputs(soul.clone(), prepared.incarnation_id.clone())
+                .await
+                .is_err());
+            server.await.unwrap();
+            assert_eq!(
+                registry
+                    .recorded_input_outcome(soul.clone(), request_id.clone(), b"queued input", None)
+                    .await
+                    .unwrap(),
+                Some(expected)
+            );
+            assert!(
+                registry
+                    .claim_next_queued_input(soul, prepared.incarnation_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a settled command must not be automatically redispatched"
+            );
+        }
+    }
 
     pub(super) struct AcceptedRecoveryTransport {
         pub(super) native: &'static str,

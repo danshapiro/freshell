@@ -5369,11 +5369,14 @@ mod codex_replacement_realpath {
         task::JoinSet,
     };
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum NativeOutcome {
         Accepted,
         Refused,
         Ambiguous,
+        UnexpectedReply,
+        InvalidIdentity,
+        RegistryFailure,
     }
 
     struct FakeNative {
@@ -5382,6 +5385,7 @@ mod codex_replacement_realpath {
         release: Mutex<Option<oneshot::Receiver<()>>>,
         outcome: NativeOutcome,
         resolutions: Arc<AtomicUsize>,
+        sends: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -5398,6 +5402,13 @@ mod codex_replacement_realpath {
             _: &str,
             profile: &FreshAgentProfile,
         ) -> Result<DispatchAck, DispatchFailure> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            if request.as_str() == "different-request" {
+                return Ok(DispatchAck {
+                    provider_ack_id: Some("different".into()),
+                    native_identity: None,
+                });
+            }
             if request.as_str() == "second-replacement-through-supervisor" {
                 assert_eq!(profile.native_session_id.as_deref(), Some("native-b"));
                 return Ok(DispatchAck {
@@ -5466,7 +5477,10 @@ mod codex_replacement_realpath {
                         acceptance_ambiguous: true,
                     })
                 }
-                NativeOutcome::Accepted => {}
+                NativeOutcome::Accepted
+                | NativeOutcome::UnexpectedReply
+                | NativeOutcome::InvalidIdentity
+                | NativeOutcome::RegistryFailure => {}
             }
             Ok(DispatchAck {
                 provider_ack_id: Some("replacement-turn".into()),
@@ -5555,6 +5569,7 @@ mod codex_replacement_realpath {
         generation: u64,
         reads: Arc<StdMutex<Vec<HostRead>>>,
         lose_send_reply: bool,
+        outcome: NativeOutcome,
         dispatches: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     }
 
@@ -5619,37 +5634,45 @@ mod codex_replacement_realpath {
                                             request_id, text, settings, checkpoint_logical_attempt_id).await;
                                     });
                                     host.dispatches.lock().await.push(dispatch);
-                                    let result = Err(freshell_runtime_protocol::RuntimeError::new(
-                                        RuntimeErrorCode::HostUnreachable, "owned host reply was lost"));
-                                    write_frame(&mut stream, &HostReply { request_id: request.request_id, result })
-                                        .await.unwrap();
+                                    // The host accepted the request but the socket closed before a reply.
                                     return;
                                 }
                                 let before = host.actor.profile().await.native_session_id.unwrap();
                                 let state = match host.actor.dispatch_with_checkpoint_identity(
                                     request_id, text, settings, checkpoint_logical_attempt_id).await {
                                     Ok(state) => state,
-                                    Err(_) => {
+                                    Err(freshell_agent_runtime::host_actor::ActorError::Transport(_)) => CommandState::Cancelled,
+                                    Err(error) => {
                                         let result = Err(freshell_runtime_protocol::RuntimeError::new(
-                                            RuntimeErrorCode::HostUnreachable, "owned fake dispatch did not settle"));
+                                            if matches!(error, freshell_agent_runtime::host_actor::ActorError::AmbiguousDispatch) {
+                                                RuntimeErrorCode::CommandAmbiguous
+                                            } else { RuntimeErrorCode::HostUnreachable }, "owned fake dispatch did not settle"));
                                         write_frame(&mut stream, &HostReply { request_id: request.request_id, result })
                                             .await.unwrap();
                                         return;
                                     }
                                 };
+                                if host.outcome == NativeOutcome::UnexpectedReply {
+                                    write_frame(&mut stream, &HostReply { request_id: request.request_id, result: Ok(HostResult::TerminalResize) }).await.unwrap();
+                                    return;
+                                }
                                 let after = host.actor.profile().await;
                                 let native = after.native_session_id.clone().unwrap();
                                 HostResult::FreshAgentCommand {
                                     state, native_session_id: Some(native.clone()), claude_fork: None,
                                     native_identity: Some(NativeDispatchIdentity {
-                                        previous_native_session_id: before, native_session_id: native,
+                                        previous_native_session_id: if host.outcome == NativeOutcome::InvalidIdentity { "wrong-source".into() } else { before }, native_session_id: native,
                                         pending_naming_handle: after.naming_handle,
                                     }),
                                 }
                             }
                             HostCommand::FreshAgentReadEvents { incarnation_id, after_sequence, max_events } => {
                                 assert_eq!(incarnation_id, host.incarnation);
-                                let batch = host.actor.read_events(after_sequence, max_events as usize).await;
+                                let mut batch = host.actor.read_events(after_sequence, max_events as usize).await;
+                                if matches!(host.outcome, NativeOutcome::UnexpectedReply | NativeOutcome::InvalidIdentity | NativeOutcome::RegistryFailure) {
+                                    batch.accepted_native_dispatch = None;
+                                    batch.native_dispatch_in_flight = true;
+                                }
                                 host.reads.lock().unwrap().push(HostRead { after: after_sequence, batch: batch.clone() });
                                 HostResult::FreshAgentEvents(batch)
                             }
@@ -5735,6 +5758,26 @@ mod codex_replacement_realpath {
     #[tokio::test]
     async fn review_ambiguous_replacement_controls_remain_hidden_and_unactionable() {
         replacement_across_realpath(true, NativeOutcome::Ambiguous, false).await;
+    }
+
+    #[tokio::test]
+    async fn review_definite_refusal_crosses_actor_supervisor_gateway_without_provider_notice() {
+        replacement_across_realpath(false, NativeOutcome::Refused, false).await;
+    }
+
+    #[tokio::test]
+    async fn review_invalid_host_reply_keeps_dispatched_input_uncertain() {
+        replacement_across_realpath(false, NativeOutcome::UnexpectedReply, false).await;
+    }
+
+    #[tokio::test]
+    async fn review_uncommitted_identity_keeps_dispatched_input_uncertain() {
+        replacement_across_realpath(false, NativeOutcome::InvalidIdentity, false).await;
+    }
+
+    #[tokio::test]
+    async fn review_failed_outcome_write_keeps_dispatched_input_uncertain() {
+        replacement_across_realpath(false, NativeOutcome::RegistryFailure, false).await;
     }
 
     #[tokio::test]
@@ -5851,12 +5894,14 @@ mod codex_replacement_realpath {
         let (source, stream) = mpsc::channel(16);
         let (release_tx, release_rx) = oneshot::channel();
         let resolutions = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
         let native = Arc::new(FakeNative {
             source: source.clone(),
             stream: StdMutex::new(Some(stream)),
             release: Mutex::new(Some(release_rx)),
             outcome,
             resolutions: resolutions.clone(),
+            sends: sends.clone(),
         });
         let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
             "provider":"codex", "runtimeVariant":"codex", "cwd":workspace, "providerStoreId":"realpath-store",
@@ -5897,6 +5942,7 @@ mod codex_replacement_realpath {
             generation: grant.execution_generation,
             reads: reads.clone(),
             lose_send_reply,
+            outcome,
             dispatches: dispatches.clone(),
         });
         let (host_stop, host_stop_rx) = oneshot::channel();
@@ -5998,9 +6044,65 @@ mod codex_replacement_realpath {
                 assert!(!frame["event"]["type"].as_str().is_some_and(|kind| kind.ends_with(".request")), "unaccepted controls must not reach the old pane: {frame}");
             }
         }
+        if outcome == NativeOutcome::RegistryFailure {
+            let conn = rusqlite::Connection::open(root.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute_batch("CREATE TRIGGER refuse_input_settlement BEFORE UPDATE OF state ON input_commands WHEN NEW.state IN ('completed', 'ambiguous') BEGIN SELECT RAISE(FAIL, 'controlled settlement failure'); END;").unwrap();
+        }
         release.take().unwrap().send(()).unwrap();
         if let Some(send) = send_task.take() {
             settle_task(send, "gateway send").await.unwrap();
+        }
+        if !lose_send_reply && outcome != NativeOutcome::Accepted {
+            let expected = if outcome == NativeOutcome::Refused { "MANAGED_FRESH_AGENT_ERROR" } else { "COMMAND_AMBIGUOUS" };
+            let mut frames = Vec::new();
+            while let Ok(frame) = public.try_recv() {
+                frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+            }
+            let frame = frames.iter().find(|frame| frame["event"]["requestId"] == "replacement-through-supervisor")
+                .expect("gateway must report the send outcome");
+            println!("FRESHELL_REALPATH_SEND_{outcome:?}={frame}");
+            assert_eq!(frame["event"]["code"], expected, "{frames:?}");
+            let repeat = serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+                "requestId":"replacement-through-supervisor", "text":"recover once"
+            })).unwrap();
+            proxy.clone().handle(HostedFreshAgentCommand::Send(repeat)).await;
+            let mut repeated = Vec::new();
+            while let Ok(frame) = public.try_recv() { repeated.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap()); }
+            if outcome == NativeOutcome::UnexpectedReply {
+                if let Some(frame) = repeated.iter().find(|frame| frame["event"]["requestId"] == "replacement-through-supervisor") {
+                    println!("FRESHELL_REALPATH_SEND_Repeated={frame}");
+                }
+            }
+            assert!(repeated.iter().any(|frame| frame["event"]["requestId"] == "replacement-through-supervisor" && frame["event"]["code"] == expected), "{repeated:?}");
+            assert_eq!(sends.load(Ordering::SeqCst), 1, "same request must never dispatch twice");
+            if outcome == NativeOutcome::RegistryFailure {
+                assert_eq!(actor.profile().await.native_session_id.as_deref(), Some("native-b"));
+                assert_eq!(registry.recovery_context(soul.clone()).await.unwrap().native_session_id.as_deref(), Some("native-b"),
+                    "the accepted identity committed before input-outcome persistence failed");
+            }
+            let different = serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+                "requestId":"different-request", "text":"different input"
+            })).unwrap();
+            proxy.clone().handle(HostedFreshAgentCommand::Send(different)).await;
+            let mut different_frames = Vec::new();
+            while let Ok(frame) = public.try_recv() { different_frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap()); }
+            match outcome {
+                NativeOutcome::Refused => assert_eq!(sends.load(Ordering::SeqCst), 2,
+                    "a separate send may proceed after refusal"),
+                NativeOutcome::RegistryFailure => {
+                    assert_eq!(sends.load(Ordering::SeqCst), 2,
+                        "a separate request can use the committed identity");
+                    assert!(different_frames.iter().any(|frame| frame["event"]["requestId"] == "different-request"
+                        && frame["event"]["code"] == "COMMAND_AMBIGUOUS"), "{different_frames:?}");
+                }
+                _ => {
+                    assert_eq!(sends.load(Ordering::SeqCst), 1, "uncommitted identity fences a different send");
+                    assert!(different_frames.iter().any(|frame| frame["event"]["requestId"] == "different-request" && frame["event"]["code"] == "MANAGED_FRESH_AGENT_ERROR"), "{different_frames:?}");
+                }
+            }
+            return;
         }
         if outcome != NativeOutcome::Accepted {
             let last_staged = staged.events.iter().map(|event| event.sequence).max().unwrap();

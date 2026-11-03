@@ -442,7 +442,7 @@ const freshAgentLiveSlice = createSlice({
       })
       .addCase(turnResult, (state, action) => endTurnsFor(state, action.payload))
       .addCase(sessionError, (state, action) => {
-        if (!action.payload.code?.startsWith('RESTORE_')) errorTailsFor(state, action.payload)
+        if (!action.payload.preserveStatus && !action.payload.code?.startsWith('RESTORE_')) errorTailsFor(state, action.payload)
       })
   },
 })

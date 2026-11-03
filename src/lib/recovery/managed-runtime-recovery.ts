@@ -4,6 +4,7 @@ import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
 import { nativeProjectionRetired } from '@/store/freshAgentLiveSlice'
+import { memoryWarningSourceChanged } from '@/store/freshAgentSlice'
 import { findPaneContent } from '@/lib/pane-utils'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
@@ -474,6 +475,12 @@ export function applyManagedRuntimeMergePlan(
     const layout = store.getState().panes.layouts[update.tabId]
     const previous = layout ? findPaneContent(layout, update.paneId) : null
     const next = update.content
+    if (previous?.kind === 'fresh-agent' && next.kind === 'fresh-agent'
+      && previous.provider === 'codex' && next.provider === 'codex'
+      && previous.sessionId && previous.sessionId === next.sessionId && next.sessionRef?.provider === 'codex') {
+      store.dispatch(memoryWarningSourceChanged({ sessionId: previous.sessionId, sessionType: previous.sessionType,
+        provider: previous.provider, nativeSessionId: next.sessionRef.sessionId, soulId: next.soulId }))
+    }
     if (previous?.kind === 'fresh-agent' && next.kind === 'fresh-agent'
       && previous.provider === 'codex' && next.provider === 'codex'
       && previous.sessionId && previous.sessionId === next.sessionId

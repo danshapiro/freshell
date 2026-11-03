@@ -278,7 +278,6 @@ impl HostedFreshAgentProxy {
                         checkpoint_logical_attempt_id,
                     )
                     .await
-                    .map(|_| ())
             }
             None => {
                 self.error_event(
@@ -291,33 +290,34 @@ impl HostedFreshAgentProxy {
                 return;
             }
         };
-        if let Err(error) = result {
-            use freshell_runtime_client::ClientError;
-            let ambiguous = matches!(
-                error,
-                ClientError::Io(_) | ClientError::Protocol(_) | ClientError::UnexpectedResult
-            ) || matches!(
-                error.runtime_code(),
-                Some(RuntimeErrorCode::CommandAmbiguous | RuntimeErrorCode::HostUnreachable)
+        use freshell_runtime_client::FreshAgentSendFailure;
+        use freshell_runtime_protocol::CommandState;
+        if provider != AgentProvider::Codex && result.is_ok() {
+            return;
+        }
+        let ambiguous = match result {
+            Ok(CommandState::ProviderAcked | CommandState::Completed) => return,
+            Ok(CommandState::Cancelled) | Err(FreshAgentSendFailure::NotAccepted(_)) => false,
+            Ok(CommandState::Ambiguous | CommandState::Queued | CommandState::Dispatching)
+            | Err(FreshAgentSendFailure::Ambiguous(_)) => true,
+        };
+        if provider == AgentProvider::Codex && ambiguous {
+            self.gateway_error_event_code(
+                &provider,
+                &session_id,
+                session_type,
+                "COMMAND_AMBIGUOUS",
+                "CODEX_DELIVERY_AMBIGUOUS: the managed gateway could not confirm whether the message reached Codex",
+                GatewayErrorContext::Operation("send", message.request_id.as_deref()),
             );
-            if provider == AgentProvider::Codex && ambiguous {
-                self.gateway_error_event_code(
-                    &provider,
-                    &session_id,
-                    session_type,
-                    "COMMAND_AMBIGUOUS",
-                    "CODEX_DELIVERY_AMBIGUOUS: the managed gateway could not confirm whether the message reached Codex",
-                    GatewayErrorContext::Operation("send", message.request_id.as_deref()),
-                );
-            } else {
-                self.error_event(
-                    &provider,
-                    &session_id,
-                    session_type,
-                    "managed fresh-agent input was not accepted",
-                    GatewayErrorContext::Operation("send", message.request_id.as_deref()),
-                );
-            }
+        } else {
+            self.error_event(
+                &provider,
+                &session_id,
+                session_type,
+                "managed fresh-agent input was not accepted",
+                GatewayErrorContext::Operation("send", message.request_id.as_deref()),
+            );
         }
     }
 
@@ -1981,6 +1981,11 @@ impl HostedFreshAgentProxy {
                             cursor = cursor.max(batch.head);
                         }
                         for event in batch.events {
+                            let current_warning = is_current_codex_memory_loss(
+                                &event.event,
+                                &provider,
+                                source.as_ref(),
+                            );
                             let retained_warning = event.sequence <= retained_through
                                 && is_current_codex_memory_loss(
                                     &event.event,
@@ -1995,8 +2000,13 @@ impl HostedFreshAgentProxy {
                                 continue;
                             }
                             let mut forwarded = event.event;
-                            if retained_warning {
-                                mark_retained_memory_loss(&mut forwarded);
+                            if current_warning {
+                                mark_memory_loss(
+                                    &mut forwarded,
+                                    source.as_ref().unwrap(),
+                                    event.sequence,
+                                    retained_warning,
+                                );
                             }
                             if !proxy.deliver_polled_event(forwarded, &delivery).await {
                                 break;
@@ -2083,14 +2093,15 @@ impl HostedFreshAgentProxy {
                 });
         let needs_source = pending_announcement
             || batch.events.iter().any(|entry| {
-                codex_event_native_id(&entry.event).is_some_and(|native| {
-                    materialized_session_id(&entry.event).is_some()
-                        || native != route.session_id
-                        || route
-                            .known_native
-                            .as_deref()
-                            .is_some_and(|known| known != native)
-                })
+                codex_memory_loss_native(&entry.event, provider).is_some()
+                    || codex_event_native_id(&entry.event).is_some_and(|native| {
+                        materialized_session_id(&entry.event).is_some()
+                            || native != route.session_id
+                            || route
+                                .known_native
+                                .as_deref()
+                                .is_some_and(|known| known != native)
+                    })
             });
         if needs_source {
             self.current_source(soul).await
@@ -2501,13 +2512,20 @@ impl HostedFreshAgentProxy {
                 }
                 let retained_warning = event.sequence <= retained_through
                     && is_current_codex_memory_loss(&event.event, provider, before.as_ref());
+                let current_warning =
+                    is_current_codex_memory_loss(&event.event, provider, source.as_ref());
                 if event.sequence > retained_through
                     || is_request_receipt(&event.event)
                     || retained_warning
                 {
                     let mut forwarded = event.event;
-                    if retained_warning {
-                        mark_retained_memory_loss(&mut forwarded);
+                    if current_warning {
+                        mark_memory_loss(
+                            &mut forwarded,
+                            source.as_ref().unwrap(),
+                            event.sequence,
+                            true,
+                        );
                     }
                     if !self.deliver_polled_event(forwarded, &delivery).await {
                         return false;
@@ -2601,9 +2619,11 @@ impl HostedFreshAgentProxy {
         }
         let mut codex_materialization = None;
         if provider == "codex" {
+            let memory_loss = codex_memory_loss_native(&event, provider).is_some();
             let materialized = materialized_session_id(&event);
             if let Some(native) = codex_event_native_id(&event).map(str::to_owned) {
-                let needs_source = materialized.is_some()
+                let needs_source = memory_loss
+                    || materialized.is_some()
                     || native != route.session_id
                     || route
                         .known_native
@@ -3498,21 +3518,39 @@ fn is_current_codex_memory_loss(
     provider: &str,
     source: Option<&freshell_runtime_protocol::RuntimeView>,
 ) -> bool {
-    let AgentEvent::Provider { payload } = event else {
-        return false;
-    };
-    provider == "codex"
-        && payload["type"] == "freshAgent.event"
-        && payload["event"]["type"] == "freshAgent.error"
-        && payload["event"]["code"] == "THREAD_MEMORY_LOST"
-        && payload["sessionId"].as_str().is_some_and(|native| {
-            source.and_then(|view| view.native_session_id.as_deref()) == Some(native)
-        })
+    codex_memory_loss_native(event, provider).is_some_and(|native| {
+        source.and_then(|view| view.native_session_id.as_deref()) == Some(native)
+    })
 }
 
-fn mark_retained_memory_loss(event: &mut AgentEvent) {
+fn codex_memory_loss_native<'a>(event: &'a AgentEvent, provider: &str) -> Option<&'a str> {
+    let AgentEvent::Provider { payload } = event else {
+        return None;
+    };
+    (provider == "codex"
+        && payload["type"] == "freshAgent.event"
+        && payload["event"]["type"] == "freshAgent.error"
+        && payload["event"]["code"] == "THREAD_MEMORY_LOST")
+        .then(|| payload["sessionId"].as_str())
+        .flatten()
+        .filter(|native| !native.is_empty())
+}
+
+fn mark_memory_loss(
+    event: &mut AgentEvent,
+    source: &freshell_runtime_protocol::RuntimeView,
+    sequence: u64,
+    replayed: bool,
+) {
     if let AgentEvent::Provider { payload } = event {
-        payload["event"]["retainedReplay"] = serde_json::json!(true);
+        payload["event"]["journalIdentity"] = serde_json::json!({
+            "soulId": source.soul_id,
+            "nativeSessionId": source.native_session_id,
+            "sequence": sequence,
+        });
+        if replayed {
+            payload["event"]["retainedReplay"] = serde_json::json!(true);
+        }
     }
 }
 

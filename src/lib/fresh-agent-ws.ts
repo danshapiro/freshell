@@ -25,6 +25,8 @@ import {
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
+  memoryWarningObserved,
+  memoryWarningSourceChanged,
   materializeSession as materializeFreshAgentSessionState,
   removePermission,
   removeQuestion,
@@ -260,6 +262,12 @@ export function handleFreshAgentMessage(
         const newNative = materialized.sessionRef?.provider === 'codex'
           ? materialized.sessionRef.sessionId
           : undefined
+        if (materialized.provider === 'codex' && newNative) {
+          for (const sessionId of new Set([materialized.previousSessionId, materialized.sessionId])) {
+            innerDispatch(memoryWarningSourceChanged({ sessionId, sessionType: materialized.sessionType,
+              provider: materialized.provider, nativeSessionId: newNative }))
+          }
+        }
         const replaceLiveProjection = materialized.provider === 'codex'
           && materialized.previousSessionId === materialized.sessionId
           && Boolean(newNative)
@@ -788,14 +796,36 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         // never the pane error surface.
         return true
       } else {
-        dispatch(sessionError({
-          ...locator,
-          code: event.code as string | undefined,
-          message: (event.message as string) || (event.error as string) || 'Unknown error',
-          ...(isObject(event.gateway) || event.code === 'FRESH_AGENT_REPLAY_RETRY'
-            || (event.code === 'THREAD_MEMORY_LOST' && event.retainedReplay === true)
-            ? { preserveStatus: true } : {}),
-        }))
+        const identity = event.code === 'THREAD_MEMORY_LOST' && isObject(event.journalIdentity)
+          ? event.journalIdentity : undefined
+        const validIdentity = identity && typeof identity.soulId === 'string' && typeof identity.nativeSessionId === 'string'
+          && typeof identity.sequence === 'number' && Number.isSafeInteger(identity.sequence) && identity.sequence > 0
+          ? { soulId: identity.soulId, nativeSessionId: identity.nativeSessionId, sequence: identity.sequence } : undefined
+        dispatch((innerDispatch, getState) => {
+          const key = makeFreshAgentSessionKey(locator)
+          const session = getState().freshAgent.sessions[key]
+          const message = (event.message as string) || (event.error as string) || 'Unknown error'
+          if (validIdentity) {
+            const previous = session?.memoryWarningHighWater?.find((source) => source.soulId === validIdentity.soulId
+              && source.nativeSessionId === validIdentity.nativeSessionId)
+            if (previous && previous.sequence >= validIdentity.sequence) return
+            const pending = session?.memoryWarning
+            if (pending?.pendingMessage && pending.soulId === validIdentity.soulId
+              && pending.nativeSessionId === validIdentity.nativeSessionId && pending.sequence >= validIdentity.sequence) return
+            const defer = event.retainedReplay === true && Boolean(session?.lastError) && session?.lastErrorCode !== 'SESSION_RESERVED'
+            innerDispatch(memoryWarningObserved({ ...locator, identity: { ...validIdentity, ...(defer ? { pendingMessage: message } : {}) } }))
+            // Keep the visible error and present the missed warning after it is dismissed.
+            if (defer) return
+          }
+          innerDispatch(sessionError({
+            ...locator,
+            code: event.code as string | undefined,
+            message,
+            ...(isObject(event.gateway) || event.code === 'FRESH_AGENT_REPLAY_RETRY'
+              || (event.code === 'THREAD_MEMORY_LOST' && event.retainedReplay === true)
+              ? { preserveStatus: true } : {}),
+          }))
+        })
       }
       return true
     case 'freshAgent.killed':

@@ -413,10 +413,20 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
             .await
             .map_err(|_| ())?;
         let request_id = RequestId::parse(request.request_id).map_err(|_| ())?;
-        self.client
+        let state = self
+            .client
             .fresh_agent_send(request_id, soul.clone(), request.text, None, None)
             .await
             .map_err(|_| ())?;
+        if provider == AgentProvider::Codex
+            && !matches!(
+                state,
+                freshell_runtime_protocol::CommandState::ProviderAcked
+                    | freshell_runtime_protocol::CommandState::Completed
+            )
+        {
+            return Err(().into());
+        }
         let completed = wait_for_completion(
             &self.client,
             soul,

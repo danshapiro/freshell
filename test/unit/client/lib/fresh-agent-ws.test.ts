@@ -1,7 +1,7 @@
 import savedCodexNativeHistory from '../../../fixtures/managed-native-history/codex.json'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer, { materializeSession, sessionCreated } from '@/store/freshAgentSlice'
+import freshAgentReducer, { clearSessionError, materializeSession, sessionCreated } from '@/store/freshAgentSlice'
 import freshAgentLiveReducer, { liveTailViewerAdded } from '@/store/freshAgentLiveSlice'
 import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
@@ -61,6 +61,144 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 }
 
 describe('fresh-agent-ws', () => {
+  it('does not redisplay a consumed warning when a presentation returns to an earlier native source', async () => {
+    const { WsClient } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    const client = new WsClient('ws://source-return.test/ws')
+    const store = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
+    } })
+    client.onMessage((message) => { handleFreshAgentMessage(store.dispatch, message, client) })
+    const locator = { provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: 'managed-public' }
+    store.dispatch(initLayout({ tabId: 'tab', paneId: 'pane', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: 'native-a' },
+      createRequestId: 'source-return', status: 'idle',
+    } }))
+    store.dispatch(sessionCreated({ ...locator, requestId: 'source-return' }))
+    const supplied = process.env.FRESHELL_TEST_CODEX_SOURCE_RETURN
+    const phases: Record<string, unknown>[][] = supplied ? JSON.parse(supplied) : [
+      ['review-soul', 'native-a', 3], ['review-soul', 'native-b', 8], ['review-soul', 'native-a', 3],
+      ['different-soul', 'native-a', 3], ['review-soul', 'native-c', 1],
+    ].map(([soulId, native, sequence]) => [
+      { type: 'freshAgent.session.materialized', ...locator, previousSessionId: locator.sessionId,
+        sessionRef: { provider: 'codex', sessionId: native } },
+      { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST',
+        message: `Memory lost at ${native}`, retainedReplay: true,
+        journalIdentity: { soulId, nativeSessionId: native, sequence } } },
+    ])
+    expect(phases).toHaveLength(5)
+    const receivePhase = (index: number) => {
+      for (const frame of phases[index]) client.receiveMessageForTest(frame as never)
+    }
+    const key = 'freshcodex:codex:managed-public'
+    receivePhase(0)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Memory lost at native-a')
+    store.dispatch(clearSessionError(locator))
+    receivePhase(1)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Memory lost at native-b')
+    store.dispatch(clearSessionError(locator))
+    receivePhase(2)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+    receivePhase(3)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Memory lost at native-a')
+    store.dispatch(clearSessionError(locator))
+    receivePhase(4)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Memory lost at native-c')
+
+    const delayed = configureStore({ reducer: {
+      freshAgent: freshAgentReducer, freshAgentLive: freshAgentLiveReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
+    } })
+    const delayedClient = new WsClient('ws://source-return-pending.test/ws')
+    delayedClient.onMessage((message) => { handleFreshAgentMessage(delayed.dispatch, message, delayedClient) })
+    delayed.dispatch(initLayout({ tabId: 'tab', paneId: 'pane', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: 'native-a' },
+      createRequestId: 'source-return-pending', status: 'idle',
+    } }))
+    delayed.dispatch(sessionCreated({ ...locator, requestId: 'source-return-pending' }))
+    delayedClient.receiveMessageForTest({ type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Newer failure' } } as never)
+    for (const phase of phases.slice(0, 3)) {
+      for (const frame of phase) delayedClient.receiveMessageForTest(frame as never)
+      expect(delayed.getState().freshAgent.sessions[key].lastError).toBe('Newer failure')
+    }
+    delayed.dispatch(clearSessionError(locator))
+    expect(delayed.getState().freshAgent.sessions[key].lastError).toBe('Memory lost at native-a')
+    delayed.dispatch(clearSessionError(locator))
+    for (const frame of phases[2]) delayedClient.receiveMessageForTest(frame as never)
+    expect(delayed.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+  })
+
+  it('does not resurrect a consumed journal warning or replace a newer failure on replay', () => {
+    const store = createFreshAgentStore()
+    const locator = { provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: 'managed-public' }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator, event })
+    const warning = { type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: 'Memory was lost',
+      journalIdentity: { soulId: 'soul', nativeSessionId: 'native-b', sequence: 3 } }
+    const key = 'freshcodex:codex:managed-public'
+    send(warning)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Memory was lost')
+    store.dispatch(clearSessionError(locator))
+    send({ ...warning, retainedReplay: true })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+    send({ type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Newer operation failed', gateway: { operation: 'compact' } })
+    send({ ...warning, retainedReplay: true })
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Newer operation failed')
+
+    const other = createFreshAgentStore()
+    const sendOther = (event: Record<string, unknown>) => handleFreshAgentMessage(other.dispatch, { type: 'freshAgent.event', ...locator, event })
+    sendOther({ ...warning, retainedReplay: true })
+    expect(other.getState().freshAgent.sessions[key].lastError).toBe('Memory was lost')
+    other.dispatch(clearSessionError(locator))
+    sendOther({ ...warning, retainedReplay: true, journalIdentity: { soulId: 'soul', nativeSessionId: 'native-c', sequence: 4 } })
+    expect(other.getState().freshAgent.sessions[key].lastError).toBe('Memory was lost')
+    const delayed = createFreshAgentStore()
+    const sendDelayed = (event: Record<string, unknown>) => handleFreshAgentMessage(delayed.dispatch, { type: 'freshAgent.event', ...locator, event })
+    sendDelayed({ type: 'freshAgent.error', code: 'OPERATION_FAILED', message: 'Newer operation failed', gateway: { operation: 'compact' } })
+    sendDelayed({ ...warning, retainedReplay: true })
+    expect(delayed.getState().freshAgent.sessions[key].lastError).toBe('Newer operation failed')
+    delayed.dispatch(clearSessionError(locator))
+    expect(delayed.getState().freshAgent.sessions[key].lastError).toBe('Memory was lost')
+    delayed.dispatch(clearSessionError(locator))
+    sendDelayed({ ...warning, retainedReplay: true })
+    expect(delayed.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+    const reserved = createFreshAgentStore()
+    const sendReserved = (event: Record<string, unknown>) => handleFreshAgentMessage(reserved.dispatch, { type: 'freshAgent.event', ...locator, event })
+    sendReserved({ type: 'freshAgent.error', code: 'SESSION_RESERVED', message: 'Transient reservation' })
+    sendReserved({ ...warning, retainedReplay: true })
+    expect(reserved.getState().freshAgent.sessions[key].lastError).toBe('Memory was lost')
+
+    const secondPane = { ...locator, sessionId: 'other-presentation' }
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...secondPane,
+      event: { ...warning, retainedReplay: true } })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:other-presentation'].lastError).toBe('Memory was lost')
+    expect(store.getState().freshAgent.sessions[key].lastError).toBe('Newer operation failed')
+  })
+
+  it('keeps hidden retained output and retry when a replayed warning is not a turn failure', () => {
+    const store = createFreshAgentStore()
+    const outer = { type: 'freshAgent.event' as const, provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: savedCodexNativeHistory.threadId }
+    const send = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, { ...outer, event })
+    send({ type: 'freshAgent.host.backpressure', retainedState: {
+      source: { projectionId: 'p', ownerEpoch: 0, ownerGeneration: 0, soulId: 'soul', incarnationId: 'incarnation', hostBootId: 'boot' },
+      snapshot: { ...savedCodexNativeHistory, status: 'running', turns: [{ id: 't', turnId: 't', role: 'assistant', summary: '', items: [{ id: 'answer', kind: 'text', text: 'Unsaved output' }] }],
+        extensions: { codex: { projection: { id: 'p', historyGeneration: 0, eventRevision: 1, eventOwnedTurnIds: ['t'], nativePreviewTurnIds: [], nativeFinalTurnIds: [], turnRows: { t: ['t'] }, turnOutputStates: {}, settledTurnIds: [] } } } },
+      pendingControls: [], attentionMarks: [],
+    } })
+    send({ type: 'freshAgent.retry', attempt: 2 })
+    const key = `freshcodex:codex:${outer.sessionId}`
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
+    expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
+    send({ type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: 'Memory was lost', retainedReplay: true,
+      journalIdentity: { soulId: 'soul', nativeSessionId: outer.sessionId, sequence: 2 } })
+    expect(store.getState().freshAgentLive.bySession[key]?.retainedSnapshot?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
+    expect(store.getState().freshAgentLive.bySession[key]?.retry?.attempt).toBe(2)
+    expect(store.getState().freshAgent.sessions[key].status).toBe('running')
+    store.dispatch(liveTailViewerAdded(outer))
+    expect(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0].items[0]).toMatchObject({ text: 'Unsaved output' })
+    send({ type: 'freshAgent.error', code: 'TURN_FAILED', message: 'Turn failed' })
+    expect(store.getState().freshAgentLive.bySession[key]?.retry).toBeUndefined()
+    expect(store.getState().freshAgent.sessions[key].status).toBe('idle')
+  })
   it('routes native patches outside the session slice and fences complete items and stale init incarnations', () => {
     const store = createFreshAgentStore()
     const outer = { type: 'freshAgent.event' as const, sessionId: 'native-live', sessionType: 'freshcodex' as const, provider: 'codex' as const }

@@ -991,6 +991,7 @@ struct FakeTransport {
     dispatch_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     stops: AtomicUsize,
     ambiguous_dispatch: bool,
+    refused_dispatch: std::sync::atomic::AtomicBool,
     live: std::sync::atomic::AtomicBool,
     native_evidence: std::sync::Mutex<Option<Value>>,
     prepared_checkpoints: std::sync::Mutex<Vec<Value>>,
@@ -1098,6 +1099,7 @@ impl FakeTransport {
             dispatch_gate: std::sync::Mutex::new(None),
             stops: AtomicUsize::new(0),
             ambiguous_dispatch: false,
+            refused_dispatch: std::sync::atomic::AtomicBool::new(false),
             live: std::sync::atomic::AtomicBool::new(true),
             native_evidence: std::sync::Mutex::new(None),
             prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
@@ -1122,6 +1124,7 @@ impl FakeTransport {
                 dispatch_gate: std::sync::Mutex::new(None),
                 stops: AtomicUsize::new(0),
                 ambiguous_dispatch: false,
+                refused_dispatch: std::sync::atomic::AtomicBool::new(false),
                 live: std::sync::atomic::AtomicBool::new(true),
                 native_evidence: std::sync::Mutex::new(None),
                 prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
@@ -1176,7 +1179,12 @@ impl FreshAgentTransport for FakeTransport {
             entered.notify_one();
             release.notified().await;
         }
-        if self.ambiguous_dispatch {
+        if self.refused_dispatch.load(Ordering::SeqCst) {
+            Err(DispatchFailure {
+                message: "provider refused before acceptance".into(),
+                acceptance_ambiguous: false,
+            })
+        } else if self.ambiguous_dispatch {
             Err(DispatchFailure {
                 message: "reply lost".into(),
                 acceptance_ambiguous: true,
@@ -2775,6 +2783,45 @@ async fn native_checkpoint_release_in_progress_and_cancelled_never_complete_or_r
         assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
         actor.stop().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn refused_input_is_recorded_without_ambiguous_delivery_or_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("codex-thread");
+    transport.refused_dispatch.store(true, Ordering::SeqCst);
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "store-a", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request = RequestId::parse("refused-input").unwrap();
+    assert_eq!(
+        actor
+            .dispatch(request.clone(), "not accepted".into(), None)
+            .await,
+        Err(ActorError::Transport(
+            "provider refused before acceptance".into()
+        ))
+    );
+    assert_eq!(
+        actor
+            .dispatch(request.clone(), "not accepted".into(), None)
+            .await,
+        Ok(CommandState::Cancelled)
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+    transport.refused_dispatch.store(false, Ordering::SeqCst);
+    assert_eq!(
+        actor
+            .dispatch(RequestId::new(), "different input".into(), None)
+            .await,
+        Ok(CommandState::ProviderAcked)
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 2);
+    actor.stop().await.unwrap();
 }
 
 #[tokio::test]

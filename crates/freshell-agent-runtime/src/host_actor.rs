@@ -2263,6 +2263,28 @@ impl FreshAgentHostActor {
         let mut batch = {
             let state = self.state.lock().await;
             let max_events = max_events.clamp(1, self.event_count_cap);
+            // A completed fork retires its parent chain, even if a later
+            // child happens to reuse an earlier native session ID. Both the
+            // fork identity and its sequence already live in this journal.
+            // Eviction removes unpinned warnings before their later fork
+            // marker, so an evicted marker cannot leave an older warning.
+            let fork_boundary = if state.profile.provider == FreshProvider::Codex {
+                state
+                    .events
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match &entry.event {
+                        AgentEvent::CommandOutcome {
+                            request_id,
+                            state: CommandState::Completed,
+                        } if state.completed_forks.contains_key(request_id.as_str()) => {
+                            Some(entry.sequence)
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            };
             EventBatch {
                 retained_state: None,
                 accepted_native_dispatch: current_accepted_native_dispatch(&state),
@@ -2275,6 +2297,12 @@ impl FreshAgentHostActor {
                     .events
                     .iter()
                     .filter(|event| event.sequence > after)
+                    .filter(|event| !fork_boundary.is_some_and(|boundary| {
+                        event.sequence < boundary && matches!(&event.event, AgentEvent::Provider { payload }
+                            if payload["type"] == "freshAgent.event"
+                                && payload["event"]["type"] == "freshAgent.error"
+                                && payload["event"]["code"] == "THREAD_MEMORY_LOST")
+                    }))
                     .filter(|event| !matches!(&event.event, AgentEvent::Started {native_session_id}
                         if state.profile.native_session_id.as_deref() != Some(native_session_id.as_str())))
                     .take(max_events)

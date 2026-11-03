@@ -41,6 +41,7 @@ struct ClassifiedFailure {
     error: RuntimeError,
     category: &'static str,
     http_status: Option<u16>,
+    request_not_sent: bool,
 }
 
 impl ClassifiedFailure {
@@ -49,6 +50,7 @@ impl ClassifiedFailure {
             error,
             category: "timeout",
             http_status: None,
+            request_not_sent: false,
         }
     }
 
@@ -58,6 +60,7 @@ impl ClassifiedFailure {
             error: map_backend(error),
             category,
             http_status,
+            request_not_sent: false,
         }
     }
 }
@@ -76,6 +79,7 @@ impl From<RuntimeError> for ClassifiedFailure {
             error,
             category,
             http_status: None,
+            request_not_sent: false,
         }
     }
 }
@@ -2245,6 +2249,7 @@ impl Supervisor {
                         ),
                         category: "not_empty",
                         http_status: None,
+                        request_not_sent: false,
                     },
                 );
                 false
@@ -2302,6 +2307,7 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Cancelled => return Ok(CommandState::Cancelled),
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2451,6 +2457,7 @@ impl Supervisor {
         {
             Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
             Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
+            Some(InputJournalDisposition::Cancelled) => return Ok(CommandState::Cancelled),
             Some(InputJournalDisposition::Dispatch) | None => {}
         }
         let active = self
@@ -2464,6 +2471,9 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
+        let codex_send = active
+            .fresh_agent()
+            .is_some_and(|agent| agent.provider == freshell_runtime_protocol::FreshProvider::Codex);
         let host = self
             .authenticate_current_fresh_host(&soul_id, &active)
             .await?;
@@ -2481,6 +2491,7 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Cancelled => return Ok(CommandState::Cancelled),
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2498,7 +2509,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let response = self
-            .send_authenticated_host_command(
+            .send_authenticated_host_reply(
                 handle.incarnation_id().clone(),
                 handle.runtime_dir(),
                 &host,
@@ -2511,80 +2522,162 @@ impl Supervisor {
                 },
             )
             .await;
+        let response = match response {
+            Ok(reply) => match reply.result {
+                Ok(result) => result,
+                Err(error) => {
+                    if !codex_send || error.code == RuntimeErrorCode::CommandAmbiguous {
+                        self.registry
+                            .mark_input_ambiguous(soul_id, request_id)
+                            .await
+                            .map_err(|error| map_input_settlement(error, codex_send))?;
+                    } else {
+                        self.registry
+                            .mark_input_cancelled(soul_id, request_id)
+                            .await
+                            .map_err(|error| map_input_settlement(error, codex_send))?;
+                    }
+                    return Err(error);
+                }
+            },
+            Err(failure) => {
+                if !codex_send {
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(map_registry)?;
+                    return Err(failure.error);
+                }
+                if failure.request_not_sent {
+                    self.registry
+                        .mark_input_cancelled(soul_id, request_id)
+                        .await
+                        .map_err(|error| map_input_settlement(error, codex_send))?;
+                    return Err(failure.error);
+                }
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(|error| map_input_settlement(error, codex_send))?;
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::CommandAmbiguous,
+                    "fresh-agent input dispatch could not be confirmed",
+                ));
+            }
+        };
         match response {
-            Ok(HostResult::FreshAgentCommand {
+            HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
                 native_session_id,
                 native_identity,
                 ..
-            }) => {
-                if let Some(identity) = native_identity {
-                    let prior_native = active
-                        .fresh_agent()
-                        .and_then(|spec| spec.native_session_id.as_deref());
-                    if active.fresh_agent().is_none_or(|spec| {
-                        spec.provider != freshell_runtime_protocol::FreshProvider::Codex
-                    }) || prior_native != Some(identity.previous_native_session_id.as_str())
-                        || native_session_id.as_deref() != Some(identity.native_session_id.as_str())
-                    {
-                        return Err(RuntimeError::new(
-                            RuntimeErrorCode::OwnershipMismatch,
-                            "accepted native identity does not match its captured command source",
-                        ));
+            } => {
+                let committed: Result<(), RuntimeError> = async {
+                    if let Some(identity) = native_identity {
+                        let prior_native = active
+                            .fresh_agent()
+                            .and_then(|spec| spec.native_session_id.as_deref());
+                        if active.fresh_agent().is_none_or(|spec| {
+                            spec.provider != freshell_runtime_protocol::FreshProvider::Codex
+                        }) || prior_native != Some(identity.previous_native_session_id.as_str())
+                            || native_session_id.as_deref() != Some(identity.native_session_id.as_str())
+                        {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::OwnershipMismatch,
+                                "accepted native identity does not match its captured command source",
+                            ));
+                        }
+                        let update = classify_fresh_agent_operation_identity(
+                            prior_native,
+                            native_session_id.as_deref(),
+                        )?;
+                        self.registry
+                            .record_fresh_agent_dispatch_identity(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                identity,
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                        tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
+                    } else if let Some(native_session_id) = native_session_id {
+                        self.registry
+                            .record_native_session_fenced(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                native_session_id,
+                                fence,
+                            )
+                            .await
+                            .map_err(map_registry)?;
                     }
-                    let update = classify_fresh_agent_operation_identity(
-                        prior_native,
-                        native_session_id.as_deref(),
-                    )?;
                     self.registry
-                        .record_fresh_agent_dispatch_identity(
-                            soul_id.clone(),
-                            handle.incarnation_id().clone(),
-                            identity,
-                        )
+                        .mark_input_completed(soul_id.clone(), request_id.clone())
                         .await
                         .map_err(map_registry)?;
-                    tracing::info!(soul_id=%soul_id,incarnation_id=%handle.incarnation_id(),previous_native_session_id=prior_native,native_session_id=native_session_id.as_deref(),native_identity_update=?update,"freshagent.native_dispatch_identity_committed");
-                } else if let Some(native_session_id) = native_session_id {
-                    self.registry
-                        .record_native_session_fenced(
-                            soul_id.clone(),
-                            handle.incarnation_id().clone(),
-                            native_session_id,
-                            fence,
-                        )
-                        .await
-                        .map_err(map_registry)?;
+                    Ok(())
                 }
-                self.registry
-                    .mark_input_completed(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
+                .await;
+                if let Err(error) = committed {
+                    if !codex_send {
+                        return Err(error);
+                    }
+                    tracing::warn!(code=?error.code, "fresh_agent.input_commit_unconfirmed");
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(|error| map_input_settlement(error, codex_send))?;
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::CommandAmbiguous,
+                        "accepted fresh-agent input could not be committed",
+                    ));
+                }
                 Ok(CommandState::ProviderAcked)
             }
-            Ok(HostResult::FreshAgentCommand { state, .. }) => {
+            HostResult::FreshAgentCommand {
+                state: CommandState::Cancelled,
+                ..
+            } => {
+                if !codex_send {
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(map_registry)?;
+                    return Ok(CommandState::Cancelled);
+                }
                 self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
+                    .mark_input_cancelled(soul_id, request_id)
                     .await
-                    .map_err(map_registry)?;
-                Ok(state)
+                    .map_err(|error| map_input_settlement(error, codex_send))?;
+                Ok(CommandState::Cancelled)
             }
-            Ok(_) => {
+            HostResult::FreshAgentCommand { state, .. } => {
                 self.registry
                     .mark_input_ambiguous(soul_id, request_id)
                     .await
-                    .map_err(map_registry)?;
-                Err(RuntimeError::new(
-                    RuntimeErrorCode::HostAuthenticationFailed,
-                    "unexpected fresh-agent command reply",
-                ))
+                    .map_err(|error| map_input_settlement(error, codex_send))?;
+                Ok(if codex_send {
+                    CommandState::Ambiguous
+                } else {
+                    state
+                })
             }
-            Err(error) => {
+            _ => {
                 self.registry
                     .mark_input_ambiguous(soul_id, request_id)
                     .await
-                    .map_err(map_registry)?;
-                Err(error)
+                    .map_err(|error| map_input_settlement(error, codex_send))?;
+                Err(if codex_send {
+                    RuntimeError::new(
+                        RuntimeErrorCode::CommandAmbiguous,
+                        "fresh-agent command reply could not confirm delivery",
+                    )
+                } else {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostAuthenticationFailed,
+                        "unexpected fresh-agent command reply",
+                    )
+                })
             }
         }
     }
@@ -5201,6 +5294,19 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, ClassifiedFailure> {
+        self.send_authenticated_host_reply(incarnation_id, runtime_dir, host, command)
+            .await?
+            .result
+            .map_err(Into::into)
+    }
+
+    async fn send_authenticated_host_reply(
+        &self,
+        incarnation_id: IncarnationId,
+        runtime_dir: &Path,
+        host: &AuthenticatedHost,
+        command: HostCommand,
+    ) -> Result<HostReply, ClassifiedFailure> {
         let startup_soul = match &command {
             HostCommand::GrantExecution { soul_id, .. } => Some(soul_id.clone()),
             _ => None,
@@ -5225,7 +5331,7 @@ impl Supervisor {
         } else {
             exchange.await?
         };
-        reply.result.map_err(Into::into)
+        Ok(reply)
     }
 
     pub(crate) async fn launch_result_from_status(
@@ -5886,9 +5992,11 @@ async fn request_host_reply_classified(
     };
     let socket_display = socket_path.display().to_string();
     tokio::time::timeout(budget, async {
-        let mut stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|error| unreachable(error.to_string()))?;
+        let mut stream = UnixStream::connect(socket_path).await.map_err(|error| {
+            let mut failure = ClassifiedFailure::from(unreachable(error.to_string()));
+            failure.request_not_sent = true;
+            failure
+        })?;
         write_frame(&mut stream, envelope)
             .await
             .map_err(map_host_frame_error)?;
@@ -9821,6 +9929,18 @@ fn map_registry(error: RegistryError) -> RuntimeError {
         _ => RuntimeErrorCode::RegistryFailure,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+fn map_input_settlement(error: RegistryError, codex_send: bool) -> RuntimeError {
+    let error = map_registry(error);
+    if !codex_send {
+        return error;
+    }
+    tracing::error!(code=?error.code, "fresh_agent.input_settlement_failed");
+    RuntimeError::new(
+        RuntimeErrorCode::CommandAmbiguous,
+        "fresh-agent input outcome could not be recorded",
+    )
 }
 
 pub(crate) fn map_backend(error: BackendError) -> RuntimeError {

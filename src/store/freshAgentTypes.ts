@@ -90,6 +90,12 @@ export type FreshAgentPendingCreate = {
   expectsHistoryHydration: boolean
 }
 
+export type FreshAgentMemoryWarningIdentity = {
+  soulId: string
+  nativeSessionId: string
+  sequence: number
+}
+
 export type FreshAgentSessionState = FreshAgentSessionLocator & {
   sessionKey: string
   threadId: string
@@ -134,6 +140,10 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   /// Task 14: the code that produced lastError -- the view filters
   /// SESSION_RESERVED out of the pane-level error banner (transient, re-driven).
   lastErrorCode?: string
+  /** Current-source warning, including one waiting behind another banner. */
+  memoryWarning?: FreshAgentMemoryWarningIdentity & { pendingMessage?: string }
+  /** Highest consumed warning sequence for each recently seen journal source. */
+  memoryWarningHighWater?: FreshAgentMemoryWarningIdentity[]
   historyLoaded?: boolean
   awaitingDurableHistory?: boolean
   lost?: boolean

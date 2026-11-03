@@ -801,6 +801,7 @@ pub enum InputJournalDisposition {
     Dispatch,
     Completed,
     Ambiguous,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1970,6 +1971,10 @@ impl Registry {
                         tx.commit()?;
                         return Ok((InputJournalDisposition::Ambiguous, recorded_incarnation));
                     }
+                    "cancelled" => {
+                        tx.commit()?;
+                        return Ok((InputJournalDisposition::Cancelled, recorded_incarnation));
+                    }
                     "queued" => {}
                     other => {
                         return Err(RegistryError::Integrity(format!(
@@ -2041,6 +2046,7 @@ impl Registry {
             match state.as_str() {
                 "completed" => Ok(Some(InputJournalDisposition::Completed)),
                 "dispatching" | "ambiguous" => Ok(Some(InputJournalDisposition::Ambiguous)),
+                "cancelled" => Ok(Some(InputJournalDisposition::Cancelled)),
                 "queued" => Ok(None),
                 _ => Err(RegistryError::Integrity(format!("unknown input command state {state}"))),
             }
@@ -2125,6 +2131,14 @@ impl Registry {
         request_id: RequestId,
     ) -> Result<(), RegistryError> {
         self.set_input_state(soul_id, request_id, "ambiguous").await
+    }
+
+    pub async fn mark_input_cancelled(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+    ) -> Result<(), RegistryError> {
+        self.set_input_state(soul_id, request_id, "cancelled").await
     }
 
     /// Atomically moves one never-dispatched command onto the replacement

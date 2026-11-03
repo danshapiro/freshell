@@ -43,6 +43,15 @@ pub enum ClientError {
     UnexpectedResult,
 }
 
+/// Whether a fresh-agent input can be safely described as not accepted.
+#[derive(Debug, thiserror::Error)]
+pub enum FreshAgentSendFailure {
+    #[error("fresh-agent input was not accepted: {0}")]
+    NotAccepted(ClientError),
+    #[error("fresh-agent input delivery is uncertain: {0}")]
+    Ambiguous(ClientError),
+}
+
 impl ClientError {
     pub fn runtime_code(&self) -> Option<RuntimeErrorCode> {
         match self {
@@ -961,9 +970,12 @@ impl RuntimeClient {
         text: String,
         settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
         checkpoint_logical_attempt_id: Option<String>,
-    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
-        let epoch = self.current_epoch().await?;
-        match self
+    ) -> Result<freshell_runtime_protocol::CommandState, FreshAgentSendFailure> {
+        let epoch = self
+            .current_epoch()
+            .await
+            .map_err(FreshAgentSendFailure::NotAccepted)?;
+        let response = self
             .request(
                 request_id,
                 AdminCommand::FreshAgentSend(FreshAgentSendRequest {
@@ -974,10 +986,22 @@ impl RuntimeClient {
                     expected_control_epoch: Some(epoch),
                 }),
             )
-            .await?
-        {
+            .await
+            .map_err(|error| match error {
+                ClientError::Io(_) => FreshAgentSendFailure::NotAccepted(error),
+                ClientError::Runtime {
+                    code: RuntimeErrorCode::CommandAmbiguous,
+                    ..
+                }
+                | ClientError::Protocol(_)
+                | ClientError::UnexpectedResult => FreshAgentSendFailure::Ambiguous(error),
+                ClientError::Runtime { .. } => FreshAgentSendFailure::NotAccepted(error),
+            })?;
+        match response {
             AdminResult::FreshAgentCommand { state } => Ok(state),
-            _ => Err(ClientError::UnexpectedResult),
+            _ => Err(FreshAgentSendFailure::Ambiguous(
+                ClientError::UnexpectedResult,
+            )),
         }
     }
 
@@ -2266,9 +2290,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("retained.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let expected = serde_json::json!({"retainedFrom":1,"head":1,"resetRequired":true,"events":[],"retainedState":{"snapshot":{"turns":[{"text":"x".repeat(2*freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}}});
-        let sent: freshell_runtime_protocol::AgentEventBatch =
-            serde_json::from_value(expected.clone()).unwrap();
+        let retained = serde_json::json!({"snapshot":{"turns":[{"text":"x".repeat(2*freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}});
+        let legacy = serde_json::json!({"retainedFrom":1,"head":1,"resetRequired":true,"events":[],"retainedState":retained.clone()});
+        let expected = freshell_runtime_protocol::AgentEventBatch {
+            retained_state: Some(retained),
+            accepted_native_dispatch: None,
+            native_dispatch_in_flight: false,
+            retained_from: 1,
+            head: 1,
+            reset_required: true,
+            events: Vec::new(),
+        };
+        let decoded: freshell_runtime_protocol::AgentEventBatch =
+            serde_json::from_value(legacy).unwrap();
+        assert!(
+            !decoded.native_dispatch_in_flight,
+            "legacy omitted field defaults to false"
+        );
+        assert!(
+            decoded == expected,
+            "legacy reply preserves every typed field and the 2MiB body"
+        );
+        let sent = expected.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
@@ -2295,7 +2338,7 @@ mod tests {
             .unwrap();
         server.await.unwrap();
         assert!(
-            serde_json::to_value(actual).unwrap() == expected,
+            actual == expected,
             "the actual retained event caller must round-trip the entire 2MiB body"
         );
     }

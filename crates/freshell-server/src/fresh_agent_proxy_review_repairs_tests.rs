@@ -4,6 +4,7 @@ use futures_util::FutureExt;
 use std::sync::Mutex as StdMutex;
 
 struct JournalState {
+    soul: String,
     native: String,
     public: String,
     fork_native: String,
@@ -18,6 +19,7 @@ struct JournalState {
     sends: Vec<String>,
     ambiguous_send: bool,
     disconnect_send: bool,
+    send_state: Option<freshell_runtime_protocol::CommandState>,
 }
 
 struct JournalFixture {
@@ -35,6 +37,7 @@ impl JournalFixture {
         let socket = dir.path().join("review-repairs.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let state = Arc::new(StdMutex::new(JournalState {
+            soul: "review-soul".into(),
             native: native.into(),
             public: public.into(),
             fork_native: "native-c".into(),
@@ -49,6 +52,7 @@ impl JournalFixture {
             sends: Vec::new(),
             ambiguous_send: false,
             disconnect_send: false,
+            send_state: None,
         }));
         let server_state = state.clone();
         let server = tokio::spawn(async move {
@@ -75,7 +79,7 @@ impl JournalFixture {
                         AdminCommand::Inventory => { gate = state.inventory_gate.take();
                             if state.fail_inventory_reads > 0 { state.fail_inventory_reads -= 1; failed_inventory = true; }
                             AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
-                            "soulId":"review-soul", "incarnationId":"review-incarnation", "hostBootId":"review-boot",
+                            "soulId":state.soul, "incarnationId":"review-incarnation", "hostBootId":"review-boot",
                             "launchState":"running", "cleanupState":"none", "intentRevision":1, "executionGeneration":1,
                             "desiredState":"running", "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
                             "evidenceRevision":1, "successfulRecoveriesInWindow":0, "provider":"codex",
@@ -116,7 +120,7 @@ impl JournalFixture {
                             state.sends.push(send.text);
                             ambiguous_send = state.ambiguous_send;
                             disconnect_send = state.disconnect_send;
-                            AdminResult::FreshAgentCommand { state: freshell_runtime_protocol::CommandState::ProviderAcked }
+                            AdminResult::FreshAgentCommand { state: state.send_state.unwrap_or(freshell_runtime_protocol::CommandState::ProviderAcked) }
                         }
                         other => panic!("unexpected review fixture request: {other:?}"),
                     };
@@ -552,6 +556,389 @@ async fn gateway_preserves_ambiguous_send_delivery() {
 }
 
 #[tokio::test]
+async fn gateway_reports_recorded_send_outcomes() {
+    use freshell_runtime_protocol::CommandState;
+    for (state, expected) in [
+        (CommandState::Ambiguous, Some("COMMAND_AMBIGUOUS")),
+        (CommandState::Cancelled, Some("MANAGED_FRESH_AGENT_ERROR")),
+        (CommandState::ProviderAcked, None),
+    ] {
+        let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
+        fixture.state.lock().unwrap().send_state = Some(state);
+        fixture.proxy.aliases.lock().await.insert(
+            ("codex".into(), "managed-public".into()),
+            fixture.soul.clone(),
+        );
+        fixture
+            .proxy
+            .clone()
+            .handle(HostedFreshAgentCommand::Send(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+                    "requestId":"recorded-send", "text":"one delivery"
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        let sends = fixture.state.lock().unwrap().sends.clone();
+        fixture.shutdown().await;
+        assert_eq!(sends, ["one delivery"]);
+        assert_eq!(
+            frames
+                .first()
+                .and_then(|frame| frame["event"]["code"].as_str()),
+            expected,
+            "state={state:?}: {frames:?}"
+        );
+        assert_eq!(
+            frames.len(),
+            usize::from(expected.is_some()),
+            "state={state:?}: {frames:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_captures_warning_replay_across_returned_native_source() {
+    let mut phases = Vec::new();
+    let mut fixture = JournalFixture::new("native-a", "managed-public", journal_batch()).await;
+    let warning = |native: &str, sequence| AgentJournalEvent {
+        sequence,
+        event: AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":native,
+                "event":{"type":"freshAgent.error", "sessionId":native, "code":"THREAD_MEMORY_LOST", "message":format!("Memory lost at {native}")}
+            }),
+        },
+    };
+    for (phase, (soul, native, previous, sequence)) in [
+        ("review-soul", "native-a", "native-old", 3),
+        ("review-soul", "native-b", "native-a", 8),
+        ("review-soul", "native-a", "native-b", 3),
+        ("different-soul", "native-a", "native-b", 3),
+        ("review-soul", "native-c", "native-b", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut batch = journal_batch();
+        let mut proof = accepted_codex_journal_proof();
+        proof.identity.previous_native_session_id = previous.into();
+        proof.identity.native_session_id = native.into();
+        proof.prior_native_session_ids = vec![previous.into()];
+        batch.accepted_native_dispatch = Some(proof);
+        // The returning A warning is the original retained entry: B's later
+        // entry still exists and the same soul's journal head never retreats.
+        if phase == 1 || phase == 2 {
+            batch.head = 8;
+            batch.events = vec![warning("native-a", 3), warning("native-b", 8)];
+        } else {
+            batch.head = sequence;
+            batch.events = vec![warning(native, sequence)];
+        }
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.soul = soul.into();
+            state.native = native.into();
+            state.batch = batch;
+        }
+        fixture.soul = SoulId::parse(soul).unwrap();
+        fixture
+            .proxy
+            .replay_once(
+                fixture.soul.clone(),
+                "codex",
+                "managed-public",
+                "freshcodex",
+            )
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.session.materialized"
+                    && frame["sessionRef"]["sessionId"] == native),
+            "{frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"
+                    && frame["event"]["journalIdentity"]["soulId"] == soul
+                    && frame["event"]["journalIdentity"]["nativeSessionId"] == native
+                    && frame["event"]["journalIdentity"]["sequence"] == sequence),
+            "{frames:?}"
+        );
+        phases.push(frames);
+    }
+    fixture.shutdown().await;
+    println!(
+        "FRESHELL_GATEWAY_SOURCE_RETURN={}",
+        serde_json::json!(phases)
+    );
+}
+
+fn canonical_warning_batch() -> AgentEventBatch {
+    let mut batch = journal_batch();
+    batch.accepted_native_dispatch = None;
+    batch.events[0].event = AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-a",
+            "event":{"type":"freshAgent.error", "sessionId":"native-a", "code":"THREAD_MEMORY_LOST", "message":"Memory lost"}
+        }),
+    };
+    batch
+}
+
+#[tokio::test]
+async fn canonical_memory_warning_live_and_replay_carry_journal_identity() {
+    let mut fixture = JournalFixture::new("native-a", "native-a", canonical_warning_batch()).await;
+    fixture.proxy.presentation_routes.lock().await.insert(
+        fixture.soul.clone(),
+        PresentationRoute::materialized("native-a"),
+    );
+    assert!(
+        fixture
+            .proxy
+            .start_poller(
+                fixture.soul.clone(),
+                "codex".into(),
+                "native-a".into(),
+                "freshcodex".into(),
+                0,
+            )
+            .await
+    );
+    let mut live = Vec::new();
+    let received = collect_until(&mut fixture.frames, &mut live, |frames| {
+        frames
+            .iter()
+            .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+    })
+    .await;
+    fixture
+        .proxy
+        .replay_once(fixture.soul.clone(), "codex", "native-a", "freshcodex")
+        .await;
+    let mut replay = Vec::new();
+    while let Ok(frame) = fixture.frames.try_recv() {
+        replay.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+    }
+    fixture.shutdown().await;
+    assert!(received, "live warning was not delivered: {live:?}");
+    for (frames, replayed) in [(&live, false), (&replay, true)] {
+        let warnings: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{frames:?}");
+        assert_eq!(
+            warnings[0]["event"]["journalIdentity"]["soulId"],
+            "review-soul"
+        );
+        assert_eq!(
+            warnings[0]["event"]["journalIdentity"]["nativeSessionId"],
+            "native-a"
+        );
+        assert_eq!(warnings[0]["event"]["journalIdentity"]["sequence"], 1);
+        assert_eq!(warnings[0]["event"]["retainedReplay"] == true, replayed);
+    }
+}
+
+#[tokio::test]
+async fn canonical_memory_warning_retries_unavailable_source_and_rejects_stale_source() {
+    for (current_native, failures) in [("native-a", 2), ("native-a", 20), ("native-b", 0)] {
+        let mut fixture =
+            JournalFixture::new(current_native, "native-a", canonical_warning_batch()).await;
+        fixture.state.lock().unwrap().fail_inventory_reads = failures;
+        fixture.proxy.presentation_routes.lock().await.insert(
+            fixture.soul.clone(),
+            PresentationRoute::materialized("native-a"),
+        );
+        fixture
+            .proxy
+            .replay_once(fixture.soul.clone(), "codex", "native-a", "freshcodex")
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        fixture.shutdown().await;
+        let warning = frames
+            .iter()
+            .find(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST");
+        if failures == 2 {
+            assert_eq!(
+                warning.unwrap()["event"]["journalIdentity"]["nativeSessionId"],
+                "native-a",
+                "{frames:?}"
+            );
+        } else if failures == 20 {
+            assert!(warning.is_none(), "unverified warning leaked: {frames:?}");
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["event"]["code"] == "FRESH_AGENT_REPLAY_RETRY"),
+                "{frames:?}"
+            );
+        } else {
+            assert!(warning.is_none(), "stale warning leaked: {frames:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn canonical_memory_warning_ignores_unavailable_unrelated_actor() {
+    let mut unrelated = identity_row(
+        "unrelated-soul",
+        "unrelated-public",
+        "unrelated-native",
+        None,
+    );
+    unrelated.unavailable = true;
+    let mut healthy = identity_row("healthy-soul", "native-a", "native-a", None);
+    healthy.batch = canonical_warning_batch();
+    let fixture = IdentityFixture::new(vec![unrelated, healthy]).await;
+    let (proxy, mut frames) = fixture.proxy();
+    proxy
+        .clone()
+        .handle(attach("native-a", "codex", "native-a"))
+        .await;
+    let mut received = Vec::new();
+    let found = collect_until(&mut frames, &mut received, |frames| {
+        frames
+            .iter()
+            .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+    })
+    .await;
+    fixture.shutdown(&[proxy]).await;
+    assert!(
+        found,
+        "healthy exact-native warning was unavailable: {received:?}"
+    );
+    assert!(
+        received.iter().any(
+            |frame| frame["event"]["journalIdentity"]["soulId"] == "healthy-soul"
+                && frame["event"]["journalIdentity"]["nativeSessionId"] == "native-a"
+        ),
+        "{received:?}"
+    );
+}
+
+#[tokio::test]
+async fn canonical_memory_warning_after_real_forks_excludes_retired_parent() {
+    use freshell_agent_runtime::host_actor::{FreshAgentHostActor, FreshAgentProfile};
+    let directory = tempfile::tempdir().unwrap();
+    let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "runtimeVariant":"codex", "cwd":directory.path(), "providerStoreId":"fork-warning",
+        "nativeSessionId":"native-a", "sessionRef":{"provider":"codex", "sessionId":"native-a"}
+    })).unwrap();
+    let actor = FreshAgentHostActor::open(
+        directory.path(),
+        profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    for request in ["warning-replace-a-to-b", "warning-replace-b-to-c"] {
+        actor
+            .dispatch(RequestId::parse(request).unwrap(), "recover".into(), None)
+            .await
+            .unwrap();
+    }
+    let warning = |message: &str| AgentEvent::Provider {
+        payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-c",
+            "event":{"type":"freshAgent.error", "sessionId":"native-c", "code":"THREAD_MEMORY_LOST", "message":message}
+        }),
+    };
+    actor
+        .record_event(warning("Retired parent warning"))
+        .await
+        .unwrap();
+    for (request, parent) in [
+        ("warning-fork-away", "native-c"),
+        ("warning-fork-back", "native-fork"),
+    ] {
+        actor
+            .fork(RequestId::parse(request).unwrap(), parent.into(), None)
+            .await
+            .unwrap();
+    }
+    let restored_profile = actor.profile().await;
+    actor.stop().await.unwrap();
+    let actor = FreshAgentHostActor::open(
+        directory.path(),
+        restored_profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    let before_child_warning = actor.read_events(0, 4096).await;
+    actor
+        .record_event(warning("Current child warning"))
+        .await
+        .unwrap();
+    let after_child_warning = actor.read_events(0, 4096).await;
+    actor.stop().await.unwrap();
+
+    let mut delivered = Vec::new();
+    for mut batch in [before_child_warning, after_child_warning] {
+        assert!(batch.accepted_native_dispatch.is_none());
+        batch.retained_state = Some(serde_json::json!({
+            "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+            "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-c","turns":[],"status":"running"},
+            "attentionMarks":[],"pendingControls":[]
+        }));
+        let mut fixture = JournalFixture::new("native-c", "native-c", batch).await;
+        fixture.proxy.presentation_routes.lock().await.insert(
+            fixture.soul.clone(),
+            PresentationRoute::materialized("native-c"),
+        );
+        fixture
+            .proxy
+            .replay_once(fixture.soul.clone(), "codex", "native-c", "freshcodex")
+            .await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        fixture.shutdown().await;
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"]["retainedState"]["snapshot"]["threadId"] == "native-c"),
+            "{frames:?}"
+        );
+        delivered.push(frames);
+    }
+    assert!(
+        !delivered[0]
+            .iter()
+            .any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"),
+        "a new child must not receive the retired parent's warning: {:?}",
+        delivered[0]
+    );
+    let warnings: Vec<_> = delivered[1]
+        .iter()
+        .filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", delivered[1]);
+    assert_eq!(warnings[0]["event"]["message"], "Current child warning");
+    assert_eq!(
+        warnings[0]["event"]["journalIdentity"]["nativeSessionId"],
+        "native-c"
+    );
+}
+
+#[tokio::test]
 async fn retained_replay_recovers_only_current_codex_memory_loss() {
     const CURRENT_WARNING: &str = "Codex crashed and this pane was restarted as a new thread. The agent no longer has memory of the earlier conversation in this pane.";
     let warning = |native: &str| AgentEvent::Provider {
@@ -600,8 +987,8 @@ async fn retained_replay_recovers_only_current_codex_memory_loss() {
         snapshot["turns"][0]["items"][0]["text"] = "Retained current transcript".into();
         snapshot["extensions"]["codex"]["projection"] = serde_json::json!({
             "id":"current", "historyGeneration":0, "eventRevision":1,
-            "eventOwnedTurnIds":[], "nativePreviewTurnIds":[], "nativeFinalTurnIds":[],
-            "turnRows":{}, "turnOutputStates":{}, "settledTurnIds":[]
+            "eventOwnedTurnIds":["original-soul"], "nativePreviewTurnIds":[], "nativeFinalTurnIds":[],
+            "turnRows":{"original-soul":["original-soul"]}, "turnOutputStates":{"original-soul":{"provenance":"retained","diagnostic":"unsaved","refreshPending":false}}, "settledTurnIds":[]
         });
         let retained = serde_json::json!({
             "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
@@ -664,6 +1051,18 @@ async fn retained_replay_recovers_only_current_codex_memory_loss() {
                 .collect();
             assert_eq!(notices.len(), 1, "{frames:?}");
             assert_eq!(notices[0]["event"]["message"], expected_warning);
+            assert_eq!(
+                notices[0]["event"]["journalIdentity"]["soulId"],
+                "review-soul"
+            );
+            assert_eq!(
+                notices[0]["event"]["journalIdentity"]["nativeSessionId"],
+                native
+            );
+            assert_eq!(
+                notices[0]["event"]["journalIdentity"]["sequence"],
+                if native == "native-c" { 3 } else { 2 }
+            );
         }
         assert!(live
             .iter()

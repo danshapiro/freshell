@@ -9,6 +9,7 @@ import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type {
   FreshAgentPermissionRequest,
+  FreshAgentMemoryWarningIdentity,
   FreshAgentRequestId,
   FreshAgentQuestionRequest,
   FreshAgentSessionState,
@@ -40,6 +41,18 @@ const initialState: FreshAgentState = {
   pendingCreateFailures: {},
   availableModels: [],
   runtimeOwners: {},
+}
+
+// The actor retains at most this many journal events by default.
+const MAX_MEMORY_WARNING_SOURCES = 4096
+
+function recordMemoryWarningConsumed(session: FreshAgentSessionState, identity: FreshAgentMemoryWarningIdentity): void {
+  const { soulId, nativeSessionId, sequence } = identity
+  const sources = session.memoryWarningHighWater ??= []
+  const previous = sources.findIndex((source) => source.soulId === soulId && source.nativeSessionId === nativeSessionId)
+  if (previous !== -1) sources.splice(previous, 1)
+  sources.push({ soulId, nativeSessionId, sequence })
+  if (sources.length > MAX_MEMORY_WARNING_SOURCES) sources.shift()
 }
 
 function sessionKey(locator: FreshAgentSessionPayload): string {
@@ -443,6 +456,20 @@ const freshAgentSlice = createSlice({
       if (key) delete state.sessions[key].pendingElicitations?.[String(action.payload.requestId)]
     },
 
+    memoryWarningObserved(state, action: PayloadAction<SessionMutationPayload & { identity: NonNullable<FreshAgentSessionState['memoryWarning']> }>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
+      if (!action.payload.identity.pendingMessage) recordMemoryWarningConsumed(session, action.payload.identity)
+      session.memoryWarning = action.payload.identity
+    },
+
+    memoryWarningSourceChanged(state, action: PayloadAction<SessionMutationPayload & { nativeSessionId: string; soulId?: string }>) {
+      const key = resolveSessionKey(state, action.payload)
+      const warning = key ? state.sessions[key]?.memoryWarning : undefined
+      if (warning && (warning.nativeSessionId !== action.payload.nativeSessionId
+        || (action.payload.soulId && warning.soulId !== action.payload.soulId))) delete warning.pendingMessage
+    },
+
     sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string; preserveStatus?: boolean }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
@@ -500,16 +527,21 @@ const freshAgentSlice = createSlice({
 
     /**
      * Dismiss the pane's "Agent error" banner: clears `lastError`/`lastErrorCode`
-     * so the banner disappears — honest state-clearing, never a cosmetic hide: a
-     * NEW `freshAgent.error` re-sets the fields and re-shows the banner. Never
-     * ENSURE-creates a session record (a dismissal must not mint state), and
-     * never touches status/streaming (the error fold already de-blued the pane).
+     * or shows a current-source warning that was waiting behind it. Never
+     * ENSURE-creates a session record, and never touches status/streaming.
      */
     clearSessionError(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
       const session = state.sessions[key]
       if (!session) return
+      if (session.memoryWarning?.pendingMessage) {
+        recordMemoryWarningConsumed(session, session.memoryWarning)
+        session.lastError = session.memoryWarning.pendingMessage
+        session.lastErrorCode = 'THREAD_MEMORY_LOST'
+        delete session.memoryWarning.pendingMessage
+        return
+      }
       session.lastError = undefined
       session.lastErrorCode = undefined
     },
@@ -757,6 +789,8 @@ export const {
   freshAgentSnapshotReceived,
   materializeSession,
   markSessionLost,
+  memoryWarningObserved,
+  memoryWarningSourceChanged,
   registerPendingCreate,
   removePermission,
   removeQuestion,

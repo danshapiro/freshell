@@ -1084,22 +1084,65 @@ async fn dispatch_with_effects(
                         .ok_or_else(unsupported_fresh_agent)?;
                     let before = actor.profile().await;
                     let dispatch_request = request_id.clone();
-                    let command_state = actor
+                    let dispatch_result = actor
                         .dispatch_with_checkpoint_identity(
                             request_id,
                             text,
                             settings,
                             checkpoint_logical_attempt_id,
                         )
-                        .await
-                        .map_err(map_actor_error)?;
+                        .await;
+                    use freshell_agent_runtime::host_actor::ActorError;
+                    let command_state = match dispatch_result {
+                        Ok(state) => state,
+                        // In this actor send operation Transport denotes a failure
+                        // before provider acceptance. Persistence after dispatch
+                        // and ambiguous transport outcomes remain uncertain.
+                        Err(ActorError::Transport(_))
+                            if before.provider
+                                == freshell_runtime_protocol::FreshProvider::Codex =>
+                        {
+                            freshell_runtime_protocol::CommandState::Cancelled
+                        }
+                        Err(error)
+                            if before.provider
+                                != freshell_runtime_protocol::FreshProvider::Codex =>
+                        {
+                            return Err(map_actor_error(error))
+                        }
+                        Err(
+                            error @ (ActorError::RequestConflict
+                            | ActorError::InvalidProfile
+                            | ActorError::WriterBusy
+                            | ActorError::NativeIdentityMismatch),
+                        ) => return Err(map_actor_error(error)),
+                        Err(_) => {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::CommandAmbiguous,
+                                "hosted fresh-agent input could not be confirmed",
+                            ))
+                        }
+                    };
                     let after = actor.profile().await;
                     if let Some(accepted) = actor
                         .accepted_native_dispatch()
                         .await
                         .filter(|accepted| accepted.request_id == dispatch_request)
                     {
-                        commit_fresh_native_dispatch(state, &actor, &accepted).await?;
+                        commit_fresh_native_dispatch(state, &actor, &accepted)
+                            .await
+                            .map_err(|error| {
+                                if before.provider
+                                    == freshell_runtime_protocol::FreshProvider::Codex
+                                {
+                                    RuntimeError::new(
+                                        RuntimeErrorCode::CommandAmbiguous,
+                                        "accepted fresh-agent input could not be committed",
+                                    )
+                                } else {
+                                    error
+                                }
+                            })?;
                     }
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
@@ -10710,6 +10753,148 @@ mod tests {
     };
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RefusingRpcTransport {
+        evidence: serde_json::Value,
+        ambiguous: bool,
+        sends: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for RefusingRpcTransport {
+        async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+            Some(self.evidence.clone())
+        }
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some("native-a".into()),
+            })
+        }
+        async fn dispatch(
+            &self,
+            _: &RequestId,
+            _: &str,
+            _: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Err(DispatchFailure {
+                message: "controlled refusal".into(),
+                acceptance_ambiguous: self.ambiguous,
+            })
+        }
+        async fn resolve_permission(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            unreachable!()
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn send_rpc_preserves_refused_and_ambiguous_provider_outcomes() {
+        for (provider, ambiguous) in [
+            (FreshProvider::Codex, false),
+            (FreshProvider::Codex, true),
+            (FreshProvider::Claude, false),
+            (FreshProvider::Claude, true),
+        ] {
+            let state = test_host_state();
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "send-outcome-rpc".into(),
+                evidence_revision: 1,
+                execution_generation: 1,
+                requested_native_session_id: Some("native-a".into()),
+            };
+            {
+                let mut persisted = state.persisted.lock().await;
+                persisted.native_identity_launch = Some(binding.clone());
+                persisted.max_execution_generation = 1;
+            }
+            let transport = Arc::new(RefusingRpcTransport {
+                evidence: serde_json::json!({
+                    "launch":binding, "nativeSessionId":"native-a", "queryGeneration":1
+                }),
+                ambiguous,
+                sends: AtomicUsize::new(0),
+            });
+            let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+                "provider":provider, "runtimeVariant":if provider == FreshProvider::Codex { "codex" } else { "fixture-sdk" }, "cwd":"/workspace", "providerStoreId":"test-store",
+                "nativeSessionId":"native-a"
+            })).unwrap();
+            let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                state.state_dir.join("send-outcome"),
+                profile,
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            *state.fresh_agent.lock().await = Some(actor.clone());
+            let request = RequestId::parse("send-outcome").unwrap();
+            for attempt in 0..2 {
+                let result = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::FreshAgentSend {
+                            incarnation_id: state.incarnation_id.clone(),
+                            request_id: request.clone(),
+                            text: "controlled input".into(),
+                            settings: None,
+                            checkpoint_logical_attempt_id: None,
+                        },
+                    ),
+                    &state,
+                )
+                .await;
+                if ambiguous {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(RuntimeError {
+                                code: RuntimeErrorCode::CommandAmbiguous,
+                                ..
+                            })
+                        ),
+                        "{result:?}"
+                    );
+                } else if provider == FreshProvider::Claude && attempt == 0 {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(RuntimeError {
+                                code: RuntimeErrorCode::HostUnreachable,
+                                ..
+                            })
+                        ),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Ok(HostResult::FreshAgentCommand {
+                                state: freshell_runtime_protocol::CommandState::Cancelled,
+                                ..
+                            })
+                        ),
+                        "{result:?}"
+                    );
+                }
+            }
+            assert_eq!(transport.sends.load(Ordering::SeqCst), 1);
+            actor.stop().await.unwrap();
+        }
+    }
 
     struct RpcFixtureTransport {
         native_evidence: std::sync::Mutex<Option<serde_json::Value>>,
