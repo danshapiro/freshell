@@ -1200,6 +1200,40 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
     return { value, owner, tunnel, environment }
   }
 
+  it('records safe run-bound reporter and cleanup counts before refusing a successful zero-case report', async () => {
+    const { value, owner } = lifecycle()
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(0),
+      stop: vi.fn().mockResolvedValue(undefined),
+      output: () => ({
+        stdout: `${JSON.stringify({ severity: 'info', event: 'managed_external_complete',
+          runId: ownedDescriptor.runId, candidateSha: ownedDescriptor.candidateSha, status: 'passed', cases: 0 })}\n`,
+        stderr: `${JSON.stringify({ severity: 'info', event: 'sandbox_workload_finished',
+          container: 'freshell-sandbox-abcd1234', code: 0 })}\n`,
+      }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).rejects.toThrow(/completed without an executed case/i)
+      expect(owner.runtime.recordLifecycle).toHaveBeenCalledWith('external.sandbox_browser_reporter_observed', {
+        runId: ownedDescriptor.runId,
+        candidateSha: ownedDescriptor.candidateSha,
+        exitCode: 0,
+        reporterEventCount: 1,
+        caseCount: 0,
+        completionCount: 1,
+        completionStatus: 'passed',
+        completionCases: 0,
+        cleanupCompletionCount: 1,
+      })
+      const cleanup = await value.abort()
+      expect(cleanup.ok).toBe(true)
+    } finally { create.mockRestore() }
+  })
+
   it('uses a private descriptor mount, passes no bearer value in host argv/env, and removes it after wrapper settlement', async () => {
     const { value, environment } = lifecycle()
     let handoffFile = ''
