@@ -2423,7 +2423,9 @@ describe('FreshAgentView', () => {
       })
       expect(composer).toHaveValue(sourcePrompt)
       expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
-      expect(screen.getByText('Message accepted. Your restored draft was kept.')).toBeVisible()
+      const acceptedSummary = screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary')
+      expect(acceptedSummary).toBeVisible()
+      expect(acceptedSummary).toHaveTextContent('Message accepted. Your restored draft was kept.')
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
@@ -2458,6 +2460,18 @@ describe('FreshAgentView', () => {
         message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
       await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
 
+      // A completed busy window retires the outgoing ref before the delayed
+      // receipt, while the original request and its send boundary remain.
+      const locator = { sessionId: placeholder, sessionType: first.sessionType, provider: first.provider }
+      act(() => {
+        store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'running' } }))
+      })
+      act(() => {
+        store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+        store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { status: 'idle' } }))
+      })
+
       landed = true
       act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
       await waitFor(() => expect(screen.getAllByText(prompt)).toHaveLength(1))
@@ -2480,7 +2494,9 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
       expect(screen.getAllByText(prompt)).toHaveLength(1)
       expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
-      expect(screen.getByText('Message accepted. Your restored draft was kept.')).toBeVisible()
+      const acceptedSummary = screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary')
+      expect(acceptedSummary).toBeVisible()
+      expect(acceptedSummary).toHaveTextContent('Message accepted. Your restored draft was kept.')
       expect(composer).toHaveValue(prompt)
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
       },
