@@ -131,7 +131,11 @@ read_dotenv_value() {
       value="${value:1}"
       value="${value%%"$quote"*}"
     else
-      value="${value%%#*}"
+      if [[ "$value" == \#* ]]; then
+        value=""
+      else
+        value="${value%%[[:space:]]#*}"
+      fi
       value="$(trim_env_value "$value")"
     fi
     printf '%s' "$value"
@@ -146,6 +150,12 @@ else
   MANAGED_RUNTIME_REQUESTED="$(read_dotenv_value FRESHELL_MANAGED_RUNTIME_V1 || true)"
 fi
 DOTENV_MANAGED_RUNTIME="$(read_dotenv_value FRESHELL_MANAGED_RUNTIME_V1 || true)"
+
+if [[ "${AUTH_TOKEN+x}" == x ]]; then
+  AUTH_TOKEN_VALUE="$AUTH_TOKEN"
+else
+  AUTH_TOKEN_VALUE="$(read_dotenv_value AUTH_TOKEN || true)"
+fi
 
 process_managed_runtime_state() {
   local pid="$1" proc_env="/proc/$1/environ" env_contents managed_value
@@ -188,10 +198,7 @@ managed_feature_enabled_in_binary() {
 }
 
 probe_live_managed_runtime() {
-  local token="${AUTH_TOKEN:-}" escaped_token response status
-  if [[ -z "$token" ]]; then
-    token="$(read_dotenv_value AUTH_TOKEN || true)"
-  fi
+  local token="$AUTH_TOKEN_VALUE" escaped_token response status body
   [[ -n "$token" ]] || return 2
   escaped_token="${token//\\/\\\\}"
   escaped_token="${escaped_token//\"/\\\"}"
@@ -199,14 +206,34 @@ probe_live_managed_runtime() {
     return 2
   fi
   response="$(printf 'header = "x-auth-token: %s"\n' "$escaped_token" \
-    | curl --silent --show-error --max-time 2 --config - --output /dev/null \
+    | curl --silent --show-error --max-time 2 --config - \
       --write-out $'\n__FRESHELL_STATUS__%{http_code}' \
       "http://127.0.0.1:$PORT/api/runtime/readiness" 2>/dev/null)" || return 2
   status="${response##*$'\n__FRESHELL_STATUS__'}"
+  body="${response%$'\n__FRESHELL_STATUS__'*}"
   [[ "$status" =~ ^[0-9]{3}$ ]] || return 2
   case "$status" in
     200) return 0 ;;
     404) return 1 ;;
+    503)
+      if printf '%s' "$body" | node -e '
+        let input = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.on("data", (chunk) => { input += chunk; });
+        process.stdin.on("end", () => {
+          try {
+            const response = JSON.parse(input);
+            if (response?.error !== "Managed runtime unavailable"
+              || Object.keys(response).length !== 1) process.exitCode = 1;
+          } catch {
+            process.exitCode = 1;
+          }
+        });
+      '; then
+        return 1
+      fi
+      return 2
+      ;;
     *) return 2 ;;
   esac
 }
@@ -362,7 +389,6 @@ fi
 
 # AUTH_TOKEN must be available (env or .env in repo root; the server loads .env
 # from its cwd and refuses to start without a token).
-AUTH_TOKEN_VALUE="${AUTH_TOKEN:-$(grep -m1 '^AUTH_TOKEN=' .env 2>/dev/null | cut -d= -f2- || true)}"
 if [[ -z "$AUTH_TOKEN_VALUE" ]]; then
   echo "AUTH_TOKEN not set (env or $REPO_ROOT/.env). The server will refuse to start." >&2
   exit 1
@@ -415,8 +441,7 @@ if [[ -f "$PID_FILE" ]]; then
     else
       echo "freshell-server already running on port $PORT (pid $saved_pid)."
       echo "  URL: http://localhost:$PORT/?token=$AUTH_TOKEN_VALUE"
-      echo "  Use --restart to stop and relaunch it. NOTE: restarting the live"
-      echo "  self-hosted server (port 3002) requires explicit user approval."
+      echo "  Use --restart to stop and relaunch it."
       exit 0
     fi
   else

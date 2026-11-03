@@ -59,7 +59,15 @@ function createFixture(buildInfo = '{"managedRuntimeV1":false}'): LaunchFixture 
     'for arg in "$@"; do',
     '  case "$arg" in',
     '    */api/health) printf "curl /api/health\\n" >> "$COMMAND_LOG"; exit 0 ;;',
-    '    */api/runtime/readiness) config="$(cat)"; auth=no; [[ "$config" == *"x-auth-token: fixture-token"* ]] && auth=yes; printf "curl /api/runtime/readiness auth=%s\\n" "$auth" >> "$COMMAND_LOG"; printf "%s" "$FAKE_READINESS_JSON"; printf "\\n__FRESHELL_STATUS__%s" "${FAKE_READINESS_STATUS:-200}"; exit "${FAKE_READINESS_EXIT:-0}" ;;',
+    '    */api/runtime/readiness)',
+    '      config="$(cat)"; auth=no',
+    '      expected_config="header = \\"x-auth-token: $FAKE_EXPECTED_AUTH_TOKEN\\""',
+    '      [[ "$config" == "$expected_config" ]] && auth=yes',
+    '      printf "curl /api/runtime/readiness auth=%s\\n" "$auth" >> "$COMMAND_LOG"',
+    '      if [[ "$auth" == no ]]; then printf "\\n__FRESHELL_STATUS__401"; exit 0; fi',
+    '      printf "%s" "$FAKE_READINESS_JSON"',
+    '      printf "\\n__FRESHELL_STATUS__%s" "${FAKE_READINESS_STATUS:-200}"',
+    '      exit "${FAKE_READINESS_EXIT:-0}" ;;',
     '  esac',
     'done',
     'exit 22',
@@ -84,16 +92,17 @@ function run(
   fixture: LaunchFixture,
   args: string[],
   managedRuntime: boolean | null = false,
-  extraEnv: Record<string, string> = {},
+  extraEnv: NodeJS.ProcessEnv = {},
 ) {
   const buildInfo = fs.readFileSync(path.join(fixture.root, '.build-info'), 'utf8')
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     PATH: `${fixture.bin}:${process.env.PATH ?? '/usr/bin:/bin'}`,
     FRESHELL_HOME: fixture.home,
     PORT: fixture.port,
     COMMAND_LOG: fixture.commandLog,
     AUTH_TOKEN: 'fixture-token',
+    FAKE_EXPECTED_AUTH_TOKEN: 'fixture-token',
     FAKE_BUILD_INFO: buildInfo,
     FAKE_SUPERVISOR_HEALTH: process.env.FAKE_SUPERVISOR_HEALTH
       ?? '{"state":"ok","installationId":"fixture-installation","controlEpoch":11}',
@@ -114,6 +123,9 @@ function run(
     ...extraEnv,
   }
   if (managedRuntime === null) delete env.FRESHELL_MANAGED_RUNTIME_V1
+  for (const [key, value] of Object.entries(extraEnv)) {
+    if (value === undefined) delete env[key]
+  }
   return spawnSync('bash', [fixture.script, ...args], {
     cwd: fixture.root,
     env,
@@ -157,11 +169,11 @@ function stopFixtureServer(fixture: LaunchFixture): void {
   fs.rmSync(managedMarkerFile(fixture), { force: true })
 }
 
-function configureManagedEnvironment(fixture: LaunchFixture): void {
+function configureManagedEnvironment(fixture: LaunchFixture, authAssignment = 'AUTH_TOKEN=fixture-token'): void {
   const secretFile = path.join(fixture.home, 'control-secret')
   fs.writeFileSync(secretFile, 'fixture-secret\n', { mode: 0o600 })
   fs.writeFileSync(path.join(fixture.root, '.env'), [
-    'AUTH_TOKEN=fixture-token',
+    authAssignment,
     'FRESHELL_MANAGED_RUNTIME_V1=1',
     `FRESHELL_RUNTIME_CONTROL_SOCKET=${path.join(fixture.home, 'supervisor.sock')}`,
     `FRESHELL_RUNTIME_CONTROL_SECRET_FILE=${secretFile}`,
@@ -230,7 +242,31 @@ describe('launch-rust managed runtime feature guard', () => {
     expect(() => process.kill(pid, 0)).not.toThrow()
   })
 
-  it('keeps an ordinary feature-enabled server stoppable when readiness says managed mode is off', () => {
+  it.each(['--stop', '--restart'])('keeps an ordinary feature-enabled server usable with %s when readiness has no runtime client', (action) => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    const unavailableRuntime = {
+      FAKE_READINESS_STATUS: '503',
+      FAKE_READINESS_JSON: '{"error":"Managed runtime unavailable"}',
+    }
+    const started = run(fixture, ['--skip-build'], null, unavailableRuntime)
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+
+    const result = run(fixture, [action, '--skip-build'], null, unavailableRuntime)
+
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).toContain('curl /api/runtime/readiness auth=yes')
+    expect(() => process.kill(pid, 0)).toThrow()
+    if (action === '--stop') {
+      expect(fs.existsSync(pidFile(fixture))).toBe(false)
+    } else {
+      const replacementPid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+      expect(replacementPid).not.toBe(pid)
+      expect(() => process.kill(replacementPid, 0)).not.toThrow()
+    }
+  })
+
+  it('retains stop support for a server without the managed readiness route', () => {
     const fixture = createFixture('{"managedRuntimeV1":true}')
     const started = run(fixture, ['--skip-build'], null, { FAKE_READINESS_STATUS: '404' })
     expect(started.status, started.stdout + started.stderr).toBe(0)
@@ -241,6 +277,29 @@ describe('launch-rust managed runtime feature guard', () => {
     expect(stopped.status, stopped.stdout + stopped.stderr).toBe(0)
     expect(fs.existsSync(pidFile(fixture))).toBe(false)
     expect(() => process.kill(pid, 0)).toThrow()
+  })
+
+  it.each([
+    ['401', '{"error":"Unauthorized"}'],
+    ['403', '{"error":"Forbidden"}'],
+    ['503', '{"error":"Supervisor unavailable"}'],
+    ['503', '{"error":"Managed runtime unavailable","readiness":"failed"}'],
+    ['503', 'not-json'],
+  ])('preserves the running server when readiness returns an ambiguous %s response %s', (status, body) => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    const started = run(fixture, ['--skip-build'], null)
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+
+    const stopped = run(fixture, ['--stop'], null, {
+      FAKE_READINESS_STATUS: status,
+      FAKE_READINESS_JSON: body,
+    })
+
+    expect(stopped.status).not.toBe(0)
+    expect(stopped.stdout + stopped.stderr).toContain('Could not verify that the running server is outside managed runtime')
+    expect(Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())).toBe(pid)
+    expect(() => process.kill(pid, 0)).not.toThrow()
   })
 
   it('verifies authenticated readiness against the intended supervisor before saying ready', () => {
@@ -262,6 +321,98 @@ describe('launch-rust managed runtime feature guard', () => {
     expect(fs.readFileSync(fixture.commandLog, 'utf8')).toContain('curl /api/runtime/readiness auth=yes')
     expect((fs.readFileSync(fixture.commandLog, 'utf8').match(/admin health/g) ?? [])).toHaveLength(3)
     expect(fs.existsSync(pidFile(fixture))).toBe(false)
+  })
+
+  it.each([
+    'AUTH_TOKEN="fixture-token" # token comment',
+    "export AUTH_TOKEN='fixture-token' # token comment",
+    'AUTH_TOKEN=fixture-token # token comment',
+  ])('authenticates managed readiness using the parsed dotenv assignment %s', (assignment) => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    configureManagedEnvironment(fixture, assignment)
+
+    const started = run(fixture, ['--skip-build'], null, { AUTH_TOKEN: undefined })
+
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    expect(started.stdout).toContain('freshell-server and managed runtime are ready')
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).toContain('curl /api/runtime/readiness auth=yes')
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+    expect(() => process.kill(pid, 0)).not.toThrow()
+  })
+
+  it.each([
+    'AUTH_TOKEN=fixture#token',
+    'AUTH_TOKEN=fixture#token # token comment',
+  ])('preserves an embedded hash in the unquoted dotenv token %s during managed startup', (assignment) => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    configureManagedEnvironment(fixture, assignment)
+
+    const started = run(fixture, ['--skip-build'], null, {
+      AUTH_TOKEN: undefined,
+      FAKE_EXPECTED_AUTH_TOKEN: 'fixture#token',
+    })
+
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    expect(started.stdout).toContain('freshell-server and managed runtime are ready')
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).toContain('curl /api/runtime/readiness auth=yes')
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+    expect(() => process.kill(pid, 0)).not.toThrow()
+  })
+
+  it('uses the process authentication token ahead of a different dotenv token', () => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    configureManagedEnvironment(fixture, 'AUTH_TOKEN="different-dotenv-token" # token comment')
+
+    const started = run(fixture, ['--skip-build'], null)
+
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    expect(started.stdout).toContain('freshell-server and managed runtime are ready')
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).toContain('curl /api/runtime/readiness auth=yes')
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+    expect(() => process.kill(pid, 0)).not.toThrow()
+  })
+
+  it('rejects an explicitly empty process token instead of using the dotenv token', () => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    configureManagedEnvironment(fixture)
+
+    const started = run(fixture, ['--skip-build'], null, { AUTH_TOKEN: '' })
+
+    expect(started.status).not.toBe(0)
+    expect(started.stdout + started.stderr).toContain('AUTH_TOKEN not set')
+    expect(fs.existsSync(pidFile(fixture))).toBe(false)
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).not.toContain('curl ')
+  })
+
+  it('rejects an empty dotenv token followed by a comment before starting a server', () => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    configureManagedEnvironment(fixture, 'AUTH_TOKEN= # token comment')
+
+    const started = run(fixture, ['--skip-build'], null, { AUTH_TOKEN: undefined })
+
+    expect(started.status).not.toBe(0)
+    expect(fs.existsSync(pidFile(fixture))).toBe(false)
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).not.toContain('curl ')
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).not.toContain('admin health')
+  })
+
+  it('preserves an unmarked managed server when the process authentication token is explicitly empty', () => {
+    const fixture = createFixture('{"managedRuntimeV1":true}')
+    configureManagedEnvironment(fixture)
+    const started = run(fixture, ['--skip-build'], null)
+    expect(started.status, started.stdout + started.stderr).toBe(0)
+    const pid = Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())
+    fs.rmSync(managedMarkerFile(fixture))
+    fs.writeFileSync(path.join(fixture.root, '.env'), 'AUTH_TOKEN=fixture-token\n')
+    const commandsBefore = fs.readFileSync(fixture.commandLog, 'utf8')
+
+    const stopped = run(fixture, ['--stop'], null, { AUTH_TOKEN: '' })
+
+    expect(stopped.status).not.toBe(0)
+    expect(stopped.stdout + stopped.stderr).toContain('Could not verify that the running server is outside managed runtime')
+    expect(fs.readFileSync(fixture.commandLog, 'utf8')).toBe(commandsBefore)
+    expect(Number(fs.readFileSync(pidFile(fixture), 'utf8').trim())).toBe(pid)
+    expect(() => process.kill(pid, 0)).not.toThrow()
   })
 
   it('fails a managed launch when authenticated runtime readiness is unavailable', () => {
