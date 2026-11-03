@@ -7474,6 +7474,66 @@ describe('FreshAgentView', () => {
       expect(rewindButton).toHaveAttribute('title', 'Rewind unavailable: No exact code checkpoint is available for this message.')
     })
 
+    it('does not show a previous conversation send as a checkpoint being saved in a different conversation', async () => {
+      const firstSessionId = 'thread-rewind-prior-send'
+      const secondSessionId = 'thread-rewind-other-busy'
+      const store = createStore()
+      let onMessage: ((message: Record<string, unknown>) => void) | undefined
+      wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+        onMessage = handler
+        return () => {}
+      })
+      const first = {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+        createRequestId: 'req-rewind-prior-send',
+        sessionId: firstSessionId,
+        sessionRef: { provider: 'codex' as const, sessionId: firstSessionId },
+        resumeSessionId: firstSessionId,
+        status: 'idle' as const,
+      }
+      const second = {
+        ...first,
+        createRequestId: 'req-rewind-other-busy',
+        sessionId: secondSessionId,
+        sessionRef: { provider: 'codex' as const, sessionId: secondSessionId },
+        resumeSessionId: secondSessionId,
+        status: 'running' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: sessionId === firstSessionId ? 'idle' : 'running',
+        threadId: sessionId,
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: sessionId === firstSessionId ? [] : [unboundModernUserTurn('msg_other', 'Other conversation prompt')],
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      wsMock.send.mockClear()
+      fireEvent.change(composer, { target: { value: 'Unresolved previous conversation prompt' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send')[0]
+      expect(sent?.requestId).toBeTruthy()
+
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', secondSessionId, expect.anything(),
+      ))
+      await screen.findByText('Other conversation prompt')
+      emitSessionSnapshotStatus(store, onMessage, secondSessionId, 'running')
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      act(() => onMessage?.({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'The previous conversation send was refused.' }))
+
+      const otherRow = screen.getByText('Other conversation prompt').closest('article')!
+      expect(within(otherRow).queryByRole('button', { name: 'Saving code rewind checkpoint' })).not.toBeInTheDocument()
+      expect(within(otherRow).queryByRole('button', { name: 'Rewind unavailable for this message' })).not.toBeInTheDocument()
+      expect(within(otherRow).queryByRole('button', { name: 'Rewind code to here' })).not.toBeInTheDocument()
+    })
+
     it('a settled-unavailable capture makes no rewind claim mid-turn, and the honest unavailable verdict returns at settle', async () => {
       const sessionId = 'thread-rewind-settled-unavailable'
       const store = createStore()
