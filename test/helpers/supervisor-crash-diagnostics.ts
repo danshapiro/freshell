@@ -211,7 +211,7 @@ function readBoundedTail(filePath: string, maxBytes = 256 * 1024): { text: strin
 
 export function summarizeSupervisorGdbOutput(text: string): SafeGdbSummary {
   const attached = text.includes('FRESHELL_GDB_ATTACHED')
-  const signalMatch = text.match(/Program received signal (SIG[A-Z0-9]+)/)
+  const signalMatch = text.match(/^(?:Program|Thread \d+\b[^\n]*?) received signal (SIG[A-Z0-9]+)/m)
   const threads = new Set<number>()
   const frames: SafeBacktraceFrame[] = []
   let currentThread = 0

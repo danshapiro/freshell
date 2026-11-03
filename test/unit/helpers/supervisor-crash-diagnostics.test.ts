@@ -178,6 +178,16 @@ describe('supervisor crash diagnostic parsing', () => {
     expect(JSON.stringify(summary)).not.toMatch(/0x[0-9a-f]+|private\/build|private\/lib/)
   })
 
+  it('reads GDB 15 thread-form signal reports without retaining the thread name', () => {
+    const summary = summarizeSupervisorGdbOutput([
+      'FRESHELL_GDB_ATTACHED',
+      'Thread 1 "/private/home/codex-agent" received signal SIGSEGV, Segmentation fault.',
+    ].join('\n'))
+
+    expect(summary).toMatchObject({ attached: true, signal: 'SIGSEGV', threadCount: 1 })
+    expect(JSON.stringify(summary)).not.toMatch(/private|codex-agent|SIGSEGV, Segmentation fault/)
+  })
+
   it('summarizes startup failures without retaining addresses or filesystem paths', () => {
     const failure = summarizeSupervisorGdbFailureOutput(
       'warning: Could not attach to process 1 at 0x00007fff00112233\n'
