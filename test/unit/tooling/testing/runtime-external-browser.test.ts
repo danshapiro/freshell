@@ -1201,6 +1201,33 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
     return { value, owner, tunnel, environment }
   }
 
+  it('refuses a passing browser report when the run-scoped pnpm store is not confirmed absent', async () => {
+    const { value, owner } = lifecycle()
+    const fakeChild = {
+      alive: () => false,
+      wait: vi.fn().mockResolvedValue(0),
+      stop: vi.fn().mockResolvedValue(undefined),
+      output: () => ({ stdout: executionEvents(), stderr: [
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_container_settled', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'preparation', container: 'freshell-sandbox-abcd1234', code: 0 },
+        { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution', container: 'freshell-sandbox-efgh5678', code: 0 },
+      ].map(event => JSON.stringify(event)).join('\n') + '\n' }),
+    }
+    const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockResolvedValue(fakeChild as any)
+    try {
+      await expect(value.child('sandbox-p2-g01', [], {
+        ...descriptor, FRESHELL_RUNTIME_EXTERNAL_SPEC: p2G01Spec, FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
+      })).rejects.toThrow(/pnpm store cleanup evidence is missing or invalid/i)
+      expect(owner.runtime.writeArtifact).toHaveBeenCalledWith('p2-g01-sandbox-output-private.json', expect.objectContaining({
+        reason: 'pnpm_store_cleanup_evidence_invalid',
+      }))
+    } finally {
+      await value.abort()
+      create.mockRestore()
+    }
+  })
+
   it('records safe run-bound reporter and cleanup counts before refusing a successful zero-case report', async () => {
     const { value, owner } = lifecycle()
     const fakeChild = {
@@ -1219,6 +1246,8 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
             container: 'freshell-sandbox-abcd1234', code: 0 },
           { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution',
             container: 'freshell-sandbox-efgh5678', code: 0 },
+          { severity: 'info', event: 'sandbox_external_pnpm_store_settled', runId: ownedDescriptor.runId,
+            volume: `freshell-p2g01-pnpm-${ownedDescriptor.runId}`, phase: 'execution', absent: true, removed: true },
         ].map(event => JSON.stringify(event)).join('\n') + '\n',
       }),
     }
@@ -1242,6 +1271,8 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
         cleanupPreparationCount: 1,
         cleanupExecutionCount: 1,
         cleanupFailureCount: 0,
+        pnpmStoreCleanupCount: 1,
+        pnpmStoreAbsent: true,
       })
     } finally {
       const cleanup = await value.abort()
@@ -1269,6 +1300,8 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
           container: 'freshell-sandbox-abcd1234', code: 0 },
         { severity: 'info', event: 'sandbox_workload_finished', phase: 'execution',
           container: 'freshell-sandbox-efgh5678', code: 0 },
+        { severity: 'info', event: 'sandbox_external_pnpm_store_settled', runId: ownedDescriptor.runId,
+          volume: `freshell-p2g01-pnpm-${ownedDescriptor.runId}`, phase: 'execution', absent: true, removed: true },
       ].map(event => JSON.stringify(event)).join('\n') + '\n' }),
     }
     const create = vi.spyOn(runner.OwnedRuntimeChild, 'create').mockImplementation(async (executable, args, cwd, childEnvironment) => {
@@ -1278,7 +1311,11 @@ describe('P2-G01 sandbox handoff lifecycle', () => {
       expect(args).toEqual([path.join(sourceRoot, 'scripts/sandbox-test.sh'), '--workspace-root', sourceRoot,
         '--external-browser', handoffFile])
       expect(args.join(' ')).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
-      expect(childEnvironment).toEqual(environment)
+      expect(childEnvironment).toEqual({
+        ...environment,
+        FRESHELL_SANDBOX_P2_G01_RUN_ID: ownedDescriptor.runId,
+        FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME: `freshell-p2g01-pnpm-${ownedDescriptor.runId}`,
+      })
       expect(JSON.stringify(childEnvironment)).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
       expect(fs.statSync(directory).mode & 0o777).toBe(0o700)
       expect(fs.statSync(handoffFile).mode & 0o777).toBe(0o444)

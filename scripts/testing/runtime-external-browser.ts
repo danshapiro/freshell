@@ -68,11 +68,11 @@ import { ownedClaudeStartupPreferences } from './runtime-native-feasibility.js'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { createP2G01SandboxHandoff, isExactP2G01Selection, P2_G01_HANDOFF_CONTAINER_PATH,
   P2_G01_SANDBOX_OPT_IN, P2_G01_SPEC, P2_G01_TITLE,
-  p2G01PlaywrightInvocation, type P2G01SandboxHandoff } from './external-browser-sandbox.js'
+  p2G01PlaywrightInvocation, p2G01PnpmStoreVolume, type P2G01SandboxHandoff } from './external-browser-sandbox.js'
 
 export { createP2G01SandboxHandoff, isExactP2G01Selection, P2_G01_HANDOFF_CONTAINER_PATH,
   P2_G01_SANDBOX_OPT_IN, P2_G01_SPEC, P2_G01_TITLE, parseP2G01SandboxHandoff,
-  p2G01PlaywrightInvocation } from './external-browser-sandbox.js'
+  p2G01PlaywrightInvocation, p2G01PnpmStoreVolume } from './external-browser-sandbox.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 type OwnedProcessScope = { children: OwnedProcessIdentity[]; groupPresent: boolean }
@@ -3329,6 +3329,8 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
   }
   private sandboxHostEnvironment(): NodeJS.ProcessEnv {
     const environment = this.environment
+    const runId = this.descriptor?.runId
+    if (!runId) throw new Error('P2-G01 sandbox pnpm store requires an owned run identity')
     const dockerHost = environment.DOCKER_HOST ?? process.env.DOCKER_HOST
     if (!dockerHost?.startsWith('unix://')) throw new Error('local sandbox dispatch requires the owned Unix Docker endpoint')
     return {
@@ -3337,6 +3339,8 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       TMPDIR: environment.TMPDIR ?? process.env.TMPDIR,
       ...(environment.XDG_RUNTIME_DIR ? { XDG_RUNTIME_DIR: environment.XDG_RUNTIME_DIR } : {}),
       DOCKER_HOST: dockerHost,
+      FRESHELL_SANDBOX_P2_G01_RUN_ID: runId,
+      FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME: p2G01PnpmStoreVolume(runId),
       ...(environment.FRESHELL_SANDBOX_CACHE_PREFIX
         ? { FRESHELL_SANDBOX_CACHE_PREFIX: environment.FRESHELL_SANDBOX_CACHE_PREFIX } : {}),
     }
@@ -3424,6 +3428,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       event.event === 'sandbox_workload_finished' || event.event === 'sandbox_workload_failed')
     const settlementEvents = stderrEvents.filter(event =>
       event.event === 'sandbox_container_settled' || event.event === 'sandbox_container_unsettled')
+    const pnpmStoreCleanupEvents = stderrEvents.filter(event => event.event === 'sandbox_external_pnpm_store_settled')
     const preparationWorkloads = workloadEvents.filter(event => event.phase === 'preparation')
     const executionWorkloads = workloadEvents.filter(event => event.phase === 'execution')
     const preparationSettlements = settlementEvents.filter(event => event.phase === 'preparation')
@@ -3437,6 +3442,12 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       && Number.isSafeInteger(events[0].code)
       ? events[0].event === 'sandbox_workload_finished' && events[0].code === 0 ? 'finished' : 'failed'
       : 'missing-or-duplicate'
+    const pnpmStoreCleanupValid = pnpmStoreCleanupEvents.length === 1
+      && pnpmStoreCleanupEvents[0].severity === 'info'
+      && pnpmStoreCleanupEvents[0].runId === this.descriptor.runId
+      && pnpmStoreCleanupEvents[0].volume === p2G01PnpmStoreVolume(this.descriptor.runId)
+      && pnpmStoreCleanupEvents[0].phase === 'execution'
+      && pnpmStoreCleanupEvents[0].absent === true && pnpmStoreCleanupEvents[0].removed === true
     this.owner.runtime.recordLifecycle('external.sandbox_browser_reporter_observed', {
       runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, exitCode,
       reporterEventCount: reporterEvents.length, caseCount: reportedCases.length,
@@ -3446,7 +3457,10 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       cleanupCompletionCount: settlementEvents.length,
       cleanupPreparationCount: preparationSettlements.length,
       cleanupExecutionCount: executionSettlements.length,
-      cleanupFailureCount: settlementEvents.filter(event => event.event === 'sandbox_container_unsettled').length,
+      cleanupFailureCount: settlementEvents.filter(event => event.event === 'sandbox_container_unsettled').length
+        + (pnpmStoreCleanupValid ? 0 : 1),
+      pnpmStoreCleanupCount: pnpmStoreCleanupEvents.length,
+      pnpmStoreAbsent: pnpmStoreCleanupValid,
     })
     if (settlementEvents.length !== 2 || workloadEvents.length !== 2
       || !cleanupEventValid(preparationSettlements, 'preparation') || !cleanupEventValid(executionSettlements, 'execution')
@@ -3465,6 +3479,10 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       this.captureP2G01SandboxOutput(output, 'execution_workload_failed')
       throw new Error('P2-G01 sandbox browser child failed')
     }
+    if (!pnpmStoreCleanupValid) {
+      this.captureP2G01SandboxOutput(output, 'pnpm_store_cleanup_evidence_invalid')
+      throw new Error('P2-G01 run-scoped pnpm store cleanup evidence is missing or invalid')
+    }
     let cases: ExternalBrowserCaseResult[]
     try { cases = parseExternalExecutionEvents(stdoutEvents, this.descriptor) }
     catch (error) {
@@ -3479,6 +3497,7 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     this.owner.runtime.recordLifecycle('external.sandbox_browser_cleanup_verified', {
       runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha,
       preparationContainer: preparationSettlements[0].container, executionContainer: executionSettlements[0].container,
+      pnpmStoreVolume: p2G01PnpmStoreVolume(this.descriptor.runId), pnpmStoreAbsent: true,
       admitted: cases.length, passed: cases.filter(row => row.status === 'passed').length,
     })
     await this.removeSandboxHandoff()

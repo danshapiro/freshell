@@ -9,6 +9,13 @@ export const P2_G01_TITLE = 'P2-G01: real browser shell survives ten graceful/ab
 export const P2_G01_SANDBOX_OPT_IN = 'FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX'
 export const P2_G01_HANDOFF_CONTAINER_PATH = '/run/freshell-external-target.json'
 
+export function p2G01PnpmStoreVolume(runId: string): string {
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(runId)) {
+    throw new Error('invalid P2-G01 run identity for the disposable pnpm store')
+  }
+  return `freshell-p2g01-pnpm-${runId}`
+}
+
 const HandoffSchema = z.object({
   FRESHELL_E2E_TARGET_URL: z.string().min(1),
   FRESHELL_E2E_TARGET_WS_URL: z.string().min(1),
