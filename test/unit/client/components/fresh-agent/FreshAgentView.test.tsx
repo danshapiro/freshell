@@ -3002,6 +3002,11 @@ describe('FreshAgentView', () => {
 
     it('keeps an ambiguous echo when a newer live projection adds a second matching row', async () => {
       const steer = await setupSteeringWithNewerLiveProjection(true)
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      const before = screen.getAllByRole('article', { name: 'You transcript turn' })
+      expect(before).toHaveLength(4)
+      expect(within(before[1]).getByText(steer.prompt)).toBeVisible()
+      expect(within(before[2]).getByText(steer.prompt)).toBeVisible()
       await steer.applyOlderIdle()
       expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
         requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: steer.prompt,
@@ -3013,6 +3018,9 @@ describe('FreshAgentView', () => {
 
     it('does not settle steering from an older idle snapshot after newer live activity', async () => {
       const steer = await setupSteeringWithNewerLiveProjection(false)
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
       await steer.applyOlderIdle()
       expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
         requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: steer.prompt,
