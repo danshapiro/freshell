@@ -2442,7 +2442,8 @@ describe('FreshAgentView', () => {
       }
       let landed = false
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
-        status: landed && landedStatus === 'running' ? 'running' : 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true },
+        status: landed && landedStatus === 'running' ? 'running' : 'idle', threadId: sessionId,
+        sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
         turns: landed ? [{ id: 'landed-turn', turnId: 'landed-turn', role: 'user',
           items: [{ id: 'landed-text', kind: 'text', text: prompt }] }] : [],
         extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
@@ -2459,6 +2460,7 @@ describe('FreshAgentView', () => {
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
         message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
       await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
 
       if (landedStatus === 'settled') {
         // Retire the outgoing ref before the delayed receipt while retaining
@@ -2476,7 +2478,11 @@ describe('FreshAgentView', () => {
 
       landed = true
       act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
-      await waitFor(() => expect(screen.getAllByText(prompt)).toHaveLength(1))
+      await waitFor(() => {
+        const rows = screen.getAllByRole('article', { name: 'You transcript turn' })
+        expect(rows).toHaveLength(1)
+        expect(within(rows[0]).getByText(prompt)).toBeVisible()
+      })
       if (landedStatus === 'running') {
         expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
       }
@@ -2494,7 +2500,7 @@ describe('FreshAgentView', () => {
       })
 
       expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
-      expect(screen.getAllByText(prompt)).toHaveLength(1)
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(1)
       expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
       const acceptedSummary = screen.getByRole('status', { name: 'Agent notices' }).querySelector('summary')
       expect(acceptedSummary).toBeVisible()
@@ -2515,7 +2521,8 @@ describe('FreshAgentView', () => {
       }
       let otherTurnLanded = false
       apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, requestedSessionId) => ({
-        status: 'idle', threadId: requestedSessionId, capabilities: { send: true, interrupt: true },
+        status: 'idle', threadId: requestedSessionId,
+        sessionType: 'freshopencode', provider: 'opencode', capabilities: { send: true, interrupt: true },
         turns: otherTurnLanded ? [{ id: 'other-turn', turnId: 'other-turn', role: 'user',
           items: [{ id: 'other-text', kind: 'text', text: prompt }] }] : [],
         extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
@@ -2532,15 +2539,20 @@ describe('FreshAgentView', () => {
       act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
         message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
       await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+      await waitFor(() => expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined())
 
       otherTurnLanded = true
       act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
-      await waitFor(() => expect(screen.getAllByText(prompt)).toHaveLength(1))
+      await waitFor(() => {
+        const rows = screen.getAllByRole('article', { name: 'You transcript turn' })
+        expect(rows).toHaveLength(1)
+        expect(within(rows[0]).getByText(prompt)).toBeVisible()
+      })
       act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
         sessionType: content.sessionType, provider: content.provider,
         requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn' }))
 
-      expect(screen.getAllByText(prompt)).toHaveLength(2)
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(2)
       expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
         requestId: sent!.requestId, submittedTurnId: 'our-accepted-turn', text: prompt,
       })
