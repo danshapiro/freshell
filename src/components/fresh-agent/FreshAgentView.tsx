@@ -6091,6 +6091,7 @@ export function FreshAgentView({
     stripModelTooltip,
     handleModelCatalogUnavailable,
     notice,
+    noticeExpanded,
     setNotice,
     ownerDivergence,
     attachTerminalOwnerHere,
