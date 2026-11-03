@@ -716,6 +716,8 @@ mod initial_grant_reference_tests {
                             assert_eq!(&incarnation_id, handle.incarnation_id());
                             // Started never enriches the registry before the first ACK.
                             HostResult::FreshAgentEvents(AgentEventBatch {
+                                accepted_native_dispatch: None,
+                                native_dispatch_in_flight: false,
                                 retained_state: None,
                                 retained_from: 0,
                                 head: 0,
@@ -2377,6 +2379,499 @@ async fn materialization_keeps_following_transcript_invalidations_on_the_native_
     );
 }
 
+async fn codex_route_inventory(
+    native: &'static str,
+) -> (
+    tempfile::TempDir,
+    Arc<HostedFreshAgentProxy>,
+    broadcast::Receiver<String>,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("codex-route.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health => AdminResult::Health {
+                    control_epoch: 1,
+                    installation_id: InstallationId::new(),
+                },
+                AdminCommand::Inventory => AdminResult::Inventory(vec![
+                    serde_json::from_value(serde_json::json!({
+                        "soulId":"soul-codex-replacement-route", "incarnationId":"owned-incarnation",
+                        "hostBootId":"owned-boot", "launchState":"running", "cleanupState":"none",
+                        "intentRevision":1, "executionGeneration":1, "desiredState":"running",
+                        "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
+                        "evidenceRevision":0, "successfulRecoveriesInWindow":0, "provider":"codex",
+                        "nativeSessionId":native, "freshAgentSessionId":"managed-public",
+                        "freshAgentSessionType":"freshcodex"
+                    })).unwrap(),
+                ]),
+                other => panic!("unexpected Codex route request: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (proxy, receiver) = configure_proxy(&socket, HashMap::new());
+    (dir, proxy, receiver, server)
+}
+
+#[tokio::test]
+async fn codex_replacement_events_follow_the_materialized_pane() {
+    let (_dir, proxy, mut receiver, server) = codex_route_inventory("native-b").await;
+    let soul = SoulId::parse("soul-codex-replacement-route").unwrap();
+    let at = chrono::Utc::now().timestamp_millis();
+    let events = [
+        serde_json::json!({"type":"freshAgent.session.materialized", "provider":"codex",
+            "sessionType":"freshcodex", "previousSessionId":"native-a", "sessionId":"native-b",
+            "sessionRef":{"provider":"codex","sessionId":"native-b"}}),
+        serde_json::json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"native-b", "event":{"type":"freshAgent.error", "sessionId":"native-b",
+                "code":"THREAD_MEMORY_LOST", "message":"Thread memory lost"}}),
+        serde_json::json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"native-b", "event":{"type":"freshAgent.turn.complete", "sessionId":"native-b",
+                "at":at, "outcome":"completed"}}),
+    ];
+    for event in events {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "codex",
+                "managed-public",
+                "freshcodex",
+                Some(0),
+            )
+            .await;
+    }
+    let frames: Vec<serde_json::Value> = (0..3)
+        .map(|_| serde_json::from_str(&receiver.try_recv().unwrap()).unwrap())
+        .collect();
+    assert_eq!(frames[0]["previousSessionId"], "managed-public");
+    assert_eq!(frames[0]["sessionRef"]["sessionId"], "native-b");
+    let pane_id = frames[0]["sessionId"].as_str().unwrap();
+    for (frame, event_type) in frames[1..]
+        .iter()
+        .zip(["freshAgent.error", "freshAgent.turn.complete"])
+    {
+        assert_eq!(frame["event"]["type"], event_type);
+        assert_eq!(
+            frame["sessionId"], pane_id,
+            "{event_type} must reach the materialized pane"
+        );
+        assert_eq!(frame["event"]["sessionId"], pane_id);
+    }
+    assert_eq!(frames[1]["event"]["code"], "THREAD_MEMORY_LOST");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn codex_unaccepted_replacement_does_not_rekey_or_deliver_its_warning() {
+    let (_dir, proxy, mut receiver, server) = codex_route_inventory("native-a").await;
+    let soul = SoulId::parse("soul-codex-replacement-route").unwrap();
+    for payload in [
+        serde_json::json!({"type":"freshAgent.session.materialized", "provider":"codex",
+            "sessionType":"freshcodex", "previousSessionId":"native-a", "sessionId":"native-b",
+            "sessionRef":{"provider":"codex","sessionId":"native-b"}}),
+        serde_json::json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"native-b", "event":{"type":"freshAgent.error", "sessionId":"native-b",
+                "code":"THREAD_MEMORY_LOST", "message":"Thread memory lost"}}),
+    ] {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload },
+                "codex",
+                "managed-public",
+                "freshcodex",
+                Some(0),
+            )
+            .await;
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "unaccepted native B must not rekey the pane or publish its warning"
+    );
+
+    proxy.forward_polled_event(&soul, AgentEvent::Provider { payload: serde_json::json!({
+        "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+        "sessionId":"native-a", "event":{"type":"freshAgent.status", "sessionId":"native-a", "status":"idle"}
+    }) }, "codex", "managed-public", "freshcodex", Some(0)).await;
+    let frame: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(frame["sessionId"], "managed-public");
+    assert_eq!(frame["event"]["status"], "idle");
+    assert!(receiver.try_recv().is_err());
+    server.abort();
+    let _ = server.await;
+}
+
+async fn codex_journal_fixture(
+    native: &'static str,
+    public: &'static str,
+    batch: freshell_runtime_protocol::AgentEventBatch,
+) -> (
+    tempfile::TempDir,
+    Arc<HostedFreshAgentProxy>,
+    broadcast::Receiver<String>,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("codex-journal.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health => AdminResult::Health { control_epoch: 1, installation_id: InstallationId::new() },
+                AdminCommand::Inventory => AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                    "soulId":"codex-journal-soul", "incarnationId":"journal-incarnation", "hostBootId":"journal-boot",
+                    "launchState":"running", "cleanupState":"none", "intentRevision":1, "executionGeneration":1,
+                    "desiredState":"running", "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
+                    "evidenceRevision":1, "successfulRecoveriesInWindow":0, "provider":"codex",
+                    "nativeSessionId":native, "freshAgentSessionId":public, "freshAgentSessionType":"freshcodex"
+                })).unwrap()]),
+                AdminCommand::FreshAgentReadEvents(read) => {
+                    let mut page = batch.clone();
+                    page.events.retain(|row| row.sequence > read.after_sequence);
+                    if read.after_sequence != 0 { page.retained_state = None; page.reset_required = false; }
+                    AdminResult::FreshAgentEvents(page)
+                }
+                other => panic!("unexpected Codex journal request: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (proxy, receiver) = configure_proxy(&socket, HashMap::new());
+    (dir, proxy, receiver, server)
+}
+
+fn accepted_codex_journal_proof() -> freshell_runtime_protocol::AcceptedNativeDispatch {
+    freshell_runtime_protocol::AcceptedNativeDispatch {
+        request_id: RequestId::parse("journal-replacement").unwrap(),
+        identity: freshell_runtime_protocol::NativeDispatchIdentity {
+            previous_native_session_id: "native-a".into(),
+            native_session_id: "native-b".into(),
+            pending_naming_handle: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn codex_native_resume_keeps_an_existing_unmaterialized_pane_live() {
+    let batch = freshell_runtime_protocol::AgentEventBatch {
+        accepted_native_dispatch: None,
+        native_dispatch_in_flight: false,
+        retained_from: 0,
+        head: 0,
+        reset_required: false,
+        events: Vec::new(),
+        retained_state: None,
+    };
+    let (dir, proxy, mut frames, server) =
+        codex_journal_fixture("native-a", "managed-public", batch).await;
+    let soul = SoulId::parse("codex-journal-soul").unwrap();
+    assert!(
+        proxy
+            .start_poller(
+                soul.clone(),
+                "codex".into(),
+                "managed-public".into(),
+                "freshcodex".into(),
+                0
+            )
+            .await
+    );
+    let create = serde_json::from_value(serde_json::json!({
+        "requestId":"resume-before-replacement", "provider":"codex", "sessionType":"freshcodex",
+        "cwd":dir.path(), "sessionRef":{"provider":"codex", "sessionId":"native-a"}
+    }))
+    .unwrap();
+    proxy
+        .clone()
+        .handle(HostedFreshAgentCommand::Create(create))
+        .await;
+    let created: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(created["type"], "freshAgent.created");
+    assert_eq!(created["sessionId"], "native-a");
+    assert_eq!(created["sessionRef"]["sessionId"], "native-a");
+    proxy.forward_polled_event(&soul, AgentEvent::Provider { payload: serde_json::json!({
+        "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-a",
+        "event":{"type":"freshAgent.status", "sessionId":"native-a", "status":"both-live"}
+    }) }, "codex", "managed-public", "freshcodex", Some(0)).await;
+    let mut delivered = HashSet::new();
+    for _ in 0..2 {
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"]["status"], "both-live");
+        assert_eq!(frame["event"]["sessionId"], frame["sessionId"]);
+        delivered.insert(frame["sessionId"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        delivered,
+        HashSet::from(["managed-public".to_owned(), "native-a".to_owned()])
+    );
+    server.abort();
+    let _ = server.await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while proxy.pollers.lock().await.contains(&soul) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("owned poller must settle after its socket closes");
+}
+
+#[tokio::test]
+async fn codex_accepted_replacement_is_presented_after_journal_eviction() {
+    for replay in [false, true] {
+        let batch = freshell_runtime_protocol::AgentEventBatch {
+            accepted_native_dispatch: Some(accepted_codex_journal_proof()),
+            native_dispatch_in_flight: false,
+            retained_from: 10,
+            head: 10,
+            reset_required: true,
+            events: Vec::new(),
+            retained_state: Some(serde_json::json!({
+                "source":{"soulId":"codex-journal-soul","incarnationId":"journal-incarnation","hostBootId":"journal-boot","projectionId":"owned","ownerEpoch":0,"ownerGeneration":0},
+                "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-b","turns":[]},
+                "attentionMarks":[],"pendingControls":[]
+            })),
+        };
+        let (_dir, proxy, mut frames, server) =
+            codex_journal_fixture("native-b", "managed-public", batch).await;
+        let soul = SoulId::parse("codex-journal-soul").unwrap();
+        if replay {
+            proxy
+                .replay_once(soul.clone(), "codex", "managed-public", "freshcodex")
+                .await;
+        } else {
+            assert!(
+                proxy
+                    .start_poller(
+                        soul.clone(),
+                        "codex".into(),
+                        "managed-public".into(),
+                        "freshcodex".into(),
+                        0
+                    )
+                    .await
+            );
+        }
+        let first: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let second: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(3), frames.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["type"], "freshAgent.session.materialized");
+        assert_eq!(first["previousSessionId"], "managed-public");
+        assert_eq!(first["sessionId"], "managed-public");
+        assert_eq!(first["sessionRef"]["sessionId"], "native-b");
+        assert!(matches!(
+            second["event"]["type"].as_str(),
+            Some("freshAgent.host.journal.reset" | "freshAgent.host.backpressure")
+        ));
+        assert_eq!(
+            second["event"]["retainedState"]["snapshot"]["threadId"],
+            "native-b"
+        );
+        server.abort();
+        let _ = server.await;
+        if !replay {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while proxy.pollers.lock().await.contains(&soul) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("owned poller must settle after its socket closes");
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_resumed_presentation_receives_retained_state_and_controls() {
+    for replay in [false, true] {
+        let batch = freshell_runtime_protocol::AgentEventBatch {
+            accepted_native_dispatch: Some(accepted_codex_journal_proof()),
+            native_dispatch_in_flight: false,
+            retained_from: 10,
+            head: 10,
+            reset_required: true,
+            events: Vec::new(),
+            retained_state: Some(serde_json::json!({
+                "source":{"soulId":"codex-journal-soul","incarnationId":"journal-incarnation","hostBootId":"journal-boot","projectionId":"owned","ownerEpoch":0,"ownerGeneration":0},
+                "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-b","turns":[{"id":"retained-turn"}]},
+                "attentionMarks":[],
+                "pendingControls":[{"type":"freshAgent.permission.request","sessionId":"native-b","requestId":"pending-control"}]
+            })),
+        };
+        let (_dir, proxy, mut frames, server) =
+            codex_journal_fixture("native-b", "managed-public", batch).await;
+        let soul = SoulId::parse("codex-journal-soul").unwrap();
+        let mut route = PresentationRoute::initial("managed-public");
+        route.resumed_session_ids.insert("native-b".into());
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .insert(soul.clone(), route);
+        if replay {
+            proxy
+                .replay_once(soul.clone(), "codex", "native-b", "freshcodex")
+                .await;
+        } else {
+            assert!(
+                proxy
+                    .start_poller(
+                        soul.clone(),
+                        "codex".into(),
+                        "managed-public".into(),
+                        "freshcodex".into(),
+                        0
+                    )
+                    .await
+            );
+        }
+        let expected: &[&str] = if replay {
+            &["native-b"]
+        } else {
+            &["managed-public", "native-b"]
+        };
+        let mut received = Vec::<serde_json::Value>::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received.len() < expected.len() * 3 {
+                received.push(serde_json::from_str(&frames.recv().await.unwrap()).unwrap());
+            }
+        }).await.expect("every selected presentation must receive materialization, retained state and pending controls");
+        for id in expected {
+            assert!(received.iter().any(|frame| frame["type"]
+                == "freshAgent.session.materialized"
+                && frame["previousSessionId"] == *id
+                && frame["sessionId"] == *id
+                && frame["sessionRef"]["sessionId"] == "native-b"));
+            assert!(received.iter().any(|frame| frame["sessionId"] == *id
+                && frame["event"]["retainedState"]["snapshot"]["threadId"] == "native-b"
+                && frame["event"]["retainedState"]["snapshot"]["turns"][0]["id"]
+                    == "retained-turn"));
+            assert!(
+                received.iter().any(|frame| frame["sessionId"] == *id
+                    && frame["event"]["type"] == "freshAgent.permission.request"
+                    && frame["event"]["sessionId"] == *id
+                    && frame["event"]["requestId"] == "pending-control"),
+                "the pending control must address its presentation {id}"
+            );
+        }
+        assert!(received
+            .iter()
+            .all(|frame| expected.contains(&frame["sessionId"].as_str().unwrap())));
+        assert!(
+            received
+                .iter()
+                .all(|frame| frame["event"]["type"] != "freshAgent.turn.complete"),
+            "reattachment must not repeat completion attention"
+        );
+        server.abort();
+        let _ = server.await;
+        if !replay {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while proxy.pollers.lock().await.contains(&soul) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("owned poller must settle after its socket closes");
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_replay_does_not_restore_a_retired_replacement_after_fork() {
+    let payloads = [
+        serde_json::json!({"type":"freshAgent.session.materialized","provider":"codex","sessionType":"freshcodex","previousSessionId":"native-a","sessionId":"native-b","sessionRef":{"provider":"codex","sessionId":"native-b"}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-b","event":{"type":"freshAgent.error","sessionId":"native-b","code":"THREAD_MEMORY_LOST"}}),
+        serde_json::json!({"type":"freshAgent.event","provider":"codex","sessionType":"freshcodex","sessionId":"native-c","event":{"type":"freshAgent.status","sessionId":"native-c","status":"idle"}}),
+    ];
+    let batch = freshell_runtime_protocol::AgentEventBatch {
+        retained_state: None,
+        accepted_native_dispatch: Some(accepted_codex_journal_proof()),
+        native_dispatch_in_flight: false,
+        retained_from: 1,
+        head: 3,
+        reset_required: false,
+        events: payloads
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, payload)| freshell_runtime_protocol::AgentJournalEvent {
+                    sequence: index as u64 + 1,
+                    event: AgentEvent::Provider { payload },
+                },
+            )
+            .collect(),
+    };
+    let (_dir, proxy, mut frames, server) =
+        codex_journal_fixture("native-c", "native-c", batch).await;
+    let soul = SoulId::parse("codex-journal-soul").unwrap();
+    proxy
+        .presentation_routes
+        .lock()
+        .await
+        .insert(soul.clone(), PresentationRoute::materialized("native-c"));
+    proxy
+        .replay_once(soul, "codex", "native-c", "freshcodex")
+        .await;
+    let frame: serde_json::Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+    assert_eq!(frame["sessionId"], "native-c");
+    assert_eq!(frame["event"]["status"], "idle");
+    assert!(
+        frames.try_recv().is_err(),
+        "the old replacement and warning must stay retired"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test]
 async fn replayed_materialization_does_not_rekey_a_forked_pane_to_its_retired_parent() {
     let (broadcast, mut receiver) = broadcast::channel(8);
@@ -2619,6 +3114,8 @@ async fn replay_once_rebuilds_pending_state_without_repeating_even_recent_attent
                         serde_json::json!({"type":"freshAgent.permission.request", "requestId":"pending-tool"}),
                     ];
                     AdminResult::FreshAgentEvents(AgentEventBatch {
+                        accepted_native_dispatch: None,
+                        native_dispatch_in_flight: false,
                         retained_state: None,
                         retained_from:1, head:payloads.len() as u64, reset_required:false,
                         events:payloads.into_iter().enumerate().map(|(index,event)| AgentJournalEvent {
@@ -2720,6 +3217,8 @@ async fn first_create_preserves_completion_generated_before_the_launch_reply() {
                 }
                 AdminCommand::FreshAgentReadEvents(read) => {
                     AdminResult::FreshAgentEvents(AgentEventBatch {
+                        accepted_native_dispatch: None,
+                        native_dispatch_in_flight: false,
                         retained_state: None,
                         retained_from: 1,
                         head: 1,
@@ -2947,6 +3446,12 @@ fn provider_child_threads_remain_snapshot_topology_not_runtime_creation_intents(
 
 #[tokio::test]
 async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
+    for parent in ["public-parent", "native-resumed"] {
+        managed_provider_fork_from_presentation(parent).await;
+    }
+}
+
+async fn managed_provider_fork_from_presentation(parent: &'static str) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("supervisor.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -2970,12 +3475,12 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
                 AdminCommand::FreshAgentFork(fork) if index == 1 => {
                     methods.push("fresh_agent_fork");
                     assert_eq!(fork.soul_id, expected_soul);
-                    assert_eq!(fork.parent_session_id, "public-parent");
+                    assert_eq!(fork.parent_session_id, parent);
                     assert_eq!(fork.input, Some(serde_json::json!({"atTurnId":"turn-4"})));
                     assert_eq!(fork.expected_control_epoch, Some(77));
                     AdminResult::FreshAgentFork(FreshAgentForkResult {
                         claude_fork: None,
-                        parent_session_id: "public-parent".into(),
+                        parent_session_id: parent.into(),
                         child_session_id: "native-child".into(),
                         parent_retired_by_runtime: true,
                     })
@@ -2996,17 +3501,16 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     });
     let client = RuntimeClient::new(&socket, "0123456789abcdef");
     let (broadcast, mut receiver) = broadcast::channel(16);
+    let mut route = PresentationRoute::initial("public-parent");
+    route.resumed_session_ids.insert("native-resumed".into());
     let proxy = Arc::new(HostedFreshAgentProxy {
         client,
         broadcast: Arc::new(broadcast),
-        aliases: Mutex::new(HashMap::from([(
-            ("codex".into(), "public-parent".into()),
-            soul.clone(),
-        )])),
-        presentation_routes: Mutex::new(HashMap::from([(
-            soul.clone(),
-            PresentationRoute::initial("public-parent"),
-        )])),
+        aliases: Mutex::new(HashMap::from([
+            (("codex".into(), "public-parent".into()), soul.clone()),
+            (("codex".into(), "native-resumed".into()), soul.clone()),
+        ])),
+        presentation_routes: Mutex::new(HashMap::from([(soul.clone(), route)])),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: std::sync::OnceLock::new(),
@@ -3018,7 +3522,7 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Codex,
-            session_id: "public-parent".into(),
+            session_id: parent.into(),
             session_type: SessionType::Freshcodex,
             input: Some(serde_json::json!({"atTurnId":"turn-4"})),
             request_id: Some("fork-request-1".into()),
@@ -3035,9 +3539,25 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     let ServerMessage::FreshAgentForked(forked) = message else {
         panic!("expected forked reply")
     };
-    assert_eq!(forked.parent_session_id, "public-parent");
+    assert_eq!(forked.parent_session_id, parent);
     assert_eq!(forked.session_id, "native-child");
     assert_eq!(forked.parent_retired_by_runtime, Some(true));
+    let resumed_frame = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("a fork that retires the soul must notify its resumed pane")
+        .unwrap();
+    let resumed: ServerMessage = serde_json::from_str(&resumed_frame).unwrap();
+    let ServerMessage::FreshAgentForked(resumed_fork) = resumed else {
+        panic!("expected a forked reply for the resumed pane")
+    };
+    let other = if parent == "public-parent" {
+        "native-resumed"
+    } else {
+        "public-parent"
+    };
+    assert_eq!(resumed_fork.parent_session_id, other);
+    assert_eq!(resumed_fork.session_id, "native-child");
+    assert_eq!(resumed_fork.parent_retired_by_runtime, Some(true));
     assert_eq!(
         proxy
             .resolve_soul(
@@ -3063,15 +3583,25 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
         .await
         .get(&soul)
         .is_some_and(|route| route.materialized));
+    assert!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .unwrap()
+            .resumed_session_ids
+            .is_empty(),
+        "retired presentations must not receive child events"
+    );
     let aliases = proxy.aliases.lock().await;
     assert_eq!(
         aliases.get(&("codex".into(), "native-child".into())),
         Some(&soul)
     );
     assert!(
-        !aliases
-            .keys()
-            .any(|(provider, session)| provider == "codex" && session == "public-parent"),
+        !aliases.keys().any(|(provider, session)| provider == "codex"
+            && ["public-parent", "native-resumed"].contains(&session.as_str())),
         "retired parent aliases must not remain command-authoritative after an in-soul fork",
     );
     drop(aliases);
@@ -4587,6 +5117,7 @@ async fn task6_gateway_recovery_receipts(
                 AdminCommand::FreshAgentReadEvents(request) => {
                     server_pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     AdminResult::FreshAgentEvents(freshell_runtime_protocol::AgentEventBatch {
+                    accepted_native_dispatch:None,native_dispatch_in_flight:false,
                     retained_state:(request.after_sequence==0).then(||serde_json::json!({
                         "source":{"soulId":"retained-soul","incarnationId":"original-incarnation","hostBootId":"original-boot","projectionId":"source-projection","ownerEpoch":0,"ownerGeneration":0},
                         "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-owned","turns":[]},"attentionMarks":[],
@@ -4692,3 +5223,714 @@ mod readiness_tests;
 
 #[path = "fresh_agent_proxy_materialization_tests.rs"]
 mod materialization_tests;
+
+// The provider and host socket below are simulated; the actor, supervisor,
+// registry, runtime client, and gateway poller are the production paths.
+mod codex_replacement_realpath {
+    use super::*;
+    use freshell_agent_runtime::host_actor::{
+        DispatchAck, DispatchFailure, FreshAgentHostActor, FreshAgentProfile, FreshAgentTransport,
+        NativeDispatchIdentity, TransportStart,
+    };
+    use freshell_runtime_protocol::{
+        host_proof, AgentEventBatch, CommandState, DockerDaemonId, HostBootId, HostCommand,
+        HostReply, HostResult, IncarnationId, NativeIdentityLaunch, NativeIdentityObservation,
+        NativeIdentitySource,
+    };
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        backend::{
+            BackendCreated, BackendError, BackendInspection, CreateRuntimeSpec, RuntimeBackend,
+        },
+        registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry},
+        service::{Supervisor, SupervisorConfig},
+    };
+    use futures_util::FutureExt;
+    use std::sync::Mutex as StdMutex;
+    use tokio::{
+        sync::{mpsc, oneshot},
+        task::JoinSet,
+    };
+
+    struct FakeNative {
+        source: mpsc::Sender<AgentEvent>,
+        stream: StdMutex<Option<mpsc::Receiver<AgentEvent>>>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FreshAgentTransport for FakeNative {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some("native-a".into()),
+            })
+        }
+
+        async fn dispatch(
+            &self,
+            request: &RequestId,
+            _: &str,
+            profile: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            assert_eq!(request.as_str(), "replacement-through-supervisor");
+            assert_eq!(profile.native_session_id.as_deref(), Some("native-a"));
+            for payload in [
+                serde_json::json!({"type":"freshAgent.session.materialized", "provider":"codex",
+                    "sessionType":"freshcodex", "previousSessionId":"native-a", "sessionId":"native-b",
+                    "sessionRef":{"provider":"codex","sessionId":"native-b"}}),
+                serde_json::json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+                    "sessionId":"native-b", "event":{"type":"freshAgent.error", "sessionId":"native-b",
+                        "code":"THREAD_MEMORY_LOST", "message":"replacement has no old thread memory"}}),
+            ] {
+                self.source
+                    .send(AgentEvent::Provider { payload })
+                    .await
+                    .map_err(|_| DispatchFailure {
+                        message: "actor event stream closed".into(),
+                        acceptance_ambiguous: false,
+                    })?;
+            }
+            let release = self
+                .release
+                .lock()
+                .await
+                .take()
+                .expect("one native dispatch");
+            release.await.map_err(|_| DispatchFailure {
+                message: "native acknowledgment not released".into(),
+                acceptance_ambiguous: true,
+            })?;
+            Ok(DispatchAck {
+                provider_ack_id: Some("replacement-turn".into()),
+                native_identity: Some(NativeDispatchIdentity {
+                    previous_native_session_id: "native-a".into(),
+                    native_session_id: "native-b".into(),
+                    pending_naming_handle: None,
+                }),
+            })
+        }
+
+        async fn resolve_permission(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            unreachable!("no permission request")
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            unreachable!("no interrupt")
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+            self.stream.lock().unwrap().take()
+        }
+    }
+
+    // The supervisor may probe recovery after a Started event. Its controlled
+    // unavailable answer cannot contact Docker or mutate a runtime.
+    struct NoRuntime;
+    #[async_trait::async_trait]
+    impl RuntimeBackend for NoRuntime {
+        async fn create_stopped(
+            &self,
+            _: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            unreachable!("no runtime creation")
+        }
+        async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!("no host process")
+        }
+        async fn inspect(&self, _: &OwnedRuntimeHandle) -> Result<BackendInspection, BackendError> {
+            Err(BackendError::Unavailable(
+                "in-process test has no runtime".into(),
+            ))
+        }
+        async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+            unreachable!("no runtime stop")
+        }
+        async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!("no runtime force stop")
+        }
+        async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            unreachable!("no runtime cleanup")
+        }
+        async fn list_known(
+            &self,
+            _: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            unreachable!("no runtime enumeration")
+        }
+        async fn read_limits(&self, _: &OwnedRuntimeHandle) -> Result<RuntimeLimits, BackendError> {
+            unreachable!("no runtime limits")
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!("no runtime lease")
+        }
+    }
+
+    #[derive(Clone)]
+    struct HostRead {
+        after: u64,
+        batch: AgentEventBatch,
+    }
+
+    struct HostFixture {
+        actor: Arc<FreshAgentHostActor>,
+        boot: HostBootId,
+        incarnation: IncarnationId,
+        observation: NativeIdentityObservation,
+        limits: RuntimeLimits,
+        epoch: u64,
+        generation: u64,
+        reads: Arc<StdMutex<Vec<HostRead>>>,
+        lose_send_reply: bool,
+        dispatches: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    async fn serve_host(
+        listener: UnixListener,
+        mut stop: oneshot::Receiver<()>,
+        host: Arc<HostFixture>,
+    ) {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                Some(done) = connections.join_next(), if !connections.is_empty() => done.unwrap(),
+                incoming = listener.accept() => {
+                    let (mut stream, _) = incoming.unwrap();
+                    let host = host.clone();
+                    connections.spawn(async move {
+                        let request: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                        assert_eq!(request.role, ControlRole::Supervisor);
+                        if !matches!(&request.body, HostCommand::Hello { .. }) {
+                            assert_eq!(request.auth.as_deref(), Some(host_proof(
+                                b"realpath-host-secret", "command-auth", &host.boot, &host.incarnation).as_str()));
+                        }
+                        let result = match request.body {
+                            HostCommand::Hello { incarnation_id, challenge } => {
+                                assert_eq!(incarnation_id, host.incarnation);
+                                HostResult::Hello {
+                                    proof: host_proof(b"realpath-host-secret", &challenge, &host.boot, &incarnation_id),
+                                    host_boot_id: host.boot.clone(),
+                                    capabilities: vec!["native-identity-observation-v1".into()],
+                                    effective_limits: host.limits,
+                                }
+                            }
+                            HostCommand::Status { incarnation_id } => {
+                                assert_eq!(incarnation_id, host.incarnation);
+                                HostResult::Status {
+                                    host_boot_id: host.boot.clone(), worker_pid: Some(123), worker_launch_count: 1,
+                                    max_control_epoch: host.epoch, max_execution_generation: host.generation,
+                                    fixture_evidence: serde_json::json!({}), exited: false,
+                                    native_session_id: Some("native-a".into()),
+                                    native_identity_observation: Some(host.observation.clone()),
+                                    opencode_transfer_receipt: None, opencode_adoption: Default::default(),
+                                }
+                            }
+                            HostCommand::FreshAgentSend { incarnation_id, request_id, text, settings, checkpoint_logical_attempt_id } => {
+                                assert_eq!(incarnation_id, host.incarnation);
+                                if host.lose_send_reply {
+                                    let actor = host.actor.clone();
+                                    let dispatch = tokio::spawn(async move {
+                                        let _ = actor.dispatch_with_checkpoint_identity(
+                                            request_id, text, settings, checkpoint_logical_attempt_id).await;
+                                    });
+                                    host.dispatches.lock().await.push(dispatch);
+                                    let result = Err(freshell_runtime_protocol::RuntimeError::new(
+                                        RuntimeErrorCode::HostUnreachable, "owned host reply was lost"));
+                                    write_frame(&mut stream, &HostReply { request_id: request.request_id, result })
+                                        .await.unwrap();
+                                    return;
+                                }
+                                let before = host.actor.profile().await.native_session_id.unwrap();
+                                let state = match host.actor.dispatch_with_checkpoint_identity(
+                                    request_id, text, settings, checkpoint_logical_attempt_id).await {
+                                    Ok(state) => state,
+                                    Err(_) => {
+                                        let result = Err(freshell_runtime_protocol::RuntimeError::new(
+                                            RuntimeErrorCode::HostUnreachable, "owned fake dispatch did not settle"));
+                                        write_frame(&mut stream, &HostReply { request_id: request.request_id, result })
+                                            .await.unwrap();
+                                        return;
+                                    }
+                                };
+                                let after = host.actor.profile().await;
+                                let native = after.native_session_id.clone().unwrap();
+                                HostResult::FreshAgentCommand {
+                                    state, native_session_id: Some(native.clone()), claude_fork: None,
+                                    native_identity: Some(NativeDispatchIdentity {
+                                        previous_native_session_id: before, native_session_id: native,
+                                        pending_naming_handle: after.naming_handle,
+                                    }),
+                                }
+                            }
+                            HostCommand::FreshAgentReadEvents { incarnation_id, after_sequence, max_events } => {
+                                assert_eq!(incarnation_id, host.incarnation);
+                                let batch = host.actor.read_events(after_sequence, max_events as usize).await;
+                                host.reads.lock().unwrap().push(HostRead { after: after_sequence, batch: batch.clone() });
+                                HostResult::FreshAgentEvents(batch)
+                            }
+                            other => panic!("unexpected in-process host command: {other:?}"),
+                        };
+                        write_frame(&mut stream, &HostReply { request_id: request.request_id, result: Ok(result) })
+                            .await.unwrap();
+                    });
+                }
+            }
+        }
+        while let Some(done) = connections.join_next().await {
+            done.unwrap();
+        }
+    }
+
+    async fn settle_task(mut task: tokio::task::JoinHandle<()>, name: &str) -> Result<(), String> {
+        match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+            Ok(result) => result.map_err(|_| format!("owned {name} failed")),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(format!("owned {name} did not settle before its deadline"))
+            }
+        }
+    }
+
+    // The socket adapter only frames requests; Supervisor::dispatch retains
+    // production authentication and lifecycle locking, without serve_control's
+    // unrelated detached periodic maintenance tasks.
+    async fn serve_supervisor(
+        listener: UnixListener,
+        mut stop: oneshot::Receiver<()>,
+        supervisor: Supervisor,
+    ) {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                Some(done) = connections.join_next(), if !connections.is_empty() => done.unwrap(),
+                incoming = listener.accept() => {
+                    let (mut stream, _) = incoming.unwrap();
+                    let supervisor = supervisor.clone();
+                    connections.spawn(async move {
+                        let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                        let reply = supervisor.dispatch(request).await;
+                        write_frame(&mut stream, &reply).await.unwrap();
+                    });
+                }
+            }
+        }
+        while let Some(done) = connections.join_next().await {
+            done.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_accepted_replacement_crosses_supervisor_actor_poller() {
+        accepted_replacement_across_realpath(false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_late_accepted_replacement_reconciles_after_lost_reply() {
+        accepted_replacement_across_realpath(true).await;
+    }
+
+    async fn accepted_replacement_across_realpath(lose_send_reply: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_string_lossy().into_owned();
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"realpath-host-secret").unwrap();
+        let limits = RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        };
+        let registry = Registry::open(root.path().join("registry"), None).unwrap();
+        let soul = SoulId::parse("realpath-codex-soul").unwrap();
+        let spec = serde_json::from_value(serde_json::json!({
+            "sessionId":"managed-public", "provider":"codex", "sessionType":"freshcodex",
+            "runtimeVariant":"codex", "providerStoreId":"realpath-store", "cwd":workspace,
+            "workspacePath":workspace, "runAsUid":65534, "runAsGid":0,
+            "nativeSessionId":"native-a", "sessionRef":{"provider":"codex","sessionId":"native-a"}
+        }))
+        .unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul.clone(),
+                provider: "codex".into(),
+                provider_store_id: "realpath-store".into(),
+                native_session_id: Some("native-a".into()),
+                creation_seed_ref: "realpath-seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "realpath-launch".into(),
+                requested_limits: limits,
+                profile: RuntimeProfile::Custom,
+                project_key: "realpath-workspace".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(spec),
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    launch_policy: None,
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: runtime.clone(),
+                    host_binary_path: std::env::current_exe().unwrap(),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        let boot = HostBootId::new();
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), boot.clone(), limits)
+            .await
+            .unwrap();
+        let current = registry.recovery_context(soul.clone()).await.unwrap();
+        let launch = registry
+            .bind_native_identity_launch(NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: prepared.launch_nonce.as_str().into(),
+                evidence_revision: current.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: Some("native-a".into()),
+            })
+            .await
+            .unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-a".into(),
+            )
+            .await
+            .unwrap();
+        let observation = NativeIdentityObservation {
+            native_session_id: "native-a".into(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: launch.launch_nonce.clone(),
+            evidence_revision: launch.evidence_revision,
+            source: NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "d".repeat(64),
+        };
+        let current = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                observation.clone(),
+                current.write_fence(),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+
+        let (source, stream) = mpsc::channel(16);
+        let (release_tx, release_rx) = oneshot::channel();
+        let native = Arc::new(FakeNative {
+            source: source.clone(),
+            stream: StdMutex::new(Some(stream)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+            "provider":"codex", "runtimeVariant":"codex", "cwd":workspace, "providerStoreId":"realpath-store",
+            "nativeSessionId":"native-a", "sessionRef":{"provider":"codex","sessionId":"native-a"}
+        })).unwrap();
+        let actor = FreshAgentHostActor::open(root.path().join("actor"), profile, native)
+            .await
+            .unwrap();
+        source.send(AgentEvent::Provider { payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-a",
+            "event":{"type":"freshAgent.status", "sessionId":"native-a", "status":"idle"}
+        }) }).await.unwrap();
+        let initial = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let batch = actor.read_events(0, 64).await;
+                if !batch.events.is_empty() {
+                    break batch;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial native status must reach the actor");
+        assert!(!initial.reset_required);
+        let cursor = initial.head;
+        assert!(cursor > 0);
+
+        let host_listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let reads = Arc::new(StdMutex::new(Vec::new()));
+        let dispatches = Arc::new(Mutex::new(Vec::new()));
+        let host = Arc::new(HostFixture {
+            actor: actor.clone(),
+            boot,
+            incarnation: prepared.incarnation_id.clone(),
+            observation,
+            limits,
+            epoch: registry.control_epoch(),
+            generation: grant.execution_generation,
+            reads: reads.clone(),
+            lose_send_reply,
+            dispatches: dispatches.clone(),
+        });
+        let (host_stop, host_stop_rx) = oneshot::channel();
+        let host_task = tokio::spawn(serve_host(host_listener, host_stop_rx, host));
+        let control_path = root.path().join("control.sock");
+        let control_listener = UnixListener::bind(&control_path).unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(NoRuntime),
+            SupervisorConfig {
+                runtime_root: root.path().into(),
+                control_socket_path: control_path.clone(),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                test_run_id: "codex-replacement-realpath".into(),
+                control_secret: "0123456789abcdef".into(),
+                lifecycle_log: root.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let (control_stop, control_stop_rx) = oneshot::channel();
+        let control_task = tokio::spawn(serve_supervisor(
+            control_listener,
+            control_stop_rx,
+            supervisor,
+        ));
+        let (proxy, mut public) = configure_proxy(
+            &control_path,
+            HashMap::from([(("codex".into(), "managed-public".into()), soul.clone())]),
+        );
+        let mut release = Some(release_tx);
+        let mut send_task = None;
+        let scenario = std::panic::AssertUnwindSafe(async {
+        assert!(proxy.start_poller(soul.clone(), "codex".into(), "managed-public".into(), "freshcodex".into(), 0).await);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if reads.lock().unwrap().iter().any(|read| read.after == cursor && !read.batch.reset_required) { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the real poller must advance beyond its initial cursor");
+        while public.try_recv().is_ok() {}
+        let message = serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+            "requestId":"replacement-through-supervisor", "text":"recover once"
+        })).unwrap();
+        send_task = Some(tokio::spawn(proxy.clone().handle(HostedFreshAgentCommand::Send(message))));
+        let staged = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let batch = actor.read_events(cursor, 64).await;
+                if batch.events.iter().filter(|row| matches!(&row.event, AgentEvent::Provider { payload }
+                    if payload["type"] == "freshAgent.session.materialized" || payload["event"]["code"] == "THREAD_MEMORY_LOST")).count() == 2 {
+                    break batch;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the real actor must journal both staged provider frames");
+        assert!(!staged.reset_required);
+        assert_eq!(actor.profile().await.native_session_id.as_deref(), Some("native-a"));
+        assert_eq!(registry.recovery_context(soul.clone()).await.unwrap().native_session_id.as_deref(), Some("native-a"));
+        // This scenario verifies the public routing after accepted replacement.
+        // It does not claim to prove where a concurrent read waits for the lock.
+        if lose_send_reply {
+            settle_task(send_task.take().unwrap(), "ambiguous gateway send").await.unwrap();
+            assert_eq!(registry.recovery_context(soul.clone()).await.unwrap().native_session_id.as_deref(), Some("native-a"));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if reads.lock().unwrap().iter().filter(|read| read.after == cursor
+                        && read.batch.native_dispatch_in_flight
+                        && read.batch.events.iter().any(|row| matches!(&row.event,
+                            AgentEvent::Provider { payload } if payload["type"] == "freshAgent.session.materialized"))).count() >= 2 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("the real poller must retry the same replacement cursor while acceptance is unresolved");
+            while let Ok(frame) = public.try_recv() {
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert_ne!(frame["type"], "freshAgent.session.materialized", "an unresolved replacement must not rekey the pane");
+                assert_ne!(frame["event"]["code"], "THREAD_MEMORY_LOST", "an unresolved replacement must not publish its warning");
+            }
+        }
+        release.take().unwrap().send(()).unwrap();
+        if let Some(send) = send_task.take() {
+            settle_task(send, "gateway send").await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if actor.profile().await.native_session_id.as_deref() == Some("native-b") { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the host actor must durably accept B");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry.recovery_context(soul.clone()).await.unwrap().native_session_id.as_deref() == Some("native-b") { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the supervisor must reconcile an accepted native B after a lost reply");
+        if lose_send_reply {
+            let replay = proxy.client.fresh_agent_send(
+                RequestId::parse("replacement-through-supervisor").unwrap(), soul.clone(),
+                "recover once".into(), None, None,
+            ).await.unwrap();
+            assert_eq!(replay, CommandState::Completed, "replay must not dispatch the accepted turn twice");
+        }
+        source.send(AgentEvent::Provider { payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-b",
+            "event":{"type":"freshAgent.turn.complete", "sessionId":"native-b", "at":chrono::Utc::now().timestamp_millis(), "outcome":"completed"}
+        }) }).await.unwrap();
+        let mut frames = Vec::<serde_json::Value>::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !frames.iter().any(|frame| frame["type"] == "freshAgent.session.materialized")
+                || !frames.iter().any(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST")
+                || !frames.iter().any(|frame| frame["event"]["type"] == "freshAgent.turn.complete")
+            {
+                let frame = public.recv().await.unwrap();
+                frames.push(serde_json::from_str(&frame).unwrap());
+            }
+        }).await.expect("real poller must deliver replacement, warning, and completion");
+        let host_reads = reads.lock().unwrap().clone();
+
+        let staged_sequences: Vec<_> = staged.events.iter().filter_map(|row| match &row.event {
+            AgentEvent::Provider { payload } if payload["type"] == "freshAgent.session.materialized"
+                || payload["event"]["code"] == "THREAD_MEMORY_LOST" => Some(row.sequence),
+            _ => None,
+        }).collect();
+        assert_eq!(staged_sequences.len(), 2);
+        assert!(host_reads.iter().filter(|read| read.after >= cursor).all(|read| !read.batch.reset_required && read.batch.retained_state.is_none()));
+        for sequence in staged_sequences {
+            assert!(host_reads.iter().any(|read| read.after >= cursor && read.batch.events.iter().any(|row| row.sequence == sequence)),
+                "the real supervisor read must carry journal sequence {sequence}");
+        }
+        let materialized_index = frames.iter().position(|frame| frame["type"] == "freshAgent.session.materialized").unwrap();
+        let warning_index = frames.iter().position(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST").unwrap();
+        let completion_index = frames.iter().position(|frame| frame["event"]["type"] == "freshAgent.turn.complete").unwrap();
+        assert!(materialized_index < warning_index && warning_index < completion_index,
+            "the pane must be told about B before its warning and completion");
+        let materialized = &frames[materialized_index];
+        assert_eq!(materialized["previousSessionId"], "managed-public");
+        assert_eq!(materialized["sessionRef"]["sessionId"], "native-b");
+        let pane = materialized["sessionId"].as_str().unwrap();
+        assert_eq!(pane, "managed-public", "accepted recovery preserves the public presentation key");
+        for frame in frames.iter().filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"
+            || frame["event"]["type"] == "freshAgent.turn.complete") {
+            assert_eq!(frame["sessionId"], pane, "warning and completion must address the pane told about B");
+            assert_eq!(frame["event"]["sessionId"], pane);
+        }
+        for alias in ["managed-public", "native-b"] {
+            assert_eq!(proxy.resolve_soul(&AgentProvider::Codex, SessionType::Freshcodex, alias).await, Some(soul.clone()));
+        }
+        while public.try_recv().is_ok() {}
+        let resume = serde_json::from_value(serde_json::json!({
+            "requestId":"resume-native-b", "provider":"codex", "sessionType":"freshcodex",
+            "cwd":workspace, "sessionRef":{"provider":"codex", "sessionId":"native-b"}
+        })).unwrap();
+        proxy.clone().handle(HostedFreshAgentCommand::Create(resume)).await;
+        let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: serde_json::Value = serde_json::from_str(&public.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created" && frame["requestId"] == "resume-native-b" {
+                    break frame;
+                }
+            }
+        }).await.expect("resuming accepted B must create a pane");
+        assert_eq!(resumed["sessionRef"]["sessionId"], "native-b");
+        let resumed_pane = resumed["sessionId"].as_str().unwrap().to_owned();
+        assert_eq!(resumed_pane, "native-b", "native resume retains its public response contract");
+        let mut replay = Vec::<serde_json::Value>::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !replay.iter().any(|frame| frame["type"] == "freshAgent.session.materialized"
+                && frame["sessionId"] == resumed_pane && frame["sessionRef"]["sessionId"] == "native-b")
+                || !replay.iter().any(|frame| frame["sessionId"] == resumed_pane && frame["event"]["code"] == "THREAD_MEMORY_LOST") {
+                let frame: serde_json::Value = serde_json::from_str(&public.recv().await.unwrap()).unwrap();
+                replay.push(frame);
+            }
+        }).await.expect("the resumed pane must receive accepted materialization and retained journal events");
+        assert!(!replay.iter().any(|frame| frame["sessionId"] == "managed-public"),
+            "a resume replay must not replay the old pane's stream");
+        source.send(AgentEvent::Provider { payload: serde_json::json!({
+            "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-b",
+            "event":{"type":"freshAgent.status", "sessionId":"native-b", "status":"resume-marker"}
+        }) }).await.unwrap();
+        let mut delivered = HashSet::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while !delivered.contains("managed-public") || !delivered.contains(&resumed_pane) {
+                let frame: serde_json::Value = serde_json::from_str(&public.recv().await.unwrap()).unwrap();
+                if frame["event"]["status"] == "resume-marker" {
+                    delivered.insert(frame["sessionId"].as_str().unwrap().to_owned());
+                }
+            }
+        }).await;
+        assert!(delivered.contains("managed-public"), "the existing pane must receive the later event; delivered={delivered:?}");
+        assert!(delivered.contains(&resumed_pane), "resumed pane {resumed_pane} must receive the later event; delivered={delivered:?}");
+        assert_eq!(proxy.presentation_routes.lock().await.get(&soul).unwrap().session_id, "managed-public");
+        }).catch_unwind().await;
+
+        // Settle the owned sockets and poller even when an assertion fails.
+        // Dropping an unreleased ACK makes the fake native dispatch ambiguous.
+        drop(release.take());
+        let mut cleanup_errors = Vec::new();
+        if let Some(send) = send_task.take() {
+            if let Err(error) = settle_task(send, "gateway send").await {
+                cleanup_errors.push(error);
+            }
+        }
+        for dispatch in std::mem::take(&mut *dispatches.lock().await) {
+            if let Err(error) = settle_task(dispatch, "owned host dispatch").await {
+                cleanup_errors.push(error);
+            }
+        }
+        if control_stop.send(()).is_err() {
+            cleanup_errors.push("supervisor socket already stopped".into());
+        }
+        if let Err(error) = settle_task(control_task, "supervisor socket").await {
+            cleanup_errors.push(error);
+        }
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            while proxy.pollers.lock().await.contains(&soul) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            cleanup_errors.push("owned poller did not settle".into());
+        }
+        if host_stop.send(()).is_err() {
+            cleanup_errors.push("host socket already stopped".into());
+        }
+        if let Err(error) = settle_task(host_task, "host socket").await {
+            cleanup_errors.push(error);
+        }
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), actor.clone().stop()).await,
+            Ok(Ok(()))
+        ) {
+            cleanup_errors.push("owned actor did not stop".into());
+        }
+        if !cleanup_errors.is_empty() {
+            eprintln!("owned cleanup failures: {cleanup_errors:?}");
+        }
+        if let Err(failure) = scenario {
+            std::panic::resume_unwind(failure);
+        }
+        assert!(
+            cleanup_errors.is_empty(),
+            "owned tasks must settle: {cleanup_errors:?}"
+        );
+    }
+}

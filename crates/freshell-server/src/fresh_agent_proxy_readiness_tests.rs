@@ -325,6 +325,8 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                     rows.extend(host_events.lock().unwrap().iter().cloned());
                     let head = rows.last().map_or(0, |row| row.sequence);
                     HostResult::FreshAgentEvents(AgentEventBatch {
+                        accepted_native_dispatch: None,
+                        native_dispatch_in_flight: false,
                         retained_state: None,
                         retained_from: 1,
                         head,

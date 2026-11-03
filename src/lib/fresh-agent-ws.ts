@@ -4,6 +4,7 @@ import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/f
 import type { SessionRef } from '@shared/session-contract'
 import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
+import { collectPaneEntries } from '@/lib/pane-utils'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
@@ -245,12 +246,31 @@ export function handleFreshAgentMessage(
         sessionType: materialized.sessionType,
         provider: materialized.provider,
       })
-      dispatch(materializeFreshAgentSessionState({
-        previousSessionId: materialized.previousSessionId,
-        sessionId: materialized.sessionId,
-        sessionType: materialized.sessionType,
-        provider: materialized.provider,
-      }))
+      dispatch((innerDispatch, getState) => {
+        const newNative = materialized.sessionRef?.provider === 'codex'
+          ? materialized.sessionRef.sessionId
+          : undefined
+        const replaceLiveProjection = materialized.provider === 'codex'
+          && materialized.previousSessionId === materialized.sessionId
+          && Boolean(newNative)
+          && Object.values(getState().panes?.layouts ?? {}).some((layout) => collectPaneEntries(layout).some(({ content }) => {
+            if (content.kind !== 'fresh-agent' || content.provider !== materialized.provider
+              || content.sessionType !== materialized.sessionType) return false
+            const matches = [content.sessionId, content.resumeSessionId, content.sessionRef?.sessionId]
+              .some((id) => id === materialized.previousSessionId)
+            const previousNative = content.sessionRef?.provider === 'codex'
+              ? content.sessionRef.sessionId
+              : (content.resumeSessionId ?? content.sessionId)
+            return matches && Boolean(previousNative) && previousNative !== newNative
+          }))
+        innerDispatch(materializeFreshAgentSessionState({
+          previousSessionId: materialized.previousSessionId,
+          sessionId: materialized.sessionId,
+          sessionType: materialized.sessionType,
+          provider: materialized.provider,
+          replaceLiveProjection,
+        }))
+      })
       dispatch(materializeFreshAgentPaneSession({
         previousSessionId: materialized.previousSessionId,
         sessionId: materialized.sessionId,

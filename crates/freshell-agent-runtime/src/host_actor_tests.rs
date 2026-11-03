@@ -1684,6 +1684,13 @@ async fn accepted_dispatch_native_identity_requires_current_source_and_existing_
         let result = work.await.unwrap();
         let current = actor.profile().await;
         if matches!(scenario, "initial-recovery" | "new-conversation") {
+            let accepted = actor
+                .read_events(0, 16)
+                .await
+                .accepted_native_dispatch
+                .unwrap();
+            assert_eq!(accepted.request_id, request);
+            assert_eq!(accepted.identity.native_session_id, "native-new");
             assert_eq!(result, Ok(CommandState::ProviderAcked), "{scenario}");
             assert_eq!(current.native_session_id.as_deref(), Some("native-new"));
             assert_eq!(
@@ -1700,6 +1707,14 @@ async fn accepted_dispatch_native_identity_requires_current_source_and_existing_
                 }
             );
         } else {
+            assert!(
+                actor
+                    .read_events(0, 16)
+                    .await
+                    .accepted_native_dispatch
+                    .is_none(),
+                "{scenario}"
+            );
             assert!(
                 matches!(result, Err(ActorError::AmbiguousDispatch)),
                 "{scenario}: {result:?}"
@@ -1730,6 +1745,108 @@ async fn accepted_dispatch_native_identity_requires_current_source_and_existing_
         }
         actor.stop().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn codex_native_dispatch_in_flight_clears_if_the_dispatch_future_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("native-old");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *transport.dispatch_gate.lock().unwrap() = Some((entered.clone(), release));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "in-flight-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request = RequestId::parse("cancelled-dispatch").unwrap();
+    let task = tokio::spawn({
+        let actor = actor.clone();
+        let request = request.clone();
+        async move { actor.dispatch(request, "input".into(), None).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    assert!(actor.read_events(0, 16).await.native_dispatch_in_flight);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let batch = actor.read_events(0, 16).await;
+    assert!(
+        !batch.native_dispatch_in_flight,
+        "a cancelled future cannot still deliver an acknowledgement"
+    );
+    assert!(batch.accepted_native_dispatch.is_none());
+    assert_eq!(
+        actor.dispatch(request, "input".into(), None).await,
+        Err(ActorError::AmbiguousDispatch)
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+    actor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn codex_native_dispatch_acceptance_survives_eviction_and_actor_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("native-old");
+    *transport.dispatch_identity.lock().unwrap() = Some(NativeDispatchIdentity {
+        previous_native_session_id: "native-old".into(),
+        native_session_id: "native-new".into(),
+        pending_naming_handle: None,
+    });
+    let actor = FreshAgentHostActor::open_with_bounds(
+        dir.path(),
+        profile(FreshProvider::Codex, "evicted-proof-store", None),
+        transport,
+        4096,
+        3,
+    )
+    .await
+    .unwrap();
+    actor
+        .dispatch(
+            RequestId::parse("evicted-proof").unwrap(),
+            "input".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    for index in 0..8 {
+        actor
+            .record_event(AgentEvent::Provider {
+                payload: serde_json::json!({"index":index}),
+            })
+            .await
+            .unwrap();
+    }
+    let batch = actor.read_events(0, 16).await;
+    assert!(
+        batch.reset_required,
+        "the original journal entries must actually be evicted"
+    );
+    let accepted = batch.accepted_native_dispatch.unwrap();
+    assert_eq!(accepted.request_id.as_str(), "evicted-proof");
+    assert_eq!(accepted.identity.native_session_id, "native-new");
+    let updated = actor.profile().await;
+    actor.stop().await.unwrap();
+    let reopened = FreshAgentHostActor::open_with_bounds(
+        dir.path(),
+        updated,
+        FakeTransport::new("native-new"),
+        4096,
+        3,
+    )
+    .await
+    .unwrap();
+    let restored = reopened
+        .read_events(0, 16)
+        .await
+        .accepted_native_dispatch
+        .unwrap();
+    assert_eq!(restored, accepted);
+    reopened.stop().await.unwrap();
 }
 
 #[tokio::test]

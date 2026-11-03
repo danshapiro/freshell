@@ -120,6 +120,8 @@ impl Fixture {
                     HostCommand::FreshAgentReadEvents { .. } => {
                         let state = current.lock().unwrap();
                         Ok(HostResult::FreshAgentEvents(AgentEventBatch {
+                            accepted_native_dispatch: None,
+                            native_dispatch_in_flight: false,
                             retained_state: None,
                             retained_from: 1,
                             head: 1,

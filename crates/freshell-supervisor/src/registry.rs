@@ -2,13 +2,13 @@ use crate::admission::{AdmissionPolicy, ReservationTotals};
 use crate::opencode_transfer::OpenCodeTransferStageReferences;
 use crate::recovery_retry::{self, RecoveryRetry, TransientRecoveryFailure};
 use freshell_runtime_protocol::{
-    AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
-    FreshAgentLaunchSpec, FreshAgentTurnSettings, FreshProvider, GrantId, HostBootId,
-    IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget,
-    NativeDispatchIdentity, NoticeId, OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor,
-    RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
-    RequestId, RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
+    AcceptedNativeDispatch, AllocationState, CleanupState, DesiredState, DockerDaemonId,
+    DurabilityState, FixtureKind, FreshAgentLaunchSpec, FreshAgentTurnSettings, FreshProvider,
+    GrantId, HostBootId, IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState,
+    LostSoulRepairTarget, NativeDispatchIdentity, NoticeId, OpenCodeAdoptionBaseline,
+    OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason, RecoveryPath,
+    RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits,
+    RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ enum NativeSessionTransitionEvidence {
     ClaudeClear(freshell_runtime_protocol::NativeIdentityObservation),
     AcceptedDispatch {
         pending_naming_handle: Option<String>,
+        request_id: Option<RequestId>,
     },
 }
 
@@ -2337,10 +2338,50 @@ impl Registry {
             fence,
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle: identity.pending_naming_handle,
+                request_id: None,
             },
         )
         .await
         .map(|_| ())
+    }
+
+    /// Reconcile a lost send reply only for the exact command and incarnation
+    /// that dispatched it. Identity and command outcome commit together.
+    pub async fn reconcile_fresh_agent_dispatch_identity(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        accepted: AcceptedNativeDispatch,
+    ) -> Result<bool, RegistryError> {
+        let query_soul = soul_id.clone();
+        let query_incarnation = incarnation_id.clone();
+        let query_request = accepted.request_id.clone();
+        let previous = accepted.identity.previous_native_session_id.clone();
+        let native = accepted.identity.native_session_id.clone();
+        let eligible = self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM input_commands c JOIN souls s ON s.soul_id=c.soul_id JOIN incarnations i ON i.incarnation_id=c.incarnation_id WHERE c.soul_id=?1 AND c.request_id=?2 AND c.incarnation_id=?3 AND c.state IN ('dispatching','ambiguous') AND s.provider='codex' AND s.desired_state='running' AND i.launch_state='running' AND s.native_session_id IN (?4,?5))",
+                params![query_soul.as_str(), query_request.as_str(), query_incarnation.as_str(), previous, native],
+                |row| row.get::<_, bool>(0),
+            ).map_err(RegistryError::from)
+        }).await?;
+        if !eligible {
+            return Ok(false);
+        }
+        let fence = self.recovery_write_fence(soul_id.clone()).await?;
+        self.transition_native_session_evidenced_fenced(
+            soul_id,
+            incarnation_id,
+            &accepted.identity.previous_native_session_id,
+            &accepted.identity.native_session_id,
+            fence,
+            NativeSessionTransitionEvidence::AcceptedDispatch {
+                pending_naming_handle: accepted.identity.pending_naming_handle,
+                request_id: Some(accepted.request_id),
+            },
+        )
+        .await?;
+        Ok(true)
     }
 
     pub async fn transition_native_session_fenced(
@@ -2411,14 +2452,15 @@ impl Registry {
         fence: RecoveryWriteFence,
         evidence: NativeSessionTransitionEvidence,
     ) -> Result<RecoveryWriteFence, RegistryError> {
-        let (claude_fork, native_clear, pending_naming_handle) = match evidence {
-            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None),
+        let (claude_fork, native_clear, pending_naming_handle, accepted_request) = match evidence {
+            NativeSessionTransitionEvidence::Operation(recipe) => (recipe, None, None, None),
             NativeSessionTransitionEvidence::ClaudeClear(observation) => {
-                (None, Some(observation), None)
+                (None, Some(observation), None, None)
             }
             NativeSessionTransitionEvidence::AcceptedDispatch {
                 pending_naming_handle,
-            } => (None, None, Some(pending_naming_handle)),
+                request_id,
+            } => (None, None, Some(pending_naming_handle), request_id),
         };
         let preserve_presentation = pending_naming_handle.is_some();
         if let Some(recipe) = &claude_fork {
@@ -2456,6 +2498,30 @@ impl Registry {
             ).optional()?.ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
             if owner != soul_id.as_str() {
                 return Err(RegistryError::NativeIdentityConflict);
+            }
+            if let Some(request_id) = accepted_request.as_ref() {
+                let pending: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM input_commands WHERE soul_id=?1 AND request_id=?2 AND incarnation_id=?3 AND state IN ('dispatching','ambiguous'))",
+                    params![soul_id.as_str(), request_id.as_str(), incarnation_id.as_str()], |row| row.get(0),
+                )?;
+                if !pending || provider != "codex" {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                // A previous version may have committed the identity before
+                // losing the separate input-outcome write. Complete that exact
+                // request only if the current owner still claims the target.
+                if existing.as_deref() == Some(child_session_id.as_str()) && expected_parent != child_session_id {
+                    let current: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id JOIN writer_claims w ON w.soul_id=s.soul_id AND w.incarnation_id=i.incarnation_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND i.launch_state='running' AND s.desired_state='running' AND w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=?3 AND w.intent_revision=s.intent_revision)",
+                        params![soul_id.as_str(), incarnation_id.as_str(), child_session_id], |row| row.get(0),
+                    )?;
+                    if !current { return Err(RegistryError::NativeIdentityConflict); }
+                    tx.execute("UPDATE input_commands SET state='completed',updated_at=?1 WHERE soul_id=?2 AND request_id=?3 AND incarnation_id=?4 AND state IN ('dispatching','ambiguous')",
+                        params![now_millis(), soul_id.as_str(), request_id.as_str(), incarnation_id.as_str()])?;
+                    let successor = load_recovery_write_fence(&tx, &soul_id)?;
+                    tx.commit()?;
+                    return Ok(successor);
+                }
             }
             if preserve_presentation {
                 let current: bool=tx.query_row(
@@ -2610,6 +2676,11 @@ impl Registry {
                 // new root so a subsequent explicit operation can use it.
                 tx.execute("UPDATE incarnations SET native_identity_observation=?2 WHERE incarnation_id=?1",
                     params![incarnation_id.as_str(), serde_json::to_string(observation)?])?;
+            }
+            if let Some(request_id) = accepted_request.as_ref() {
+                let changed = tx.execute("UPDATE input_commands SET state='completed',updated_at=?1 WHERE soul_id=?2 AND request_id=?3 AND incarnation_id=?4 AND state IN ('dispatching','ambiguous')",
+                    params![now_millis(), soul_id.as_str(), request_id.as_str(), incarnation_id.as_str()])?;
+                if changed != 1 { return Err(RegistryError::NativeIdentityConflict); }
             }
             let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;
@@ -8969,6 +9040,189 @@ pub(crate) mod tests {
             serde_json::to_value(fresh).unwrap()["freshAgentCreateRequestId"],
             "seed"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_codex_dispatch_reconciliation_fences_request_incarnation_and_stale_root() {
+        for identity_precommitted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                materialize_fresh_runtime(&registry, soul.clone(), workspace.path()).await;
+            let mut spec = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .fresh_agent
+                .unwrap();
+            spec.provider = FreshProvider::Codex;
+            spec.session_type = "freshcodex".into();
+            spec.runtime_variant = "codex".into();
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(&spec).unwrap(),
+                    prepared.incarnation_id.as_str()
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            registry
+                .record_native_session(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    "native-a".into(),
+                )
+                .await
+                .unwrap();
+            let request = RequestId::parse("reconcile-request").unwrap();
+            registry
+                .begin_input(soul.clone(), request.clone(), b"prompt", None)
+                .await
+                .unwrap();
+            let accepted = AcceptedNativeDispatch {
+                request_id: request.clone(),
+                identity: NativeDispatchIdentity {
+                    previous_native_session_id: "native-a".into(),
+                    native_session_id: "native-b".into(),
+                    pending_naming_handle: None,
+                },
+            };
+            assert!(
+                !registry
+                    .reconcile_fresh_agent_dispatch_identity(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        accepted.clone()
+                    )
+                    .await
+                    .unwrap(),
+                "a queued command has not been dispatched"
+            );
+            registry
+                .mark_input_dispatching(soul.clone(), request.clone())
+                .await
+                .unwrap();
+            let mut wrong_request = accepted.clone();
+            wrong_request.request_id = RequestId::parse("other-request").unwrap();
+            assert!(!registry
+                .reconcile_fresh_agent_dispatch_identity(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    wrong_request
+                )
+                .await
+                .unwrap());
+            assert!(!registry
+                .reconcile_fresh_agent_dispatch_identity(
+                    soul.clone(),
+                    IncarnationId::new(),
+                    accepted.clone()
+                )
+                .await
+                .unwrap());
+            let mut wrong_root = accepted.clone();
+            wrong_root.identity.previous_native_session_id = "foreign-root".into();
+            assert!(!registry
+                .reconcile_fresh_agent_dispatch_identity(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    wrong_root
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .native_session_id
+                    .as_deref(),
+                Some("native-a")
+            );
+            registry
+                .mark_input_ambiguous(soul.clone(), request.clone())
+                .await
+                .unwrap();
+            if identity_precommitted {
+                // Model a crash between an earlier identity commit and its
+                // formerly separate input-completion write.
+                registry
+                    .record_fresh_agent_dispatch_identity(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        accepted.identity.clone(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(registry
+                .reconcile_fresh_agent_dispatch_identity(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    accepted.clone()
+                )
+                .await
+                .unwrap());
+            let current = registry.recovery_context(soul.clone()).await.unwrap();
+            assert_eq!(current.native_session_id.as_deref(), Some("native-b"));
+            assert_eq!(
+                current.fresh_agent.unwrap().session_id,
+                "fresh-session",
+                "direct recovery keeps the presentation key"
+            );
+            assert_eq!(
+                registry
+                    .begin_input(soul.clone(), request, b"prompt", None)
+                    .await
+                    .unwrap()
+                    .0,
+                InputJournalDisposition::Completed
+            );
+            assert!(!registry
+                .reconcile_fresh_agent_dispatch_identity(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    accepted.clone()
+                )
+                .await
+                .unwrap());
+            registry
+                .transition_native_session(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    "native-b",
+                    "native-c",
+                )
+                .await
+                .unwrap();
+            assert!(!registry
+                .reconcile_fresh_agent_dispatch_identity(
+                    soul.clone(),
+                    prepared.incarnation_id,
+                    accepted
+                )
+                .await
+                .unwrap());
+            assert_eq!(
+                registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .native_session_id
+                    .as_deref(),
+                Some("native-c"),
+                "old acceptance must not undo a fork"
+            );
+        }
     }
 
     #[tokio::test]

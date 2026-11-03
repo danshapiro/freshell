@@ -90,6 +90,21 @@ function isViewed(state: FreshAgentLiveState, key: string): boolean {
   return (state.viewers[key] ?? 0) > 0
 }
 
+function dropUnviewedTail(state: FreshAgentLiveState, key: string): void {
+  const { retiredProjectionIds, retiredRetainedSourceKeys } = state.bySession[key]
+  if (!retiredProjectionIds && !retiredRetainedSourceKeys) {
+    delete state.bySession[key]
+    return
+  }
+  // Discard transient output while keeping the identity fences until the
+  // session itself is removed. Late events must not revive a retired source.
+  state.bySession[key] = {
+    ...emptySession(),
+    ...(retiredProjectionIds ? { retiredProjectionIds } : {}),
+    ...(retiredRetainedSourceKeys ? { retiredRetainedSourceKeys } : {}),
+  }
+}
+
 /**
  * The session's turn ended (its result, or an idle status). A tail a visible
  * pane settles keeps its blocks, marked ended, until their lines land; the
@@ -98,7 +113,7 @@ function isViewed(state: FreshAgentLiveState, key: string): boolean {
 function endTurnsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
   for (const key of tailKeysFor(state, payload)) {
     if (!isViewed(state, key) && !state.bySession[key].projection) {
-      delete state.bySession[key]
+      dropUnviewedTail(state, key)
       continue
     }
     const session = state.bySession[key]
@@ -115,7 +130,7 @@ function endTurnsFor(state: FreshAgentLiveState, payload: SessionMutationPayload
  */
 function errorTailsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
   for (const key of tailKeysFor(state, payload)) {
-    if (!isViewed(state, key)) delete state.bySession[key]
+    if (!isViewed(state, key)) dropUnviewedTail(state, key)
     else if (state.bySession[key].retry) delete state.bySession[key].retry
   }
 }
@@ -169,6 +184,7 @@ const freshAgentLiveSlice = createSlice({
     transcriptProjectionBound(state, action: PayloadAction<FreshAgentSessionLocator & { projectionId: string; historyGeneration: number }>) {
       const { projectionId, historyGeneration, ...locator } = action.payload
       const session = sessionFor(state, locator)
+      if (session.retiredProjectionIds?.[projectionId]) return
       const previous = session.projection
       // A later incarnation is accepted through the view's fenced snapshot
       // request. Delayed init frames cannot replace an already-bound source.
@@ -375,7 +391,24 @@ const freshAgentLiveSlice = createSlice({
         const previousKey = makeFreshAgentSessionKey({ sessionId: previousSessionId, sessionType, provider })
         const nextKey = makeFreshAgentSessionKey({ sessionId, sessionType, provider })
         const previous = state.bySession[previousKey]
-        if (!previous || previousKey === nextKey) return
+        if (!previous) return
+        if (previousKey === nextKey) {
+          if (!action.payload.replaceLiveProjection) return
+          if (previous.projection) {
+            previous.retiredProjectionIds ??= {}
+            previous.retiredProjectionIds[previous.projection.id] = true
+          }
+          retireRetainedSource(previous)
+          delete previous.projection
+          delete previous.unboundTranscriptPatches
+          delete previous.unboundTranscriptWatermarks
+          delete previous.codexMetadata
+          delete previous.retry
+          delete previous.notice
+          previous.blocks = []
+          previous.expectedTurnIds = []
+          return
+        }
         state.bySession[nextKey] = previous
         delete state.bySession[previousKey]
       })

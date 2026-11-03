@@ -118,6 +118,81 @@ describe('fresh-agent-ws', () => {
     _resetCancelledCreates()
   })
 
+  it('keeps a Codex replacement warning, transcript, and completion with its materialized pane', () => {
+    const store = configureStore({
+      reducer: {
+        freshAgent: freshAgentReducer,
+        freshAgentLive: freshAgentLiveReducer,
+        panes: panesReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+    })
+    const managed = 'managed-public'
+    const replacement = 'native-b'
+    const locator = { provider: 'codex', sessionType: 'freshcodex' } as const
+    const receive = (sessionId: string, event: Record<string, unknown>) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event', ...locator, sessionId, event: { sessionId, ...event },
+      })
+    store.dispatch(initLayout({ tabId: 'tab-replacement', paneId: 'pane-replacement', content: {
+      kind: 'fresh-agent', ...locator, sessionId: managed,
+      sessionRef: { provider: 'codex', sessionId: 'native-a' },
+      createRequestId: 'create-replacement', status: 'running', model: 'native-custom',
+    } }))
+    store.dispatch(sessionCreated({ ...locator, requestId: 'create-replacement', sessionId: managed }))
+    store.dispatch(resetCompletionDedupeBaselines())
+    receive(managed, { type: 'freshAgent.session.init', projectionId: 'old-projection', historyGeneration: 0 })
+    receive(managed, { type: 'freshAgent.transcript.patch', projectionId: 'old-projection', historyGeneration: 0,
+      ops: [{ op: 'resetTurn', nativeTurnId: 'old', revision: 1, turns: [{
+        id: 'old', turnId: 'old', role: 'assistant', summary: '',
+        items: [{ id: 'old-answer', kind: 'text', text: 'Old conversation' }],
+      }] }],
+    })
+    expect(store.getState().freshAgentLive.bySession[`freshcodex:codex:${managed}`]?.projection?.turns[0]?.items[0])
+      .toMatchObject({ text: 'Old conversation' })
+
+    // Managed recovery keeps the public pane key while its durable Codex
+    // reference changes from A to B.
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized', ...locator, previousSessionId: managed,
+      sessionId: managed, sessionRef: { provider: 'codex', sessionId: replacement },
+    })
+    const key = `freshcodex:codex:${managed}`
+    expect(store.getState().freshAgentLive.bySession[key]?.retiredProjectionIds).toMatchObject({ 'old-projection': true })
+    receive(managed, { type: 'freshAgent.error', code: 'THREAD_MEMORY_LOST', message: 'Thread memory lost' })
+    expect(store.getState().freshAgentLive.bySession[key]?.retiredProjectionIds).toMatchObject({ 'old-projection': true })
+    // A delayed event from the old projection must not reclaim the pane.
+    receive(managed, { type: 'freshAgent.session.init', projectionId: 'old-projection', historyGeneration: 1 })
+    receive(managed, { type: 'freshAgent.session.init', projectionId: 'new-projection', historyGeneration: 0 })
+    receive(managed, { type: 'freshAgent.transcript.patch', projectionId: 'new-projection', historyGeneration: 0,
+      ops: [{ op: 'resetTurn', nativeTurnId: 'new', revision: 1, turns: [{
+        id: 'new', turnId: 'new', role: 'assistant', summary: '',
+        items: [{ id: 'new-answer', kind: 'text', text: 'Replacement conversation' }],
+      }] }],
+    })
+    // Replaying the same accepted materialization is idempotent.
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized', ...locator, previousSessionId: managed,
+      sessionId: managed, sessionRef: { provider: 'codex', sessionId: replacement },
+    })
+    receive(managed, { type: 'freshAgent.turn.complete', at: 43, outcome: 'completed' })
+
+    const layout = store.getState().panes.layouts['tab-replacement']
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(layout.content).toMatchObject({
+      sessionId: managed, sessionRef: { provider: 'codex', sessionId: replacement }, model: 'native-custom',
+    })
+    expect.soft(store.getState().freshAgent.sessions[key]).toMatchObject({
+      lastErrorCode: 'THREAD_MEMORY_LOST', lastError: 'Thread memory lost',
+    })
+    expect.soft(store.getState().freshAgentLive.bySession[key]?.projection?.turns[0]?.items[0]).toMatchObject({
+      text: 'Replacement conversation',
+    })
+    expect.soft(store.getState().turnCompletion.pendingEvents).toMatchObject([
+      { terminalId: `codex:${managed}`, at: 43, outcome: 'completed' },
+    ])
+  })
+
   it('a continuation follows its authoritative child name instead of the original spent handle', () => {
     const store = createFreshAgentPaneStore()
     store.dispatch(initLayout({

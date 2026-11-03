@@ -25,6 +25,7 @@ type FreshAgentSessionPayload = {
 
 type FreshAgentSessionMaterializedPayload = FreshAgentSessionPayload & {
   previousSessionId: string
+  replaceLiveProjection?: boolean
 }
 
 type SessionMutationPayload = {

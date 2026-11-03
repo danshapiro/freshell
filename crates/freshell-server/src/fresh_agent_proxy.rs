@@ -73,21 +73,73 @@ struct RollbackInvocation {
 #[derive(Clone)]
 struct PresentationRoute {
     session_id: String,
+    /// Other public IDs created by resuming this same Codex soul.
+    resumed_session_ids: HashSet<String>,
     materialized: bool,
+    known_native: Option<String>,
+    announced_native: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct PolledDelivery<'a> {
+    soul: &'a SoulId,
+    provider: &'a str,
+    fallback_presentation_id: &'a str,
+    session_type: &'a str,
+    attention_since: Option<i64>,
+    source: Option<&'a freshell_runtime_protocol::RuntimeView>,
+    native_dispatch_in_flight: bool,
+    force_materialization: bool,
+    /// A replay is for the newly resumed presentation, not every live pane.
+    replay_session_id: Option<&'a str>,
 }
 
 impl PresentationRoute {
     fn initial(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            resumed_session_ids: HashSet::new(),
             materialized: false,
+            known_native: None,
+            announced_native: None,
         }
     }
 
     fn materialized(session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
         Self {
-            session_id: session_id.into(),
+            known_native: Some(session_id.clone()),
+            session_id,
+            resumed_session_ids: HashSet::new(),
             materialized: true,
+            announced_native: None,
+        }
+    }
+
+    fn presentations(&self) -> Vec<String> {
+        let mut resumed: Vec<_> = self.resumed_session_ids.iter().cloned().collect();
+        resumed.sort();
+        std::iter::once(self.session_id.clone())
+            .chain(resumed)
+            .collect()
+    }
+
+    fn contains_presentation(&self, session_id: &str) -> bool {
+        self.session_id == session_id || self.resumed_session_ids.contains(session_id)
+    }
+
+    fn delivery_presentations(
+        &self,
+        provider: &str,
+        replay_session_id: Option<&str>,
+    ) -> Vec<String> {
+        if provider != "codex" {
+            return vec![self.session_id.clone()];
+        }
+        match replay_session_id {
+            Some(id) if self.contains_presentation(id) => vec![id.into()],
+            Some(_) => Vec::new(),
+            None => self.presentations(),
         }
     }
 }
@@ -487,11 +539,11 @@ impl HostedFreshAgentProxy {
                                 soul.clone(),
                             );
                         }
-                        self.presentation_routes.lock().await.insert(
+                        let previous_route = self.presentation_routes.lock().await.insert(
                             soul,
                             PresentationRoute::materialized(transition.child_session_id.clone()),
                         );
-                        self.send(ServerMessage::FreshAgentForked(FreshAgentForked {
+                        let forked = FreshAgentForked {
                             request_id: message.request_id,
                             parent_session_id: transition.parent_session_id,
                             session_id: transition.child_session_id.clone(),
@@ -503,7 +555,22 @@ impl HostedFreshAgentProxy {
                                 provider: provider_wire(&provider),
                                 session_id: transition.child_session_id,
                             }),
-                        }));
+                        };
+                        self.send(ServerMessage::FreshAgentForked(forked.clone()));
+                        if matches!(provider, AgentProvider::Codex)
+                            && forked.parent_retired_by_runtime == Some(true)
+                        {
+                            for presentation in previous_route
+                                .into_iter()
+                                .flat_map(|route| route.presentations())
+                            {
+                                if presentation != forked.parent_session_id {
+                                    let mut other = forked.clone();
+                                    other.parent_session_id = presentation;
+                                    self.send(ServerMessage::FreshAgentForked(other));
+                                }
+                            }
+                        }
                     }
                     Err(_) => self.error_event(
                         &provider,
@@ -1050,7 +1117,19 @@ impl HostedFreshAgentProxy {
                         session_id: session_id.clone(),
                     })
             });
-        if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
+        if matches!(provider, FreshProvider::Codex) {
+            let mut routes = self.presentation_routes.lock().await;
+            let route = routes.entry(view.soul_id.clone()).or_insert_with(|| {
+                if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
+                    PresentationRoute::materialized(&public_session_id)
+                } else {
+                    PresentationRoute::initial(&public_session_id)
+                }
+            });
+            if route.session_id != public_session_id {
+                route.resumed_session_ids.insert(public_session_id.clone());
+            }
+        } else if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
             self.observe_native_session(&view.soul_id, &public_session_id)
                 .await;
         }
@@ -1206,7 +1285,15 @@ impl HostedFreshAgentProxy {
                     || view.native_session_id.as_deref() == Some(session_id))
         })?;
         if view.native_session_id.as_deref() == Some(session_id) {
-            self.observe_native_session(&view.soul_id, session_id).await;
+            if matches!(runtime_provider, FreshProvider::Codex) {
+                self.presentation_routes
+                    .lock()
+                    .await
+                    .entry(view.soul_id.clone())
+                    .or_insert_with(|| PresentationRoute::materialized(session_id));
+            } else {
+                self.observe_native_session(&view.soul_id, session_id).await;
+            }
         }
         self.aliases.lock().await.insert(
             (public_provider, session_id.to_string()),
@@ -1263,20 +1350,42 @@ impl HostedFreshAgentProxy {
                                 continue;
                             }
                         }
+                        let source = proxy
+                            .codex_batch_source(
+                                &soul,
+                                &provider,
+                                &presentation_session_id,
+                                &batch,
+                                false,
+                            )
+                            .await;
+                        let delivery = PolledDelivery {
+                            soul: &soul,
+                            provider: &provider,
+                            fallback_presentation_id: &presentation_session_id,
+                            session_type: &session_type,
+                            attention_since: Some(attention_since),
+                            source: source.as_ref(),
+                            native_dispatch_in_flight: batch.native_dispatch_in_flight,
+                            force_materialization: false,
+                            replay_session_id: None,
+                        };
+                        if !proxy
+                            .publish_accepted_codex_dispatch(
+                                &delivery,
+                                batch.accepted_native_dispatch.as_ref(),
+                                false,
+                            )
+                            .await
+                        {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
                         if let Some(retained) = batch.retained_state {
-                            let presentation = proxy
-                                .presentation_routes
-                                .lock()
-                                .await
-                                .get(&soul)
-                                .map(|route| route.session_id.clone())
-                                .unwrap_or_else(|| presentation_session_id.clone());
                             proxy
-                                .forward_retained(
+                                .forward_retained_batch(
                                     retained,
-                                    &provider,
-                                    &presentation,
-                                    &session_type,
+                                    &delivery,
                                     if batch.reset_required {
                                         "freshAgent.host.journal.reset"
                                     } else {
@@ -1288,46 +1397,39 @@ impl HostedFreshAgentProxy {
                             // still have to drain through every bounded journal page.
                             retained_through = retained_through.max(batch.head);
                         } else if batch.reset_required {
-                            let current_presentation = proxy
+                            let presentations = proxy
                                 .presentation_routes
                                 .lock()
                                 .await
                                 .get(&soul)
-                                .map(|route| route.session_id.clone())
-                                .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                                event: serde_json::json!({
-                                    "type":"freshAgent.host.journal.reset",
-                                    "retainedFrom":batch.retained_from,
-                                }),
-                                provider: provider.clone(),
-                                session_id: current_presentation,
-                                session_type: session_type.clone(),
-                            }));
+                                .map(|route| route.delivery_presentations(&provider, None))
+                                .unwrap_or_else(|| vec![presentation_session_id.clone()]);
+                            for presentation in presentations {
+                                proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                                    event: serde_json::json!({
+                                        "type":"freshAgent.host.journal.reset",
+                                        "retainedFrom":batch.retained_from,
+                                    }),
+                                    provider: provider.clone(),
+                                    session_id: presentation,
+                                    session_type: session_type.clone(),
+                                }));
+                            }
                         }
                         if batch.events.is_empty() {
                             cursor = cursor.max(batch.head);
                         }
                         for event in batch.events {
-                            cursor = cursor.max(event.sequence);
                             if event.sequence <= retained_through
                                 && !is_request_receipt(&event.event)
                             {
+                                cursor = cursor.max(event.sequence);
                                 continue;
                             }
-                            // Materialization is the explicit event transition at which the
-                            // client rekeys its pane to the provider-native session id. Keep
-                            // subsequent invalidators on that same route.
-                            proxy
-                                .forward_polled_event(
-                                    &soul,
-                                    event.event,
-                                    &provider,
-                                    &presentation_session_id,
-                                    &session_type,
-                                    Some(attention_since),
-                                )
-                                .await;
+                            if !proxy.deliver_polled_event(event.event, &delivery).await {
+                                break;
+                            }
+                            cursor = cursor.max(event.sequence);
                         }
                     }
                     Err(_) => {
@@ -1368,6 +1470,174 @@ impl HostedFreshAgentProxy {
                     && view.desired_state == DesiredState::Running
                     && view.launch_state == freshell_runtime_protocol::LaunchState::Running
             })
+    }
+
+    async fn codex_batch_source(
+        &self,
+        soul: &SoulId,
+        provider: &str,
+        fallback: &str,
+        batch: &freshell_runtime_protocol::AgentEventBatch,
+        replay: bool,
+    ) -> Option<freshell_runtime_protocol::RuntimeView> {
+        if provider != "codex" {
+            return None;
+        }
+        let route = self
+            .presentation_routes
+            .lock()
+            .await
+            .get(soul)
+            .cloned()
+            .unwrap_or_else(|| PresentationRoute::initial(fallback));
+        let pending_announcement =
+            batch
+                .accepted_native_dispatch
+                .as_ref()
+                .is_some_and(|accepted| {
+                    replay
+                        || route.announced_native.as_ref()
+                            != Some(&accepted.identity.native_session_id)
+                });
+        let needs_source = pending_announcement
+            || batch.events.iter().any(|entry| {
+                codex_event_native_id(&entry.event).is_some_and(|native| {
+                    materialized_session_id(&entry.event).is_some()
+                        || native != route.session_id
+                        || route
+                            .known_native
+                            .as_deref()
+                            .is_some_and(|known| known != native)
+                })
+            });
+        if needs_source {
+            self.current_source(soul).await
+        } else {
+            None
+        }
+    }
+
+    async fn publish_accepted_codex_dispatch(
+        &self,
+        delivery: &PolledDelivery<'_>,
+        accepted: Option<&freshell_runtime_protocol::AcceptedNativeDispatch>,
+        replay: bool,
+    ) -> bool {
+        let PolledDelivery {
+            soul,
+            provider,
+            fallback_presentation_id: fallback,
+            session_type,
+            source,
+            replay_session_id,
+            ..
+        } = *delivery;
+        let Some(accepted) = accepted.filter(|_| provider == "codex") else {
+            return true;
+        };
+        let native = &accepted.identity.native_session_id;
+        let route = self
+            .presentation_routes
+            .lock()
+            .await
+            .get(soul)
+            .cloned()
+            .unwrap_or_else(|| PresentationRoute::initial(fallback));
+        if !replay && route.announced_native.as_ref() == Some(native) {
+            return true;
+        }
+        let Some(source) = source else {
+            return false;
+        };
+        if source.native_session_id.as_deref() != Some(native.as_str()) {
+            return true;
+        }
+        // An explicit fork can replace the route while a read is in flight.
+        if source
+            .fresh_agent_session_id
+            .as_deref()
+            .is_some_and(|current| current != route.session_id)
+            && route.session_id != *native
+        {
+            return true;
+        }
+        let projection =
+            session_projection(&self.naming.get().cloned(), NamedProvider::Codex, native).await;
+        let Some(after) = self.current_source(soul).await else {
+            return false;
+        };
+        if source.soul_id != after.soul_id || !rest::same_snapshot_source(source, &after) {
+            return false;
+        }
+        let mut routes = self.presentation_routes.lock().await;
+        let current = routes
+            .entry(soul.clone())
+            .or_insert_with(|| PresentationRoute::initial(fallback));
+        if current.session_id != route.session_id {
+            return true;
+        }
+        if !replay && current.announced_native.as_ref() == Some(native) {
+            return true;
+        }
+        let presentations = current.delivery_presentations(provider, replay_session_id);
+        if presentations.is_empty() {
+            return true;
+        }
+        for presentation in presentations {
+            self.send(ServerMessage::FreshAgentSessionMaterialized(
+                FreshAgentSessionMaterialized {
+                    previous_session_id: presentation.clone(),
+                    provider: provider.into(),
+                    session_id: presentation,
+                    session_type: session_type.into(),
+                    session_ref: Some(SessionLocator {
+                        provider: provider.into(),
+                        session_id: native.clone(),
+                    }),
+                    name_ref: projection.as_ref().map(|(reference, _)| reference.clone()),
+                    session_name: projection.as_ref().map(|(_, record)| record.clone()),
+                },
+            ));
+        }
+        current.materialized = true;
+        current.known_native = Some(native.clone());
+        current.announced_native = Some(native.clone());
+        true
+    }
+
+    async fn forward_retained_batch(
+        &self,
+        retained: serde_json::Value,
+        delivery: &PolledDelivery<'_>,
+        event_type: &str,
+    ) {
+        let presentations = self
+            .presentation_routes
+            .lock()
+            .await
+            .get(delivery.soul)
+            .map(|route| {
+                route.delivery_presentations(delivery.provider, delivery.replay_session_id)
+            })
+            .unwrap_or_else(|| vec![delivery.fallback_presentation_id.to_owned()]);
+        for (index, presentation) in presentations.into_iter().enumerate() {
+            let mut copy = retained.clone();
+            // The retained naming facts belong to the soul, not each pane.
+            if let Some(extension) = (index > 0)
+                .then(|| copy["snapshot"]["extensions"]["codex"].as_object_mut())
+                .flatten()
+            {
+                extension.remove("hostedNamingFacts");
+            }
+            self.forward_retained(
+                copy,
+                delivery.provider,
+                &presentation,
+                delivery.session_type,
+                event_type,
+            )
+            .await;
+        }
     }
 
     async fn forward_retained(
@@ -1454,6 +1724,7 @@ impl HostedFreshAgentProxy {
         let mut cursor = 0;
         let mut replay_through = None;
         let mut retained_through = 0;
+        let mut replay_materialized = false;
         loop {
             let Ok(batch) = self
                 .client
@@ -1475,15 +1746,51 @@ impl HostedFreshAgentProxy {
                     return;
                 }
             }
-            if let Some(retained) = batch.retained_state {
-                self.forward_retained(
-                    retained,
+            let source = self
+                .codex_batch_source(
+                    &soul,
                     provider,
                     presentation_session_id,
-                    session_type,
-                    "freshAgent.host.backpressure",
+                    &batch,
+                    !replay_materialized,
                 )
                 .await;
+            let force_materialization = batch.accepted_native_dispatch.is_none();
+            let delivery = PolledDelivery {
+                soul: &soul,
+                provider,
+                fallback_presentation_id: presentation_session_id,
+                session_type,
+                attention_since: None,
+                source: source.as_ref(),
+                native_dispatch_in_flight: batch.native_dispatch_in_flight,
+                force_materialization,
+                replay_session_id: Some(presentation_session_id),
+            };
+            if !self
+                .publish_accepted_codex_dispatch(
+                    &delivery,
+                    batch.accepted_native_dispatch.as_ref(),
+                    !replay_materialized,
+                )
+                .await
+            {
+                return;
+            }
+            if batch
+                .accepted_native_dispatch
+                .as_ref()
+                .zip(source.as_ref())
+                .is_some_and(|(accepted, source)| {
+                    source.native_session_id.as_deref()
+                        == Some(accepted.identity.native_session_id.as_str())
+                })
+            {
+                replay_materialized = true;
+            }
+            if let Some(retained) = batch.retained_state {
+                self.forward_retained_batch(retained, &delivery, "freshAgent.host.backpressure")
+                    .await;
                 retained_through = retained_through.max(batch.head);
             }
             if batch.events.is_empty() {
@@ -1493,18 +1800,12 @@ impl HostedFreshAgentProxy {
                 if event.sequence > replay_through {
                     return;
                 }
-                cursor = cursor.max(event.sequence);
-                if event.sequence > retained_through || is_request_receipt(&event.event) {
-                    self.forward_polled_event(
-                        &soul,
-                        event.event,
-                        provider,
-                        presentation_session_id,
-                        session_type,
-                        None,
-                    )
-                    .await;
+                if (event.sequence > retained_through || is_request_receipt(&event.event))
+                    && !self.deliver_polled_event(event.event, &delivery).await
+                {
+                    return;
                 }
+                cursor = cursor.max(event.sequence);
             }
             if cursor >= replay_through {
                 return;
@@ -1512,6 +1813,7 @@ impl HostedFreshAgentProxy {
         }
     }
 
+    #[cfg(test)]
     async fn forward_polled_event(
         &self,
         soul: &SoulId,
@@ -1521,7 +1823,45 @@ impl HostedFreshAgentProxy {
         session_type: &str,
         attention_since: Option<i64>,
     ) {
-        let materialized_session_id = (provider != "codex")
+        let source = if provider == "codex" {
+            self.current_source(soul).await
+        } else {
+            None
+        };
+        self.deliver_polled_event(
+            event,
+            &PolledDelivery {
+                soul,
+                provider,
+                fallback_presentation_id,
+                session_type,
+                attention_since,
+                source: source.as_ref(),
+                native_dispatch_in_flight: false,
+                force_materialization: false,
+                replay_session_id: None,
+            },
+        )
+        .await;
+    }
+
+    async fn deliver_polled_event(
+        &self,
+        mut event: AgentEvent,
+        delivery: &PolledDelivery<'_>,
+    ) -> bool {
+        let PolledDelivery {
+            soul,
+            provider,
+            fallback_presentation_id,
+            session_type,
+            attention_since,
+            source,
+            native_dispatch_in_flight,
+            force_materialization,
+            replay_session_id,
+        } = *delivery;
+        let other_materialized_session_id = (provider != "codex")
             .then(|| materialized_session_id(&event))
             .flatten();
         let confirmed_clear = self
@@ -1545,6 +1885,40 @@ impl HostedFreshAgentProxy {
         let route = presentation_routes
             .entry(soul.clone())
             .or_insert_with(|| PresentationRoute::initial(fallback_presentation_id));
+        if provider == "codex" {
+            let materialized = materialized_session_id(&event);
+            if let Some(native) = codex_event_native_id(&event).map(str::to_owned) {
+                let needs_source = materialized.is_some()
+                    || native != route.session_id
+                    || route
+                        .known_native
+                        .as_ref()
+                        .is_some_and(|known| known != &native);
+                if needs_source && !is_request_receipt(&event) {
+                    let Some(source) = source else {
+                        return false;
+                    };
+                    if source.native_session_id.as_deref() != Some(native.as_str()) {
+                        // A provisional replacement is not authority. Keep its
+                        // cursor until an in-flight send settles; discard a
+                        // refused or retired producer only after that point.
+                        return !native_dispatch_in_flight;
+                    }
+                    route.known_native = Some(native.clone());
+                }
+                if materialized.is_some() {
+                    if !force_materialization && route.announced_native.as_ref() == Some(&native) {
+                        return true;
+                    }
+                    if let AgentEvent::Provider { payload } = &mut event {
+                        preserve_codex_materialized_route(payload, &route.session_id);
+                    }
+                    route.materialized = true;
+                    route.known_native = Some(native.clone());
+                    route.announced_native = Some(native);
+                }
+            }
+        }
         if let Some((previous_session_id, session_id)) = confirmed_clear {
             if route.materialized && route.session_id == previous_session_id {
                 // The SDK's provisional rekey precedes its actual native init.
@@ -1570,14 +1944,14 @@ impl HostedFreshAgentProxy {
                 route.session_id = session_id;
             }
         }
-        if materialized_session_id
+        if other_materialized_session_id
             .as_ref()
             .is_some_and(|session_id| route.materialized && session_id != &route.session_id)
         {
             // The journal replays from cursor zero. After a fork, an older
             // parent materialization must not move this soul back off its
             // current native session.
-            return;
+            return true;
         }
 
         if let AgentEvent::Provider { payload } = &event {
@@ -1605,19 +1979,36 @@ impl HostedFreshAgentProxy {
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|session_id| session_id != route.session_id);
                 if !new_edge || retired_route {
-                    return;
+                    return true;
                 }
             }
         }
 
-        let presentation_id = route.session_id.clone();
-        if let Some(session_id) = materialized_session_id {
+        let mut presentations = route.delivery_presentations(provider, replay_session_id);
+        if let Some(session_id) = other_materialized_session_id {
             route.session_id = session_id;
             route.materialized = true;
         }
         drop(presentation_routes);
-        self.forward_host_event(event, provider, &presentation_id, session_type)
-            .await;
+        if provider == "codex"
+            && matches!(&event, AgentEvent::Provider { payload }
+                if payload["event"]["type"] == freshell_freshagent::naming::HOSTED_CODEX_NAMING_EVENT)
+        {
+            // Naming is an authority-side fold, rather than a pane event.
+            presentations.truncate(1);
+        }
+        for presentation in presentations {
+            let mut routed = event.clone();
+            match &mut routed {
+                AgentEvent::Provider { payload } if provider == "codex" => {
+                    preserve_codex_materialized_route(payload, &presentation);
+                }
+                _ => {}
+            }
+            self.forward_host_event(routed, provider, &presentation, session_type)
+                .await;
+        }
+        true
     }
 
     async fn confirmed_claude_clear(
@@ -1729,7 +2120,10 @@ impl HostedFreshAgentProxy {
                     let _ = self.broadcast.send(frame);
                 }
             }
-            AgentEvent::PermissionRequested { payload, .. } => {
+            AgentEvent::PermissionRequested { mut payload, .. } => {
+                if provider == "codex" {
+                    rewrite_presentation_id(&mut payload, presentation_session_id);
+                }
                 self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
                     event: payload,
                     provider: provider.into(),
@@ -2296,6 +2690,35 @@ fn retained_matches_view(
         && retained["snapshot"]["provider"] == "codex"
         && retained["snapshot"]["sessionType"] == "freshcodex"
         && retained["snapshot"]["threadId"].as_str() == view.native_session_id.as_deref()
+}
+
+fn codex_event_native_id(event: &AgentEvent) -> Option<&str> {
+    let AgentEvent::Provider { payload } = event else {
+        return None;
+    };
+    let kind = payload.get("type")?.as_str()?;
+    if !kind.starts_with("freshAgent.") {
+        return None;
+    }
+    payload
+        .get("sessionId")?
+        .as_str()
+        .filter(|native| !native.is_empty())
+}
+
+fn preserve_codex_materialized_route(payload: &mut serde_json::Value, presentation: &str) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if object.get("type").and_then(serde_json::Value::as_str)
+        == Some("freshAgent.session.materialized")
+    {
+        object.insert("previousSessionId".into(), presentation.into());
+        object.insert("sessionId".into(), presentation.into());
+    }
+    for child in object.values_mut() {
+        preserve_codex_materialized_route(child, presentation);
+    }
 }
 
 fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &str) {

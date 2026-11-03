@@ -1083,6 +1083,7 @@ async fn dispatch_with_effects(
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
                     let before = actor.profile().await;
+                    let dispatch_request = request_id.clone();
                     let command_state = actor
                         .dispatch_with_checkpoint_identity(
                             request_id,
@@ -1093,6 +1094,13 @@ async fn dispatch_with_effects(
                         .await
                         .map_err(map_actor_error)?;
                     let after = actor.profile().await;
+                    if let Some(accepted) = actor
+                        .accepted_native_dispatch()
+                        .await
+                        .filter(|accepted| accepted.request_id == dispatch_request)
+                    {
+                        commit_fresh_native_dispatch(state, &actor, &accepted).await?;
+                    }
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
                         if after.provider == freshell_runtime_protocol::FreshProvider::Codex {
@@ -1378,6 +1386,9 @@ async fn dispatch_with_effects(
                     let events = actor
                         .read_events(after_sequence, (max_events as usize).clamp(1, 4096))
                         .await;
+                    if let Some(accepted) = events.accepted_native_dispatch.as_ref() {
+                        commit_fresh_native_dispatch(state, &actor, accepted).await?;
+                    }
                     Ok(HostResult::FreshAgentEvents(events))
                 }
                 HostCommand::RuntimeMetrics { incarnation_id } => {
@@ -2648,6 +2659,90 @@ async fn commit_fresh_native_transition(
     write_state(&state.state_dir, &updated).map_err(registry_like_error)?;
     *persisted = updated;
     append_event_with_secret(&state.state_dir, &state.secret, "host.native_identity.transition_committed",
+        serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
+        "executionGeneration":persisted.max_execution_generation,
+        "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
+    Ok(())
+}
+
+/// Bind the actor's typed accepted send to this host's launch. A read can
+/// finish the binding when the command reply was lost after actor acceptance.
+async fn commit_fresh_native_dispatch(
+    state: &HostState,
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+    accepted: &freshell_runtime_protocol::AcceptedNativeDispatch,
+) -> Result<(), RuntimeError> {
+    let refuse = || {
+        RuntimeError::new(
+            RuntimeErrorCode::RecoveryWrongIdentity,
+            "accepted native dispatch lost its current host binding",
+        )
+    };
+    let identity = &accepted.identity;
+    if actor.observed_native_session_id().await.as_deref()
+        != Some(identity.native_session_id.as_str())
+        || !state
+            .fresh_agent
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, actor))
+    {
+        return Err(refuse());
+    }
+    let mut persisted = state.persisted.lock().await;
+    let Some(mut launch) = persisted.native_identity_launch.clone() else {
+        return if cfg!(feature = "fresh-agent-fixtures")
+            && persisted.fixture_evidence["fixtureTransport"] == "deterministic"
+        {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    };
+    if launch.incarnation_id != state.incarnation_id
+        || launch.execution_generation != persisted.max_execution_generation
+    {
+        return Err(refuse());
+    }
+    if launch.requested_native_session_id.as_deref() == Some(identity.native_session_id.as_str()) {
+        return Ok(());
+    }
+    if launch
+        .requested_native_session_id
+        .as_deref()
+        .is_some_and(|root| root != identity.previous_native_session_id)
+    {
+        return Err(refuse());
+    }
+    let evidence = actor
+        .observed_native_identity_evidence()
+        .await
+        .ok_or_else(refuse)?;
+    if evidence["providerEvidence"]["source"] != "native_turn_start_ack"
+        || evidence["providerEvidence"]["requestId"].as_str() != Some(accepted.request_id.as_str())
+        || evidence["nativeSessionId"].as_str() != Some(identity.native_session_id.as_str())
+        || evidence["providerEvidence"]["nativeSessionId"].as_str()
+            != Some(identity.native_session_id.as_str())
+    {
+        return Err(refuse());
+    }
+    launch.evidence_revision = launch.evidence_revision.checked_add(1).ok_or_else(refuse)?;
+    launch.requested_native_session_id = Some(identity.native_session_id.clone());
+    if serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(
+        evidence["launch"].clone(),
+    )
+    .as_ref()
+    .ok()
+        != Some(&launch)
+    {
+        return Err(refuse());
+    }
+    let mut updated = persisted.clone();
+    updated.native_identity_launch = Some(launch);
+    write_state(&state.state_dir, &updated).map_err(registry_like_error)?;
+    *persisted = updated;
+    append_event_with_secret(&state.state_dir, &state.secret, "host.native_identity.dispatch_committed",
         serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
         "executionGeneration":persisted.max_execution_generation,
         "evidenceRevision":persisted.native_identity_launch.as_ref().map(|launch|launch.evidence_revision)})).ok();
@@ -10785,6 +10880,229 @@ mod tests {
             value["launch"]["evidenceRevision"] =
                 serde_json::json!(value["launch"]["evidenceRevision"].as_u64().unwrap() + 1);
             value["launch"]["requestedNativeSessionId"] = serde_json::json!("fixture-native-child");
+        }
+    }
+
+    struct ReplacingCodexRpcTransport {
+        evidence: std::sync::Mutex<serde_json::Value>,
+        dispatches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for ReplacingCodexRpcTransport {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some("native-a".into()),
+            })
+        }
+
+        async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
+            Some(self.evidence.lock().unwrap().clone())
+        }
+
+        async fn dispatch(
+            &self,
+            request_id: &RequestId,
+            _: &str,
+            profile: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            let previous = profile.native_session_id.as_deref().unwrap();
+            let native = "native-b";
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            if previous != native {
+                let mut evidence = self.evidence.lock().unwrap();
+                let mut launch = evidence["launch"].clone();
+                launch["evidenceRevision"] =
+                    serde_json::json!(launch["evidenceRevision"].as_u64().unwrap() + 1);
+                launch["requestedNativeSessionId"] = serde_json::json!(native);
+                *evidence = serde_json::json!({
+                    "nativeSessionId":native, "launch":launch,
+                    "providerEvidence":{"source":"native_turn_start_ack", "requestId":request_id.as_str(), "nativeSessionId":native},
+                });
+            }
+            Ok(DispatchAck {
+                provider_ack_id: Some(request_id.to_string()),
+                native_identity: Some(freshell_runtime_protocol::NativeDispatchIdentity {
+                    previous_native_session_id: previous.into(),
+                    native_session_id: native.into(),
+                    pending_naming_handle: None,
+                }),
+            })
+        }
+
+        async fn resolve_permission(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            unreachable!("no permission request")
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_codex_replacement_updates_host_status_and_allows_next_input() {
+        for scenario in ["send", "read", "wrong-request", "wrong-launch"] {
+            let state = test_host_state();
+            let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: state.incarnation_id.clone(),
+                launch_nonce: "codex-replacement-rpc".into(),
+                evidence_revision: 7,
+                execution_generation: 1,
+                requested_native_session_id: Some("native-a".into()),
+            };
+            state.persisted.lock().await.native_identity_launch = Some(binding.clone());
+            state.persisted.lock().await.max_execution_generation = 1;
+            let transport = Arc::new(ReplacingCodexRpcTransport {
+                evidence: std::sync::Mutex::new(
+                    serde_json::json!({"launch":binding,"nativeSessionId":"native-a"}),
+                ),
+                dispatches: AtomicUsize::new(0),
+            });
+            let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                state.state_dir.join("codex-replacement-agent"),
+                FreshAgentProfile {
+                    naming_handle: None,
+                    collaboration_mode: None,
+                    provider: FreshProvider::Codex,
+                    runtime_variant: "codex".into(),
+                    cwd: "/workspace".into(),
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    provider_store_id: "fixture-store".into(),
+                    native_session_id: Some("native-a".into()),
+                    plugins: None,
+                    model_selection: None,
+                    session_ref: None,
+                    provider_launch_context: None,
+                    provider_secret_references: Vec::new(),
+                },
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            *state.fresh_agent.lock().await = Some(actor.clone());
+            let send = |id: &str| HostCommand::FreshAgentSend {
+                incarnation_id: state.incarnation_id.clone(),
+                request_id: RequestId::parse(id).unwrap(),
+                text: "input".into(),
+                settings: None,
+                checkpoint_logical_attempt_id: None,
+            };
+            if scenario != "send" {
+                // The actor accepted the send, but the owning host did not get to
+                // finish the binding before its response path was interrupted.
+                actor
+                    .dispatch(RequestId::parse("replace").unwrap(), "input".into(), None)
+                    .await
+                    .unwrap();
+                if scenario == "wrong-request" {
+                    transport.evidence.lock().unwrap()["providerEvidence"]["requestId"] =
+                        serde_json::json!("different-request");
+                } else if scenario == "wrong-launch" {
+                    transport.evidence.lock().unwrap()["launch"]["evidenceRevision"] =
+                        serde_json::json!(99);
+                }
+                let events = dispatch(
+                    authenticated_host_envelope(
+                        &state,
+                        HostCommand::FreshAgentReadEvents {
+                            incarnation_id: state.incarnation_id.clone(),
+                            after_sequence: 0,
+                            max_events: 16,
+                        },
+                    ),
+                    &state,
+                )
+                .await;
+                if matches!(scenario, "wrong-request" | "wrong-launch") {
+                    assert!(
+                        matches!(
+                            events,
+                            Err(RuntimeError {
+                                code: RuntimeErrorCode::RecoveryWrongIdentity,
+                                ..
+                            })
+                        ),
+                        "{scenario}: {events:?}"
+                    );
+                    assert_eq!(
+                        state
+                            .persisted
+                            .lock()
+                            .await
+                            .native_identity_launch
+                            .as_ref()
+                            .unwrap()
+                            .requested_native_session_id
+                            .as_deref(),
+                        Some("native-a")
+                    );
+                    actor.stop().await.unwrap();
+                    continue;
+                }
+                assert!(
+                    matches!(events.unwrap(), HostResult::FreshAgentEvents(batch) if batch.accepted_native_dispatch.is_some())
+                );
+            } else {
+                let accepted =
+                    dispatch(authenticated_host_envelope(&state, send("replace")), &state)
+                        .await
+                        .unwrap();
+                assert!(matches!(
+                    accepted,
+                    HostResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                        ..
+                    }
+                ));
+            }
+            let status = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::Status {
+                        incarnation_id: state.incarnation_id.clone(),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .unwrap();
+            let HostResult::Status {
+                native_session_id,
+                native_identity_observation,
+                ..
+            } = status
+            else {
+                panic!("status")
+            };
+            assert_eq!(native_session_id.as_deref(), Some("native-b"));
+            let observation = native_identity_observation.unwrap();
+            assert_eq!(observation.evidence_revision, 8);
+            assert!(observation.matches_launch(
+                state
+                    .persisted
+                    .lock()
+                    .await
+                    .native_identity_launch
+                    .as_ref()
+                    .unwrap()
+            ));
+            dispatch(authenticated_host_envelope(&state, send("next")), &state)
+                .await
+                .unwrap();
+            assert_eq!(transport.dispatches.load(Ordering::SeqCst), 2);
+            actor.stop().await.unwrap();
         }
     }
 

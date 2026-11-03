@@ -2706,6 +2706,13 @@ pub struct AgentJournalEvent {
 pub struct AgentEventBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_state: Option<serde_json::Value>,
+    /// A typed native transition accepted by the owning actor, correlated to
+    /// the command that caused it. Provider events alone are not authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_native_dispatch: Option<AcceptedNativeDispatch>,
+    /// A Codex operation is still awaiting its native dispatch result.
+    #[serde(default)]
+    pub native_dispatch_in_flight: bool,
     pub retained_from: u64,
     pub head: u64,
     pub reset_required: bool,
@@ -3323,6 +3330,13 @@ pub struct NativeDispatchIdentity {
     /// Existing provider pending-name intent: retained for initial recovery,
     /// absent for an established new conversation.
     pub pending_naming_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedNativeDispatch {
+    pub request_id: RequestId,
+    pub identity: NativeDispatchIdentity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

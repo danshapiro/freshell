@@ -2996,6 +2996,320 @@ mod tests {
         }
     }
 
+    // This diagnostic substitutes only the native producer and its correlated
+    // acknowledgment. The actual host bridge and actor own event delivery.
+    struct ReplacementBridgeProbe {
+        frames: broadcast::Sender<String>,
+        events: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for ReplacementBridgeProbe {
+        async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some("native-a".into()),
+            })
+        }
+
+        async fn dispatch(
+            &self,
+            request_id: &RequestId,
+            _: &str,
+            profile: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            assert_eq!(request_id.as_str(), "bridge-replacement-send");
+            assert_eq!(profile.native_session_id.as_deref(), Some("native-a"));
+            for frame in [
+                json!({"type":"freshAgent.session.materialized", "provider":"codex",
+                    "sessionType":"freshcodex", "previousSessionId":"native-a",
+                    "sessionId":"native-b", "sessionRef":{"provider":"codex","sessionId":"native-b"}}),
+                json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+                    "sessionId":"native-b", "event":{"type":"freshAgent.error", "sessionId":"native-b",
+                        "code":"THREAD_MEMORY_LOST", "message":"replacement has no old thread memory"}}),
+            ] {
+                self.frames
+                    .send(frame.to_string())
+                    .map_err(|_| DispatchFailure {
+                        message: "bridge receiver closed".into(),
+                        acceptance_ambiguous: false,
+                    })?;
+            }
+            let release = self.release.lock().await.take().expect("one dispatch");
+            release.await.map_err(|_| DispatchFailure {
+                message: "replacement acknowledgment was not released".into(),
+                acceptance_ambiguous: true,
+            })?;
+            Ok(DispatchAck {
+                provider_ack_id: Some("replacement-turn".into()),
+                native_identity: Some(NativeDispatchIdentity {
+                    previous_native_session_id: "native-a".into(),
+                    native_session_id: "native-b".into(),
+                    pending_naming_handle: None,
+                }),
+            })
+        }
+
+        async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+            unreachable!("this diagnostic does not request permission")
+        }
+
+        async fn interrupt(&self) -> Result<(), String> {
+            unreachable!("this diagnostic does not interrupt a provider")
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn take_event_stream(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+            self.events.lock().unwrap().take()
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_replacement_bridge_journals_before_typed_acceptance() {
+        let directory = tempfile::tempdir().unwrap();
+        let (frames, receiver) = broadcast::channel(16);
+        let (events, stream) = mpsc::channel(16);
+        let (native, native_rx) = watch::channel(None::<String>);
+        let identity = Arc::new(std::sync::Mutex::new(HostedNativeIdentity::default()));
+        let mut bridge = spawn_broadcast_bridge(
+            FreshProvider::Codex,
+            receiver,
+            BroadcastBridgeOutputs {
+                owned_session: None,
+                retained_codex: None,
+                created: watch::channel(None).0,
+                native,
+                native_evidence: watch::channel(None).0,
+                native_identity: identity.clone(),
+                events,
+                send_outcomes: broadcast::channel(8).0,
+                kill_outcomes: broadcast::channel(8).0,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                refusal_observer: None,
+            },
+        );
+        let (release_tx, release_rx) = oneshot::channel();
+        let transport = Arc::new(ReplacementBridgeProbe {
+            frames: frames.clone(),
+            events: std::sync::Mutex::new(Some(stream)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let mut profile = parity_profile(FreshProvider::Codex);
+        profile.cwd = directory.path().to_string_lossy().into_owned();
+        profile.native_session_id = Some("native-a".into());
+        profile.session_ref.as_mut().unwrap().session_id = "native-a".into();
+        profile.plugins = None;
+        profile.provider_launch_context = None;
+        profile.provider_secret_references.clear();
+        let actor = FreshAgentHostActor::open(directory.path().join("actor"), profile, transport)
+            .await
+            .unwrap();
+        let scenario_actor = actor.clone();
+        let mut scenario = tokio::spawn(async move {
+            let actor = scenario_actor;
+            frames
+                .send(
+                    json!({"type":"freshAgent.created", "provider":"codex",
+            "sessionType":"freshcodex", "sessionId":"native-a"})
+                    .to_string(),
+                )
+                .unwrap();
+            let initial = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let batch = actor.read_events(0, 64).await;
+                    if native_rx.borrow().as_deref() == Some("native-a")
+                        && batch.events.iter().any(|row| {
+                            matches!(&row.event,
+                        AgentEvent::Provider { payload } if payload["type"] == "freshAgent.created")
+                        })
+                    {
+                        break batch;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the real bridge must publish and journal initial native A");
+            assert!(!initial.reset_required);
+            assert!(initial.head > 0);
+            let cursor = initial.head;
+
+            {
+                let dispatch = actor.dispatch(
+                    RequestId::parse("bridge-replacement-send").unwrap(),
+                    "recover once".into(),
+                    None,
+                );
+                tokio::pin!(dispatch);
+                let before_ack = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let batch = actor.read_events(cursor, 64).await;
+                    let delivered = batch.events.iter().filter(|row| matches!(&row.event,
+                        AgentEvent::Provider { payload }
+                        if payload["type"] == "freshAgent.session.materialized"
+                            || payload["event"]["code"] == "THREAD_MEMORY_LOST")).count();
+                    if delivered == 2 {
+                        break batch;
+                    }
+                    tokio::select! {
+                        result = &mut dispatch => panic!("acknowledgment was not released: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    }
+                }
+            }).await.expect("bridge replacement frames must reach the actor journal");
+                assert!(!before_ack.reset_required);
+                assert_eq!(
+                    serde_json::to_value(&before_ack).unwrap()["nativeDispatchInFlight"],
+                    true,
+                    "the actor must identify an unresolved native dispatch"
+                );
+                let provider: Vec<_> = before_ack
+                    .events
+                    .iter()
+                    .filter_map(|row| match &row.event {
+                        AgentEvent::Provider { payload } => Some(payload),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(provider.len(), 2);
+                assert_eq!(provider[0]["type"], "freshAgent.session.materialized");
+                assert_eq!(provider[0]["previousSessionId"], "native-a");
+                assert_eq!(provider[0]["sessionRef"]["sessionId"], "native-b");
+                assert_eq!(provider[1]["event"]["code"], "THREAD_MEMORY_LOST");
+                assert_eq!(
+                    actor.profile().await.native_session_id.as_deref(),
+                    Some("native-a")
+                );
+                assert_eq!(identity.lock().unwrap().root.as_deref(), Some("native-a"));
+                assert!(!before_ack.events.iter().any(|row| matches!(&row.event,
+                AgentEvent::Started { native_session_id } if native_session_id == "native-b")));
+
+                release_tx.send(()).unwrap();
+                let state = tokio::time::timeout(Duration::from_secs(3), &mut dispatch)
+                    .await
+                    .expect("typed acceptance must settle")
+                    .unwrap();
+                assert_eq!(
+                    state,
+                    freshell_runtime_protocol::CommandState::ProviderAcked
+                );
+            }
+            assert_eq!(
+                actor.profile().await.native_session_id.as_deref(),
+                Some("native-b")
+            );
+            frames.send(json!({"type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex",
+            "sessionId":"native-b", "event":{"type":"freshAgent.turn.complete", "sessionId":"native-b",
+                "at":42, "outcome":"completed"}}).to_string()).unwrap();
+            let after_ack = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let batch = actor.read_events(cursor, 64).await;
+                if batch.events.iter().any(|row| matches!(&row.event,
+                    AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.turn.complete"))
+                {
+                    break batch;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the replacement completion must reach the actor journal");
+            assert!(!after_ack.reset_required);
+            let accepted = serde_json::to_value(&after_ack).unwrap();
+            assert_ne!(accepted["nativeDispatchInFlight"], true);
+            assert_eq!(
+                accepted["acceptedNativeDispatch"]["requestId"],
+                "bridge-replacement-send"
+            );
+            assert_eq!(
+                accepted["acceptedNativeDispatch"]["identity"]["previousNativeSessionId"],
+                "native-a"
+            );
+            assert_eq!(
+                accepted["acceptedNativeDispatch"]["identity"]["nativeSessionId"],
+                "native-b"
+            );
+            let started = after_ack
+                .events
+                .iter()
+                .find(|row| {
+                    matches!(&row.event,
+            AgentEvent::Started { native_session_id } if native_session_id == "native-b")
+                })
+                .unwrap();
+            let completion = after_ack.events.iter().find(|row| matches!(&row.event,
+            AgentEvent::Provider { payload } if payload["event"]["type"] == "freshAgent.turn.complete")).unwrap();
+            assert!(started.sequence < completion.sequence);
+        });
+        let mut cleanup_errors = Vec::new();
+        let mut outcome = tokio::time::timeout(Duration::from_secs(15), &mut scenario).await;
+        if outcome.is_err() {
+            scenario.abort();
+            match tokio::time::timeout(Duration::from_secs(5), &mut scenario).await {
+                Ok(result) if result.as_ref().err().is_some_and(|error| error.is_panic()) => {
+                    outcome = Ok(result);
+                }
+                Ok(_) => {}
+                Err(_) => cleanup_errors.push("scenario task did not settle".into()),
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(5), actor.clone().stop()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => cleanup_errors.push(format!("actor stop failed: {error}")),
+            Err(_) => cleanup_errors.push("actor stop timed out".into()),
+        }
+        bridge.forward.abort();
+        bridge.recovery.abort();
+        for (name, task) in [
+            ("forward", &mut bridge.forward),
+            ("recovery", &mut bridge.recovery),
+        ] {
+            match tokio::time::timeout(Duration::from_secs(5), task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => cleanup_errors.push(format!("{name} task failed: {error}")),
+                Err(_) => cleanup_errors.push(format!("{name} task did not settle")),
+            }
+        }
+        if !cleanup_errors.is_empty() {
+            eprintln!("owned bridge cleanup failures: {cleanup_errors:?}");
+        }
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Ok(Err(error)) => panic!("owned bridge diagnostic failed: {error}"),
+            Err(_) => panic!("owned bridge diagnostic exceeded its deadline"),
+        }
+        assert!(
+            cleanup_errors.is_empty(),
+            "owned bridge tasks must settle: {cleanup_errors:?}"
+        );
+        let reopened_profile = actor.profile().await;
+        drop(actor);
+        let (_reopened_tx, reopened_stream) = mpsc::channel(8);
+        let reopened = FreshAgentHostActor::open(
+            directory.path().join("actor"),
+            reopened_profile,
+            Arc::new(StartedBridgeTransport {
+                native: "native-b".into(),
+                events: std::sync::Mutex::new(Some(reopened_stream)),
+            }),
+        )
+        .await
+        .unwrap();
+        let recovered = serde_json::to_value(reopened.read_events(0, 64).await).unwrap();
+        assert_eq!(
+            recovered["acceptedNativeDispatch"]["requestId"],
+            "bridge-replacement-send"
+        );
+        assert_eq!(
+            recovered["acceptedNativeDispatch"]["identity"]["nativeSessionId"],
+            "native-b"
+        );
+        reopened.stop().await.unwrap();
+    }
+
     #[tokio::test]
     async fn task6_recovery_does_not_journal_another_sessions_pending_decision() {
         let mut fixture = native_codex_fixture(json!({"recordTurns":true,"serverRequestsByPrompt":{"ask":{"id":71,"method":"item/tool/requestUserInput","params":{"isBlocking":true,"questions":[{"id":"choice","header":"Choice","question":"Other session only?","options":null}]}}}})).await;

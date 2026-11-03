@@ -4,15 +4,15 @@
 //! event cursor; dropping that cursor cannot drop the provider transport.
 
 use async_trait::async_trait;
+use freshell_runtime_protocol::{
+    AcceptedNativeDispatch, CommandState, FreshAgentCapture, FreshAgentNativeNameError,
+    FreshAgentNativeNameOperation, FreshAgentNativeNameReply, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext,
+    ProviderModelSelection, ProviderSecretReference, ProviderSessionReference, RequestId,
+};
 pub use freshell_runtime_protocol::{
     AgentEvent, AgentEventBatch as EventBatch, AgentJournalEvent as JournalEvent, FreshProvider,
     NativeDispatchIdentity,
-};
-use freshell_runtime_protocol::{
-    CommandState, FreshAgentCapture, FreshAgentNativeNameError, FreshAgentNativeNameOperation,
-    FreshAgentNativeNameReply, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentTurnSettings, NativeIdentityLaunch, ProviderLaunchContext, ProviderModelSelection,
-    ProviderSecretReference, ProviderSessionReference, RequestId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -564,6 +564,8 @@ struct PersistedActorState {
     #[serde(default)]
     initialization_state: Option<CommandState>,
     commands: BTreeMap<String, PersistedCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_native_dispatch: Option<AcceptedNativeDispatch>,
     #[serde(default)]
     completed_forks: BTreeMap<String, ForkTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -582,6 +584,7 @@ impl PersistedActorState {
             profile,
             initialization_state: None,
             commands: BTreeMap::new(),
+            accepted_native_dispatch: None,
             completed_forks: BTreeMap::new(),
             claude_fork_state: None,
             decisions: BTreeMap::new(),
@@ -635,6 +638,21 @@ enum NativeRecoveryRelease {
     Released,
 }
 
+struct NativeDispatchInFlight<'a>(&'a AtomicBool);
+
+impl<'a> NativeDispatchInFlight<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for NativeDispatchInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct FreshAgentHostActor {
     state_dir: PathBuf,
     transport: Arc<dyn FreshAgentTransport>,
@@ -643,6 +661,7 @@ pub struct FreshAgentHostActor {
     /// identity remains a resume request and cannot populate this slot.
     observed_native_session_id: Mutex<Option<String>>,
     native_identity_transition: AtomicBool,
+    native_dispatch_in_flight: AtomicBool,
     stopped: AtomicBool,
     dispatch_lock: Mutex<()>,
     native_recovery_release: Mutex<NativeRecoveryRelease>,
@@ -920,6 +939,7 @@ impl FreshAgentHostActor {
             state: Mutex::new(state),
             observed_native_session_id: Mutex::new(observed_native_session_id),
             native_identity_transition: AtomicBool::new(false),
+            native_dispatch_in_flight: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             dispatch_lock: Mutex::new(()),
             native_recovery_release: Mutex::new(NativeRecoveryRelease::Pending),
@@ -955,6 +975,11 @@ impl FreshAgentHostActor {
 
     pub async fn profile(&self) -> FreshAgentProfile {
         self.state.lock().await.profile.clone()
+    }
+
+    pub async fn accepted_native_dispatch(&self) -> Option<AcceptedNativeDispatch> {
+        let state = self.state.lock().await;
+        current_accepted_native_dispatch(&state)
     }
 
     pub async fn prepare_native_readiness(&self) -> Result<(), ActorError> {
@@ -1165,6 +1190,7 @@ impl FreshAgentHostActor {
             self.prepare_claude_effect(&mut state, true).await?;
             write_state(&self.state_dir, &state)?;
         }
+        let _in_flight = NativeDispatchInFlight::new(&self.native_dispatch_in_flight);
         let result = self
             .transport
             .dispatch_with_turn_settings(
@@ -1176,6 +1202,7 @@ impl FreshAgentHostActor {
             )
             .await;
         let mut state = self.state.lock().await;
+        let mut accepted_native_dispatch = None;
         if let Ok(ack) = &result {
             if let Some(identity) = &ack.native_identity {
                 if identity.native_session_id.is_empty()
@@ -1216,6 +1243,12 @@ impl FreshAgentHostActor {
                 *self.observed_native_session_id.lock().await =
                     Some(identity.native_session_id.clone());
                 if changed {
+                    if state.profile.provider == FreshProvider::Codex {
+                        accepted_native_dispatch = Some(AcceptedNativeDispatch {
+                            request_id: request_id.clone(),
+                            identity: identity.clone(),
+                        });
+                    }
                     if let Some(reference) = state.profile.session_ref.as_mut() {
                         reference.session_id = identity.native_session_id.clone();
                     }
@@ -1238,6 +1271,9 @@ impl FreshAgentHostActor {
             Ok(ack) => {
                 command.provider_ack_id = ack.provider_ack_id;
                 command.state = CommandState::ProviderAcked;
+                if let Some(accepted) = accepted_native_dispatch {
+                    state.accepted_native_dispatch = Some(accepted);
+                }
                 push_event_bounded(
                     &mut state,
                     AgentEvent::CommandOutcome {
@@ -2158,6 +2194,9 @@ impl FreshAgentHostActor {
             let max_events = max_events.clamp(1, self.event_count_cap);
             EventBatch {
                 retained_state: None,
+                accepted_native_dispatch: current_accepted_native_dispatch(&state),
+                native_dispatch_in_flight: state.profile.provider == FreshProvider::Codex
+                    && self.native_dispatch_in_flight.load(Ordering::SeqCst),
                 retained_from: state.retained_from,
                 head: state.next_sequence.saturating_sub(1),
                 reset_required: after.saturating_add(1) < state.retained_from,
@@ -2206,6 +2245,23 @@ impl FreshAgentHostActor {
             .await
             .map_err(ActorError::Transport)
     }
+}
+
+fn current_accepted_native_dispatch(state: &PersistedActorState) -> Option<AcceptedNativeDispatch> {
+    state.accepted_native_dispatch.clone().filter(|accepted| {
+        state.profile.provider == FreshProvider::Codex
+            && state.profile.native_session_id.as_deref()
+                == Some(accepted.identity.native_session_id.as_str())
+            && state
+                .commands
+                .get(accepted.request_id.as_str())
+                .is_some_and(|command| {
+                    matches!(
+                        command.state,
+                        CommandState::ProviderAcked | CommandState::Completed
+                    )
+                })
+    })
 }
 
 fn push_event_bounded(

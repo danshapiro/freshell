@@ -3528,6 +3528,29 @@ impl Supervisor {
                         "fresh-agent events owner changed",
                     ));
                 }
+                if context.provider == "codex" {
+                    if let Some(accepted) = events.accepted_native_dispatch.clone() {
+                        if self
+                            .registry
+                            .reconcile_fresh_agent_dispatch_identity(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                accepted.clone(),
+                            )
+                            .await
+                            .map_err(map_registry)?
+                        {
+                            current_native = Some(accepted.identity.native_session_id);
+                            fence = self
+                                .registry
+                                .recovery_write_fence(soul_id.clone())
+                                .await
+                                .map_err(map_registry)?;
+                            tracing::info!(soul_id=%soul_id, incarnation_id=%handle.incarnation_id(), request_id=%accepted.request_id,
+                                "freshagent.native_dispatch_identity_reconciled");
+                        }
+                    }
+                }
                 if let Some(retained) = &mut events.retained_state {
                     let after = self
                         .authenticate_host(current.incarnation_id(), current.runtime_dir())
@@ -8951,6 +8974,8 @@ mod opencode_transfer_restart_tests {
                             assert_eq!(after_sequence, 0, "web restart replays the host journal");
                             HostResult::FreshAgentEvents(
                                 freshell_runtime_protocol::AgentEventBatch {
+                                    accepted_native_dispatch: None,
+                                    native_dispatch_in_flight: false,
                                     retained_state: None,
                                     retained_from: 1,
                                     head: 2,

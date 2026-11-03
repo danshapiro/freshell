@@ -188,6 +188,7 @@ mod uncertain_launch {
                             HostResult::FreshAgentCommand {
                                 state: CommandState::ProviderAcked,
                                 claude_fork: None,
+                                native_identity: None,
                                 native_session_id: Some(current.native_session_id.clone()),
                             }
                         }
