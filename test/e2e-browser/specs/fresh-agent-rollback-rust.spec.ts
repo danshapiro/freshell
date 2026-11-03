@@ -883,10 +883,12 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       const notices = page.getByRole('region', { name: 'Agent errors' })
       await expect(notices).toBeVisible({ timeout: 15_000 })
       await showNotice(page, /Redo is not available for Codex sessions/)
+      const noticeSummary = notices.locator('[data-agent-error="notice"] > summary')
       await expect(
-        notices.getByText(/Redo is not available for Codex sessions/),
-        'the REDO_CODEX_UNSUPPORTED_NOTICE prefix renders on the notice banner',
+        noticeSummary,
+        'the REDO_CODEX_UNSUPPORTED_NOTICE prefix renders in the notice summary',
       ).toBeVisible({ timeout: 15_000 })
+      await expect(noticeSummary).toContainText(/Redo is not available for Codex sessions/)
       expect(userRows(await snap())).toBe(0) // transcript unchanged
 
       // The pinned-notice path never touches the provider: after the notice
@@ -1179,10 +1181,12 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // The CLI refused the guarded fork; the server's pinned reason renders
       // verbatim on the notice banner, never a guard-less retry.
       await showNotice(page, "Claude folded another message into that turn, so it can't be undone to that point.")
+      const noticeSummary = page.locator('[data-agent-error="notice"] > summary')
       await expect(
-        page.getByText("Claude folded another message into that turn, so it can't be undone to that point."),
-        'the honest refusal renders on the notice banner',
+        noticeSummary,
+        'the honest refusal renders in the notice summary',
       ).toBeVisible({ timeout: 30_000 })
+      await expect(noticeSummary).toContainText("Claude folded another message into that turn, so it can't be undone to that point.")
       const boots = simBoots(lane.simLedger).slice(bootsBefore)
       expect(boots, 'one guarded fork, never a guard-less retry').toHaveLength(1)
       expect(boots[0].forkSession).toBe(true)
@@ -1344,10 +1348,12 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // copy — no rollback frame ever leaves the client.
       await typeSlash(page, '/undo')
       await showNotice(page, /queue a message to steer it/)
+      const busyNoticeSummary = page.locator('[data-agent-error="notice"] > summary')
       await expect(
-        page.getByText(/queue a message to steer it/),
-        'the pinned busy copy renders on the notice banner',
+        busyNoticeSummary,
+        'the pinned busy copy renders in the notice summary',
       ).toBeVisible({ timeout: 15_000 })
+      await expect(busyNoticeSummary).toContainText(/queue a message to steer it/)
       // Transcript unchanged; the parked card is NEVER silently resolved
       // (cancel frames fire only on a SUCCESSFUL rollback).
       expect(userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG))).toBe(1)
@@ -1363,10 +1369,14 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await typeSlash(page, '/undo')
       await showNotice(page, /the removed prompt is back in the composer/)
+      const notices = page.getByRole('status', { name: 'Agent notices' })
+      const refillNoticeSummary = notices.locator('summary')
       await expect(
-        page.getByText(/the removed prompt is back in the composer/),
-        'UNDO_REFILL_NOTICE: the post-turn /undo succeeds',
+        refillNoticeSummary,
+        'UNDO_REFILL_NOTICE renders in the routine notice summary',
       ).toBeVisible({ timeout: 15_000 })
+      await expect(refillNoticeSummary).toContainText(/the removed prompt is back in the composer/)
+      await expect(notices.locator('.fresh-agent-diagnostic-body')).toContainText(/the removed prompt is back in the composer/)
       // The tail /undo booted EXACTLY ONE replacement: the busy window was
       // proven boot-silent above, so a leaked boot there plus the tail's
       // legitimate one would surface as TWO, as would a silent retry. NOTE:

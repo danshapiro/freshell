@@ -483,7 +483,7 @@ async function routeNativePermission({ session, sessionId, req, launch, generati
   let currentOptions = options
   if (session.nativeStore && req.resumeSessionId && !session.nativeContinuation) {
     const resumed = await waitForNativeCheckpointRelease(session,
-      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, nativeInputDigest)
+      { tool_use_id: options?.toolUseID, tool_input: input }, generation, options?.signal, nativeInputDigest, sessionId, log)
     if (resumed === false) return { behavior: 'deny', message: 'Original native checkpoint has no current fenced release' }
   }
   const record = session.nativeContinuation
@@ -734,7 +734,8 @@ hooks: state.nativeChannel ? { PreToolUse: [{ matcher: 'Bash', hooks: [async (in
           return {}
         }
         if (req.resumeSessionId && state.nativeStore) {
-          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal, nativeInputDigest)
+          const resumed = await waitForNativeCheckpointRelease(state, input, generation, hookOptions?.signal,
+            nativeInputDigest, sessionId, log)
           if (resumed !== null) return resumed ? {} : deny('Original native checkpoint has no current fenced release')
         }
         // SDK control callbacks and the output iterator have independent

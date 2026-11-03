@@ -194,6 +194,100 @@ describe('native checkpoint admission waiters', () => {
     expect(rechecks).toBe(1)
   })
 
+  it('rechecks a queued hook after the first clear inspection releases its pending slot', async () => {
+    const firstRead = deferred<unknown>()
+    const secondRead = deferred<unknown>()
+    const firstInputState = deferred<string>()
+    const secondInputState = deferred<string>()
+    const firstInputStateStarted = deferred<void>()
+    const secondReadStarted = deferred<void>()
+    const secondInputStateStarted = deferred<void>()
+    let readCount = 0
+    let inputStateCount = 0
+    const state = admissionState(() => {
+      readCount += 1
+      if (readCount === 1) return firstRead.promise
+      secondReadStarted.resolve()
+      return secondRead.promise
+    })
+    state.nativeStore.inputState = () => {
+      inputStateCount += 1
+      if (inputStateCount === 1) {
+        firstInputStateStarted.resolve()
+        return firstInputState.promise
+      }
+      secondInputStateStarted.resolve()
+      return secondInputState.promise
+    }
+
+    const ownerResult = waitForNativeCheckpointRelease(state, hookInput('first-tool'), 7, undefined, digestInput)
+    const firstPending = state.nativePendingOperation
+    const waiterResult = waitForNativeCheckpointRelease(state, hookInput('second-tool'), 7, undefined, digestInput)
+    firstRead.resolve(null)
+    await firstInputStateStarted.promise
+    firstInputState.resolve('clear')
+    await expect(firstPending.admission).resolves.toBe('clear')
+    await expect(ownerResult).resolves.toBeNull()
+    await expect(firstPending.settled).resolves.toBeUndefined()
+
+    await secondReadStarted.promise
+    secondRead.resolve(null)
+    await secondInputStateStarted.promise
+    secondInputState.resolve('clear')
+
+    await expect(waiterResult).resolves.toBeNull()
+    expect(readCount).toBe(2)
+    expect(inputStateCount).toBe(2)
+    expect(state.nativePendingOperation).toBeUndefined()
+  })
+
+  it.each(['recoverable', 'blocked'] as const)('logs a concurrent hook denial when native input is %s', async (inputState) => {
+    const firstRead = deferred<unknown>()
+    const inputStateResult = deferred<string>()
+    const inputStateStarted = deferred<void>()
+    const state = admissionState(() => firstRead.promise)
+    state.nativeStore.inputState = () => {
+      inputStateStarted.resolve()
+      return inputStateResult.promise
+    }
+    const events: unknown[][] = []
+    const log = (...event: unknown[]) => events.push(event)
+    const ownerResult = waitForNativeCheckpointRelease(state, hookInput('first-tool'), 7, undefined,
+      digestInput, 'session-current', log)
+    const pending = state.nativePendingOperation
+    const waiterResult = waitForNativeCheckpointRelease(state, hookInput('second-tool'), 7, undefined,
+      digestInput, 'session-current', log)
+
+    firstRead.resolve(null)
+    await inputStateStarted.promise
+    inputStateResult.resolve(inputState)
+
+    await expect(pending.admission).resolves.toBe('blocked')
+    await expect(ownerResult).resolves.toBe(false)
+    await expect(waiterResult).resolves.toBe(false)
+    expect(events).toEqual([['info', 'native.concurrent_hook_denied', {
+      sessionId: 'session-current', queryGeneration: 7, reason: 'concurrent_admission_not_clear',
+    }]])
+  })
+
+  it('logs when the same native tool is already pending', async () => {
+    const firstRead = deferred<unknown>()
+    const state = admissionState(() => firstRead.promise)
+    const events: unknown[][] = []
+    const log = (...event: unknown[]) => events.push(event)
+    const ownerResult = waitForNativeCheckpointRelease(state, hookInput('same-tool'), 7, undefined,
+      digestInput, 'session-current', log)
+
+    await expect(waitForNativeCheckpointRelease(state, hookInput('same-tool'), 7, undefined,
+      digestInput, 'session-current', log)).resolves.toBe(false)
+
+    firstRead.resolve(null)
+    await expect(ownerResult).resolves.toBeNull()
+    expect(events).toEqual([['info', 'native.concurrent_hook_denied', {
+      sessionId: 'session-current', queryGeneration: 7, reason: 'same_tool_use_pending',
+    }]])
+  })
+
   it('cleans up a matching-checkpoint recheck when native-root reset invalidates its release', async () => {
     const firstRead = deferred<unknown>()
     const secondRead = deferred<unknown>()

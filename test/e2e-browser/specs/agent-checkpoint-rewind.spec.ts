@@ -318,8 +318,11 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         // actually completed, not just that the click landed.
         const notices = page.getByRole('status', { name: 'Agent notices' })
         await expect(notices).toBeVisible({ timeout: 15_000 })
-        await notices.locator('summary').click()
-        await expect(notices.getByText(/Code rewound to before/i)).toBeVisible()
+        const noticeSummary = notices.locator('summary')
+        const noticeBody = notices.locator('.fresh-agent-diagnostic-body')
+        await expect(noticeSummary).toContainText(/Code rewound to before/i)
+        await noticeSummary.click()
+        await expect(noticeBody).toContainText(/Code rewound to before/i)
         expect(confirmMessageSeen).toMatch(/Rewind code to the state before/i)
         expect(confirmMessageSeen).toMatch(/conversation is not affected/i)
 
