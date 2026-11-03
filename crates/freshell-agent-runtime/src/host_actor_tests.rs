@@ -2771,23 +2771,48 @@ async fn exact_native_identity_and_profile_are_reused_on_host_actor_recovery() {
     .unwrap();
     assert_eq!(actor.profile().await, recovered_profile);
     drop(actor);
+    let state_path = dir.path().join("fresh-agent-state.json");
+    let accepted_state = fs::read(&state_path).unwrap();
+
+    let mut wrong_identity_profile = recovered_profile.clone();
+    wrong_identity_profile.native_session_id = Some("wrong".into());
+    let wrong_identity_transport = FakeTransport::new("wrong");
     let wrong = FreshAgentHostActor::open(
         dir.path(),
-        profile(FreshProvider::Kilroy, "kilroy-store", Some("wrong")),
-        FakeTransport::new("wrong"),
+        wrong_identity_profile,
+        wrong_identity_transport.clone(),
     )
     .await;
-    assert!(matches!(wrong, Err(ActorError::NativeIdentityMismatch)));
+    let Err(ActorError::NativeProfileMismatch(facts)) = wrong else {
+        panic!("a different requested native identity must be rejected as a profile mismatch");
+    };
+    assert_eq!(
+        facts.reason,
+        crate::host_actor::NativeProfileMismatchReason::PersistedProfileFields
+    );
+    let fields = facts.profile_fields.expect("field comparisons are present");
+    assert!(!fields.native_session_id);
+    assert!(fields.model);
+    assert_eq!(wrong_identity_transport.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&state_path).unwrap(), accepted_state);
 
     let mut wrong_profile = recovered_profile;
     wrong_profile.model = Some("different-model".into());
-    let wrong = FreshAgentHostActor::open(
-        dir.path(),
-        wrong_profile,
-        FakeTransport::new("claude-native-9"),
-    )
-    .await;
-    assert!(matches!(wrong, Err(ActorError::NativeIdentityMismatch)));
+    let wrong_profile_transport = FakeTransport::new("claude-native-9");
+    let wrong =
+        FreshAgentHostActor::open(dir.path(), wrong_profile, wrong_profile_transport.clone()).await;
+    let Err(ActorError::NativeProfileMismatch(facts)) = wrong else {
+        panic!("a changed persisted model must retain its profile mismatch classification");
+    };
+    assert_eq!(
+        facts.reason,
+        crate::host_actor::NativeProfileMismatchReason::PersistedProfileFields
+    );
+    let fields = facts.profile_fields.expect("field comparisons are present");
+    assert!(!fields.model);
+    assert!(fields.native_session_id);
+    assert_eq!(wrong_profile_transport.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&state_path).unwrap(), accepted_state);
 }
 
 #[derive(Clone, Copy)]
