@@ -2145,6 +2145,59 @@ describe('FreshAgentView', () => {
       },
     )
 
+    it.each(['info', 'warning'] as const)(
+      'keeps uncertain delivery visible after a later %s notice', async (level) => {
+        const queue = await setup('idle')
+        const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        const original = 'Keep this uncertain prompt'
+        queue.send(original)
+        const [sent] = sentFreshAgentMessages('freshAgent.send')
+        expect(sent?.requestId).toBeTruthy()
+        act(() => listener({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: sent.requestId,
+          message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+        }))
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        await waitFor(() => expect(composer).toHaveValue(original))
+        const uncertainty = 'Check the conversation before sending again. Delivery is uncertain.'
+        const warningTexts = () => screen.queryAllByRole('alert', { name: 'Agent warning' }).map(alert => alert.textContent)
+        expect(warningTexts()).toContain(uncertainty)
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+
+        vi.useFakeTimers()
+        try {
+          act(() => {
+            const message = {
+              type: 'freshAgent.event', ...locator,
+              event: { type: 'freshAgent.notice', sessionId: locator.sessionId, level,
+                code: 'FOLLOWUP_NOTICE', message: 'Later provider feedback' },
+            }
+            handleFreshAgentMessage(queue.store.dispatch, message)
+            listener(message)
+          })
+          expect(warningTexts()).toContain(uncertainty)
+          if (level === 'info') {
+            expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Later provider feedback')
+          } else {
+            expect(warningTexts()).toContain('Later provider feedback')
+          }
+          await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+          expect(warningTexts()).toContain(uncertainty)
+          expect(composer).toHaveValue(original)
+          expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+        } finally {
+          vi.useRealTimers()
+        }
+
+        act(() => listener({ type: 'freshAgent.send.accepted', ...locator,
+          requestId: sent.requestId, submittedTurnId: 'accepted-uncertain-turn' }))
+        await waitFor(() => expect(warningTexts()).not.toContain(uncertainty))
+        expect(composer).toHaveValue(original)
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
     it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
       const store = createStore()
       const first = {
