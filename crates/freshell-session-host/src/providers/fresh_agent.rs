@@ -9358,6 +9358,9 @@ export function query({ prompt, options }) {
             }))
             .unwrap();
         let input = json!({"command":"harmless"});
+        // Byte-equivalent to production's native_input_digest (UTF-16 key
+        // ordering + ECMAScript number canonicalization) for this single-key
+        // object; do not "fix" this into a divergence for richer inputs.
         let input_digest = format!(
             "{:x}",
             sha2::Sha256::digest(serde_json::to_vec(&input).unwrap())
