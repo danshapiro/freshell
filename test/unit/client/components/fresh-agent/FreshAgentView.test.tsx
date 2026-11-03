@@ -2050,6 +2050,54 @@ describe('FreshAgentView', () => {
       }
     })
 
+    it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'notice-create-a', sessionId: 'notice-thread-a', status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(first.sessionId))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', first.sessionId, expect.anything(),
+      ))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'Selected model is at capacity. Please try a different model.'
+      act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId: first.sessionId, sessionType: first.sessionType, provider: first.provider,
+          event: { type: 'freshAgent.notice', sessionId: first.sessionId, level: 'error', code: 'CODEX_PROVIDER_ERROR', message: diagnostic },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      const notice = () => document.querySelector('[data-agent-error="notice"] summary')
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      // A new attachment attempt for the same conversation keeps its error.
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: { ...first, createRequestId: 'notice-rebind-a' },
+      })))
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      // A different conversation in the same mounted pane must not inherit it.
+      const second = { ...first, createRequestId: 'notice-create-b', sessionId: 'notice-thread-b' }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(second.sessionId))
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex', 'codex', second.sessionId, expect.anything(),
+      ))
+      await waitFor(() => expect(notice()).toBeNull())
+    })
+
     it('keeps queued work when the provider exits', async () => {
       const queue = await setup()
       queue.send('Keep this follow-up')
