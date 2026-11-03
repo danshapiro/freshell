@@ -255,8 +255,9 @@ describe('browser selection non-vacuity', () => {
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
   })
 
-  // Each discovery launches and joins a real Playwright child. Keep the
-  // independent selection contracts within their own test deadline.
+  // Each discovery launches and joins a real Playwright child. A full cloud
+  // roster can take just over 30s on a loaded shard; runDiscovery still bounds
+  // the child at 40s while this test leaves room for completion and assertions.
   it('discovers cloud cases while excluding local-only specs and titles', () => {
     const cloud = listedProjects(cleanEnvironment(), cloudConfig)
     expect(cloud.labels).toEqual(['chromium'])
@@ -275,7 +276,7 @@ describe('browser selection non-vacuity', () => {
     for (const title of CLOUD_SKIP_TITLES) {
       expect(cloud.output, `cloud lane must not list excluded title: ${title.source}`).not.toMatch(title)
     }
-  })
+  }, 90_000)
 
   it('intersects mixed positional file selectors with cloud exclusions', () => {
     // Explicit positional file args are an INTERSECTION with testIgnore,
