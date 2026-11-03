@@ -2235,6 +2235,88 @@ describe('FreshAgentView', () => {
       },
     )
 
+    it.each(['refusal', 'uncertainty'] as const)(
+      'does not restore a previous conversation\'s %s into the current conversation', async (kind) => {
+        const store = createStore()
+        const first = {
+          kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+          createRequestId: 'send-scope-create-a', sessionId: 'send-scope-thread-a',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-thread-a' },
+          resumeSessionId: 'send-scope-thread-a', status: 'idle' as const,
+        }
+        const snapshot = (threadId: string) => ({
+          status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+        })
+        apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => snapshot(sessionId))
+        store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+
+        const sourcePrompt = 'Only belongs to the first conversation'
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: sourcePrompt } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+        const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+        expect(sent?.requestId).toBeTruthy()
+
+        const second = {
+          ...first, createRequestId: 'send-scope-create-b', sessionId: 'send-scope-thread-b',
+          sessionRef: { provider: 'codex' as const, sessionId: 'send-scope-thread-b' },
+          resumeSessionId: 'send-scope-thread-b',
+        }
+        act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: second })))
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+          'freshcodex', 'codex', second.sessionId, expect.anything(),
+        ))
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        const currentDraft = 'Only belongs to the second conversation'
+        fireEvent.change(composer, { target: { value: currentDraft } })
+
+        const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+        act(() => listener({
+          type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+          message: kind === 'uncertainty' ? 'CODEX_DELIVERY_AMBIGUOUS: response was lost' : 'The first send was refused.',
+        }))
+
+        expect(composer).toHaveValue(currentDraft)
+        expect(screen.queryByText(/Check the conversation before sending again/)).toBeNull()
+        expect(screen.queryByText(/Message not sent: The first send was refused/)).toBeNull()
+        expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      },
+    )
+
+    it('restores an uncertain send after rebinding the same conversation', async () => {
+      const store = createStore()
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'send-scope-rebind-a', sessionId: 'send-scope-same-thread', status: 'idle' as const,
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle', threadId: first.sessionId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      const sourcePrompt = 'Keep the same-conversation prompt'
+      fireEvent.change(composer, { target: { value: sourcePrompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1', paneId: 'pane-1', content: { ...first, createRequestId: 'send-scope-rebind-b' },
+      })))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({
+        type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'CODEX_DELIVERY_AMBIGUOUS: response was lost',
+      }))
+
+      await waitFor(() => expect(composer).toHaveValue(sourcePrompt))
+      expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
     it('keeps a Codex provider error across a same-session rebind but not a conversation switch', async () => {
       const store = createStore()
       const first = {
