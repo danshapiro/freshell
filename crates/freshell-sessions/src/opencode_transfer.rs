@@ -5753,9 +5753,12 @@ impl WorkspaceGitChild {
                 .name("workspace-git-stderr".into())
                 .spawn(move || {
                     #[cfg(all(test, target_os = "linux"))]
-                    started_tx
-                        .send(unsafe { libc::syscall(libc::SYS_gettid) as u32 })
-                        .expect("owned test drainer receiver");
+                    {
+                        let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+                        let stat = fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+                            .expect("capture original owned drainer identity");
+                        started_tx.send((tid, stat)).expect("owned test drainer receiver");
+                    }
                     let mut retained = Vec::new();
                     let mut bytes = [0; 8192];
                     loop {
@@ -5793,10 +5796,10 @@ impl WorkspaceGitChild {
         workspace_metadata_test_hooks::count("drain_spawn");
         #[cfg(all(test, target_os = "linux"))]
         workspace_metadata_test_hooks::STATE.with(|state| {
-            state
-                .borrow_mut()
-                .drainer_tids
-                .push(started_rx.recv().expect("actual owned drainer start"))
+            let (tid, stat) = started_rx.recv().expect("actual owned drainer start");
+            let mut state = state.borrow_mut();
+            state.drainer_tids.push(tid);
+            state.drainer_start_stats.insert(tid, stat);
         });
         Ok(Self {
             child,
@@ -6006,6 +6009,8 @@ mod workspace_metadata_test_hooks {
         pub fail_drain_join: bool,
         #[cfg(target_os = "linux")]
         pub drainer_tids: Vec<u32>,
+        #[cfg(target_os = "linux")]
+        pub drainer_start_stats: BTreeMap<u32, String>,
     }
     thread_local! { pub(super) static STATE: RefCell<State> = RefCell::new(State::default()); }
     pub(super) fn spawned(pid: u32) {
@@ -12873,7 +12878,27 @@ mod native_source_inventory_tests {
                 }
                 #[cfg(target_os = "linux")]
                 for tid in &state.drainer_tids {
-                    assert!(!Path::new(&format!("/proc/self/task/{tid}")).exists());
+                    let path = format!("/proc/self/task/{tid}");
+                    let present = Path::new(&path).exists();
+                    if present {
+                        let mut samples = Vec::new();
+                        let mut previous = 0;
+                        for elapsed_ms in [0u64, 1, 2, 5, 10, 20, 50] {
+                            std::thread::sleep(Duration::from_millis(elapsed_ms - previous));
+                            previous = elapsed_ms;
+                            samples.push(serde_json::json!({
+                                "elapsedMs": elapsed_ms,
+                                "stat": fs::read_to_string(format!("{path}/stat")).ok(),
+                                "status": fs::read_to_string(format!("{path}/status")).ok(),
+                            }));
+                        }
+                        eprintln!("{}", serde_json::json!({
+                            "severity":"error", "event":"test.opencode_transfer.drainer_tid_after_join",
+                            "fault":fault, "tid":tid,
+                            "originalStat":state.drainer_start_stats.get(tid), "samples":samples,
+                        }));
+                    }
+                    assert!(!present, "owned drainer task remained after join: {tid}");
                 }
             });
         }
