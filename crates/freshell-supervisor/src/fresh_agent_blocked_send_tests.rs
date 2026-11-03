@@ -38,6 +38,7 @@ async fn new_blocked_send_is_refused_with_the_available_recovery_reason() {
                 )
                 .unwrap();
         }
+        let before = registry.recovery_context(soul.clone()).await.unwrap();
         let request = RequestId::parse("new-blocked-send").unwrap();
         let error = supervisor
             .fresh_agent_send(
@@ -62,18 +63,20 @@ async fn new_blocked_send_is_refused_with_the_available_recovery_reason() {
             with_reason,
             "{message}"
         );
-        let database = rusqlite::Connection::open(registry.database_path()).unwrap();
-        let state: String = database
-            .query_row(
-                "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
-                rusqlite::params![soul.as_str(), request.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        assert!(matches!(
+            registry
+                .recorded_input_outcome(soul.clone(), request, b"new message", Some(b"null"))
+                .await
+                .unwrap(),
+            Some(InputJournalDisposition::Refused(_))
+        ));
+        let after = registry.recovery_context(soul).await.unwrap();
+        assert_eq!(after.accepted_command_count, before.accepted_command_count);
         assert_eq!(
-            state, "refused",
-            "the refused input must be journaled without becoming queued"
+            after.dispatched_command_count,
+            before.dispatched_command_count
         );
+        assert_eq!(after.never_dispatched, before.never_dispatched);
     }
 }
 

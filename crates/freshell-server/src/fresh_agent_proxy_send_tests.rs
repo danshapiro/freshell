@@ -356,10 +356,12 @@ async fn hosted_blocked_send_distinguishes_new_from_queued_input() {
             )
             .optional()
             .unwrap();
-        assert_eq!(
-            state.as_deref(),
-            Some(if queued { "queued" } else { "refused" })
-        );
+        if queued {
+            assert_eq!(state.as_deref(), Some("queued"));
+        } else {
+            assert!(state.is_some(), "the refusal must be durable");
+            assert_ne!(state.as_deref(), Some("queued"));
+        }
     }
 }
 
