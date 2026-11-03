@@ -2007,6 +2007,43 @@ async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_
 }
 
 #[tokio::test]
+async fn review_provisional_codex_controls_cannot_be_answered_under_old_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("native-a");
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(
+            FreshProvider::Codex,
+            "review-control-store",
+            Some("native-a"),
+        ),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let mut results = Vec::new();
+    for kind in ["permission", "question", "elicitation"] {
+        let id = format!("{kind}-b");
+        actor.record_permission(id.clone(), serde_json::json!({
+            "type":format!("freshAgent.{kind}.request"), "sessionId":"native-b", "requestId":id,
+        })).await.unwrap();
+        results.push(
+            actor
+                .resolve_permission(&id, serde_json::json!({"decision":"accept"}))
+                .await,
+        );
+    }
+    actor.stop().await.unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Err(ActorError::UnknownDecision))),
+        "a B control is not actionable while A remains current: {results:?}"
+    );
+    assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn snapshot_control_can_be_answered_before_its_delayed_journal_event() {
     for (scenario, event_type) in [
         ("current", "freshAgent.permission.request"),

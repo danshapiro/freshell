@@ -2166,6 +2166,19 @@ impl FreshAgentHostActor {
         let response_digest = digest(&serde_json::to_vec(&decision).map_err(persist)?);
         {
             let mut state = self.state.lock().await;
+            if state.profile.provider == FreshProvider::Codex
+                && state.decisions.get(decision_id).is_some_and(|pending| {
+                    pending
+                        .payload
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|native| {
+                            state.profile.native_session_id.as_deref() != Some(native)
+                        })
+                })
+            {
+                return Err(ActorError::UnknownDecision);
+            }
             let pending = state
                 .decisions
                 .get_mut(decision_id)
