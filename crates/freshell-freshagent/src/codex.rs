@@ -1701,6 +1701,90 @@ impl FreshCodexState {
         clear_codex_condemned_prior_if_matching(&self.condemned_priors, session_id, ownership_id);
     }
 
+    async fn stop_removed_session(
+        &self,
+        session_id: &str,
+        session: CodexSession,
+    ) -> crate::session_handoff::StopResult {
+        session.consumer.abort();
+        session.client.close().await;
+        if let Some(kill_tx) = session.kill_tx {
+            let _ = kill_tx.send(());
+        }
+        match session.watcher.await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    session_id = %session_id,
+                    error = %error,
+                    "freshagent.codex.teardown_watcher_failed: writer shutdown is unconfirmed"
+                );
+                watcher_stop_not_confirmed()
+            }
+        }
+    }
+
+    /// A new native writer is already registered when binding begins. Retain
+    /// its exact identity and the Starting claim through both teardown and
+    /// ledger repair, including cancellation during either operation.
+    fn registered_binding_guard(
+        &self,
+        ticket: Option<freshell_ownership::OperationTicket>,
+        claim: Option<crate::identity_sink::BindingClaim>,
+        session_id: &str,
+        runtime_id: &str,
+        pid: Option<u32>,
+    ) -> crate::identity_sink::BindingWriteGuard {
+        let mut guard =
+            crate::identity_sink::BindingWriteGuard::new(ticket, claim, self.identity_sink());
+        let recorded = pid.map(|pid| {
+            crate::session_lease::record_condemned_runtime_identity(
+                pid,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                runtime_id,
+            )
+        });
+        let cleanup_probe = self.sidecar_cleanup_probe.get().cloned();
+        let state = self.clone();
+        let id = session_id.to_string();
+        let runtime_id = runtime_id.to_string();
+        guard.settle_startup_before_repair(async move {
+            let session = {
+                let mut sessions = state.sessions.lock().await;
+                if sessions.get(&id).is_some_and(|s| s.sidecar_ownership_id == runtime_id) {
+                    sessions.remove(&id)
+                } else {
+                    None
+                }
+            };
+            let confirmed = if let Some(session) = session {
+                match state.stop_removed_session(&id, session).await {
+                    crate::session_handoff::StopResult::Reaped
+                    | crate::session_handoff::StopResult::AlreadyGone => true,
+                    crate::session_handoff::StopResult::NotConfirmed { confirmation } => confirmation.await,
+                    crate::session_handoff::StopResult::PlatformLimited => false,
+                }
+            } else {
+                // Another exact teardown may already own the removed session.
+                // Never remove or kill a replacement occupying the same key.
+                match recorded {
+                    Some(recorded) => codex_tree_death_escalation(
+                        recorded, runtime_id.clone(), id.clone(), cleanup_probe,
+                    ).await,
+                    None => false,
+                }
+            };
+            if !confirmed {
+                tracing::error!(target: "invariant", provider = PROVIDER,
+                    session_id = %id, ownership_id = %runtime_id,
+                    "freshagent.codex.canceled_startup_unconfirmed: retaining ownership until writer death is proven");
+                std::future::pending::<()>().await;
+            }
+            state.leases.clear_binding_if_matches(PROVIDER, &id, &id, &runtime_id);
+        });
+        guard
+    }
+
     /// Finish teardown for a session removed by a create/resume/fork recovery
     /// path.  The caller must not release a lease or coordinator ticket until
     /// this watcher settles: `NotConfirmed` and `PlatformLimited` retain the
@@ -1713,22 +1797,7 @@ impl FreshCodexState {
         lease_guard: Option<crate::FreshSessionLeaseGuard>,
     ) -> CodexTeardownSettlement {
         let ownership_id = session.sidecar_ownership_id.clone();
-        session.consumer.abort();
-        session.client.close().await;
-        if let Some(kill_tx) = session.kill_tx {
-            let _ = kill_tx.send(());
-        }
-        let result = match session.watcher.await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(target: "freshell_freshagent::codex",
-                    session_id = %session_id,
-                    error = %error,
-                    "freshagent.codex.teardown_watcher_failed: writer shutdown is unconfirmed"
-                );
-                watcher_stop_not_confirmed()
-            }
-        };
+        let result = self.stop_removed_session(session_id, session).await;
         match result {
             crate::session_handoff::StopResult::Reaped
             | crate::session_handoff::StopResult::AlreadyGone => {
@@ -2839,18 +2908,20 @@ impl FreshCodexState {
                     // authoritative Live owner (the ticket's drop would
                     // otherwise restore Vacant while the runtime keeps
                     // running, licensing a SECOND writer).
-                    if self.has_live_session(&resume_session_id).await {
+                    let mut guard =
+                        self.map_hit_binding_guard(ticket, &resume_session_id, provenance.clone());
+                    if guard.map_hit_runtime_present().await {
                         return self
                             .adopt_live_create_with_starting_ticket(
                                 &request_id,
                                 view_id.as_deref(),
                                 &resume_session_id,
                                 provenance.clone(),
-                                Some(ticket),
+                                Some(guard),
                             )
                             .await;
                     }
-                    Some(ticket)
+                    guard.finish()
                 }
                 crate::ownership_lane::LaneClaim::Unwired => {
                     // The unwired lane's map fast path (V1 behavior): a live
@@ -3726,7 +3797,7 @@ impl FreshCodexState {
                 exited,
                 checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
-                sidecar_ownership_id,
+                sidecar_ownership_id: sidecar_ownership_id.clone(),
                 quiet_deadman,
                 turn_in_flight,
                 retired_turn_id,
@@ -3829,10 +3900,12 @@ impl FreshCodexState {
                 crate::identity_sink::BindingClaimKind::Starting,
             )
         });
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+        let mut binding_guard = Some(self.registered_binding_guard(
             own_ticket.take(),
             binding_claim.clone(),
-            self.identity_sink(),
+            &thread_id,
+            &sidecar_ownership_id,
+            sidecar_pid,
         ));
 
         // P1.13 identity event (Task 4): the ledger binding row for this create,
@@ -4170,33 +4243,123 @@ impl FreshCodexState {
         .await
     }
 
+    /// Install recovery before the first session-map await. The first probe
+    /// captures the incumbent under the held Starting claim; all subsequent
+    /// probes and the commit refer to that exact native runtime.
+    fn map_hit_binding_guard(
+        &self,
+        ticket: freshell_ownership::OperationTicket,
+        thread_id: &str,
+        provenance: Option<crate::BindProvenance>,
+    ) -> crate::identity_sink::BindingWriteGuard {
+        let claim = crate::identity_sink::BindingClaim::from_ticket(
+            &ticket,
+            crate::identity_sink::BindingClaimKind::Starting,
+        )
+        .expect("the granted Starting ticket has an exact claim");
+        let mut guard = crate::identity_sink::BindingWriteGuard::new(
+            Some(ticket),
+            Some(claim.clone()),
+            self.identity_sink(),
+        );
+        let runtime = Arc::new(StdMutex::new(None::<(String, Option<u32>)>));
+        let probe_runtime = runtime.clone();
+        let probe_state = self.clone();
+        let probe_id = thread_id.to_string();
+        let probe_provenance = provenance.clone().filter(|p| p.is_meaningful());
+        let write_state = self.clone();
+        let write_id = thread_id.to_string();
+        let commit_state = self.clone();
+        let commit_id = thread_id.to_string();
+        guard.recover_map_hit(
+            move || {
+                let state = probe_state.clone();
+                let id = probe_id.clone();
+                let runtime = probe_runtime.clone();
+                let provenance = probe_provenance.clone();
+                async move {
+                    let mut sessions = state.sessions.lock().await;
+                    let Some(session) = sessions.get_mut(&id) else {
+                        return false;
+                    };
+                    if session.exited.load(Ordering::SeqCst)
+                        || session
+                            .sidecar_pid
+                            .is_some_and(crate::ownership_lane::partial_pid_confirmed_dead)
+                    {
+                        return false;
+                    }
+                    let mut expected = runtime.lock().unwrap();
+                    let expected = expected.get_or_insert_with(|| {
+                        if let Some(provenance) = provenance {
+                            session.provenance = Some(provenance);
+                        }
+                        (session.sidecar_ownership_id.clone(), session.sidecar_pid)
+                    });
+                    expected.0 == session.sidecar_ownership_id
+                }
+            },
+            move || {
+                let state = write_state.clone();
+                let id = write_id.clone();
+                let claim = claim.clone();
+                let provenance = provenance.clone();
+                Box::pin(async move {
+                    state
+                        .record_codex_binding(
+                            &id,
+                            None,
+                            "",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            provenance.as_ref(),
+                            None,
+                            Some(claim.epoch),
+                            Some(claim.generation),
+                            Some(claim),
+                            Some(crate::identity_sink::SettingsUpdate::Keep),
+                        )
+                        .await
+                })
+            },
+            move |ticket| {
+                let pid = runtime
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|runtime| runtime.1);
+                commit_state.commit_lane_claim_at(ticket, &commit_id, &commit_id, pid)
+            },
+        );
+        guard
+    }
+
     async fn adopt_live_create_with_starting_ticket(
         &self,
         request_id: &str,
         view_id: Option<&str>,
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
-        starting_ticket: Option<freshell_ownership::OperationTicket>,
+        starting_guard: Option<crate::identity_sink::BindingWriteGuard>,
     ) -> CodexCreateOutcome {
         let provenance = provenance.filter(|p| p.is_meaningful());
-        let (pid, runtime_id) = {
+        let pid = {
             let mut guard = self.sessions.lock().await;
-            guard
-                .get_mut(thread_id)
-                .map(|session| {
-                    if let Some(p) = provenance.as_ref() {
-                        session.provenance = Some(p.clone());
-                    }
-                    (
-                        session.sidecar_pid,
-                        Some(session.sidecar_ownership_id.clone()),
-                    )
-                })
-                .unwrap_or((None, None))
+            guard.get_mut(thread_id).and_then(|session| {
+                if let Some(p) = provenance.as_ref() {
+                    session.provenance = Some(p.clone());
+                }
+                session.sidecar_pid
+            })
         };
 
-        let binding_claim = starting_ticket
+        let binding_claim = starting_guard
             .as_ref()
+            .and_then(|guard| guard.ticket_ref().as_ref())
             .and_then(|ticket| {
                 crate::identity_sink::BindingClaim::from_ticket(
                     ticket,
@@ -4240,73 +4403,7 @@ impl FreshCodexState {
         }
 
         let mut persisted_under_starting_ticket = false;
-        if let Some(ticket) = starting_ticket {
-            let Some(claim) = binding_claim.clone() else {
-                return self.fail_create(
-                    request_id,
-                    view_id,
-                    "SESSION_RESERVED",
-                    "The Codex runtime no longer owns this session; refresh before reopening it.",
-                );
-            };
-            let mut write_guard = crate::identity_sink::BindingWriteGuard::new(
-                Some(ticket),
-                Some(claim.clone()),
-                self.identity_sink(),
-            );
-            let probe_state = self.clone();
-            let probe_id = thread_id.to_string();
-            let retry_state = self.clone();
-            let retry_id = thread_id.to_string();
-            let retry_claim = claim.clone();
-            let retry_provenance = provenance.clone();
-            let commit_state = self.clone();
-            let commit_id = thread_id.to_string();
-            write_guard.recover_map_hit(
-                move || {
-                    let state = probe_state.clone();
-                    let id = probe_id.clone();
-                    let expected = runtime_id.clone();
-                    async move {
-                        state.sessions.lock().await.get(&id).is_some_and(|session| {
-                            Some(&session.sidecar_ownership_id) == expected.as_ref()
-                                && !session
-                                    .sidecar_pid
-                                    .is_some_and(crate::ownership_lane::partial_pid_confirmed_dead)
-                        })
-                    }
-                },
-                move || {
-                    let state = retry_state.clone();
-                    let id = retry_id.clone();
-                    let claim = retry_claim.clone();
-                    let provenance = retry_provenance.clone();
-                    Box::pin(async move {
-                        state
-                            .record_codex_binding(
-                                &id,
-                                None,
-                                "",
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                provenance.as_ref(),
-                                None,
-                                Some(claim.epoch),
-                                Some(claim.generation),
-                                Some(claim),
-                                Some(crate::identity_sink::SettingsUpdate::Keep),
-                            )
-                            .await
-                    })
-                },
-                move |ticket| {
-                    commit_state.commit_lane_claim_at(ticket, &commit_id, &commit_id, pid)
-                },
-            );
+        if let Some(mut write_guard) = starting_guard {
             if let Err(error) = write_guard.write_map_hit().await {
                 tracing::error!(target: "invariant",
                     provider = PROVIDER, session_id = %thread_id, error = %error,
@@ -4320,9 +4417,7 @@ impl FreshCodexState {
                     "The session's recovery record could not be persisted; refresh and retry.",
                 );
             }
-            if let Err(outcome) =
-                self.commit_lane_claim_at(write_guard.ticket_mut(), thread_id, thread_id, pid)
-            {
+            if let Err(outcome) = write_guard.commit_map_hit().await {
                 tracing::warn!(target: "freshell_freshagent::codex",
                     session_id = %thread_id, request_id = %request_id,
                     outcome = ?outcome,
@@ -6512,7 +6607,7 @@ impl FreshCodexState {
             &child_id,
             child_client,
             child_notifs,
-            child_ownership_id,
+            child_ownership_id.clone(),
             child_proc,
             eff_model.clone(),
             parent_effort.clone(),
@@ -6539,10 +6634,12 @@ impl FreshCodexState {
                 crate::identity_sink::BindingClaimKind::Starting,
             )
         });
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+        let mut binding_guard = Some(self.registered_binding_guard(
             own_ticket.take(),
             binding_claim.clone(),
-            self.identity_sink(),
+            &child_id,
+            &child_ownership_id,
+            child_pid,
         ));
         if let Err(error) = self
             .record_codex_binding(
@@ -8563,7 +8660,7 @@ impl FreshCodexState {
                     exited,
                     checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
-                    sidecar_ownership_id,
+                    sidecar_ownership_id: sidecar_ownership_id.clone(),
                     quiet_deadman,
                     turn_in_flight,
                     retired_turn_id,
@@ -8586,10 +8683,12 @@ impl FreshCodexState {
                 crate::identity_sink::BindingClaimKind::Starting,
             )
         });
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+        let mut binding_guard = Some(self.registered_binding_guard(
             own_ticket.take(),
             binding_claim.clone(),
-            self.identity_sink(),
+            session_id,
+            &sidecar_ownership_id,
+            sidecar_pid,
         ));
         if let Err(error) = self
             .record_codex_binding(
@@ -8951,7 +9050,7 @@ impl FreshCodexState {
                     exited,
                     checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
-                    sidecar_ownership_id,
+                    sidecar_ownership_id: sidecar_ownership_id.clone(),
                     quiet_deadman,
                     turn_in_flight,
                     retired_turn_id,
@@ -8985,10 +9084,12 @@ impl FreshCodexState {
         } else {
             crate::identity_sink::SettingsUpdate::Replace(settings)
         };
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+        let mut binding_guard = Some(self.registered_binding_guard(
             own_ticket.take(),
             binding_claim.clone(),
-            self.identity_sink(),
+            &new_thread_id,
+            &sidecar_ownership_id,
+            sidecar_pid,
         ));
         if let Err(error) = self
             .record_codex_binding(
@@ -10756,7 +10857,7 @@ impl FreshCodexState {
                 thread_id,
                 client.clone(),
                 notifs,
-                ownership_id,
+                ownership_id.clone(),
                 child,
                 rec.model.clone().unwrap_or_default(),
                 rec.effort.clone(),
@@ -10879,10 +10980,12 @@ impl FreshCodexState {
             });
         let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
         let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
-        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+        let mut binding_guard = Some(self.registered_binding_guard(
             own_ticket.take(),
             binding_claim.clone(),
-            self.identity_sink(),
+            thread_id,
+            &ownership_id,
+            sidecar_pid,
         ));
         {
             let settings_update = match recovered.as_ref() {
@@ -21398,6 +21501,212 @@ pub(crate) mod tests {
             epoch: vacant.epoch,
             generation: vacant.generation,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_map_hit_before_session_lookup_keeps_incumbent_owned() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let id = create_real_fake_session(&state, &mut rx).await;
+        for lookup in 1..=2 {
+            vacate_codex_owner_for_map_hit(&registry, &id);
+            let mut held = Some(state.sessions.lock().await);
+            let incumbent = held
+                .as_ref()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .sidecar_ownership_id
+                .clone();
+            let mut msg = create_msg(&format!("cancel-before-incumbent-lookup-{lookup}"));
+            msg.resume_session_id = Some(id.clone());
+            let mut request = Box::pin(state.handle_create(msg, None));
+            assert!(futures_util::poll!(&mut request).is_pending());
+            for _ in 1..lookup {
+                let mut next = Box::pin(state.sessions.lock());
+                assert!(futures_util::poll!(&mut next).is_pending());
+                drop(held.take());
+                assert!(futures_util::poll!(&mut request).is_pending());
+                held = Some(next.await);
+            }
+            drop(request);
+            let fenced = matches!(
+                registry.observe(PROVIDER, &id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            );
+            drop(held);
+            if !fenced {
+                state.shutdown().await;
+                panic!("canceling incumbent lookup {lookup} released ownership over a live writer");
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(
+                    registry.observe(PROVIDER, &id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the exact incumbent is adopted after the lock releases");
+            assert_eq!(
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&id)
+                    .unwrap()
+                    .sidecar_ownership_id,
+                incumbent
+            );
+        }
+        assert!(sink.repairs.lock().unwrap().is_empty());
+        state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_registered_startup_keeps_claim_until_native_writer_is_settled() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, _rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let id = "cancel-registered-startup";
+        let stall = sink.arm_binding_stall(PROVIDER, id);
+        let mut msg = create_msg("cancel-registered-startup");
+        msg.resume_session_id = Some(id.into());
+        let st = state.clone();
+        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(id)
+            .expect("the native writer is already registered");
+        let pid = session.sidecar_pid.unwrap();
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(pid));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fenced = matches!(
+            registry.observe(PROVIDER, id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        );
+        drop(sessions);
+        let _ = stall.release.send(());
+        if !fenced {
+            state.shutdown().await;
+            panic!("ledger repair released Starting while the registered native writer was alive");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let vacant = matches!(
+                    registry.observe(PROVIDER, id).state,
+                    freshell_ownership::OwnershipState::Vacant
+                );
+                let dead = crate::ownership_lane::partial_pid_confirmed_dead(pid);
+                assert!(
+                    !vacant || dead,
+                    "Vacant must never overlap a live native writer"
+                );
+                if vacant && dead {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("canceled startup terminates the writer before releasing its claim");
+        assert!(!state.sessions.lock().await.contains_key(id));
+        assert_eq!(sink.repairs.lock().unwrap().len(), 1);
+        state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_registered_startup_preserves_replacement_runtime_and_owner() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, _rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry.clone());
+        let id = "cancel-replaced-startup";
+        let stall = sink.arm_binding_stall(PROVIDER, id);
+        let mut msg = create_msg("cancel-replaced-startup");
+        msg.resume_session_id = Some(id.into());
+        let st = state.clone();
+        let task = tokio::spawn(async move { st.handle_create(msg, None).await });
+        stall.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let original = state.sessions.lock().await.remove(id).unwrap();
+        let original_pid = original.sidecar_pid.unwrap();
+        let claim = sink
+            .bindings
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .claim
+            .clone()
+            .unwrap();
+
+        let mut replacement_msg = create_msg("replacement-runtime");
+        replacement_msg.resume_session_id = Some("replacement-runtime".into());
+        assert!(matches!(
+            state.handle_create(replacement_msg, None).await,
+            CodexCreateOutcome::Created { .. }
+        ));
+        let replacement = state
+            .sessions
+            .lock()
+            .await
+            .remove("replacement-runtime")
+            .unwrap();
+        let replacement_pid = replacement.sidecar_pid.unwrap();
+        let replacement_id = replacement.sidecar_ownership_id.clone();
+        state.sessions.lock().await.insert(id.into(), replacement);
+        // Model a superseding lifecycle owner while the old request is parked.
+        registry.fail(PROVIDER, id, &claim.operation_id, claim.generation, false);
+        let crate::ownership_lane::LaneClaim::Granted(ticket) =
+            state.begin_lane_claim_at(id, "replacement-owner", None, "test")
+        else {
+            panic!("new owner is granted after supersession")
+        };
+        state
+            .commit_lane_claim_at(&mut Some(ticket), id, id, Some(replacement_pid))
+            .unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let _ = stall.release.send(());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sink.repairs.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the exact old runtime is settled and its failed binding repaired");
+        assert!(crate::ownership_lane::partial_pid_confirmed_dead(
+            original_pid
+        ));
+        assert!(!crate::ownership_lane::partial_pid_confirmed_dead(
+            replacement_pid
+        ));
+        assert_eq!(
+            state
+                .sessions
+                .lock()
+                .await
+                .get(id)
+                .unwrap()
+                .sidecar_ownership_id,
+            replacement_id
+        );
+        assert!(matches!(registry.observe(PROVIDER, id).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.ownership_id.as_deref() == Some("replacement-owner")));
+        let _ = state.settle_removed_session(id, original, None, None).await;
+        state.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -68,6 +68,7 @@ pub struct LedgerSink {
     ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
     turn_interrupted_marker_gate: Option<Arc<LedgerWriteGate>>,
     genesis_clear_gate: Option<Arc<LedgerWriteGate>>,
+    binding_completed_gate: Option<Arc<LedgerWriteGate>>,
 }
 
 impl LedgerSink {
@@ -78,6 +79,7 @@ impl LedgerSink {
             ownership: None,
             turn_interrupted_marker_gate: None,
             genesis_clear_gate: None,
+            binding_completed_gate: None,
         }
     }
 
@@ -92,7 +94,13 @@ impl LedgerSink {
             ownership,
             turn_interrupted_marker_gate: None,
             genesis_clear_gate: None,
+            binding_completed_gate: None,
         }
+    }
+
+    pub fn with_binding_completed_gate(mut self, gate: Option<Arc<LedgerWriteGate>>) -> Self {
+        self.binding_completed_gate = gate;
+        self
     }
 
     pub fn with_genesis_clear_gate(mut self, gate: Arc<LedgerWriteGate>) -> Self {
@@ -228,7 +236,7 @@ impl PaneIdentitySink for LedgerSink {
         let ledger = self.ledger.clone();
         let ownership = self.ownership.clone();
         let now = now_ms();
-        blocking(move || {
+        let write = blocking(move || {
             if let Some(refusal) = authoritative_write_refusal(ownership.as_deref(), &upsert) {
                 return Err(refusal);
             }
@@ -293,6 +301,14 @@ impl PaneIdentitySink for LedgerSink {
             }
             if let Some(p) = upsert.resolves_pending.as_deref() {
                 let _ = ledger.delete_pending(p);
+            }
+            Ok(())
+        });
+        let gate = self.binding_completed_gate.clone();
+        Box::pin(async move {
+            write.await?;
+            if let Some(gate) = gate {
+                gate.hold().await?;
             }
             Ok(())
         })
