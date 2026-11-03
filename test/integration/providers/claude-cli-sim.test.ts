@@ -288,6 +288,28 @@ describe('Claude CLI simulator programs', () => {
     expect(results(s.messages)[1]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
   })
 
+  it('holds a cold command until Stop when explicitly requested', async () => {
+    const uuid = '88888888-8888-4888-8888-888888888888'
+    const s = await open({}, {
+      FRESHELL_CLAUDE_SIM_COLD_COMMAND: 'queued',
+      FRESHELL_CLAUDE_SIM_COLD_HOLD_UNTIL_STOP: '1',
+      FRESHELL_CLAUDE_SIM_TIME_SCALE: '0',
+    })
+    await s.q.initializationResult()
+    const lifecycle = () => s.messages.filter((m) => m.type === 'command_lifecycle' && m.command_uuid === uuid).map((m) => m.state)
+    s.prompt.push('SLOW cold', uuid)
+    await s.until(() => lifecycle().includes('queued'))
+    // At scale zero the ordinary cold timeout has already expired by the
+    // next timer turn; an explicit hold must still keep the command queued.
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(lifecycle()).toEqual(['queued'])
+    expect(results(s.messages)).toEqual([])
+    await expect(s.q.interrupt()).resolves.toEqual({ still_queued: [uuid] })
+    await s.until(() => lifecycle().at(-1) === 'completed')
+    expect(lifecycle()).toEqual(['queued', 'started', 'completed'])
+    expect(results(s.messages)).toHaveLength(1)
+  })
+
   it('FRESHELL_CLAUDE_SIM_COLD_COMMAND: an interrupt sent once the cold command runs aborts it', async () => {
     const uuid = '77777777-7777-4777-8777-777777777777'
     const s = await open({}, { FRESHELL_CLAUDE_SIM_COLD_COMMAND: 'empty', FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })

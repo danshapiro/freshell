@@ -200,12 +200,36 @@ export function query(params) {{
         let mut extra = vec![("FRESHELL_CLAUDE_SDK_QUERY_MODULE", module.to_str().unwrap())];
         if reissued {
             extra.push(("FRESHELL_CLAUDE_SIM_COLD_COMMAND", "queued"));
+            extra.push(("FRESHELL_CLAUDE_SIM_COLD_HOLD_UNTIL_STOP", "1"));
         }
         let rig = ClaudeRig::start_with_env(RigKind::Sim, &extra).await;
         let mut conn = rig.connect().await;
         let id = conn.create("refused-stop-create").await;
         conn.send_text(&id, "the-running-turn", "TOOL:sleep=0.5")
             .await;
+        if reissued {
+            let accepted = conn
+                .wait_for("the send accepted before Stop", |frame| {
+                    frame["type"] == "freshAgent.send.accepted"
+                        && frame["requestId"] == "the-running-turn"
+                })
+                .await;
+            let turn_id = accepted["submittedTurnId"]
+                .as_str()
+                .expect("the accepted send has a turn id");
+            let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+            while !rig
+                .ledger_rows("cold_hold_ready")
+                .iter()
+                .any(|row| row["uuid"] == turn_id)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the simulator never held the accepted cold command"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         if !reissued {
             conn.wait_for("the running tool", |frame| {
                 frame["event"]["content"]
