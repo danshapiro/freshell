@@ -23,6 +23,7 @@ type Device = {
   harness: TestHarness
   tabId: string
   paneId: string
+  viewId: string
   frames: JsonRow[]
   createdReplies: CreatedReplyGate
 }
@@ -39,6 +40,7 @@ type NativeFixture = {
   info: E2eServerInfo
   rows: () => JsonRow[]
   bootCount: (sessionId?: string) => number
+  runtimeStartCount: (sessionId: string) => number
   stopCount: (sessionId?: string) => number
   holdNextTurn: (sessionId?: string) => Promise<void>
   releaseTurn: () => Promise<void>
@@ -52,6 +54,7 @@ export type FreshAgentMultipleDeviceSession = {
   session: { provider: Provider; sessionType: FreshAgentMultipleDeviceMode; sessionId: string }
   frames: { desktop: JsonRow[]; mobile: JsonRow[] }
   openView: (device: 'desktop' | 'mobile', sessionId: string) => Promise<Device>
+  restartWithDeadTerminalBinding: () => Promise<void>
   close: () => Promise<void>
 }
 
@@ -181,6 +184,30 @@ function appendFrame(frames: JsonRow[], direction: 'sent' | 'received', payload:
   }
 }
 
+export function wireFreshAgentWebSocketRoute(
+  client: WebSocketRoute,
+  server: WebSocketRoute,
+  frames: JsonRow[],
+  intercept: (
+    client: WebSocketRoute,
+    message: unknown,
+    recordReceived: (message: unknown) => void,
+  ) => boolean,
+): void {
+  client.onMessage((message) => {
+    appendFrame(frames, 'sent', message)
+    server.send(message)
+  })
+  server.onMessage((message) => {
+    const recordReceived = (payload: unknown) => appendFrame(frames, 'received', payload)
+    if (intercept(client, message, recordReceived)) return
+    recordReceived(message)
+    client.send(message)
+  })
+  client.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
+  server.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
+}
+
 async function openDevicePage(
   context: BrowserContext,
   info: E2eServerInfo,
@@ -188,12 +215,6 @@ async function openDevicePage(
   createdReplies: CreatedReplyGate,
 ): Promise<DevicePage> {
   const page = await context.newPage()
-  const ownedWsOrigin = info.baseUrl.replace(/^http/, 'ws')
-  page.on('websocket', (socket) => {
-    if (!socket.url().startsWith(ownedWsOrigin)) return
-    socket.on('framesent', ({ payload }) => appendFrame(frames, 'sent', payload))
-    socket.on('framereceived', ({ payload }) => appendFrame(frames, 'received', payload))
-  })
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const machineChooser = page.getByRole('dialog', { name: 'Choose a machine' })
   await page.waitForFunction(() => Boolean(
@@ -210,9 +231,13 @@ async function openDevicePage(
   return { context, page, harness, frames, createdReplies }
 }
 
-function createCreatedReplyGate(): {
+export function createCreatedReplyGate(): {
   gate: CreatedReplyGate
-  intercept: (client: WebSocketRoute, raw: unknown) => boolean
+  intercept: (
+    client: WebSocketRoute,
+    raw: unknown,
+    recordReceived: (message: unknown) => void,
+  ) => boolean
 } {
   let shouldHoldNext = false
   let held: { raw: string; frame: JsonRow } | undefined
@@ -252,14 +277,17 @@ function createCreatedReplyGate(): {
 
   return {
     gate,
-    intercept: (client, raw) => {
+    intercept: (client, raw, recordReceived) => {
       if (!shouldHoldNext || typeof raw !== 'string') return false
       let frame: unknown
       try { frame = JSON.parse(raw) } catch { return false }
       if (!frame || typeof frame !== 'object' || (frame as { type?: unknown }).type !== 'freshAgent.created') return false
       held = { raw, frame: frame as JsonRow }
       shouldHoldNext = false
-      sendHeld = (message) => client.send(message)
+      sendHeld = (message) => {
+        recordReceived(message)
+        client.send(message)
+      }
       resolveHeld?.(held.frame)
       return true
     },
@@ -269,18 +297,13 @@ function createCreatedReplyGate(): {
 async function installCreatedReplyGate(
   context: BrowserContext,
   info: E2eServerInfo,
+  frames: JsonRow[],
   gate: ReturnType<typeof createCreatedReplyGate>,
 ): Promise<void> {
   const wsOrigin = new URL(info.baseUrl.replace(/^http/, 'ws')).origin
   await context.routeWebSocket((url) => url.origin === wsOrigin && url.pathname === '/ws', (client) => {
     const server = client.connectToServer()
-    client.onMessage((message) => server.send(message))
-    server.onMessage((message) => {
-      if (gate.intercept(client, message)) return
-      client.send(message)
-    })
-    client.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
-    server.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
+    wireFreshAgentWebSocketRoute(client, server, frames, gate.intercept)
   })
 }
 
@@ -298,13 +321,45 @@ async function seedHome(homeDir: string, provider: Provider): Promise<void> {
   if (provider === 'codex') await fs.mkdir(path.join(homeDir, '.codex', 'sessions'), { recursive: true })
 }
 
+function encodeLedgerSegment(value: string): string {
+  if (value === '') return '%00'
+  if (value === '.') return '%2E'
+  if (value === '..') return '%2E%2E'
+  return [...new TextEncoder().encode(value)].map((byte) => {
+    const char = String.fromCharCode(byte)
+    return /[A-Za-z0-9._-]/.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`
+  }).join('')
+}
+
+async function seedDeadTerminalBinding(info: E2eServerInfo, provider: Provider, sessionId: string): Promise<void> {
+  const bindingPath = path.join(
+    info.homeDir,
+    '.freshell',
+    'pane-ledger',
+    'bindings',
+    encodeLedgerSegment(provider),
+    `${encodeLedgerSegment(sessionId)}.json`,
+  )
+  const binding = JSON.parse(await fs.readFile(bindingPath, 'utf8')) as JsonRow
+  if (binding.state !== 'bound' || binding.sessionId !== sessionId || binding.provider !== provider) {
+    throw new Error(`expected a bound ${provider}/${sessionId} ledger row, found ${JSON.stringify(binding)}`)
+  }
+  // The next server boot has no live terminal process or owner registry entry.
+  // Keep any settings and ownership stamp from the historical row so recovery
+  // must prove it can convert both legacy row shapes without losing settings.
+  binding.mode = provider
+  binding.liveTerminalId = `dead-terminal-fixture-${sessionId}`
+  delete binding.paneKind
+  await fs.writeFile(bindingPath, `${JSON.stringify(binding)}\n`)
+}
+
 async function openFreshAgentView(
   device: DevicePage,
   sessionId: string,
   provider: Provider,
   sessionType: string,
   cwd: string,
-): Promise<{ tabId: string; paneId: string }> {
+): Promise<{ tabId: string; paneId: string; viewId: string }> {
   // Create an independent browser-owned pane at the known durable locator.
   // The actual FreshAgentView mounts and performs the normal WS attach; this
   // avoids coupling a view-lifecycle test to session-directory discovery.
@@ -364,7 +419,7 @@ async function openFreshAgentView(
   // The tracked, live Codex attach path intentionally has no response frame
   // (it is a parity no-op). Callers prove the view remains usable through the
   // later status or shared-stream assertions in their scenario.
-  return { tabId, paneId }
+  return { tabId, paneId, viewId }
 }
 
 async function fetchSnapshot(info: E2eServerInfo, session: { sessionType: string; provider: Provider; sessionId: string }): Promise<any> {
@@ -399,6 +454,15 @@ function nativeFixture(input: {
     ...(input.notificationPath ? readJsonl(input.notificationPath) : []),
     ...(input.additionalAuditPaths ?? []).flatMap(readJsonl),
   ]
+  // The managed OpenCode fixture runs a shared `opencode serve` daemon. Its
+  // launch row uses a synthetic rootSessionId derived from the port, while
+  // Freshagent conversations are created later over HTTP with unrelated
+  // ses_http_* ids. Count the provider daemon by its actual launch command,
+  // not by comparing those two different identities.
+  const openCodeServeLaunches = () => rows().filter((row) => row.event === 'launch'
+    && Array.isArray(row.argv)
+    && row.argv[0] === 'serve'
+    && !row.argv.includes('--pure'))
   const promptText = (row: JsonRow) => typeof row.prompt === 'string' ? row.prompt : undefined
   const heldPromptCount = (sessionId = input.sessionId) => {
     switch (input.mode) {
@@ -426,13 +490,23 @@ function nativeFixture(input: {
         if (input.mode === 'freshcodex') {
           return rows().filter((row) => row.method === 'thread/start' && row.threadId === sessionId).length
         }
-        return rows().filter((row) => row.event === 'launch' && row.rootSessionId === sessionId).length
+        return openCodeServeLaunches().length
       }
       return rows().filter((row) => input.mode === 'freshopencode'
         ? row.event === 'launch'
         : input.mode === 'freshclaude' || input.mode === 'kilroy'
           ? row.kind === 'boot'
           : row.event === 'native_boot').length
+    },
+    runtimeStartCount: (sessionId) => {
+      if (input.mode === 'freshclaude' || input.mode === 'kilroy') {
+        return rows().filter((row) => row.kind === 'boot' && row.sessionId === sessionId).length
+      }
+      if (input.mode === 'freshcodex') {
+        return rows().filter((row) => ['thread/start', 'thread/resume'].includes(String(row.method))
+          && row.threadId === sessionId).length
+      }
+      return openCodeServeLaunches().length
     },
     stopCount: (sessionId) => {
       if (input.mode === 'freshcodex') {
@@ -493,6 +567,7 @@ async function startTwoDeviceSession(
   const desktopContext = await newDeviceContext(browser, false)
   let mobileContext: BrowserContext | undefined
   let server: RustServer | undefined
+  let originalServer: RustServer | undefined
   await fs.mkdir(projectDir, { recursive: true })
   // The first warm turn is allowed through. Removing this file holds the next
   // native operation, and restoring it is the explicit release action.
@@ -508,6 +583,11 @@ async function startTwoDeviceSession(
   let env: Record<string, string> = {}
   let additionalAuditPaths: string[] | undefined
   if (mode === 'freshclaude' || mode === 'kilroy') {
+    const terminalBinDir = path.join(root, 'terminal-bin')
+    const terminalClaudePath = path.join(terminalBinDir, 'claude')
+    await fs.mkdir(terminalBinDir, { recursive: true })
+    await fs.writeFile(terminalClaudePath, '#!/bin/sh\nexec /bin/sleep 300\n')
+    await fs.chmod(terminalClaudePath, 0o755)
     env = claudeSimulatorServerEnv({
       ledgerPath: rowsPath,
       flavour: mode,
@@ -519,6 +599,10 @@ async function startTwoDeviceSession(
         ],
       },
       extra: {
+        // The Claude SDK simulator is independent of the CLI executable. This
+        // small long-lived process lets the live-terminal recovery twin create
+        // a real Running PTY owner without depending on a host Claude install.
+        CLAUDE_CMD: terminalClaudePath,
         FRESHELL_CLAUDE_SIM_HOLD_PROMPT_GATE_PATH: gatePath,
         FRESHELL_CLAUDE_SIM_RECORD_NATIVE_STOP: '1',
       },
@@ -567,8 +651,8 @@ async function startTwoDeviceSession(
   }
 
   let info: E2eServerInfo
-  let desktopOpen: { page: Page; harness: TestHarness }
-  let mobileOpen: { page: Page; harness: TestHarness }
+  let desktopOpen: DevicePage
+  let mobileOpen: DevicePage
   let desktop: Device
   let mobile: Device
   let session: FreshAgentMultipleDeviceSession['session']
@@ -581,6 +665,7 @@ async function startTwoDeviceSession(
     await mobileContext?.close().catch(() => {})
     await desktopContext.close().catch(() => {})
     await server?.stop().catch(() => {})
+    if (originalServer && originalServer !== server) await originalServer.stop().catch(() => {})
     await fs.rm(root, { recursive: true, force: true }).catch(() => {})
   }
 
@@ -590,12 +675,13 @@ async function startTwoDeviceSession(
       setupHome: async (homeDir) => seedHome(homeDir, provider),
       verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
     })
+    originalServer = server
     info = await server.start()
     mobileContext = await newDeviceContext(browser, true)
     desktopCreatedReplyGate = createCreatedReplyGate()
     mobileCreatedReplyGate = createCreatedReplyGate()
-    await installCreatedReplyGate(desktopContext, info, desktopCreatedReplyGate)
-    await installCreatedReplyGate(mobileContext, info, mobileCreatedReplyGate)
+    await installCreatedReplyGate(desktopContext, info, desktopFrames, desktopCreatedReplyGate)
+    await installCreatedReplyGate(mobileContext, info, mobileFrames, mobileCreatedReplyGate)
     desktopOpen = await openDevicePage(desktopContext, info, desktopFrames, desktopCreatedReplyGate.gate)
     mobileOpen = await openDevicePage(mobileContext, info, mobileFrames, mobileCreatedReplyGate.gate)
 
@@ -611,17 +697,22 @@ async function startTwoDeviceSession(
     await createFreshAgentPane(desktopOpen.page, mode, projectDir)
     const desktopTabId = await desktopOpen.harness.getActiveTabId()
     expect(desktopTabId).toBeTruthy()
+    const desktopLeaf = findFreshAgentLeaf(await desktopOpen.harness.getPaneLayout(desktopTabId!))
+    if (!desktopLeaf?.id) throw new Error('the initial desktop Fresh Agent pane is missing from its tab layout')
+    const desktopViewId = desktopLeaf.content?.viewId ?? desktopLeaf.content?.createRequestId
+    if (typeof desktopViewId !== 'string' || desktopViewId.length === 0) {
+      throw new Error('the initial desktop Fresh Agent pane has no stable view id')
+    }
     desktop = {
       ...desktopOpen,
       tabId: desktopTabId!,
-      paneId: '',
+      paneId: desktopLeaf.id,
+      viewId: desktopViewId,
     }
     await waitForPaneStatus(desktop, /^(connected|idle)$/)
     await sendComposerText(desktop.page, 'stage1 warm session for multiple devices')
     await waitForPaneStatus(desktop, 'idle')
     const sessionId = await waitForFreshAgentSessionId(desktop)
-    const desktopLeaf = findFreshAgentLeaf(await desktop.harness.getPaneLayout(desktop.tabId))
-    desktop.paneId = desktopLeaf.id
     session = { provider, sessionType: mode, sessionId }
 
     const mobileSession = await openFreshAgentView(mobileOpen, sessionId, provider, mode, projectDir)
@@ -649,6 +740,24 @@ async function startTwoDeviceSession(
         const target = deviceName === 'desktop' ? desktopOpen : mobileOpen
         const view = await openFreshAgentView(target, viewSessionId, provider, mode, projectDir)
         return { ...target, ...view }
+      },
+      restartWithDeadTerminalBinding: async () => {
+        if (!server) throw new Error('the owned Rust server is unavailable')
+        const priorInfo = info
+        // Kill only this fixture's owned process tree, edit its durable row
+        // while the index is closed, and boot the same home/port/token again.
+        await server.kill()
+        await seedDeadTerminalBinding(priorInfo, provider, sessionId)
+        server = new RustServer({
+          env,
+          homeDir: priorInfo.homeDir,
+          port: priorInfo.port,
+          token: priorInfo.token,
+          preserveHomeOnStop: true,
+          setupHome: async (homeDir) => seedHome(homeDir, provider),
+          verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+        })
+        info = await server.start()
       },
       close,
     }

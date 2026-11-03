@@ -200,11 +200,10 @@ impl PaneIdentitySink for LedgerIdentitySink {
                 // an unaccepted window.
                 //
                 // LAYER 1 — THIS consult (execution-time truth): refuses
-                // every authoritative write whose handoff transition is
-                // already gone when the closure executes (canceled,
-                // superseded, restored, vacated, foreign epoch). Handles
-                // every post-cancel ARRIVAL, including the `spawn_blocking`
-                // closure that outlived its awaiting task's cancellation.
+                // every claim whose exact Starting, Handoff, or Live owner
+                // no longer owns this provider/key. The captured operation
+                // id and key are immutable; the sink never promotes a later
+                // owner into authority for an old write.
                 //
                 // LAYER 2 — the failed-transition repair (the runner's
                 // abort/failure cleanup, `repair_failed_transition` on this
@@ -222,42 +221,33 @@ impl PaneIdentitySink for LedgerIdentitySink {
                 // its `commit_claim`, so the fence never wedges the
                 // session.
                 //
-                // The (epoch, generation) pair uniquely identifies the
-                // write's own transition (generations advance per
-                // operation on the key), so a state-shape + generation
-                // match proves the write's handoff still owns it:
-                // * `Handoff{generation == w}` — the runner's window (the
-                //   codex/opencode under-ticket writes execute inside it,
-                //   and the claude adoption can race the runner's commit).
-                // * `Live{FreshAgent, generation == w}` — the committed
-                //   target (the claude under-ticket shape, post-commit).
-                // Everything else refuses typed and the recovery row keeps
-                // its rightful owner. Non-authoritative writes never
-                // consult (the r2 ledger matrix governs them unchanged).
-                if upsert.authoritative {
+                let claim = upsert.claim.as_ref();
+                if let Some(claim) = claim {
                     #[cfg(test)]
                     if let Some(park) = authoritative_park.as_ref() {
                         park.wait_for_release();
                     }
                     let stale_transition = || {
                         std::io::Error::other(
-                            "STALE_TRANSITION_BINDING: the authoritative write's \
-                             handoff operation no longer owns the key's transition \
-                             at its generation (canceled, superseded, restored, \
+                            "STALE_TRANSITION_BINDING: the exact binding claim no \
+                             longer owns its provider/key operation (canceled, \
+                             superseded, restored, \
                              vacated, or a new boot epoch) — the write is refused \
                              (kata b8ke focused ep5 r3 F1)",
                         )
                     };
-                    let (Some(w_epoch), Some(w_generation)) =
-                        (upsert.observed_epoch, upsert.observed_generation)
-                    else {
+                    if claim.provider != upsert.provider || claim.session_id != upsert.session_id {
                         return Err(std::io::Error::other(
-                            "STALE_TRANSITION_BINDING: an authoritative write must \
-                             carry its observed (epoch, generation) pair — the \
-                             ownership re-validation cannot run (kata b8ke focused \
-                             ep5 r3 F1)",
+                            "STALE_TRANSITION_BINDING: claim provider/session key does not \
+                             match the binding upsert",
                         ));
-                    };
+                    }
+                    let (w_epoch, w_generation) = (claim.epoch, claim.generation);
+                    if upsert.observed_epoch != Some(w_epoch)
+                        || upsert.observed_generation != Some(w_generation)
+                    {
+                        return Err(stale_transition());
+                    }
                     let Some(registry) = ownership.as_ref() else {
                         return Err(std::io::Error::other(
                             "STALE_TRANSITION_BINDING: an authoritative write \
@@ -269,18 +259,46 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     };
                     let snap = registry.observe(&upsert.provider, &upsert.session_id);
                     let transition_owned = snap.epoch == w_epoch
-                        && match &snap.state {
-                            freshell_ownership::OwnershipState::Handoff {
-                                generation, ..
-                            } => *generation == w_generation,
-                            freshell_ownership::OwnershipState::Live {
-                                owner,
-                                generation,
-                                ..
-                            } => {
+                        && match (claim.kind, &snap.state) {
+                            (
+                                freshell_freshagent::BindingClaimKind::Starting,
+                                freshell_ownership::OwnershipState::Starting {
+                                    kind,
+                                    operation_id,
+                                    generation,
+                                    ..
+                                },
+                            ) => {
+                                *kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && operation_id == &claim.operation_id
+                                    && *generation == w_generation
+                            }
+                            (
+                                freshell_freshagent::BindingClaimKind::Handoff,
+                                freshell_ownership::OwnershipState::Handoff {
+                                    to_kind,
+                                    operation_id,
+                                    generation,
+                                    ..
+                                },
+                            ) => {
+                                *to_kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && operation_id == &claim.operation_id
+                                    && *generation == w_generation
+                            }
+                            (
+                                freshell_freshagent::BindingClaimKind::LiveFreshAgent,
+                                freshell_ownership::OwnershipState::Live {
+                                    owner,
+                                    generation,
+                                    ..
+                                },
+                            ) => {
                                 *generation == w_generation
                                     && owner.kind
                                         == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && owner.ownership_id.as_deref()
+                                        == Some(claim.operation_id.as_str())
                             }
                             _ => false,
                         };
@@ -290,6 +308,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                             session_id = %upsert.session_id,
                             write_epoch = w_epoch,
                             write_generation = w_generation,
+                            write_operation_id = %claim.operation_id,
                             snapshot_epoch = snap.epoch,
                             snapshot_generation = snap.generation,
                             "identity_sink.authoritative_binding_refused_stale_transition: \
@@ -331,8 +350,12 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     }
                 };
                 let stored_genesis = upsert.genesis.stored_value();
+                let settings = match &upsert.settings {
+                    freshell_freshagent::SettingsUpdate::Keep => None,
+                    freshell_freshagent::SettingsUpdate::Replace(settings) => Some(settings),
+                };
                 let w = FreshAgentBindingWrite {
-                    collaboration_mode: upsert.settings.collaboration_mode.as_deref(),
+                    collaboration_mode: settings.and_then(|s| s.collaboration_mode.as_deref()),
                     genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
                         stored_genesis.as_ref(),
                         upsert.genesis.is_clear(),
@@ -340,28 +363,26 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
                     mode: &upsert.mode,
-                    cwd: upsert.settings.cwd.as_deref(),
+                    cwd: settings.and_then(|s| s.cwd.as_deref()),
                     create_request_id: upsert.create_request_id.as_deref(),
-                    model: upsert.settings.model.as_deref(),
-                    sandbox: upsert.settings.sandbox.as_deref(),
-                    permission_mode: upsert.settings.permission_mode.as_deref(),
-                    effort: upsert.settings.effort.as_deref(),
-                    plugins: upsert.settings.plugins.as_deref(),
+                    model: settings.and_then(|s| s.model.as_deref()),
+                    sandbox: settings.and_then(|s| s.sandbox.as_deref()),
+                    permission_mode: settings.and_then(|s| s.permission_mode.as_deref()),
+                    effort: settings.and_then(|s| s.effort.as_deref()),
+                    plugins: settings.and_then(|s| s.plugins.as_deref()),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance,
                     // b8ke ext r22 F2: the upsert's observed (epoch,
                     // generation) pair threads into the ledger write —
                     // the delayed-write fence (the write path refuses
                     // typed on a stale pair).
-                    observed_epoch: upsert.observed_epoch,
-                    observed_generation: upsert.observed_generation,
-                    // b8ke focused ep5 r2 F1: the runner-supplied target
-                    // binding marker threads through (the terminal-row
-                    // guard's authoritative arm).
-                    authoritative: upsert.authoritative,
+                    observed_epoch: claim.map(|claim| claim.epoch).or(upsert.observed_epoch),
+                    observed_generation: claim
+                        .map(|claim| claim.generation)
+                        .or(upsert.observed_generation),
                     now_ms: now,
                 };
-                ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
+                ledger.record_fresh_agent_binding_claimed(&w, claim, &upsert.settings)?;
                 // kata 1wxv Task 4 (r1 discipline): on the CLAUDE fork-adoption
                 // leg (`supersedes` = the pre-rollback durable id) the rollback
                 // row re-keys old→new inside the SAME awaited batch as the
@@ -779,15 +800,20 @@ impl PaneIdentitySink for LedgerIdentitySink {
         &self,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         epoch: u64,
         generation: u64,
     ) -> SinkWrite {
         let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
+        let (p, s, op) = (
+            provider.to_string(),
+            session_id.to_string(),
+            operation_id.to_string(),
+        );
         let now = now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
+                ledger.repair_failed_transition_binding(&p, &s, &op, epoch, generation, now)
             })
             .await
             .map_err(std::io::Error::other)?
@@ -823,8 +849,111 @@ impl PaneIdentitySink for LedgerIdentitySink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_freshagent::{FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink};
+    use freshell_freshagent::{
+        BindingClaim, BindingClaimKind, FreshAgentBindingUpsert, FreshAgentSettings,
+        PaneIdentitySink, SettingsUpdate,
+    };
     use std::sync::Arc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn valid_starting_claim_replaces_dead_terminal_bindings_and_preserves_settings() {
+        use freshell_ownership::{BeginOutcome, RuntimeOwnerKind, RuntimeOwnershipRegistry};
+
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let epoch = registry.boot_epoch();
+
+        for (session_id, prior_pair) in [
+            ("dead-terminal-unstamped", None),
+            ("dead-terminal-stamped", Some((epoch, 0))),
+        ] {
+            let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                root.path().into(),
+            )));
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id,
+                    terminal_id: "dead-terminal-process",
+                    mode: "claude",
+                    cwd: Some("/workspace"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: prior_pair.map(|pair| pair.0),
+                    observed_generation: prior_pair.map(|pair| pair.1),
+                    now_ms: 100,
+                })
+                .expect("historical terminal row seeds");
+
+            // Historical terminal-shaped rows can still carry settings from
+            // an earlier fresh-agent binding. Reopen the ledger after editing
+            // the on-disk fixture so the test exercises its normal load path.
+            let row_path = root
+                .path()
+                .join("bindings/claude")
+                .join(format!("{session_id}.json"));
+            let mut row: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&row_path).unwrap()).unwrap();
+            row["model"] = serde_json::Value::String("remembered-model".into());
+            std::fs::write(&row_path, serde_json::to_vec(&row).unwrap()).unwrap();
+            drop(ledger);
+
+            let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                root.path().into(),
+            )));
+            let operation_id = format!("recover-{session_id}");
+            let generation = match registry.begin_start(
+                "claude",
+                session_id,
+                RuntimeOwnerKind::FreshAgent,
+                &operation_id,
+                None,
+                "test-dead-binding-recovery",
+                0,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("dead terminal binding should be claimable: {other:?}"),
+            };
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+            sink.record_binding(FreshAgentBindingUpsert {
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
+                name_transition: None,
+                provider: "claude".into(),
+                session_id: session_id.into(),
+                mode: "freshclaude".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(epoch),
+                observed_generation: Some(generation),
+                claim: Some(BindingClaim {
+                    provider: "claude".into(),
+                    session_id: session_id.into(),
+                    operation_id,
+                    epoch,
+                    generation,
+                    kind: BindingClaimKind::Starting,
+                }),
+                settings: SettingsUpdate::Keep,
+            })
+            .await
+            .expect("the current Starting claim heals a dead terminal row");
+
+            let row = ledger
+                .load_binding("claude", session_id)
+                .expect("the recovered identity row remains durable");
+            assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+            assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+            assert_eq!(row.live_terminal_id, None);
+            assert_eq!(
+                (row.owner_epoch, row.owner_generation),
+                (Some(epoch), Some(generation))
+            );
+            assert_eq!(row.model.as_deref(), Some("remembered-model"));
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn task008_settings_complete_codex_defaults_survive_the_actual_ledger_restart() {
@@ -854,8 +983,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: Some(11),
             observed_generation: Some(3),
-            authoritative: false,
-            settings: settings.clone(),
+            claim: None,
+            settings: SettingsUpdate::Replace(settings.clone()),
         })
         .await
         .unwrap();
@@ -896,11 +1025,11 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 collaboration_mode: Some("plan".into()),
                 ..Default::default()
-            },
+            }),
         })
         .await
         .unwrap();
@@ -934,8 +1063,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 collaboration_mode: None,
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -943,7 +1072,7 @@ mod tests {
                 effort: None,
                 cwd: Some("/w".into()),
                 plugins: None,
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -982,8 +1111,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("binding write succeeds");
@@ -1061,11 +1190,11 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 plugins: Some(plugins.clone()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -1115,11 +1244,11 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         };
         for (id, supersedes) in [("s-a", None), ("s-c", Some("s-a")), ("s-d", Some("s-c"))] {
             sink.record_binding(upsert(id, supersedes))
@@ -1169,11 +1298,11 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 model: model.map(str::to_string),
                 ..FreshAgentSettings::default()
-            },
+            }),
         };
         sink.record_binding(upsert(
             freshell_freshagent::GenesisUpdate::Set(fork.clone()),
@@ -1303,8 +1432,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("binding writes keep their existing disabled-ledger policy");
@@ -1355,8 +1484,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: settings.clone(),
+            claim: None,
+            settings: SettingsUpdate::Replace(settings.clone()),
         })
         .await
         .expect("claude adoption binding write");
@@ -1380,11 +1509,11 @@ mod tests {
             resolves_pending: None,
             supersedes: Some("old-thread".into()),
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
-            settings,
+            settings: SettingsUpdate::Replace(settings),
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
+            claim: None,
         })
         .await
         .expect("codex crash-respawn binding write");
@@ -1429,11 +1558,11 @@ mod tests {
             observed_epoch: Some(EPOCH),
             observed_generation: Some(3),
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 model: Some("old-model".into()),
                 ..Default::default()
-            },
+            }),
         })
         .await
         .expect("the pre-handoff row writes");
@@ -1453,11 +1582,11 @@ mod tests {
             observed_epoch: Some(EPOCH),
             observed_generation: Some(4),
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 model: Some("new-owner-model".into()),
                 ..Default::default()
-            },
+            }),
         })
         .await
         .expect("the handoff target's stamped write lands");
@@ -1478,11 +1607,11 @@ mod tests {
                 observed_epoch: Some(EPOCH),
                 observed_generation: Some(3),
 
-                authoritative: false,
-                settings: FreshAgentSettings {
+                claim: None,
+                settings: SettingsUpdate::Replace(FreshAgentSettings {
                     model: Some("stale-writer-model".into()),
                     ..Default::default()
-                },
+                }),
             })
             .await
             .expect_err("the delayed prior-generation write is refused typed");
@@ -1535,8 +1664,8 @@ mod tests {
             observed_epoch: Some(EPOCH),
             observed_generation: Some(3),
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("the pre-handoff row writes");
@@ -1578,8 +1707,8 @@ mod tests {
                 observed_epoch: Some(EPOCH),
                 observed_generation: Some(3),
 
-                authoritative: false,
-                settings: FreshAgentSettings::default(),
+                claim: None,
+                settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
             })
             .await
             .expect_err("the stale fenced compensation is refused typed");
@@ -1673,7 +1802,7 @@ mod tests {
         fn authoritative_upsert(
             epoch: u64,
             generation: u64,
-            authoritative: bool,
+            operation_id: Option<&str>,
         ) -> FreshAgentBindingUpsert {
             FreshAgentBindingUpsert {
                 genesis: freshell_freshagent::GenesisUpdate::Keep,
@@ -1687,11 +1816,42 @@ mod tests {
                 provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
                 observed_epoch: Some(epoch),
                 observed_generation: Some(generation),
-                authoritative,
-                settings: FreshAgentSettings {
+                claim: operation_id.map(|operation_id| {
+                    BindingClaim::handoff("claude", SID, operation_id, epoch, generation)
+                }),
+                settings: SettingsUpdate::Replace(FreshAgentSettings {
                     model: Some("stale-or-current".into()),
                     ..Default::default()
-                },
+                }),
+            }
+        }
+
+        fn starting_upsert(
+            epoch: u64,
+            generation: u64,
+            operation_id: &str,
+        ) -> FreshAgentBindingUpsert {
+            FreshAgentBindingUpsert {
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
+                name_transition: None,
+                provider: "claude".into(),
+                session_id: SID.into(),
+                mode: "freshclaude".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(epoch),
+                observed_generation: Some(generation),
+                claim: Some(BindingClaim {
+                    provider: "claude".into(),
+                    session_id: SID.into(),
+                    operation_id: operation_id.into(),
+                    epoch,
+                    generation,
+                    kind: BindingClaimKind::Starting,
+                }),
+                settings: SettingsUpdate::Keep,
             }
         }
 
@@ -1757,8 +1917,12 @@ mod tests {
                 .with_authoritative_park(park.clone());
             let write_epoch = registry.boot_epoch();
             let write = tokio::spawn(async move {
-                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
-                    .await
+                sink.record_binding(authoritative_upsert(
+                    write_epoch,
+                    generation,
+                    Some("op-handoff-1"),
+                ))
+                .await
             });
             while !park.reached() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1818,8 +1982,12 @@ mod tests {
                 .with_authoritative_park(park.clone());
             let write_epoch = registry.boot_epoch();
             let write = tokio::spawn(async move {
-                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
-                    .await
+                sink.record_binding(authoritative_upsert(
+                    write_epoch,
+                    generation,
+                    Some("op-handoff-1"),
+                ))
+                .await
             });
             while !park.reached() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1929,8 +2097,12 @@ mod tests {
                 .with_authoritative_park(park.clone());
             let write_epoch = registry.boot_epoch();
             let write = tokio::spawn(async move {
-                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
-                    .await
+                sink.record_binding(authoritative_upsert(
+                    write_epoch,
+                    generation,
+                    Some("op-handoff-1"),
+                ))
+                .await
             });
             while !park.reached() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1971,11 +2143,19 @@ mod tests {
                 CommitOutcome::Committed
             );
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(
-                    registry.boot_epoch(),
-                    generation_2,
-                    true,
-                ))
+                .record_binding({
+                    let epoch = registry.boot_epoch();
+                    let mut upsert =
+                        authoritative_upsert(epoch, generation_2, Some("op-handoff-2"));
+                    upsert.claim = Some(BindingClaim::live_fresh_agent(
+                        "claude",
+                        SID,
+                        "own-x",
+                        epoch,
+                        generation_2,
+                    ));
+                    upsert
+                })
                 .await
                 .expect("the post-commit authoritative write lands");
         }
@@ -2022,7 +2202,7 @@ mod tests {
                 .record_binding(authoritative_upsert(
                     registry.boot_epoch(),
                     generation,
-                    true,
+                    Some("op-handoff-1"),
                 ))
                 .await
                 .expect_err("the superseded handoff's stale write is refused");
@@ -2044,7 +2224,7 @@ mod tests {
 
             // VACANT (no record at all): refused.
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(epoch, 2, true))
+                .record_binding(authoritative_upsert(epoch, 2, Some("never-started")))
                 .await
                 .expect_err("an authoritative write over a vacant key is refused");
 
@@ -2054,14 +2234,18 @@ mod tests {
             let generation = drive_handoff_window(&registry, "op-handoff-x");
             assert_eq!(generation, 1);
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(epoch, 2, true))
+                .record_binding(authoritative_upsert(epoch, 2, Some("op-handoff-x")))
                 .await
                 .expect_err("an authoritative write naming a foreign generation is refused");
 
             // EPOCH MISMATCH (a pre-restart pair against this boot's
             // registry): refused.
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(epoch + 1, generation, true))
+                .record_binding(authoritative_upsert(
+                    epoch + 1,
+                    generation,
+                    Some("op-handoff-x"),
+                ))
                 .await
                 .expect_err("an authoritative write from a foreign boot epoch is refused");
 
@@ -2069,7 +2253,7 @@ mod tests {
             // (epoch, generation) cannot re-validate — refused.
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
                 .record_binding({
-                    let mut u = authoritative_upsert(epoch, generation, true);
+                    let mut u = authoritative_upsert(epoch, generation, Some("op-handoff-x"));
                     u.observed_generation = None;
                     u
                 })
@@ -2080,7 +2264,11 @@ mod tests {
             // all): an authoritative marker only ever comes from
             // coordinator-driven handoff lanes — fail closed.
             LedgerIdentitySink::new(ledger.clone(), None)
-                .record_binding(authoritative_upsert(epoch, generation, true))
+                .record_binding(authoritative_upsert(
+                    epoch,
+                    generation,
+                    Some("op-handoff-x"),
+                ))
                 .await
                 .expect_err("an authoritative write over an unwired bridge is refused");
 
@@ -2107,7 +2295,7 @@ mod tests {
             // Fresh row, coordinator Vacant: the ordinary lane write lands
             // (the consult never fires for authoritative: false).
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(epoch, 0, false))
+                .record_binding(authoritative_upsert(epoch, 0, None))
                 .await
                 .expect("the non-authoritative write lands over a fresh row");
             assert!(ledger.load_binding("claude", SID).is_some());
@@ -2120,7 +2308,7 @@ mod tests {
             )));
             seed_terminal_row(&ledger2, "t-plain");
             let err = LedgerIdentitySink::new(ledger2.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(epoch, 0, false))
+                .record_binding(authoritative_upsert(epoch, 0, None))
                 .await
                 .expect_err("the ledger's own terminal-row guard refuses it");
             assert!(
@@ -2154,8 +2342,12 @@ mod tests {
                 .with_authoritative_park_after_validation(park.clone());
             let write_epoch = registry.boot_epoch();
             let write = tokio::spawn(async move {
-                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
-                    .await
+                sink.record_binding(authoritative_upsert(
+                    write_epoch,
+                    generation,
+                    Some("op-handoff-vc"),
+                ))
+                .await
             });
             while !park.reached() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2166,7 +2358,7 @@ mod tests {
             // fails with the restore.
             let repair_sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
             repair_sink
-                .repair_failed_transition("claude", SID, write_epoch, generation)
+                .repair_failed_transition("claude", SID, "op-handoff-vc", write_epoch, generation)
                 .await
                 .expect("the cleanup's repair lands");
             assert_eq!(
@@ -2186,6 +2378,11 @@ mod tests {
             );
             let row = ledger.load_binding("claude", SID).expect("the row");
             assert_eq!(
+                row.state,
+                freshell_ws::pane_ledger::RowState::Bound,
+                "the restored terminal remains recoverable after the canceled write: {row:?}"
+            );
+            assert_eq!(
                 row.pane_kind, None,
                 "the reaped target's fresh-agent metadata never landed: {row:?}"
             );
@@ -2197,6 +2394,241 @@ mod tests {
             // The durable fence is fed (a still-in-flight sibling closure
             // from the same transition would face it too).
             assert!(ledger.kill_tombstone_at("claude", SID).is_some());
+        }
+
+        /// The same validated-then-canceled race applies to a lane-owned
+        /// Starting claim. Its repair must land before the claim is released:
+        /// a terminal can then take ownership, and the old already-validated
+        /// closure is suppressed by the scoped tombstone instead of replacing
+        /// an unstamped terminal row.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn validated_starting_write_is_repaired_before_terminal_owner_can_take_over() {
+            use freshell_ownership::{BeginOutcome, FailOutcome};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            seed_terminal_row(&ledger, "t-original");
+            let epoch = registry.boot_epoch();
+            let operation_id = "op-start-canceled";
+            let generation = match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                None,
+                "test-start-cancellation",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the start claim must be granted: {other:?}"),
+            };
+
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park_after_validation(park.clone());
+            let write = tokio::spawn(async move {
+                sink.record_binding(starting_upsert(epoch, generation, operation_id))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .repair_failed_transition("claude", SID, operation_id, epoch, generation)
+                .await
+                .expect("the canceled start's durable repair lands before release");
+            assert_eq!(
+                registry.fail("claude", SID, operation_id, generation, false),
+                FailOutcome::Released,
+                "the Starting ticket releases only after the durable fence is installed"
+            );
+
+            let terminal_generation = match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::Terminal,
+                "op-terminal-after-start",
+                None,
+                "test-terminal-attach",
+                EPOCH_MS + 1,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the terminal may claim after repair: {other:?}"),
+            };
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    "op-terminal-after-start",
+                    terminal_generation,
+                    terminal_owner("t-new"),
+                ),
+                CommitOutcome::Committed
+            );
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: SID,
+                    terminal_id: "t-new",
+                    mode: "claude",
+                    cwd: Some("/w-new"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: Some(epoch),
+                    observed_generation: Some(terminal_generation),
+                    now_ms: 200,
+                })
+                .expect("the terminal owner writes its newer recovery row");
+
+            park.release();
+            write
+                .await
+                .expect("the delayed write task joins")
+                .expect("the tombstone suppresses the already-validated old write without error");
+            let row = ledger
+                .load_binding("claude", SID)
+                .expect("terminal row remains");
+            assert_eq!(
+                row.state,
+                freshell_ws::pane_ledger::RowState::Bound,
+                "the new terminal remains recoverable after the canceled write: {row:?}"
+            );
+            assert_eq!(row.pane_kind, None, "no stale FreshAgent row: {row:?}");
+            assert_eq!(row.live_terminal_id.as_deref(), Some("t-new"), "{row:?}");
+            assert_eq!(row.cwd.as_deref(), Some("/w-new"), "{row:?}");
+            assert!(ledger.kill_tombstone_at("claude", SID).is_some());
+        }
+
+        /// If durable repair itself fails after the old Starting commit has
+        /// already gone stale, the ledger keeps an exact process-local fence
+        /// for that operation. It suppresses the parked old closure while a
+        /// newer terminal owner writes normally.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn failed_repair_after_stale_start_commit_keeps_exact_late_write_fence() {
+            use freshell_ownership::{BeginOutcome, CommitOutcome, FailOutcome};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            seed_terminal_row(&ledger, "t-original");
+            let epoch = registry.boot_epoch();
+            let operation_id = "op-start-stale-commit";
+            let generation = match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                None,
+                "test-start-stale-commit",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the start claim must be granted: {other:?}"),
+            };
+
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park_after_validation(park.clone());
+            let write = tokio::spawn(async move {
+                sink.record_binding(starting_upsert(epoch, generation, operation_id))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            assert_eq!(
+                registry.fail("claude", SID, operation_id, generation, false),
+                FailOutcome::Released
+            );
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    operation_id,
+                    generation,
+                    OwnerIdentity {
+                        kind: RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(SID.into()),
+                        pid: None,
+                        ownership_id: Some(operation_id.into()),
+                    },
+                ),
+                CommitOutcome::ForeignOperation,
+                "the old Starting commit is stale after cancellation"
+            );
+
+            // Force the durable close-envelope write to fail: atomic rename
+            // cannot replace a directory at the exact encoded journal path.
+            let blocked_envelope = tmp
+                .path()
+                .join("close-envelopes")
+                .join("claude%3Ases-ep5-r3.json");
+            std::fs::create_dir_all(&blocked_envelope).unwrap();
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .repair_failed_transition("claude", SID, operation_id, epoch, generation)
+                .await
+                .expect_err("the obstructed durable repair must fail");
+
+            // The failed start no longer owns the registry, so a terminal is
+            // admitted. Its newer recovery row must survive the old closure.
+            let terminal_generation = match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::Terminal,
+                "op-terminal-after-repair-error",
+                None,
+                "test-terminal-attach",
+                EPOCH_MS + 1,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the terminal start must be granted: {other:?}"),
+            };
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    "op-terminal-after-repair-error",
+                    terminal_generation,
+                    terminal_owner("t-after-repair-error"),
+                ),
+                CommitOutcome::Committed
+            );
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: SID,
+                    terminal_id: "t-after-repair-error",
+                    mode: "claude",
+                    cwd: Some("/terminal-after-repair-error"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: Some(epoch),
+                    observed_generation: Some(terminal_generation),
+                    now_ms: 300,
+                })
+                .expect("the newer terminal row writes despite the repair failure");
+
+            park.release();
+            write
+                .await
+                .expect("the delayed write task joins")
+                .expect("the exact failed-operation fence suppresses its late mutation");
+            let row = ledger
+                .load_binding("claude", SID)
+                .expect("terminal row remains");
+            assert_eq!(row.pane_kind, None, "no old fresh-agent row: {row:?}");
+            assert_eq!(
+                row.live_terminal_id.as_deref(),
+                Some("t-after-repair-error"),
+                "a repair failure leaves the newer owner untouched: {row:?}"
+            );
+            assert_eq!(row.cwd.as_deref(), Some("/terminal-after-repair-error"));
         }
 
         /// b8ke focused ep5 r4 F1 — the COMPLETED-THEN-CANCELED ordering
@@ -2220,7 +2652,11 @@ mod tests {
             // The write completes, live handoff — the row becomes the
             // target's (legitimate AT THIS MOMENT).
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .record_binding(authoritative_upsert(epoch, generation, true))
+                .record_binding(authoritative_upsert(
+                    epoch,
+                    generation,
+                    Some("op-handoff-cc"),
+                ))
                 .await
                 .expect("the in-window write completes");
             let row = ledger.load_binding("claude", SID).expect("the row");
@@ -2229,7 +2665,7 @@ mod tests {
             // THE CANCEL (the abort cleanup's order): the repair, then the
             // restore-fail.
             LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
-                .repair_failed_transition("claude", SID, epoch, generation)
+                .repair_failed_transition("claude", SID, "op-handoff-cc", epoch, generation)
                 .await
                 .expect("the cleanup's repair lands");
             assert_eq!(
@@ -2293,7 +2729,7 @@ mod tests {
                 .record_binding(authoritative_upsert(
                     registry.boot_epoch(),
                     generation,
-                    true,
+                    Some("op-handoff-1"),
                 ))
                 .await
                 .expect_err("the equal-pair authoritative write is refused by the ledger");
@@ -2442,11 +2878,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -2490,11 +2926,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -2551,8 +2987,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("awaited write succeeds");
@@ -2578,8 +3014,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("awaited conn-less refresh succeeds");
@@ -2602,11 +3038,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -2669,11 +3105,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         };
         sink.record_binding(upsert(freshell_freshagent::ProvenanceUpdate::Replace(
             freshell_freshagent::BindProvenance {
@@ -2731,8 +3167,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("awaited write succeeds");
@@ -2776,11 +3212,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -2867,11 +3303,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         };
         sink.record_binding(bind("ses_x", "cr-x"))
             .await
@@ -2994,11 +3430,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("awaited write succeeds");
@@ -3045,11 +3481,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("seed write");
@@ -3113,11 +3549,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         })
         .await
         .expect("row write");
@@ -3212,11 +3648,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         };
 
         // Sequential sanity: kill first (no row yet — the finding's shape),
@@ -3309,11 +3745,11 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings {
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
-            },
+            }),
         };
 
         sink.record_binding(upsert("revive-1"))
@@ -3435,8 +3871,8 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: FreshAgentSettings::default(),
+            claim: None,
+            settings: SettingsUpdate::Replace(FreshAgentSettings::default()),
         })
         .await
         .expect("awaited write succeeds");

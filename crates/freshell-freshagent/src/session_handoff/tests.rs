@@ -5833,8 +5833,12 @@ async fn handoff_abort_of_a_fresh_target_fires_the_failed_transition_repair() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let generation = match rig.ownership.observe("claude", &sid).state {
-        OwnershipState::Handoff { generation, .. } => generation,
+    let (operation_id, generation) = match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Handoff {
+            operation_id,
+            generation,
+            ..
+        } => (operation_id, generation),
         other => panic!("expected the Handoff window, got {other:?}"),
     };
 
@@ -5849,17 +5853,17 @@ async fn handoff_abort_of_a_fresh_target_fires_the_failed_transition_repair() {
     })
     .await;
 
-    // THE REPAIR FIRED with the transition's own pair: (provider, sid,
-    // boot epoch, handoff generation).
+    // THE REPAIR FIRED with the transition's exact identity and pair.
     let repairs = fake.repairs.lock().expect("repairs lock").clone();
     assert!(
         repairs.contains(&(
             "claude".to_string(),
             sid.clone(),
+            operation_id,
             rig.ownership.boot_epoch(),
             generation
         )),
-        "the failed transition's repair fired with its own (epoch, generation): \
+        "the failed transition's repair fired with its exact op id and pair: \
          {repairs:?} (boot epoch {}, handoff generation {generation})",
         rig.ownership.boot_epoch()
     );
@@ -6354,14 +6358,17 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
             "the under-ticket adoption stamps the SUPPLIED handoff generation — \
              pre-r27 it carried None (the adoption holds no own ticket)"
         );
-        // b8ke focused ep5 r2 F1: the under-ticket target binding carries
-        // the AUTHORITATIVE marker (the handoff runner's own target
-        // binding — the ledger's terminal-row guard accepts it over the
-        // prior terminal's normal UNSTAMPED row).
-        assert!(
-            target_binding.authoritative,
-            "the under-ticket target binding is the runner's authoritative write: \
-             {target_binding:?}"
+        let claim = target_binding
+            .claim
+            .as_ref()
+            .expect("the under-ticket binding carries an exact claim");
+        assert_eq!(claim.kind, crate::identity_sink::BindingClaimKind::Handoff);
+        assert_eq!(claim.provider, "claude");
+        assert_eq!(claim.session_id, sid);
+        assert!(!claim.operation_id.is_empty());
+        assert_eq!(
+            (claim.epoch, claim.generation),
+            (rig.ownership.boot_epoch(), committed_generation)
         );
     }
 

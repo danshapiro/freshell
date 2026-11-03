@@ -12,21 +12,72 @@ impl FreshClaudeState {
         create_request_id: Option<&str>,
         provenance: Option<&crate::BindProvenance>,
         ticket: &Option<freshell_ownership::OperationTicket>,
+        transition_claim: Option<&crate::identity_sink::BindingClaim>,
+        settings_update: crate::identity_sink::SettingsUpdate,
     ) -> std::io::Result<()> {
         let Some(sink) = self.identity_sink() else {
             return Ok(());
         };
-        let (settings, genesis, owning_generation) = {
+        let (genesis, owning_generation, pid) = {
             let sessions = self.sessions.lock().await;
             let session = sessions.get(session_id).ok_or_else(|| {
                 std::io::Error::other("Claude stopped while recording its create identity")
             })?;
             (
-                session.configuration.settings.clone(),
                 session.launch_genesis.clone(),
                 session.owning_generation,
+                session.child.id(),
             )
         };
+        let claim = ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| transition_claim.cloned())
+            .or_else(|| {
+                let _registry = self.ownership.as_ref()?;
+                let stamp =
+                    crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, session_id)?;
+                // A session's sidecar tag is a process-cleanup identity, not
+                // the coordinator operation id. Adoption can authorize an
+                // identity-only write only from the exact retained stamp for
+                // this still-current live runtime.
+                if stamp.owner.ownership_id.as_deref() != Some(stamp.operation_id.as_str()) {
+                    return None;
+                }
+                let current = crate::ownership_lane::current_local_snapshot_owner(
+                    &self.ownership,
+                    &self.ownership_stamps,
+                    PROVIDER,
+                    session_id,
+                    session_id,
+                    pid,
+                )?;
+                Some(crate::identity_sink::BindingClaim::live_fresh_agent(
+                    PROVIDER,
+                    session_id,
+                    &stamp.operation_id,
+                    current.epoch,
+                    current.generation,
+                ))
+            });
+        // `adopt_live_create` has no start ticket: its only authority is the
+        // retained stamp for the already-live runtime. If the wired
+        // coordinator cannot prove that exact owner still matches, refuse
+        // instead of downgrading to a pair-only/unfenced binding write.
+        if self.ownership.is_some()
+            && ticket.is_none()
+            && transition_claim.is_none()
+            && claim.is_none()
+        {
+            return Err(std::io::Error::other(
+                "Claude live adoption has no current exact ownership stamp",
+            ));
+        }
         let generation = ticket
             .as_ref()
             .map(|ticket| ticket.generation())
@@ -43,14 +94,13 @@ impl FreshClaudeState {
                 crate::identity_sink::GenesisUpdate::Set(recorded.genesis)
             }),
             provenance: provenance.cloned().into(),
-            observed_epoch: generation.and(
-                self.ownership
-                    .as_ref()
-                    .map(|registry| registry.boot_epoch()),
-            ),
-            observed_generation: generation,
-            authoritative: ticket.is_none() && owning_generation.is_some(),
-            settings,
+            observed_epoch: claim
+                .as_ref()
+                .map(|claim| claim.epoch)
+                .or_else(|| generation.and(self.ownership.as_ref().map(|r| r.boot_epoch()))),
+            observed_generation: claim.as_ref().map(|claim| claim.generation).or(generation),
+            claim,
+            settings: settings_update,
         })
         .await
     }
@@ -191,8 +241,8 @@ impl FreshClaudeState {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: stamp.as_ref().map(|stamp| stamp.epoch),
             observed_generation: stamp.as_ref().map(|stamp| stamp.generation),
-            authoritative: false,
-            settings,
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(settings),
         })
         .await?;
         tracing::debug!(target: "freshell_freshagent::claude",

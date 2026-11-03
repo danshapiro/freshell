@@ -801,6 +801,10 @@ function attachmentAttemptKey(
     content.createRequestId,
     content.reconcileEpoch ?? 0,
     state.connection.bootId ?? null,
+    // Each successful ready handshake is a distinct attachment opportunity,
+    // including same-server transport reconnects. The boot id alone cannot
+    // distinguish those from a duplicate boot-id effect for the same ready.
+    state.connection.readySequence ?? 0,
     decisionSerial,
   ])
 }
@@ -812,8 +816,29 @@ function captureAttachmentAttempt(
   decisionSerial: number,
 ): AttachmentAttempt {
   const key = attachmentAttemptKey(state, content, decisionSerial)
-  if (previous?.key === key && previous.fence) return previous
-  return { key, content, fence: selectPaneOwnerFence(state, content) }
+  const fence = selectPaneOwnerFence(state, content)
+  if (previous?.key === key && (previous.fence || !fence)) return previous
+  return { key, content, fence }
+}
+
+function attachmentSendKey(attempt: AttachmentAttempt): string {
+  return JSON.stringify([attempt.key, attempt.fence?.epoch ?? null, attempt.fence?.generation ?? null])
+}
+
+function currentAttachmentPaneContent(
+  state: ReturnType<AppStore['getState']>,
+  tabId: string,
+  paneId: string,
+  rendered: FreshAgentPaneContent,
+): FreshAgentPaneContent {
+  const layout = state.panes.layouts[tabId]
+  const current = layout && findPaneContent(layout, paneId)
+  // Reconcile can update Redux before React commits the new pane props. Both
+  // automatic producers must observe the same persisted round for this view.
+  if (current?.kind === 'fresh-agent'
+    && current.createRequestId === rendered.createRequestId
+    && (current.viewId ?? current.createRequestId) === (rendered.viewId ?? rendered.createRequestId)) return current
+  return rendered
 }
 
 function buildFreshAgentAttachMessage(
@@ -1329,6 +1354,7 @@ export function FreshAgentView({
     const canonical = resolveCanonicalPaneSession(state, paneContent)
     return canonical ? selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId) : undefined
   })
+  const previousRuntimeOwnerRef = useRef<RuntimeOwnerRecord | undefined>(runtimeOwner)
   const ownerDivergence = derivePaneOwnerDivergence(runtimeOwner, 'fresh-agent')
   const ownerDivergenceRef = useRef(ownerDivergence)
   ownerDivergenceRef.current = ownerDivergence
@@ -1990,6 +2016,8 @@ export function FreshAgentView({
   // key changes for a new durable identity, create round, server boot, or
   // explicit recovery decision; queued/timer retries keep the same attempt.
   const attachmentAttemptRef = useRef<AttachmentAttempt | null>(null)
+  const blockedAttachmentAttemptRef = useRef<{ attempt: AttachmentAttempt, owner: RuntimeOwnerRecord } | null>(null)
+  const lastConnectionAttachSentKeyRef = useRef<string | null>(null)
   const attachDecisionSerialRef = useRef(0)
   const previousLifecycleBlockedRef = useRef(lifecycleBlocked)
   // Pre-verdict create wait (fresh-agent leg of Task 8's pattern): a pane
@@ -2221,23 +2249,25 @@ export function FreshAgentView({
   // suppressed, so reaction handlers that follow the attach with more
   // sends (the lost-session retry's resend) can skip them.
   const captureFreshAgentAttachmentAttempt = useCallback((content: FreshAgentPaneContent) => {
+    const state = appStore.getState()
     const attempt = captureAttachmentAttempt(
-      appStore.getState(),
-      content,
+      state,
+      currentAttachmentPaneContent(state, tabId, paneId, content),
       attachmentAttemptRef.current,
       attachDecisionSerialRef.current,
     )
+    if (attachmentAttemptRef.current !== attempt) blockedAttachmentAttemptRef.current = null
     attachmentAttemptRef.current = attempt
     return attempt
-  }, [appStore])
+  }, [appStore, paneId, tabId])
 
   const sendFencedFreshAgentAttach = useCallback((attempt: AttachmentAttempt): boolean => {
-    const content = paneContentRef.current
-    if (!isMountedRef.current || !content.sessionId || isFreshAgentLifecycleBlocked(content)) return false
     // One state read (review N1): the suppression check and the current-round
     // identity check observe the same store snapshot — nothing dispatches in
     // between. A queued callback may never upgrade itself to a newer fence.
     const state = appStore.getState()
+    const content = currentAttachmentPaneContent(state, tabId, paneId, paneContentRef.current)
+    if (!isMountedRef.current || !content.sessionId || isFreshAgentLifecycleBlocked(content)) return false
     // Close marks are set before detach and remain through durable close
     // evidence. Rebind/reconnect work already queued before the close must
     // re-check here, at the actual send boundary, so it cannot restore this
@@ -2245,17 +2275,42 @@ export function FreshAgentView({
     if (isPaneClosePending(state.panes, tabId, paneId)) return false
     if (attachmentAttemptRef.current !== attempt) return false
     if (attachmentAttemptKey(state, content, attachDecisionSerialRef.current) !== attempt.key) return false
-    if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence)) return false
+    if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence)) {
+      const canonical = resolveCanonicalPaneSession(state, content)
+      const owner = canonical && selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
+      if (owner?.transition === 'handoff-started') {
+        // The sender can observe Starting even if React batches it with Live
+        // before the next render. Retain the exact blocked decision so that
+        // completing this owner can re-arm it without reviving stale work.
+        blockedAttachmentAttemptRef.current = { attempt, owner }
+      }
+      return false
+    }
     const cwd = getFreshOpenCodeRouteCwd(attempt.content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     sendFreshAgentMessage(buildFreshAgentAttachMessage(attempt.content, { tabId, paneId }, cwd, attempt.fence))
+    blockedAttachmentAttemptRef.current = null
     return true
   }, [appStore, paneId, sendFreshAgentMessage, tabId])
 
+  const sendConnectionFreshAgentAttach = useCallback((attempt: AttachmentAttempt): boolean => {
+    // The boot-id effect and WsClient's onReconnect callback both observe the
+    // same ready handshake. Collapse those duplicate producers by the exact
+    // attachment decision and captured fence, while keeping a new ready,
+    // fence, create/reconcile round, or explicit decision distinct.
+    const key = attachmentSendKey(attempt)
+    if (lastConnectionAttachSentKeyRef.current === key) return true
+    const sent = sendFencedFreshAgentAttach(attempt)
+    if (sent) lastConnectionAttachSentKeyRef.current = key
+    return sent
+  }, [sendFencedFreshAgentAttach])
+
   const enqueueFreshAgentAttach = useCallback((attempt: AttachmentAttempt) => {
     getRebindQueue().enqueue({
-      key: `freshagent:${paneId}:attach`,
+      // A newer authorized decision must not be dropped behind an older
+      // queued callback that will suppress itself at execution time.
+      key: `freshagent:${paneId}:attach:${attachmentSendKey(attempt)}`,
       run: (release) => {
-        if (!sendFencedFreshAgentAttach(attempt)) {
+        if (!sendConnectionFreshAgentAttach(attempt)) {
           release()
           return
         }
@@ -2263,7 +2318,7 @@ export function FreshAgentView({
         setTimeout(release, 100)
       },
     })
-  }, [paneId, sendFencedFreshAgentAttach])
+  }, [paneId, sendConnectionFreshAgentAttach])
 
   // kata b8ke: the opened-as-CLI-elsewhere attach action — THIS pane adopts
   // the committed terminal owner (keeping its sessionRef + createRequestId,
@@ -3235,7 +3290,7 @@ export function FreshAgentView({
     if (wasLifecycleBlocked) attachDecisionSerialRef.current += 1
     const attempt = captureFreshAgentAttachmentAttempt(paneContentRef.current)
     const sendAttach = () => {
-      sendFencedFreshAgentAttach(attempt)
+      sendConnectionFreshAgentAttach(attempt)
     }
     if (hiddenRef.current) {
       // Hidden: cheap session rebind still happens, but paced through the
@@ -3258,7 +3313,39 @@ export function FreshAgentView({
     paneContent.sessionRef?.provider,
     paneContent.sessionRef?.sessionId,
     paneContent.sessionType,
-    sendFencedFreshAgentAttach,
+    sendConnectionFreshAgentAttach,
+  ])
+
+  useEffect(() => {
+    const state = appStore.getState()
+    const content = currentAttachmentPaneContent(state, tabId, paneId, paneContentRef.current)
+    const blocked = blockedAttachmentAttemptRef.current
+    const blockedIsCurrent = blocked
+      && blocked.attempt === attachmentAttemptRef.current
+      && blocked.attempt.key === attachmentAttemptKey(state, content, attachDecisionSerialRef.current)
+    const previous = blockedIsCurrent ? blocked.owner : previousRuntimeOwnerRef.current
+    previousRuntimeOwnerRef.current = runtimeOwner
+    if (!previous || !runtimeOwner) return
+    if (previous.transition !== 'handoff-started' || runtimeOwner.transition !== 'handoff-committed') return
+    if (previous.provider !== runtimeOwner.provider || previous.sessionId !== runtimeOwner.sessionId) return
+    if (previous.epoch !== runtimeOwner.epoch || previous.generation !== runtimeOwner.generation) return
+    if (previous.ownerKind !== runtimeOwner.ownerKind) return
+    if (isFreshAgentLifecycleBlocked(content) || !content.sessionId) return
+
+    // A peer's exact Starting owner becoming Live is a new attach opportunity,
+    // including when only the send boundary observed Starting. Other owner
+    // updates do not re-run the generic mount attach path.
+    const attempt = captureFreshAgentAttachmentAttempt(content)
+    if (hiddenRef.current) enqueueFreshAgentAttach(attempt)
+    else sendConnectionFreshAgentAttach(attempt)
+  }, [
+    appStore,
+    captureFreshAgentAttachmentAttempt,
+    enqueueFreshAgentAttach,
+    paneId,
+    runtimeOwner,
+    sendConnectionFreshAgentAttach,
+    tabId,
   ])
 
   useEffect(() => {
@@ -3274,7 +3361,7 @@ export function FreshAgentView({
         if (isFreshAgentLifecycleBlocked(current) || !current.sessionId) return
         const attempt = captureFreshAgentAttachmentAttempt(current)
         const sendAttach = () => {
-          sendFencedFreshAgentAttach(attempt)
+          sendConnectionFreshAgentAttach(attempt)
         }
         if (hiddenRef.current) {
           enqueueFreshAgentAttach(attempt)
@@ -3298,7 +3385,7 @@ export function FreshAgentView({
     lifecycleBlocked,
     markSnapshotDirty,
     requestSnapshotRefresh,
-    sendFencedFreshAgentAttach,
+    sendConnectionFreshAgentAttach,
     ws,
   ])
 

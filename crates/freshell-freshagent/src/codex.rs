@@ -2708,11 +2708,10 @@ impl FreshCodexState {
         // legacy-unfenced lanes (no commit under way).
         observed_epoch: Option<u64>,
         observed_generation: Option<u64>,
-        // b8ke focused ep5 r2 F1: the handoff runner's OWN authoritative
-        // target binding (the under-ticket continuation's write — the pair
-        // is the runner's supplied handoff generation). Every other
-        // caller passes false (a lane write).
-        authoritative: bool,
+        // Exact ownership proof for identity establishment. Ordinary
+        // settings refreshes carry None and cannot take over a terminal row.
+        claim: Option<crate::identity_sink::BindingClaim>,
+        settings_update: Option<crate::identity_sink::SettingsUpdate>,
     ) -> Result<(), std::io::Error> {
         let Some(sink) = self.identity_sink() else {
             return Ok(());
@@ -2730,6 +2729,13 @@ impl FreshCodexState {
             cwd: cwd.map(Into::into),
             plugins: None,
         };
+        let settings_update = settings_update.unwrap_or_else(|| {
+            if settings == crate::identity_sink::FreshAgentSettings::default() {
+                crate::identity_sink::SettingsUpdate::Keep
+            } else {
+                crate::identity_sink::SettingsUpdate::Replace(settings.clone())
+            }
+        });
         // No-laundering guard (V7/A10): never persist an all-blank snapshot --
         // it would mask a genuine record miss forever. Real creates always carry
         // at least cwd; a supersession write always goes through (G3 linkage);
@@ -2739,7 +2745,8 @@ impl FreshCodexState {
         // while the stamps assert the CURRENT attribution (the focused-ep1
         // branch-2 regime; a blank-snapshot row with stamps is never a
         // laundered defaults row).
-        if settings == crate::identity_sink::FreshAgentSettings::default()
+        if claim.is_none()
+            && settings == crate::identity_sink::FreshAgentSettings::default()
             && supersedes.is_none()
             && provenance.is_none()
         {
@@ -2764,8 +2771,8 @@ impl FreshCodexState {
                 provenance: provenance.cloned().into(),
                 observed_epoch,
                 observed_generation,
-                authoritative,
-                settings,
+                claim,
+                settings: settings_update,
             })
             .await
         {
@@ -3533,77 +3540,13 @@ impl FreshCodexState {
                     // otherwise restore Vacant while the runtime keeps
                     // running, licensing a SECOND writer).
                     if self.has_live_session(&resume_session_id).await {
-                        // The codex sessions map is keyed BY the session id.
-                        // The adopted runtime's sidecar pid (R2-1's recorded
-                        // identity; None for test fixtures without a child).
-                        let adopted_pid = self
-                            .sessions
-                            .lock()
-                            .await
-                            .get(&resume_session_id)
-                            .and_then(|sess| sess.sidecar_pid);
-                        let adopted_map_key = resume_session_id.clone();
-                        let mut adopt_ticket = Some(ticket);
-                        match self.commit_lane_claim_at(
-                            &mut adopt_ticket,
-                            &resume_session_id,
-                            &adopted_map_key,
-                            adopted_pid,
-                        ) {
-                            Ok(()) => {
-                                self.broadcast(&ServerMessage::SessionRuntimeOwner(
-                                    SessionRuntimeOwner {
-                                        provider: PROVIDER.to_string(),
-                                        session_id: resume_session_id.clone(),
-                                        epoch: self
-                                            .ownership
-                                            .as_ref()
-                                            .map(|r| r.boot_epoch())
-                                            .unwrap_or(0),
-                                        generation: self
-                                            .ownership
-                                            .as_ref()
-                                            .map(|r| {
-                                                r.observe(PROVIDER, &resume_session_id).generation
-                                            })
-                                            .unwrap_or(0),
-                                        owner_kind: "fresh-agent".into(),
-                                        previous_kind: None,
-                                        terminal_id: None,
-                                        operation_id: format!("adopt-{request_id}"),
-                                        transition: "handoff-committed".into(),
-                                        reason: None,
-                                        fenced: None,
-                                        alias_of: None,
-                                    },
-                                ));
-                            }
-                            Err(outcome) => {
-                                tracing::warn!(target: "freshell_freshagent::codex",
-                                    session_id = %resume_session_id, request_id = %request_id,
-                                    outcome = ?outcome,
-                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
-                                     moved on while the live-runtime adopt committed — the \
-                                     create is refused (never a live writer left unowned)"
-                                );
-                                return self.fail_create(
-                                    &request_id,
-                                    view_id.as_deref(),
-                                    "STALE_CLAIM",
-                                    "ownership moved on while adopting the live session; refresh and retry",
-                                );
-                            }
-                        }
-                        // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
-                        // the CURRENT connection's provenance — recovery plans mint
-                        // NEW tabIds, so the incumbent must not keep the old tab's
-                        // attribution.
                         return self
-                            .adopt_live_create(
+                            .adopt_live_create_with_starting_ticket(
                                 &request_id,
                                 view_id.as_deref(),
                                 &resume_session_id,
                                 provenance.clone(),
+                                Some(ticket),
                             )
                             .await;
                     }
@@ -4728,6 +4671,17 @@ impl FreshCodexState {
                 }
                 _ => (None, None),
             };
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
 
         // P1.13 identity event (Task 4): the ledger binding row for this create,
         // AWAITED before the `freshAgent.created` reply below goes out
@@ -4764,7 +4718,8 @@ impl FreshCodexState {
                 binding_epoch,
                 binding_generation,
                 // b8ke focused ep5 r2 F1: an ordinary create's lane write.
-                false,
+                binding_claim.clone(),
+                None,
             )
             .await
         {
@@ -4775,6 +4730,16 @@ impl FreshCodexState {
                  not be persisted — the registered session is torn down and the create \
                  fails typed, never a committed Live (kata b8ke ext r27 F4)"
             );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
             if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
                 let _ = self
                     .settle_removed_session(&thread_id, session, own_ticket.take(), None)
@@ -4790,15 +4755,31 @@ impl FreshCodexState {
                 "the session's resume record could not be persisted; torn down",
             );
         }
-        if let Err(outcome) =
-            self.commit_lane_claim_at(&mut own_ticket, &thread_id, &thread_id, sidecar_pid)
-        {
+        if let Err(outcome) = self.commit_lane_claim_at(
+            binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .ticket_mut(),
+            &thread_id,
+            &thread_id,
+            sidecar_pid,
+        ) {
             tracing::error!(target: "invariant",
                 provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
                 outcome = ?outcome,
                 "freshagent.codex.create_commit_stale: the coordinator moved on while the \
                  create registered; the uncommitted session is torn down"
             );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
             if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
                 let _ = self
                     .settle_removed_session(&thread_id, session, own_ticket.take(), None)
@@ -4814,6 +4795,7 @@ impl FreshCodexState {
                 "session ownership changed during create; torn down",
             );
         }
+        drop(binding_guard.take().map(|guard| guard.finish()));
 
         // DIAG-01: fresh-agent session lifecycle -- provider/session_id/cwd,
         // never the turn text/prompt content.
@@ -5018,7 +5000,8 @@ impl FreshCodexState {
     /// created broadcast below) — otherwise the parked value and every later
     /// refresh/fork would keep the PRE-reload connection's attribution. A
     /// conn-less adopt (`provenance == None`) re-parks nothing (the parked
-    /// Some is never regressed to None) and writes nothing (never invented).
+    /// Some is never regressed to None); a current exact Live claim still
+    /// establishes identity with Keep settings.
     /// A HOLLOW `Some` (a partially initialized client's hello without
     /// device/client fields, focused-ep1-r5 Finding 2) behaves like `None`:
     /// it must never overwrite the parked truth nor fire the refresh write.
@@ -5028,6 +5011,24 @@ impl FreshCodexState {
         view_id: Option<&str>,
         thread_id: &str,
         provenance: Option<crate::BindProvenance>,
+    ) -> CodexCreateOutcome {
+        self.adopt_live_create_with_starting_ticket(
+            request_id,
+            view_id,
+            thread_id,
+            provenance,
+            None,
+        )
+        .await
+    }
+
+    async fn adopt_live_create_with_starting_ticket(
+        &self,
+        request_id: &str,
+        view_id: Option<&str>,
+        thread_id: &str,
+        provenance: Option<crate::BindProvenance>,
+        starting_ticket: Option<freshell_ownership::OperationTicket>,
     ) -> CodexCreateOutcome {
         #[cfg(windows)]
         if self.windows_prior_blocks_create(thread_id).await {
@@ -5046,49 +5047,246 @@ impl FreshCodexState {
                 CODEX_DRAIN_RESERVATION_MESSAGE,
             );
         }
-        if let Some(p) = provenance.filter(|p| p.is_meaningful()) {
-            // Re-park + snapshot the incumbent's settings in one lock scope
-            // (the refresh write below asserts the parked identity together
-            // with the session's current values — the same composition this
-            // lane's per-send/fork writes use). A vanished incumbent (a kill
-            // racing the has-live check) skips the write: there is nothing
-            // live to re-attribute.
-            let parked = {
-                let mut guard = self.sessions.lock().await;
-                guard.get_mut(thread_id).map(|s| {
-                    s.provenance = Some(p.clone());
+        let provenance = provenance.filter(|p| p.is_meaningful());
+        // Re-park the current connection and snapshot the incumbent's settings
+        // together so the refresh stays about the process that is being adopted.
+        let (pid, runtime_id, adopted_settings) = {
+            let mut guard = self.sessions.lock().await;
+            guard
+                .get_mut(thread_id)
+                .map(|session| {
+                    if let Some(p) = provenance.as_ref() {
+                        session.provenance = Some(p.clone());
+                    }
                     (
-                        s.model.clone(),
-                        s.effort.clone(),
-                        s.cwd.clone(),
-                        s.sandbox.clone(),
-                        s.permission_mode.clone(),
-                        s.collaboration_mode,
+                        session.sidecar_pid,
+                        Some(session.sidecar_ownership_id.clone()),
+                        crate::identity_sink::FreshAgentSettings {
+                            collaboration_mode: session
+                                .collaboration_mode
+                                .map(|mode| mode.as_str().to_string()),
+                            model: (!session.model.is_empty()).then(|| session.model.clone()),
+                            sandbox: session.sandbox.clone(),
+                            permission_mode: session.permission_mode.clone(),
+                            effort: session.effort.clone(),
+                            cwd: session.cwd.clone(),
+                            plugins: None,
+                        },
                     )
                 })
-            };
-            if let Some((model, effort, cwd, sandbox, permission_mode, collaboration_mode)) = parked
-            {
-                let _ = self
-                    .record_codex_binding(
+                .unwrap_or((
+                    None,
+                    None,
+                    crate::identity_sink::FreshAgentSettings::default(),
+                ))
+        };
+        let adoption_settings_update = if provenance.is_some()
+            && adopted_settings != crate::identity_sink::FreshAgentSettings::default()
+        {
+            crate::identity_sink::SettingsUpdate::Replace(adopted_settings)
+        } else {
+            crate::identity_sink::SettingsUpdate::Keep
+        };
+
+        let binding_claim = starting_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                self.ownership.as_ref().and_then(|_| {
+                    let stamp = crate::ownership_lane::peek_retained_stamp(
+                        &self.ownership_stamps,
                         thread_id,
-                        None,
-                        &model,
-                        sandbox.as_deref(),
-                        permission_mode.as_deref(),
-                        effort.as_deref(),
-                        cwd.as_deref(),
-                        collaboration_mode,
-                        None,
-                        Some(&p),
-                        // Unified agent names: a refresh carries no naming fact.
-                        None,
-                        None, // observed_epoch (b8ke ext r22 F2)
-                        None, // observed_generation
-                        // b8ke focused ep5 r2 F1: a lane write.
-                        false,
-                    )
-                    .await;
+                    )?;
+                    let current = crate::ownership_lane::current_local_snapshot_owner(
+                        &self.ownership,
+                        &self.ownership_stamps,
+                        PROVIDER,
+                        thread_id,
+                        thread_id,
+                        pid,
+                    )?;
+                    if !matches!(&current.state, freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner == &stamp.owner && owner.ownership_id.as_deref() == Some(stamp.operation_id.as_str())) {
+                        return None;
+                    }
+                    Some(crate::identity_sink::BindingClaim::live_fresh_agent(
+                        PROVIDER,
+                        thread_id,
+                        &stamp.operation_id,
+                        stamp.epoch,
+                        stamp.generation,
+                    ))
+                })
+            });
+        if self.ownership.is_some() && binding_claim.is_none() {
+            return self.fail_create(
+                request_id,
+                view_id,
+                "SESSION_RESERVED",
+                "The Codex runtime no longer owns this session; refresh before reopening it.",
+            );
+        }
+
+        let mut persisted_under_starting_ticket = false;
+        if let Some(ticket) = starting_ticket {
+            let Some(claim) = binding_claim.clone() else {
+                return self.fail_create(
+                    request_id,
+                    view_id,
+                    "SESSION_RESERVED",
+                    "The Codex runtime no longer owns this session; refresh before reopening it.",
+                );
+            };
+            let mut write_guard = crate::identity_sink::BindingWriteGuard::new(
+                Some(ticket),
+                Some(claim.clone()),
+                self.identity_sink(),
+            );
+            let probe_state = self.clone();
+            let probe_id = thread_id.to_string();
+            let retry_state = self.clone();
+            let retry_id = thread_id.to_string();
+            let retry_claim = claim.clone();
+            let retry_provenance = provenance.clone();
+            let retry_settings_update = adoption_settings_update.clone();
+            let commit_state = self.clone();
+            let commit_id = thread_id.to_string();
+            write_guard.recover_map_hit(
+                move || {
+                    let state = probe_state.clone();
+                    let id = probe_id.clone();
+                    let expected = runtime_id.clone();
+                    async move {
+                        state.sessions.lock().await.get(&id).is_some_and(|session| {
+                            Some(&session.sidecar_ownership_id) == expected.as_ref()
+                                && !session
+                                    .sidecar_pid
+                                    .is_some_and(crate::ownership_lane::partial_pid_confirmed_dead)
+                        })
+                    }
+                },
+                move || {
+                    let state = retry_state.clone();
+                    let id = retry_id.clone();
+                    let claim = retry_claim.clone();
+                    let provenance = retry_provenance.clone();
+                    let settings_update = retry_settings_update.clone();
+                    Box::pin(async move {
+                        state
+                            .record_codex_binding(
+                                &id,
+                                None,
+                                "",
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                provenance.as_ref(),
+                                None,
+                                Some(claim.epoch),
+                                Some(claim.generation),
+                                Some(claim),
+                                Some(settings_update),
+                            )
+                            .await
+                    })
+                },
+                move |ticket| {
+                    commit_state.commit_lane_claim_at(ticket, &commit_id, &commit_id, pid)
+                },
+            );
+            if let Err(error) = write_guard.write_map_hit().await {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %thread_id, error = %error,
+                    "freshagent.codex.map_hit_binding_failed: exact Starting identity could not be persisted; writer remains fenced"
+                );
+                let _ = write_guard.repair_now().await;
+                return self.fail_create(
+                    request_id,
+                    view_id,
+                    "LEDGER_WRITE_FAILED",
+                    "The session's recovery record could not be persisted; refresh and retry.",
+                );
+            }
+            if let Err(outcome) =
+                self.commit_lane_claim_at(write_guard.ticket_mut(), thread_id, thread_id, pid)
+            {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %thread_id, request_id = %request_id,
+                    outcome = ?outcome,
+                    "fresh_agent_create_adopt_commit_stale: the coordinator moved while the identity write was in flight"
+                );
+                return self.fail_create(
+                    request_id,
+                    view_id,
+                    "STALE_CLAIM",
+                    "ownership moved on while adopting the live session; refresh and retry",
+                );
+            }
+            write_guard.finish();
+            persisted_under_starting_ticket = true;
+            self.broadcast(&ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+                provider: PROVIDER.to_string(),
+                session_id: thread_id.to_string(),
+                epoch: claim.epoch,
+                generation: claim.generation,
+                owner_kind: "fresh-agent".into(),
+                previous_kind: None,
+                terminal_id: None,
+                operation_id: format!("adopt-{request_id}"),
+                transition: "handoff-committed".into(),
+                reason: None,
+                fenced: None,
+                alias_of: None,
+            }));
+        }
+
+        if !persisted_under_starting_ticket && (binding_claim.is_some() || provenance.is_some()) {
+            // An exact Live claim establishes identity without changing
+            // settings. A meaningful connection provenance also refreshes the
+            // current runtime's real settings snapshot; blank snapshots stay
+            // Keep so a lineage-only row is not filled with inferred defaults.
+            let (epoch, generation) = binding_claim
+                .as_ref()
+                .map(|claim| (Some(claim.epoch), Some(claim.generation)))
+                .unwrap_or((None, None));
+            if let Err(error) = self
+                .record_codex_binding(
+                    thread_id,
+                    None,
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    provenance.as_ref(),
+                    None,
+                    epoch,
+                    generation,
+                    binding_claim,
+                    Some(adoption_settings_update),
+                )
+                .await
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %thread_id, error = %error,
+                    "freshagent.codex.adopt_binding_failed: exact Live identity could not be persisted"
+                );
+                return self.fail_create(
+                    request_id,
+                    view_id,
+                    "LEDGER_WRITE_FAILED",
+                    "The session's recovery record could not be persisted; refresh and retry.",
+                );
             }
         }
         self.create_dedup
@@ -5661,7 +5859,8 @@ impl FreshCodexState {
                 refresh_generation,
                 // b8ke focused ep5 r2 F1: a lane refresh, never the
                 // runner's authoritative target binding.
-                false,
+                None,
+                None,
             )
             .await
         {
@@ -6055,7 +6254,8 @@ impl FreshCodexState {
                 None,
                 epoch,
                 generation,
-                false,
+                None,
+                None,
             )
             .await
         {
@@ -7432,7 +7632,18 @@ impl FreshCodexState {
         // never the parent's stale park when the fork came from another tab).
         // `None` only when no source knows the attribution (a conn-less,
         // never-stamped parent) — unattributed rather than invented.
-        let _ = self
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
+        if let Err(error) = self
             .record_codex_binding(
                 &child_id,
                 None,
@@ -7448,26 +7659,71 @@ impl FreshCodexState {
                 // is driven by its dedicated lane; this ledger edge carries no
                 // naming fact.
                 None,
-                None, // observed_epoch (b8ke ext r22 F2)
-                None, // observed_generation
+                binding_claim.as_ref().map(|claim| claim.epoch),
+                binding_claim.as_ref().map(|claim| claim.generation),
                 // b8ke focused ep5 r2 F1: a lane write.
-                false,
+                binding_claim.clone(),
+                None,
             )
-            .await;
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %child_id, parent_session_id = %parent_id,
+                error = %error,
+                "freshagent.codex.fork_binding_failed: the child binding failed before Live"
+            );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
+            if let Some(session) = self.sessions.lock().await.remove(&child_id) {
+                let _ = self
+                    .settle_removed_session(&child_id, session, own_ticket.take(), None)
+                    .await;
+            }
+            let _ = parent_client.unarchive_thread(&child_id).await;
+            reply_sink(fork_error_frame(
+                &parent_id,
+                "the forked session's recovery record could not be persisted; the child was torn down",
+            ));
+            return;
+        }
 
         // kata b8ke Task 3: the child's registration is complete — commit
         // `Live{FreshAgent}` under the NEW child key (the stamp lands in the
         // lane's retained map). A stale/foreign commit tears the child down
         // through the same containment the failure legs use.
-        if let Err(outcome) =
-            self.commit_lane_claim_at(&mut own_ticket, &child_id, &child_id, child_pid)
-        {
+        if let Err(outcome) = self.commit_lane_claim_at(
+            binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .ticket_mut(),
+            &child_id,
+            &child_id,
+            child_pid,
+        ) {
             tracing::error!(target: "invariant",
                 provider = PROVIDER, session_id = %child_id, parent_session_id = %parent_id,
                 outcome = ?outcome,
                 "freshagent.codex.fork_commit_stale: the coordinator moved on while the \
                  fork child registered; the uncommitted child is torn down"
             );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
             if let Some(session) = self.sessions.lock().await.remove(&child_id) {
                 let _ = self
                     .settle_removed_session(&child_id, session, own_ticket.take(), None)
@@ -7480,6 +7736,7 @@ impl FreshCodexState {
             ));
             return;
         }
+        drop(binding_guard.take().map(|guard| guard.finish()));
 
         // DIAG-01: lifecycle metadata only.
         tracing::info!(
@@ -9564,12 +9821,37 @@ impl FreshCodexState {
         }
         let _ = registered_tx.send(());
 
-        // P1.13 identity event (Task 4, R2): refresh write under the SAME id --
-        // snapshots the LIVE in-session values (which originate from a real
-        // create/user change); the helper's no-laundering guard skips it if they
-        // are all blank. AWAITED before this fn returns (durable-before-answer).
-        // D8: conn-less refresh — provenance `None` keeps the create's stamps.
-        let _ = self
+        // Persist the recovered identity while the exact Starting ticket is
+        // still held. A failed or canceled write must repair this operation's
+        // row before another owner can take over the key.
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let recovered_settings = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: collaboration_mode.map(|mode| mode.as_str().into()),
+            model: (!model.is_empty()).then(|| model.clone()),
+            sandbox: sandbox.clone(),
+            permission_mode: permission_mode.clone(),
+            effort: effort.clone(),
+            cwd: cwd.clone(),
+            plugins: None,
+        };
+        let settings_update = if recovered_settings
+            == crate::identity_sink::FreshAgentSettings::default()
+        {
+            crate::identity_sink::SettingsUpdate::Keep
+        } else {
+            crate::identity_sink::SettingsUpdate::Replace(recovered_settings)
+        };
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
+        if let Err(error) = self
             .record_codex_binding(
                 session_id,
                 None,
@@ -9581,14 +9863,80 @@ impl FreshCodexState {
                 collaboration_mode,
                 None,
                 None,
-                // Unified agent names: a refresh carries no naming fact.
                 None,
-                None, // observed_epoch (b8ke ext r22 F2)
-                None, // observed_generation
-                // b8ke focused ep5 r2 F1: a lane write.
-                false,
+                binding_claim.as_ref().map(|claim| claim.epoch),
+                binding_claim.as_ref().map(|claim| claim.generation),
+                binding_claim.clone(),
+                Some(settings_update),
             )
-            .await;
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %session_id, error = %error,
+                "freshagent.codex.recovery_binding_failed: the recovered session is torn down"
+            );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
+            if let Some(session) = self.sessions.lock().await.remove(session_id) {
+                let _ = self
+                    .settle_removed_session(session_id, session, own_ticket.take(), None)
+                    .await;
+            }
+            if let Some(mut guard) = lease_guard.take() {
+                guard.fail();
+            }
+            return Err(EnsureAliveError::RespawnFailed(
+                "the recovered session's recovery record could not be persisted".to_string(),
+            ));
+        }
+
+        // The durable binding now precedes the exact-claim Live transition.
+        if let Err(outcome) = self.commit_lane_claim_at(
+            binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .ticket_mut(),
+            session_id,
+            session_id,
+            sidecar_pid,
+        ) {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %session_id,
+                outcome = ?outcome,
+                "freshagent.codex.recovery_commit_stale: the coordinator moved on while \
+                 the crash recovery registered; the uncommitted session is torn down"
+            );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
+            if let Some(session) = self.sessions.lock().await.remove(session_id) {
+                let _ = self
+                    .settle_removed_session(session_id, session, own_ticket.take(), None)
+                    .await;
+            }
+            if let Some(mut guard) = lease_guard.take() {
+                guard.fail();
+            }
+            return Err(EnsureAliveError::RespawnFailed(
+                "session ownership changed during crash recovery; torn down".to_string(),
+            ));
+        }
+        drop(binding_guard.take().map(|guard| guard.finish()));
 
         // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive again
         // -- clear any stale "recently gone" marking so it doesn't linger.
@@ -9603,29 +9951,6 @@ impl FreshCodexState {
                 // has-live fast paths adopt it from here.
                 g.fail();
             }
-        }
-
-        // kata b8ke Task 3: crash recovery's resume-first path recovered the
-        // SAME id — commit `Live{FreshAgent}` under it (the lease-revoked arm
-        // above KEEPS the recovered session, so the commit is truthful either
-        // way). The stamp lands in the lane's retained map.
-        if let Err(outcome) =
-            self.commit_lane_claim_at(&mut own_ticket, session_id, session_id, sidecar_pid)
-        {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %session_id,
-                outcome = ?outcome,
-                "freshagent.codex.recovery_commit_stale: the coordinator moved on while \
-                 the crash recovery registered; the uncommitted session is torn down"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(session_id) {
-                let _ = self
-                    .settle_removed_session(session_id, session, own_ticket.take(), None)
-                    .await;
-            }
-            return Err(EnsureAliveError::RespawnFailed(
-                "session ownership changed during crash recovery; torn down".to_string(),
-            ));
         }
 
         // DIAG-01: crash recovery took the resume-first path -- the durable
@@ -9910,45 +10235,34 @@ impl FreshCodexState {
         }
         let _ = registered_tx.send(());
 
-        // Task 13: bind the OLD durable id to the NEW live key (the identity moved) --
-        // contenders holding the old id adopt the new session via BoundLive.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&new_thread_id) {
-                // Revoked mid-respawn: keep the live session (we are the only writer);
-                // reopen the key -- has-live fast paths adopt from here.
-                g.fail();
-            }
-        }
-
-        // kata b8ke Task 3: the mint-new registration survived its gates —
-        // commit `Live{FreshAgent}` under the NEW key (the lease-revoked arm
-        // above KEEPS the live session, so the commit is truthful either
-        // way).
-        if let Err(outcome) =
-            self.commit_lane_claim_at(&mut own_ticket, &new_thread_id, &new_thread_id, sidecar_pid)
-        {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %new_thread_id,
-                old_session_id = %old_session_id, outcome = ?outcome,
-                "freshagent.codex.respawn_commit_stale: the coordinator moved on while the \
-                 crash respawn registered; the uncommitted session is torn down"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
-                let _ = self
-                    .settle_removed_session(&new_thread_id, session, own_ticket.take(), None)
-                    .await;
-            }
-            return Err(EnsureAliveError::RespawnFailed(
-                "session ownership changed during crash respawn; torn down".to_string(),
-            ));
-        }
-
-        // P1.13 identity event (Task 4): NEW ledger row under the new thread id with
-        // `supersedes: Some(old_thread_id)` -- the G3 supersession linkage (V8/A14):
-        // the ledger retires the old row and links it to the new one. This is the
-        // ONLY site that ever knows both ids; the edge is unrecoverable if not
-        // written here. AWAITED before the materialized broadcast below goes out.
-        let _ = self
+        // Persist the new key's identity before it becomes Live. The exact
+        // Starting ticket fences cancellation and stale delayed writes.
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let settings = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: collaboration_mode.map(|mode| mode.as_str().into()),
+            model: (!model.is_empty()).then(|| model.clone()),
+            sandbox: sandbox.clone(),
+            permission_mode: permission_mode.clone(),
+            effort: effort.clone(),
+            cwd: cwd.clone(),
+            plugins: None,
+        };
+        let settings_update = if settings == crate::identity_sink::FreshAgentSettings::default() {
+            crate::identity_sink::SettingsUpdate::Keep
+        } else {
+            crate::identity_sink::SettingsUpdate::Replace(settings)
+        };
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
+        if let Err(error) = self
             .record_codex_binding(
                 &new_thread_id,
                 None,
@@ -9959,19 +10273,91 @@ impl FreshCodexState {
                 cwd.as_deref(),
                 collaboration_mode,
                 Some(old_session_id),
-                // D8: conn-less crash-respawn — provenance `None`; the ledger
-                // inherits the superseded parent's stamps (fork-chain rule).
                 None,
-                // Unified agent names (Task 4): the mint-new respawn is a
-                // NewConversation edge for naming, driven by the dedicated naming
-                // lanes; this ledger edge itself carries no pending transfer.
                 None,
-                None, // observed_epoch (b8ke ext r22 F2)
-                None, // observed_generation
-                // b8ke focused ep5 r2 F1: a lane write.
-                false,
+                binding_claim.as_ref().map(|claim| claim.epoch),
+                binding_claim.as_ref().map(|claim| claim.generation),
+                binding_claim.clone(),
+                Some(settings_update),
             )
-            .await;
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %new_thread_id, error = %error,
+                "freshagent.codex.respawn_binding_failed: the new session is torn down"
+            );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
+            if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
+                let _ = self
+                    .settle_removed_session(&new_thread_id, session, own_ticket.take(), None)
+                    .await;
+            }
+            if let Some(mut guard) = lease_guard.take() {
+                guard.fail();
+            }
+            return Err(EnsureAliveError::RespawnFailed(
+                "the respawned session's recovery record could not be persisted".to_string(),
+            ));
+        }
+
+        // The durable identity write precedes the exact-claim Live transition.
+        if let Err(outcome) = self.commit_lane_claim_at(
+            binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .ticket_mut(),
+            &new_thread_id,
+            &new_thread_id,
+            sidecar_pid,
+        ) {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %new_thread_id,
+                old_session_id = %old_session_id, outcome = ?outcome,
+                "freshagent.codex.respawn_commit_stale: the coordinator moved on while the \
+                 crash respawn registered; the uncommitted session is torn down"
+            );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+            } else {
+                drop(binding_guard.take());
+            }
+            if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
+                let _ = self
+                    .settle_removed_session(&new_thread_id, session, own_ticket.take(), None)
+                    .await;
+            }
+            if let Some(mut guard) = lease_guard.take() {
+                guard.fail();
+            }
+            return Err(EnsureAliveError::RespawnFailed(
+                "session ownership changed during crash respawn; torn down".to_string(),
+            ));
+        }
+        drop(binding_guard.take().map(|guard| guard.finish()));
+
+        // Task 13: bind the OLD durable id to the NEW live key (the identity moved) --
+        // contenders holding the old id adopt the new session via BoundLive.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&new_thread_id) {
+                // Revoked mid-respawn: keep the live session (we are the only writer);
+                // reopen the key -- has-live fast paths adopt from here.
+                g.fail();
+            }
+        }
 
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
@@ -12076,13 +12462,37 @@ impl FreshCodexState {
         // ticket's RAII drop settles the claim typed), in BOTH modes: the
         // under-ticket failure surfaces to the runner as the typed
         // recoverable handoff failure.
-        let (binding_epoch, binding_generation) = match (self.ownership.as_ref(), handoff) {
-            (Some(registry), Some((_, handoff_generation))) => {
-                (Some(registry.boot_epoch()), Some(handoff_generation))
-            }
-            _ => (None, None),
-        };
-        if recovered.is_some() {
+        let binding_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                let (operation_id, handoff_generation) = handoff?;
+                let registry = self.ownership.as_ref()?;
+                Some(crate::identity_sink::BindingClaim::handoff(
+                    PROVIDER,
+                    thread_id,
+                    operation_id,
+                    registry.boot_epoch(),
+                    handoff_generation,
+                ))
+            });
+        let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
+        let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
+        {
+            let settings_update = match recovered.as_ref() {
+                Some(_) => crate::identity_sink::SettingsUpdate::Replace(rec.clone()),
+                None => crate::identity_sink::SettingsUpdate::Keep,
+            };
             if let Err(e) = self
                 .record_codex_binding(
                     thread_id,
@@ -12103,23 +12513,8 @@ impl FreshCodexState {
                     None,
                     binding_epoch,
                     binding_generation,
-                    // b8ke focused ep5 r2 F1 + focused ep5 r5 F1: the
-                    // authoritative marker is CONDITIONAL on the
-                    // under-ticket handoff shape (`handoff.is_some()` —
-                    // exactly the OpenCode path's discipline): the
-                    // runner-supplied handoff binding is the r27-F2
-                    // authoritative target write; an ORDINARY
-                    // `ensure_session_resumable` cold resume (handoff
-                    // `None`, pair `(None, None)`) is a lane write. Pre-r5
-                    // the unconditional `true` made every ordinary cold
-                    // resume's binding write arrive at the production sink
-                    // marked authoritative with NO pair — the ep5-r3
-                    // consult's typed refusal (an authoritative write must
-                    // carry its observed pair) — so the recovered thread
-                    // registered, its binding write was REFUSED, the
-                    // runtime tore back down, and the resume answered a
-                    // transient error: restart recovery was broken.
-                    handoff.is_some(),
+                    binding_claim.clone(),
+                    Some(settings_update),
                 )
                 .await
             {
@@ -12129,6 +12524,16 @@ impl FreshCodexState {
                      failed — the registered session is torn down, no commit (kata \
                      b8ke ext r27 F4)"
                 );
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                } else {
+                    drop(binding_guard.take());
+                }
                 if let Some(session) = self.sessions.lock().await.remove(thread_id) {
                     let _ = self
                         .settle_removed_session(thread_id, session, own_ticket.take(), None)
@@ -12157,15 +12562,31 @@ impl FreshCodexState {
                 ownership_id: None,
             }),
             None => {
-                if let Err(outcome) =
-                    self.commit_lane_claim_at(&mut own_ticket, thread_id, thread_id, sidecar_pid)
-                {
+                if let Err(outcome) = self.commit_lane_claim_at(
+                    binding_guard
+                        .as_mut()
+                        .expect("binding guard is present")
+                        .ticket_mut(),
+                    thread_id,
+                    thread_id,
+                    sidecar_pid,
+                ) {
                     tracing::error!(target: "invariant",
                         provider = PROVIDER, session_id = %thread_id,
                         outcome = ?outcome,
                         "freshagent.codex.resume_commit_stale: the coordinator moved on \
                          while the resume registered; the uncommitted session is torn down"
                     );
+                    let repaired = binding_guard
+                        .as_mut()
+                        .expect("binding guard is present")
+                        .repair_now()
+                        .await;
+                    if repaired {
+                        own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+                    } else {
+                        drop(binding_guard.take());
+                    }
                     if let Some(session) = self.sessions.lock().await.remove(thread_id) {
                         let _ = self
                             .settle_removed_session(thread_id, session, own_ticket.take(), None)
@@ -12181,6 +12602,7 @@ impl FreshCodexState {
                 None
             }
         };
+        drop(binding_guard.take().map(|guard| guard.finish()));
 
         resume_fence.disarm();
         Ok(ResumedCodexSession {
@@ -21824,13 +22246,15 @@ pub(crate) mod tests {
                 "the handoff continuation stamps the SUPPLIED handoff generation — \
                  pre-r27 it carried None (the under-ticket lane has no own ticket)"
             );
-            // b8ke focused ep5 r2 F1: the under-ticket target binding is
-            // the runner's AUTHORITATIVE write (the terminal-row guard's
-            // accepting arm over the prior terminal's unstamped row).
-            assert!(
-                last.authoritative,
-                "the handoff continuation's binding is authoritative: {last:?}"
-            );
+            let claim = last
+                .claim
+                .as_ref()
+                .expect("the under-ticket binding carries an exact claim");
+            assert_eq!(claim.kind, crate::identity_sink::BindingClaimKind::Handoff);
+            assert_eq!(claim.provider, "codex");
+            assert_eq!(claim.session_id, thread_id);
+            assert_eq!(claim.operation_id, "handoff-op-r27");
+            assert_eq!((claim.epoch, claim.generation), (registry.boot_epoch(), 11));
         }
         // Drain the bus so the shutdown's frames do not leak into other tests.
         while rx.try_recv().is_ok() {}
@@ -24990,6 +25414,270 @@ pub(crate) mod tests {
     /// the opencode in-memory-hit refresh, ec435cbf3). Otherwise the parked
     /// value (and every later refresh/fork) keeps the OLD tab's attribution.
     #[tokio::test]
+    async fn live_adoption_requires_the_codex_runtimes_retained_owner_stamp() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(registry);
+        let session_id = create_real_fake_session(&state, &mut rx).await;
+        let before = sink.bindings.lock().unwrap().len();
+        let stamp = state
+            .ownership_stamps
+            .lock()
+            .unwrap()
+            .remove(&session_id)
+            .unwrap();
+
+        let result = state
+            .adopt_live_create("adopt-without-stamp", None, &session_id, None)
+            .await;
+        assert!(
+            matches!(result, CodexCreateOutcome::Failed { .. }),
+            "a current registry owner alone does not prove this local runtime owns it"
+        );
+        assert_eq!(
+            sink.bindings.lock().unwrap().len(),
+            before,
+            "an unfenced local adoption must not touch the durable binding"
+        );
+
+        state
+            .ownership_stamps
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), stamp.clone());
+        let result = state
+            .adopt_live_create("adopt-with-stamp", None, &session_id, None)
+            .await;
+        assert!(
+            !matches!(result, CodexCreateOutcome::Failed { .. }),
+            "the retained owner can adopt"
+        );
+        let binding = sink.bindings.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(binding.claim.unwrap().operation_id, stamp.operation_id);
+        state.shutdown().await;
+    }
+
+    fn vacate_codex_owner_for_map_hit(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        session_id: &str,
+    ) -> freshell_ownership::ObservedFence {
+        let live = registry.observe(PROVIDER, session_id);
+        let generation = match live.state {
+            freshell_ownership::OwnershipState::Live { generation, .. } => generation,
+            state => panic!("map-hit fixture must begin with a live owner: {state:?}"),
+        };
+        let stop_op = format!("test-vacate-{session_id}");
+        let freshell_ownership::StopOutcome::Granted {
+            generation: stop_generation,
+        } = registry.begin_stop(
+            PROVIDER,
+            session_id,
+            &stop_op,
+            &freshell_ownership::StopClaim {
+                expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                expected_runtime: None,
+                observed: freshell_ownership::ObservedFence {
+                    epoch: live.epoch,
+                    generation,
+                },
+            },
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        )
+        else {
+            panic!("the fixture must stop the coordinator row while keeping its mapped session")
+        };
+        assert_eq!(
+            registry.commit_stop(PROVIDER, session_id, &stop_op, stop_generation),
+            freshell_ownership::CommitOutcome::Committed,
+        );
+        let vacant = registry.observe(PROVIDER, session_id);
+        freshell_ownership::ObservedFence {
+            epoch: vacant.epoch,
+            generation: vacant.generation,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacant_map_hit_create_keeps_starting_until_binding_persists() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(Arc::clone(&registry));
+        let thread_id = create_real_fake_session(&state, &mut rx).await;
+        while rx.try_recv().is_ok() {}
+        let vacant_fence = vacate_codex_owner_for_map_hit(&registry, &thread_id);
+        sink.bindings.lock().unwrap().clear();
+        while rx.try_recv().is_ok() {}
+        let stall = sink.arm_binding_stall(PROVIDER, &thread_id);
+
+        let mut resume = create_msg("req-vacant-map-hit-adopt");
+        resume.resume_session_id = Some(thread_id.clone());
+        resume.observed_epoch = Some(vacant_fence.epoch);
+        resume.observed_generation = Some(vacant_fence.generation);
+        let state2 = state.clone();
+        let task = tokio::spawn(async move { state2.handle_create(resume, None).await });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the map-hit adoption reaches its durable binding write");
+
+        let starting = registry.observe(PROVIDER, &thread_id);
+        let (operation_id, epoch, generation) = match starting.state {
+            freshell_ownership::OwnershipState::Starting {
+                ref operation_id,
+                generation,
+                ..
+            } => (operation_id.clone(), starting.epoch, generation),
+            state => panic!("the map-hit binding write must remain Starting: {state:?}"),
+        };
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                &thread_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-during-vacant-adopt-write",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        let pending_binding = sink.bindings.lock().unwrap().last().cloned().unwrap();
+        let expected_operation_id = operation_id.clone();
+        assert_eq!(
+            pending_binding.claim,
+            Some(crate::identity_sink::BindingClaim {
+                provider: PROVIDER.into(),
+                session_id: thread_id.clone(),
+                operation_id: expected_operation_id.clone(),
+                epoch,
+                generation,
+                kind: crate::identity_sink::BindingClaimKind::Starting,
+            }),
+            "the parked write carries the exact ticket that still holds Starting"
+        );
+        assert_eq!(
+            pending_binding.settings,
+            crate::identity_sink::SettingsUpdate::Keep,
+            "map-hit identity establishment never replaces saved settings with defaults"
+        );
+        let premature_frames = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .filter(|frame| {
+                (frame["type"] == "freshAgent.created"
+                    && frame["requestId"] == "req-vacant-map-hit-adopt")
+                    || (frame["type"] == "session.runtimeOwner"
+                        && frame["operationId"] == expected_operation_id)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            premature_frames.is_empty(),
+            "the adopt cannot publish before persistence: {premature_frames:?}"
+        );
+
+        stall.release.send(()).unwrap();
+        let outcome = task.await.unwrap();
+        assert!(matches!(
+            outcome,
+            CodexCreateOutcome::Created { ref session_id, .. } if session_id == &thread_id
+        ));
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("adoption reply within budget");
+        assert_eq!(created["type"], "freshAgent.created", "{created}");
+        assert!(matches!(
+            registry.observe(PROVIDER, &thread_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacant_map_hit_create_write_failure_keeps_the_starting_writer_fence() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (mut state, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.set_ownership(Arc::clone(&registry));
+        let thread_id = create_real_fake_session(&state, &mut rx).await;
+        let vacant_fence = vacate_codex_owner_for_map_hit(&registry, &thread_id);
+        sink.bindings.lock().unwrap().clear();
+        sink.set_fail_writes(true);
+
+        let mut resume = create_msg("req-vacant-map-hit-adopt-failure");
+        resume.resume_session_id = Some(thread_id.clone());
+        resume.observed_epoch = Some(vacant_fence.epoch);
+        resume.observed_generation = Some(vacant_fence.generation);
+        let outcome = state.handle_create(resume, None).await;
+        assert!(matches!(
+            outcome,
+            CodexCreateOutcome::Failed { ref code, .. } if code == "LEDGER_WRITE_FAILED"
+        ));
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, &thread_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "a failed map-hit bind leaves its existing writer fenced Starting"
+        );
+        assert!(
+            matches!(
+                registry.begin_handoff(
+                    PROVIDER,
+                    &thread_id,
+                    freshell_ownership::RuntimeOwnerKind::Terminal,
+                    "handoff-after-vacant-adopt-write-failure",
+                    None,
+                    "test",
+                    freshell_ownership::now_epoch_ms(),
+                ),
+                freshell_ownership::BeginOutcome::Blocked { .. }
+            ),
+            "a failed identity write cannot admit a terminal second writer"
+        );
+        while let Ok(raw) = rx.try_recv() {
+            assert_ne!(
+                serde_json::from_str::<Value>(&raw).unwrap()["type"],
+                "freshAgent.created",
+                "a failed identity write never publishes success"
+            );
+        }
+        assert!(sink.bindings.lock().unwrap().is_empty());
+        sink.set_fail_writes(false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe(PROVIDER, &thread_id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained exact map-hit claim retries persistence and becomes Live");
+        assert!(
+            sink.repairs.lock().unwrap().is_empty(),
+            "a recoverable map-hit write must not tombstone the operation being retried"
+        );
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn adopt_live_create_restamps_the_parked_provenance_and_the_ledger_row() {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
@@ -25423,8 +26111,10 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("row stamp write ok");
@@ -25618,8 +26308,10 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("seed binding write ok");
@@ -25673,7 +26365,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 b.settings,
-                crate::identity_sink::FreshAgentSettings::default(),
+                crate::identity_sink::SettingsUpdate::Keep,
                 "the settings payload is untouched by the provenance refresh (stays lineage-only)"
             );
         }
@@ -25740,16 +26432,18 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings {
-                collaboration_mode: None,
-                model: Some("gpt-5.3-codex-spark".into()),
-                sandbox: None,
-                permission_mode: None,
-                effort: None,
-                cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
-                plugins: None,
-            },
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
+                    model: Some("gpt-5.3-codex-spark".into()),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: None,
+                    cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                    plugins: None,
+                },
+            ),
         })
         .await
         .expect("seed binding write ok");
@@ -25846,16 +26540,18 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings {
-                collaboration_mode: None,
-                model: Some("gpt-5.3-codex-spark".into()),
-                sandbox: None,
-                permission_mode: None,
-                effort: None,
-                cwd: Some("/w".into()),
-                plugins: None,
-            },
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
+                    model: Some("gpt-5.3-codex-spark".into()),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: None,
+                    cwd: Some("/w".into()),
+                    plugins: None,
+                },
+            ),
         })
         .await
         .expect("seed binding write ok");
@@ -25885,7 +26581,11 @@ pub(crate) mod tests {
         assert_eq!(b.asserted_stamps().device_id, None);
         assert_eq!(b.asserted_stamps().tab_key, None);
         assert!(
-            b.settings.model.is_some(),
+            b.settings
+                .as_replacement()
+                .expect("recovered settings refresh is an explicit replacement")
+                .model
+                .is_some(),
             "the refresh still re-persists the recovered settings"
         );
     }
@@ -29999,8 +30699,10 @@ pub(crate) mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("lineage seed write");
@@ -30452,19 +31154,16 @@ pub(crate) mod tests {
         );
         let (state, _bus) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
-        fake.seed(
-            "codex",
-            "thread-9",
-            crate::identity_sink::FreshAgentSettings {
-                collaboration_mode: None,
-                model: Some("gpt-5.3-codex-spark".into()),
-                sandbox: Some("workspace-write".into()),
-                permission_mode: Some("on-request".into()),
-                effort: Some("high".into()),
-                cwd: Some("/w".into()),
-                plugins: None,
-            },
-        );
+        let recorded = crate::identity_sink::FreshAgentSettings {
+            collaboration_mode: Some("plan".into()),
+            model: Some("gpt-5.3-codex-spark".into()),
+            sandbox: Some("workspace-write".into()),
+            permission_mode: Some("on-request".into()),
+            effort: Some("high".into()),
+            cwd: Some("/w".into()),
+            plugins: None,
+        };
+        fake.seed("codex", "thread-9", recorded.clone());
         state.set_identity_sink(fake.clone());
 
         // Simulate the restart path exactly as the existing R3 tests above do
@@ -30479,7 +31178,13 @@ pub(crate) mod tests {
         assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
         assert_eq!(s.permission_mode.as_deref(), Some("on-request"));
         assert_eq!(s.effort.as_deref(), Some("high"));
+        let mut expected = recorded;
+        // The provider may establish a different working directory on resume.
+        expected.cwd = s.cwd.clone();
         drop(sessions);
+
+        // The resumed runtime must not erase the next restart's settings.
+        assert_eq!(fake.load_settings("codex", "thread-9"), Some(expected));
 
         // The fake app-server's log write lands from a SEPARATE OS process (see the
         // single-flight test above) -- poll briefly for it before the one real read.
@@ -30510,13 +31215,18 @@ pub(crate) mod tests {
     /// resume silently with defaults exactly as today, and must NOT launder a defaults
     /// row into the ledger. Permanent regression guard for V7's no-spam rule.
     #[tokio::test(flavor = "multi_thread")]
-    async fn resume_of_a_never_recorded_session_is_silent_and_writes_no_defaults_row() {
+    async fn attach_resume_of_a_never_recorded_session_is_silent_and_writes_no_defaults_row() {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
-        let (state, mut bus_rx) = state_with_bus();
+        let (mut state, mut bus_rx) = state_with_bus();
         // Deliberately empty: no record, no snapshot.
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(fake.clone());
+        // Identity establishment needs the same exact Starting authority as
+        // production. An unwired coordinator cannot prove this recovery may
+        // replace a terminal binding, so the test must not rely on a pair-only
+        // write.
+        state.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
 
         // Same R3 entry point as above for an untracked "thread-x".
         state.handle_attach(attach_msg("thread-x")).await;
@@ -30531,16 +31241,20 @@ pub(crate) mod tests {
                 "never-recorded resume must stay silent"
             );
         }
-        // No defaults laundering (V7 §2): no binding row was written for thread-x.
-        assert!(
-            !fake
-                .bindings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|b| b.session_id == "thread-x"),
-            "a load_settings miss must not write a defaults row"
-        );
+        // The verified resume establishes the identity even when there was
+        // no settings record. It must not turn the settings miss into a
+        // fabricated defaults snapshot or a SETTINGS_RESET condition.
+        let binding = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|binding| binding.provider == "codex" && binding.session_id == "thread-x")
+            .cloned()
+            .expect("a verified resume establishes the recovered identity");
+        assert_eq!(binding.settings, crate::identity_sink::SettingsUpdate::Keep);
+        assert!(fake.load_settings("codex", "thread-x").is_none());
+        assert!(!fake.was_recorded("codex", "thread-x"));
     }
 
     /// The genuine anomaly: the ledger PROVES prior fresh-agent recording, yet no
@@ -32380,10 +33094,14 @@ pub(crate) mod tests {
             .expect("binding row written at thread/start");
         assert_eq!(b.provider, "codex");
         assert_eq!(b.mode, "freshcodex");
-        assert_eq!(b.settings.model.as_deref(), Some("gpt-5.3-codex-spark"));
-        assert_eq!(b.settings.sandbox.as_deref(), Some("workspace-write"));
-        assert_eq!(b.settings.permission_mode.as_deref(), Some("on-request"));
-        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        let settings = b
+            .settings
+            .as_replacement()
+            .expect("create settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert_eq!(settings.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(settings.permission_mode.as_deref(), Some("on-request"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
     }
 
     /// D8 lane-reach (restore-open-sessions-only, review round 3): the

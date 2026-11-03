@@ -127,8 +127,8 @@ impl FreshClaudeState {
                         provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
                         observed_epoch: new_at.map(|at| at.epoch),
                         observed_generation: new_at.map(|at| at.generation),
-                        authoritative: false,
-                        settings,
+                        claim: None,
+                        settings: crate::identity_sink::SettingsUpdate::Replace(settings),
                         genesis: crate::identity_sink::GenesisUpdate::Set(
                             crate::identity_sink::ClaudeGenesis::Fresh,
                         ),

@@ -793,6 +793,10 @@ struct SessionRecord {
     /// fence release: "the operation's settle/cancellation has concluded"
     /// is probe-able HERE, never inferred from registration absence.
     settle_fired: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// A binding write can outlive its request handler through spawn_blocking.
+    /// Its owner holds this through durable repair, independently of handler
+    /// settlement, so the stale-start watchdog cannot release it early.
+    binding_write_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// b8ke e3r3 F7: the STOP operation's sender-side settlement flag —
     /// the kill handler's scope guard sets it on Drop, so the
     /// stale-Stopping watchdog can distinguish a SLOW-BUT-LIVE stop (flag
@@ -830,6 +834,7 @@ impl Default for SessionRecord {
             cancellation: None,
             settle: None,
             settle_fired: None,
+            binding_write_pending: None,
             stop_settled: None,
             partial_runtime: None,
             in_flight_attaches: 0,
@@ -1004,6 +1009,17 @@ pub struct OperationTicket {
     disarmed: bool,
 }
 
+/// Keeps an operation's binding write/repair visible to the stale-start
+/// watchdog after the originating handler has unwound. No registry lock is
+/// held while disk work runs.
+pub struct BindingWriteHold(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BindingWriteHold {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl OperationTicket {
     /// Wrap an already-`Granted` claim (the caller holds the `Granted`
     /// generation from its `begin_start`/`begin_handoff` call). This never
@@ -1033,6 +1049,25 @@ impl OperationTicket {
         self.generation
     }
 
+    /// The ownership kind this ticket started for. Server-produced
+    /// recovery claims use this to reject tickets for terminal starts.
+    pub fn kind(&self) -> RuntimeOwnerKind {
+        self.kind
+    }
+
+    /// The provider namespace the ticket was minted under. Exact durable
+    /// binding claims carry this together with `session_id` so a claim
+    /// cannot be replayed against another coordinator key.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The boot epoch in which this ticket was granted. It is immutable for
+    /// the ticket's lifetime and travels with durable binding claims.
+    pub fn epoch(&self) -> u64 {
+        self.registry.boot_epoch()
+    }
+
     /// b8ke focused episode-2 round-2 F1: the ticket's coordinator key —
     /// the key the claim was minted under (the claude lane's commit
     /// derives its registry key from the ticket, never a caller-passed
@@ -1044,6 +1079,19 @@ impl OperationTicket {
 
     pub fn operation_id(&self) -> &str {
         &self.operation_id
+    }
+
+    pub fn hold_binding_write(&self) -> Option<BindingWriteHold> {
+        let mut inner = self.registry.inner.lock().expect("ownership lock poisoned");
+        let record = inner.get_mut(&SessionKey::new(&self.provider, &self.session_id))?;
+        if record.generation != self.generation
+            || record.state.operation_id() != Some(self.operation_id.as_str())
+        {
+            return None;
+        }
+        let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        record.binding_write_pending = Some(Arc::clone(&pending));
+        Some(BindingWriteHold(pending))
     }
 
     /// Keep the claim alive past this guard's drop (the holder completed
@@ -1334,6 +1382,7 @@ impl RuntimeOwnershipRegistry {
                 record.cancellation = None;
                 record.settle = None;
                 record.settle_fired = None;
+                record.binding_write_pending = None;
                 record.partial_runtime = None;
                 record.generation += 1;
                 record.state = OwnershipState::Starting {
@@ -3905,6 +3954,18 @@ impl RuntimeOwnershipRegistry {
             } = record.state.clone()
             {
                 if now_ms.saturating_sub(since_ms) >= max_age_ms {
+                    if record
+                        .binding_write_pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.load(Ordering::SeqCst))
+                    {
+                        tracing::info!(target: "freshell_ownership",
+                            event = "ownership.start.stale_start_skipped_binding_repair",
+                            provider = %key.provider, session_id = %key.session_id,
+                            operation_id = %operation_id, epoch = self.epoch, generation,
+                            "the binding write or its durable repair still owns this start");
+                        continue;
+                    }
                     // b8ke ext r20 F1: consult the start's SETTLEMENT
                     // EVIDENCE before converting on age — the e3r3 F7
                     // stop-sweep discipline. A registered settle flag

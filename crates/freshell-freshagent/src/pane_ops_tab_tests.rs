@@ -1251,9 +1251,13 @@ async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route(
             Some(crid),
             "the row carries the NEW pane's lineage (the resumed pane's              createRequestId)"
         );
-        assert_eq!(row.settings.model.as_deref(), Some("big-model"));
-        assert_eq!(row.settings.effort.as_deref(), Some("high"));
-        assert_eq!(row.settings.cwd.as_deref(), Some("/real/project"));
+        let settings = row
+            .settings
+            .as_replacement()
+            .expect("resumed settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("big-model"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.cwd.as_deref(), Some("/real/project"));
         assert_eq!(
             row.provenance,
             crate::identity_sink::ProvenanceUpdate::Clear,
@@ -1317,8 +1321,8 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
         observed_epoch: None,
         observed_generation: None,
 
-        authoritative: false,
-        settings: FreshAgentSettings::default(),
+        claim: None,
+        settings: crate::identity_sink::SettingsUpdate::Replace(FreshAgentSettings::default()),
     })
     .await
     .expect("lineage binding write ok");

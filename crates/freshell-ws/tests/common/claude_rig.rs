@@ -495,7 +495,6 @@ impl ClaudeRig {
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 observed_epoch: None,
                 observed_generation: None,
-                authoritative: false,
                 now_ms: 1_000,
             })
             .expect("seed the binding row");

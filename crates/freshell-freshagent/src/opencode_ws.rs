@@ -1312,6 +1312,79 @@ impl FreshOpencodeState {
         )
     }
 
+    /// Hold a map-hit adoption's exact Starting claim until its durable
+    /// binding is present and the same provider runtime is still registered.
+    /// The recovery callback is installed before the caller's first awaited
+    /// write, so cancellation cannot release the key while an existing
+    /// OpenCode session remains addressable.
+    fn map_hit_binding_guard(
+        &self,
+        ticket: freshell_ownership::OperationTicket,
+        claim: crate::identity_sink::BindingClaim,
+        durable_id: &str,
+        session_arc: Arc<OpencodeSessionCell>,
+        upsert: crate::identity_sink::FreshAgentBindingUpsert,
+    ) -> crate::identity_sink::BindingWriteGuard {
+        let mut guard = crate::identity_sink::BindingWriteGuard::new(
+            Some(ticket),
+            Some(claim),
+            self.identity_sink(),
+        );
+
+        let probe_state = self.clone();
+        let probe_id = durable_id.to_string();
+        let probe_session = session_arc;
+        let retry_sink = self.identity_sink();
+        let retry_upsert = upsert;
+        let commit_state = self.clone();
+        let commit_id = durable_id.to_string();
+        guard.recover_map_hit(
+            move || {
+                let state = probe_state.clone();
+                let id = probe_id.clone();
+                let expected = probe_session.clone();
+                async move {
+                    loop {
+                        // Take the session lock before rechecking map membership.
+                        // The provider's lock order permits session -> map; this
+                        // makes the membership check cover the exact record
+                        // without holding the map lock while awaiting the session.
+                        let (identity_matches, closing, mapped) = {
+                            let session = expected.lock().await;
+                            let identity_matches =
+                                session.real_session_id.as_deref() == Some(id.as_str());
+                            let closing =
+                                session.killed.load(Ordering::SeqCst) || session.close_pending > 0;
+                            let sessions = state.sessions.lock().await;
+                            let mapped = sessions
+                                .values()
+                                .any(|candidate| Arc::ptr_eq(candidate, &expected));
+                            (identity_matches, closing, mapped)
+                        };
+                        if !mapped || !identity_matches {
+                            return false;
+                        }
+                        if !closing {
+                            return true;
+                        }
+                        // A close in progress can still be refused and unwind
+                        // its gate. Keep the Starting claim while that outcome
+                        // settles; only exact-cell removal is retirement.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            },
+            move || -> crate::identity_sink::SinkWrite {
+                match retry_sink.clone() {
+                    Some(sink) => sink.record_binding(retry_upsert.clone()),
+                    None => Box::pin(std::future::ready(Ok(()))),
+                }
+            },
+            move |ticket| commit_state.commit_lane_claim_at(ticket, &commit_id),
+        );
+        guard
+    }
+
     /// The post-commit rescue's committed fence (fresheyes ep2-r5): the
     /// `(epoch, generation)` pair the lane's own claim committed `Live`
     /// under — the registry's boot epoch and the ticket's generation
@@ -1994,6 +2067,22 @@ impl FreshOpencodeState {
             } => (Some(*generation), Some(owner.clone())),
             _ => (None, None),
         };
+        let mut binding_claim_for_adopt = pre_await_owner
+            .as_ref()
+            .filter(|owner| {
+                owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                    && owner.live_session_key.as_deref() == Some(durable_id.as_str())
+            })
+            .and_then(|owner| {
+                Some(crate::identity_sink::BindingClaim::live_fresh_agent(
+                    PROVIDER,
+                    &durable_id,
+                    owner.ownership_id.as_deref()?,
+                    pre_await.epoch,
+                    pre_await_generation?,
+                ))
+            });
+        let mut map_hit_starting_ticket = None;
         // b8ke ext r15 F1: the request fence is parsed BEFORE ANY
         // ownership mutation — the map-hit/Vacant compatibility claim
         // below carries it, and a half-sent (or stale) pair must refuse
@@ -2049,22 +2138,12 @@ impl FreshOpencodeState {
                         "freshopencode/map-hit-adopt",
                     ) {
                         crate::ownership_lane::LaneClaim::Granted(ticket) => {
-                            let mut ticket_opt = Some(ticket);
-                            if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
-                                &self.fresh_agent.ownership,
-                                &self.fresh_agent.ownership_stamps,
-                                Some(&self.fresh_agent.broadcast_tx),
-                                PROVIDER,
-                                &durable_id,
-                                &mut ticket_opt,
-                                &durable_id,
-                                None,
-                            ) {
-                                tracing::warn!(target: "freshell_freshagent::opencode",
-                                    session_id = %durable_id, outcome = ?outcome,
-                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
-                                     moved on while registering the existing session — the \
-                                     reuse is refused (never a live writer left unowned)");
+                            binding_claim_for_adopt =
+                                crate::identity_sink::BindingClaim::from_ticket(
+                                    &ticket,
+                                    crate::identity_sink::BindingClaimKind::Starting,
+                                );
+                            let Some(_) = binding_claim_for_adopt else {
                                 self.fail_create(
                                     &request_id,
                                     view_id,
@@ -2072,7 +2151,8 @@ impl FreshOpencodeState {
                                     "A lifecycle operation owns this session; retry after it settles",
                                 );
                                 return;
-                            }
+                            };
+                            map_hit_starting_ticket = Some(ticket);
                         }
                         crate::ownership_lane::LaneClaim::Unwired
                         | crate::ownership_lane::LaneClaim::Adopt => {}
@@ -2278,9 +2358,20 @@ impl FreshOpencodeState {
         // `resume_durable_session`, so it must perform that lane's SAME
         // awaited refresh write itself (durable-before-answer) — the CURRENT
         // connection's attribution lands on the row immediately, even if no
-        // send ever follows this resume. Conn-less resumes write nothing here
-        // (nothing new to assert; the row keeps its stamps).
-        if let Some(p) = provenance.filter(|_| in_memory_hit) {
+        // send ever follows this resume. A conn-less adoption still writes an
+        // identity-only row under the exact live owner claim; it keeps both
+        // existing settings and provenance.
+        if in_memory_hit {
+            let p = provenance.clone();
+            if self.fresh_agent.ownership.is_some() && binding_claim_for_adopt.is_none() {
+                self.fail_create(
+                    &request_id,
+                    view_id,
+                    "SESSION_RESERVED",
+                    "The OpenCode runtime no longer owns this session; refresh before reopening it.",
+                );
+                return;
+            }
             let (model, effort, cwd) = {
                 let session = session_arc.lock().await;
                 (
@@ -2292,6 +2383,29 @@ impl FreshOpencodeState {
             // Capture the PRE-write row state for the rollback (the
             // PRE-PARK capture above — the row's state before this
             // handler's own re-park).
+            let settings_were_asserted = msg.collaboration_mode.is_some()
+                || msg.cwd.is_some()
+                || msg.effort.is_some()
+                || msg.model.is_some()
+                || msg.model_selection.is_some()
+                || msg.permission_mode.is_some()
+                || msg.sandbox.is_some()
+                || msg.plugins.is_some();
+            let settings_update = if settings_were_asserted {
+                crate::identity_sink::SettingsUpdate::Replace(
+                    crate::identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
+                        model: model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: effort.clone(),
+                        cwd: cwd.clone(),
+                        plugins: None,
+                    },
+                )
+            } else {
+                crate::identity_sink::SettingsUpdate::Keep
+            };
             binding_write_rollback = Some(crate::identity_sink::FreshAgentBindingUpsert {
                 genesis: crate::identity_sink::GenesisUpdate::Keep,
                 provider: PROVIDER.into(),
@@ -2314,40 +2428,108 @@ impl FreshOpencodeState {
                 observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
                 observed_generation: observed_binding_pair.map(|(_, generation)| generation),
                 // b8ke focused ep5 r2 F1: a lane write.
-                authoritative: false,
-                settings: pre_park_settings.clone(),
+                claim: None,
+                settings: if settings_were_asserted {
+                    crate::identity_sink::SettingsUpdate::Replace(pre_park_settings.clone())
+                } else {
+                    crate::identity_sink::SettingsUpdate::Keep
+                },
             });
-            let _ = self
-                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                    genesis: crate::identity_sink::GenesisUpdate::Keep,
-                    provider: PROVIDER.into(),
-                    session_id: durable_id.clone(),
-                    mode: SESSION_TYPE.into(),
-                    create_request_id: None,
-                    resolves_pending: None,
-                    supersedes: None,
-                    // Unified agent names: no naming fact on this ledger edge.
-                    name_transition: None,
-                    provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
-                    // b8ke ext r27 F1: the refresh write carries the SAME
-                    // observed pair (it can land after a turnover's
-                    // terminal-side row write — the fence refuses it typed
-                    // instead of letting it corrupt the new owner's row).
-                    observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
-                    observed_generation: observed_binding_pair.map(|(_, generation)| generation),
-                    // b8ke focused ep5 r2 F1: a lane write.
-                    authoritative: false,
-                    settings: crate::identity_sink::FreshAgentSettings {
-                        collaboration_mode: None,
-                        model,
-                        sandbox: None,
-                        permission_mode: None,
-                        effort,
-                        cwd,
-                        plugins: None,
-                    },
-                })
-                .await;
+            let upsert = crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                // Unified agent names: no naming fact on this ledger edge.
+                name_transition: None,
+                provenance: p.map_or(
+                    crate::identity_sink::ProvenanceUpdate::Inherit,
+                    crate::identity_sink::ProvenanceUpdate::Replace,
+                ),
+                // b8ke ext r27 F1: the refresh write carries the SAME
+                // observed pair (it can land after a turnover's
+                // terminal-side row write — the fence refuses it typed
+                // instead of letting it corrupt the new owner's row).
+                observed_epoch: binding_claim_for_adopt
+                    .as_ref()
+                    .map(|claim| claim.epoch)
+                    .or_else(|| observed_binding_pair.map(|(epoch, _)| epoch)),
+                observed_generation: binding_claim_for_adopt
+                    .as_ref()
+                    .map(|claim| claim.generation)
+                    .or_else(|| observed_binding_pair.map(|(_, generation)| generation)),
+                claim: binding_claim_for_adopt.clone(),
+                settings: settings_update,
+            };
+            let mut binding_guard = if let Some(ticket) = map_hit_starting_ticket.take() {
+                let Some(claim) = binding_claim_for_adopt.clone() else {
+                    self.fail_create(
+                        &request_id,
+                        view_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                };
+                Some(self.map_hit_binding_guard(
+                    ticket,
+                    claim,
+                    &durable_id,
+                    session_arc.clone(),
+                    upsert.clone(),
+                ))
+            } else {
+                None
+            };
+            if let Some(guard) = binding_guard.as_mut() {
+                if !guard.map_hit_runtime_present().await {
+                    self.fail_create(
+                        &request_id,
+                        view_id,
+                        "SESSION_RESERVED",
+                        "The OpenCode session stopped while it was being adopted; refresh and retry.",
+                    );
+                    return;
+                }
+            }
+            let binding_write = match binding_guard.as_mut() {
+                Some(guard) => guard.write_map_hit().await,
+                None => self.record_binding_row(upsert).await,
+            };
+            if let Err(error) = binding_write {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %durable_id, error = %error,
+                    "freshagent.opencode.adopt_binding_failed: identity persistence failed before created reply"
+                );
+                if let Some(guard) = binding_guard.as_mut() {
+                    let _ = guard.repair_now().await;
+                }
+                self.fail_create(
+                    &request_id,
+                    view_id,
+                    "LEDGER_WRITE_FAILED",
+                    "The session's recovery record could not be persisted; refresh and retry.",
+                );
+                return;
+            }
+            if let Some(guard) = binding_guard.as_mut() {
+                if let Err(outcome) = guard.commit_map_hit().await {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable_id, outcome = ?outcome,
+                        "fresh_agent_create_adopt_commit_stale: the coordinator moved while the identity write was in flight"
+                    );
+                    self.fail_create(
+                        &request_id,
+                        view_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+            }
         }
 
         // b8ke e3r4 F4 + e3 post-cap F4: the POST-WRITE RECHECK — strict:
@@ -2946,6 +3128,17 @@ impl FreshOpencodeState {
             // session missing from the authoritative recovery registry);
             // the ticket's RAII drop settles the rekeyed claim typed and
             // the pane answers the typed recoverable error.
+            let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            });
+            let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+                own_ticket.take(),
+                binding_claim.clone(),
+                self.identity_sink(),
+            ));
             if let Err(e) = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                     genesis: crate::identity_sink::GenesisUpdate::Keep,
@@ -2989,11 +3182,10 @@ impl FreshOpencodeState {
                         session.placeholder_id.clone(),
                     )),
                     provenance: session.provenance.clone().into(),
-                    observed_epoch: None,
-                    observed_generation: None,
-                    // b8ke focused ep5 r2 F1: a lane write.
-                    authoritative: false,
-                    settings: crate::identity_sink::FreshAgentSettings {
+                    observed_epoch: binding_claim.as_ref().map(|claim| claim.epoch),
+                    observed_generation: binding_claim.as_ref().map(|claim| claim.generation),
+                    claim: binding_claim.clone(),
+                    settings: crate::identity_sink::SettingsUpdate::Replace(crate::identity_sink::FreshAgentSettings {
                         collaboration_mode: None,
                         model: session.model.clone(),
                         sandbox: None,
@@ -3001,7 +3193,7 @@ impl FreshOpencodeState {
                         effort: session.effort.clone(),
                         cwd: session.cwd.clone(),
                         plugins: None,
-                    },
+                    }),
                 })
                 .await
             {
@@ -3010,6 +3202,16 @@ impl FreshOpencodeState {
                     "freshagent.opencode.materialize_binding_failed_typed: the durable \
                      row write failed — the session is torn down (kata b8ke ext r26 F4)"
                 );
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
+                } else {
+                    drop(binding_guard.take());
+                }
                 {
                     let mut guard = self.sessions.lock().await;
                     guard.remove(&session.placeholder_id);
@@ -3025,6 +3227,46 @@ impl FreshOpencodeState {
                 );
                 return;
             }
+
+            // The durable binding is established before ownership becomes
+            // Live and before the materialized identity is published.
+            if let Err(outcome) = self.commit_lane_claim_at(
+                binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .ticket_mut(),
+                &durable_id,
+            ) {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %durable_id,
+                    outcome = ?outcome,
+                    "freshagent.opencode.materialize_commit_stale: the coordinator moved on \
+                     after the binding was persisted; the uncommitted session is torn down"
+                );
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
+                } else {
+                    drop(binding_guard.take());
+                }
+                {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(&session.placeholder_id);
+                    guard.remove(&durable_id);
+                }
+                session.killed.store(true, Ordering::SeqCst);
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "SESSION_RESERVED",
+                    "Session ownership changed during materialization",
+                );
+                return;
+            }
+            drop(binding_guard.take().map(|guard| guard.finish()));
 
             // Unified agent names (Task 2): commit the pending→durable name
             // transfer BEFORE the materialized frame publishes the identity
@@ -3057,35 +3299,6 @@ impl FreshOpencodeState {
             self.install_serve_bridge(&manager, &mut *session, &durable_id)
                 .await;
 
-            // kata b8ke Task 3: the materialization's registration is
-            // complete — commit `Live{FreshAgent}` for the minted `ses_*`
-            // key (the stamp lands in the SHARED map). A stale/foreign
-            // commit means the key was recovered mid-materialization: tear
-            // the just-registered session down (map keys, bridge) — the
-            // shared serve is never touched.
-            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &durable_id) {
-                tracing::error!(target: "invariant",
-                    provider = PROVIDER, session_id = %durable_id,
-                    outcome = ?outcome,
-                    "freshagent.opencode.materialize_commit_stale: the coordinator moved on \
-                     while the materialization registered; the uncommitted session is torn down"
-                );
-                {
-                    let mut guard = self.sessions.lock().await;
-                    guard.remove(&session.placeholder_id);
-                    guard.remove(&durable_id);
-                }
-                if let Some(bridge) = session.serve_bridge.take() {
-                    bridge.abort();
-                }
-                session.killed.store(true, Ordering::SeqCst);
-                self.emit_fresh_agent_error(
-                    &session_id,
-                    "SESSION_RESERVED",
-                    "Session ownership changed during materialization",
-                );
-                return;
-            }
             // b8ke ext r23 F1 carried the placeholder→durable COORDINATOR
             // ALIAS as an explicit `alias_vacant_key` call here; b8ke ext
             // r26 F3's pre-mint claim makes it inherent — the mint-time
@@ -3125,16 +3338,18 @@ impl FreshOpencodeState {
                     observed_epoch: None,
                     observed_generation: None,
                     // b8ke focused ep5 r2 F1: a lane write.
-                    authoritative: false,
-                    settings: crate::identity_sink::FreshAgentSettings {
-                        collaboration_mode: None,
-                        model: session.model.clone(),
-                        sandbox: None,
-                        permission_mode: None,
-                        effort: session.effort.clone(),
-                        cwd: session.cwd.clone(),
-                        plugins: None,
-                    },
+                    claim: None,
+                    settings: crate::identity_sink::SettingsUpdate::Replace(
+                        crate::identity_sink::FreshAgentSettings {
+                            collaboration_mode: None,
+                            model: session.model.clone(),
+                            sandbox: None,
+                            permission_mode: None,
+                            effort: session.effort.clone(),
+                            cwd: session.cwd.clone(),
+                            plugins: None,
+                        },
+                    ),
                 })
                 .await;
         }
@@ -3686,16 +3901,18 @@ impl FreshOpencodeState {
                     provenance: provenance.into(),
                     observed_epoch: None,
                     observed_generation: None,
-                    authoritative: false,
-                    settings: crate::identity_sink::FreshAgentSettings {
-                        collaboration_mode: None,
-                        model: model.clone(),
-                        sandbox: None,
-                        permission_mode: None,
-                        effort: effort.clone(),
-                        cwd,
-                        plugins: None,
-                    },
+                    claim: None,
+                    settings: crate::identity_sink::SettingsUpdate::Replace(
+                        crate::identity_sink::FreshAgentSettings {
+                            collaboration_mode: None,
+                            model: model.clone(),
+                            sandbox: None,
+                            permission_mode: None,
+                            effort: effort.clone(),
+                            cwd,
+                            plugins: None,
+                        },
+                    ),
                 })
                 .await;
         }
@@ -6559,8 +6776,6 @@ impl FreshOpencodeState {
         );
         child_session.provenance = fork_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
-        self.install_serve_bridge(&manager, &mut child_session, &child.id)
-            .await;
         // ep2-r5: bind the child's session INSTANCE — the fork's rescue
         // verifies this exact `Arc` against the map (a same-key
         // replacement for the child can never satisfy it).
@@ -6580,6 +6795,17 @@ impl FreshOpencodeState {
         // authoritative recovery registry (the pre-r26 log-and-continue
         // discarded the Result); the ticket's RAII drop settles the rekeyed
         // claim typed.
+        let binding_claim = own_ticket.as_ref().and_then(|ticket| {
+            crate::identity_sink::BindingClaim::from_ticket(
+                ticket,
+                crate::identity_sink::BindingClaimKind::Starting,
+            )
+        });
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
         if let Err(e) = self
             .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 genesis: crate::identity_sink::GenesisUpdate::Keep,
@@ -6597,19 +6823,20 @@ impl FreshOpencodeState {
                 // connection > parent's parked > parent's row); `Inherit` only
                 // when no source knows the attribution — never invented.
                 provenance: fork_provenance.into(),
-                observed_epoch: None,
-                observed_generation: None,
-                // b8ke focused ep5 r2 F1: a lane write.
-                authoritative: false,
-                settings: crate::identity_sink::FreshAgentSettings {
-                    collaboration_mode: None,
-                    model,
-                    sandbox: None,
-                    permission_mode: None,
-                    effort,
-                    cwd: child_cwd.clone(),
-                    plugins: None,
-                },
+                observed_epoch: binding_claim.as_ref().map(|claim| claim.epoch),
+                observed_generation: binding_claim.as_ref().map(|claim| claim.generation),
+                claim: binding_claim.clone(),
+                settings: crate::identity_sink::SettingsUpdate::Replace(
+                    crate::identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
+                        model,
+                        sandbox: None,
+                        permission_mode: None,
+                        effort,
+                        cwd: child_cwd.clone(),
+                        plugins: None,
+                    },
+                ),
             })
             .await
         {
@@ -6619,6 +6846,16 @@ impl FreshOpencodeState {
                 "freshagent.opencode.fork_binding_failed_typed: the child's durable row \
                  write failed — the child is torn down (kata b8ke ext r26 F4)"
             );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
+            } else {
+                drop(binding_guard.take());
+            }
             // The sibling stale-commit teardown shape: KEEP the removed value
             // so the bridge abort and the killed flag actually execute.
             let removed = {
@@ -6652,13 +6889,29 @@ impl FreshOpencodeState {
         // `Live{FreshAgent}` under the NEW child key (the stamp lands in the
         // SHARED map). A stale/foreign commit tears the child down (map keys
         // + bridge); the shared serve is never touched.
-        if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &child.id) {
+        if let Err(outcome) = self.commit_lane_claim_at(
+            binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .ticket_mut(),
+            &child.id,
+        ) {
             tracing::error!(target: "invariant",
                 provider = PROVIDER, session_id = %child.id,
                 parent_session_id = %msg.session_id, outcome = ?outcome,
                 "freshagent.opencode.fork_commit_stale: the coordinator moved on while the \
                  fork child registered; the uncommitted child is torn down"
             );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
+            } else {
+                drop(binding_guard.take());
+            }
             // Task 3 review M-1: KEEP the removed value — the re-get below
             // could never find the just-removed entry, so the bridge abort
             // and the killed flag never executed (the child's serve-SSE
@@ -6690,6 +6943,12 @@ impl FreshOpencodeState {
             ));
             return;
         }
+        own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+
+        // The child has a durable identity and a committed exact owner before
+        // its event bridge can publish provider output.
+        self.install_serve_bridge(&manager, &mut *child_session_arc.lock().await, &child.id)
+            .await;
 
         // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
         // commit landed, so the child is now visible to every future
@@ -7427,7 +7686,7 @@ impl FreshOpencodeState {
         // epoch/generation) is the typed invalid-fence refusal — before any
         // state interaction. The attach never proceeds as a silently
         // downgraded legacy request.
-        let attach_fence =
+        let mut attach_fence =
             match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
                 Ok(fence) => fence,
                 Err(err) => {
@@ -7481,6 +7740,9 @@ impl FreshOpencodeState {
         } else {
             false
         };
+        let mut map_hit_durable_id = None;
+        let mut map_hit_starting_ticket = None;
+        let mut map_hit_starting_claim = None;
         // b8ke delta round-3 F2: an existing-session attach still CONSULTS
         // the coordinator — a delayed attach during a Handoff (the map entry
         // exists until the stop lands) must be BLOCKED or typed, never a
@@ -7516,6 +7778,7 @@ impl FreshOpencodeState {
                         None => None,
                     }
                     .unwrap_or_else(|| msg.session_id.clone());
+                    map_hit_durable_id = Some(durable.clone());
                     let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
                     // b8ke ext r15 F1: the attach's compatibility claim is
                     // FENCED with the request's observed pair (parsed at
@@ -7529,22 +7792,12 @@ impl FreshOpencodeState {
                         "freshopencode/map-hit-adopt",
                     ) {
                         crate::ownership_lane::LaneClaim::Granted(ticket) => {
-                            let mut ticket_opt = Some(ticket);
-                            if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
-                                &self.fresh_agent.ownership,
-                                &self.fresh_agent.ownership_stamps,
-                                Some(&self.fresh_agent.broadcast_tx),
-                                PROVIDER,
-                                &durable,
-                                &mut ticket_opt,
-                                &durable,
-                                None,
-                            ) {
-                                tracing::warn!(target: "freshell_freshagent::opencode",
-                                    session_id = %durable, outcome = ?outcome,
-                                    "fresh_agent_attach_adopt_commit_stale: the coordinator \
-                                     moved on while registering the existing session — the \
-                                     reuse is refused (never a live writer left unowned)");
+                            map_hit_starting_claim =
+                                crate::identity_sink::BindingClaim::from_ticket(
+                                    &ticket,
+                                    crate::identity_sink::BindingClaimKind::Starting,
+                                );
+                            if map_hit_starting_claim.is_none() {
                                 self.emit_fresh_agent_error(
                                     &msg.session_id,
                                     "SESSION_RESERVED",
@@ -7552,6 +7805,7 @@ impl FreshOpencodeState {
                                 );
                                 return;
                             }
+                            map_hit_starting_ticket = Some(ticket);
                         }
                         crate::ownership_lane::LaneClaim::Unwired
                         | crate::ownership_lane::LaneClaim::Adopt => {}
@@ -7588,6 +7842,82 @@ impl FreshOpencodeState {
                 }
                 _ => {}
             }
+        }
+        if let (Some(ticket), Some(durable), Some(claim)) = (
+            map_hit_starting_ticket.take(),
+            map_hit_durable_id.as_deref(),
+            map_hit_starting_claim.clone(),
+        ) {
+            let Some(session_arc) = session_arc.as_ref().cloned() else {
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    "INVALID_SESSION_ID",
+                    "The OpenCode session stopped while it was being attached.",
+                );
+                return;
+            };
+            let upsert = crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
+                provider: PROVIDER.into(),
+                session_id: durable.into(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                name_transition: None,
+                provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(claim.epoch),
+                observed_generation: Some(claim.generation),
+                claim: Some(claim.clone()),
+                settings: crate::identity_sink::SettingsUpdate::Keep,
+            };
+            let mut binding_guard = self.map_hit_binding_guard(
+                ticket,
+                claim.clone(),
+                durable,
+                session_arc,
+                upsert.clone(),
+            );
+            if !binding_guard.map_hit_runtime_present().await {
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    "INVALID_SESSION_ID",
+                    "The OpenCode session stopped while it was being attached.",
+                );
+                return;
+            }
+            if let Err(error) = binding_guard.write_map_hit().await {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %durable, error = %error,
+                    "freshagent.opencode.attach_binding_failed: map-hit identity could not be persisted"
+                );
+                let _ = binding_guard.repair_now().await;
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    "LEDGER_WRITE_FAILED",
+                    "The session's recovery record could not be persisted; refresh and retry.",
+                );
+                return;
+            }
+            if let Err(outcome) = binding_guard.commit_map_hit().await {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable, outcome = ?outcome,
+                    "fresh_agent_attach_adopt_commit_stale: the coordinator moved while the identity write was in flight"
+                );
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    "SESSION_RESERVED",
+                    "A lifecycle operation owns this session; retry after it settles",
+                );
+                return;
+            }
+            attach_fence = self.fresh_agent.ownership.as_ref().map(|registry| {
+                let snapshot = registry.observe(PROVIDER, durable);
+                freshell_ownership::ObservedFence {
+                    epoch: snapshot.epoch,
+                    generation: snapshot.generation,
+                }
+            });
         }
         // b8ke ext r12 F2: the existing-session attach's REAL claim — the
         // guard arms under the coordinator lock and is held ACROSS the
@@ -8096,55 +8426,146 @@ impl FreshOpencodeState {
             ));
         }
 
-        // kata b8ke Task 3: the resume's registration survived every
-        // teardown gate — commit `Live{FreshAgent}` under the durable
-        // `ses_*` key (the stamp lands in the SHARED map: the kill/exit
-        // claim source for BOTH the REST and WS surfaces). Task 6:
-        // under-ticket mode (handoff continuation) SKIPS the commit — the
-        // handoff runner performs the ONE `commit_live` (single commit
-        // authority).
-        // b8ke ext r22 F2: the binding row's fence pair — captured at the
-        // moment this resume's commit runs (the delayed-write fence
-        // baseline the durable row carries below).
-        // b8ke ext r27 F2: the UNDER-TICKET continuation holds NO ticket
-        // by design — the SUPPLIED handoff (epoch, generation) stamps the
-        // row instead, so the target's durable row carries the handoff's
-        // generation (pre-r27 the derivation collapsed to (None, None)
-        // here, the row preserved the PRIOR generation, and a delayed
-        // prior-generation write could pass the ledger's comparison and
-        // replace the new owner's recovery metadata).
-        let (binding_epoch, binding_generation) = match (
-            self.fresh_agent.ownership.as_ref(),
-            own_ticket.as_ref(),
-            handoff,
-        ) {
-            (Some(registry), Some(ticket), _) => {
-                (Some(registry.boot_epoch()), Some(ticket.generation()))
-            }
-            (Some(registry), None, Some((_, handoff_generation))) => {
-                (Some(registry.boot_epoch()), Some(handoff_generation))
-            }
-            _ => (None, None),
+        // Capture the exact operation before any commit can change coordinator
+        // state. A normal cold resume owns Starting; a handoff continuation
+        // carries the runner's exact Handoff identity.
+        let binding_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                let (operation_id, generation) = handoff?;
+                let registry = self.fresh_agent.ownership.as_ref()?;
+                Some(crate::identity_sink::BindingClaim::handoff(
+                    PROVIDER,
+                    session_id,
+                    operation_id,
+                    registry.boot_epoch(),
+                    generation,
+                ))
+            });
+        let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
+        let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
+        let mut binding_guard = Some(crate::identity_sink::BindingWriteGuard::new(
+            own_ticket.take(),
+            binding_claim.clone(),
+            self.identity_sink(),
+        ));
+
+        // Every verified resume establishes identity before the coordinator
+        // can publish Live or the caller can answer success. A missing
+        // settings snapshot is Keep: it preserves prior settings and never
+        // creates a defaults record.
+        let provenance_update: crate::identity_sink::ProvenanceUpdate = provenance.into();
+        let settings_update = match recovered.as_ref() {
+            Some(_) => crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
+                    model: rec.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: rec.effort.clone(),
+                    cwd: cwd.clone(),
+                    plugins: None,
+                },
+            ),
+            None => crate::identity_sink::SettingsUpdate::Keep,
         };
+        if let Err(error) = self
+            .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
+                provider: PROVIDER.into(),
+                session_id: session_id.to_string(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                name_transition: None,
+                provenance: provenance_update,
+                observed_epoch: binding_epoch,
+                observed_generation: binding_generation,
+                claim: binding_claim.clone(),
+                settings: settings_update,
+            })
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %session_id, error = %error,
+                "freshagent.opencode.resume_binding_failed: identity persistence failed before Live"
+            );
+            let repaired = binding_guard
+                .as_mut()
+                .expect("binding guard is present")
+                .repair_now()
+                .await;
+            if repaired {
+                drop(binding_guard.take().and_then(|guard| guard.finish()));
+            } else {
+                drop(binding_guard.take());
+            }
+            let removed = {
+                let mut guard = self.sessions.lock().await;
+                guard.remove(session_id)
+            };
+            if let Some(removed) = removed {
+                let mut session = removed.lock().await;
+                session.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = session.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
+                if let Some(bridge) = session.serve_bridge.take() {
+                    bridge.abort();
+                }
+            }
+            lease_guard.fail();
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} identity could not be persisted; torn down"
+                )),
+            ));
+        }
+
+        // The durable identity is now established under the exact claim;
+        // only then may a lane-owned Starting claim become Live. The handoff
+        // runner remains the sole commit authority for its Handoff ticket.
         if handoff.is_none() {
-            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, session_id) {
+            if let Err(outcome) = self.commit_lane_claim_at(
+                binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .ticket_mut(),
+                session_id,
+            ) {
                 tracing::error!(target: "invariant",
                     provider = PROVIDER, session_id = %session_id,
                     outcome = ?outcome,
-                    "freshagent.opencode.resume_commit_stale: the coordinator moved on while the \
-                     resume registered; the uncommitted session is torn down"
+                    "freshagent.opencode.resume_commit_stale: the coordinator moved after identity persistence"
                 );
+                let repaired = binding_guard
+                    .as_mut()
+                    .expect("binding guard is present")
+                    .repair_now()
+                    .await;
+                if repaired {
+                    drop(binding_guard.take().and_then(|guard| guard.finish()));
+                } else {
+                    drop(binding_guard.take());
+                }
                 let removed = {
                     let mut guard = self.sessions.lock().await;
                     guard.remove(session_id)
                 };
                 if let Some(removed) = removed {
-                    let mut s = removed.lock().await;
-                    s.killed.store(true, Ordering::SeqCst);
-                    if let Some(task) = s.turn_task.take() {
+                    let mut session = removed.lock().await;
+                    session.killed.store(true, Ordering::SeqCst);
+                    if let Some(task) = session.turn_task.take() {
                         task.abort_and_settle().await;
                     }
-                    if let Some(bridge) = s.serve_bridge.take() {
+                    if let Some(bridge) = session.serve_bridge.take() {
                         bridge.abort();
                     }
                 }
@@ -8155,100 +8576,9 @@ impl FreshOpencodeState {
                 ));
             }
         }
-        // Under-ticket mode leaves own_ticket None (never claimed); in the
-        // normal mode the commit above consumed or disarmed it, and every
-        // early error return drops it armed for the RAII typed fail.
-
-        // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
-        // (durable-before-answer). The SETTINGS payload rides only when a record was
-        // actually recovered (never launder a defaults row for a never-recorded
-        // session, V7); the D8 provenance re-stamp rides whenever the resume is
-        // connection-scoped — INCLUDING the settings-None (lineage-only row) case,
-        // which must still assert the CURRENT connection's identity/tab
-        // (focused-ep1 Finding A, branch 2). A conn-less resume of a
-        // never-recorded session still writes nothing (V7's no-laundering rule,
-        // unchanged).
-        if recovered.is_some() || provenance.is_some() {
-            // D8 provenance (delta-r1 Finding 3): a connection-scoped
-            // create-resume re-stamps the row with the CURRENT connection's
-            // identity/tab (a resume-into-a-new-tab must not keep the OLD tab's
-            // attribution). When no connection identity is available the write
-            // is `Inherit` (never invent) and the ledger merge preserves the
-            // create's stamps.
-            let provenance: crate::identity_sink::ProvenanceUpdate = provenance.into();
-            // Settings merge stays as-is: recovered values when a snapshot
-            // exists; otherwise a blank payload (a replace-no-op — a
-            // lineage-only row has no settings to clobber, and a never-recorded
-            // session gains provenance WITHOUT a laundered defaults snapshot).
-            let settings = if recovered.is_some() {
-                crate::identity_sink::FreshAgentSettings {
-                    collaboration_mode: None,
-                    model: rec.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: rec.effort.clone(),
-                    cwd,
-                    plugins: None,
-                }
-            } else {
-                crate::identity_sink::FreshAgentSettings::default()
-            };
-            // b8ke ext r22 F2: the binding failure PROPAGATES — the
-            // rebuilt session is torn down and the resume answers the
-            // typed failure (the claim settles through the teardown),
-            // never a bare LEDGER_WRITE_FAILED notification under a
-            // committed Live.
-            if let Err(e) = self
-                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                    genesis: crate::identity_sink::GenesisUpdate::Keep,
-                    provider: PROVIDER.into(),
-                    session_id: session_id.to_string(),
-                    mode: SESSION_TYPE.into(),
-                    create_request_id: None,
-                    resolves_pending: None,
-                    supersedes: None,
-                    // Unified agent names: no naming fact on this ledger edge.
-                    name_transition: None,
-                    provenance,
-                    observed_epoch: binding_epoch,
-                    observed_generation: binding_generation,
-                    // b8ke focused ep5 r2 F1: the UNDER-TICKET shape (no own
-                    // ticket; the runner-supplied handoff generation stamped
-                    // the pair) is the handoff runner's OWN authoritative
-                    // target binding — the normal resume's own-ticket write
-                    // stays a lane write.
-                    authoritative: own_ticket.is_none() && handoff.is_some(),
-                    settings,
-                })
-                .await
-            {
-                tracing::error!(target: "invariant",
-                    provider = PROVIDER, session_id = %session_id,
-                    error = %e,
-                    "freshagent.opencode.resume_binding_failed_typed: the durable row \
-                     write failed — the rebuilt session is torn down (kata b8ke ext r22 F2)"
-                );
-                let removed = {
-                    let mut guard = self.sessions.lock().await;
-                    guard.remove(session_id)
-                };
-                if let Some(removed) = removed {
-                    let mut s = removed.lock().await;
-                    s.killed.store(true, Ordering::SeqCst);
-                    if let Some(task) = s.turn_task.take() {
-                        task.abort_and_settle().await;
-                    }
-                    if let Some(bridge) = s.serve_bridge.take() {
-                        bridge.abort();
-                    }
-                }
-                return Err(ResumeOpencodeError::Manager(
-                    freshell_opencode::ServeError::Transport(format!(
-                        "opencode session {session_id} resume record could not be persisted; torn down"
-                    )),
-                ));
-            }
-        }
+        own_ticket = binding_guard.take().and_then(|guard| guard.finish());
+        // Under-ticket mode leaves own_ticket None; the handoff runner commits
+        // the exact Handoff operation after this function returns.
 
         // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
         // resume installed its bridge BEFORE the map publication and the
@@ -15167,10 +15497,14 @@ mod tests {
             .find(|b| b.session_id.starts_with("ses_"))
             .expect("binding at materialization");
         assert_eq!(b.provider, "opencode");
-        assert_eq!(b.settings.model.as_deref(), Some("big-model"));
-        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        let settings = b
+            .settings
+            .as_replacement()
+            .expect("materialized settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("big-model"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
         assert!(
-            b.settings.cwd.is_some(),
+            settings.cwd.is_some(),
             "cwd captured (upgraded from created.directory)"
         );
         assert!(b
@@ -15400,13 +15734,15 @@ mod tests {
             "the handoff continuation stamps the SUPPLIED handoff generation — \
              pre-r27 it carried None (derived from its own absent ticket)"
         );
-        // b8ke focused ep5 r2 F1: the under-ticket target binding is the
-        // runner's AUTHORITATIVE write (the terminal-row guard's
-        // accepting arm over the prior terminal's unstamped row).
-        assert!(
-            last.authoritative,
-            "the handoff continuation's binding is authoritative: {last:?}"
-        );
+        let claim = last
+            .claim
+            .as_ref()
+            .expect("the under-ticket binding carries an exact claim");
+        assert_eq!(claim.kind, crate::identity_sink::BindingClaimKind::Handoff);
+        assert_eq!(claim.provider, "opencode");
+        assert_eq!(claim.session_id, "ses_r27_oc");
+        assert_eq!(claim.operation_id, "handoff-op-r27");
+        assert_eq!((claim.epoch, claim.generation), (registry.boot_epoch(), 9));
     }
 
     /// b8ke ext r26 F4: a first-send materialization whose durable
@@ -15516,8 +15852,12 @@ mod tests {
             .rev()
             .find(|b| b.session_id.starts_with("ses_"))
             .unwrap();
-        assert_eq!(b.settings.model.as_deref(), Some("small-model"));
-        assert_eq!(b.settings.effort.as_deref(), Some("low"));
+        let settings = b
+            .settings
+            .as_replacement()
+            .expect("accepted settings refresh is an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("small-model"));
+        assert_eq!(settings.effort.as_deref(), Some("low"));
     }
 
     /// D8 lane-reach (restore-open-sessions-only, review round 3): opencode's
@@ -15761,8 +16101,10 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("lineage binding write ok");
@@ -15823,8 +16165,10 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("lineage seed write");
@@ -16037,7 +16381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_without_record_is_silent_and_uses_serve_directory() {
+    async fn attach_resume_without_record_is_silent_and_uses_serve_directory() {
         // Same harness; NO seed (never-recorded session -- the ROUTINE case, V7:
         // handle_attach's own doc describes this attach population).
         let (state, mut rx) = state_with_durable_serve_session().await;
@@ -16069,16 +16413,19 @@ mod tests {
             );
         }
 
-        // NO refresh binding was written for the session (no defaults laundering).
-        assert!(
-            !fake
-                .bindings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|b| b.session_id == DURABLE_ID),
-            "a load_settings miss must not write a defaults row"
-        );
+        // A verified resume establishes the durable identity, while keeping
+        // the settings miss identity-only so no defaults row is laundered.
+        let binding = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|binding| binding.provider == "opencode" && binding.session_id == DURABLE_ID)
+            .cloned()
+            .expect("a verified resume establishes the recovered identity");
+        assert_eq!(binding.settings, crate::identity_sink::SettingsUpdate::Keep);
+        assert!(fake.load_settings("opencode", DURABLE_ID).is_none());
+        assert!(!fake.was_recorded("opencode", DURABLE_ID));
     }
 
     #[tokio::test]
@@ -16512,6 +16859,546 @@ mod tests {
         generation
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacant_map_hit_create_resume_keeps_starting_until_binding_persists() {
+        let durable_id = "ses_map_hit_resume_binding_order";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(identity.clone());
+        let vacant = registry.observe(PROVIDER, durable_id);
+        let stall = identity.arm_binding_stall(PROVIDER, durable_id);
+
+        let mut msg = create_msg("req-map-hit-resume-binding-order");
+        msg.resume_session_id = Some(durable_id.to_string());
+        msg.observed_epoch = Some(vacant.epoch);
+        msg.observed_generation = Some(vacant.generation);
+        let st2 = st.clone();
+        let durable_id_for_task = durable_id.to_string();
+        let task = tokio::spawn(async move {
+            st2.handle_create_resume(
+                "req-map-hit-resume-binding-order".to_string(),
+                durable_id_for_task,
+                &msg,
+                None,
+            )
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the in-memory resume reaches its durable identity write");
+
+        let starting = registry.observe(PROVIDER, durable_id);
+        let (operation_id, epoch, generation) = match starting.state {
+            freshell_ownership::OwnershipState::Starting {
+                ref operation_id,
+                generation,
+                ..
+            } => (operation_id.clone(), starting.epoch, generation),
+            state => panic!("the map-hit binding write must remain Starting: {state:?}"),
+        };
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-during-opencode-resume-binding",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        let binding = identity.bindings.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            binding.claim,
+            Some(crate::identity_sink::BindingClaim {
+                provider: PROVIDER.into(),
+                session_id: durable_id.into(),
+                operation_id,
+                epoch,
+                generation,
+                kind: crate::identity_sink::BindingClaimKind::Starting,
+            }),
+            "the parked identity write is authorized by the exact Starting claim"
+        );
+        assert_eq!(
+            binding.settings,
+            crate::identity_sink::SettingsUpdate::Keep,
+            "map-hit identity establishment never replaces saved settings with defaults"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the resume cannot publish before persistence"
+        );
+
+        stall.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("the in-memory resume settles")
+            .unwrap();
+        let mut saw_created = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            saw_created |= frame["type"] == "freshAgent.created"
+                && frame["requestId"] == "req-map-hit-resume-binding-order";
+        }
+        assert!(saw_created, "the persisted map-hit resume is acknowledged");
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacant_map_hit_create_resume_write_failure_keeps_the_starting_writer_fence() {
+        let durable_id = "ses_map_hit_resume_binding_failure";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        identity.set_fail_writes(true);
+        st.set_identity_sink(identity.clone());
+        let vacant = registry.observe(PROVIDER, durable_id);
+
+        let mut msg = create_msg("req-map-hit-resume-binding-failure");
+        msg.resume_session_id = Some(durable_id.to_string());
+        msg.observed_epoch = Some(vacant.epoch);
+        msg.observed_generation = Some(vacant.generation);
+        st.handle_create_resume(
+            "req-map-hit-resume-binding-failure".to_string(),
+            durable_id.to_string(),
+            &msg,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, durable_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "a failed map-hit identity write keeps the existing writer fenced Starting"
+        );
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-after-opencode-resume-binding-failure",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        assert!(identity.bindings.lock().unwrap().is_empty());
+        let mut saw_created = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            saw_created |= frame["type"] == "freshAgent.created"
+                && frame["requestId"] == "req-map-hit-resume-binding-failure";
+        }
+        assert!(
+            !saw_created,
+            "a failed binding write never publishes success"
+        );
+        identity.set_fail_writes(false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe(PROVIDER, durable_id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained exact map-hit claim retries persistence and becomes Live");
+        assert!(
+            identity.repairs.lock().unwrap().is_empty(),
+            "a recoverable map-hit write must not tombstone the operation being retried"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacant_map_hit_attach_keeps_starting_until_binding_persists() {
+        let durable_id = "ses_map_hit_attach_binding_order";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(identity.clone());
+        let vacant = registry.observe(PROVIDER, durable_id);
+        let stall = identity.arm_binding_stall(PROVIDER, durable_id);
+
+        let mut attach = attach_msg(durable_id);
+        attach.observed_epoch = Some(vacant.epoch);
+        attach.observed_generation = Some(vacant.generation);
+        let st2 = st.clone();
+        let task = tokio::spawn(async move { st2.handle_attach(attach).await });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the materialized attach reaches its durable identity write");
+
+        let starting = registry.observe(PROVIDER, durable_id);
+        let (operation_id, epoch, generation) = match starting.state {
+            freshell_ownership::OwnershipState::Starting {
+                ref operation_id,
+                generation,
+                ..
+            } => (operation_id.clone(), starting.epoch, generation),
+            state => panic!("the attach binding write must remain Starting: {state:?}"),
+        };
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-during-opencode-attach-binding",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        let binding = identity.bindings.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            binding.claim,
+            Some(crate::identity_sink::BindingClaim {
+                provider: PROVIDER.into(),
+                session_id: durable_id.into(),
+                operation_id,
+                epoch,
+                generation,
+                kind: crate::identity_sink::BindingClaimKind::Starting,
+            }),
+            "the attach's parked identity write is authorized by the exact Starting claim"
+        );
+        assert_eq!(binding.settings, crate::identity_sink::SettingsUpdate::Keep);
+        assert!(
+            rx.try_recv().is_err(),
+            "the attach cannot publish before persistence"
+        );
+
+        stall.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("the materialized attach settles")
+            .unwrap();
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        let mut saw_snapshot = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            saw_snapshot |= frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["sessionId"] == durable_id;
+        }
+        assert!(
+            saw_snapshot,
+            "the durable attach answers with its session snapshot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacant_map_hit_attach_write_failure_keeps_the_starting_writer_fence() {
+        let durable_id = "ses_map_hit_attach_binding_failure";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        identity.set_fail_writes(true);
+        st.set_identity_sink(identity.clone());
+        let vacant = registry.observe(PROVIDER, durable_id);
+
+        let mut attach = attach_msg(durable_id);
+        attach.observed_epoch = Some(vacant.epoch);
+        attach.observed_generation = Some(vacant.generation);
+        st.handle_attach(attach).await;
+
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, durable_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "a failed map-hit attach bind keeps the existing writer fenced Starting"
+        );
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-after-opencode-attach-binding-failure",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        assert!(identity.bindings.lock().unwrap().is_empty());
+        let mut saw_error = false;
+        let mut saw_snapshot = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            saw_error |= frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.error"
+                && frame["event"]["code"] == "LEDGER_WRITE_FAILED";
+            saw_snapshot |= frame["event"]["type"] == "freshAgent.session.snapshot";
+        }
+        assert!(
+            saw_error,
+            "a failed identity write is returned as a typed error"
+        );
+        assert!(
+            !saw_snapshot,
+            "a failed identity write never publishes an attach snapshot"
+        );
+        identity.set_fail_writes(false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe(PROVIDER, durable_id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained exact map-hit claim retries persistence and becomes Live");
+        assert!(
+            identity.repairs.lock().unwrap().is_empty(),
+            "a recoverable map-hit write must not tombstone the operation being retried"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn map_hit_attach_waits_for_temporary_close_before_binding() {
+        let durable_id = "ses_map_hit_attach_temporary_close";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(identity.clone());
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get(durable_id)
+            .cloned()
+            .expect("the materialized session is in the map");
+        session_arc.lock().await.close_pending = 1;
+        let vacant = registry.observe(PROVIDER, durable_id);
+        let stall = identity.arm_binding_stall(PROVIDER, durable_id);
+
+        let mut attach = attach_msg(durable_id);
+        attach.observed_epoch = Some(vacant.epoch);
+        attach.observed_generation = Some(vacant.generation);
+        let st2 = st.clone();
+        let task = tokio::spawn(async move { st2.handle_attach(attach).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, durable_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "a temporary close must keep the adoption claim Starting"
+        );
+        assert!(identity.bindings.lock().unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-during-opencode-temporary-close",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        session_arc.lock().await.close_pending = 0;
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the binding starts once the temporary close clears");
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+        stall.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("the attach settles")
+            .unwrap();
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the attach publishes after persistence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_map_hit_create_resume_retries_binding_before_live() {
+        let durable_id = "ses_map_hit_resume_binding_cancel";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(identity.clone());
+        let vacant = registry.observe(PROVIDER, durable_id);
+        let stall = identity.arm_binding_stall(PROVIDER, durable_id);
+
+        let mut msg = create_msg("req-map-hit-resume-binding-cancel");
+        msg.resume_session_id = Some(durable_id.to_string());
+        msg.observed_epoch = Some(vacant.epoch);
+        msg.observed_generation = Some(vacant.generation);
+        let st2 = st.clone();
+        let durable_id_for_task = durable_id.to_string();
+        let task = tokio::spawn(async move {
+            st2.handle_create_resume(
+                "req-map-hit-resume-binding-cancel".to_string(),
+                durable_id_for_task,
+                &msg,
+                None,
+            )
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the create-resume reaches its parked binding write");
+
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        assert_eq!(identity.bindings.lock().unwrap().len(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "created is withheld while the write is parked"
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, durable_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "the original parked write must settle before recovery can publish Live"
+        );
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-after-canceled-opencode-resume",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "cancellation never publishes created"
+        );
+
+        stall.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe(PROVIDER, durable_id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the canceled create-resume settles its original write before Live");
+        assert!(identity.repairs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_map_hit_attach_retries_binding_before_live() {
+        let durable_id = "ses_map_hit_attach_binding_cancel";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let identity = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(identity.clone());
+        let vacant = registry.observe(PROVIDER, durable_id);
+        let stall = identity.arm_binding_stall(PROVIDER, durable_id);
+
+        let mut attach = attach_msg(durable_id);
+        attach.observed_epoch = Some(vacant.epoch);
+        attach.observed_generation = Some(vacant.generation);
+        let st2 = st.clone();
+        let task = tokio::spawn(async move { st2.handle_attach(attach).await });
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the attach reaches its parked binding write");
+
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+        assert_eq!(identity.bindings.lock().unwrap().len(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "the session snapshot is withheld while the write is parked"
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, durable_id).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "the original parked write must settle before recovery can publish Live"
+        );
+        assert!(matches!(
+            registry.begin_handoff(
+                PROVIDER,
+                durable_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-after-canceled-opencode-attach",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "cancellation never publishes a snapshot"
+        );
+
+        stall.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    registry.observe(PROVIDER, durable_id).state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the canceled attach settles its original write before Live");
+        assert!(identity.repairs.lock().unwrap().is_empty());
+    }
+
     /// b8ke ext r15 F1 (a): a STALE-observed-generation create hitting a
     /// since-vacated in-memory map entry CANNOT reclaim ownership. The
     /// delayed request carries the OLD generation (G) while the key sits
@@ -16670,8 +17557,10 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("lineage binding write ok");
@@ -16719,7 +17608,7 @@ mod tests {
         // defaults, and the row stays lineage-only.
         assert_eq!(
             b.settings,
-            crate::identity_sink::FreshAgentSettings::default(),
+            crate::identity_sink::SettingsUpdate::Keep,
             "the settings payload is untouched by the provenance refresh"
         );
     }
@@ -16943,16 +17832,18 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings {
-                collaboration_mode: None,
-                model: Some("big-model".into()),
-                sandbox: None,
-                permission_mode: None,
-                effort: Some("high".into()),
-                cwd: Some("/real/project".into()),
-                plugins: None,
-            },
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
+                    model: Some("big-model".into()),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: Some("high".into()),
+                    cwd: Some("/real/project".into()),
+                    plugins: None,
+                },
+            ),
         })
         .await
         .expect("seed binding write ok");
@@ -17047,16 +17938,18 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings {
-                collaboration_mode: None,
-                model: Some("big-model".into()),
-                sandbox: None,
-                permission_mode: None,
-                effort: Some("high".into()),
-                cwd: Some("/real/project".into()),
-                plugins: None,
-            },
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings {
+                    collaboration_mode: None,
+                    model: Some("big-model".into()),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: Some("high".into()),
+                    cwd: Some("/real/project".into()),
+                    plugins: None,
+                },
+            ),
         })
         .await
         .expect("seed binding write ok");
@@ -17210,8 +18103,10 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("row stamp write ok");
@@ -17300,8 +18195,10 @@ mod tests {
             observed_epoch: None,
             observed_generation: None,
 
-            authoritative: false,
-            settings: crate::identity_sink::FreshAgentSettings::default(),
+            claim: None,
+            settings: crate::identity_sink::SettingsUpdate::Replace(
+                crate::identity_sink::FreshAgentSettings::default(),
+            ),
         })
         .await
         .expect("seed binding write ok");
@@ -22330,9 +23227,13 @@ mod tests {
             .expect("a binding row for the forked child");
         assert_eq!(b.provider, "opencode");
         assert_eq!(b.mode, "freshopencode");
-        assert_eq!(b.settings.model.as_deref(), Some("prov-a/mdl-x"));
-        assert_eq!(b.settings.effort.as_deref(), Some("low"));
-        assert_eq!(b.settings.cwd.as_deref(), Some("/forked/dir"));
+        let settings = b
+            .settings
+            .as_replacement()
+            .expect("forked child settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("prov-a/mdl-x"));
+        assert_eq!(settings.effort.as_deref(), Some("low"));
+        assert_eq!(settings.cwd.as_deref(), Some("/forked/dir"));
 
         // No atTurnId → the legacy no-body fork POST.
         let forks = http.fork_requests();
@@ -24580,8 +25481,12 @@ mod tests {
             .rev()
             .find(|b| b.session_id == durable)
             .expect("a binding row re-snapshot");
-        assert_eq!(last.settings.model.as_deref(), Some("prov/mdl-b"));
-        assert_eq!(last.settings.effort.as_deref(), Some("low"));
+        let settings = last
+            .settings
+            .as_replacement()
+            .expect("configured settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("prov/mdl-b"));
+        assert_eq!(settings.effort.as_deref(), Some("low"));
     }
 
     // ── Task 4 (opencode daemon-death recovery): the runtime-level self-heal ──

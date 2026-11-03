@@ -2190,44 +2190,43 @@ impl SessionHandoffRunner {
     /// same provider→lane dispatch the kill path uses). The epoch is the
     /// coordinator's boot epoch (the same one the under-ticket binding
     /// write's pair carried, so the orphan filter matches the orphaned
-    /// row's own stamp exactly). Best-effort on failure: the cleanup
-    /// never blocks its coordinator fail on a ledger hiccup, but it logs
-    /// LOUD — the consult still refuses the failed transition's late
-    /// writes, and a landed orphan row converges at the next claim or
-    /// sweep.
+    /// row's own stamp exactly). Cleanup cannot release the transition or
+    /// publish success until the durable repair has landed. A repair error
+    /// keeps the owner key fenced so no later launch can race an orphan row.
     async fn repair_failed_transition_binding_row(
         self: &Arc<Self>,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         generation: u64,
-    ) {
+    ) -> bool {
         let epoch = self.ownership.boot_epoch();
         let sink = match provider {
             "codex" => self.fresh_codex.identity_sink(),
             "claude" => self.fresh_claude.identity_sink(),
             "opencode" => self.fresh_opencode.identity_sink(),
             // An unknown provider never wrote a fresh-agent binding row.
-            _ => return,
+            _ => return true,
         };
         let Some(sink) = sink else {
             // The lane has no ledger wired (unwired tests): nothing to
             // repair.
-            return;
+            return true;
         };
         if let Err(err) = sink
-            .repair_failed_transition(provider, session_id, epoch, generation)
+            .repair_failed_transition(provider, session_id, operation_id, epoch, generation)
             .await
         {
             tracing::error!(target: "invariant",
                 provider = %provider, session_id = %session_id,
-                epoch, generation, error = %err,
+                operation_id = %operation_id, epoch, generation, error = %err,
                 event = "ownership.handoff.failed_transition_repair_write_failed",
-                "the failed transition's durable ledger repair could not land — \
-                 the bridge consult still refuses this transition's late \
-                 writes; an already-landed orphan row converges at the next \
-                 claim or sweep (kata b8ke focused ep5 r4 F1)"
+                "the failed transition's durable ledger repair could not land; \
+                 the coordinator key remains fenced and cannot be released (Task 3)"
             );
+            return false;
         }
+        true
     }
 
     async fn reap_uncommitted_target(
@@ -2378,12 +2377,17 @@ impl SessionHandoffRunner {
                 // ReapTimeout, PlatformLimited — the target is abandoned
                 // in all three, and its identity claim must not outlive
                 // the transition that failed.
-                self.repair_failed_transition_binding_row(
-                    &req.provider,
-                    &req.session_id,
-                    generation,
-                )
-                .await;
+                if !self
+                    .repair_failed_transition_binding_row(
+                        &req.provider,
+                        &req.session_id,
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                {
+                    return StopOutcomePriv::ReapTimeout { fenced: true };
+                }
                 outcome
             }
         }
@@ -3217,8 +3221,17 @@ impl SessionHandoffRunner {
             // the spawned-but-identity-unrecorded target (the abort landed
             // between the spawn and start_target's return), whose binding
             // write is equally in flight or landed.
-            self.repair_failed_transition_binding_row(provider, session_id, *generation)
-                .await;
+            if !self
+                .repair_failed_transition_binding_row(
+                    provider,
+                    session_id,
+                    operation_id,
+                    *generation,
+                )
+                .await
+            {
+                return UncommittedTargetOutcome::Unconfirmed;
+            }
             if reaped {
                 // The aborted resume's lease guard dropped ARMED with its
                 // kill handle set (the child existed), so the lease is held
@@ -4199,6 +4212,7 @@ impl SessionHandoffRunner {
                         req.tab_id.as_deref(),
                         req.pane_id.as_deref(),
                         generation,
+                        operation_id,
                     )
                     .await
                     .map(|owner| (owner, None)),
@@ -4211,6 +4225,7 @@ impl SessionHandoffRunner {
                         req.tab_id.as_deref(),
                         req.pane_id.as_deref(),
                         generation,
+                        operation_id,
                     )
                     .await
                     .map(|owner| (owner, None)),

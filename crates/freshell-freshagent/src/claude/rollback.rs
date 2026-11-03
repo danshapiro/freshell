@@ -1011,6 +1011,7 @@ impl FreshClaudeState {
                     // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
                     // owns this runtime's coordinator transition — the
                     owning_generation: None,
+                    binding_claim: None,
                     // Conn-less lane (D8): the ledger merge inherits the
                     // superseded parent's stamps.
                     provenance: None,
@@ -1081,7 +1082,7 @@ impl FreshClaudeState {
                 settings: &launch_settings,
                 supersedes: Some(&durable_id),
                 provenance: None,
-                ticket: &own_ticket,
+                ticket: &mut own_ticket,
             })
             .await
         {

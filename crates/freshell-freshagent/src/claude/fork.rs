@@ -437,6 +437,7 @@ impl FreshClaudeState {
                     claim: None,
                     recorded_settings: Some(launch_settings.clone()),
                     owning_generation: None,
+                    binding_claim: None,
                     provenance: fork_provenance.clone(),
                     naming: None,
                     partial_runtime_key: own_ticket.as_ref().map(|_| child.clone()),
@@ -490,7 +491,7 @@ impl FreshClaudeState {
                 settings: &launch_settings,
                 supersedes: None,
                 provenance: fork_provenance.clone(),
-                ticket: &own_ticket,
+                ticket: &mut own_ticket,
             })
             .await
         {

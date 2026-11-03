@@ -127,10 +127,11 @@ pub use host_opencode_restore::{
     locate_host_opencode_restore, HostOpenCodeRestoreError, HostOpenCodeRestoreSource,
 };
 pub use identity_sink::{
-    BindProvenance, ClaimCommit, ClaudeGenesis, CloseAnswer, FreshAgentBindingUpsert,
-    FreshAgentSettings, GenesisUpdate, PaneIdentitySink, ProvenanceUpdate, RecordedGenesis,
-    SharedPaneIdentitySink, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
-    SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
+    BindProvenance, BindingClaim, BindingClaimKind, ClaimCommit, ClaudeGenesis, CloseAnswer,
+    FreshAgentBindingUpsert, FreshAgentSettings, GenesisUpdate, PaneIdentitySink, ProvenanceUpdate,
+    RecordedGenesis, SettingsUpdate, SharedPaneIdentitySink, SinkAliasClearWrite, SinkCloseError,
+    SinkCloseWrite, SinkCommitWrite, SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite,
+    SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rollback_record::{
@@ -5946,16 +5947,18 @@ async fn resume_session_ref_tab(
                 // b8ke focused ep5 r2 F1: a REST-lane write (never the
                 // runner's authoritative target binding — the REST surface
                 // carries no handoff continuation context).
-                authoritative: false,
-                settings: identity_sink::FreshAgentSettings {
-                    collaboration_mode: None,
-                    model: model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: effort.clone(),
-                    cwd: cwd.clone(),
-                    plugins: None,
-                },
+                claim: None,
+                settings: crate::identity_sink::SettingsUpdate::Replace(
+                    identity_sink::FreshAgentSettings {
+                        collaboration_mode: None,
+                        model: model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: effort.clone(),
+                        cwd: cwd.clone(),
+                        plugins: None,
+                    },
+                ),
             })
             .await
         {
@@ -7006,16 +7009,18 @@ async fn send_keys(
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
                     // b8ke focused ep5 r2 F1: a REST-lane write.
-                    authoritative: false,
-                    settings: identity_sink::FreshAgentSettings {
-                        collaboration_mode: None,
-                        model: pane.model.clone(),
-                        sandbox: None,
-                        permission_mode: None,
-                        effort: pane.effort.clone(),
-                        cwd: pane.cwd.clone(),
-                        plugins: None,
-                    },
+                    claim: None,
+                    settings: crate::identity_sink::SettingsUpdate::Replace(
+                        identity_sink::FreshAgentSettings {
+                            collaboration_mode: None,
+                            model: pane.model.clone(),
+                            sandbox: None,
+                            permission_mode: None,
+                            effort: pane.effort.clone(),
+                            cwd: pane.cwd.clone(),
+                            plugins: None,
+                        },
+                    ),
                 })
                 .await
             {
@@ -10134,9 +10139,13 @@ mod tests {
         assert_eq!(b.provider, "opencode");
         assert_eq!(b.mode, "freshopencode");
         assert_eq!(b.resolves_pending.as_deref(), Some("freshopencode-r1"));
-        assert_eq!(b.settings.model.as_deref(), Some("big-model"));
-        assert_eq!(b.settings.effort.as_deref(), Some("high"));
-        assert_eq!(b.settings.cwd.as_deref(), Some("/w"));
+        let settings = b
+            .settings
+            .as_replacement()
+            .expect("materialization settings are an explicit replacement");
+        assert_eq!(settings.model.as_deref(), Some("big-model"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.cwd.as_deref(), Some("/w"));
         // Task 3 (corrected semantics): `create_request_id` is the CREATE's
         // requestId, derived from the pane's placeholder id
         // (`freshopencode-r1` → `r1`) — the WS path previously stamped the
@@ -11082,7 +11091,7 @@ mod tests {
         assert_eq!(b.resolves_pending.as_deref(), Some("freshopencode-b1"));
         assert_eq!(
             b.settings,
-            identity_sink::FreshAgentSettings::default(),
+            identity_sink::SettingsUpdate::Replace(identity_sink::FreshAgentSettings::default()),
             "blank settings payload is recorded verbatim"
         );
 

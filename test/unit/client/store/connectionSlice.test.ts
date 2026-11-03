@@ -23,6 +23,7 @@ describe('connectionSlice', () => {
       expect(state.lastError).toBeUndefined()
       expect(state.lastErrorCode).toBeUndefined()
       expect(state.lastReadyAt).toBeUndefined()
+      expect(state.readySequence).toBe(0)
     })
   })
 
@@ -116,6 +117,23 @@ describe('connectionSlice', () => {
       expect(state.lastReadyAt).toBe(secondTime)
 
       vi.restoreAllMocks()
+    })
+
+    it('increments the ready sequence for each handshake when timestamps match', () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1000)
+      let state = connectionReducer(undefined, setStatus('ready'))
+      expect(state.readySequence).toBe(1)
+      state = connectionReducer(state, setStatus('disconnected'))
+      state = connectionReducer(state, setStatus('ready'))
+      expect(state.lastReadyAt).toBe(1000)
+      expect(state.readySequence).toBe(2)
+      vi.restoreAllMocks()
+    })
+
+    it('keeps one ready sequence when bootstrap repeats the ready status for the same socket', () => {
+      const ready = connectionReducer(undefined, setStatus('ready'))
+      const bootstrapCompleted = connectionReducer(ready, setStatus('ready'))
+      expect(bootstrapCompleted.readySequence).toBe(ready.readySequence)
     })
   })
 

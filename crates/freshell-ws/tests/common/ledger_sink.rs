@@ -51,9 +51,10 @@ pub type TurnInterruptedMarkerGate = LedgerWriteGate;
 
 use freshell_freshagent::identity_sink::SinkCloseError;
 use freshell_freshagent::{
-    BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    ProvenanceUpdate, RollbackRecord, SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite,
-    SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
+    BindProvenance, BindingClaimKind, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings,
+    PaneIdentitySink, ProvenanceUpdate, RollbackRecord, SettingsUpdate, SinkAliasClearWrite,
+    SinkCloseWrite, SinkCommitWrite, SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite,
+    SinkWrite,
 };
 use freshell_ws::pane_ledger::{
     ClaimCommitOutcome, CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger, ProvenancePolicy,
@@ -105,24 +106,27 @@ impl LedgerSink {
     }
 }
 
-/// The production bridge's authoritative-write consult
+/// The production bridge's exact-claim consult
 /// (`freshell-server/src/identity_sink.rs`), run at execution time inside the
-/// write: an authoritative write must carry its observed pair, and the handoff
-/// that minted it must still own the key's transition at that pair.
+/// write: the captured claim must match the upsert key, pair and exact current
+/// coordinator operation/owner.
 fn authoritative_write_refusal(
     ownership: Option<&freshell_ownership::RuntimeOwnershipRegistry>,
     upsert: &FreshAgentBindingUpsert,
 ) -> Option<std::io::Error> {
-    if !upsert.authoritative {
+    let Some(claim) = upsert.claim.as_ref() else {
         return None;
-    }
-    let (Some(epoch), Some(generation)) = (upsert.observed_epoch, upsert.observed_generation)
-    else {
-        return Some(std::io::Error::other(
-            "STALE_TRANSITION_BINDING: an authoritative write must carry its observed \
-             (epoch, generation) pair",
-        ));
     };
+    let (epoch, generation) = (claim.epoch, claim.generation);
+    if claim.provider != upsert.provider
+        || claim.session_id != upsert.session_id
+        || upsert.observed_epoch != Some(epoch)
+        || upsert.observed_generation != Some(generation)
+    {
+        return Some(std::io::Error::other(
+            "STALE_TRANSITION_BINDING: the claim's provider/key/pair must match the upsert",
+        ));
+    }
     let Some(registry) = ownership else {
         return Some(std::io::Error::other(
             "STALE_TRANSITION_BINDING: an authoritative write arrived at a bridge with no \
@@ -131,24 +135,51 @@ fn authoritative_write_refusal(
     };
     let snap = registry.observe(&upsert.provider, &upsert.session_id);
     let transition_owned = snap.epoch == epoch
-        && match &snap.state {
-            freshell_ownership::OwnershipState::Handoff {
-                generation: owned, ..
-            } => *owned == generation,
-            freshell_ownership::OwnershipState::Live {
-                owner,
-                generation: owned,
-                ..
-            } => {
+        && match (claim.kind, &snap.state) {
+            (
+                BindingClaimKind::Starting,
+                freshell_ownership::OwnershipState::Starting {
+                    kind,
+                    operation_id,
+                    generation: owned,
+                    ..
+                },
+            ) => {
+                *kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                    && operation_id == &claim.operation_id
+                    && *owned == generation
+            }
+            (
+                BindingClaimKind::Handoff,
+                freshell_ownership::OwnershipState::Handoff {
+                    to_kind,
+                    operation_id,
+                    generation: owned,
+                    ..
+                },
+            ) => {
+                *to_kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                    && operation_id == &claim.operation_id
+                    && *owned == generation
+            }
+            (
+                BindingClaimKind::LiveFreshAgent,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    generation: owned,
+                    ..
+                },
+            ) => {
                 *owned == generation
                     && owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                    && owner.ownership_id.as_deref() == Some(claim.operation_id.as_str())
             }
             _ => false,
         };
     (!transition_owned).then(|| {
         std::io::Error::other(
-            "STALE_TRANSITION_BINDING: the authoritative write's handoff operation no \
-             longer owns the key's transition at its generation",
+            "STALE_TRANSITION_BINDING: the claimed operation no longer owns the key \
+             at its captured epoch and generation",
         )
     })
 }
@@ -212,8 +243,12 @@ impl PaneIdentitySink for LedgerSink {
                 ProvenanceUpdate::Clear => ProvenancePolicy::Clear,
             };
             let stored_genesis = upsert.genesis.stored_value();
-            ledger.record_fresh_agent_binding(&FreshAgentBindingWrite {
-                collaboration_mode: upsert.settings.collaboration_mode.as_deref(),
+            let settings = match &upsert.settings {
+                SettingsUpdate::Keep => None,
+                SettingsUpdate::Replace(settings) => Some(settings),
+            };
+            let write = FreshAgentBindingWrite {
+                collaboration_mode: settings.and_then(|s| s.collaboration_mode.as_deref()),
                 genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
                     stored_genesis.as_ref(),
                     upsert.genesis.is_clear(),
@@ -221,20 +256,24 @@ impl PaneIdentitySink for LedgerSink {
                 provider: &upsert.provider,
                 session_id: &upsert.session_id,
                 mode: &upsert.mode,
-                cwd: upsert.settings.cwd.as_deref(),
+                cwd: settings.and_then(|s| s.cwd.as_deref()),
                 create_request_id: upsert.create_request_id.as_deref(),
-                model: upsert.settings.model.as_deref(),
-                sandbox: upsert.settings.sandbox.as_deref(),
-                permission_mode: upsert.settings.permission_mode.as_deref(),
-                effort: upsert.settings.effort.as_deref(),
-                plugins: upsert.settings.plugins.as_deref(),
+                model: settings.and_then(|s| s.model.as_deref()),
+                sandbox: settings.and_then(|s| s.sandbox.as_deref()),
+                permission_mode: settings.and_then(|s| s.permission_mode.as_deref()),
+                effort: settings.and_then(|s| s.effort.as_deref()),
+                plugins: settings.and_then(|s| s.plugins.as_deref()),
                 supersedes: upsert.supersedes.as_deref(),
                 provenance,
                 observed_epoch: upsert.observed_epoch,
                 observed_generation: upsert.observed_generation,
-                authoritative: upsert.authoritative,
                 now_ms: now,
-            })?;
+            };
+            ledger.record_fresh_agent_binding_claimed(
+                &write,
+                upsert.claim.as_ref(),
+                &upsert.settings,
+            )?;
             // The claude rollback row follows the pane to the superseding id in the
             // same awaited batch as the binding write.
             if upsert.provider == "claude" {
@@ -399,13 +438,20 @@ impl PaneIdentitySink for LedgerSink {
         &self,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         epoch: u64,
         generation: u64,
     ) -> SinkWrite {
         let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
+        let (p, s, op) = (
+            provider.to_string(),
+            session_id.to_string(),
+            operation_id.to_string(),
+        );
         let now = now_ms();
-        blocking(move || ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now))
+        blocking(move || {
+            ledger.repair_failed_transition_binding(&p, &s, &op, epoch, generation, now)
+        })
     }
 
     fn lookup_by_create_request_id(
