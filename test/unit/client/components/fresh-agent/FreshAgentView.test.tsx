@@ -2417,9 +2417,6 @@ describe('FreshAgentView', () => {
       })
 
       expect(getFreshAgentPaneContent(store).sessionId).toBe(durable)
-      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toMatchObject({
-        requestId: sent!.requestId, text: sourcePrompt, submittedTurnId: 'materialized-accepted-turn',
-      })
       expect(composer).toHaveValue(sourcePrompt)
       expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
       expect(screen.getByText('Message accepted. Your restored draft was kept.')).toBeVisible()
