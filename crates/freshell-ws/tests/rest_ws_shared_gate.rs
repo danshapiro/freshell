@@ -126,6 +126,7 @@ async fn spawn_combined_server(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),

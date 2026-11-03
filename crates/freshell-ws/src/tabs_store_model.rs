@@ -361,13 +361,18 @@ const LEGACY_CONTENT_KEYS: [&str; 7] = [
     "restoreError",
 ];
 
-/// The five legal `RestoreError.reason`s (shared/session-contract.ts:17-23).
-const RESTORE_ERROR_REASONS: [&str; 5] = [
+/// The six legal `RestoreError.reason`s (shared/session-contract.ts:17-29).
+/// `session_store_unreadable` (auto-restore-warming): the session index
+/// published but this identity's store could not be read — an honest
+/// per-pane error that preserves the session identity for a later
+/// reconnect-driven retry; never warming.
+const RESTORE_ERROR_REASONS: [&str; 6] = [
     "missing_canonical_identity",
     "invalid_legacy_restore_target",
     "dead_live_handle",
     "provider_runtime_failed",
     "durable_artifact_missing",
+    "session_store_unreadable",
 ];
 
 fn restore_error(reason: &str) -> Value {

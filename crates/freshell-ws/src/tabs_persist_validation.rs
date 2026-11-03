@@ -456,6 +456,11 @@ fn validate_fresh_agent(path: &Path, payload: &Value, name: &str) -> std::io::Re
                 "dead_live_handle",
                 "provider_runtime_failed",
                 "durable_artifact_missing",
+                // Auto-restore-warming: the honest unreadable-store verdict
+                // (twin of RestoreErrorReasonSchema in
+                // shared/session-contract.ts and RESTORE_ERROR_REASONS in
+                // tabs_store_model.rs).
+                "session_store_unreadable",
             ],
         )?;
         if error.get("reason").is_none() {

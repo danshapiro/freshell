@@ -644,11 +644,17 @@ export type RestoreFallbackAttempt = {
 
 /**
  * Slice-level banner state while reconcile-driven creates are warming.
- * Ephemeral — must never be persisted.
+ * Ephemeral — must never be persisted. Each paneRef is IDENTITY-BOUND
+ * (auto-restore-warming round-2 finding 3): it carries the PARKED pane's
+ * createRequestId as minted by `foldVerdicts` from the request pane claims,
+ * so the recovery driver drives only refs whose CURRENT content still
+ * carries the parked identity — a pane replaced while waiting (same paneId,
+ * new content) drops out exactly like a closed pane: its pending recovery
+ * is canceled, never transferred to the replacement.
  */
 export type ReconcileWarmingState = {
   count: number
-  paneRefs: { tabId: string; paneId: string }[]
+  paneRefs: { tabId: string; paneId: string; createRequestId: string }[]
 }
 
 /**

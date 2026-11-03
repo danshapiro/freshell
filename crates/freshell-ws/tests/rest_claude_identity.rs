@@ -95,6 +95,7 @@ async fn spawn_merged_server_with_claude_environment(
     fresh_opencode.set_ownership(Arc::clone(&ownership));
 
     let state = WsState {
+        session_index_ready: None,
         layout: layout_store.clone(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&ledger),

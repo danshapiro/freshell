@@ -951,7 +951,7 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
           // browser reloads. The dead pane still has a current xterm surface,
           // so inspect it by the stable pane identity rather than asking the
           // harness for a no-longer-registered terminalId.
-          const buffer = await harness.getTerminalBufferForPane(paneId)
+          const buffer = await harness.getPaneTerminalBuffer(paneId)
           return typeof buffer === 'string'
             ? buffer.split(DEAD_SESSION_BUFFER_NOTICE).length - 1
             : 0

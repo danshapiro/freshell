@@ -21,6 +21,7 @@ import panesReducer, {
   resetFreshAgentPaneForReconcileCreate,
   setPaneReconcileNotice,
   setPaneRestoreError,
+  setReconcileWarming,
 } from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type {
@@ -406,6 +407,23 @@ describe('foldVerdicts fresh-agent routing', () => {
     expect(restoreErrors.every((r) => r.code === 'RESTORE_UNAVAILABLE' && r.reason === 'durable_artifact_missing')).toBe(true)
     expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' },
+    })
+  })
+
+  it('folds error{session_store_unreadable} into an honest per-pane restore error, never warming', () => {
+    // Mirror twin of the terminal-arm pin (auto-restore-warming): the honest
+    // unreadable-store verdict folds a per-pane restoreError with the
+    // session identity preserved — never a warming label (the index is
+    // already published; post-readiness warming would be a lying label).
+    const { req, dispatch, dispatched } = freshAgentFoldHarness([['error', { reason: 'session_store_unreadable' }]])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.warming).toBe(0)
+    expect(dispatched.countOf(setReconcileWarming.type)).toBe(0)
+    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+    expect(dispatched.lastPayloadOf(setPaneRestoreError.type)).toMatchObject({
+      tabId: 'tab1',
+      paneId: 'p1',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'session_store_unreadable' },
     })
   })
 

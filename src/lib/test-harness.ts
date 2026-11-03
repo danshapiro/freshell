@@ -48,8 +48,6 @@ export interface FreshellTestHarness {
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isTerminalNetworkEffectsSuppressed: (paneId: string) => boolean
   getTerminalBuffer: (terminalId?: string) => string | null
-  /** Current xterm surface for a pane, including dead panes with no runtime terminalId. */
-  getTerminalBufferForPane?: (paneId: string) => string | null
   getTerminalSnapshot?: (terminalId: string) => TerminalSurfaceSnapshot | null
   registerTerminalSnapshot?: (terminalId: string, accessor: () => TerminalSurfaceSnapshot | null) => void
   unregisterTerminalSnapshot?: (terminalId: string) => void
@@ -77,14 +75,33 @@ export interface FreshellTestHarness {
   unregisterTerminalModes: (terminalId: string) => void
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
-  registerTerminalBufferForPane?: (paneId: string, accessor: () => string) => void
-  unregisterTerminalBufferForPane?: (paneId: string) => void
+  /**
+   * Pane-scoped buffer registry (delta fix focused review, finding 2): the
+   * same renderer-independent xterm buffer text, addressed by the PANE id so
+   * it stays reachable when the pane holds NO terminalId (the durable-park
+   * shapes: an exited pane's restore-notice line lands exactly when the
+   * cleared terminalId unregisters the terminalId-keyed accessor). Kept in
+   * its OWN registry — getRegisteredTerminalIds keeps returning terminalIds
+   * only, because its consumers treat every key as a terminal id.
+   */
+  getPaneTerminalBuffer?: (paneId: string) => string | null
+  registerPaneTerminalBuffer?: (paneId: string, accessor: () => string) => void
+  unregisterPaneTerminalBuffer?: (paneId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
   getSentWsMessages?: () => unknown[]
   getSentWsMessagesWithTimestamps?: () => Array<{ __sentAt?: number; type?: string; requestId?: string }>
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
   getReceivedWsMessages?: () => unknown[]
+  /**
+   * The received-frame ring with its page-clock stamps (delta fix focused
+   * review, findings 3+4): mirrors getSentWsMessagesWithTimestamps — every
+   * retained frame carries __receivedAt (Date.now() at receipt), letting
+   * e2e witnesses scope their search by TIME (e.g. only frames received
+   * after a restart's ready handshake, whose connection.lastReadyAt uses
+   * the same page clock) instead of a boot-agnostic whole-ring type match.
+   */
+  getReceivedWsMessagesWithTimestamps?: () => Array<{ __receivedAt?: number; type?: string }>
   clearReceivedWsMessages?: () => void
   recordReceivedWsMessage?: (msg: unknown) => void
   recordTerminalWrite?: (event: TerminalWriteEvent) => void
@@ -129,11 +146,6 @@ export function installTestHarness(
   // Registry of terminal buffer accessors, keyed by terminalId.
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
-  // Pane surfaces can outlive their runtime terminalId (for example, a
-  // dead-session pane restored after a browser reload). This registry is
-  // keyed by the stable pane identity so E2E checks can inspect that current
-  // surface without accidentally querying a stale terminalId.
-  const terminalPaneBuffers = new Map<string, () => string>()
   const terminalSnapshots = new Map<string, () => TerminalSurfaceSnapshot | null>()
   const terminalModes = new Map<string, () => {
     mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
@@ -147,6 +159,10 @@ export function installTestHarness(
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
   const receivedWsMessages: unknown[] = []
+  // Pane-scoped buffer accessors, keyed by paneId (delta fix focused
+  // review, finding 2) — separate from the terminalId-keyed registry above
+  // so getRegisteredTerminalIds never surfaces pane keys.
+  const paneTerminalBuffers = new Map<string, () => string>()
   const terminalWriteEvents: TerminalWriteEvent[] = []
   let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
@@ -191,10 +207,6 @@ export function installTestHarness(
       if (first.done) return null
       return first.value()
     },
-    getTerminalBufferForPane: (paneId: string) => {
-      const accessor = terminalPaneBuffers.get(paneId)
-      return accessor ? accessor() : null
-    },
     setFreshAgentNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => {
       if (suppressed) {
         suppressedFreshAgentPaneIds.add(paneId)
@@ -217,11 +229,12 @@ export function installTestHarness(
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
     },
-    registerTerminalBufferForPane: (paneId: string, accessor: () => string) => {
-      terminalPaneBuffers.set(paneId, accessor)
+    getPaneTerminalBuffer: (paneId: string) => paneTerminalBuffers.get(paneId)?.() ?? null,
+    registerPaneTerminalBuffer: (paneId: string, accessor: () => string) => {
+      paneTerminalBuffers.set(paneId, accessor)
     },
-    unregisterTerminalBufferForPane: (paneId: string) => {
-      terminalPaneBuffers.delete(paneId)
+    unregisterPaneTerminalBuffer: (paneId: string) => {
+      paneTerminalBuffers.delete(paneId)
     },
     getTerminalModes: (terminalId?: string) => {
       if (terminalId) {
@@ -252,6 +265,7 @@ export function installTestHarness(
       const { __receivedAt, ...rest } = msg as { __receivedAt?: number }
       return rest
     }),
+    getReceivedWsMessagesWithTimestamps: () => [...receivedWsMessages] as Array<{ __receivedAt?: number; type?: string }>,
     clearReceivedWsMessages: () => {
       receivedWsMessages.length = 0
     },

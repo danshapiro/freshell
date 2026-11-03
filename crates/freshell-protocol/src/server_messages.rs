@@ -29,7 +29,9 @@ pub enum ServerMessage {
     #[serde(rename = "amplifier.activity.updated")]
     AmplifierActivityUpdated(AmplifierActivityUpdated),
     // Antigravity plan Task 8: the antigravity activity family — the
-    // amplifier family's additive twin (see EXTENSION_SERVER_MESSAGE_TYPES).
+    // amplifier family's additive twin. Additive via the frozen route —
+    // SERVER_MESSAGE_TYPES / the generated inventory carry it; no protocol
+    // version bump (nothing awaits it).
     #[serde(rename = "antigravity.activity.list.response")]
     AntigravityActivityListResponse(AntigravityActivityListResponse),
     #[serde(rename = "antigravity.activity.updated")]
@@ -130,6 +132,17 @@ pub enum ServerMessage {
     SessionStatus(SessionStatus),
     #[serde(rename = "sessions.changed")]
     SessionsChanged(SessionsChanged),
+    // Auto-restore-warming Task 2: the session-index readiness broadcast —
+    // sent once per boot when the session index completes its first sweep
+    // (see `broadcast_sessions_index_ready` in freshell-ws). A bare
+    // marker: readiness state at handshake time already rides
+    // `ready.sessionIndexReady`. Capability-gated at the forward site — a
+    // connection whose hello did not negotiate `sessionIndexReadyV1` never
+    // receives the frame (frozen-client inertness). Additive via the
+    // frozen route — SERVER_MESSAGE_TYPES / the regenerated inventory
+    // carry it; no protocol version bump (nothing awaits it).
+    #[serde(rename = "sessions.index.ready")]
+    SessionsIndexReady(SessionsIndexReady),
     #[serde(rename = "settings.updated")]
     SettingsUpdated(SettingsUpdated),
     #[serde(rename = "tabs.sync.ack")]
@@ -216,9 +229,11 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 73] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
+    "antigravity.activity.list.response",
+    "antigravity.activity.updated",
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",
@@ -261,6 +276,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
     "session.runtimeOwner",
     "session.status",
     "sessions.changed",
+    "sessions.index.ready",
     "settings.updated",
     "tabs.sync.ack",
     "tabs.sync.snapshot",
@@ -422,15 +438,8 @@ pub struct RuntimeViewChanged {
 /// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
 /// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 4] = [
-    "durability.degraded",
-    "freshAgent.recovery.stopped",
-    // Antigravity plan Task 8: the antigravity activity family (the
-    // amplifier family's additive twin — the generated frozen inventory is
-    // not regenerated in this task; promote on the next contract reconcile).
-    "antigravity.activity.list.response",
-    "antigravity.activity.updated",
-];
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 2] =
+    ["durability.degraded", "freshAgent.recovery.stopped"];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.
@@ -1201,7 +1210,9 @@ pub enum ReconcileVerdict {
     DeadSession,
     Invalid,
     /// Terminal per-pane error state (replaces the deleted `retry`):
-    /// reason is one of "index_warming" | "provider_unavailable".
+    /// reason is one of "index_warming" | "provider_unavailable" |
+    /// "session_store_unreadable" (auto-restore-warming Task 4 adds the
+    /// session_store_unreadable value).
     Error,
 }
 
@@ -1293,6 +1304,12 @@ pub struct ReadyCapabilities {
     pub managed_runtime_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fresh_agent_attention_replay_v1: Option<bool>,
+    /// Session-index readiness echo (auto-restore-warming Task 2):
+    /// `Some(true)` iff the connection's `hello` opted in via
+    /// `capabilities.sessionIndexReadyV1` — omitted from the wire entirely
+    /// otherwise (frozen-client inertness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_index_ready_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1326,6 +1343,13 @@ pub struct Ready {
     /// a reconnect replays marks newer than the page's own high-water marks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fresh_agent_attention: Option<Vec<FreshAgentAttentionMark>>,
+    /// Session-index readiness at handshake time (auto-restore-warming
+    /// Task 2). Present iff the client's hello opted in via
+    /// `capabilities.sessionIndexReadyV1` (the frozen shape omits it
+    /// entirely); the value is the readiness watch's current state, `false`
+    /// when the server wired no watch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_index_ready: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1461,6 +1485,13 @@ pub struct SessionStatus {
 pub struct SessionsChanged {
     pub revision: i64,
 }
+
+/// The `sessions.index.ready` payload (auto-restore-warming Task 2): the
+/// frame is a bare marker — the CURRENT readiness state rides
+/// `ready.sessionIndexReady` at handshake time, and this broadcast only
+/// announces the readiness TRANSITION.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionsIndexReady {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettingsUpdated {
@@ -2481,6 +2512,7 @@ mod tests {
             server_instance_id: Some("inst-1".into()),
             build_id: None,
             capabilities: None,
+            session_index_ready: None,
             runtime_owners: Some(vec![
                 RuntimeOwnerReplay {
                     provider: "codex".into(),
@@ -2524,6 +2556,7 @@ mod tests {
             server_instance_id: Some("inst-1".into()),
             build_id: None,
             capabilities: None,
+            session_index_ready: None,
             runtime_owners: None,
         });
         let legacy_json = serde_json::to_string(&legacy).expect("serialize");

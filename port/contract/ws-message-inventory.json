@@ -1,8 +1,9 @@
 {
   "clientToServer": {
-    "count": 43,
+    "count": 44,
     "types": [
       "amplifier.activity.list",
+      "antigravity.activity.list",
       "claude.activity.list",
       "client.diagnostic",
       "codex.activity.list",
@@ -50,10 +51,12 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 70,
+    "count": 73,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
+      "antigravity.activity.list.response",
+      "antigravity.activity.updated",
       "claude.activity.list.response",
       "claude.activity.updated",
       "codex.activity.list.response",
@@ -96,6 +99,7 @@
       "session.runtimeOwner",
       "session.status",
       "sessions.changed",
+      "sessions.index.ready",
       "settings.updated",
       "tabs.sync.ack",
       "tabs.sync.snapshot",

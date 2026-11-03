@@ -383,14 +383,17 @@ export class TestHarness {
     }, terminalId)
   }
 
-  async getTerminalBufferForPane(paneId: string): Promise<string | null> {
+  /**
+   * Renderer-independent xterm buffer text addressed by PANE id (delta fix
+   * focused review, finding 2): readable even while the pane holds no
+   * terminalId (the durable-park shapes whose notice lines land after the
+   * terminalId cleared).
+   */
+  async getPaneTerminalBuffer(paneId: string): Promise<string | null> {
     return this.page.evaluate((id) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
       if (!harness) throw new Error('Test harness not installed')
-      if (!harness.getTerminalBufferForPane) {
-        throw new Error('Pane-scoped terminal buffer accessor is not available')
-      }
-      return harness.getTerminalBufferForPane(id)
+      return harness.getPaneTerminalBuffer?.(id) ?? null
     }, paneId)
   }
 
@@ -423,6 +426,20 @@ export class TestHarness {
       const harness = window.__FRESHELL_TEST_HARNESS__
       if (!harness) throw new Error('Test harness not installed')
       return harness.getReceivedWsMessages?.() ?? []
+    })
+  }
+
+  /**
+   * The received-frame ring with each frame's page-clock __receivedAt stamp
+   * (delta fix focused review, findings 3+4) — the discriminator
+   * restart-scoped witnesses correlate by, instead of a boot-agnostic
+   * whole-ring type match.
+   */
+  async getReceivedWsMessagesWithTimestamps(): Promise<Array<{ __receivedAt?: number; type?: string }>> {
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getReceivedWsMessagesWithTimestamps?.() ?? []
     })
   }
 
