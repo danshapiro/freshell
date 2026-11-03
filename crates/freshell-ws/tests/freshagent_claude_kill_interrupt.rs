@@ -289,7 +289,7 @@ export function query(params) {{
                     && event.field("outcome") == Some("refused")
                     && expected_stop_id
                         .as_deref()
-                        .map_or(true, |stop_id| event.field("stop_id") == Some(stop_id))
+                        .is_none_or(|stop_id| event.field("stop_id") == Some(stop_id))
             })
             .await;
         if let Some(stop_id) = expected_stop_id.as_deref() {
