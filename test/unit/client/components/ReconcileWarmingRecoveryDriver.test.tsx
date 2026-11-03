@@ -161,6 +161,20 @@ function stillWarmingResultFor(req: any): Record<string, unknown> {
   }
 }
 
+function terminalErrorResultFor(req: any, reason: string): Record<string, unknown> {
+  return {
+    type: 'pane.reconcile.result',
+    reconcileId: req.reconcileId,
+    bootId: 'boot-1',
+    serverInstanceId: 'srv-1',
+    verdicts: req.panes.map((pane: any) => ({
+      paneKey: pane.paneKey,
+      verdict: 'error',
+      reason,
+    })),
+  }
+}
+
 describe('ReconcileWarmingRecoveryDriver', () => {
   beforeEach(() => {
     cleanup()
@@ -595,5 +609,69 @@ describe('ReconcileWarmingRecoveryDriver', () => {
       sessionIndexReady: true,
     })
     expect(document.body.textContent).toBe('')
+  })
+
+  it('does not log a per-pane failure warn for a pane closed mid-drive (the stale verdict is not a recovery failure)', () => {
+    // Focused review round 2, finding 3: the warn record must correlate
+    // each verdict against the settle-time warming state. A pane whose tab
+    // CLOSED while the drive was in flight folds nothing (the pane is
+    // gone; the reducers reject the stale verdict) — its error verdict is
+    // a canceled recovery, not a failed one, and must never produce a
+    // false failure record.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 1, paneRefs: [ref('p1')] },
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      act(() => {
+        store.dispatch(removeLayout({ tabId: 'tab-1' }))
+      })
+      expect(store.getState().panes.reconcileWarming).toBeNull()
+      deliverServerFrame(terminalErrorResultFor(req, 'session_store_unreadable'))
+      expect(warnText(warnSpy)).not.toContain('resolved to an error')
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('does not log a per-pane failure warn for a pane rebound mid-drive (the stale verdict for the replaced identity is not a recovery failure)', () => {
+    // Focused review round 2, finding 3: the Replace-pane rebind race.
+    // The pane was replaced while the drive was in flight (same paneId,
+    // NEW content identity), the fold's identity guard rejects the stale
+    // verdict, and the parked recovery was canceled — no failure record.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderDriver({
+        reconcileWarming: { count: 1, paneRefs: [ref('p1')] },
+        sessionIndexReady: true,
+      })
+      const req = requests()[0]
+      expect(req).toBeDefined()
+      act(() => {
+        store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'p1' }))
+        store.dispatch(updatePaneContent({
+          tabId: 'tab-1',
+          paneId: 'p1',
+          content: {
+            kind: 'terminal',
+            mode: 'shell',
+            shell: 'system',
+            createRequestId: 'cr-new',
+            status: 'creating',
+          },
+        }))
+      })
+      expect(store.getState().panes.reconcileWarming).toBeNull()
+      deliverServerFrame(terminalErrorResultFor(req, 'session_store_unreadable'))
+      expect(warnText(warnSpy)).not.toContain('resolved to an error')
+      // The rebound pane keeps its new identity untouched.
+      expect(terminalContentOf(store).createRequestId).toBe('cr-new')
+      expect(terminalContentOf(store).terminalId).toBeUndefined()
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 })

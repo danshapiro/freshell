@@ -156,6 +156,15 @@ export function ReconcileWarmingRecoveryDriver(): null {
         // reconcileId THIS drive minted; foreign reconciles are skipped.
         if (msg.reconcileId !== request.reconcileId) return
         clearPending()
+        // Focused review round 2, finding 3: correlate each verdict against
+        // the SETTLE-TIME warming state — the parked set as it stands at
+        // result arrival, after any mid-drive closure/rebind pruned it,
+        // BEFORE this drive's own folds mutate it. Only a pane still parked
+        // warming under the SAME createRequestId this drive sent is
+        // recovery-relevant; a closed or rebound pane's stale verdict folds
+        // nothing (the reducers' identity guard rejects it), and its
+        // outcome is a CANCELED recovery, not a failed one.
+        const warmingAtSettle = store.getState().panes.reconcileWarming
         const outcome = foldVerdicts(dispatch, request, msg)
         // Cardinality violation FIRST (mirror the banner handler): a
         // malformed result folds NOTHING — keep the banner + manual Retry.
@@ -176,12 +185,22 @@ export function ReconcileWarmingRecoveryDriver(): null {
         // verdict is the unchanged WAIT, not a terminal outcome: it never
         // produces a per-pane warn here (the bounded backoff debug log and
         // the gave-up aggregate warn at the retry limit are its records),
-        // so nothing repeats per poll.
+        // so nothing repeats per poll. Focused review round 2, finding 3:
+        // only panes STILL warming-relevant at settle (present in the
+        // settle-time warming map with the same createRequestId) get a
+        // failure record — a pane closed or rebound mid-drive never does.
         for (const verdict of msg.verdicts) {
           if (verdict.verdict !== 'error' || verdict.reason === 'index_warming') continue
-          const claim = request.panes.find((p) => p.paneKey === verdict.paneKey)?.sessionRef
+          const pane = request.panes.find((p) => p.paneKey === verdict.paneKey)
+          if (!pane) continue
+          const stillWarmingAtSettle = warmingAtSettle?.paneRefs.some(
+            (r) =>
+              paneKeyFor(r.tabId, r.paneId) === verdict.paneKey &&
+              r.createRequestId === pane.createRequestId,
+          )
+          if (!stillWarmingAtSettle) continue
           log.warn(
-            `parked pane resolved to an error (cause=${verdict.reason ?? 'unknown'}, elapsedMs=${Date.now() - startedAt}, paneKey=${verdict.paneKey}, session=${claim ? `${claim.provider}:${claim.sessionId}` : '-'}, reconcileId=${request.reconcileId})`,
+            `parked pane resolved to an error (cause=${verdict.reason ?? 'unknown'}, elapsedMs=${Date.now() - startedAt}, paneKey=${verdict.paneKey}, session=${pane.sessionRef ? `${pane.sessionRef.provider}:${pane.sessionRef.sessionId}` : '-'}, reconcileId=${request.reconcileId})`,
           )
         }
         if (outcome.warming === 0) {
@@ -214,7 +233,7 @@ export function ReconcileWarmingRecoveryDriver(): null {
       // banner's own Retry which also does not guard the send.
       ws.send(request)
     },
-    [dispatch, rearmDrive, clearPending],
+    [dispatch, rearmDrive, clearPending, store],
   )
 
   // Unmount safety: drop any in-flight subscription/timer.
