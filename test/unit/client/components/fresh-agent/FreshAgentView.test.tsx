@@ -2427,6 +2427,60 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
     })
 
+    it('does not duplicate a landed prompt when acceptance follows materialization', async () => {
+      const store = createStore()
+      const placeholder = 'freshopencode-landed-acceptance-placeholder'
+      const durable = 'ses_landed_acceptance_materialized'
+      const prompt = 'This prompt has already landed'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'landed-acceptance-materialize', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      let landed = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async (_type, _provider, sessionId) => ({
+        status: 'idle', threadId: sessionId, capabilities: { send: true, interrupt: true },
+        turns: landed ? [{ id: 'landed-turn', turnId: 'landed-turn', role: 'user',
+          items: [{ id: 'landed-text', kind: 'text', text: prompt }] }] : [],
+        extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true } },
+      }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'error', code: 'INTERNAL_ERROR', requestId: sent!.requestId,
+        message: 'FRESH_AGENT_DELIVERY_AMBIGUOUS: response was lost' }))
+      await waitFor(() => expect(screen.getByRole('alert', { name: 'Agent warning' })).toHaveTextContent('Delivery is uncertain'))
+
+      landed = true
+      act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(screen.getAllByText(prompt)).toHaveLength(1))
+      act(() => {
+        const materialized = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, materialized)
+        listener(materialized)
+        listener({ type: 'freshAgent.send.accepted', sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          requestId: sent!.requestId, submittedTurnId: 'landed-turn' })
+      })
+
+      expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+      expect(screen.getAllByText(prompt)).toHaveLength(1)
+      expect(screen.queryByText(/Delivery is uncertain/)).toBeNull()
+      expect(screen.getByText('Message accepted. Your restored draft was kept.')).toBeVisible()
+      expect(composer).toHaveValue(prompt)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    })
+
     it('clears a send refusal when the pane switches to another conversation', async () => {
       const store = createStore()
       const first = {
