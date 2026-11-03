@@ -93,6 +93,36 @@ before returning. The coordinator's watchdog limits and kill behavior remain
 unchanged.
 Strict mode automatically prepares the dependency caches before starting the requested command;
 that command keeps its read-only root and no network.
+
+## Fixed P2-G01 external browser route
+
+The P2-G01 web continuity case can use the existing external-target browser
+project while keeping the browser test body inside a disposable sandbox:
+
+```bash
+FRESHELL_E2E_BACKEND=local FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX=1 \
+  pnpm exec tsx scripts/testing/runtime-external-browser.ts \
+  --spec test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts \
+  --grep 'P2-G01: real browser shell survives ten graceful/abrupt web replacements'
+```
+
+This route admits only that exact spec and title. The trusted host owner starts
+the managed runtime, broker, web server, and authenticated tunnel, then lists
+the selected Playwright case. The browser test runs inside
+`scripts/sandbox-test.sh`; the host never executes its test body. The owner
+hands the sandbox a private read-only descriptor file, and the browser process
+receives only the five target/run identity values plus the fixed spec and title.
+The sandbox gets no Docker socket, provider home, or cloud credential.
+
+The browser container uses the existing `freshell-sandbox` bridge so it can
+reach the owner's HTTPS/WSS tunnel. Its root remains read-only, it runs as the
+`sandbox` user with `no-new-privileges` and the existing process/memory limits,
+and the wrapper verifies settlement of its owned container before returning.
+Dependency and Chromium preparation also uses only that bridge and receives no
+external-target descriptor. This fixed route does not change the
+networkless behavior of ordinary `--runtime-suite` commands or enable a
+general networked shell mode.
+
 The exact stopped-repair selector has a finite managed-runtime route:
 
 ```bash

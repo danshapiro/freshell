@@ -12,6 +12,7 @@
 #   scripts/sandbox-test.sh --native-tools <manifest-path> --receipt-dir <absolute-directory>
 #   scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex ..."
 #   scripts/sandbox-test.sh --runtime-suite --checkpoint-fixture "cargo test -p freshell-server --features managed-runtime-v1 --locked --test code_checkpoint_permissions"
+#   scripts/sandbox-test.sh --external-browser <private-p2-g01-descriptor.json>
 #
 # --runtime-suite prepares dependencies first, then runs the caller in the
 # stricter managed-runtime lifecycle mode: no network, no real provider corpus,
@@ -153,6 +154,8 @@ else
   MOUNT_CORPUS=0
   RUNTIME_SUITE=0
   CHECKPOINT_FIXTURE=0
+  EXTERNAL_BROWSER=0
+  EXTERNAL_DESCRIPTOR_PATH=""
   while [ "$#" -gt 0 ]; do
     case "${1}" in
       --corpus)
@@ -166,6 +169,15 @@ else
       --checkpoint-fixture)
         CHECKPOINT_FIXTURE=1
         shift
+        ;;
+      --external-browser)
+        if [ "$#" -lt 2 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+          echo '[sandbox] --external-browser requires one private descriptor file' >&2
+          exit 2
+        fi
+        EXTERNAL_BROWSER=1
+        EXTERNAL_DESCRIPTOR_PATH="$2"
+        shift 2
         ;;
       --)
         shift
@@ -187,11 +199,76 @@ else
     exit 2
   fi
 
-  if [ "$#" -lt 1 ]; then
+  if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+    if [ "${MOUNT_CORPUS}" -eq 1 ] || [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${CHECKPOINT_FIXTURE}" -eq 1 ] || [ "$#" -ne 0 ]; then
+      echo '[sandbox] --external-browser accepts only its private descriptor and workspace root' >&2
+      exit 2
+    fi
+    if [[ "${EXTERNAL_DESCRIPTOR_PATH}" != /* ]] || [ ! -f "${EXTERNAL_DESCRIPTOR_PATH}" ] || [ -L "${EXTERNAL_DESCRIPTOR_PATH}" ]; then
+      echo '[sandbox] P2-G01 descriptor must be an absolute regular file' >&2
+      exit 2
+    fi
+    EXTERNAL_DESCRIPTOR_PATH="$(realpath -e "${EXTERNAL_DESCRIPTOR_PATH}")"
+    if [[ "${EXTERNAL_DESCRIPTOR_PATH}" == "${WORKSPACE_ROOT}"/* ]]; then
+      echo '[sandbox] P2-G01 descriptor must remain outside the worktree' >&2
+      exit 2
+    fi
+    DESCRIPTOR_FILE_MODE="$(stat -c '%a' "${EXTERNAL_DESCRIPTOR_PATH}")"
+    DESCRIPTOR_FILE_UID="$(stat -c '%u' "${EXTERNAL_DESCRIPTOR_PATH}")"
+    DESCRIPTOR_DIR="$(dirname "${EXTERNAL_DESCRIPTOR_PATH}")"
+    DESCRIPTOR_DIR_MODE="$(stat -c '%a' "${DESCRIPTOR_DIR}")"
+    DESCRIPTOR_DIR_UID="$(stat -c '%u' "${DESCRIPTOR_DIR}")"
+    if [ "${DESCRIPTOR_FILE_MODE}" != 600 ] || [ "${DESCRIPTOR_DIR_MODE}" != 700 ] \
+      || [ "${DESCRIPTOR_FILE_UID}" != "$(id -u)" ] || [ "${DESCRIPTOR_DIR_UID}" != "$(id -u)" ]; then
+      echo '[sandbox] P2-G01 descriptor and parent directory must be owned by the caller with modes 0600 and 0700' >&2
+      exit 2
+    fi
+    python3 - "${EXTERNAL_DESCRIPTOR_PATH}" <<'PY'
+import json
+import re
+import sys
+from urllib.parse import urlsplit
+
+expected = {
+    "FRESHELL_E2E_TARGET_URL",
+    "FRESHELL_E2E_TARGET_WS_URL",
+    "FRESHELL_E2E_TARGET_TOKEN",
+    "FRESHELL_RUNTIME_EXTERNAL_RUN_ID",
+    "FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA",
+    "FRESHELL_RUNTIME_EXTERNAL_SPEC",
+    "FRESHELL_RUNTIME_EXTERNAL_GREP",
+}
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        value = json.load(stream)
+    assert isinstance(value, dict) and set(value) == expected
+    assert all(isinstance(value[key], str) and value[key] for key in expected)
+    assert len(value["FRESHELL_E2E_TARGET_TOKEN"]) <= 4096
+    http = urlsplit(value["FRESHELL_E2E_TARGET_URL"])
+    websocket = urlsplit(value["FRESHELL_E2E_TARGET_WS_URL"])
+    assert http.scheme == "https" and websocket.scheme == "wss"
+    assert http.hostname and http.hostname == websocket.hostname and http.port == websocket.port
+    assert http.path in ("", "/") and websocket.path == "/ws"
+    assert not any((http.username, http.password, http.query, http.fragment,
+                    websocket.username, websocket.password, websocket.query, websocket.fragment))
+    assert re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", value["FRESHELL_RUNTIME_EXTERNAL_RUN_ID"])
+    assert re.fullmatch(r"[a-f0-9]{40}", value["FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA"])
+    assert value["FRESHELL_RUNTIME_EXTERNAL_SPEC"] == "test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts"
+    assert value["FRESHELL_RUNTIME_EXTERNAL_GREP"] == "P2-G01: real browser shell survives ten graceful/abrupt web replacements"
+except (AssertionError, OSError, ValueError, json.JSONDecodeError):
+    print("[sandbox] P2-G01 descriptor is invalid or selects an unapproved case", file=sys.stderr)
+    raise SystemExit(2)
+PY
+    CMD='pnpm exec tsx scripts/testing/external-browser-sandbox.ts'
+  elif [ "$#" -lt 1 ]; then
     echo "usage: $0 [--workspace-root <absolute-worktree>] [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
     exit 2
+  else
+    CMD="$1"
   fi
-  CMD="$1"
+
+  STRICT_SANDBOX=0
+  if [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; then STRICT_SANDBOX=1; fi
 
   # Only the closed native Codex contract entrypoint receives its declared
   # sandbox construction policy. Every other runtime suite keeps Docker's
@@ -237,10 +314,14 @@ else
 
   # Each phase runs the same owned wrapper lifecycle with its own name, CID,
   # guard and completed settlement. Only the fixed preparation has networking.
-  if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
+  if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
+    PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
+    fi
     env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite \
-      'if [ -f Cargo.lock ]; then cargo fetch --locked; fi' &
+      "${PREPARATION_COMMAND}" &
     PREPARATION_PID=$!
     trap 'kill -INT "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 130' INT
     trap 'kill -TERM "${PREPARATION_PID}" 2>/dev/null || true; wait "${PREPARATION_PID}" 2>/dev/null || true; exit 143' TERM
@@ -249,8 +330,16 @@ else
     wait "${PREPARATION_PID}" || PREPARATION_STATUS=$?
     trap - INT TERM HUP
     if [ "${PREPARATION_STATUS}" -ne 0 ]; then exit "${PREPARATION_STATUS}"; fi
-    CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}" --runtime-suite)
-    if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
+    CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}")
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      CALLER_FLAGS+=(--external-browser "${EXTERNAL_DESCRIPTOR_PATH}")
+    else
+      CALLER_FLAGS+=(--runtime-suite)
+      if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
+    fi
+    if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+      exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}"
+    fi
     exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
   fi
 
@@ -346,9 +435,8 @@ PY
     "${REPO_ROOT}/scripts/sandbox-build.sh"
   fi
 
-  # Ordinary destructive tests keep the established dedicated bridge network.
-  # Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
-  # ever uses the host network.
+  # Ordinary destructive tests and the fixed P2-G01 external browser use only
+  # the established bridge. Ordinary --runtime-suite commands remain offline.
   NETWORK_ARGS=()
   if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
     NETWORK_ARGS=(--network none)
@@ -534,9 +622,10 @@ trap 'interrupt_owned_sandbox 130 SIGINT' INT
 trap 'interrupt_owned_sandbox 143 SIGTERM' TERM
 trap 'interrupt_owned_sandbox 129 SIGHUP' HUP
 
-# Only the strict Rust route opts in. A detached owner guard survives the
-# unchanged coordinator's SIGKILL tree and settles this preallocated object.
-if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_OWNER_GUARD:-}" = "1" ]; then
+# A detached owner guard survives the unchanged coordinator's SIGKILL tree
+# and settles this preallocated object when the caller opts into that guard.
+if { [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; } \
+  && [ "${FRESHELL_SANDBOX_OWNER_GUARD:-}" = "1" ]; then
   OWNER_GUARD_PID="$(python3 "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" "${OWNED_CONTROL_DIR}" "$$" "${BASH_SOURCE[0]}")"
   printf '{"severity":"info","event":"sandbox_owner_guard_started","container":"%s","pid":%s}\n' \
     "${OWNED_CONTAINER_NAME}" "${OWNER_GUARD_PID}" >&2
@@ -578,7 +667,7 @@ if [ -n "${LINKED_WORKTREE_GIT_COMMON_DIR}" ]; then
   )
 fi
 
-if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
+if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
   # shellcheck disable=SC2054 # Commas belong to each single tmpfs option string.
   DOCKER_ARGS+=(
     --read-only
@@ -599,6 +688,10 @@ if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]
       -e FRESHELL_CODEX_CONTRACT_POLICY=prepared
     )
   fi
+
+if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
+  DOCKER_ARGS+=(--mount "type=bind,src=${EXTERNAL_DESCRIPTOR_PATH},dst=/run/freshell-external-target.json,readonly")
+fi
   if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
     DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)
   fi
