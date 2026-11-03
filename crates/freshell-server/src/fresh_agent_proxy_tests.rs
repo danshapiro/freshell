@@ -2567,6 +2567,7 @@ async fn codex_journal_fixture(
 fn accepted_codex_journal_proof() -> freshell_runtime_protocol::AcceptedNativeDispatch {
     freshell_runtime_protocol::AcceptedNativeDispatch {
         request_id: RequestId::parse("journal-replacement").unwrap(),
+        prior_native_session_ids: Vec::new(),
         identity: freshell_runtime_protocol::NativeDispatchIdentity {
             previous_native_session_id: "native-a".into(),
             native_session_id: "native-b".into(),
@@ -5388,6 +5389,17 @@ mod codex_replacement_realpath {
             _: &str,
             profile: &FreshAgentProfile,
         ) -> Result<DispatchAck, DispatchFailure> {
+            if request.as_str() == "second-replacement-through-supervisor" {
+                assert_eq!(profile.native_session_id.as_deref(), Some("native-b"));
+                return Ok(DispatchAck {
+                    provider_ack_id: Some("second-replacement-turn".into()),
+                    native_identity: Some(NativeDispatchIdentity {
+                        previous_native_session_id: "native-b".into(),
+                        native_session_id: "native-c".into(),
+                        pending_naming_handle: None,
+                    }),
+                });
+            }
             assert_eq!(request.as_str(), "replacement-through-supervisor");
             assert_eq!(profile.native_session_id.as_deref(), Some("native-a"));
             // The real bridge converts these three raw provider controls to
@@ -5576,6 +5588,9 @@ mod codex_replacement_realpath {
                                     // replacement changes the supervisor's launch revision.
                                     observation.native_session_id = "native-b".into();
                                     observation.evidence_revision += 1;
+                                } else if native.as_deref() == Some("native-c") {
+                                    observation.native_session_id = "native-c".into();
+                                    observation.evidence_revision += 2;
                                 }
                                 HostResult::Status {
                                     host_boot_id: host.boot.clone(), worker_pid: Some(123), worker_launch_count: 1,
@@ -5695,25 +5710,34 @@ mod codex_replacement_realpath {
 
     #[tokio::test]
     async fn codex_accepted_replacement_crosses_supervisor_actor_poller() {
-        replacement_across_realpath(false, NativeOutcome::Accepted).await;
+        replacement_across_realpath(false, NativeOutcome::Accepted, false).await;
     }
 
     #[tokio::test]
     async fn codex_late_accepted_replacement_reconciles_after_lost_reply() {
-        replacement_across_realpath(true, NativeOutcome::Accepted).await;
+        replacement_across_realpath(true, NativeOutcome::Accepted, false).await;
     }
 
     #[tokio::test]
     async fn review_refused_replacement_controls_remain_hidden_and_unactionable() {
-        replacement_across_realpath(true, NativeOutcome::Refused).await;
+        replacement_across_realpath(true, NativeOutcome::Refused, false).await;
     }
 
     #[tokio::test]
     async fn review_ambiguous_replacement_controls_remain_hidden_and_unactionable() {
-        replacement_across_realpath(true, NativeOutcome::Ambiguous).await;
+        replacement_across_realpath(true, NativeOutcome::Ambiguous, false).await;
     }
 
-    async fn replacement_across_realpath(lose_send_reply: bool, outcome: NativeOutcome) {
+    #[tokio::test]
+    async fn codex_two_accepted_replacements_survive_gateway_restart() {
+        replacement_across_realpath(false, NativeOutcome::Accepted, true).await;
+    }
+
+    async fn replacement_across_realpath(
+        lose_send_reply: bool,
+        outcome: NativeOutcome,
+        two_replacements: bool,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().to_string_lossy().into_owned();
         let runtime = root.path().join("runtime");
@@ -5897,6 +5921,7 @@ mod codex_replacement_realpath {
         );
         let mut release = Some(release_tx);
         let mut send_task = None;
+        let mut restarted_proxy = None;
         let scenario = std::panic::AssertUnwindSafe(async {
         assert!(proxy.start_poller(soul.clone(), "codex".into(), "managed-public".into(), "freshcodex".into(), 0).await);
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -5905,6 +5930,22 @@ mod codex_replacement_realpath {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.expect("the real poller must advance beyond its initial cursor");
+        if two_replacements {
+            let create = serde_json::from_value(serde_json::json!({
+                "requestId":"resume-native-a", "provider":"codex", "sessionType":"freshcodex",
+                "cwd":workspace, "sessionRef":{"provider":"codex", "sessionId":"native-a"}
+            })).unwrap();
+            proxy.clone().handle(HostedFreshAgentCommand::Create(create)).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let frame: serde_json::Value = serde_json::from_str(&public.recv().await.unwrap()).unwrap();
+                    if frame["type"] == "freshAgent.created" && frame["requestId"] == "resume-native-a" {
+                        assert_eq!(frame["sessionId"], "native-a");
+                        break;
+                    }
+                }
+            }).await.expect("the older A presentation must exist before replacement");
+        }
         while public.try_recv().is_ok() {}
         let message = serde_json::from_value(serde_json::json!({
             "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
@@ -6036,10 +6077,21 @@ mod codex_replacement_realpath {
                 .unwrap_or_else(|| panic!("accepted {kind} control must reach the original pane: {frames:?}"));
             assert!(materialized_index < index, "the original pane must see B before its controls");
         }
-        for frame in frames.iter().filter(|frame| frame["event"]["code"] == "THREAD_MEMORY_LOST"
+        for (index, frame) in frames.iter().enumerate().filter(|(_, frame)| frame["event"]["code"] == "THREAD_MEMORY_LOST"
             || frame["event"]["type"] == "freshAgent.turn.complete") {
-            assert_eq!(frame["sessionId"], pane, "warning and completion must address the pane told about B");
-            assert_eq!(frame["event"]["sessionId"], pane);
+            let presentation = frame["sessionId"].as_str().unwrap();
+            if two_replacements && presentation == "native-a" {
+                assert!(frames[..index].iter().any(|earlier| earlier["type"] == "freshAgent.session.materialized"
+                    && earlier["sessionId"] == "native-a" && earlier["sessionRef"]["sessionId"] == "native-b"),
+                    "A must learn B before its own warning or completion: {frames:?}");
+            } else {
+                assert_eq!(presentation, pane, "warning and completion must address the pane told about B");
+            }
+            assert_eq!(frame["event"]["sessionId"], presentation);
+        }
+        if two_replacements {
+            assert!(frames.iter().any(|frame| frame["sessionId"] == "native-a" && frame["event"]["code"] == "THREAD_MEMORY_LOST"),
+                "the existing A pane must receive its own B warning: {frames:?}");
         }
         for alias in ["managed-public", "native-b"] {
             assert_eq!(proxy.resolve_soul(&AgentProvider::Codex, SessionType::Freshcodex, alias).await, Some(soul.clone()));
@@ -6097,6 +6149,37 @@ mod codex_replacement_realpath {
         assert!(delivered.contains("managed-public"), "the existing pane must receive the later event; delivered={delivered:?}");
         assert!(delivered.contains(&resumed_pane), "resumed pane {resumed_pane} must receive the later event; delivered={delivered:?}");
         assert_eq!(proxy.presentation_routes.lock().await.get(&soul).unwrap().session_id, "managed-public");
+        if two_replacements {
+            let second = serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public",
+                "requestId":"second-replacement-through-supervisor", "text":"recover again"
+            })).unwrap();
+            proxy.clone().handle(HostedFreshAgentCommand::Send(second)).await;
+            assert_eq!(actor.profile().await.native_session_id.as_deref(), Some("native-c"));
+            assert_eq!(registry.recovery_context(soul.clone()).await.unwrap().native_session_id.as_deref(), Some("native-c"));
+            let proof = actor.read_events(0, 128).await.accepted_native_dispatch.unwrap();
+            assert_eq!(proof.identity.previous_native_session_id, "native-b");
+            assert!(proof.prior_native_session_ids.contains(&"native-a".into()));
+            let (restarted, mut after_restart) = configure_proxy(&control_path, HashMap::new());
+            restarted_proxy = Some(restarted.clone());
+            restarted.clone().handle(HostedFreshAgentCommand::Attach(serde_json::from_value(serde_json::json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-a",
+                "sessionRef":{"provider":"codex", "sessionId":"native-c"}
+            })).unwrap())).await;
+            source.send(AgentEvent::Provider { payload:serde_json::json!({
+                "type":"freshAgent.event", "provider":"codex", "sessionType":"freshcodex", "sessionId":"native-c",
+                "event":{"type":"freshAgent.status", "sessionId":"native-c", "status":"after-second-replacement"}
+            }) }).await.unwrap();
+            let mut replay = Vec::<serde_json::Value>::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !replay.iter().any(|frame| frame["sessionId"] == "native-a" && frame["event"]["status"] == "after-second-replacement") {
+                    replay.push(serde_json::from_str(&after_restart.recv().await.unwrap()).unwrap());
+                }
+            }).await.expect("the restarted real gateway must replay and deliver C to old A");
+            let announcement = replay.iter().position(|frame| frame["type"] == "freshAgent.session.materialized" && frame["sessionId"] == "native-a" && frame["sessionRef"]["sessionId"] == "native-c").unwrap();
+            let output = replay.iter().position(|frame| frame["sessionId"] == "native-a" && frame["event"]["status"] == "after-second-replacement").unwrap();
+            assert!(announcement < output, "A must learn C before its output: {replay:?}");
+        }
         }).catch_unwind().await;
 
         // Settle the owned sockets and poller even when an assertion fails.
@@ -6120,7 +6203,12 @@ mod codex_replacement_realpath {
             cleanup_errors.push(error);
         }
         if tokio::time::timeout(Duration::from_secs(5), async {
-            while proxy.pollers.lock().await.contains(&soul) {
+            while proxy.pollers.lock().await.contains(&soul)
+                || match restarted_proxy.as_ref() {
+                    Some(restarted) => restarted.pollers.lock().await.contains(&soul),
+                    None => false,
+                }
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

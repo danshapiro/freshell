@@ -1279,6 +1279,14 @@ impl FreshAgentHostActor {
                 }
                 let changed = state.profile.native_session_id.as_deref()
                     != Some(identity.native_session_id.as_str());
+                let mut prior_native_session_ids = BTreeSet::new();
+                if changed && state.profile.provider == FreshProvider::Codex {
+                    if let Some(prior) = current_accepted_native_dispatch(&state) {
+                        prior_native_session_ids.extend(prior.prior_native_session_ids);
+                        prior_native_session_ids.insert(prior.identity.previous_native_session_id);
+                    }
+                    prior_native_session_ids.insert(identity.previous_native_session_id.clone());
+                }
                 state.profile.native_session_id = Some(identity.native_session_id.clone());
                 state.profile.naming_handle = identity.pending_naming_handle.clone();
                 *self.observed_native_session_id.lock().await =
@@ -1288,6 +1296,9 @@ impl FreshAgentHostActor {
                         accepted_native_dispatch = Some(AcceptedNativeDispatch {
                             request_id: request_id.clone(),
                             identity: identity.clone(),
+                            prior_native_session_ids: prior_native_session_ids
+                                .into_iter()
+                                .collect(),
                         });
                     }
                     if let Some(reference) = state.profile.session_ref.as_mut() {
@@ -1445,6 +1456,12 @@ impl FreshAgentHostActor {
                     return Err(ActorError::AmbiguousDispatch);
                 }
                 state.profile.native_session_id = Some(transition.child_session_id.clone());
+                if state.profile.provider == FreshProvider::Codex {
+                    // A fork retires the whole parent presentation chain. A
+                    // later child may reuse an old native ID, but that must
+                    // never make its earlier replacement proof authoritative.
+                    state.accepted_native_dispatch = None;
+                }
                 state.profile.naming_handle = None;
                 if let Some(reference) = state.profile.session_ref.as_mut() {
                     reference.session_id = transition.child_session_id.clone();

@@ -9143,6 +9143,7 @@ pub(crate) mod tests {
                 .unwrap();
             let accepted = AcceptedNativeDispatch {
                 request_id: request.clone(),
+                prior_native_session_ids: Vec::new(),
                 identity: NativeDispatchIdentity {
                     previous_native_session_id: "native-a".into(),
                     native_session_id: "native-b".into(),

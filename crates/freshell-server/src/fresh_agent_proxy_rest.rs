@@ -199,10 +199,7 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
         let Some(view) = view else {
             return Ok(None);
         };
-        self.aliases
-            .lock()
-            .await
-            .insert(alias_key, view.soul_id.clone());
+        let generation = self.route_generation(&view.soul_id).await;
         let (mut snapshot, history_only) = match self
             .client
             .fresh_agent_snapshot(view.soul_id.clone())
@@ -276,6 +273,20 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 serde_json::json!(true);
             snapshot["extensions"][&request.provider]["statusFromLiveState"] =
                 serde_json::json!(false);
+        }
+        if runtime_provider == FreshProvider::Codex {
+            if !self
+                .register_codex_alias(alias_key, &view.soul_id, generation)
+                .await
+            {
+                tracing::warn!(event="fresh_agent.codex.snapshot_refused", reason="presentation_changed", soul_id=%view.soul_id);
+                return Err(ManagedUnavailable);
+            }
+        } else {
+            self.aliases
+                .lock()
+                .await
+                .insert(alias_key, view.soul_id.clone());
         }
         freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
             &mut snapshot,

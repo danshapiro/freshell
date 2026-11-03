@@ -3337,6 +3337,10 @@ pub struct NativeDispatchIdentity {
 pub struct AcceptedNativeDispatch {
     pub request_id: RequestId,
     pub identity: NativeDispatchIdentity,
+    /// Distinct native identities retired by this uninterrupted chain of
+    /// accepted replacements. A provider fork starts a new chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_native_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
