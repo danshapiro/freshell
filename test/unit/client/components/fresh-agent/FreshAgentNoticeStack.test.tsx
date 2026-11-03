@@ -14,6 +14,11 @@ it('groups routine notices and preserves recovery behind an error summary', asyn
  await user.click(screen.getByText('Conversation could not load'))
  expect(button).toBeVisible(); await user.click(button); expect(retry).toHaveBeenCalledOnce()
 })
+it('shows an actionable create failure and retry without requiring disclosure expansion', () => {
+ render(<FreshAgentNoticeStack notices={[]} errors={[{id:'create',summary:'Agent could not start',initiallyExpanded:true,content:<><p>Host coding-agent starts are temporarily paused for maintenance.</p><button>Retry</button></>}]} />)
+ expect(screen.getByText('Host coding-agent starts are temporarily paused for maintenance.')).toBeVisible()
+ expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible()
+})
 it('keeps reconciliation and owner transition visible with nonempty expandable details', async () => {
  const user = userEvent.setup()
  render(<FreshAgentNoticeStack notices={[{id:'reconciliation',text:'Session corrected',prominent:true},{id:'transition',text:'Reopening elsewhere',prominent:true}]} errors={[]} />)
