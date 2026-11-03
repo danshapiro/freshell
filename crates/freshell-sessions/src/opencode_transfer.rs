@@ -6075,6 +6075,47 @@ mod workspace_metadata_test_hooks {
                 unexpected_peak
             });
             if unexpected_peak {
+                // Proof-only diagnostics: retain the original peak and assertion.
+                // Observe the exact same process and pipe identities after the
+                // first over-bound sample, without treating a later sample as a pass.
+                for (candidate, fds) in &pipe_details {
+                    if fds.len() <= 3 {
+                        continue;
+                    }
+                    let owned_targets: BTreeSet<_> =
+                        fds.iter().map(|(_, target)| target.clone()).collect();
+                    let cmdline = fs::read(format!("/proc/{candidate}/cmdline")).ok().map(|bytes| {
+                        bytes.split(|byte| *byte == 0)
+                            .filter(|part| !part.is_empty())
+                            .map(|part| String::from_utf8_lossy(part).into_owned())
+                            .collect::<Vec<_>>()
+                    });
+                    let exe = fs::read_link(format!("/proc/{candidate}/exe")).ok();
+                    let mut previous_ms = 0;
+                    let mut snapshots = Vec::new();
+                    for elapsed_ms in [0, 1, 2, 5, 10, 20] {
+                        if elapsed_ms > previous_ms {
+                            std::thread::sleep(std::time::Duration::from_millis(elapsed_ms - previous_ms));
+                        }
+                        previous_ms = elapsed_ms;
+                        let descriptors = fs::read_dir(format!("/proc/{candidate}/fd")).ok().map(|entries| {
+                            entries.filter_map(Result::ok).filter_map(|entry| {
+                                let target = fs::read_link(entry.path()).ok()?;
+                                if !owned_targets.contains(&target) {
+                                    return None;
+                                }
+                                let fd = entry.file_name().to_string_lossy().into_owned();
+                                let fdinfo = fs::read_to_string(format!("/proc/{candidate}/fdinfo/{fd}")).ok();
+                                Some(serde_json::json!({"fd":fd,"target":target,"fdinfo":fdinfo}))
+                            }).collect::<Vec<_>>()
+                        });
+                        snapshots.push(serde_json::json!({"elapsedMs":elapsed_ms,"descriptors":descriptors}));
+                    }
+                    eprintln!("{}", serde_json::json!({
+                        "severity":"info", "event":"test.opencode_transfer.owned_pipe_peak_diagnostic",
+                        "pid":candidate, "cmdline":cmdline, "exe":exe, "snapshots":snapshots,
+                    }));
+                }
                 eprintln!(
                     "{}",
                     serde_json::json!({
