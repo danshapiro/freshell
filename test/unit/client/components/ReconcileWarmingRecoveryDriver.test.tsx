@@ -271,6 +271,16 @@ describe('ReconcileWarmingRecoveryDriver', () => {
       expect(text).toContain('tab-1:p1')
       expect(text).toContain('claude:sess-p1')
       expect(text).toContain('cause=session_store_unreadable')
+      // Focused review round 2, finding 1: the warn-level failure record
+      // must carry the drive's elapsed time ITSELF — the info-level
+      // `settled` message that also carries it is suppressed in production
+      // (client-logger default level `warn`), so without elapsedMs here a
+      // routine failure leaves no production recovery-duration record.
+      const elapsedMatch = text.match(/elapsedMs=(\d+)/)
+      expect(elapsedMatch).not.toBeNull()
+      const elapsedMs = Number(elapsedMatch![1])
+      expect(Number.isFinite(elapsedMs)).toBe(true)
+      expect(elapsedMs).toBeGreaterThanOrEqual(0)
     } finally {
       warnSpy.mockRestore()
     }
