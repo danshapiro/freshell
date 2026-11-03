@@ -2664,6 +2664,159 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'A queued follow-up' })
     })
 
+    async function setupCodexSharedTurnSteer(earlierText: string, prompt: string) {
+      const store = createStore()
+      const sessionId = 'codex-shared-native-turn'
+      const nativeTurnId = 'shared-turn'
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'codex-shared-turn-create', sessionId, resumeSessionId: sessionId,
+        sessionRef: { provider: 'codex' as const, sessionId }, status: 'idle' as const,
+      }
+      const userRow = (id: string, text: string, nativeId?: string) => ({
+        id, turnId: id, role: 'user' as const, ...(nativeId ? { nativeTurnId: nativeId } : {}),
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      const assistantRow = (id: string, text: string) => ({
+        id, turnId: id, role: 'assistant' as const,
+        items: [{ id: `${id}:text`, kind: 'text' as const, text }],
+      })
+      type Row = ReturnType<typeof userRow> | ReturnType<typeof assistantRow>
+      let status: 'idle' | 'running' = 'idle'
+      let rows: Row[] = [userRow(nativeTurnId, earlierText, nativeTurnId)]
+      let revision = 0
+      const snapshot = () => ({
+        status, threadId: sessionId, sessionType: content.sessionType, provider: content.provider,
+        revision: ++revision, capabilities: { send: true, interrupt: true }, turns: rows,
+      })
+      const acceptanceRead = createDeferred<ReturnType<typeof snapshot>>()
+      let holdAcceptanceRead = false
+      let acceptanceReadStarted = false
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => {
+        if (holdAcceptanceRead) {
+          acceptanceReadStarted = true
+          return acceptanceRead.promise
+        }
+        return snapshot()
+      })
+      store.dispatch(sessionInit({ sessionId, sessionType: content.sessionType, provider: content.provider }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      await waitFor(() => expect(composer).toBeEnabled())
+      await screen.findByText(earlierText)
+      fireEvent.change(composer, { target: { value: prompt } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      const sent = sentFreshAgentMessages('freshAgent.send').at(-1)
+      expect(sent?.requestId).toBeTruthy()
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+
+      return {
+        store, composer, sent: sent!, userRow, assistantRow,
+        accept() {
+          holdAcceptanceRead = true
+          act(() => listener({ type: 'freshAgent.send.accepted', sessionId,
+            sessionType: content.sessionType, provider: content.provider,
+            requestId: sent!.requestId, submittedTurnId: nativeTurnId }))
+        },
+        async releaseAcceptedRead(nextStatus: 'idle' | 'running', nextRows: Row[]) {
+          await waitFor(() => expect(acceptanceReadStarted).toBe(true))
+          status = nextStatus
+          rows = nextRows
+          holdAcceptanceRead = false
+          await act(async () => { acceptanceRead.resolve(snapshot()) })
+        },
+        async refresh(nextStatus: 'idle' | 'running', nextRows: Row[], marker: string) {
+          status = nextStatus
+          rows = nextRows
+          act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+          await screen.findByText(marker)
+        },
+      }
+    }
+
+    it('keeps a steered echo visible when an earlier matching row shares its native turn ID', async () => {
+      const prompt = 'Same wording in two sends'
+      const steer = await setupCodexSharedTurnSteer(prompt, prompt)
+      const expectEcho = () => {
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+          requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+        })
+        const users = screen.getAllByRole('article', { name: 'You transcript turn' })
+        expect(users).toHaveLength(2)
+        expect(within(users[0]).getByText(prompt)).toBeVisible()
+        expect(within(users[1]).getByText(prompt)).toBeVisible()
+      }
+      steer.accept()
+      expectEcho()
+      // A one-row Codex turn is keyed by the native ID. Once assistant output
+      // lands, its original user row is re-keyed to :row-0, not a new input.
+      await steer.releaseAcceptedRead('running', [
+        steer.userRow('shared-turn:row-0', prompt, 'shared-turn'),
+        steer.assistantRow('shared-turn:row-1', 'Earlier turn is running'),
+      ])
+      await screen.findByText('Earlier turn is running')
+      expectEcho()
+    })
+
+    it('settles a uniquely matching steered row at authoritative idle and releases queued work', async () => {
+      const prompt = 'Add this steered context'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const runningRows = [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', 'The shared turn is running'),
+        steer.userRow('shared-turn:row-2', prompt),
+      ]
+      await steer.releaseAcceptedRead('running', runningRows)
+      await screen.findByText('The shared turn is running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+        requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+      })
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(3)
+      expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+      fireEvent.change(steer.composer, { target: { value: 'Follow up after steering' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send', exact: true }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+
+      await steer.refresh('idle', [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', 'The shared turn completed'),
+        steer.userRow('shared-turn:row-2', prompt),
+      ], 'The shared turn completed')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2), { timeout: 10_000 })
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Follow up after steering' })
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).not.toBe(steer.sent.requestId)
+    })
+
+    it('keeps an ambiguous steered echo when multiple new user rows have the same text', async () => {
+      const prompt = 'Same steered message from two clients'
+      const steer = await setupCodexSharedTurnSteer('Earlier user request', prompt)
+      steer.accept()
+      const rows = (marker: string) => [
+        steer.userRow('shared-turn:row-0', 'Earlier user request'),
+        steer.assistantRow('shared-turn:row-1', marker),
+        steer.userRow('shared-turn:row-2', prompt),
+        steer.assistantRow('shared-turn:row-3', 'Intervening response'),
+        steer.userRow('shared-turn:row-4', prompt),
+      ]
+      await steer.releaseAcceptedRead('running', rows('Two matching sends are running'))
+      await screen.findByText('Two matching sends are running')
+      expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho?.requestId).toBe(steer.sent.requestId)
+
+      // Repeated current idle reads must not turn multiple possible matches
+      // into a claim that either particular row belongs to this request.
+      for (let read = 0; read <= IDLE_INCOMPLETE_MAX_RETRIES; read++) {
+        const marker = `Ambiguous completed read ${read}`
+        await steer.refresh('idle', rows(marker), marker)
+        expect(getFreshAgentPaneContent(steer.store).pendingLocalEcho).toMatchObject({
+          requestId: steer.sent.requestId, submittedTurnId: 'shared-turn', text: prompt,
+        })
+      }
+      expect(screen.getAllByRole('article', { name: 'You transcript turn' })).toHaveLength(4)
+    })
+
+
     it.each([
       { label: 'uncertainty and acceptance arrive in the same batch', ambiguous: true },
       { label: 'ordinary acceptance arrives in the same batch as a landed snapshot', ambiguous: false },
