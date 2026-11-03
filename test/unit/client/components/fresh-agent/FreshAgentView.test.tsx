@@ -2103,6 +2103,56 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(notice()).toBeNull())
     })
 
+    it('keeps a provider error when an OpenCode placeholder materializes to a durable session', async () => {
+      const store = createStore()
+      const placeholder = 'freshopencode-notice-materialize-create'
+      const durable = 'ses_notice_materialized'
+      const first = {
+        kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        createRequestId: 'notice-materialize-create', sessionId: placeholder, resumeSessionId: placeholder,
+        sessionRef: { provider: 'opencode' as const, sessionId: placeholder }, status: 'idle' as const,
+      }
+      const snapshot = (threadId: string) => ({
+        status: 'idle' as const, threadId, capabilities: { send: true, interrupt: true }, turns: [],
+      })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(placeholder))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: first }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshopencode', 'opencode', placeholder, expect.anything(),
+      ))
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const diagnostic = 'The provider reported a capacity error.'
+      act(() => {
+        const message = {
+          type: 'freshAgent.event', sessionId: placeholder, sessionType: first.sessionType, provider: first.provider,
+          event: { type: 'freshAgent.notice', sessionId: placeholder, level: 'error', code: 'PROVIDER_ERROR', message: diagnostic },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      const notice = () => document.querySelector('[data-agent-error="notice"] summary')
+      await waitFor(() => expect(notice()).toHaveTextContent(diagnostic))
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot(durable))
+      act(() => {
+        const message = {
+          type: 'freshAgent.session.materialized', previousSessionId: placeholder, sessionId: durable,
+          sessionType: first.sessionType, provider: first.provider,
+          sessionRef: { provider: first.provider, sessionId: durable },
+        }
+        handleFreshAgentMessage(store.dispatch, message)
+        listener(message)
+      })
+      await waitFor(() => expect(getFreshAgentPaneContent(store).sessionId).toBe(durable))
+      expect(getFreshAgentPaneContent(store).createRequestId).toBe(first.createRequestId)
+      expect(notice()).toHaveTextContent(diagnostic)
+    })
+
     it.each([
       [false, 'notice-gap-thread-a', 'clears the old notice when no saved conversation remains'],
       [true, 'notice-gap-thread-a', 'retains the notice when the saved conversation is reconnecting'],
