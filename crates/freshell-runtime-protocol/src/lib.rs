@@ -3445,6 +3445,8 @@ pub struct FreshAgentResolveRequest {
     pub soul_id: SoulId,
     pub decision_id: String,
     pub decision: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_attempt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -3453,6 +3455,8 @@ pub struct FreshAgentResolveRequest {
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentInterruptRequest {
     pub soul_id: SoulId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -3463,6 +3467,17 @@ pub struct FreshAgentReadEventsRequest {
     pub soul_id: SoulId,
     pub after_sequence: u64,
     pub max_events: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+/// Read retained display state without applying journal identity changes.
+/// The deadline includes waiting for the session's lifecycle lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadRetainedStateRequest {
+    pub soul_id: SoulId,
+    pub max_duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -3534,6 +3549,25 @@ pub struct RuntimeMetricsRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+/// A known send outcome, with an optional diagnostic already published to the
+/// originating user by the provider's request-correlated receipt. Arbitrary
+/// transport error text must never be placed here: it can contain request
+/// bodies or credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentSendDiagnostic {
+    pub outcome: FreshAgentSendDiagnosticOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAgentSendDiagnosticOutcome {
+    Refused,
+    Ambiguous,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeError {
@@ -3543,6 +3577,8 @@ pub struct RuntimeError {
     pub diagnostic_code: Option<RuntimeDiagnosticCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_send_diagnostic: Option<FreshAgentSendDiagnostic>,
 }
 
 impl RuntimeError {
@@ -3552,6 +3588,7 @@ impl RuntimeError {
             message: message.into(),
             diagnostic_code: None,
             fresh_agent_provider_start_diagnostic: None,
+            fresh_agent_send_diagnostic: None,
         }
     }
 
@@ -3565,6 +3602,14 @@ impl RuntimeError {
         diagnostic: FreshAgentProviderStartDiagnostic,
     ) -> Self {
         self.fresh_agent_provider_start_diagnostic = Some(diagnostic);
+        self
+    }
+
+    pub fn with_fresh_agent_send_diagnostic(
+        mut self,
+        diagnostic: FreshAgentSendDiagnostic,
+    ) -> Self {
+        self.fresh_agent_send_diagnostic = Some(diagnostic);
         self
     }
 }
@@ -4510,6 +4555,7 @@ pub enum AdminCommand {
     FreshAgentPrepareNative(FreshAgentInterruptRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
+    FreshAgentReadRetainedState(FreshAgentReadRetainedStateRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
     FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
     FreshAgentModelCatalog(FreshAgentModelCatalogRequest),
@@ -5182,9 +5228,13 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         decision_id: String,
         decision: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_attempt_id: Option<String>,
     },
     FreshAgentInterrupt {
         incarnation_id: IncarnationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     FreshAgentReadEvents {
         incarnation_id: IncarnationId,
@@ -6404,6 +6454,7 @@ mod tests {
             incarnation_id: IncarnationId::parse("incarnation-agent-rpc").unwrap(),
             decision_id: "decision-7".into(),
             decision: serde_json::json!({"behavior":"allow"}),
+            operation_attempt_id: None,
         };
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["method"], "fresh_agent_resolve");

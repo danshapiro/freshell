@@ -5255,6 +5255,19 @@ impl Supervisor {
                         .await
                         .map_err(|error| error.to_string())?;
                 }
+                Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::Cancelled,
+                    ..
+                }) if handle.fresh_agent().is_some() => {
+                    self.registry.mark_fresh_input_refused(soul_id.clone(), request_id.clone(),
+                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                            outcome: freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                            message: None,
+                        }).await.map_err(|error| error.to_string())?;
+                    tracing::warn!(soul_id=%soul_id, incarnation_id=%incarnation_id, request_id=%request_id,
+                        "supervisor.recovery.queued_input_refused");
+                    continue;
+                }
                 Ok(HostResult::TerminalInput { state })
                 | Ok(HostResult::FreshAgentCommand { state, .. }) => {
                     self.registry
@@ -5276,6 +5289,24 @@ impl Supervisor {
                     );
                 }
                 Err(error) => {
+                    let refusal = error.fresh_agent_send_diagnostic.as_ref().filter(|diagnostic| {
+                        handle.fresh_agent().is_some()
+                            && error.code != RuntimeErrorCode::CommandAmbiguous
+                            && diagnostic.outcome == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                    });
+                    if let Some(diagnostic) = refusal {
+                        self.registry
+                            .mark_fresh_input_refused(
+                                soul_id.clone(),
+                                request_id.clone(),
+                                diagnostic.clone(),
+                            )
+                            .await
+                            .map_err(|registry_error| registry_error.to_string())?;
+                        tracing::warn!(soul_id=%soul_id, incarnation_id=%incarnation_id, request_id=%request_id,
+                            "supervisor.recovery.queued_input_refused");
+                        continue;
+                    }
                     self.registry
                         .mark_input_ambiguous(soul_id.clone(), request_id)
                         .await
@@ -6194,6 +6225,8 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("fresh_agent_queued_refusal_tests.rs");
+
     include!("shell_recovery_tests.rs");
     include!("retained_output_tests.rs");
     include!("host_restart_recovery_tests.rs");
@@ -8754,6 +8787,7 @@ pub(crate) mod automatic_retry_tests {
     };
 
     include!("deterministic_fixture_recovery_tests.rs");
+    include!("fresh_agent_queued_recovery_tests.rs");
 
     // These four subprocess tests are only entered by the documented runtime
     // sandbox. Abrupt exit skips every Rust destructor, including SQLite owners.
@@ -9246,6 +9280,68 @@ pub(crate) mod automatic_retry_tests {
                                 );
                             }
                             HostResult::Stopped
+                        }
+                        HostCommand::FreshAgentSend {
+                            request_id, text, ..
+                        } => {
+                            let mode =
+                                std::fs::read_to_string(facts_root.join("queued-recovery-mode"))
+                                    .expect("a queued-send test must configure the fixture");
+                            RetryBackend::record_at(
+                                &facts_root,
+                                "queued-recovery-sends",
+                                &format!("{}:{text}", request_id.as_str()),
+                            );
+                            if request_id.as_str() == "queued-first" {
+                                match mode.as_str() {
+                                    "cancelled" => HostResult::FreshAgentCommand {
+                                        state: CommandState::Cancelled,
+                                        native_session_id: None,
+                                        native_identity: None,
+                                        claude_fork: None,
+                                    },
+                                    "diagnostic" | "ambiguous" => {
+                                        use freshell_runtime_protocol::{
+                                            FreshAgentSendDiagnostic,
+                                            FreshAgentSendDiagnosticOutcome,
+                                        };
+                                        let error = RuntimeError::new(
+                                            if mode == "ambiguous" {
+                                                RuntimeErrorCode::CommandAmbiguous
+                                            } else {
+                                                RuntimeErrorCode::HostUnreachable
+                                            },
+                                            "hosted fresh-agent command failed",
+                                        )
+                                        .with_fresh_agent_send_diagnostic(
+                                            FreshAgentSendDiagnostic {
+                                                outcome: FreshAgentSendDiagnosticOutcome::Refused,
+                                                message: Some(
+                                                    "already-published queued refusal".into(),
+                                                ),
+                                            },
+                                        );
+                                        write_frame(
+                                            &mut socket,
+                                            &HostReply {
+                                                request_id: request.request_id,
+                                                result: Err(error),
+                                            },
+                                        )
+                                        .await
+                                        .unwrap();
+                                        continue;
+                                    }
+                                    other => panic!("unexpected queued recovery mode: {other}"),
+                                }
+                            } else {
+                                HostResult::FreshAgentCommand {
+                                    state: CommandState::ProviderAcked,
+                                    native_session_id: None,
+                                    native_identity: None,
+                                    claude_fork: None,
+                                }
+                            }
                         }
                         other => panic!("unexpected retry fixture command: {other:?}"),
                     };

@@ -119,7 +119,8 @@ fn initial_or_rejected_creation(conn: &Connection, soul: &SoulId) -> Result<bool
     if !exists {
         return Ok(true);
     };
-    let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM souls s JOIN provider_input_preparations p ON p.soul_id=s.soul_id WHERE s.soul_id=?1 AND s.provider='opencode' AND s.native_session_id IS NULL AND s.desired_state='running' AND s.intent_revision=1 AND s.creation_seed_ref=p.creation_seed_ref AND p.provider=s.provider AND p.consumed=0 AND p.bound_incarnation_id IS NULL AND NOT EXISTS(SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id AND i.launch_state!='stopped') AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id AND c.state!='provider_inputs_changed') AND (SELECT COUNT(*) FROM commands c WHERE c.soul_id=s.soul_id AND c.state='provider_inputs_changed') BETWEEN 1 AND 2 AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id))",[soul.as_str()],|row|row.get(0))?;
+    // Refusal records prevent duplicate requests but did not admit input.
+    let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM souls s JOIN provider_input_preparations p ON p.soul_id=s.soul_id WHERE s.soul_id=?1 AND s.provider='opencode' AND s.native_session_id IS NULL AND s.desired_state='running' AND s.intent_revision=1 AND s.creation_seed_ref=p.creation_seed_ref AND p.provider=s.provider AND p.consumed=0 AND p.bound_incarnation_id IS NULL AND NOT EXISTS(SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id AND i.launch_state!='stopped') AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id AND c.state!='provider_inputs_changed') AND (SELECT COUNT(*) FROM commands c WHERE c.soul_id=s.soul_id AND c.state='provider_inputs_changed') BETWEEN 1 AND 2 AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id AND c.state!='refused_before_admission'))",[soul.as_str()],|row|row.get(0))?;
     Ok(eligible)
 }
 
@@ -311,7 +312,8 @@ fn rejected_initial_observation(
     conn: &Connection,
     incarnation: &IncarnationId,
 ) -> Result<(String, InitialAuthVolumeObservation), RegistryError> {
-    let row:Option<(String,String)>=conn.query_row("SELECT s.soul_id,p.observation FROM provider_input_preparations p JOIN incarnations i ON i.incarnation_id=p.bound_incarnation_id JOIN souls s ON s.soul_id=p.soul_id WHERE i.incarnation_id=?1 AND i.soul_id=s.soul_id AND p.consumed=1 AND p.provider='opencode' AND s.provider=p.provider AND s.creation_seed_ref=p.creation_seed_ref AND s.native_session_id IS NULL AND s.desired_state='running' AND s.intent_revision=1 AND i.launch_state='starting' AND i.provider_preparation_pending=0 AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id) AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id AND c.incarnation_id!=i.incarnation_id AND c.state!='provider_inputs_changed') AND (SELECT COUNT(*) FROM commands c WHERE c.soul_id=s.soul_id AND c.state='provider_inputs_changed')<3",[incarnation.as_str()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    // A refused-before-admission row cannot have consumed the initial grant.
+    let row:Option<(String,String)>=conn.query_row("SELECT s.soul_id,p.observation FROM provider_input_preparations p JOIN incarnations i ON i.incarnation_id=p.bound_incarnation_id JOIN souls s ON s.soul_id=p.soul_id WHERE i.incarnation_id=?1 AND i.soul_id=s.soul_id AND p.consumed=1 AND p.provider='opencode' AND s.provider=p.provider AND s.creation_seed_ref=p.creation_seed_ref AND s.native_session_id IS NULL AND s.desired_state='running' AND s.intent_revision=1 AND i.launch_state='starting' AND i.provider_preparation_pending=0 AND NOT EXISTS(SELECT 1 FROM input_commands c WHERE c.soul_id=s.soul_id AND c.state!='refused_before_admission') AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.soul_id=s.soul_id AND c.incarnation_id!=i.incarnation_id AND c.state!='provider_inputs_changed') AND (SELECT COUNT(*) FROM commands c WHERE c.soul_id=s.soul_id AND c.state='provider_inputs_changed')<3",[incarnation.as_str()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
     let (soul, raw) = row.ok_or_else(|| {
         RegistryError::InvalidState(
             "initial provider inputs rejection has no undispatched creation ownership".into(),
@@ -319,3 +321,7 @@ fn rejected_initial_observation(
     })?;
     Ok((soul, serde_json::from_str(&raw)?))
 }
+
+#[cfg(test)]
+#[path = "input_reservation_refused_tests.rs"]
+mod input_reservation_refused_tests;

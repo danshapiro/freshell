@@ -1549,9 +1549,11 @@ impl Registry {
                     "UPDATE commands SET state='lost',updated_at=?1 WHERE incarnation_id=?2",
                     params![now, incarnation_id],
                 )?;
+                // An unadmitted refusal is a durable retry result, not input
+                // for the lost incarnation to cancel.
                 tx.execute(
                     "UPDATE input_commands SET state='cancelled',updated_at=?1 \
-                     WHERE incarnation_id=?2 AND state NOT IN ('completed','cancelled')",
+                     WHERE incarnation_id=?2 AND state NOT IN ('completed','cancelled','refused_before_admission')",
                     params![now, incarnation_id],
                 )?;
             }

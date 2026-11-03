@@ -33,6 +33,109 @@ type SessionMutationPayload = {
   provider?: FreshAgentRuntimeProvider
 }
 
+type ControlCancellation = { requestId: FreshAgentRequestId; operationAttemptId?: string; operationJournalId?: string; operationJournalSequence?: number }
+
+// Keep replay deduplication bounded without retaining copies of provider text.
+function operationReceiptFingerprint(parts: readonly unknown[]): string {
+  const value = JSON.stringify(parts)
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value.charCodeAt(index)
+    first = Math.imul(first ^ character, 0x01000193)
+    second = Math.imul(second ^ character, 0x85ebca6b)
+  }
+  return `${value.length}:${first >>> 0}:${second >>> 0}`
+}
+
+function clearSessionErrorState(session: FreshAgentSessionState) {
+  session.lastError = undefined
+  session.lastErrorCode = undefined
+  session.lastErrorRequestId = undefined
+  session.lastErrorOperationAttemptId = undefined
+  session.lastErrorWasOperationFallback = undefined
+  session.lastErrorOperationUncertain = undefined
+  session.lastErrorOperationUncertainty = undefined
+  session.lastErrorOperationProvisional = undefined
+  session.earlierControlUncertainties = undefined
+  session.unattributedControlErrors = undefined
+  session.pendingControlFallbacks = undefined
+}
+
+function earlierControlUncertainty(session: FreshAgentSessionState, requestId?: string): string | undefined {
+  const messages = session.earlierControlUncertainties
+    ?.map((entry) => `${entry.requestId === requestId ? 'Earlier attempt' : 'Another request'}: ${entry.message}`)
+  return messages?.length ? messages.join(' ') : undefined
+}
+
+function rememberControlUncertainty(session: FreshAgentSessionState, requestId: string, attemptId: string | undefined, message: string) {
+  const warnings = session.earlierControlUncertainties ??= []
+  if (warnings.some((entry) => entry.requestId === requestId && entry.attemptId === attemptId)) return false
+  warnings.push({ requestId, attemptId, message })
+  if (warnings.length > 16) warnings.shift()
+  return true
+}
+
+function unattributedControlError(session: FreshAgentSessionState, requestId?: string): string | undefined {
+  const messages = session.unattributedControlErrors
+    ?.filter((entry) => entry.requestId === requestId)
+    .map((entry) => `Provider error for this request (answer attempt unknown): ${entry.message}`)
+  return messages?.length ? messages.join(' ') : undefined
+}
+
+function clearProvisionalControlWarning(session: FreshAgentSessionState, requestId: string) {
+  if (!session.lastErrorOperationProvisional || session.lastErrorRequestId !== requestId) return
+  if (session.lastErrorCode !== 'ANSWER_IN_PROGRESS') {
+    const provisional = session.lastErrorOperationUncertainty
+    if (provisional) session.lastError = session.lastError?.replace(` ${provisional}`, '')
+    session.lastErrorOperationUncertain = undefined
+    session.lastErrorOperationUncertainty = undefined
+    session.lastErrorOperationProvisional = undefined
+    return
+  }
+  const earlier = earlierControlUncertainty(session, requestId)
+  if (!earlier) {
+    clearSessionErrorState(session)
+    return
+  }
+  session.lastError = earlier
+  session.lastErrorCode = undefined
+  session.lastErrorRequestId = undefined
+  session.lastErrorOperationAttemptId = undefined
+  session.lastErrorWasOperationFallback = true
+  session.lastErrorOperationUncertain = undefined
+  session.lastErrorOperationUncertainty = undefined
+  session.lastErrorOperationProvisional = undefined
+}
+
+function adoptControlJournal(session: FreshAgentSessionState, journalId?: string): boolean {
+  if (!journalId || session.activeControlJournalId === journalId) return true
+  if (session.retiredControlJournalIds?.includes(journalId)) return false
+  if (session.activeControlJournalId) {
+    const retired = session.retiredControlJournalIds ??= []
+    retired.push(session.activeControlJournalId)
+    if (retired.length > 32) retired.shift()
+    session.recentControlAttempts = []
+  }
+  session.activeControlJournalId = journalId
+  return true
+}
+
+function recordControlCancellation(session: FreshAgentSessionState, cancellation: ControlCancellation): boolean {
+  const requestId = String(cancellation.requestId)
+  if (!adoptControlJournal(session, cancellation.operationJournalId)) return false
+  const current = session.recentControlAttempts?.find((entry) => entry.requestId === requestId)
+  if (current?.journalId && current.journalId === cancellation.operationJournalId
+      && current.journalSequence != null && cancellation.operationJournalSequence != null
+      && cancellation.operationJournalSequence < current.journalSequence) return false
+  if (current && cancellation.operationAttemptId && current.attemptId !== cancellation.operationAttemptId) return false
+  const settled = session.settledControlRevisions ??= []
+  settled.push({ requestId, attemptId: cancellation.operationAttemptId ?? current?.attemptId,
+    journalId: cancellation.operationJournalId, journalSequence: cancellation.operationJournalSequence })
+  if (settled.length > 128) settled.shift()
+  return true
+}
+
 const initialState: FreshAgentState = {
   sessions: {},
   pendingCreates: {},
@@ -415,10 +518,12 @@ const freshAgentSlice = createSlice({
       state.sessions[key].pendingPermissions[String(action.payload.requestId)] = action.payload
     },
 
-    removePermission(state, action: PayloadAction<SessionMutationPayload & { requestId: string | number }>) {
+    removePermission(state, action: PayloadAction<SessionMutationPayload & ControlCancellation>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
+      if (!recordControlCancellation(state.sessions[key], action.payload)) return
       delete state.sessions[key].pendingPermissions[String(action.payload.requestId)]
+      clearProvisionalControlWarning(state.sessions[key], String(action.payload.requestId))
     },
 
     addQuestionRequest(state, action: PayloadAction<SessionMutationPayload & FreshAgentQuestionRequest>) {
@@ -427,25 +532,160 @@ const freshAgentSlice = createSlice({
       state.sessions[key].pendingQuestions[String(action.payload.requestId)] = action.payload
     },
 
-    removeQuestion(state, action: PayloadAction<SessionMutationPayload & { requestId: string | number }>) {
+    removeQuestion(state, action: PayloadAction<SessionMutationPayload & ControlCancellation>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
+      if (!recordControlCancellation(state.sessions[key], action.payload)) return
       delete state.sessions[key].pendingQuestions[String(action.payload.requestId)]
+      clearProvisionalControlWarning(state.sessions[key], String(action.payload.requestId))
     },
 
     addElicitationRequest(state, action: PayloadAction<SessionMutationPayload & NonNullable<FreshAgentSessionState['pendingElicitations']>[string]>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (session) (session.pendingElicitations ??= {})[String(action.payload.requestId)] = action.payload
     },
-    removeElicitation(state, action: PayloadAction<SessionMutationPayload & { requestId: FreshAgentRequestId }>) {
+    removeElicitation(state, action: PayloadAction<SessionMutationPayload & ControlCancellation>) {
       const key = resolveSessionKey(state, action.payload)
-      if (key) delete state.sessions[key].pendingElicitations?.[String(action.payload.requestId)]
+      if (key) {
+        if (!recordControlCancellation(state.sessions[key], action.payload)) return
+        delete state.sessions[key].pendingElicitations?.[String(action.payload.requestId)]
+        clearProvisionalControlWarning(state.sessions[key], String(action.payload.requestId))
+      }
     },
 
-    sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string }>) {
+    sessionError(state, action: PayloadAction<SessionMutationPayload & {
+      code?: string; message: string; requestId?: string; operationReceipt?: boolean; operationFallback?: boolean; operationOutcomeUncertain?: boolean; operationReceiptReplay?: boolean; operationAttemptId?: string
+    }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
-      session.lastError = action.payload.message
+      const { requestId, operationAttemptId } = action.payload
+      if (action.payload.operationReceipt && requestId) {
+        const fingerprint = operationReceiptFingerprint([
+          requestId, operationAttemptId ?? null, action.payload.code ?? null, action.payload.message,
+          Boolean(action.payload.operationFallback), Boolean(action.payload.operationOutcomeUncertain),
+        ])
+        const recent = session.recentOperationReceiptFingerprints ??= []
+        const seen = recent.includes(fingerprint)
+        if (action.payload.operationReceiptReplay && seen) return
+        if (!seen) {
+          recent.push(fingerprint)
+          if (recent.length > 128) recent.shift()
+        }
+      }
+      const trackedAttempt = session.recentControlAttempts?.find((entry) => entry.requestId === requestId)
+      if (action.payload.operationReceipt && requestId && operationAttemptId) {
+        if (!trackedAttempt && action.payload.operationFallback) {
+          const pending = session.pendingControlFallbacks ??= []
+          if (!pending.some((entry) => entry.requestId === requestId && entry.attemptId === operationAttemptId)) {
+            pending.push({ requestId, attemptId: operationAttemptId, code: action.payload.code,
+              message: action.payload.message, uncertain: Boolean(action.payload.operationOutcomeUncertain) })
+            if (pending.length > 32) pending.shift()
+          }
+        }
+        // The host journal can deliver a previous answer's receipt after a
+        // retry has already started. It cannot describe that newer attempt.
+        if (trackedAttempt && trackedAttempt.attemptId !== operationAttemptId) {
+          if (action.payload.operationFallback) {
+            // The gateway can fail before the host's start event arrives. Do
+            // not guess whether this is a later attempt or a delayed old one.
+            const pending = session.pendingControlFallbacks ??= []
+            if (!pending.some((entry) => entry.requestId === requestId && entry.attemptId === operationAttemptId)) {
+              pending.push({ requestId, attemptId: operationAttemptId, code: action.payload.code,
+                message: action.payload.message, uncertain: Boolean(action.payload.operationOutcomeUncertain) })
+              if (pending.length > 32) pending.shift()
+              const warning = `Another answer attempt: ${action.payload.message}`
+              if (session.lastErrorCode === 'SESSION_RESERVED' && session.lastErrorWasOperationFallback === undefined) {
+                // Attach reservations are hidden by the view. The answer
+                // failure is separate and must remain visible.
+                session.lastError = warning
+                session.lastErrorCode = action.payload.code
+                session.lastErrorWasOperationFallback = true
+              } else if (!session.lastError?.includes(warning)) {
+                session.lastError = [session.lastError, warning].filter(Boolean).join(' ')
+              }
+            }
+          }
+          return
+        }
+        // Only an observed start is authoritative. A newly attached browser
+        // can receive an old journal event before the current attempt state.
+      }
+      // A provider receipt is more informative than the managed host's
+      // body-free fallback for the same operation, in either arrival order.
+      const sameOperation = Boolean(action.payload.operationReceipt && action.payload.requestId
+        && session.lastErrorRequestId === action.payload.requestId
+        && session.lastErrorOperationAttemptId === operationAttemptId)
+      if (action.payload.operationFallback && requestId && operationAttemptId && !trackedAttempt
+          && session.lastErrorRequestId === requestId && !session.lastErrorOperationAttemptId
+          && session.lastErrorWasOperationFallback === false && session.lastError) {
+        const errors = session.unattributedControlErrors ??= []
+        if (!errors.some((entry) => entry.requestId === requestId)) {
+          errors.push({ requestId, message: session.lastError })
+          if (errors.length > 16) errors.shift()
+        }
+      }
+      if (session.lastErrorRequestId && session.lastErrorOperationAttemptId && session.lastErrorOperationUncertain
+          && session.lastErrorOperationUncertainty
+          && (session.lastErrorRequestId !== requestId
+            || (operationAttemptId && session.lastErrorOperationAttemptId
+              && session.lastErrorOperationAttemptId !== operationAttemptId))) {
+        rememberControlUncertainty(session, session.lastErrorRequestId, session.lastErrorOperationAttemptId,
+          session.lastErrorOperationUncertainty)
+      }
+      const activeTaggedAttemptId = trackedAttempt?.attemptId
+        ?? (session.lastErrorRequestId === requestId ? session.lastErrorOperationAttemptId : undefined)
+      if (action.payload.operationReceipt && requestId && !operationAttemptId
+          && !action.payload.operationFallback && activeTaggedAttemptId) {
+        // An older managed host does not echo attempt IDs. Show its native
+        // diagnostic without claiming it belongs to the current answer.
+        const errors = session.unattributedControlErrors ??= []
+        if (!errors.some((entry) => entry.requestId === requestId && entry.message === action.payload.message)) {
+          errors.push({ requestId, message: action.payload.message })
+          if (errors.length > 16) errors.shift()
+        }
+        const unknown = unattributedControlError(session, requestId)
+        if (session.lastErrorRequestId === requestId && session.lastErrorOperationAttemptId === activeTaggedAttemptId) {
+          if (unknown && !session.lastError?.includes(unknown)) session.lastError = `${session.lastError} ${unknown}`
+        } else {
+          session.lastError = [unknown, earlierControlUncertainty(session, requestId)].filter(Boolean).join(' ')
+          session.lastErrorCode = undefined
+          session.lastErrorRequestId = requestId
+          session.lastErrorOperationAttemptId = undefined
+          session.lastErrorWasOperationFallback = false
+          session.lastErrorOperationUncertain = undefined
+          session.lastErrorOperationUncertainty = undefined
+          session.lastErrorOperationProvisional = undefined
+        }
+        return
+      }
+      if (action.payload.operationFallback && sameOperation && session.lastErrorWasOperationFallback === false) {
+        if (action.payload.operationOutcomeUncertain && !session.lastErrorOperationUncertain) {
+          session.lastError = `${session.lastError} ${action.payload.message}`
+          session.lastErrorOperationUncertain = true
+          session.lastErrorOperationUncertainty = action.payload.message
+        }
+        return
+      }
+      const priorUncertainty = !action.payload.operationFallback && sameOperation
+        && !session.lastErrorOperationProvisional
+        && session.lastErrorOperationUncertain
+        ? session.lastErrorOperationUncertainty
+          ?? (session.lastErrorWasOperationFallback ? session.lastError : undefined)
+        : undefined
+      const nativeUncertainty = action.payload.operationReceipt && !action.payload.operationFallback
+        && action.payload.operationOutcomeUncertain && !priorUncertainty
+        ? 'The outcome could not be confirmed. Check the conversation before trying again.' : undefined
+      const uncertainty = priorUncertainty || nativeUncertainty
+        || (action.payload.operationFallback && action.payload.operationOutcomeUncertain ? action.payload.message : undefined)
+      session.lastError = [action.payload.message, priorUncertainty || nativeUncertainty,
+        earlierControlUncertainty(session, requestId), unattributedControlError(session, requestId)].filter(Boolean).join(' ')
+      session.lastErrorRequestId = action.payload.operationReceipt ? action.payload.requestId : undefined
+      session.lastErrorOperationAttemptId = action.payload.operationReceipt ? operationAttemptId : undefined
+      session.lastErrorWasOperationFallback = action.payload.operationReceipt ? Boolean(action.payload.operationFallback) : undefined
+      session.lastErrorOperationUncertain = action.payload.operationReceipt
+        ? Boolean(uncertainty) : undefined
+      session.lastErrorOperationUncertainty = action.payload.operationReceipt ? uncertainty : undefined
+      session.lastErrorOperationProvisional = undefined
       // Task 14: the view filters SESSION_RESERVED out of the pane-level
       // error banner (a transient reservation is re-driven, never surfaced).
       session.lastErrorCode = action.payload.code
@@ -455,8 +695,9 @@ const freshAgentSlice = createSlice({
         session.historyLoading = false
         session.restoreFailureCode = action.payload.code
         session.restoreFailureMessage = action.payload.message
-      } else if (action.payload.code === 'SESSION_RESERVED') {
-        // A transient reservation does NOT end the turn. The fence-less
+      } else if (action.payload.code === 'SESSION_RESERVED' || action.payload.operationReceipt) {
+        // An operation failure does not prove the current turn has ended.
+        // A transient reservation likewise does NOT end the turn. The fence-less
         // mount-rebind attach for a just-materialized session answers this
         // typed refusal (FENCE_REQUIRED server-side — "re-observe the owner
         // record and retry with the pair") and the pane redrives the attach
@@ -507,9 +748,138 @@ const freshAgentSlice = createSlice({
       if (!key) return
       const session = state.sessions[key]
       if (!session) return
-      session.lastError = undefined
-      session.lastErrorCode = undefined
+      clearSessionErrorState(session)
     },
+
+    beginOperationAttempt(state, action: PayloadAction<SessionMutationPayload & { requestId: string; operationAttemptId?: string; operationAttemptReplay?: boolean; operationJournalId?: string; operationJournalSequence?: number }>) {
+      const session = action.payload.operationAttemptId
+        ? resolveOrEnsureSession(state, action.payload)
+        : state.sessions[resolveSessionKey(state, action.payload) ?? '']
+      if (!session) return
+      if (action.payload.operationAttemptId) {
+        const journalId = action.payload.operationJournalId
+        const journalSequence = action.payload.operationJournalSequence
+        if (!adoptControlJournal(session, journalId)) return
+        const attempts = session.recentControlAttempts ??= []
+        const previousIndex = attempts.findIndex((entry) => entry.requestId === action.payload.requestId)
+        if (previousIndex >= 0 && attempts[previousIndex].attemptId === action.payload.operationAttemptId) {
+          if (journalId && journalSequence != null) {
+            attempts[previousIndex].journalId = journalId
+            attempts[previousIndex].journalSequence = journalSequence
+          }
+          if (!action.payload.operationAttemptReplay) attempts[previousIndex].replayed = false
+          return
+        }
+        if (previousIndex >= 0 && journalId && journalSequence != null
+            && attempts[previousIndex].journalId === journalId && attempts[previousIndex].journalSequence != null) {
+          if (journalSequence <= attempts[previousIndex].journalSequence!) return
+        } else if (action.payload.operationAttemptReplay && previousIndex >= 0 && !attempts[previousIndex].replayed) return
+        if (previousIndex >= 0) attempts.splice(previousIndex, 1)
+        attempts.push({ requestId: action.payload.requestId, attemptId: action.payload.operationAttemptId,
+          replayed: Boolean(action.payload.operationAttemptReplay), journalId, journalSequence })
+        if (attempts.length > 128) attempts.shift()
+        if (session.lastErrorRequestId === action.payload.requestId
+            && session.lastErrorOperationAttemptId === action.payload.operationAttemptId) {
+          if (session.pendingControlFallbacks) {
+            session.pendingControlFallbacks = session.pendingControlFallbacks.filter((entry) => entry.requestId !== action.payload.requestId
+              || entry.attemptId !== action.payload.operationAttemptId)
+          }
+          return
+        }
+        if (session.unattributedControlErrors) {
+          session.unattributedControlErrors = session.unattributedControlErrors
+            .filter((entry) => entry.requestId !== action.payload.requestId)
+        }
+        const pendingIndex = session.pendingControlFallbacks?.findIndex((entry) => entry.requestId === action.payload.requestId
+          && entry.attemptId === action.payload.operationAttemptId) ?? -1
+        if (pendingIndex >= 0) {
+          const [fallback] = session.pendingControlFallbacks!.splice(pendingIndex, 1)
+          if (session.earlierControlUncertainties) {
+            session.earlierControlUncertainties = session.earlierControlUncertainties.filter((entry) => entry.requestId !== fallback.requestId
+              || entry.attemptId !== fallback.attemptId)
+          }
+          if (session.lastErrorRequestId && session.lastErrorOperationUncertain && session.lastErrorOperationUncertainty) {
+            rememberControlUncertainty(session, session.lastErrorRequestId, session.lastErrorOperationAttemptId,
+              session.lastErrorOperationUncertainty)
+          }
+          session.lastError = [fallback.message, earlierControlUncertainty(session, fallback.requestId)].filter(Boolean).join(' ')
+          session.lastErrorCode = fallback.code
+          session.lastErrorRequestId = fallback.requestId
+          session.lastErrorOperationAttemptId = fallback.attemptId
+          session.lastErrorWasOperationFallback = true
+          session.lastErrorOperationUncertain = fallback.uncertain
+          session.lastErrorOperationUncertainty = fallback.uncertain ? fallback.message : undefined
+          session.lastErrorOperationProvisional = undefined
+          return
+        }
+      }
+      // Do not clear a failure belonging to another request.
+      if (action.payload.requestId !== session.lastErrorRequestId) return
+      if (session.lastErrorOperationUncertain) {
+        // A new attempt does not resolve an earlier unconfirmed delivery.
+        // Retain its warning without carrying its old provider cause forward.
+        if (session.lastErrorOperationUncertainty) {
+          if (action.payload.operationAttemptId
+              && action.payload.operationAttemptId !== session.lastErrorOperationAttemptId) {
+            rememberControlUncertainty(session, action.payload.requestId, session.lastErrorOperationAttemptId,
+              session.lastErrorOperationUncertainty)
+          }
+          session.lastError = session.lastErrorOperationUncertainty
+          session.lastErrorCode = undefined
+          session.lastErrorWasOperationFallback = true
+        }
+        return
+      }
+      const earlier = earlierControlUncertainty(session, action.payload.requestId)
+      if (earlier) {
+        session.lastError = earlier
+        session.lastErrorCode = undefined
+        session.lastErrorRequestId = undefined
+        session.lastErrorOperationAttemptId = undefined
+        session.lastErrorWasOperationFallback = true
+        session.lastErrorOperationUncertain = undefined
+        session.lastErrorOperationUncertainty = undefined
+        session.lastErrorOperationProvisional = undefined
+        return
+      }
+      clearSessionErrorState(session)
+    },
+
+    markControlAttemptPending(state, action: PayloadAction<SessionMutationPayload & { requestId: string; operationAttemptId: string }>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      const current = session?.recentControlAttempts?.find((entry) => entry.requestId === action.payload.requestId
+        && entry.attemptId === action.payload.operationAttemptId)
+      if (!session || !current) return
+      if (session.settledControlRevisions?.some((entry) => entry.requestId === action.payload.requestId
+          && (entry.attemptId === action.payload.operationAttemptId
+            || (entry.journalId && entry.journalId === current.journalId && entry.journalSequence != null
+              && current.journalSequence != null && entry.journalSequence > current.journalSequence)))) return
+      const message = 'The answer is still being processed. Its outcome is not yet confirmed.'
+      const same = session.lastErrorRequestId === action.payload.requestId
+        && session.lastErrorOperationAttemptId === action.payload.operationAttemptId
+      if (same && session.lastErrorOperationUncertain) return
+      if (same && session.lastErrorWasOperationFallback === false) {
+        session.lastError = `${session.lastError} ${message}`
+        session.lastErrorOperationUncertain = true
+        session.lastErrorOperationUncertainty = message
+        session.lastErrorOperationProvisional = true
+        return
+      }
+      if (session.lastErrorRequestId && session.lastErrorOperationAttemptId && session.lastErrorOperationUncertain
+          && session.lastErrorOperationUncertainty) {
+        rememberControlUncertainty(session, session.lastErrorRequestId, session.lastErrorOperationAttemptId,
+          session.lastErrorOperationUncertainty)
+      }
+      session.lastError = [message, earlierControlUncertainty(session, action.payload.requestId)].filter(Boolean).join(' ')
+      session.lastErrorCode = 'ANSWER_IN_PROGRESS'
+      session.lastErrorRequestId = action.payload.requestId
+      session.lastErrorOperationAttemptId = action.payload.operationAttemptId
+      session.lastErrorWasOperationFallback = true
+      session.lastErrorOperationUncertain = true
+      session.lastErrorOperationUncertainty = message
+      session.lastErrorOperationProvisional = true
+    },
+
 
     /**
      * Dismiss a restore-failure banner: clears the restore-failure fields
@@ -732,6 +1102,11 @@ const freshAgentSlice = createSlice({
      */
     resetRuntimeOwners(state) {
       state.runtimeOwners = {}
+      // Reconnect replay must be able to advance past the last start that was
+      // observed on the old connection.
+      for (const session of Object.values(state.sessions)) {
+        for (const attempt of session.recentControlAttempts ?? []) attempt.replayed = true
+      }
     },
   },
 })
@@ -744,6 +1119,8 @@ export const {
   applyRuntimeOwner,
   applyRuntimeOwnerFenceRefresh,
   applyRefusalFence,
+  beginOperationAttempt,
+  markControlAttemptPending,
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,

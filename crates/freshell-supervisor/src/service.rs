@@ -486,7 +486,316 @@ impl Supervisor {
         }
     }
 
+    // Keep the sizeable provider operations out of the general command
+    // switch's polling frame. A request only polls its own command family.
     async fn dispatch_non_recovery(
+        &self,
+        envelope: Envelope<AdminCommand>,
+    ) -> Result<AdminResult, RuntimeError> {
+        match &envelope.body {
+            AdminCommand::FreshAgentSend(_)
+            | AdminCommand::FreshAgentFork(_)
+            | AdminCommand::FreshAgentCompact(_)
+            | AdminCommand::FreshAgentConfigure(_)
+            | AdminCommand::FreshAgentRollback(_)
+            | AdminCommand::FreshAgentCapture(_)
+            | AdminCommand::FreshAgentResolve(_)
+            | AdminCommand::FreshAgentPrepareNative(_)
+            | AdminCommand::FreshAgentInterrupt(_)
+            | AdminCommand::FreshAgentReadEvents(_)
+            | AdminCommand::FreshAgentReadRetainedState(_)
+            | AdminCommand::FreshAgentReadHistory(_)
+            | AdminCommand::FreshAgentReadSnapshot(_)
+            | AdminCommand::FreshAgentModelCatalog(_)
+            | AdminCommand::FreshAgentNativeName(_)
+            | AdminCommand::FreshAgentReadChild(_) => {
+                Box::pin(async move { self.dispatch_fresh_agent(envelope).await }).await
+            }
+            AdminCommand::Health
+            | AdminCommand::ReserveProviderInputs(_)
+            | AdminCommand::NativeAuthLookup(_)
+            | AdminCommand::ObserveClaudeSources(_)
+            | AdminCommand::BindProviderPathInputs(_)
+            | AdminCommand::Launch(_)
+            | AdminCommand::OpenCodeTransfer(_)
+            | AdminCommand::Stop(_)
+            | AdminCommand::Reopen(_)
+            | AdminCommand::Inventory
+            | AdminCommand::InventorySnapshot
+            | AdminCommand::PendingViewProjections(_)
+            | AdminCommand::AcknowledgeViewProjection(_)
+            | AdminCommand::UpdateViewVisibility(_)
+            | AdminCommand::UpsertViewIntent(_)
+            | AdminCommand::UpdateLimits(_)
+            | AdminCommand::QualificationWriterClaim(_)
+            | AdminCommand::PendingNotices(_)
+            | AdminCommand::NoticeReceipt(_)
+            | AdminCommand::IncidentSummary(_)
+            | AdminCommand::PreflightLostSouls(_)
+            | AdminCommand::RestoreLostSouls(_)
+            | AdminCommand::MetricsSnapshot
+            | AdminCommand::MigrationPlan(_)
+            | AdminCommand::RepairAudit(_)
+            | AdminCommand::TerminalInput(_)
+            | AdminCommand::TerminalResize(_)
+            | AdminCommand::TerminalReadOutput(_)
+            | AdminCommand::RuntimeMetrics(_)
+            | AdminCommand::ProbeRecovery(_)
+            | AdminCommand::Recover(_) => {
+                Box::pin(async move { self.dispatch_general(envelope).await }).await
+            }
+        }
+    }
+
+    async fn dispatch_fresh_agent(
+        &self,
+        envelope: Envelope<AdminCommand>,
+    ) -> Result<AdminResult, RuntimeError> {
+        match envelope.body {
+            AdminCommand::FreshAgentSend(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                // Keep the owned send future out of the shared command
+                // switch's worker-stack frame, including for non-send calls.
+                let state = Box::pin(async move {
+                    self.fresh_agent_send(
+                        envelope.request_id,
+                        request.soul_id,
+                        request.text,
+                        request.settings,
+                        request.checkpoint_logical_attempt_id,
+                    )
+                    .await
+                })
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentFork(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let result = Box::pin(async move {
+                    self.fresh_agent_fork(
+                        envelope.request_id,
+                        request.soul_id,
+                        request.parent_session_id,
+                        request.input,
+                    )
+                    .await
+                })
+                .await?;
+                Ok(AdminResult::FreshAgentFork(result))
+            }
+            AdminCommand::FreshAgentCompact(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(async move {
+                    self.fresh_agent_compact(
+                        envelope.request_id,
+                        request.soul_id,
+                        request.instructions,
+                        request.cwd,
+                    )
+                    .await
+                })
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentConfigure(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_configure(envelope.request_id, request.soul_id, request.settings)
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentRollback(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = Box::pin(async move {
+                    self.fresh_agent_rollback(envelope.request_id, request)
+                        .await
+                })
+                .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentCapture(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentCapture(
+                    self.fresh_agent_capture(request.soul_id, request.max_bytes)
+                        .await?,
+                ))
+            }
+            AdminCommand::FreshAgentModelCatalog(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentModelCatalog(
+                    self.fresh_agent_model_catalog(request.soul_id, request.cwd)
+                        .await?,
+                ))
+            }
+            AdminCommand::FreshAgentNativeName(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentNativeName(
+                    self.fresh_agent_native_name(request).await?,
+                ))
+            }
+            AdminCommand::FreshAgentReadSnapshot(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentSnapshot(
+                    self.fresh_agent_snapshot(request.soul_id).await?,
+                ))
+            }
+            AdminCommand::FreshAgentReadChild(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentChildSnapshot(
+                    self.fresh_agent_read_child(request.soul_id, request.child_thread_id)
+                        .await?,
+                ))
+            }
+            AdminCommand::FreshAgentResolve(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_resolve(
+                        request.soul_id,
+                        request.decision_id,
+                        request.decision,
+                        request.operation_attempt_id,
+                    )
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentInterrupt(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.fresh_agent_interrupt(request.soul_id, request.request_id)
+                    .await?;
+                Ok(AdminResult::FreshAgentInterrupted)
+            }
+            AdminCommand::FreshAgentPrepareNative(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.fresh_agent_prepare_native(request.soul_id).await?;
+                Ok(AdminResult::FreshAgentCommand {
+                    state: CommandState::Completed,
+                })
+            }
+            AdminCommand::FreshAgentReadHistory(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let context = self
+                    .registry
+                    .recovery_context(request.soul_id)
+                    .await
+                    .map_err(map_registry)?;
+                let handle = &context.prior_handle;
+                let agent = handle.fresh_agent().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "soul is not a fresh agent",
+                    )
+                })?;
+                let native_id = context.native_session_id.as_deref().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "saved native session identity unavailable",
+                    )
+                })?;
+                let mut snapshot = self
+                    .backend
+                    .read_native_history(
+                        handle,
+                        agent.provider.as_str(),
+                        native_id,
+                        &self.config.host_binary_path,
+                    )
+                    .await
+                    .map_err(map_backend)?;
+                // Kilroy uses the Claude transcript contract, with its own session type.
+                let wire_provider =
+                    if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+                        "claude"
+                    } else {
+                        agent.provider.as_str()
+                    };
+                if snapshot["threadId"].as_str() != Some(native_id)
+                    || snapshot["provider"].as_str() != Some(wire_provider)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "native history identity mismatch",
+                    ));
+                }
+                // Presentation context comes from the persisted owned launch.
+                // It does not assert provider identity, LIVE, or loss evidence.
+                snapshot["managedDirectory"] = serde_json::json!({
+                    "incarnationId": handle.incarnation_id(),
+                    "cwd": agent.cwd,
+                    "workspacePath": agent.workspace_path,
+                    "gitCommonDir": agent.git_common_dir,
+                    "sessionType": agent.session_type,
+                });
+                Ok(AdminResult::FreshAgentHistory(snapshot))
+            }
+            AdminCommand::FreshAgentReadEvents(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let events = self
+                    .fresh_agent_read_events(
+                        request.soul_id,
+                        request.after_sequence,
+                        request.max_events,
+                    )
+                    .await?;
+                Ok(AdminResult::FreshAgentEvents(events))
+            }
+            AdminCommand::FreshAgentReadRetainedState(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let budget_ms = request.max_duration_ms.min(DEFAULT_HOST_COMMAND_TIMEOUT_MS);
+                let soul_id = request.soul_id;
+                let events = match tokio::time::timeout(
+                    Duration::from_millis(budget_ms),
+                    self.fresh_agent_read_events_inner(soul_id.clone(), 0, 1, true),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::warn!(%soul_id, budget_ms, "freshagent.retained_read_timeout");
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "fresh-agent retained state read timed out",
+                        ));
+                    }
+                };
+                Ok(AdminResult::FreshAgentEvents(events))
+            }
+            _ => unreachable!("only fresh-agent commands reach this dispatcher"),
+        }
+    }
+
+    async fn dispatch_general(
         &self,
         envelope: Envelope<AdminCommand>,
     ) -> Result<AdminResult, RuntimeError> {
@@ -576,7 +885,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.lookup_native_auth(request)
+                Box::pin(async move { self.lookup_native_auth(request).await })
                     .await
                     .map(AdminResult::NativeAuthLookup)
             }
@@ -584,7 +893,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.observe_claude_sources(*request)
+                Box::pin(async move { self.observe_claude_sources(*request).await })
                     .await
                     .map(AdminResult::ClaudeSourceObservation)
             }
@@ -835,7 +1144,10 @@ impl Supervisor {
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 request.validate_payload()?;
-                self.restore_lost_souls(envelope.request_id, request)
+                // The restore future is much larger than the other command
+                // states. Construct it inside a boxed async block so merely
+                // polling an unrelated command does not reserve its stack.
+                Box::pin(async move { self.restore_lost_souls(envelope.request_id, request).await })
                     .await
                     .map(AdminResult::RestoreLostSouls)
             }
@@ -912,206 +1224,6 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::TerminalOutput(output))
             }
-            AdminCommand::FreshAgentSend(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_send(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.text,
-                        request.settings,
-                        request.checkpoint_logical_attempt_id,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentFork(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let result = self
-                    .fresh_agent_fork(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.parent_session_id,
-                        request.input,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentFork(result))
-            }
-            AdminCommand::FreshAgentCompact(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_compact(
-                        envelope.request_id,
-                        request.soul_id,
-                        request.instructions,
-                        request.cwd,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentConfigure(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_configure(envelope.request_id, request.soul_id, request.settings)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentRollback(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_rollback(envelope.request_id, request)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentCapture(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentCapture(
-                    self.fresh_agent_capture(request.soul_id, request.max_bytes)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentModelCatalog(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentModelCatalog(
-                    self.fresh_agent_model_catalog(request.soul_id, request.cwd)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentNativeName(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentNativeName(
-                    self.fresh_agent_native_name(request).await?,
-                ))
-            }
-            AdminCommand::FreshAgentReadSnapshot(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentSnapshot(
-                    self.fresh_agent_snapshot(request.soul_id).await?,
-                ))
-            }
-            AdminCommand::FreshAgentReadChild(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                Ok(AdminResult::FreshAgentChildSnapshot(
-                    self.fresh_agent_read_child(request.soul_id, request.child_thread_id)
-                        .await?,
-                ))
-            }
-            AdminCommand::FreshAgentResolve(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let state = self
-                    .fresh_agent_resolve(request.soul_id, request.decision_id, request.decision)
-                    .await?;
-                Ok(AdminResult::FreshAgentCommand { state })
-            }
-            AdminCommand::FreshAgentInterrupt(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                self.fresh_agent_interrupt(request.soul_id).await?;
-                Ok(AdminResult::FreshAgentInterrupted)
-            }
-            AdminCommand::FreshAgentPrepareNative(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                self.fresh_agent_prepare_native(request.soul_id).await?;
-                Ok(AdminResult::FreshAgentCommand {
-                    state: CommandState::Completed,
-                })
-            }
-            AdminCommand::FreshAgentReadHistory(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let context = self
-                    .registry
-                    .recovery_context(request.soul_id)
-                    .await
-                    .map_err(map_registry)?;
-                let handle = &context.prior_handle;
-                let agent = handle.fresh_agent().ok_or_else(|| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::InvalidRequest,
-                        "soul is not a fresh agent",
-                    )
-                })?;
-                let native_id = context.native_session_id.as_deref().ok_or_else(|| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::InvalidRequest,
-                        "saved native session identity unavailable",
-                    )
-                })?;
-                let mut snapshot = self
-                    .backend
-                    .read_native_history(
-                        handle,
-                        agent.provider.as_str(),
-                        native_id,
-                        &self.config.host_binary_path,
-                    )
-                    .await
-                    .map_err(map_backend)?;
-                // Kilroy uses the Claude transcript contract, with its own session type.
-                let wire_provider =
-                    if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
-                        "claude"
-                    } else {
-                        agent.provider.as_str()
-                    };
-                if snapshot["threadId"].as_str() != Some(native_id)
-                    || snapshot["provider"].as_str() != Some(wire_provider)
-                {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        "native history identity mismatch",
-                    ));
-                }
-                // Presentation context comes from the persisted owned launch.
-                // It does not assert provider identity, LIVE, or loss evidence.
-                snapshot["managedDirectory"] = serde_json::json!({
-                    "incarnationId": handle.incarnation_id(),
-                    "cwd": agent.cwd,
-                    "workspacePath": agent.workspace_path,
-                    "gitCommonDir": agent.git_common_dir,
-                    "sessionType": agent.session_type,
-                });
-                Ok(AdminResult::FreshAgentHistory(snapshot))
-            }
-            AdminCommand::FreshAgentReadEvents(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                let events = self
-                    .fresh_agent_read_events(
-                        request.soul_id,
-                        request.after_sequence,
-                        request.max_events,
-                    )
-                    .await?;
-                Ok(AdminResult::FreshAgentEvents(events))
-            }
             AdminCommand::RuntimeMetrics(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1130,6 +1242,7 @@ impl Supervisor {
             AdminCommand::Recover(_) => {
                 unreachable!("recovery is dispatched before the general command switch")
             }
+            _ => unreachable!("only general commands reach this dispatcher"),
         }
     }
 
@@ -2392,6 +2505,7 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Refused(_) => return Ok(CommandState::Cancelled),
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2541,13 +2655,31 @@ impl Supervisor {
         {
             Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
             Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
+            Some(InputJournalDisposition::Refused(diagnostic)) => {
+                return Err(fresh_send_refusal_error(diagnostic))
+            }
             Some(InputJournalDisposition::Dispatch) | None => {}
         }
-        let active = self
-            .registry
-            .active_handle_for_soul(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
+        let active = match self.registry.active_handle_for_soul(soul_id.clone()).await {
+            Ok(active) => active,
+            Err(error @ RegistryError::UnknownSoul(_)) => {
+                let blocked = self
+                    .registry
+                    .refuse_blocked_unadmitted_input(
+                        soul_id.clone(),
+                        request_id.clone(),
+                        text.as_bytes(),
+                        &settings_correlation,
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                if let Some(diagnostic) = blocked {
+                    return Err(fresh_send_refusal_error(diagnostic));
+                }
+                return Err(map_registry(error));
+            }
+            Err(error) => return Err(map_registry(error)),
+        };
         if active.fresh_agent().is_none() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::UnsupportedWorkload,
@@ -2571,6 +2703,9 @@ impl Supervisor {
         match disposition {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Refused(diagnostic) => {
+                return Err(fresh_send_refusal_error(diagnostic))
+            }
             InputJournalDisposition::Dispatch => {}
         }
         let handle = self
@@ -2652,6 +2787,24 @@ impl Supervisor {
                     .map_err(map_registry)?;
                 Ok(CommandState::ProviderAcked)
             }
+            Ok(HostResult::FreshAgentCommand {
+                state: CommandState::Cancelled,
+                ..
+            }) => {
+                self.registry
+                    .mark_fresh_input_refused(
+                        soul_id,
+                        request_id,
+                        freshell_runtime_protocol::FreshAgentSendDiagnostic {
+                            outcome:
+                                freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused,
+                            message: None,
+                        },
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                Ok(CommandState::Cancelled)
+            }
             Ok(HostResult::FreshAgentCommand { state, .. }) => {
                 self.registry
                     .mark_input_ambiguous(soul_id, request_id)
@@ -2670,10 +2823,21 @@ impl Supervisor {
                 ))
             }
             Err(error) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
+                let refusal = error.fresh_agent_send_diagnostic.as_ref().filter(|diagnostic| {
+                    error.code != RuntimeErrorCode::CommandAmbiguous
+                        && diagnostic.outcome == freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome::Refused
+                });
+                if let Some(diagnostic) = refusal {
+                    self.registry
+                        .mark_fresh_input_refused(soul_id, request_id, diagnostic.clone())
+                        .await
+                        .map_err(map_registry)?;
+                } else {
+                    self.registry
+                        .mark_input_ambiguous(soul_id, request_id)
+                        .await
+                        .map_err(map_registry)?;
+                }
                 Err(error)
             }
         }
@@ -3585,6 +3749,7 @@ impl Supervisor {
         soul_id: SoulId,
         decision_id: String,
         decision: serde_json::Value,
+        operation_attempt_id: Option<String>,
     ) -> Result<CommandState, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -3615,6 +3780,7 @@ impl Supervisor {
                     incarnation_id: handle.incarnation_id().clone(),
                     decision_id,
                     decision,
+                    operation_attempt_id,
                 },
             )
             .await?
@@ -3627,7 +3793,11 @@ impl Supervisor {
         }
     }
 
-    async fn fresh_agent_interrupt(&self, soul_id: SoulId) -> Result<(), RuntimeError> {
+    async fn fresh_agent_interrupt(
+        &self,
+        soul_id: SoulId,
+        request_id: Option<String>,
+    ) -> Result<(), RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
@@ -3645,6 +3815,7 @@ impl Supervisor {
                 &host,
                 HostCommand::FreshAgentInterrupt {
                     incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
                 },
             )
             .await?
@@ -3662,6 +3833,17 @@ impl Supervisor {
         soul_id: SoulId,
         after_sequence: u64,
         max_events: u32,
+    ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
+        self.fresh_agent_read_events_inner(soul_id, after_sequence, max_events, false)
+            .await
+    }
+
+    async fn fresh_agent_read_events_inner(
+        &self,
+        soul_id: SoulId,
+        after_sequence: u64,
+        max_events: u32,
+        retained_only: bool,
     ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _guard = lifecycle_lock.lock().await;
@@ -3715,6 +3897,13 @@ impl Supervisor {
                     retained["source"]["incarnationId"] =
                         serde_json::json!(handle.incarnation_id());
                     retained["source"]["hostBootId"] = serde_json::json!(host.host_boot_id);
+                }
+                if retained_only {
+                    // This bounded read is display-only. In particular, a
+                    // cancelled request must not leave a journal-driven
+                    // identity transition or recovery probe in progress.
+                    events.events.clear();
+                    return Ok(events);
                 }
                 let mut observed_current_start = false;
                 let latest_start =
@@ -11710,7 +11899,8 @@ mod opencode_transfer_restart_tests {
                 .fresh_agent_resolve(
                     soul.clone(),
                     "uncommitted-decision".into(),
-                    serde_json::json!({"behavior":"allow"})
+                    serde_json::json!({"behavior":"allow"}),
+                    None,
                 )
                 .await
                 .unwrap_err()
@@ -11727,10 +11917,22 @@ mod opencode_transfer_restart_tests {
             RuntimeErrorCode::RecoveryBlocked,
             "provider compaction also waits for the registry commit"
         );
-        let transition = supervisor
-            .fresh_agent_fork(RequestId::new(), soul.clone(), "native-parent".into(), None)
-            .await
-            .unwrap();
+        let mut fork = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::FreshAgentFork(freshell_runtime_protocol::FreshAgentForkRequest {
+                soul_id: soul.clone(),
+                parent_session_id: "native-parent".into(),
+                input: None,
+                expected_control_epoch: Some(registry.control_epoch()),
+            }),
+        );
+        fork.auth = Some("synthetic-secret".into());
+        let AdminResult::FreshAgentFork(transition) =
+            supervisor.dispatch(fork).await.result.unwrap()
+        else {
+            panic!("the authenticated fork must return its native transition");
+        };
         assert_eq!(transition.child_session_id, "native-child");
         let replay = supervisor
             .fresh_agent_read_events(soul.clone(), 0, 128)
@@ -12543,6 +12745,16 @@ fn map_opencode_transfer(error: crate::opencode_transfer::StagingError) -> Runti
         | crate::opencode_transfer::StagingError::Metadata(_) => RuntimeErrorCode::RegistryFailure,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+fn fresh_send_refusal_error(
+    diagnostic: freshell_runtime_protocol::FreshAgentSendDiagnostic,
+) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::HostUnreachable,
+        "hosted fresh-agent command failed",
+    )
+    .with_fresh_agent_send_diagnostic(diagnostic)
 }
 
 fn map_registry(error: RegistryError) -> RuntimeError {
@@ -17071,3 +17283,7 @@ mod control_connection_tests {
 #[cfg(test)]
 #[path = "native_clear_service_tests.rs"]
 mod native_clear_service_tests;
+
+#[cfg(test)]
+#[path = "fresh_agent_blocked_send_tests.rs"]
+mod fresh_agent_blocked_send_tests;

@@ -6716,7 +6716,9 @@ async fn send_keys(
                     "status":if result.noop { "noop" } else if result.completed { "idle" } else { "approx" },
                 });
                 if !result.noop {
-                    data["submittedTurnId"] = json!(result.submitted_turn_id.unwrap_or(request_id));
+                    if let Some(submitted_turn_id) = result.submitted_turn_id {
+                        data["submittedTurnId"] = json!(submitted_turn_id);
+                    }
                 }
                 if result.noop {
                     ok_json(data, "no input sent")
