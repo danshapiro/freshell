@@ -186,7 +186,6 @@ mod uncertain_launch {
                             // This fixture starts no turns or permissions. The
                             // real reattach still releases that empty gate.
                             HostResult::FreshAgentCommand {
-                                native_identity: None,
                                 state: CommandState::ProviderAcked,
                                 claude_fork: None,
                                 native_session_id: Some(current.native_session_id.clone()),
