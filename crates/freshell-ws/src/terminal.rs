@@ -8959,19 +8959,39 @@ async fn handle_pane_reconcile(
         // fired exactly ONCE per deferred request. `warming_cleared` says
         // whether any deferred pane still answers warming; the per-pane
         // failure cause names every deferred pane whose re-derived verdict
-        // is an ERROR (still index_warming, the honest
-        // session_store_unreadable, provider_unavailable, ...) so a failed
-        // recovery is traceable to a specific pane and session from the
-        // server log alone. Severity is outcome-structured: WARN when any
-        // deferred pane ended in a failure state, INFO on clean resolution.
+        // ended in a terminal NON-RESOLVED state (focused review round 2,
+        // finding 2): Error (still index_warming, the honest
+        // session_store_unreadable, provider_unavailable, ...), DeadSession
+        // (confirmed absence — the index published and the previously
+        // claimed identity is gone; the pane parks in the dead-sessions
+        // dialog awaiting user adjudication), or Invalid (the pane claim
+        // was rejected). Attach/Respawn/Fresh are true resolutions and
+        // stay clean, so a failed recovery is traceable to a specific pane
+        // and session from the server log alone. Severity is
+        // outcome-structured: WARN when any deferred pane ended in a
+        // failure state, INFO on clean resolution.
         let deferred_keys: Vec<String> = deferred.iter().map(|(k, _)| k.clone()).collect();
         let unresolved_panes: Vec<String> = verdicts
             .iter()
+            .filter(|v| deferred_keys.contains(&v.pane_key))
             .filter(|v| {
-                deferred_keys.contains(&v.pane_key)
-                    && matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
+                matches!(
+                    v.verdict,
+                    freshell_protocol::ReconcileVerdict::Error
+                        | freshell_protocol::ReconcileVerdict::DeadSession
+                        | freshell_protocol::ReconcileVerdict::Invalid
+                )
             })
-            .map(|v| format!("{}:{}", v.pane_key, v.reason.as_deref().unwrap_or("-")))
+            .map(|v| {
+                let cause = match v.verdict {
+                    freshell_protocol::ReconcileVerdict::DeadSession => "dead_session",
+                    freshell_protocol::ReconcileVerdict::Invalid => {
+                        v.reason.as_deref().unwrap_or("invalid")
+                    }
+                    _ => v.reason.as_deref().unwrap_or("-"),
+                };
+                format!("{}:{}", v.pane_key, cause)
+            })
             .collect();
         let warming_cleared = !verdicts
             .iter()
