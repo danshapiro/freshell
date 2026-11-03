@@ -1678,12 +1678,11 @@ impl HostedFreshAgentProxy {
             if !proof.as_ref().is_some_and(|proof| {
                 codex_transition_covers(proof, reference, view.native_session_id.as_deref())
             }) {
-                // Older actor records never stored a transition proof. The
-                // canonical public ID still identifies this soul; the stale
-                // reference is only a hint and cannot establish any alias.
-                if proof.is_none()
-                    && view.fresh_agent_session_id.as_deref() == Some(message.session_id.as_str())
-                {
+                // A canonical public ID identifies its soul independently of
+                // the reference. Older records may lack part of the history
+                // even when a later replacement has supplied a new proof.
+                // Treat the reference only as a hint, never as an alias claim.
+                if view.fresh_agent_session_id.as_deref() == Some(message.session_id.as_str()) {
                     legacy_canonical = true;
                 } else {
                     return None;
@@ -2369,37 +2368,11 @@ impl HostedFreshAgentProxy {
                     if provider != "codex" {
                         return true;
                     }
-                    // A changed route means the live poller has already
-                    // announced a replacement. If that announcement is still
-                    // in flight, require its accepted transition from this
-                    // same host before retrying a native-source change.
-                    if self.route_generation(soul).await != route_generation {
-                        return false;
-                    }
-                    if let Some((old, new)) =
-                        before.as_ref().zip(after.as_ref()).filter(|(old, new)| {
-                            same_retained_host(old, new)
-                                && old.native_session_id != new.native_session_id
-                        })
-                    {
-                        if let (Some(previous), Some(current)) = (
-                            old.native_session_id.as_deref(),
-                            new.native_session_id.as_deref(),
-                        ) {
-                            let accepted = self
-                                .client
-                                .fresh_agent_events(soul.clone(), 0, 1)
-                                .await
-                                .ok()
-                                .and_then(|batch| batch.accepted_native_dispatch);
-                            if accepted.as_ref().is_some_and(|proof| {
-                                codex_transition_covers(proof, previous, Some(current))
-                            }) {
-                                return false;
-                            }
-                        }
-                    }
-                    return true;
+                    // A missing or mismatched source cannot certify that this
+                    // pane received its retained state or request receipts.
+                    // Retry from the beginning; replay_once checks retirement
+                    // before each attempt and reports bounded exhaustion.
+                    return false;
                 }
                 before = after;
             }

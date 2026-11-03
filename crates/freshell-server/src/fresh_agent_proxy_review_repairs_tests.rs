@@ -6,11 +6,13 @@ use std::sync::Mutex as StdMutex;
 struct JournalState {
     native: String,
     public: String,
+    fork_native: String,
     presentations: Vec<String>,
     batch: AgentEventBatch,
     reads: usize,
     advance_on_read: Option<String>,
     inventory_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    fail_inventory_reads: usize,
     replay_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     live_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     sends: Vec<String>,
@@ -33,11 +35,13 @@ impl JournalFixture {
         let state = Arc::new(StdMutex::new(JournalState {
             native: native.into(),
             public: public.into(),
+            fork_native: "native-c".into(),
             presentations: Vec::new(),
             batch,
             reads: 0,
             advance_on_read: None,
             inventory_gate: None,
+            fail_inventory_reads: 0,
             replay_gate: None,
             live_gate: None,
             sends: Vec::new(),
@@ -53,15 +57,18 @@ impl JournalFixture {
                 let server_state = server_state.clone();
                 connections.spawn(async move {
                 let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
-                let (result, gate, stale_claim) = {
+                let (result, gate, stale_claim, failed_inventory) = {
                     let mut state = server_state.lock().unwrap();
                     let mut gate = None;
                     let mut stale_claim = false;
+                    let mut failed_inventory = false;
                     let result = match envelope.body {
                         AdminCommand::Health => AdminResult::Health {
                             control_epoch: 1, installation_id: InstallationId::new(),
                         },
-                        AdminCommand::Inventory => { gate = state.inventory_gate.take(); AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                        AdminCommand::Inventory => { gate = state.inventory_gate.take();
+                            if state.fail_inventory_reads > 0 { state.fail_inventory_reads -= 1; failed_inventory = true; }
+                            AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
                             "soulId":"review-soul", "incarnationId":"review-incarnation", "hostBootId":"review-boot",
                             "launchState":"running", "cleanupState":"none", "intentRevision":1, "executionGeneration":1,
                             "desiredState":"running", "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
@@ -88,12 +95,12 @@ impl JournalFixture {
                             AdminResult::FreshAgentEvents(page)
                         }
                         AdminCommand::FreshAgentFork(fork) => {
-                            state.native = "native-c".into();
-                            state.public = "native-c".into();
+                            state.native = state.fork_native.clone();
+                            state.public = state.fork_native.clone();
                             state.presentations.clear();
                             AdminResult::FreshAgentFork(FreshAgentForkResult {
                                 claude_fork: None, parent_session_id: fork.parent_session_id,
-                                child_session_id: "native-c".into(), parent_retired_by_runtime: true,
+                                child_session_id: state.fork_native.clone(), parent_retired_by_runtime: true,
                             })
                         }
                         AdminCommand::FreshAgentReadSnapshot(_) => AdminResult::FreshAgentSnapshot(serde_json::json!({
@@ -105,7 +112,7 @@ impl JournalFixture {
                         }
                         other => panic!("unexpected review fixture request: {other:?}"),
                     };
-                    (result, gate, stale_claim)
+                    (result, gate, stale_claim, failed_inventory)
                 };
                 if let Some((entered, release)) = gate {
                     entered.notify_one();
@@ -115,7 +122,11 @@ impl JournalFixture {
                     &mut stream,
                     &AdminReply {
                         request_id: envelope.request_id,
-                        result: if stale_claim {
+                        result: if failed_inventory {
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::BackendUnavailable, "fixture inventory unavailable",
+                            ))
+                        } else if stale_claim {
                             Err(freshell_runtime_protocol::RuntimeError::new(
                                 RuntimeErrorCode::OwnershipMismatch, "fixture source changed",
                             ))
@@ -245,12 +256,14 @@ impl IdentityFixture {
                                         }
                                     }
                                     AdminCommand::FreshAgentReadSnapshot(read) => {
-                                        let row = rows.iter().find(|row| row.view.soul_id == read.soul_id).unwrap();
-                                        if row.unavailable { (unavailable(), None) } else {
+                                        let row = rows.iter_mut().find(|row| row.view.soul_id == read.soul_id).unwrap();
+                                        let gate = row.delay.take();
+                                        if row.unavailable { (unavailable(), gate) } else {
                                             (Ok(AdminResult::FreshAgentSnapshot(serde_json::json!({
                                                 "threadId":row.view.native_session_id, "provider":"codex", "sessionType":"freshcodex",
-                                                "status":"idle", "turns":[], "capabilities":{}, "extensions":{}
-                                            }))), None)
+                                                "status":"idle", "turns":[{"id":row.view.soul_id}], "capabilities":{},
+                                                "extensions":{"codex":{"statusFromLiveState":true}}
+                                            }))), gate)
                                         }
                                     }
                                     AdminCommand::FreshAgentReadHistory(read) => {
@@ -930,6 +943,70 @@ async fn native_ancestry_does_not_transfer_public_presentation_ownership() {
 }
 
 #[tokio::test]
+async fn hosted_snapshot_fences_stale_source_and_routes_public_id_to_its_owner() {
+    let fixture = IdentityFixture::new(vec![
+        identity_row("original-soul", "managed-public", "native-a", None),
+        identity_row("other-soul", "native-b", "other-current-native", None),
+    ])
+    .await;
+    let (proxy, _) = fixture.proxy();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    fixture.rows.lock().unwrap()[0].delay = Some((entered.clone(), release.clone()));
+    let scenario = std::panic::AssertUnwindSafe(async {
+        let pending = tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                proxy
+                    .snapshot(freshell_freshagent::rest_lane::RestLaneSnapshot {
+                        provider: "codex".into(),
+                        session_type: "freshcodex".into(),
+                        session_id: "managed-public".into(),
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        fixture.rows.lock().unwrap()[0].view.native_session_id = Some("native-b".into());
+        release.notify_one();
+        let stale = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stale.is_err(),
+            "captured A must fail once the source becomes B: {stale:?}"
+        );
+        for (public, expected_native, expected_soul) in [
+            ("managed-public", "native-b", "original-soul"),
+            ("native-b", "other-current-native", "other-soul"),
+        ] {
+            let snapshot = proxy
+                .snapshot(freshell_freshagent::rest_lane::RestLaneSnapshot {
+                    provider: "codex".into(),
+                    session_type: "freshcodex".into(),
+                    session_id: public.into(),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot["threadId"], expected_native);
+            assert_eq!(snapshot["turns"][0]["id"], expected_soul);
+            assert_eq!(snapshot["extensions"]["codex"]["statusFromLiveState"], true);
+        }
+    })
+    .catch_unwind()
+    .await;
+    release.notify_one();
+    fixture.shutdown(&[proxy]).await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn actual_secondary_presentation_survives_restart_and_a_second_souls_replacement() {
     let fixture = IdentityFixture::new(vec![identity_row(
         "original-soul",
@@ -1321,12 +1398,21 @@ async fn reconnect_requires_the_accepted_old_to_current_identity() {
         ("unrelated", "codex", "native-b"),
         ("native-a", "codex", "native-a"),
         ("native-a", "claude", "native-b"),
-        ("managed-public", "codex", "stale-native"),
+        ("native-a", "codex", "stale-native"),
     ] {
         let mut fixture = JournalFixture::new("native-b", "managed-public", journal_batch()).await;
         if id == "native-a" && reference == "native-a" {
             // A stale reference is invalid without authenticated replacement proof.
             fixture.state.lock().unwrap().batch.accepted_native_dispatch = None;
+        } else if id == "native-a" {
+            // A recorded secondary presentation still cannot borrow an
+            // unrelated reference from outside its accepted transition.
+            fixture
+                .state
+                .lock()
+                .unwrap()
+                .presentations
+                .push("native-a".into());
         }
         fixture
             .proxy
@@ -1568,12 +1654,112 @@ async fn legacy_canonical_pane_reconnects_to_current_native_without_fabricating_
 }
 
 #[tokio::test]
-async fn legacy_canonical_reference_uses_the_current_owner_even_if_old_native_is_owned_elsewhere() {
+async fn legacy_canonical_reconnect_survives_a_later_recorded_replacement() {
+    use freshell_agent_runtime::host_actor::{FreshAgentHostActor, FreshAgentProfile};
+    let directory = tempfile::tempdir().unwrap();
+    let profile: FreshAgentProfile = serde_json::from_value(serde_json::json!({
+        "provider":"codex", "runtimeVariant":"codex", "cwd":directory.path(), "providerStoreId":"legacy-two-replacements",
+        "nativeSessionId":"native-a", "sessionRef":{"provider":"codex", "sessionId":"native-a"}
+    })).unwrap();
+    let actor = FreshAgentHostActor::open(
+        directory.path(),
+        profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    actor
+        .dispatch(
+            RequestId::parse("old-a-to-b").unwrap(),
+            "recover".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let profile = actor.profile().await;
+    actor.stop().await.unwrap();
+    let path = directory.path().join("fresh-agent-state.json");
+    let mut old: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(old
+        .as_object_mut()
+        .unwrap()
+        .remove("acceptedNativeDispatch")
+        .is_some());
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let reopened = FreshAgentHostActor::open(
+        directory.path(),
+        profile,
+        Arc::new(ConsecutiveAcceptedReplacements),
+    )
+    .await
+    .unwrap();
+    assert!(reopened
+        .read_events(0, 128)
+        .await
+        .accepted_native_dispatch
+        .is_none());
+    reopened
+        .dispatch(
+            RequestId::parse("new-b-to-c").unwrap(),
+            "recover".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut batch = reopened.read_events(0, 128).await;
+    let proof = batch.accepted_native_dispatch.as_ref().unwrap();
+    assert_eq!(proof.identity.previous_native_session_id, "native-b");
+    assert_eq!(proof.identity.native_session_id, "native-c");
+    assert!(!proof
+        .prior_native_session_ids
+        .iter()
+        .any(|id| id == "native-a"));
+    batch.head += 1;
+    batch.events.push(AgentJournalEvent {
+        sequence: batch.head,
+        event: status("native-c", "legacy-current-c"),
+    });
+    reopened.stop().await.unwrap();
+
+    let mut fixture = JournalFixture::new("native-c", "managed-public", batch).await;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        fixture.proxy.clone().handle(attach("managed-public", "codex", "native-a")).await;
+        let mut frames = Vec::new();
+        assert!(collect_until(&mut fixture.frames, &mut frames, |frames| frames.iter().any(|frame|
+            frame["event"]["status"] == "legacy-current-c" || frame["event"]["type"] == "freshAgent.error"
+        )).await, "{frames:?}");
+        let announced = frames.iter().position(|frame| frame["type"] == "freshAgent.session.materialized"
+            && frame["sessionId"] == "managed-public" && frame["sessionRef"]["sessionId"] == "native-c");
+        let replayed = frames.iter().position(|frame| frame["sessionId"] == "managed-public"
+            && frame["event"]["status"] == "legacy-current-c");
+        assert!(announced.zip(replayed).is_some_and(|(a, b)| a < b), "{frames:?}");
+        assert!(!fixture.state.lock().unwrap().presentations.iter().any(|id| id == "native-a"));
+        fixture.state.lock().unwrap().fork_native = "native-d".into();
+        fixture.proxy.clone().handle(HostedFreshAgentCommand::Fork(serde_json::from_value(serde_json::json!({
+            "provider":"codex", "sessionType":"freshcodex", "sessionId":"managed-public", "requestId":"legacy-fork"
+        })).unwrap())).await;
+        while fixture.frames.try_recv().is_ok() {}
+        fixture.proxy.clone().handle(attach("managed-public", "codex", "native-a")).await;
+        let mut retired = Vec::new();
+        assert!(collect_until(&mut fixture.frames, &mut retired, |frames| frames.iter().any(|frame|
+            frame["sessionId"] == "managed-public" && frame["event"]["type"] == "freshAgent.error"
+        )).await, "a fork-retired canonical route cannot attach to its child: {retired:?}");
+        assert!(!retired.iter().any(|frame| frame["sessionId"] == "managed-public"
+            && frame["sessionRef"]["sessionId"] == "native-d"), "{retired:?}");
+    }).catch_unwind().await;
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn legacy_canonical_owner_fences(native: &str, prior: Option<&str>) {
     use freshell_ownership::{
         BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
     };
     let fixture = IdentityFixture::new(vec![
-        identity_row("original-soul", "managed-one", "native-b", None),
+        identity_row("original-soul", "managed-one", native, prior),
         identity_row("other-soul", "other-public", "native-a", None),
     ])
     .await;
@@ -1588,19 +1774,19 @@ async fn legacy_canonical_reference_uses_the_current_owner_even_if_old_native_is
         };
         let BeginOutcome::Granted { generation } = ownership.begin_start(
             "codex",
-            "native-b",
+            native,
             kind,
             "current-owner",
             None,
             "legacy-test",
             1,
         ) else {
-            panic!("current owner must acquire B")
+            panic!("current owner must acquire {native}")
         };
         assert_eq!(
             ownership.commit_live(
                 "codex",
-                "native-b",
+                native,
                 "current-owner",
                 generation,
                 OwnerIdentity {
@@ -1613,7 +1799,7 @@ async fn legacy_canonical_reference_uses_the_current_owner_even_if_old_native_is
             ),
             CommitOutcome::Committed
         );
-        let observed = ownership.observe("codex", "native-b");
+        let observed = ownership.observe("codex", native);
         let (proxy, mut frames) = fixture.proxy();
         proxy.set_ownership(ownership);
         proxies.push(proxy.clone());
@@ -1635,7 +1821,7 @@ async fn legacy_canonical_reference_uses_the_current_owner_even_if_old_native_is
         let acceptable = if case == "fresh-current" {
             received.iter().any(|frame| {
                 frame["type"] == "freshAgent.session.materialized"
-                    && frame["sessionRef"]["sessionId"] == "native-b"
+                    && frame["sessionRef"]["sessionId"] == native
             }) && received
                 .iter()
                 .any(|frame| frame["event"]["status"] == "original-soul")
@@ -1654,8 +1840,18 @@ async fn legacy_canonical_reference_uses_the_current_owner_even_if_old_native_is
     fixture.shutdown(&proxies).await;
     assert!(
         failures.is_empty(),
-        "legacy canonical reconnect must follow the actual B owner and fence: {failures:#?}"
+        "legacy canonical reconnect must follow the actual {native} owner and fence: {failures:#?}"
     );
+}
+
+#[tokio::test]
+async fn legacy_canonical_reference_uses_the_current_owner_even_if_old_native_is_owned_elsewhere() {
+    legacy_canonical_owner_fences("native-b", None).await;
+}
+
+#[tokio::test]
+async fn legacy_canonical_reference_keeps_owner_fences_after_later_replacement() {
+    legacy_canonical_owner_fences("native-c", Some("native-b")).await;
 }
 
 #[tokio::test]
@@ -2224,6 +2420,128 @@ async fn targeted_replay_recovers_after_a_live_replacement() {
 #[tokio::test]
 async fn targeted_replay_does_not_revive_a_fork_retired_presentation() {
     targeted_replay_after_route_change(true).await;
+}
+
+// Keep the live poller past the retained prefix while another presentation
+// attaches. Only its targeted replay can supply the earlier receipt.
+async fn targeted_replay_with_unstable_source(mismatched_producer: bool) {
+    let mut batch = journal_batch();
+    batch.accepted_native_dispatch = None;
+    batch.events = vec![AgentJournalEvent {
+        sequence: 1,
+        event: AgentEvent::Provider {
+            payload: serde_json::json!({"type":"freshAgent.send.accepted", "provider":"codex",
+            "sessionType":"freshcodex", "sessionId":"native-a", "requestId":"prior-receipt"}),
+        },
+    }];
+    batch.retained_state = Some(serde_json::json!({
+        "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+        "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-a","turns":[{"id":"current-turn"}]},
+        "attentionMarks":[],"pendingControls":[{"type":"freshAgent.permission.request","sessionId":"native-a","requestId":"current-control"}]
+    }));
+    let mut fixture = JournalFixture::new("native-a", "managed-public", batch).await;
+    let live_entered = Arc::new(tokio::sync::Notify::new());
+    let live_release = Arc::new(tokio::sync::Notify::new());
+    let replay_entered = Arc::new(tokio::sync::Notify::new());
+    let replay_release = Arc::new(tokio::sync::Notify::new());
+    let scenario = std::panic::AssertUnwindSafe(async {
+        assert!(fixture.proxy.start_poller(fixture.soul.clone(), "codex".into(), "managed-public".into(), "freshcodex".into(), 0).await);
+        let mut first = Vec::new();
+        assert!(collect_until(&mut fixture.frames, &mut first, |frames| frames.iter().any(|frame|
+            frame["type"] == "freshAgent.send.accepted" && frame["requestId"] == "prior-receipt"
+        )).await, "initial live poller must pass the receipt: {first:?}");
+        fixture.state.lock().unwrap().live_gate = Some((live_entered.clone(), live_release.clone()));
+        tokio::time::timeout(Duration::from_secs(3), live_entered.notified()).await.unwrap();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            if mismatched_producer {
+                state.batch.retained_state.as_mut().unwrap()["snapshot"]["threadId"] = "native-b".into();
+            }
+            state.replay_gate = Some((replay_entered.clone(), replay_release.clone()));
+        }
+        let attaching = tokio::spawn({ let proxy = fixture.proxy.clone(); async move {
+            proxy.handle(attach("native-a", "codex", "native-a")).await;
+        }});
+        tokio::time::timeout(Duration::from_secs(3), replay_entered.notified()).await.unwrap();
+        if !mismatched_producer { fixture.state.lock().unwrap().fail_inventory_reads = 1; }
+        while fixture.frames.try_recv().is_ok() {}
+        replay_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), attaching).await.unwrap().unwrap();
+        let mut after = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() { after.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap()); }
+        if mismatched_producer {
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a" && frame["event"]["code"] == "FRESH_AGENT_REPLAY_RETRY"),
+                "a retained producer that disagrees with stable inventory needs an explicit retry error: {after:?}");
+            assert!(!after.iter().any(|frame| frame["event"]["retainedState"]["snapshot"]["threadId"] == "native-b"), "{after:?}");
+        } else {
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a" && frame["event"]["retainedState"]["snapshot"]["turns"][0]["id"] == "current-turn"), "{after:?}");
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a" && frame["event"]["requestId"] == "current-control"), "{after:?}");
+            assert!(after.iter().any(|frame| frame["sessionId"] == "native-a" && frame["type"] == "freshAgent.send.accepted" && frame["requestId"] == "prior-receipt"), "{after:?}");
+        }
+    }).catch_unwind().await;
+    live_release.notify_one();
+    replay_release.notify_one();
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn targeted_replay_retries_after_unavailable_inventory() {
+    targeted_replay_with_unstable_source(false).await;
+}
+
+#[tokio::test]
+async fn targeted_replay_retries_when_initial_inventory_is_unavailable() {
+    let mut batch = journal_batch();
+    batch.accepted_native_dispatch = None;
+    batch.events[0].event = status("native-a", "initial");
+    batch.retained_state = Some(serde_json::json!({
+        "source":{"soulId":"review-soul","incarnationId":"review-incarnation","hostBootId":"review-boot","projectionId":"current","ownerEpoch":0,"ownerGeneration":0},
+        "snapshot":{"provider":"codex","sessionType":"freshcodex","threadId":"native-a","turns":[{"id":"current-turn"}]},
+        "attentionMarks":[],"pendingControls":[]
+    }));
+    let mut fixture = JournalFixture::new("native-a", "managed-public", batch).await;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        fixture.proxy.presentation_routes.lock().await.insert(
+            fixture.soul.clone(),
+            PresentationRoute::initial("managed-public"),
+        );
+        fixture.state.lock().unwrap().fail_inventory_reads = 1;
+        fixture
+            .proxy
+            .replay_once(
+                fixture.soul.clone(),
+                "codex",
+                "managed-public",
+                "freshcodex",
+            )
+            .await;
+        let mut after = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            after.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        assert!(
+            after
+                .iter()
+                .any(|frame| frame["sessionId"] == "managed-public"
+                    && frame["event"]["retainedState"]["snapshot"]["turns"][0]["id"]
+                        == "current-turn"),
+            "{after:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = scenario {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn targeted_replay_reports_a_mismatched_retained_producer() {
+    targeted_replay_with_unstable_source(true).await;
 }
 
 #[tokio::test]
