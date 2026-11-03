@@ -31,7 +31,7 @@ pub fn exact_resume_candidate(
         return Ok(None);
     };
 
-    // The saved launch/receipt stays immutable. A new read belongs to the
+    // The saved native identity/history proof stays immutable. A new read belongs to the
     // current registry evidence generation, including after import refresh.
     spec.evidence_revision = context.evidence_revision;
     let baseline = match context.opencode_adoption_baseline.clone() {
@@ -142,19 +142,27 @@ fn exact_resume_candidate_base(
         }
     }
 
-    if let Some(stored) = context.resume_spec.clone() {
+    if let Some(mut candidate) = context.resume_spec.clone() {
         let expected = context.native_session_id.as_deref();
-        if stored.provider_session.provider != context.provider
-            || (stored.claude_fork.is_some() && stored.claude_fork != context.claude_fork)
-            || stored.provider_session.provider_store_id != context.provider_store_id
-            || expected != Some(stored.provider_session.native_session_id.as_str())
+        if candidate.provider_session.provider != context.provider
+            || (candidate.claude_fork.is_some() && candidate.claude_fork != context.claude_fork)
+            || candidate.provider_session.provider_store_id != context.provider_store_id
+            || expected != Some(candidate.provider_session.native_session_id.as_str())
         {
             return Err(blocked(
                 RecoveryBlockReason::WrongNativeIdentity,
                 "stored resume specification is not bound to the current soul identity".into(),
             ));
         }
-        return Ok(Some(stored));
+        // The cached proof pins native history. Accepted launch settings can
+        // change after that capture and remain authoritative for fresh actors.
+        if let Some(agent) = context.fresh_agent.as_ref() {
+            candidate.cwd = agent.cwd.clone();
+            candidate.model = agent.model.clone();
+            candidate.reasoning_effort = agent.effort.clone();
+            candidate.permission_mode = agent.permission_mode.clone();
+        }
+        return Ok(Some(candidate));
     }
 
     let native_session_id = observed_native_session_id
@@ -659,6 +667,70 @@ pub(crate) mod tests {
         assert_eq!(opencode.provider_session.provider, "opencode");
         assert_eq!(opencode.model, resume.model);
         assert_eq!(opencode.permission_mode, resume.permission_mode);
+    }
+
+    #[test]
+    fn cached_fresh_resume_uses_current_accepted_launch_settings() {
+        let mut context = fixture_context(Some("native-exact"));
+        context.provider = "codex".into();
+        context.fresh_agent = Some(
+            serde_json::from_value::<FreshAgentLaunchSpec>(serde_json::json!({
+                "sessionId":"presentation", "provider":"codex", "sessionType":"freshcodex",
+                "runtimeVariant":"codex-app-server", "providerStoreId":"store",
+                "nativeSessionId":"native-exact", "cwd":"/workspace", "workspacePath":"/workspace",
+                "runAsUid":65534, "runAsGid":0, "model":"original-model",
+                "effort":"low", "permissionMode":"untrusted", "sandbox":"workspace-write"
+            }))
+            .unwrap(),
+        );
+        context.accepted_command_count = 3;
+        context.completed_command_count = 2;
+        let captured = exact_resume_candidate(&context, Some("native-exact"))
+            .unwrap()
+            .unwrap();
+        context.resume_spec = Some(captured.clone());
+        context.accepted_command_count = 9;
+        context.completed_command_count = 8;
+
+        for (model, effort) in [(Some("current-model"), Some("xhigh")), (None, None)] {
+            let launch = context.fresh_agent.as_mut().unwrap();
+            launch.cwd = "/workspace/recovery-cwd".into();
+            launch.model = model.map(str::to_string);
+            launch.effort = effort.map(str::to_string);
+            launch.permission_mode = Some("never".into());
+            launch.collaboration_mode = Some("plan".into());
+            launch.sandbox = Some("read-only".into());
+
+            let resumed = exact_resume_candidate(&context, Some("native-exact"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(resumed.cwd, "/workspace/recovery-cwd");
+            assert_eq!(resumed.model.as_deref(), model);
+            assert_eq!(resumed.reasoning_effort.as_deref(), effort);
+            assert_eq!(resumed.permission_mode.as_deref(), Some("never"));
+            assert_eq!(resumed.provider_session, captured.provider_session);
+            assert_eq!(resumed.runtime_variant, captured.runtime_variant);
+            assert_eq!(resumed.durable_position, captured.durable_position);
+            assert_eq!(resumed.provider_volume, captured.provider_volume);
+            assert_eq!(
+                resumed.checkpoint_references,
+                captured.checkpoint_references
+            );
+        }
+
+        assert!(matches!(
+            exact_resume_candidate(&context, Some("different-native")),
+            Err(RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::WrongNativeIdentity,
+                ..
+            })
+        ));
+        // A cached non-fresh/legacy recipe retains its saved launch settings.
+        context.fresh_agent = None;
+        assert_eq!(
+            exact_resume_candidate(&context, Some("native-exact")).unwrap(),
+            Some(captured)
+        );
     }
 
     fn claude_backed_fresh_context(provider: FreshProvider) -> RecoveryContext {

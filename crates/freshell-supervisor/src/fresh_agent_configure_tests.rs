@@ -988,6 +988,71 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
 }
 
 #[tokio::test]
+async fn verified_resume_capture_preserves_cleared_settings_and_history_anchors() {
+    let fixture =
+        running_fresh_provider_with_name(FreshProvider::Codex, None, "resume-native").await;
+    let context = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap();
+    let mut candidate = crate::resume_catalog::exact_resume_candidate(&context, None)
+        .unwrap()
+        .unwrap();
+    candidate.model = Some("cached-model".into());
+    candidate.reasoning_effort = Some("high".into());
+    candidate.permission_mode = Some("untrusted".into());
+    let saved = fixture
+        .supervisor
+        .registry
+        .store_verified_resume_spec_fenced(fixture.soul.clone(), candidate, context.write_fence())
+        .await
+        .unwrap();
+    let mut current = saved.clone();
+    current.model = None;
+    current.reasoning_effort = None;
+    current.permission_mode = Some("never".into());
+    let fence = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .write_fence();
+    let captured = fixture
+        .supervisor
+        .registry
+        .store_verified_resume_spec_fenced(fixture.soul.clone(), current, fence)
+        .await
+        .unwrap();
+    assert_eq!(captured.model, None);
+    assert_eq!(captured.reasoning_effort, None);
+    assert_eq!(captured.permission_mode.as_deref(), Some("never"));
+    assert_eq!(captured.provider_session, saved.provider_session);
+    assert_eq!(captured.durable_position, saved.durable_position);
+    assert_eq!(captured.checkpoint_references, saved.checkpoint_references);
+    assert!(captured.evidence_revision > saved.evidence_revision);
+    let fence = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .write_fence();
+    let repeated = fixture
+        .supervisor
+        .registry
+        .store_verified_resume_spec_fenced(fixture.soul.clone(), captured.clone(), fence)
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated, captured,
+        "an identical recapture stays idempotent"
+    );
+}
+
+#[tokio::test]
 async fn native_name_lifecycle_contention_is_undispatched_and_fresh_retry_succeeds() {
     let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
     let view = fixture

@@ -2780,6 +2780,9 @@ impl Registry {
                     && existing.claude_fork == resume_spec.claude_fork
                     && existing.program == resume_spec.program
                     && existing.cwd == resume_spec.cwd
+                    && existing.model == resume_spec.model
+                    && existing.reasoning_effort == resume_spec.reasoning_effort
+                    && existing.permission_mode == resume_spec.permission_mode
                     && existing.workspace_path == resume_spec.workspace_path
                     && existing.environment == resume_spec.environment
                     && existing.opencode_adoption_baseline
