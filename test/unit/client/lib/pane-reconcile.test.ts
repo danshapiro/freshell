@@ -894,6 +894,95 @@ describe('foldVerdicts identity guards on every fold arm (auto-restore-warming r
     expect(c.createRequestId).toBe('cr-f1-new')
     expect(c.restoreError).toBeUndefined()
   })
+
+  it('a stale invalid verdict for a replaced pane folds NOTHING — no restoreError latch, no rejected-pane notice', () => {
+    const store = realStoreWithTerminalPanes(['p1'])
+    const req = buildReconcileRequest(asRootState(store.getState().panes))!
+    expect(req.panes[0].createRequestId).toBe('cr-p1')
+
+    rebindPane(store, 'tab-p1', 'p1', 'cr-p1-new')
+
+    // The OLD request's invalid verdict carries a reason, so the arm
+    // dispatches BOTH the restoreError latch and the rejected-pane notice
+    // — neither may land on the rebound content.
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'invalid', reason: 'unsupported_kind' },
+    ]))
+
+    const rebound = leafContentOf<TerminalPaneContent>(store, 'tab-p1')
+    expect(rebound.createRequestId).toBe('cr-p1-new')
+    expect(rebound.restoreError).toBeUndefined()
+    expect(rebound.reconcileNotice).toBeUndefined()
+    expect(rebound.status).toBe('creating')
+  })
+
+  function realStoreWithFreshAgentPane(tabId: string, createRequestId: string) {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'fp',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId,
+        status: 'creating',
+      } as any,
+    }))
+    return store
+  }
+
+  function rebindFreshAgentPane(
+    store: ReturnType<typeof realStoreWithFreshAgentPane>,
+    tabId: string,
+    newCreateRequestId: string,
+  ): void {
+    store.dispatch(replacePane({ tabId, paneId: 'fp' }))
+    store.dispatch(updatePaneContent({
+      tabId,
+      paneId: 'fp',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: newCreateRequestId,
+        status: 'creating',
+      } as any,
+    }))
+  }
+
+  it('a stale fresh-agent dead_session verdict for a replaced pane folds NOTHING onto the rebound content', () => {
+    const store = realStoreWithFreshAgentPane('tab-f1', 'cr-f1')
+    const req = buildReconcileRequest(asRootState(store.getState().panes), { includeFreshAgent: true })!
+    expect(req.panes[0].createRequestId).toBe('cr-f1')
+    rebindFreshAgentPane(store, 'tab-f1', 'cr-f1-new')
+
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'dead_session', sessionRef: { provider: 'claude', sessionId: 'gone-1' }, reason: 'session_missing' },
+    ]))
+
+    const c = leafContentOf<FreshAgentPaneContent>(store, 'tab-f1')
+    expect(c.createRequestId).toBe('cr-f1-new')
+    expect(c.restoreError).toBeUndefined()
+  })
+
+  it('a stale fresh-agent invalid verdict for a replaced pane folds NOTHING onto the rebound content', () => {
+    const store = realStoreWithFreshAgentPane('tab-f1', 'cr-f1')
+    const req = buildReconcileRequest(asRootState(store.getState().panes), { includeFreshAgent: true })!
+    rebindFreshAgentPane(store, 'tab-f1', 'cr-f1-new')
+
+    // Reason present, so the arm dispatches BOTH the restoreError latch
+    // and the rejected-pane notice — neither may land on the rebound
+    // content.
+    foldVerdicts(store.dispatch, req, resultFor(req, [
+      { paneKey: req.panes[0].paneKey, verdict: 'invalid', reason: 'unsupported_kind' },
+    ]))
+
+    const c = leafContentOf<FreshAgentPaneContent>(store, 'tab-f1')
+    expect(c.createRequestId).toBe('cr-f1-new')
+    expect(c.restoreError).toBeUndefined()
+    expect(c.reconcileNotice).toBeUndefined()
+  })
 })
 
 describe('deadSessionReconcileNoticeFor', () => {
