@@ -2035,12 +2035,16 @@ describe('FreshAgentView', () => {
 
         const notice = errorNotice()
         expect(notice).toBeInTheDocument()
-        await act(async () => {
-          fireEvent.click(notice!.querySelector('summary')!)
-          expect(notice).toHaveAttribute('open')
-          fireEvent(notice!, new Event('toggle', { bubbles: true }))
-          await vi.advanceTimersByTimeAsync(0)
-        })
+        fireEvent.click(notice!.querySelector('summary')!)
+        expect(notice).toHaveAttribute('open')
+        fireEvent(notice!, new Event('toggle', { bubbles: true }))
+        await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+        console.info('NOTICE_TOGGLE_PROOF', JSON.stringify({
+          connected: notice!.isConnected,
+          sameNode: notice === errorNotice(),
+          original: notice!.outerHTML,
+          current: errorNotice()?.outerHTML,
+        }))
         const details = notice!.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
         expect(within(details).getByText(errorMessage, { exact: true })).toBeVisible()
         fireEvent.click(within(details).getByRole('button', { name: 'Dismiss', exact: true }))
