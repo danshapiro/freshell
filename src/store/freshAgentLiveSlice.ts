@@ -1,5 +1,6 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { isCodexRetainedDiagnosticNotice } from '@/lib/fresh-agent-notice'
 import { isLiveBlockLanded, landedTranscript, type LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import { applyFreshAgentTranscriptPatch, bindTranscriptProjection, freezeTranscriptProjection, hydrateTranscriptProjection, readTranscriptProjection } from '@/lib/fresh-agent-transcript-projection'
 import type { FreshAgentSnapshot, FreshAgentTranscriptPatch } from '@shared/fresh-agent-contract'
@@ -336,6 +337,7 @@ const freshAgentLiveSlice = createSlice({
      */
     liveNoticeReceived(state, action: PayloadAction<FreshAgentSessionLocator & Omit<LiveNotice, 'seq'>>) {
       const { sessionId, sessionType, provider, ...notice } = action.payload
+      if (isCodexRetainedDiagnosticNotice(provider, notice.code)) return
       state.noticeSeq += 1
       const session = sessionFor(state, { sessionId, sessionType, provider })
       const current = { seq: state.noticeSeq, ...notice }
