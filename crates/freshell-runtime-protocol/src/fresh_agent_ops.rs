@@ -98,12 +98,25 @@ pub enum FreshAgentNativeNameOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshAgentNativeNameError {
-    Unavailable { message: String },
-    Rpc { code: i64, message: String },
-    Timeout { timeout_ms: u64 },
+    /// The lifecycle guard refused before any host or provider operation.
+    LifecycleBusy,
+    Unavailable {
+        message: String,
+    },
+    Rpc {
+        code: i64,
+        message: String,
+    },
+    Timeout {
+        timeout_ms: u64,
+    },
     Closed,
-    Transport { message: String },
-    InvalidResponse { detail: String },
+    Transport {
+        message: String,
+    },
+    InvalidResponse {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

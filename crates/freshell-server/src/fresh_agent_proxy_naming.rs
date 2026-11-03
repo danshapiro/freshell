@@ -102,6 +102,11 @@ impl HostedCodexNameBackend {
                     "managed Codex naming request did not settle: {error}"
                 ))
             })?;
+        // This reply proves no host/native operation was dispatched. A later
+        // inventory change cannot turn that refusal into an ambiguous write.
+        if matches!(reply, Reply::Failed(NameError::LifecycleBusy)) {
+            return Err(NativeClassified::LifecycleBusy);
+        }
         let inventory = self
             .client
             .inventory()
@@ -126,6 +131,7 @@ fn classify_name_error(error: NameError, method: &str) -> NativeClassified {
     use freshell_codex::app_server::CodexAppServerError as Error;
     let method = method.to_string();
     let error = match error {
+        NameError::LifecycleBusy => return NativeClassified::LifecycleBusy,
         NameError::Unavailable { message } => return NativeClassified::Undelivered(message),
         NameError::Rpc { code, message } => Error::Rpc {
             method,

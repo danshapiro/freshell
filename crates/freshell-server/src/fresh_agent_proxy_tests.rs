@@ -203,6 +203,8 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         "closed",
         "transport",
         "invalid-response",
+        "lifecycle-busy",
+        "lifecycle-busy-source-changes",
     ] {
         let socket = dir.path().join(format!("native-name-{scenario}.sock"));
         let listener = UnixListener::bind(&socket).unwrap();
@@ -221,7 +223,7 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                     AdminCommand::Inventory => {
                         inventories += 1;
                         AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
-                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if scenario=="source-changes"&&inventories>1 {"replaced-boot"}else{"name-boot"},
+                            "soulId":"name-soul","incarnationId":"name-incarnation","hostBootId":if scenario.contains("source-changes")&&inventories>1 {"replaced-boot"}else{"name-boot"},
                             "launchState":"running","cleanupState":"none","intentRevision":3,"executionGeneration":2,
                             "desiredState":"running","recoveryState":"live","durabilityState":"unknown","allocationState":"allocated",
                             "evidenceRevision":0,"successfulRecoveriesInWindow":0,"provider":"codex",
@@ -268,6 +270,9 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
                             "invalid-response" => Reply::Failed(Error::InvalidResponse {
                                 detail: "malformed metadata".into(),
                             }),
+                            "lifecycle-busy" | "lifecycle-busy-source-changes" => {
+                                Reply::Failed(Error::LifecycleBusy)
+                            }
                             _ => unreachable!(),
                         })
                     }
@@ -303,6 +308,9 @@ async fn hosted_native_name_reads_pin_the_source_and_preserve_typed_delivery_fai
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
         match scenario {
+            "lifecycle-busy" | "lifecycle-busy-source-changes" => {
+                assert_eq!(reply, NativeCallResult::LifecycleBusy)
+            }
             "ok" => assert!(
                 matches!(reply,NativeCallResult::Confirmed(value) if value.title.as_deref()==Some("Native title"))
             ),

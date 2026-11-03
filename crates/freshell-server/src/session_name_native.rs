@@ -35,7 +35,7 @@
 //!
 //! The [`SessionNameWorker`] owns the serial dispatch loop under the shared
 //! `.session-names-worker.lock` background guard (acquire worker then
-//! document, never the reverse; retry delays hold neither lock; the guard is
+//! document, never the reverse; between-cycle delays hold neither lock; the guard is
 //! retained through the actual local operation and its owned-helper cleanup,
 //! then released despite external ambiguity). Task 4 adds generation to this
 //! same owned loop and selector.
@@ -86,6 +86,11 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// discoverable, allowance intact.
 const CAPABILITY_REPROBE_DELAY: Duration = Duration::from_secs(2);
 
+// These refusals dispatch no native operation. Keep their retries within the
+// same phase/receipt, with at most three seconds of paced waiting in total.
+const LIFECYCLE_RETRY_ATTEMPTS: usize = 16;
+const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(25);
+
 /// The bounded window a FAILED on-demand route discovery backs the series
 /// off for: a permanently-missing transcript (deleted after indexing, an
 /// off-machine session id) otherwise re-walks the whole projects tree every
@@ -109,9 +114,14 @@ const DISCOVERY_RETRY_WINDOW: Duration = Duration::from_secs(30);
 /// post-send error); `Unsupported` is a diagnosed capability failure
 /// (unsupported/archived/ephemeral/missing). Native error classification is
 /// preserved here — never reduced to a generic timeout.
+/// `LifecycleBusy` proves that no host/native operation was dispatched. Its
+/// bounded phase retries share one charge and receipt; terminal contention
+/// refunds only the undispatched phase, retaining real reads and write ACKs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeCallResult<T> {
     Confirmed(T),
+    /// The managed lifecycle lock refused before any host/native dispatch.
+    LifecycleBusy,
     Undelivered(String),
     Ambiguous(String),
     Unsupported(String),
@@ -122,6 +132,7 @@ pub enum NativeCallResult<T> {
 /// it into the operation's own `NativeCallResult<T>`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeClassified {
+    LifecycleBusy,
     Undelivered(String),
     Ambiguous(String),
     Unsupported(String),
@@ -130,6 +141,7 @@ pub enum NativeClassified {
 impl NativeClassified {
     pub(crate) fn into_call<T>(self) -> NativeCallResult<T> {
         match self {
+            Self::LifecycleBusy => NativeCallResult::LifecycleBusy,
             Self::Undelivered(reason) => NativeCallResult::Undelivered(reason),
             Self::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
             Self::Unsupported(reason) => NativeCallResult::Unsupported(reason),
@@ -240,14 +252,18 @@ pub struct NativeCycleClaim {
 }
 
 impl NativeCycleClaim {
+    fn native_target(&self) -> NativeNameTarget {
+        NativeNameTarget {
+            name_ref: self.target.clone(),
+            location: self.location.clone(),
+            location_revision: self.location_revision,
+        }
+    }
+
     /// The write attempt shape for the backend.
     pub fn attempt(&self) -> NativeNameAttempt {
         NativeNameAttempt {
-            target: NativeNameTarget {
-                name_ref: self.target.clone(),
-                location: self.location.clone(),
-                location_revision: self.location_revision,
-            },
+            target: self.native_target(),
             desired_revision: self.desired_revision,
             title: self.title.clone(),
             source: self.source,
@@ -277,6 +293,62 @@ pub enum NativeOutcomeFold {
     Ambiguous { reason: String },
     /// A diagnosed capability failure (unsupported/archived/ephemeral/missing).
     Unsupported { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeLifecyclePhase {
+    PreRead,
+    Write,
+    ConfirmationRead,
+}
+
+async fn native_call_with_lifecycle_retry<T>(
+    names: &Arc<SessionNames>,
+    claim: &NativeCycleClaim,
+    phase: NativeLifecyclePhase,
+    mut call: impl FnMut() -> NativeFuture<T>,
+) -> Option<NativeCallResult<T>> {
+    let deadline = tokio::time::Instant::now() + NATIVE_REQUEST_TIMEOUT;
+    for attempt in 0..LIFECYCLE_RETRY_ATTEMPTS {
+        match names.native_claim_is_current(claim.clone()).await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!(op = "native_claim_is_current", revision = claim.desired_revision,
+                    class = %error.code(), "session_names.operation_failed: {error}");
+                return None;
+            }
+        }
+        let outcome = match tokio::time::timeout_at(deadline, call()).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return Some(NativeCallResult::Ambiguous(
+                    "native naming request timed out".into(),
+                ))
+            }
+        };
+        if !matches!(outcome, NativeCallResult::LifecycleBusy) {
+            if attempt > 0 {
+                tracing::info!(event = "session_names.native_lifecycle_resumed", ?phase,
+                    attempts = attempt + 1, revision = claim.desired_revision,
+                    receipt_id = %claim.receipt_id);
+            }
+            return Some(outcome);
+        }
+        let delay = LIFECYCLE_RETRY_DELAY * (attempt as u32 + 1);
+        if attempt + 1 == LIFECYCLE_RETRY_ATTEMPTS
+            || tokio::time::Instant::now() + delay >= deadline
+        {
+            tracing::warn!(event = "session_names.native_lifecycle_exhausted", ?phase,
+                attempts = attempt + 1, revision = claim.desired_revision,
+                receipt_id = %claim.receipt_id);
+            return Some(NativeCallResult::LifecycleBusy);
+        }
+        // The serial worker guard stays owned during this short, bounded
+        // in-phase retry; no document or supervisor lifecycle lock is held.
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("the finite retry loop returns on its final attempt")
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +824,7 @@ async fn run_cycle(
     //    desired value); a readback of `None` reports an EXISTING target
     //    holding no title yet — divergence the write below reconciles.
     if !names
-        .charge_native_read(claim_target.clone(), series_epoch)
+        .charge_native_read(claim.clone())
         .await
         .unwrap_or(false)
     {
@@ -771,15 +843,20 @@ async fn run_cycle(
             .await;
         return;
     }
-    let observed = match native
-        .read(NativeNameTarget {
-            name_ref: claim_target.clone(),
-            location: claim.location.clone(),
-            location_revision,
+    let Some(outcome) =
+        native_call_with_lifecycle_retry(names, &claim, NativeLifecyclePhase::PreRead, || {
+            native.read(claim.native_target())
         })
         .await
-    {
+    else {
+        return;
+    };
+    let observed = match outcome {
         NativeCallResult::Confirmed(readback) => readback.title,
+        NativeCallResult::LifecycleBusy => {
+            finish_lifecycle_contention(names, &claim, NativeLifecyclePhase::PreRead).await;
+            return;
+        }
         NativeCallResult::Undelivered(reason) => {
             fold(
                 names,
@@ -835,7 +912,19 @@ async fn run_cycle(
     // reconciles. A missing target can never reach here — the adapters
     // diagnose it through their error paths as an explicit native failure.
     // 2. At most one write per cycle, bounded to 20 seconds by the adapter.
-    match native.write(claim.attempt()).await {
+    let Some(outcome) =
+        native_call_with_lifecycle_retry(names, &claim, NativeLifecyclePhase::Write, || {
+            native.write(claim.attempt())
+        })
+        .await
+    else {
+        return;
+    };
+    match outcome {
+        NativeCallResult::LifecycleBusy => {
+            finish_lifecycle_contention(names, &claim, NativeLifecyclePhase::Write).await;
+            return;
+        }
         NativeCallResult::Confirmed(()) => {
             fold(
                 names,
@@ -886,7 +975,7 @@ async fn run_cycle(
     // 3. One confirming read afterward — only a current-revision readback can
     //    establish the target as synchronized.
     if !names
-        .charge_native_read(claim_target.clone(), series_epoch)
+        .charge_native_read(claim.clone())
         .await
         .unwrap_or(false)
     {
@@ -903,14 +992,21 @@ async fn run_cycle(
             .await;
         return;
     }
-    match native
-        .read(NativeNameTarget {
-            name_ref: claim_target.clone(),
-            location: claim.location.clone(),
-            location_revision,
-        })
-        .await
-    {
+    let Some(outcome) = native_call_with_lifecycle_retry(
+        names,
+        &claim,
+        NativeLifecyclePhase::ConfirmationRead,
+        || native.read(claim.native_target()),
+    )
+    .await
+    else {
+        return;
+    };
+    match outcome {
+        NativeCallResult::LifecycleBusy => {
+            finish_lifecycle_contention(names, &claim, NativeLifecyclePhase::ConfirmationRead)
+                .await;
+        }
         NativeCallResult::Confirmed(readback) => {
             fold(
                 names,
@@ -954,6 +1050,20 @@ async fn run_cycle(
             )
             .await;
         }
+    }
+}
+
+async fn finish_lifecycle_contention(
+    names: &Arc<SessionNames>,
+    claim: &NativeCycleClaim,
+    phase: NativeLifecyclePhase,
+) {
+    if let Err(error) = names
+        .finish_native_lifecycle_contention(claim.clone(), phase)
+        .await
+    {
+        tracing::warn!(op = "finish_native_lifecycle_contention", revision = claim.desired_revision,
+            class = %error.code(), "session_names.operation_failed: {error}");
     }
 }
 
@@ -1222,6 +1332,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
                     NativeCallResult::Confirmed(NativeNameReadback { title })
                 }
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
+                NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
             }
@@ -1251,6 +1362,7 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
             match adapter.exchange(attempt.target.location, request).await {
                 NativeCallResult::Confirmed(_) => NativeCallResult::Confirmed(()),
                 NativeCallResult::Undelivered(reason) => NativeCallResult::Undelivered(reason),
+                NativeCallResult::LifecycleBusy => NativeCallResult::LifecycleBusy,
                 NativeCallResult::Ambiguous(reason) => NativeCallResult::Ambiguous(reason),
                 NativeCallResult::Unsupported(reason) => NativeCallResult::Unsupported(reason),
             }

@@ -3168,7 +3168,9 @@ impl Supervisor {
                     },
                 }),
             );
-            return Ok(unavailable());
+            return Ok(FreshAgentNativeNameReply::Failed(
+                FreshAgentNativeNameError::LifecycleBusy,
+            ));
         };
         let handle = self
             .registry

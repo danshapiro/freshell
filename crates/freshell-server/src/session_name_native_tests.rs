@@ -573,6 +573,405 @@ async fn a_failed_route_discovery_backs_off_instead_of_rescanning_every_pass() {
 // The finite cycle machine
 // ---------------------------------------------------------------------------
 
+struct LifecycleContentionBackend {
+    actual: Arc<ScriptedBackend>,
+    busy: [AtomicU32; 3],
+    attempts: Mutex<Vec<(usize, tokio::time::Instant)>>,
+    receipts: Mutex<Vec<String>>,
+    gate_phase: AtomicU32,
+    gate_arrived: Arc<tokio::sync::Notify>,
+    gate_open: Arc<tokio::sync::Notify>,
+}
+
+impl LifecycleContentionBackend {
+    fn new(busy: [u32; 3]) -> Arc<Self> {
+        Arc::new(Self {
+            actual: ScriptedBackend::new(vec![WriteStep::Confirm]),
+            busy: busy.map(AtomicU32::new),
+            attempts: Mutex::new(Vec::new()),
+            receipts: Mutex::new(Vec::new()),
+            gate_phase: AtomicU32::new(u32::MAX),
+            gate_arrived: Arc::new(tokio::sync::Notify::new()),
+            gate_open: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    fn refuses(&self, phase: usize) -> bool {
+        self.attempts
+            .lock()
+            .unwrap()
+            .push((phase, tokio::time::Instant::now()));
+        self.busy[phase]
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn busy_reply<T: 'static>(&self, phase: usize) -> super::NativeFuture<T> {
+        if self
+            .gate_phase
+            .compare_exchange(phase as u32, u32::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.gate_arrived.notify_one();
+            let open = self.gate_open.clone();
+            Box::pin(async move {
+                open.notified().await;
+                NativeCallResult::LifecycleBusy
+            })
+        } else {
+            Box::pin(async { NativeCallResult::LifecycleBusy })
+        }
+    }
+}
+
+impl NativeNameBackend for LifecycleContentionBackend {
+    fn read(&self, target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+        let phase = if self.actual.writes() == 0 { 0 } else { 2 };
+        if self.refuses(phase) {
+            self.busy_reply(phase)
+        } else {
+            self.actual.read(target)
+        }
+    }
+
+    fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
+        self.receipts
+            .lock()
+            .unwrap()
+            .push(attempt.receipt_id.clone());
+        if self.refuses(1) {
+            self.busy_reply(1)
+        } else {
+            self.actual.write(attempt)
+        }
+    }
+
+    fn route_available(&self, _: NativeNameTarget) -> super::NativeProbeFuture {
+        Box::pin(async { true })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_contention_retries_only_the_undispatched_phase() {
+    for phase in 0..3 {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = armed_pending(&store, "h-contention", "/h/.claude").await;
+        let mut busy = [0; 3];
+        busy[phase] = 3;
+        let backend = LifecycleContentionBackend::new(busy);
+        super::run_cycle(&store, backend.as_ref(), &target).await;
+
+        let sync = native_sync_of(&store, target.clone()).await.unwrap();
+        assert_eq!(sync.status, NativeSyncStatus::Synced, "phase {phase}");
+        assert_eq!(backend.actual.reads(), 2, "only two actual native reads");
+        assert_eq!(
+            backend.actual.writes(),
+            1,
+            "confirmation retry never rewrites"
+        );
+        let document = document_json(dir.path());
+        let state = native_entry_of(&document);
+        assert_eq!(state["cyclesConsumed"], 1);
+        assert_eq!(state["readsConsumed"], 2);
+        let receipts = backend.receipts.lock().unwrap();
+        assert!(receipts.iter().all(|receipt| receipt == &receipts[0]));
+        let attempts = backend.attempts.lock().unwrap();
+        let retried: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
+        assert_eq!(retried.len(), 4, "three refusals then actual dispatch");
+        assert!(
+            retried
+                .windows(2)
+                .all(|pair| pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(25)),
+            "contention retries must be paced"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_contention_exhaustion_refunds_only_undispatched_work() {
+    for phase in 0..3 {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = armed_pending(&store, "h-exhaustion", "/h/.claude").await;
+        let mut busy = [0; 3];
+        busy[phase] = u32::MAX;
+        let backend = LifecycleContentionBackend::new(busy);
+        super::run_cycle(&store, backend.as_ref(), &target).await;
+        let document = document_json(dir.path());
+        let state = native_entry_of(&document);
+        assert_eq!(state["cyclesConsumed"], u32::from(phase == 2));
+        assert_eq!(state["readsConsumed"], u32::from(phase != 0));
+        assert_eq!(backend.actual.reads(), u32::from(phase != 0));
+        assert_eq!(backend.actual.writes(), u32::from(phase == 2));
+        assert_eq!(state["settled"], true);
+        assert!(
+            state["receiptId"].is_null(),
+            "retired claim cannot refund twice"
+        );
+        assert_eq!(state["attemptedReceipts"].as_array().unwrap().len(), 1);
+        assert!(
+            state["lastConfirmedReceipt"].is_null(),
+            "ACK alone never means synced"
+        );
+        assert_eq!(
+            native_sync_of(&store, target.clone()).await.unwrap().status,
+            NativeSyncStatus::Unsynced
+        );
+        assert!(store.native_work_snapshot().is_empty());
+        let attempts = backend.attempts.lock().unwrap();
+        let refused: Vec<_> = attempts.iter().filter(|(step, _)| *step == phase).collect();
+        assert_eq!(refused.len(), super::LIFECYCLE_RETRY_ATTEMPTS);
+        assert!(refused
+            .windows(2)
+            .all(|pair| pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(25)));
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_contention_terminal_refund_is_idempotent() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-idempotent", "/h/.claude").await;
+    let claim = store
+        .claim_native_cycle(target.clone(), "owned-receipt".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.charge_native_read(claim.clone()).await.unwrap());
+    store
+        .finish_native_lifecycle_contention(claim.clone(), super::NativeLifecyclePhase::PreRead)
+        .await
+        .unwrap();
+    let before = document_json(dir.path());
+    store
+        .finish_native_lifecycle_contention(claim, super::NativeLifecyclePhase::PreRead)
+        .await
+        .unwrap();
+    assert_eq!(document_json(dir.path()), before);
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "h-idempotent",
+    );
+    store
+        .bind_pending(BindNameInput {
+            pending: target,
+            target: durable,
+            acquisition: verified_acquisition(claude_location("/h/.claude", "h-idempotent")),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "binding the same source cannot renew exhaustion"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_contention_exhaustion_survives_same_source_echo() {
+    for rearm in ["name", "source"] {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = armed_pending(&store, "h-reopen", "/h/.claude").await;
+        observe(&store, target.clone(), "Previous native title", 1)
+            .await
+            .unwrap();
+        let backend = LifecycleContentionBackend::new([u32::MAX, 0, 0]);
+        backend.actual.set_title(Some("Previous native title"));
+        super::run_cycle(&store, backend.as_ref(), &target).await;
+        drop(store);
+        let reopened = open_store(dir.path());
+        assert!(reopened.native_work_snapshot().is_empty());
+        record_acquisition(
+            &reopened,
+            target.clone(),
+            verified_acquisition(claude_location("/h/.claude", "h-reopen")),
+        )
+        .await
+        .unwrap();
+        assert!(reopened.native_work_snapshot().is_empty());
+        observe(&reopened, target.clone(), "Previous native title", 1)
+            .await
+            .unwrap();
+        assert!(
+            reopened.native_work_snapshot().is_empty(),
+            "an unchanged native echo must not renew exhausted contention work"
+        );
+        if rearm == "name" {
+            rename_user(&reopened, target.clone(), "New manual title")
+                .await
+                .unwrap();
+        } else {
+            record_acquisition(
+                &reopened,
+                target.clone(),
+                verified_acquisition(claude_location("/moved/.claude", "h-reopen")),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            reopened.native_work_snapshot().len(),
+            1,
+            "real new-name/source changes retain their existing recovery behavior"
+        );
+        super::run_cycle(&reopened, backend.actual.as_ref(), &target).await;
+        assert_eq!(
+            native_sync_of(&reopened, target).await.unwrap().status,
+            NativeSyncStatus::Synced
+        );
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_contention_changed_binding_source_rearms() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-changed-bind", "/h/.claude").await;
+    let claim = store
+        .claim_native_cycle(target.clone(), "old-source-receipt".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.charge_native_read(claim.clone()).await.unwrap());
+    store
+        .finish_native_lifecycle_contention(claim.clone(), super::NativeLifecyclePhase::PreRead)
+        .await
+        .unwrap();
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "h-changed-bind",
+    );
+    store
+        .bind_pending(BindNameInput {
+            pending: target,
+            target: durable.clone(),
+            acquisition: verified_acquisition(claude_location("/moved/.claude", "h-changed-bind")),
+        })
+        .await
+        .unwrap();
+    let current_source = store.location_revision_of(&durable);
+    assert!(current_source > claim.location_revision);
+    observe(
+        &store,
+        durable.clone(),
+        "Previous native title",
+        current_source,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.native_work_snapshot().len(),
+        1,
+        "a genuinely changed verified binding keeps the existing source-rearm behavior"
+    );
+    let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    backend.set_title(Some("Previous native title"));
+    super::run_cycle(&store, backend.as_ref(), &durable).await;
+    assert_eq!(
+        native_sync_of(&store, durable).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_contention_stale_name_or_route_cannot_retry_or_refund() {
+    for (phase, change) in [
+        (0, "name"),
+        (1, "name"),
+        (2, "name"),
+        (0, "route"),
+        (0, "prospective"),
+    ] {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = if change == "prospective" {
+            let target = pending("h-stale");
+            ensure_pending(&store, "h-stale", None).await.unwrap();
+            rename_user(&store, target.clone(), "Manual Title")
+                .await
+                .unwrap();
+            record_acquisition(
+                &store,
+                target.clone(),
+                NativeAcquisition {
+                    location: claude_location("/h/.claude", "h-stale"),
+                    evidence: NativeEvidenceKind::InitializedRuntime,
+                    persistence: NativePersistence::Prospective,
+                },
+            )
+            .await
+            .unwrap();
+            target
+        } else {
+            armed_pending(&store, "h-stale", "/h/.claude").await
+        };
+        let mut busy = [0; 3];
+        busy[phase] = 3;
+        let backend = LifecycleContentionBackend::new(busy);
+        backend.gate_phase.store(phase as u32, Ordering::SeqCst);
+        let running_store = store.clone();
+        let running_backend = backend.clone();
+        let running_target = target.clone();
+        let running = tokio::spawn(async move {
+            super::run_cycle(&running_store, running_backend.as_ref(), &running_target).await;
+        });
+        backend.gate_arrived.notified().await;
+        let other = open_store(dir.path());
+        if change == "name" {
+            rename_user(&other, target.clone(), "New manual title")
+                .await
+                .unwrap();
+        } else if change == "prospective" {
+            record_acquisition(
+                &other,
+                target.clone(),
+                NativeAcquisition {
+                    location: claude_location("/moved/.claude", "h-stale"),
+                    evidence: NativeEvidenceKind::InitializedRuntime,
+                    persistence: NativePersistence::Prospective,
+                },
+            )
+            .await
+            .unwrap();
+        } else {
+            record_acquisition(
+                &other,
+                target.clone(),
+                verified_acquisition(claude_location("/moved/.claude", "h-stale")),
+            )
+            .await
+            .unwrap();
+        }
+        let current = document_json(dir.path());
+        backend.gate_open.notify_one();
+        running.await.unwrap();
+        assert_eq!(
+            native_entry_of(&document_json(dir.path())),
+            native_entry_of(&current),
+            "late refusal cannot change successor counters/receipts"
+        );
+        assert_eq!(
+            backend
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(step, _)| *step == phase)
+                .count(),
+            1,
+            "no retry after a fresh transaction observes changed name/source"
+        );
+        assert_eq!(
+            backend.actual.writes(),
+            u32::from(phase == 2),
+            "only a write acknowledged before the concurrent rename may have run"
+        );
+    }
+}
+
 /// Ordinary confirmed success: one pre-write read (divergent), one write,
 /// one confirming readback — the exact revision synchronizes and the unused
 /// remaining cycles pause.
@@ -1010,10 +1409,7 @@ async fn binding_transfers_cycles_rebases_desired_revision_and_retains_receipts(
         .expect("claim");
     assert_eq!(claim.cycle, 1);
     assert!(
-        store
-            .charge_native_read(target.clone(), claim.series_epoch)
-            .await
-            .unwrap(),
+        store.charge_native_read(claim.clone()).await.unwrap(),
         "the read allowance charges"
     );
     store
@@ -2737,18 +3133,12 @@ async fn native_reads_are_bounded_at_six_per_revision() {
         .expect("claim");
     for i in 1..=6 {
         assert!(
-            store
-                .charge_native_read(target.clone(), claim.series_epoch)
-                .await
-                .unwrap(),
+            store.charge_native_read(claim.clone()).await.unwrap(),
             "read {i} charges against the allowance"
         );
     }
     assert!(
-        !store
-            .charge_native_read(target.clone(), claim.series_epoch)
-            .await
-            .unwrap(),
+        !store.charge_native_read(claim.clone()).await.unwrap(),
         "the seventh read is refused"
     );
 

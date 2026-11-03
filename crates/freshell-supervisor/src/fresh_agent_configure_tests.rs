@@ -988,6 +988,80 @@ fn host_configure_gets_the_fresh_agent_command_budget() {
 }
 
 #[tokio::test]
+async fn native_name_lifecycle_contention_is_undispatched_and_fresh_retry_succeeds() {
+    let fixture = running_fresh_provider_with_name(FreshProvider::Codex, None, "name-native").await;
+    let view = fixture
+        .supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.soul_id == fixture.soul)
+        .unwrap();
+    let source = FreshAgentNativeNameSource {
+        incarnation_id: view.incarnation_id,
+        host_boot_id: view.host_boot_id.unwrap(),
+        execution_generation: view.execution_generation,
+        intent_revision: view.intent_revision,
+        native_session_id: "name-native".into(),
+    };
+    let (received, host) =
+        fake_host_with_boot(&fixture.runtime_dir, false, source.host_boot_id.clone());
+    let mut request = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::FreshAgentNativeName(FreshAgentNativeNameRequest {
+            soul_id: fixture.soul.clone(),
+            source,
+            codex_home: "/owning/codex".into(),
+            operation: FreshAgentNativeNameOperation::Write {
+                title: "Manual title".into(),
+            },
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        }),
+    );
+    request.auth = Some(SECRET.into());
+    let lifecycle = fixture.supervisor.lifecycle_lock(&fixture.soul).await;
+    let held = lifecycle.lock().await;
+    let reply = fixture
+        .supervisor
+        .dispatch(request.clone())
+        .await
+        .result
+        .unwrap();
+    let AdminResult::FreshAgentNativeName(reply) = reply else {
+        panic!("wrong reply")
+    };
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap()["data"]["kind"],
+        "lifecycle_busy"
+    );
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "contention must dispatch no host command"
+    );
+    drop(held);
+
+    let retried = fixture.supervisor.dispatch(request).await.result.unwrap();
+    assert!(matches!(
+        retried,
+        AdminResult::FreshAgentNativeName(FreshAgentNativeNameReply::Renamed)
+    ));
+    assert_eq!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| matches!(command, HostCommand::FreshAgentNativeName { .. }))
+            .count(),
+        1
+    );
+    host.abort();
+    let _ = host.await;
+}
+
+#[tokio::test]
 async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserves_recovery() {
     for scenario in [
         "read",
@@ -1100,6 +1174,10 @@ async fn admin_native_name_rejects_stale_authority_before_host_work_and_preserve
                 "boot-changes" => assert_eq!(
                     reply,
                     FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::Closed)
+                ),
+                "busy" => assert_eq!(
+                    reply,
+                    FreshAgentNativeNameReply::Failed(FreshAgentNativeNameError::LifecycleBusy)
                 ),
                 _ => assert!(matches!(
                     reply,
