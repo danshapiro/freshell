@@ -1876,6 +1876,15 @@ export function FreshAgentView({
   )
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
+  const managedCodexNativeId = paneContent.provider === 'codex' && paneContent.soulId
+    ? (paneContent.sessionRef?.provider === 'codex' ? paneContent.sessionRef.sessionId : paneContent.sessionId)
+    : undefined
+  const previousManagedCodexNativeIdRef = useRef(managedCodexNativeId)
+  useEffect(() => {
+    const previous = previousManagedCodexNativeIdRef.current
+    previousManagedCodexNativeIdRef.current = managedCodexNativeId
+    if (previous && managedCodexNativeId && previous !== managedCodexNativeId) commitSnapshot(null)
+  }, [commitSnapshot, managedCodexNativeId])
   const snapshotHydrationIdentity = `${paneContent.createRequestId}:${paneContent.sessionType}:${paneContent.provider}:${snapshotThreadId ?? ''}`
   const previousSnapshotHydrationIdentityRef = useRef(snapshotHydrationIdentity)
   useEffect(() => {
@@ -3615,6 +3624,7 @@ export function FreshAgentView({
     const requestCreateRequestId = paneContent.createRequestId
     const requestPaneSoulId = paneContent.soulId
     const requestPaneSoulRevision = paneContent.soulIntentRevision
+    const requestNativeId = managedCodexNativeId
     const requestOwnerFence = selectPaneOwnerFence(appStore.getState(), paneContent)
     const requestBootId = appStore.getState().connection.bootId
     // A missing soul uses the owned snapshot route, but remains a history-only
@@ -3640,6 +3650,11 @@ export function FreshAgentView({
       if (paneContentRef.current.createRequestId !== requestCreateRequestId) return rejected('create')
       if (paneContentRef.current.soulId !== requestPaneSoulId) return rejected('soul')
       if (paneContentRef.current.soulIntentRevision !== requestPaneSoulRevision) return rejected('revision')
+      const currentPane = paneContentRef.current
+      const currentNativeId = currentPane.provider === 'codex' && currentPane.soulId
+        ? (currentPane.sessionRef?.provider === 'codex' ? currentPane.sessionRef.sessionId : currentPane.sessionId)
+        : undefined
+      if (currentNativeId !== requestNativeId) return rejected('native')
       if (appStore.getState().connection.bootId !== requestBootId) return rejected('boot')
       if (JSON.stringify(selectPaneOwnerFence(appStore.getState(), paneContentRef.current)) !== JSON.stringify(requestOwnerFence)) return rejected('owner')
       if (requestSerial < snapshotRequestAuthorityRef.current.applied) return rejected('applied_serial')
@@ -3683,9 +3698,9 @@ export function FreshAgentView({
     const applySnapshot = (next: FreshAgentSnapshot) => {
       const historyOnly = isNativeHistoryOnlySnapshot(next)
       if ((historyOnly || (requestPaneSoulId && next.extensions?.[provider]?.statusFromLiveState === true))
-        && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== sessionId)) {
+        && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== (requestNativeId ?? sessionId))) {
         auditRequest('identity_rejected', () => ({ providerMatches: next.provider === provider,
-          typeMatches: next.sessionType === requestSessionType, threadMatches: next.threadId === sessionId, historyOnly }))
+          typeMatches: next.sessionType === requestSessionType, threadMatches: next.threadId === (requestNativeId ?? sessionId), historyOnly }))
         return
       }
       const snapshotIdentity = currentAutoTitleIdentityRef.current
@@ -3801,7 +3816,7 @@ export function FreshAgentView({
         snapshotAcceptedForRecovery && paneContentRef.current.soulId && requestSessionWasLost && agentSessionLostRef.current
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && resolved.provider === provider && resolved.sessionType === requestSessionType
-        && resolved.threadId === sessionId
+        && resolved.threadId === (requestNativeId ?? sessionId)
         && liveProviderState?.statusFromLiveState === true
         && liveProviderState.ownerKind !== 'vacant'
       ) {
@@ -4102,7 +4117,7 @@ export function FreshAgentView({
     // Keep interactive reads and recovery history reads distinct, with pane authority in both keys.
     const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd,
       soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision })
-      + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}`
+      + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}:native:${requestNativeId ?? ''}`
     let ran = false
     auditRequest('request_queued')
     void getSnapshotScheduler().schedule(key, trigger, async () => {
@@ -4179,6 +4194,7 @@ export function FreshAgentView({
   }, [
     agentSession?.lost,
     managedLostStatusVersion,
+    managedCodexNativeId,
     appStore,
     captureFreshAgentAttachmentAttempt,
     claudeSession,

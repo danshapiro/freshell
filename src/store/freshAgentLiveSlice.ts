@@ -55,6 +55,22 @@ function retireRetainedSource(session: FreshAgentLiveSession): void {
   delete session.retainedSnapshot
 }
 
+function retireLiveProjection(session: FreshAgentLiveSession): void {
+  if (session.projection) {
+    session.retiredProjectionIds ??= {}
+    session.retiredProjectionIds[session.projection.id] = true
+  }
+  retireRetainedSource(session)
+  delete session.projection
+  delete session.unboundTranscriptPatches
+  delete session.unboundTranscriptWatermarks
+  delete session.codexMetadata
+  delete session.retry
+  delete session.notice
+  session.blocks = []
+  session.expectedTurnIds = []
+}
+
 /** Session keys are `${sessionType}:${provider}:${sessionId}`; the id may itself contain ':'. */
 function sessionIdOfKey(key: string): string {
   return key.split(':').slice(2).join(':')
@@ -180,6 +196,10 @@ const freshAgentLiveSlice = createSlice({
   name: 'freshAgentLive',
   initialState,
   reducers: {
+    nativeProjectionRetired(state, action: PayloadAction<FreshAgentSessionLocator>) {
+      const session = state.bySession[makeFreshAgentSessionKey(action.payload)]
+      if (session) retireLiveProjection(session)
+    },
     /** Authoritative init/snapshot binding; arbitrary patches cannot change incarnation. */
     transcriptProjectionBound(state, action: PayloadAction<FreshAgentSessionLocator & { projectionId: string; historyGeneration: number }>) {
       const { projectionId, historyGeneration, ...locator } = action.payload
@@ -394,19 +414,7 @@ const freshAgentLiveSlice = createSlice({
         if (!previous) return
         if (previousKey === nextKey) {
           if (!action.payload.replaceLiveProjection) return
-          if (previous.projection) {
-            previous.retiredProjectionIds ??= {}
-            previous.retiredProjectionIds[previous.projection.id] = true
-          }
-          retireRetainedSource(previous)
-          delete previous.projection
-          delete previous.unboundTranscriptPatches
-          delete previous.unboundTranscriptWatermarks
-          delete previous.codexMetadata
-          delete previous.retry
-          delete previous.notice
-          previous.blocks = []
-          previous.expectedTurnIds = []
+          retireLiveProjection(previous)
           return
         }
         state.bySession[nextKey] = previous
@@ -432,6 +440,7 @@ const freshAgentLiveSlice = createSlice({
 })
 
 export const {
+  nativeProjectionRetired,
   transcriptProjectionBound,
   transcriptPatchApplied,
   transcriptProjectionSnapshotReceived,

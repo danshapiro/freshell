@@ -3,6 +3,9 @@ import { managedTerminalPaneStatus } from '../managed-terminal.js'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
+import { nativeProjectionRetired } from '@/store/freshAgentLiveSlice'
+import { findPaneContent } from '@/lib/pane-utils'
+import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, TerminalStatus } from '@/store/types'
 import { isScopedPaneContent } from '@/store/selectors/sessionNameSelectors'
@@ -468,6 +471,18 @@ export function applyManagedRuntimeMergePlan(
   plan: ManagedRuntimeMergePlan,
 ): void {
   for (const update of plan.updates) {
+    const layout = store.getState().panes.layouts[update.tabId]
+    const previous = layout ? findPaneContent(layout, update.paneId) : null
+    const next = update.content
+    if (previous?.kind === 'fresh-agent' && next.kind === 'fresh-agent'
+      && previous.provider === 'codex' && next.provider === 'codex'
+      && previous.sessionId && previous.sessionId === next.sessionId
+      && previous.sessionRef?.provider === 'codex' && next.sessionRef?.provider === 'codex'
+      && previous.sessionRef.sessionId !== next.sessionRef.sessionId) {
+      const locator = { sessionId: previous.sessionId, sessionType: previous.sessionType, provider: previous.provider }
+      streamBatcherFor(store.dispatch).flush(locator)
+      store.dispatch(nativeProjectionRetired(locator))
+    }
     store.dispatch(updatePaneContent({
       tabId: update.tabId,
       paneId: update.paneId,
