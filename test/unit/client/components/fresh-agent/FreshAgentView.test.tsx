@@ -2015,6 +2015,41 @@ describe('FreshAgentView', () => {
       } }
     }
 
+    it('keeps a Codex provider error until dismissed while routine notices still expire', async () => {
+      const queue = await setup('idle')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      const deliver = (event: Record<string, unknown>) => act(() => {
+        const message = { type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } }
+        handleFreshAgentMessage(queue.store.dispatch, message)
+        listener(message)
+      })
+      const errorMessage = 'Selected model is at capacity. Please try a different model.'
+      const errorNotice = () => document.querySelector('[data-agent-error="notice"]')
+
+      vi.useFakeTimers()
+      try {
+        deliver({ type: 'freshAgent.notice', level: 'error', code: 'CODEX_PROVIDER_ERROR', message: errorMessage })
+        expect(errorNotice()?.querySelector('summary')).toHaveAccessibleName(errorMessage)
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+
+        const notice = errorNotice()
+        expect(notice).toBeInTheDocument()
+        fireEvent.click(notice!.querySelector('summary')!)
+        const details = notice!.querySelector('.fresh-agent-diagnostic-body') as HTMLElement
+        expect(within(details).getByText(errorMessage, { exact: true })).toBeVisible()
+        fireEvent.click(within(details).getByRole('button', { name: 'Dismiss', exact: true }))
+        expect(errorNotice()).toBeNull()
+
+        deliver({ type: 'freshAgent.notice', level: 'info', code: 'SETTINGS_UPDATED', message: 'Settings saved' })
+        expect(screen.getByRole('status', { name: 'Agent notices' })).toHaveTextContent('Settings saved')
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_200) })
+        expect(screen.queryByRole('status', { name: 'Agent notices' })).toBeNull()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
     it('keeps queued work when the provider exits', async () => {
       const queue = await setup()
       queue.send('Keep this follow-up')
