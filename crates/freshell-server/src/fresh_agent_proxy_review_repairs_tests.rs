@@ -259,11 +259,13 @@ impl IdentityFixture {
                                         let row = rows.iter_mut().find(|row| row.view.soul_id == read.soul_id).unwrap();
                                         let gate = row.delay.take();
                                         if row.unavailable { (unavailable(), gate) } else {
-                                            (Ok(AdminResult::FreshAgentSnapshot(serde_json::json!({
-                                                "threadId":row.view.native_session_id, "provider":"codex", "sessionType":"freshcodex",
-                                                "status":"idle", "turns":[{"id":row.view.soul_id}], "capabilities":{},
-                                                "extensions":{"codex":{"statusFromLiveState":true}}
-                                            }))), gate)
+                                            let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+                                                "../../../test/fixtures/managed-native-history/codex-hosted-live.json"
+                                            )).unwrap();
+                                            snapshot["threadId"] = serde_json::json!(row.view.native_session_id);
+                                            snapshot["turns"][0]["id"] = serde_json::json!(row.view.soul_id);
+                                            snapshot["turns"][0]["turnId"] = serde_json::json!(row.view.soul_id);
+                                            (Ok(AdminResult::FreshAgentSnapshot(snapshot)), gate)
                                         }
                                     }
                                     AdminCommand::FreshAgentReadHistory(read) => {
@@ -995,6 +997,16 @@ async fn hosted_snapshot_fences_stale_source_and_routes_public_id_to_its_owner()
             assert_eq!(snapshot["threadId"], expected_native);
             assert_eq!(snapshot["turns"][0]["id"], expected_soul);
             assert_eq!(snapshot["extensions"]["codex"]["statusFromLiveState"], true);
+            if public == "managed-public" {
+                let client_fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../test/fixtures/managed-native-history/codex-hosted-live.json"
+                ))
+                .unwrap();
+                assert_eq!(
+                    snapshot, client_fixture,
+                    "the mounted client consumes the route's exact live payload"
+                );
+            }
         }
     })
     .catch_unwind()

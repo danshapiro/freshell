@@ -1,6 +1,7 @@
 import savedCodexTools from '../../../../fixtures/managed-native-history/codex-tools.json'
 import savedClaudeNativeHistory from '../../../../fixtures/managed-native-history/claude.json'
 import savedCodexNativeHistory from '../../../../fixtures/managed-native-history/codex.json'
+import hostedCodexNativeHistory from '../../../../fixtures/managed-native-history/codex-hosted-live.json'
 import savedOpenCodeNativeHistory from '../../../../fixtures/managed-native-history/opencode.json'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { lazy, Suspense } from 'react'
@@ -1906,11 +1907,9 @@ describe('FreshAgentView', () => {
 
   function hostedCodexSnapshot(nativeId: string, text: string) {
     return FreshAgentSnapshotSchema.parse({
-      ...savedCodexNativeHistory, threadId: nativeId, status: 'idle',
-      capabilities: { ...savedCodexNativeHistory.capabilities, send: true, interrupt: true },
-      turns: [{ id: 'hosted-turn', turnId: 'hosted-turn', role: 'assistant', summary: text,
-        items: [{ id: 'hosted-answer', kind: 'text', text }] }],
-      extensions: { codex: { statusFromLiveState: true } },
+      ...hostedCodexNativeHistory, threadId: nativeId,
+      turns: hostedCodexNativeHistory.turns.map((turn) => ({ ...turn, summary: text,
+        items: turn.items.map((item) => ({ ...item, text })) })),
     })
   }
 
@@ -1997,6 +1996,7 @@ describe('FreshAgentView', () => {
     act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(1))
     const displaysBeforeReplacement = bridge.snapshot().perfEvents.filter((entry) => entry.event === 'fresh_agent.snapshot_request' && entry.stage === 'display_committed').length
+    const outcomesBeforeReplacement = bridge.snapshot().perfEvents.filter((entry) => entry.event === 'fresh_agent.snapshot_request' && entry.stage === 'outcome_received').length
     await act(async () => {
       applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(managedCodexInventory('native-b'), store.getState() as any))
       handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.session.materialized', ...locator,
@@ -2011,6 +2011,7 @@ describe('FreshAgentView', () => {
       handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.session.materialized', ...locator,
         previousSessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: 'native-b' } })
     })
+    await waitFor(() => expect(bridge.snapshot().perfEvents.filter((entry) => entry.event === 'fresh_agent.snapshot_request' && entry.stage === 'outcome_received').length).toBeGreaterThan(outcomesBeforeReplacement))
     const displaysAfterOldReply = bridge.snapshot().perfEvents.filter((entry) => entry.event === 'fresh_agent.snapshot_request' && entry.stage === 'display_committed').length
     installPerfAuditBridge(null)
     expect(displaysBeforeReplacement).toBeGreaterThan(0)

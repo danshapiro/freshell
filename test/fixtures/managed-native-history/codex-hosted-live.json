@@ -1,0 +1,57 @@
+{
+  "sessionType": "freshcodex",
+  "provider": "codex",
+  "threadId": "native-b",
+  "revision": 0,
+  "status": "idle",
+  "summary": "",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "worktrees": false,
+    "diffs": false,
+    "childThreads": false,
+    "undo": false,
+    "redo": false,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "sandbox": "per-send",
+      "permissionMode": "per-send"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cachedTokens": 0,
+    "totalTokens": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "original-soul",
+      "turnId": "original-soul",
+      "role": "assistant",
+      "summary": "Current hosted B answer",
+      "items": [
+        {
+          "id": "hosted-answer",
+          "kind": "text",
+          "text": "Current hosted B answer"
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "codex": {
+      "statusFromLiveState": true
+    }
+  }
+}
