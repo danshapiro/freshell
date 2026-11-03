@@ -343,6 +343,110 @@ OUTER_PID=""
 test "${STATUS}" -eq 143
 assert_preparation_store_removed "${TEST_TMP}/prep-signalled.stderr"
 
+# Defer TERM while the P2 parent has no preparation PID, then stop in the
+# post-fork/pre-forward window so the child can install its signal handler.
+# This proves the deferred signal reaches the child and its EXIT trap removes
+# exactly the run-scoped store before returning.
+: >"${DOCKER_CALLS}"
+python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(["run", f"{sys.argv[2]}:/home/sandbox/.local/share/pnpm/store"]) + "\n")
+PY
+P2_PREPID_READY_FILE="${TEST_TMP}/p2-prepid-child-ready"
+P2_PREPID_SIGNAL_FILE="${TEST_TMP}/p2-prepid-child-signal"
+P2_PREPID_BARRIER_ENTERED="${TEST_TMP}/p2-prepid-barrier-entered"
+P2_PREPID_BARRIER_RELEASE="${TEST_TMP}/p2-prepid-barrier-release"
+P2_FORWARD_BARRIER_ENTERED="${TEST_TMP}/p2-forward-barrier-entered"
+P2_FORWARD_BARRIER_RELEASE="${TEST_TMP}/p2-forward-barrier-release"
+python3 - "${REPO_ROOT}" "${FAKE_BIN}" "${TEST_TMP}" "${DESCRIPTOR}" <<'PY'
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+repo, fake_bin, test_tmp, descriptor = sys.argv[1:]
+root = pathlib.Path(test_tmp)
+barrier_entered = root / "p2-prepid-barrier-entered"
+barrier_release = root / "p2-prepid-barrier-release"
+forward_entered = root / "p2-forward-barrier-entered"
+forward_release = root / "p2-forward-barrier-release"
+child_ready = root / "p2-prepid-child-ready"
+child_signal = root / "p2-prepid-child-signal"
+bash_env = root / "p2-prepid-bash-env"
+bash_env.write_text(r'''if [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
+  trap '
+    if [[ "${BASH_COMMAND}" == *"FRESHELL_SANDBOX_PREPARE_ONLY=1"* ]] && [ ! -e "${FRESHELL_TEST_PREPID_BARRIER_ENTERED}" ]; then
+      : >"${FRESHELL_TEST_PREPID_BARRIER_ENTERED}"
+      while [ ! -e "${FRESHELL_TEST_PREPID_BARRIER_RELEASE}" ]; do sleep 0.01; done
+    elif [[ "${BASH_COMMAND}" == preparation_signal* ]] && [ ! -e "${FRESHELL_TEST_FORWARD_BARRIER_ENTERED}" ]; then
+      : >"${FRESHELL_TEST_FORWARD_BARRIER_ENTERED}"
+      while [ ! -e "${FRESHELL_TEST_FORWARD_BARRIER_RELEASE}" ]; do sleep 0.01; done
+    fi
+  ' DEBUG
+fi
+''', encoding="utf-8")
+stderr_path = root / "p2-prepid.stderr"
+stdout_file = open(root / "p2-prepid.stdout", "w", encoding="utf-8")
+stderr_file = open(stderr_path, "w", encoding="utf-8")
+environment = os.environ.copy()
+environment.update({
+    "PATH": f"{fake_bin}:{environment.get('PATH', '')}",
+    "BASH_ENV": str(bash_env),
+    "FRESHELL_TEST_PREPID_BARRIER_ENTERED": str(barrier_entered),
+    "FRESHELL_TEST_PREPID_BARRIER_RELEASE": str(barrier_release),
+    "FRESHELL_TEST_FORWARD_BARRIER_ENTERED": str(forward_entered),
+    "FRESHELL_TEST_FORWARD_BARRIER_RELEASE": str(forward_release),
+    "FRESHELL_TEST_PREPARATION_READY_FILE": str(child_ready),
+    "FRESHELL_TEST_PREPARATION_SIGNAL_FILE": str(child_signal),
+    "FRESHELL_SANDBOX_P2_G01_RUN_ID": "7aab49a4-08ed-4ca7-a4b2-6501f4821a63",
+    "FRESHELL_SANDBOX_P2_G01_PNPM_STORE_VOLUME": "freshell-p2g01-pnpm-7aab49a4-08ed-4ca7-a4b2-6501f4821a63",
+})
+process = subprocess.Popen(
+    [str(pathlib.Path(fake_bin, "bash")), str(pathlib.Path(repo, "scripts/sandbox-test.sh")),
+     "--workspace-root", repo, "--external-browser", descriptor],
+    env=environment, stdout=stdout_file, stderr=stderr_file,
+)
+
+def wait_for(predicate, message, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate(): return
+        if process.poll() is not None: raise AssertionError(f"P2 preparation exited before {message}")
+        time.sleep(0.01)
+    raise AssertionError(f"P2 preparation did not reach {message}")
+
+try:
+    wait_for(barrier_entered.exists, "the deterministic pre-PID barrier")
+    process.send_signal(signal.SIGTERM)
+    wait_for(lambda: '"event":"sandbox_preparation_signal_deferred"' in stderr_path.read_text(encoding="utf-8"),
+             "the deferred TERM event")
+    barrier_release.touch()
+    wait_for(forward_entered.exists, "the post-fork signal-forward barrier")
+    wait_for(child_ready.exists, "the child signal handler")
+    forward_release.touch()
+    status = process.wait(timeout=15)
+    assert status == 143, f"pre-PID P2 TERM produced exit {status}, expected 143"
+    assert child_signal.read_text(encoding="utf-8") == "SIGTERM", "P2 child did not receive TERM"
+    events = [json.loads(line) for line in stderr_path.read_text(encoding="utf-8").splitlines()
+              if line.startswith("{")]
+    deferred = [row for row in events if row.get("event") == "sandbox_preparation_signal_deferred"]
+    assert deferred == [{"severity": "info", "event": "sandbox_preparation_signal_deferred", "signal": "TERM"}]
+finally:
+    if process.poll() is None:
+        barrier_release.touch()
+        forward_release.touch()
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=15)
+    stdout_file.close()
+    stderr_file.close()
+PY
+assert_preparation_store_removed "${TEST_TMP}/p2-prepid.stderr"
+
 : >"${DOCKER_CALLS}"
 python3 - "${DOCKER_CALLS}" "${P2_G01_PNPM_STORE_VOLUME}" <<'PY'
 import json

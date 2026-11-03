@@ -978,6 +978,7 @@ describe('actual runner child and nonvacuity lifecycle', () => {
   })
   it('dispatches the exact P2-G01 admission through the local sandbox with no selector or bearer token in argv', async () => {
     const { owned, child } = lifecycle()
+    const publishOriginals = vi.fn()
     owned.list.mockResolvedValue([p2G01Case])
     child.mockResolvedValue({ exitCode: 0, cases: [{ ...p2G01Case, status: 'passed' }] })
     const environment = {
@@ -985,7 +986,8 @@ describe('actual runner child and nonvacuity lifecycle', () => {
       FRESHELL_RUNTIME_EXTERNAL_LOCAL_SANDBOX: '1',
     }
 
-    const result = await runner.dispatchOwnedExternalBrowser({ spec: p2G01Spec, grep: p2G01Title }, environment, owned)
+    const result = await runner.dispatchOwnedExternalBrowser({ spec: p2G01Spec, grep: p2G01Title }, environment,
+      { ...owned, publishOriginals })
 
     expect(owned.list.mock.invocationCallOrder[0]).toBeLessThan(child.mock.invocationCallOrder[0])
     expect(child).toHaveBeenCalledWith('sandbox-p2-g01', [], expect.objectContaining({
@@ -994,6 +996,7 @@ describe('actual runner child and nonvacuity lifecycle', () => {
       FRESHELL_RUNTIME_EXTERNAL_GREP: p2G01Title,
     }))
     expect(JSON.stringify(child.mock.calls[0][1])).not.toContain(descriptor.FRESHELL_E2E_TARGET_TOKEN)
+    expect(publishOriginals).not.toHaveBeenCalled()
     expect(result).toMatchObject({ selected: 1, executed: 1, passed: 1, failed: 0, skipped: 0 })
     expect(owned.finish).toHaveBeenCalledOnce()
     expect(owned.abort).not.toHaveBeenCalled()
