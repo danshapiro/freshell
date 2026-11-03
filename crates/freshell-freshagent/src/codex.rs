@@ -13176,7 +13176,7 @@ fn spawn_exit_watcher_tracking_turns(
                 // synchronous final events under the same lock.
                 let _current_session = if let Some(state) = &retained_state {
                     let sessions = state.sessions.lock().await;
-                    if !sessions.get(&thread_id).is_some_and(|session| session.sidecar_ownership_id == ownership_id) {
+                    if sessions.get(&thread_id).is_none_or(|session| session.sidecar_ownership_id != ownership_id) {
                         drop(sessions);
                         exited.store(true, Ordering::SeqCst);
                         if let Some(drain) = &notification_drain {
