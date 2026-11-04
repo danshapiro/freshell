@@ -39,6 +39,12 @@
 //   fresh install creates its root mid-run), so the tier snapshots,
 //   scans, and sweeps EVERY candidate root (the env override, the default
 //   root, and the snap root — deduplicated).
+//   A removal that FAILS is never silent on either cleanup path (the
+//   headless-turn tier's sweep and this tier's finally re-scan): a
+//   loud stderr line names the leaked ids, and the removal failure
+//   becomes the test's failure when the body itself succeeded — a
+//   body failure is never masked by a cleanup error (then the log line
+//   alone reports the leak).
 //
 //   To run the gated tiers 3-4 (CLI settings precondition: both tiers pass
 //   the session-scoped `--settings '{"modelProvider":"gemini"}'` overlay for
@@ -120,6 +126,11 @@ describe('antigravity real launch smoke', () => {
   itTurn('completes a headless turn and echoes the nonce', async () => {
     const nonce = `antigravity-smoke-ok-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const beforeByRoot = await snapshotBeforeByRoot()
+    // Set only after the body's last assertion: a cleanup removal
+    // failure becomes THIS test's failure only when the body succeeded
+    // (surfaceRemovalFailures) — a body failure must never be masked
+    // by a finally-thrown cleanup error.
+    let bodySucceeded = false
     try {
       const { stdout } = await execFileAsync(
         agyCommand,
@@ -133,12 +144,15 @@ describe('antigravity real launch smoke', () => {
         { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
       )
       expect(stdout).toContain(nonce)
+      bodySucceeded = true
     } finally {
       // The tier owns its conversation in every candidate root: a
       // creation-then-failure (or a passing run) must not leave scratch
       // data in the live store — the same sweep discipline as the resume
-      // tier below.
-      await sweepNonceBearingFresh([nonce], beforeByRoot)
+      // tier below, and a removal that fails is visible, never a silent
+      // leak.
+      const leaked = await sweepNonceBearingFresh([nonce], beforeByRoot)
+      surfaceRemovalFailures(leaked, bodySucceeded)
     }
   }, 200_000)
 
@@ -185,11 +199,12 @@ describe('antigravity real launch smoke', () => {
   // resume id is still identifiable as this run's scratch). The
   // ownership gate stays: this run removes only conversations
   // carrying its own run-unique markers, never a concurrent user
-  // conversation.
+  // conversation. Returns the per-id removal failures for the caller
+  // to surface (removeOwnedFromAllRoots).
   async function sweepNonceBearingFresh(
     ownedMarkers: string[],
     beforeByRoot: Map<string, Set<string>>,
-  ): Promise<void> {
+  ): Promise<string[]> {
     const owned = new Set<string>()
     for (const [root, before] of beforeByRoot) {
       const brainDir = brainDirOf(root)
@@ -202,11 +217,59 @@ describe('antigravity real launch smoke', () => {
         if (ownedMarkers.some((marker) => body.includes(marker))) owned.add(id)
       }
     }
+    return removeOwnedFromAllRoots(owned, [...beforeByRoot.keys()])
+  }
+
+  // Remove BOTH store trees (brain/<id> and conversations/<id>.db) of
+  // every owned conversation in EVERY candidate root, COLLECTING
+  // per-id removal failures instead of swallowing them: a failed
+  // removal (permissions, a racing handle) leaves this run's scratch
+  // in the live store, and that leak must be visible — never a silent
+  // `.catch(() => {})` pass. An id counts as failed when ANY of its
+  // removals rejected (the sweep removes defensively from every root;
+  // `force` already ignores not-found, so a rejection is a real
+  // failure). Returns the ids whose removal failed.
+  async function removeOwnedFromAllRoots(owned: Set<string>, roots: string[]): Promise<string[]> {
+    const failedIds: string[] = []
     for (const id of owned) {
-      for (const root of beforeByRoot.keys()) {
-        await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {})
-        await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {})
+      let failed = false
+      for (const root of roots) {
+        await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {
+          failed = true
+        })
+        await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {
+          failed = true
+        })
       }
+      if (failed) failedIds.push(id)
+    }
+    return failedIds
+  }
+
+  // Make cleanup removal failures visible WITHOUT masking the test
+  // body's own failure: the loud stderr line ALWAYS prints (a
+  // passing-but-leaky run is visible in the output), and the removal
+  // failure becomes the test's failure only when the body itself
+  // succeeded — a finally-thrown removal error must NOT replace the
+  // body's original failure, so when the body already failed the log
+  // line alone reports the leak. The same discipline on both cleanup
+  // paths (the headless-turn tier's sweep and the resume tier's
+  // finally re-scan). The line goes straight to stderr because this
+  // suite's setup spies console.error into a capture-only
+  // implementation: a literal console.error would either be swallowed
+  // (never printed) or add a misleading "Unexpected console.error"
+  // failure — raw stderr is the one channel that is both loud and
+  // actually visible in this suite's output.
+  function surfaceRemovalFailures(failedIds: string[], bodySucceeded: boolean): void {
+    if (failedIds.length === 0) return
+    process.stderr.write(
+      `[antigravity-smoke] LEAK: cleanup failed to remove run-owned scratch conversation(s) ` +
+        `from the live store — ids: ${failedIds.join(', ')} (remove them manually)\n`,
+    )
+    if (bodySucceeded) {
+      throw new Error(
+        `cleanup failed to remove this run's scratch conversation(s) from the live store: ${failedIds.join(', ')}`,
+      )
     }
   }
 
@@ -246,6 +309,11 @@ describe('antigravity real launch smoke', () => {
       // failed tier run must not leave its scratch data in the live
       // store).
       const owned = new Set<string>()
+      // Set only after the body's last assertion: a cleanup removal
+      // failure becomes THIS test's failure only when the body
+      // succeeded (surfaceRemovalFailures) — a body failure must never
+      // be masked by a finally-thrown cleanup error.
+      let bodySucceeded = false
       try {
       // Turn 1: a fresh scratch conversation this run owns.
       const first = await execFileAsync(
@@ -340,11 +408,13 @@ describe('antigravity real launch smoke', () => {
         .map((r: { step_index: number }) => r.step_index)
       expect(new Set(userSteps).size).toBe(userSteps.length)
       expect(userSteps[userSteps.length - 1]).toBeGreaterThan(userSteps[0])
+      bodySucceeded = true
 
       // Cleanup (finally): this run owns every conversation it created (the
       // contract-probe hygiene precedent). Remove BOTH store trees for EVERY
       // owned fresh conversation in EVERY candidate root — success or
-      // any failure (Task 1 Step 7 parity).
+      // any failure (Task 1 Step 7 parity) — and a removal that FAILS is
+      // visible (surfaceRemovalFailures), never a silent leak.
       } finally {
         // Re-scan fresh conversations in the finally, in EVERY candidate
         // root (the binary's write root is not necessarily the seam's read
@@ -373,12 +443,8 @@ describe('antigravity real launch smoke', () => {
             if (ownedMarkers.some((marker) => body.includes(marker))) owned.add(id)
           }
         }
-        for (const id of owned) {
-          for (const root of roots) {
-            await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {})
-            await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {})
-          }
-        }
+        const leaked = await removeOwnedFromAllRoots(owned, roots)
+        surfaceRemovalFailures(leaked, bodySucceeded)
       }
     },
     420_000,

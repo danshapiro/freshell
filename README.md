@@ -264,9 +264,11 @@ the provider child when the session starts.
 
 Antigravity CLI support launches `agy` panes (with no launch flags — the
 real CLI starts interactive by default, as probed against pinned binaries
-1.4.10 and 1.4.12), indexes native conversation history, binds one
-conversation identity per pane, and shows busy and turn-completion
-state — with these recorded limitations. Freshell reads Antigravity
+1.4.10 and 1.4.12) and indexes native conversation history. The
+per-pane conversation binding and busy/turn-completion machinery exists
+and is exercised by Freshell's own fixtures, but real `agy`
+conversations do not carry the ownership records that machinery
+requires — with these recorded limitations. Freshell reads Antigravity
 conversations from `~/.gemini/antigravity-cli` (or the
 `FRESHELL_ANTIGRAVITY_HOME` override); snap installs keep their store
 under `~/snap/antigravity-cli/common/.gemini/antigravity-cli`, which
