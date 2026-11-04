@@ -116,9 +116,13 @@ pub use claude_snapshot::{
     transcript_cwd_checked, LocateError, SelectedTranscript, TranscriptLocation,
 };
 mod host_claude_restore;
+mod host_opencode_restore;
 pub use codex::FreshCodexState;
 pub use host_claude_restore::{
     locate_host_claude_restore, HostClaudeRestoreError, HostClaudeRestoreSource,
+};
+pub use host_opencode_restore::{
+    locate_host_opencode_restore, HostOpenCodeRestoreError, HostOpenCodeRestoreSource,
 };
 pub use identity_sink::{
     BindProvenance, ClaimCommit, ClaudeGenesis, CloseAnswer, FreshAgentBindingUpsert,

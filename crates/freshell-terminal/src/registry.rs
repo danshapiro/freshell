@@ -1028,6 +1028,17 @@ pub trait ManagedTerminalController: Send + Sync {
         terminal_id: &'a str,
         create_request_id: Option<String>,
     ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>>;
+    /// Read-only inventory check across every managed state and create key.
+    /// Unsupported or unavailable inventory is not evidence of absence.
+    fn owns_native_session<'a>(
+        &'a self,
+        _provider: &'a str,
+        _session_id: &'a str,
+    ) -> ManagedTerminalFuture<'a, Result<bool, String>> {
+        Box::pin(std::future::ready(Err(
+            "managed native-session inventory unavailable".into(),
+        )))
+    }
     fn launch<'a>(
         &'a self,
         request: ManagedTerminalLaunch,
@@ -4686,6 +4697,20 @@ impl TerminalRegistry {
             .read()
             .expect("managed controller lock")
             .is_some()
+    }
+
+    pub async fn managed_owns_native_session(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
+        controller.owns_native_session(provider, session_id).await
     }
 
     /// Per-connection creation capability latch. Existing managed rows keep

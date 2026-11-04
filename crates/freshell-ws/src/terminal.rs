@@ -74,6 +74,9 @@ use freshell_terminal::{build_child_env_from_process, FrameSink};
 #[cfg(all(test, unix))]
 #[path = "host_claude_restore_tests.rs"]
 mod host_claude_restore_tests;
+#[cfg(all(test, unix))]
+#[path = "host_opencode_restore_tests.rs"]
+mod host_opencode_restore_tests;
 
 use crate::WsState;
 
@@ -6105,10 +6108,16 @@ pub(crate) async fn handle_create(
         && (create.restore == Some(true)
             || create_session_locator(&create)
                 .is_some_and(|locator| is_canonical_claude_session_id(&locator.session_id)));
+    let require_host_opencode_restore = managed_runtime_v1
+        && mode == "opencode"
+        && (create.restore == Some(true)
+            || create_session_locator(&create)
+                .is_some_and(|locator| locator.session_id.starts_with("ses_")));
     let use_managed_runtime = managed_runtime_v1
         && managed_runtime_mode(&mode)
         && !require_retained_codex
-        && !require_host_claude_restore;
+        && !require_host_claude_restore
+        && !require_host_opencode_restore;
     if require_retained_codex {
         tracing::info!(
             event = "terminal.create.retained_codex",
@@ -6553,6 +6562,52 @@ pub(crate) async fn handle_create(
                     "Original host Claude conversation could not be verified");
                 return send_create_error(out, ErrorCode::RestoreUnavailable,
                     "The original Claude conversation could not be verified on this host. No replacement was started.".into(),
+                    &create.request_id).await;
+            }
+        }
+    } else {
+        None
+    };
+
+    let host_opencode_restore_source = if require_host_opencode_restore {
+        let session_id = resume_session_id.clone().unwrap_or_default();
+        if session_id.is_empty() {
+            return send_create_error(out, ErrorCode::RestoreUnavailable,
+                "The saved OpenCode conversation has no native identity. No replacement was started.".into(),
+                &create.request_id).await;
+        }
+        if state
+            .registry
+            .managed_owns_native_session("opencode", &session_id)
+            .await
+            != Ok(false)
+        {
+            return send_create_error(out, ErrorCode::RestoreUnavailable,
+                "The managed owner of this OpenCode conversation could not be ruled out. No host replacement was started.".into(),
+                &create.request_id).await;
+        }
+        let requested_cwd = create.cwd.as_deref().map(std::path::PathBuf::from);
+        let selected = spawn_blocking_in_span(move || {
+            freshell_freshagent::locate_host_opencode_restore(&session_id, requested_cwd.as_deref())
+        })
+        .await
+        .unwrap_or(Err(
+            freshell_freshagent::HostOpenCodeRestoreError::Unreadable,
+        ));
+        match selected {
+            Ok(source) => {
+                resolved_cwd = Some(source.cwd.to_string_lossy().into_owned());
+                tracing::info!(event = "terminal.create.host_opencode_restore",
+                    request_id = %create.request_id, session_id = ?resume_session_id,
+                    "Restoring the verified original host OpenCode conversation");
+                Some(source)
+            }
+            Err(reason) => {
+                tracing::warn!(event = "terminal.create.host_opencode_restore_refused",
+                    request_id = %create.request_id, reason = reason.reason(),
+                    "Original host OpenCode conversation could not be verified");
+                return send_create_error(out, ErrorCode::RestoreUnavailable,
+                    "The original OpenCode conversation could not be verified on this host. No replacement was started.".into(),
                     &create.request_id).await;
             }
         }
@@ -7384,8 +7439,25 @@ pub(crate) async fn handle_create(
     // host-owned PTY makes the preallocated identity observable.
     #[cfg(all(test, unix))]
     host_claude_restore_tests::before_source_revalidation(&create.request_id, &terminal_id);
+    #[cfg(all(test, unix))]
+    host_opencode_restore_tests::before_source_revalidation(&create.request_id, &terminal_id);
+    // A managed claim that appeared during MCP preparation must not authorize
+    // a second host writer. The ordinary native-session ownership claim stays
+    // held across this check and the existing atomic registry create/settle.
+    let host_opencode_owner_absent = if host_opencode_restore_source.is_some() {
+        state
+            .registry
+            .managed_owns_native_session(
+                "opencode",
+                resume_session_id.as_deref().unwrap_or_default(),
+            )
+            .await
+            == Ok(false)
+    } else {
+        true
+    };
     let mut provider_preparation_failure = None;
-    let mut host_claude_restore_failure = None;
+    let mut host_restore_failure = None;
     let create_result: std::io::Result<()> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -7432,9 +7504,19 @@ pub(crate) async fn handle_create(
         let spawn_create_request_id = create.request_id.clone();
         match spawn_blocking_in_span(move || {
             if let Some(source) = host_claude_restore_source {
-                source.revalidate()?;
+                source
+                    .revalidate()
+                    .map_err(|reason| ("claude", reason.reason()))?;
             }
-            Ok::<_, freshell_freshagent::HostClaudeRestoreError>(registry.create(
+            if let Some(source) = host_opencode_restore_source {
+                if !host_opencode_owner_absent {
+                    return Err(("opencode", "managed_native_owner_not_absent"));
+                }
+                source
+                    .revalidate(&child_env)
+                    .map_err(|reason| ("opencode", reason.reason()))?;
+            }
+            Ok::<_, (&'static str, &'static str)>(registry.create(
                 &spawn_spec,
                 &child_env,
                 spawn_terminal_id,
@@ -7449,12 +7531,12 @@ pub(crate) async fn handle_create(
         .await
         {
             Ok(Ok(res)) => res,
-            Ok(Err(reason)) => {
-                tracing::warn!(event = "terminal.create.host_claude_restore_refused",
-                    request_id = %create.request_id, reason = reason.reason(),
-                    "Original host Claude source changed before its owned spawn");
-                host_claude_restore_failure = Some(reason);
-                Err(std::io::Error::other("original host Claude source changed"))
+            Ok(Err((provider, reason))) => {
+                tracing::warn!(event = "terminal.create.host_restore_refused",
+                    request_id = %create.request_id, provider, reason,
+                    "Original host conversation changed before its owned spawn");
+                host_restore_failure = Some(provider);
+                Err(std::io::Error::other("original host conversation changed"))
             }
             Err(join_err) => Err(std::io::Error::other(format!(
                 "terminal spawn task panicked: {join_err}"
@@ -7527,9 +7609,14 @@ pub(crate) async fn handle_create(
                 .await;
         }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
-        if host_claude_restore_failure.is_some() {
+        if let Some(provider) = host_restore_failure {
+            let label = if provider == "claude" {
+                "Claude"
+            } else {
+                "OpenCode"
+            };
             return send_create_error(out, ErrorCode::RestoreUnavailable,
-                "The original Claude conversation changed before restoration. No replacement was started.".into(),
+                format!("The original {label} conversation changed before restoration. No replacement was started."),
                 &create.request_id).await;
         }
         let label = mode_label(&mode, cli.as_ref());

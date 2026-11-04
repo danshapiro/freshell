@@ -1389,6 +1389,45 @@ async fn spawn_terminal_pane_with_handoff_and_admission(
 
     if let Some(session_id) = resume_session_id
         .clone()
+        .filter(|_| use_managed_runtime && mode == "opencode")
+    {
+        let original_cwd = cwd.as_deref().map(std::path::PathBuf::from);
+        let selected_id = session_id.clone();
+        let verified_host_source = tokio::task::spawn_blocking(move || {
+            crate::locate_host_opencode_restore(&selected_id, original_cwd.as_deref()).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if verified_host_source {
+            match registry
+                .managed_owns_native_session("opencode", &session_id)
+                .await
+            {
+                // The managed route remains authoritative, including a
+                // non-running owner or a different original create key.
+                Ok(true) => {}
+                absence => {
+                    tracing::info!(
+                        event = "terminal.rest.host_opencode_restore_refused",
+                        provider = "opencode",
+                        transport = "rest",
+                        reason = if absence == Ok(false) {
+                            "verified_original_host_history"
+                        } else {
+                            "managed_inventory_unavailable"
+                        },
+                        "Original host OpenCode history requires its terminal-tab resume route"
+                    );
+                    return Err(fail_json_code(StatusCode::CONFLICT, "RESTORE_UNAVAILABLE",
+                        "This saved OpenCode conversation uses its original host history. Restore it through its terminal tab.".into(),
+                    ).into());
+                }
+            }
+        }
+    }
+
+    if let Some(session_id) = resume_session_id
+        .clone()
         .filter(|_| use_managed_runtime && mode == "claude")
     {
         let original_cwd = cwd.as_deref().map(std::path::PathBuf::from);
@@ -7483,9 +7522,19 @@ if (args.includes('app-server')) {{
 
     struct UnusedManagedController;
 
-    struct CapturingManagedController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+    struct CapturingManagedController(
+        std::sync::Mutex<Option<ManagedTerminalLaunch>>,
+        std::sync::Mutex<Result<bool, String>>,
+    );
 
     impl ManagedTerminalController for CapturingManagedController {
+        fn owns_native_session<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> ManagedTerminalFuture<'a, Result<bool, String>> {
+            Box::pin(async { self.1.lock().unwrap().clone() })
+        }
         fn lookup_terminal<'a>(
             &'a self,
             _: &'a str,
@@ -7565,7 +7614,10 @@ if (args.includes('app-server')) {{
                     true,
                 ));
             let registry = state.terminal_registry.clone().unwrap();
-            let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+            let controller = Arc::new(CapturingManagedController(
+                std::sync::Mutex::new(None),
+                std::sync::Mutex::new(Ok(false)),
+            ));
             registry.set_managed_controller(Some(controller.clone()));
             let mut body = json!({"mode":"codex", "cwd":std::env::temp_dir(), "effort":"low"});
             if let Some(model) = model {
@@ -7686,6 +7738,117 @@ if (args.includes('app-server')) {{
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
+    async fn rest_verified_host_opencode_resume_refuses_before_launch_or_new_tab() {
+        const CHILD: &str = "FRESHELL_REST_HOST_OPENCODE_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "terminal_tabs::tests::rest_verified_host_opencode_resume_refuses_before_launch_or_new_tab", "--nocapture"])
+                .env(CHILD, "1").kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(45), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owned = tempfile::tempdir().unwrap();
+        let session_id = "ses_rest_original_host";
+        let data = owned.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join("opencode.db");
+        let database = rusqlite::Connection::open(&path).unwrap();
+        database.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, project_id TEXT, workspace_id TEXT, time_created INTEGER, title TEXT);").unwrap();
+        database
+            .execute(
+                "INSERT INTO session VALUES(?1,?2,'original-project',NULL,1,'original metadata')",
+                rusqlite::params![session_id, owned.path().to_str().unwrap()],
+            )
+            .unwrap();
+        drop(database);
+        std::env::set_var("HOME", owned.path());
+        for key in ["XDG_DATA_HOME", "OPENCODE_DB", "OPENCODE_TEST_HOME"] {
+            std::env::remove_var(key);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let hook_count = hooks.clone();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "opencode",
+                &owned.path().join("argv"),
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Present,
+                true,
+            ))
+            .with_terminal_created_hook(Arc::new(move |_| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let controller = Arc::new(CapturingManagedController(
+            std::sync::Mutex::new(None),
+            std::sync::Mutex::new(Ok(false)),
+        ));
+        registry.set_managed_controller(Some(controller.clone()));
+        let mut events = state.broadcast_tx.subscribe();
+        for (native_owner, expected_status, expect_managed_launch) in [
+            (Ok(false), StatusCode::CONFLICT, false),
+            (
+                Err("owned unavailable inventory".into()),
+                StatusCode::CONFLICT,
+                false,
+            ),
+            (Ok(true), StatusCode::BAD_REQUEST, true),
+        ] {
+            *controller.1.lock().unwrap() = native_owner;
+            *controller.0.lock().unwrap() = None;
+            let (status, body) = post(
+                app(state.clone()),
+                "/api/tabs",
+                json!({
+                    "mode":"opencode", "cwd":owned.path(),
+                    "sessionRef":{"provider":"opencode","sessionId":session_id}
+                }),
+                true,
+            )
+            .await;
+            assert_eq!(status, expected_status, "{body}");
+            if !expect_managed_launch {
+                assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+            }
+            assert_eq!(
+                controller.0.lock().unwrap().is_some(),
+                expect_managed_launch,
+                "verified original host/managed ownership routing changed"
+            );
+            assert!(state.tabs.lock().unwrap().is_empty());
+            assert!(state.terminal_panes.lock().unwrap().is_empty());
+            assert!(registry.directory().is_empty());
+            assert!(
+                matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ),
+                "failed or refused restore emitted an event"
+            );
+            assert_eq!(hooks.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "metadata-only decision changed original native DB"
+            );
+        }
+        registry.kill_all();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn rest_verified_host_claude_resume_refuses_before_launch_or_new_tab() {
         const CHILD: &str = "FRESHELL_REST_HOST_CLAUDE_REFUSAL_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -7735,7 +7898,10 @@ if (args.includes('app-server')) {{
                 hook_count.fetch_add(1, Ordering::SeqCst);
             }));
         let registry = state.terminal_registry.clone().unwrap();
-        let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+        let controller = Arc::new(CapturingManagedController(
+            std::sync::Mutex::new(None),
+            std::sync::Mutex::new(Ok(false)),
+        ));
         registry.set_managed_controller(Some(controller.clone()));
         let mut events = state.broadcast_tx.subscribe();
         let (status, body) = post(app(state.clone()), "/api/tabs", json!({"mode":"claude","cwd":owned.path(),"sessionRef":{"provider":"claude","sessionId":session_id}}), true).await;
@@ -7868,7 +8034,10 @@ if (args.includes('app-server')) {{
                 hook_count.fetch_add(1, Ordering::SeqCst);
             }));
         let registry = state.terminal_registry.clone().unwrap();
-        let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+        let controller = Arc::new(CapturingManagedController(
+            std::sync::Mutex::new(None),
+            std::sync::Mutex::new(Ok(false)),
+        ));
         registry.set_managed_controller(Some(controller.clone()));
         let mut events = state.broadcast_tx.subscribe();
         let (status, body) = post(
