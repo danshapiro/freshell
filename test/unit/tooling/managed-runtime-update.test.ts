@@ -755,6 +755,53 @@ it('supervisor readiness timeout preserves the last actionable verification reas
   expect(checks).toBeGreaterThan(0)
 })
 
+it('supervisor readiness preserves the image mismatch when the final clamped timer wakes one millisecond early', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const startedAt = 1_000
+  const timeoutMs = 100
+  const firstProbeMs = 10
+  const deadline = startedAt + timeoutMs
+  const finalWaitMs = timeoutMs - firstProbeMs
+  let wallTime = startedAt
+  const now = vi.spyOn(Date, 'now').mockImplementation(() => wallTime)
+  const imageMismatch = 'the live supervisor process image reference does not match the verified managed-runtime image'
+  let lastIssue = imageMismatch
+  let checks = 0
+  const check = vi.fn(async () => {
+    checks += 1
+    if (checks === 1) {
+      wallTime = startedAt + firstProbeMs
+    } else {
+      // An extra subprocess probe can only consume the last millisecond and
+      // replace the useful process-image diagnostic with a generic timeout.
+      lastIssue = 'systemctl timed out after 1 ms'
+      wallTime = deadline
+    }
+    return undefined
+  })
+
+  try {
+    const outcome = waitForSupervisorReadiness(check, {
+      timeoutMs,
+      intervalMs: timeoutMs * 2,
+      timeoutMessage: () => `Supervisor readiness expired: ${lastIssue}`,
+    }).then(value => ({ value, error: undefined }), error => ({ value: undefined, error }))
+    await Promise.resolve()
+    expect(vi.getTimerCount()).toBe(1)
+    // The requested wait consumes the remaining 90 ms, but a rounded wall
+    // clock still reports 1 ms at wakeup. It must not authorize a new probe.
+    wallTime = deadline - 1
+    await vi.advanceTimersByTimeAsync(finalWaitMs)
+    const result = await outcome
+    expect(result.error).toBeInstanceOf(Error)
+    expect(result.error).toMatchObject({ message: expect.stringContaining(imageMismatch) })
+    expect(check).toHaveBeenCalledTimes(1)
+  } finally {
+    vi.useRealTimers()
+    now.mockRestore()
+  }
+})
+
 it('supervisor readiness timeout reports a persistent process image mismatch', async () => {
   const tempRoot = path.resolve('.test-tmp')
   fs.mkdirSync(tempRoot, { recursive: true })
