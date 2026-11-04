@@ -26,9 +26,13 @@
 //   transcript" is the fourth tier, opt-in under the same double gate: it
 //   mints one fresh real conversation, resumes it with `--conversation <id>`,
 //   pins the transcript continuity receipts (same brain/<id> growth; unique,
-//   strictly-increasing USER_INPUT step indexes), and removes the
-//   conversation it created (brain/<id> + conversations/<id>.db) in a finally
-//   sweep — one real conversation created and then removed per gated run.
+//   strictly-increasing USER_INPUT step indexes), and removes EVERY
+//   conversation it created (brain/<id> + conversations/<id>.db) in a
+//   finally sweep — the turn-1 conversation, plus any fresh conversation
+//   the binary mints by REJECTING the resume id (the documented
+//   missing-id passthrough): the resume prompt carries a run-unique
+//   marker, so the sweep identifies that minted conversation as this
+//   run's scratch too and never leaks it in the live store.
 //   The store scan is exhaustive: the binary's write root is not
 //   necessarily the seam's read root (the snap binary pins its store under
 //   $HOME/snap while the default root can also hold conversations, and a
@@ -134,7 +138,7 @@ describe('antigravity real launch smoke', () => {
       // creation-then-failure (or a passing run) must not leave scratch
       // data in the live store — the same sweep discipline as the resume
       // tier below.
-      await sweepNonceBearingFresh(nonce, beforeByRoot)
+      await sweepNonceBearingFresh([nonce], beforeByRoot)
     }
   }, 200_000)
 
@@ -173,15 +177,20 @@ describe('antigravity real launch smoke', () => {
     return beforeByRoot
   }
 
-  // Sweep every FRESH conversation carrying THIS run's unique nonce in
-  // every candidate root — success or any failure. The nonce gate stays:
-  // this run removes only conversations carrying its own unique nonce,
-  // never a concurrent user conversation.
+  // Sweep every FRESH conversation this run OWNS in every candidate
+  // root — success or any failure. OWNED = the transcript carries ANY
+  // of this run's unique markers: the tier's nonce, or the tier-4
+  // resume marker (the run-unique string embedded in the resume
+  // prompt, so a conversation the binary MINTS by rejecting the
+  // resume id is still identifiable as this run's scratch). The
+  // ownership gate stays: this run removes only conversations
+  // carrying its own run-unique markers, never a concurrent user
+  // conversation.
   async function sweepNonceBearingFresh(
-    nonce: string,
+    ownedMarkers: string[],
     beforeByRoot: Map<string, Set<string>>,
   ): Promise<void> {
-    const nonceBearing = new Set<string>()
+    const owned = new Set<string>()
     for (const [root, before] of beforeByRoot) {
       const brainDir = brainDirOf(root)
       const nowIds = await fs.readdir(brainDir).catch(() => [] as string[])
@@ -190,10 +199,10 @@ describe('antigravity real launch smoke', () => {
         const body = await fs
           .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
           .catch(() => '')
-        if (body.includes(nonce)) nonceBearing.add(id)
+        if (ownedMarkers.some((marker) => body.includes(marker))) owned.add(id)
       }
     }
-    for (const id of nonceBearing) {
+    for (const id of owned) {
       for (const root of beforeByRoot.keys()) {
         await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {})
         await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {})
@@ -207,6 +216,21 @@ describe('antigravity real launch smoke', () => {
     'resumes a real conversation headlessly and appends to the same transcript',
     async () => {
       const nonce = `antigravity-smoke-resume-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      // The resume prompt's run-unique marker: if the binary REJECTS the
+      // --conversation id (the documented missing-id passthrough — a
+      // future CLI contract change), it mints a FRESH conversation whose
+      // USER_INPUT carries the resume prompt, which contains NO nonce.
+      // The marker makes that minted conversation identifiable as THIS
+      // run's scratch so the finally sweep owns and removes it — without
+      // it, the exact regression this tier exists to catch (a broken
+      // --conversation) would leak its minted conversation in the live
+      // store. Run-unique like the nonce, so the never-delete-a-user-
+      // conversation gate holds unchanged.
+      const resumeMarker = `freshell-smoke-resume-mark-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      // A fresh conversation is OWNED by this run when its transcript
+      // carries ANY of these run-unique markers (the invariant the
+      // in-try scan and the finally sweep both apply).
+      const ownedMarkers = [nonce, resumeMarker]
       // The binary's write root is not necessarily the seam's read root —
       // scan EVERY candidate root (see agyStoreRootCandidates).
       const roots = agyStoreRootCandidates()
@@ -216,11 +240,12 @@ describe('antigravity real launch smoke', () => {
       for (const root of roots) {
         beforeByRoot.set(root, new Set(await fs.readdir(brainDirOf(root)).catch(() => [] as string[])))
       }
-      // EVERY fresh conversation whose transcript carries the nonce — the
-      // cleanup sweep must remove them all even if the id resolution or any
-      // later assertion fails (a failed tier run must not leave its scratch
-      // data in the live store).
-      const nonceBearing = new Set<string>()
+      // EVERY fresh conversation this run owns (a transcript carrying the
+      // nonce OR the resume marker) — the cleanup sweep must remove them
+      // all even if the id resolution or any later assertion fails (a
+      // failed tier run must not leave its scratch data in the live
+      // store).
+      const owned = new Set<string>()
       try {
       // Turn 1: a fresh scratch conversation this run owns.
       const first = await execFileAsync(
@@ -248,7 +273,7 @@ describe('antigravity real launch smoke', () => {
             .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
             .catch(() => '')
           if (body.includes(nonce)) {
-            nonceBearing.add(id)
+            owned.add(id)
             convId ??= id
             transcriptPath ??= path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl')
           }
@@ -290,11 +315,16 @@ describe('antigravity real launch smoke', () => {
       }
       if (unknownTypes.size > 0) console.log(`[tier4] unknown record types (recorded, not failed): ${[...unknownTypes].join(', ')} (agy ${version})`)
 
-      // THE real resume: same conversation, follow-up recall.
+      // THE real resume: same conversation, follow-up recall. The prompt
+      // carries the run-unique resume marker (parenthesized, so the
+      // recall instruction stays intact — the stdout assertion still
+      // checks the NONCE): a binary that rejects the id mints a fresh
+      // conversation whose USER_INPUT carries THIS text, and the marker
+      // ties that minted conversation to this run for the finally sweep.
       const linesBefore = lines.length
       const second = await execFileAsync(
         agyCommand,
-        ['--settings', '{"modelProvider":"gemini"}', '--conversation', convId!, '-p=Reply with exactly the string I asked you to reply with in the first message.'],
+        ['--settings', '{"modelProvider":"gemini"}', '--conversation', convId!, `-p=Reply with exactly the string I asked you to reply with in the first message. (${resumeMarker})`],
         { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
       )
       expect(second.stdout).toContain(nonce)
@@ -313,7 +343,7 @@ describe('antigravity real launch smoke', () => {
 
       // Cleanup (finally): this run owns every conversation it created (the
       // contract-probe hygiene precedent). Remove BOTH store trees for EVERY
-      // nonce-bearing fresh conversation in EVERY candidate root — success or
+      // owned fresh conversation in EVERY candidate root — success or
       // any failure (Task 1 Step 7 parity).
       } finally {
         // Re-scan fresh conversations in the finally, in EVERY candidate
@@ -322,24 +352,28 @@ describe('antigravity real launch smoke', () => {
         // conversation on a host whose roots are split): a failure AFTER
         // the CLI already created a conversation (the exact
         // creation-then-429 mode the Task 1 receipts recorded on a
-        // quota-dead key) can throw before the in-try scan populates
-        // nonceBearing — without this re-scan that scratch conversation
-        // would leak in the live store. The nonce gate stays: this run
-        // removes only conversations carrying THIS run's unique nonce,
-        // never a concurrent user conversation.
+        // quota-dead key, or the resume invocation failing after the
+        // binary minted a fresh conversation) can throw before the in-try
+        // scan populates `owned` — without this re-scan that scratch
+        // conversation would leak in the live store. Owned is nonce OR
+        // resume marker (see ownedMarkers): a resume the binary rejects
+        // mints a conversation whose transcript carries only the marker.
+        // The ownership gate stays: this run removes only conversations
+        // carrying THIS run's unique markers, never a concurrent user
+        // conversation.
         for (const root of roots) {
           const brainDir = brainDirOf(root)
           const before = beforeByRoot.get(root) ?? new Set<string>()
           const nowIds = await fs.readdir(brainDir).catch(() => [] as string[])
           for (const id of nowIds) {
-            if (before.has(id) || nonceBearing.has(id)) continue
+            if (before.has(id) || owned.has(id)) continue
             const body = await fs
               .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
               .catch(() => '')
-            if (body.includes(nonce)) nonceBearing.add(id)
+            if (ownedMarkers.some((marker) => body.includes(marker))) owned.add(id)
           }
         }
-        for (const id of nonceBearing) {
+        for (const id of owned) {
           for (const root of roots) {
             await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {})
             await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {})

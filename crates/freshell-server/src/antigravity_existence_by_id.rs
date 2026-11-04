@@ -85,7 +85,12 @@
 //! rebinds through the provider's natural identity fold, which clears the
 //! stale id. The follow-up surface is post-spawn warning detection
 //! (binary-authority verification: surface the CLI's own missing-id
-//! warning as a Freshell-visible fact), recorded as future work.
+//! warning as a Freshell-visible fact), recorded as future work. In
+//! the dual-root-ambiguity corner (both roots populated, no override),
+//! the pane's saved label also retains the stale id after the deferred
+//! proceed (the real-format no-binding limitation) until the operator
+//! disambiguates the store — the same post-spawn warning detection
+//! would flip the label honestly.
 //!
 //! Per-root tri-state contract (the ladder's core; mirrors
 //! [`crate::existence_by_id::ByIdAnswer`]):

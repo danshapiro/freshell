@@ -293,7 +293,10 @@ written back to the Antigravity CLI itself (native rename is unsupported).
 Binding a pane to its conversation depends on Freshell rebuilding the typed
 prompt from keystrokes: prompts entered through history recall (Up/Down), Tab
 completion, bracketed paste, or keys Freshell does not model never bind,
-and the pane binds again on its next clean typed prompt. On a resumed or
+and the pane binds again on its next clean typed prompt — a rebind that
+exists only in Freshell's own test fixtures, which append the ownership
+records the real CLI never writes; real `agy` conversations do not re-bind
+per-pane (the recorded limitation above). On a resumed or
 restored pane of a REAL `agy` session, transcript-driven busy and
 turn-completion signals never engage: the real transcript format carries no
 settle record, so Freshell marks no turn completion and rings no completion
