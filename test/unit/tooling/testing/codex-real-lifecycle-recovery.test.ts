@@ -7,6 +7,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 // There are no Docker clients, subprocesses, sockets, or real fixture files.
 const control = vi.hoisted(() => ({
   exec: vi.fn(),
+  execAsync: vi.fn(),
   reads: new Map<string, unknown>(),
   stats: new Map<string, unknown>(),
   fsOverrides: new Map<string, Map<string, unknown>>(),
@@ -17,7 +18,7 @@ const control = vi.hoisted(() => ({
 
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal<typeof import('node:child_process')>()
-  return { ...actual, execFileSync: control.exec }
+  return { ...actual, execFile: control.execAsync, execFileSync: control.exec }
 })
 
 vi.mock('node:fs', async importOriginal => {
@@ -81,6 +82,10 @@ function deferred<T>() {
 
 async function flushMicrotasks() {
   for (let i = 0; i < 16; i++) await Promise.resolve()
+}
+
+function appendLifecycle(lifecyclePath: string, event: string, data: unknown) {
+  control.reads.set(lifecyclePath, `${control.reads.get(lifecyclePath) ?? ''}${JSON.stringify({ event, data })}\n`)
 }
 
 function nestedErrors(value: unknown, seen = new Set<unknown>()): unknown[] {
@@ -147,6 +152,7 @@ function volumeState(fixture: ReturnType<typeof volumeFixture>['fixture'], stop:
 
 beforeEach(() => {
   control.exec.mockReset()
+  control.execAsync.mockReset()
   control.reads.clear()
   control.stats.clear()
   control.fsOverrides.clear()
@@ -314,6 +320,197 @@ it('preserves an unexpected deferred probe rejection with the observation and cl
   expect.soft(output.join('')).not.toContain(rejectedProbe.message)
 })
 
+// Exercise the actual owner's tracking, capture wait, stop, and callback with
+// an in-memory child and process observations. No subprocess or signal exists.
+async function actualOwnerProbeInterleaving(
+  independent: boolean, failedStage?: 'capture' | 'remove',
+  fault?: 'signal_not_accepted' | 'different_probe_id' | 'signal_evidence_unavailable',
+) {
+  const { ManagedRuntimeOwner } = await vi.importActual<typeof import('../../../../scripts/testing/runtime-sandbox.js')>(
+    '../../../../scripts/testing/runtime-sandbox.js')
+  const containerId = 'b'.repeat(64)
+  const daemonId = 'controlled-daemon'
+  const cliPid = 21111
+  const insidePid = 21112
+  const fakeCli = '/virtual/docker'
+  const capture = deferred<void>()
+  const trace: string[] = []
+  const output: EventRow[] = []
+  const cause = Object.assign(new Error('synthetic-independent-probe-secret-marker'), { signal: 'SIGKILL' as const })
+  const cleanupFailure = new Error(`synthetic-${failedStage}-secret-marker`)
+  const stat = (pid: number) => `${pid} (task4) ${['S', ...Array(18).fill('0'), '1234'].join(' ')}`
+  const gone = Object.assign(new Error('gone'), { code: 'ENOENT' })
+  let callback: ((error: typeof cause, stdout: string, stderr: string) => void) | undefined
+  let exited = false
+  const child = {
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+    kill: vi.fn((signal: NodeJS.Signals) => { trace.push(`owner-signal:${signal}`); return fault !== 'signal_not_accepted' }),
+  }
+  const exitProbe = () => {
+    if (exited || !callback) return
+    exited = true
+    trace.push(independent ? 'independent-signal' : 'probe-exit')
+    child.signalCode = 'SIGKILL'
+    control.reads.set(`/proc/${cliPid}/stat`, gone)
+    control.reads.set(`/proc/${insidePid}/stat`, gone)
+    callback(cause, '', '')
+  }
+  setFsOverride('realpathSync', '/virtual/repo', '/virtual/repo')
+  setFsOverride('realpathSync', `/proc/${cliPid}/exe`, fakeCli)
+  setFsOverride('realpathSync', fakeCli, fakeCli)
+  control.reads.set(`/proc/self/task/${process.pid}/children`, `${cliPid}`)
+  control.reads.set(`/proc/${cliPid}/stat`, stat(cliPid))
+  control.reads.set(`/proc/${insidePid}/stat`, stat(insidePid))
+  vi.stubEnv('DOCKER_HOST', 'unix:///virtual/task4-daemon.sock')
+  let nonce = ''
+  control.exec.mockImplementation((program: string, args: string[]) => {
+    if (program === 'git') return 'a'.repeat(40)
+    if (args[0] === 'info') return `${daemonId}\n`
+    if (args[0] === 'top') return `PID ARGS\n${insidePid} node ${nonce}\n`
+    if (args[0] === 'container' && args[1] === 'ls') return ''
+    throw new Error('unexpected controlled Docker operation')
+  })
+  control.execAsync.mockImplementation((_program: string, args: string[], _options: unknown, done: typeof callback) => {
+    nonce = args[args.length - 1]
+    control.reads.set(`/proc/${cliPid}/cmdline`, Buffer.from(`${[fakeCli, ...args].join('\0')}\0`))
+    control.reads.set(`/proc/${insidePid}/cmdline`, Buffer.from(`node\0${nonce}\0`))
+    callback = done
+    return child
+  })
+  const owner = new ManagedRuntimeOwner(() => { throw new Error('unused web factory') }, '/virtual/repo')
+  const lifecyclePath = owner.runtime.lifecyclePath
+  control.reads.set(lifecyclePath, '')
+  Object.defineProperty(owner.runtime, 'broker', { value: {
+    receiptIds: () => new Set([containerId]), receipts: () => [{ containerId }],
+  } })
+  vi.spyOn(owner.runtime, 'recordLifecycle').mockImplementation((event, data) => {
+    trace.push(event)
+    if (event === 'external.provider_probe_signal_attempted' && fault === 'signal_evidence_unavailable') {
+      throw new Error('synthetic-signal-evidence-secret-marker')
+    }
+    // Change only the signal receipt to model an unrelated probe's receipt.
+    const recorded = event === 'external.provider_probe_signal_attempted' && fault === 'different_probe_id'
+      ? { ...data as Record<string, unknown>, probeId: 'unrelated-probe' } : data
+    appendLifecycle(lifecyclePath, event, recorded)
+  })
+  const runtimeCleanup = vi.spyOn(owner.runtime, 'cleanup').mockImplementation(async () => {
+    trace.push('runtime-cleanup')
+    return { ok: true, errors: [] }
+  })
+  vi.spyOn(owner.runtime, 'writeArtifact').mockReturnValue('/virtual/cleanup.json')
+  vi.spyOn(managedCodexCleanupDependencies, 'captureVolumes').mockImplementation(() => {
+    if (failedStage === 'capture') throw cleanupFailure
+    return []
+  })
+  vi.spyOn(managedCodexCleanupDependencies, 'removeVolumes').mockImplementation(() => {
+    if (failedStage === 'remove') throw cleanupFailure
+    return []
+  })
+  const internals = owner as unknown as {
+    trackNativeCapture(work: () => Promise<void>): Promise<void>
+    stopWebAndReleaseHeldHosts(): Promise<void>
+    providerProbes: Map<string, unknown>
+  }
+  const stopWeb = internals.stopWebAndReleaseHeldHosts.bind(owner)
+  vi.spyOn(internals, 'stopWebAndReleaseHeldHosts').mockImplementation(async () => {
+    trace.push('owner-signal-boundary')
+    return stopWeb()
+  })
+  const stop = owner.stop.bind(owner)
+  vi.spyOn(owner, 'stop').mockImplementation(() => { trace.push('owner-stop-start'); return stop() })
+  const nativeCapture = internals.trackNativeCapture(() => capture.promise)
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+    output.push(JSON.parse(String(chunk)) as EventRow); return true
+  }) as typeof process.stdout.write)
+  let finished = false
+  const pending = checkInFlightOwnedProbe({ owner, containerId, owners: [], daemonId,
+    daemonSocket: '/virtual/task4-daemon.sock', dockerCli: fakeCli })
+    .then(() => undefined, error => error).then(result => { finished = true; return result })
+  try {
+    await flushMicrotasks()
+    expect(output.some(row => row.event === 'real_probe.in_flight')).toBe(true)
+    expect(trace).toContain('owner-stop-start')
+    expect(trace).not.toContain('owner-signal-boundary')
+    expect(internals.providerProbes.size).toBe(1)
+    if (independent) {
+      exitProbe()
+      await flushMicrotasks()
+      expect(trace).toContain('external.provider_probe_settled')
+      expect(trace).not.toContain('owner-signal-boundary')
+      expect(child.kill).not.toHaveBeenCalled()
+      expect(internals.providerProbes.size).toBe(0)
+    }
+    capture.resolve()
+    await nativeCapture
+    await flushMicrotasks()
+    expect(trace).toContain('owner-signal-boundary')
+    if (!independent) {
+      expect(child.kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+      expect(runtimeCleanup).not.toHaveBeenCalled()
+      expect(finished).toBe(false)
+      exitProbe()
+    }
+    const failure = await pending
+    expect(runtimeCleanup).toHaveBeenCalledOnce()
+    expect(internals.providerProbes.size).toBe(0)
+    if (!independent) {
+      const rows = String(control.reads.get(lifecyclePath)).trim().split('\n').map(line => JSON.parse(line))
+      const start = rows.find(row => row.event === 'external.provider_probe_started')
+      const attempt = rows.find(row => row.event === 'external.provider_probe_signal_attempted')
+      if (fault === 'signal_evidence_unavailable') {
+        expect(attempt).toBeUndefined()
+      } else {
+        expect(attempt.data).toMatchObject({
+          probeId: fault === 'different_probe_id' ? 'unrelated-probe' : start.data.probeId,
+          signal: 'SIGKILL', sent: fault !== 'signal_not_accepted',
+        })
+      }
+    }
+    if (independent || fault) {
+      if (independent) {
+        expect.soft(trace.indexOf('independent-signal')).toBeLessThan(trace.indexOf('external.provider_probe_settled'))
+        expect.soft(trace.indexOf('external.provider_probe_settled')).toBeLessThan(trace.indexOf('owner-signal-boundary'))
+        expect.soft(child.kill).not.toHaveBeenCalled()
+      }
+      expect.soft(output.some(row => row.event === 'real_probe.case_passed')).toBe(false)
+      expect.soft(nestedErrors(failure)).toContain(cause)
+      expect.soft(output.flatMap(row => Array.isArray(row.failures) ? row.failures : []))
+        .toContainEqual({ phase: 'probe', kind: 'cancellation_unconfirmed' })
+      if (failedStage) {
+        expect.soft(nestedErrors(failure)).toContain(cleanupFailure)
+        expect.soft(output.flatMap(row => Array.isArray(row.failures) ? row.failures : []))
+          .toContainEqual({ phase: 'cleanup', kind: 'exception' })
+      }
+    } else {
+      expect.soft(failure).toBeUndefined()
+      expect.soft(output.some(row => row.event === 'real_probe.case_passed')).toBe(true)
+    }
+    expect(JSON.stringify(output)).not.toContain(cause.message)
+    expect(JSON.stringify(output)).not.toContain(cleanupFailure.message)
+    expect(JSON.stringify(output)).not.toContain('synthetic-signal-evidence-secret-marker')
+  } finally {
+    capture.resolve()
+    exitProbe()
+    await pending
+    stdout.mockRestore()
+  }
+}
+
+it.each([undefined, 'capture', 'remove'] as const)(
+  'does not attribute an independently settled probe to the actual owner (cleanup failure: %s)',
+  async failedStage => { await actualOwnerProbeInterleaving(true, failedStage) },
+)
+
+it('joins the actual owner cancellation before reporting the probe passed', async () => {
+  await actualOwnerProbeInterleaving(false)
+})
+
+it.each(['signal_not_accepted', 'different_probe_id', 'signal_evidence_unavailable'] as const)(
+  'does not confirm cancellation when the actual owner signal evidence has fault %s',
+  async fault => { await actualOwnerProbeInterleaving(false, undefined, fault) },
+)
+
 it.each(['SIGKILL', 'SIGTERM'] as const)(
   'treats an owned probe rejection with %s according to the owner cancellation contract', async signal => {
     const probe = deferred<void>()
@@ -346,14 +543,15 @@ it.each(['SIGKILL', 'SIGTERM'] as const)(
         const args = [fakeCli, 'exec', '--user', '65534:0', containerId, 'env', 'HOME=/home/freshell/provider', ...command]
         control.reads.set(`/proc/${cliPid}/cmdline`, Buffer.from(`${args.join('\0')}\0`))
         control.reads.set(`/proc/${insidePid}/cmdline`, Buffer.from(`node\0${nonce}\0`))
-        control.reads.set(lifecyclePath, `${JSON.stringify({ event: 'external.provider_probe_started', data: { probeId: 'probe-1', containerId } })}\n`)
+        appendLifecycle(lifecyclePath, 'external.provider_probe_started', { probeId: 'probe-1', containerId })
         return probe.promise
       }),
       stop: vi.fn(async () => {
         const gone = Object.assign(new Error('gone'), { code: 'ENOENT' })
         control.reads.set(`/proc/${cliPid}/stat`, gone)
         control.reads.set(`/proc/${insidePid}/stat`, gone)
-        control.reads.set(lifecyclePath, `${control.reads.get(lifecyclePath)}${JSON.stringify({ event: 'external.provider_probe_settled', data: { probeId: 'probe-1' } })}\n`)
+        appendLifecycle(lifecyclePath, 'external.provider_probe_signal_attempted', { probeId: 'probe-1', signal: 'SIGKILL', sent: true })
+        appendLifecycle(lifecyclePath, 'external.provider_probe_settled', { probeId: 'probe-1' })
         probe.reject(rejectedProbe)
         return { ok: true, errors: [] as string[] }
       }),
@@ -424,12 +622,15 @@ it.each([
         const args = [fakeCli, 'exec', '--user', '65534:0', containerId, 'env', 'HOME=/home/freshell/provider', ...command]
         control.reads.set(`/proc/${cliPid}/cmdline`, Buffer.from(`${args.join('\0')}\0`))
         control.reads.set(`/proc/${insidePid}/cmdline`, Buffer.from(`node\0${nonce}\0`))
+        appendLifecycle(lifecyclePath, 'external.provider_probe_started', { probeId: 'probe-1', containerId })
         return probe.promise
       }),
       stop: vi.fn(async () => {
         const gone = Object.assign(new Error('gone'), { code: 'ENOENT' })
         control.reads.set(`/proc/${cliPid}/stat`, gone)
         control.reads.set(`/proc/${insidePid}/stat`, gone)
+        appendLifecycle(lifecyclePath, 'external.provider_probe_signal_attempted', { probeId: 'probe-1', signal: 'SIGKILL', sent: true })
+        appendLifecycle(lifecyclePath, 'external.provider_probe_settled', { probeId: 'probe-1' })
         probe.reject(cancellation)
         return ownerSucceeded ? { ok: true, errors: [] as string[] }
           : { ok: false, errors: ['synthetic-owner-secret-marker'] }

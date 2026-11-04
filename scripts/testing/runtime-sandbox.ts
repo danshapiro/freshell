@@ -6103,13 +6103,17 @@ export class ManagedRuntimeOwner {
 
   private async stopWebAndReleaseHeldHosts(): Promise<void> {
     const errors: unknown[] = []
-    const probes = [...this.providerProbes.values()]
-    for (const probe of probes) {
+    const probes = [...this.providerProbes.entries()]
+    for (const [probeId, probe] of probes) {
       if (probe.child && probe.child.exitCode === null && probe.child.signalCode === null) {
-        try { probe.child.kill('SIGKILL') } catch (error) { errors.push(error) }
+        let sent: boolean
+        try { sent = probe.child.kill('SIGKILL') } catch (error) { errors.push(error); continue }
+        try {
+          this.runtime.recordLifecycle('external.provider_probe_signal_attempted', { severity: 'info', probeId, signal: 'SIGKILL', sent })
+        } catch { errors.push(new Error('owned provider probe signal evidence unavailable')) }
       }
     }
-    await Promise.allSettled(probes.map(probe => probe.settlement))
+    await Promise.allSettled(probes.map(([, probe]) => probe.settlement))
     for (const { handle } of this.heldHosts.values()) {
       try { await this.releaseRuntimeHost(handle) }
       catch (error) {

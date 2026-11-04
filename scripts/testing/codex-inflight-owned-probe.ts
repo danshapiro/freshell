@@ -97,6 +97,22 @@ function rowData(row: Record<string, unknown>): Record<string, unknown> {
   return row.data as Record<string, unknown>
 }
 
+function probeEvidence(owner: ManagedRuntimeOwner, containerId: string, prior: Set<unknown>) {
+  const rows = lifecycle(owner)
+  const starts = rows.filter(row => row.event === 'external.provider_probe_started'
+    && rowData(row).containerId === containerId && !prior.has(rowData(row).probeId))
+  if (starts.length !== 1) return undefined
+  const probeId = rowData(starts[0]).probeId
+  if (typeof probeId !== 'string') return undefined
+  const finishes = rows.filter(row => row.event === 'external.provider_probe_settled' && rowData(row).probeId === probeId)
+  const attempts = rows.filter(row => {
+    if (row.event !== 'external.provider_probe_signal_attempted') return false
+    const data = rowData(row)
+    return data.probeId === probeId && data.signal === 'SIGKILL' && data.sent === true
+  })
+  return { probeId, finishCount: finishes.length, signalAttemptCount: attempts.length }
+}
+
 /**
  * Call once as the final action on an actual live managed rig. Its callers must
  * have joined/closed their own fixture work and supplied every authorized
@@ -161,25 +177,24 @@ export async function checkInFlightOwnedProbe(input: {
     await startCleanup()
     const outcome = await settlement
     assert.equal(stopCalls, 1)
+    assert.equal(ownerStopSucceeded, true, 'the owner stop must succeed')
     assert.equal(inFlightAtStop, true, 'both exact processes must still be present when real stop begins')
     assert.equal(outcome.kind, 'rejected')
     if (outcome.kind !== 'rejected') throw new Error('probe unexpectedly succeeded')
     const cause = outcome.error instanceof Error ? outcome.error.cause as { signal?: string } | undefined : undefined
-    assert.equal(cause?.signal, 'SIGKILL', 'the owned CLI must report the owner cancellation signal')
+    assert.equal(cause?.signal, 'SIGKILL', 'the owned CLI must report SIGKILL')
     assert.equal(sameIdentity(cli), false)
     assert.equal(sameIdentity(inside), false)
     assert.equal(docker('daemon_identity_after_stop', ['info', '--format', '{{.ID}}']), daemonId)
     const listed = docker('container_absence', ['container', 'ls', '-a', '--no-trunc', '--filter', `id=${containerId}`, '--format', '{{.ID}}'])
     assert.equal(listed.split('\n').includes(containerId), false)
-    const rows = lifecycle(owner)
-    const starts = rows.filter(row => row.event === 'external.provider_probe_started'
-      && rowData(row).containerId === containerId && !prior.has(rowData(row).probeId))
-    assert.equal(starts.length, 1)
-    const probeId = rowData(starts[0]).probeId
-    const finishes = rows.filter(row => row.event === 'external.provider_probe_settled' && rowData(row).probeId === probeId)
-    assert.equal(finishes.length, 1)
-    event('real_probe.case_passed', { daemonId, containerId, probeId,
-      cli, containerOperation: inside, signal: cause?.signal ?? null, ownerStopCalls: stopCalls, containerAbsent: true })
+    const evidence = probeEvidence(owner, containerId, prior)
+    assert.ok(evidence, 'exactly one new owned probe is required')
+    assert.equal(evidence.finishCount, 1)
+    assert.equal(evidence.signalAttemptCount, 1, 'the owner must report an accepted signal attempt for this probe')
+    event('real_probe.case_passed', { daemonId, containerId, probeId: evidence.probeId,
+      cli, containerOperation: inside, signal: cause?.signal ?? null, ownerSignalAttempted: true,
+      ownerStopCalls: stopCalls, containerAbsent: true })
   } catch (error) {
     caseFailed = true
     caseError = error
@@ -205,9 +220,13 @@ export async function checkInFlightOwnedProbe(input: {
     && probeResult.status === 'fulfilled' && probeResult.value.kind === 'rejected') {
     const error = probeResult.value.error
     const cause = error instanceof Error ? error.cause as { signal?: string } | undefined : undefined
+    // An accepted signal attempt and a SIGKILL outcome do not identify the
+    // signal sender, but without the matching attempt cancellation is unconfirmed.
+    let matchingSignalAttempt = false
+    try { matchingSignalAttempt = probeEvidence(owner, containerId, prior)?.signalAttemptCount === 1 } catch { /* unconfirmed */ }
     // Capture and removal can fail independently of a successful owner stop.
-    const ownerCancellationProven = ownerStopSucceeded && stopCalls === 1 && inFlightAtStop
-    const expectedCancellation = ownerCancellationProven && cause?.signal === 'SIGKILL'
+    const expectedCancellation = ownerStopSucceeded && stopCalls === 1 && inFlightAtStop
+      && matchingSignalAttempt && cause?.signal === 'SIGKILL'
     if (!expectedCancellation) {
       failures.push({ phase: 'probe', kind: cause?.signal === 'SIGKILL' ? 'cancellation_unconfirmed' : 'unexpected_rejection' })
       errors.push(error)
