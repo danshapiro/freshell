@@ -162,7 +162,7 @@ git status --short
 git rev-parse HEAD
 ~~~
 
-Expected: staged whitespace check exits 0 and the summary shows both new .mjs files as mode 100644, followed by a focused source/tests/docs commit and clean worktree. Record its commit/tree before final-source acceptance. Any later scoped correction requires affected tests and a new commit. Reuse the recorded cold result only when the actual workload and its complete compiled input closure are demonstrated unchanged; otherwise repeat cold acceptance on the corrected source. Attribute the measured source honestly, and run the final full-suite gate on the final committed HEAD.
+Expected: staged whitespace check exits 0 and the summary shows both new .mjs files as mode 100644, followed by a focused source/tests/docs commit and clean worktree. Record its commit/tree before final-source acceptance. Any later scoped correction requires affected tests and a new commit. Reuse a recorded launcher cold result only when the actual workload and complete compiled input closure are unchanged and the launch path, canonical image and relevant runtime configuration are equivalent; otherwise repeat cold acceptance on the corrected source. Attribute the measured source honestly, and run the final full-suite gate on the final committed HEAD.
 
 ## Task 2: Prove actual launcher behavior and cold Clippy in one disposable normal-rootless/systemd guest
 
@@ -214,11 +214,11 @@ Run the actual wrapper with exit 37 and literal exit 137; preserve their exact s
 
 Retain --rm and corroborate published full CID after ordinary auto-removal before wrapper control cleanup. Record actual guest Docker version; source-matched installed-host CLI evidence is not a substitute for its real route. Remove fixture projects after each run.
 
-- [x] **Step 3: Run exact final-source cold supported-toolchain Clippy**
+- [ ] **Step 3: Run exact final-source cold supported-toolchain Clippy**
 
 The completed historical cold measurement below used a directly created task container. The current follow-up must also run this payload through the actual unmodified launcher and canonical image; the historical direct-container result remains separately attributed sizing evidence, not a substitute for that launcher run or its review.
 
-Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it. A later follow-up may reuse the recorded result only after proving that the workload and complete compiled input closure are unchanged; if that proof fails, repeat the cold payload on the corrected source, preserving exact source attribution.
+Commit any scoped correction discovered in Step 2, run its affected verification and repeat affected real smokes before this step. Archive that new clean commit and run the cold payload against it. A later follow-up may reuse the actual-launcher result only after proving that the workload and complete compiled input closure are unchanged and that the launch path, canonical image and relevant runtime configuration are equivalent. If that proof fails, repeat the actual-launcher cold payload on the corrected source, preserving exact source and image attribution.
 
 Use fresh exact-owned target, registry and Git caches. Before invoking the launcher, establish that its actual target volume is empty and rule out inherited target/compiler-cache redirection; bind the running container to that volume. Network/toolchain preparation may not precompile the graph. Record image ABI/UID/tools, source and actual supported toolchain.
 
@@ -246,15 +246,15 @@ Judge observed outcomes separately:
 
 The coordinator and independent review decide whether the actual evidence delivers the requested measured default and contained outcome. If it does not, lower concurrency only through scoped red/green/refactor and rerun affected final-source acceptance, or report FAILED/non-converged. Historical evidence cannot fill a current measurement gap.
 
-- [x] **Step 4: Export, clean exact resources and obtain independent review**
+- [ ] **Step 4: Export, clean exact resources and obtain independent review**
 
 Export commands/statuses, source/image/toolchain manifests, actual jobs, receipts, observed kernel samples and any sampling gaps or tail, complete workload logs, expected-negative cases and failed attempts before deleting temporary source/dependencies/disks. Keep necessary review evidence, not workspace/dependency copies.
 
 Verify recorded containers/volumes are absent and unreferenced; QEMU/outer/sampler/sentinel processes ended; owned keys/disks/seed/temp inputs removed. Verify PID birth identity/cwd/argv before stopping an exact task process. Never broad-kill, delete another task's resource/shared cache, or treat inspection failure as absence. Keep the feature branch/worktree for review.
 
-Obtain this task's the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding. Any further source correction is committed and receives affected verification; reuse cold evidence only after proving its workload and complete compiled input closure unchanged, or repeat acceptance on the corrected source.
+Obtain this task's the-usual fresh specification-plus-quality review of implementation and actual evidence. It must assess final-source attribution, normal rootless/systemd topology, limits before compiler, observed jobs/defaults/overrides, cold graph, measured resource/failure limits, service continuity, metadata privacy and cleanup. Resolve every substantiated finding with the smallest compliant disposition. A generated receipt or mock alone cannot close a real-route finding. Any further source correction is committed and receives affected verification; reuse launcher cold evidence only after proving its workload and complete compiled input closure unchanged and its launch path, canonical image and relevant runtime configuration equivalent, or repeat acceptance on the corrected source.
 
-- [x] **Step 5: Complete the scoped handoff**
+- [ ] **Step 5: Complete the scoped handoff**
 
 Record actual commands, final commit, measured result or qualifying contained failure and limitations, task-review verdicts and evidence paths in the run record. The parent appends the final-HEAD full-suite disposition after both task reviews and before whole-branch review. Unresolved required proof is FAILED/non-converged, never silent success. Launcher/Docker/Cargo integration and smokes provide relevant end-to-end coverage; browser tests add no evidence for this unchanged UI.
 
