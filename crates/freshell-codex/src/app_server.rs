@@ -1053,6 +1053,13 @@ impl ChannelPeer {
         parse_client_frame(&raw)
     }
 
+    /// Await a decoded client frame, returning `None` only when the client closes.
+    /// Invalid frames panic so test drivers do not mistake protocol errors for shutdown.
+    pub async fn next_frame_or_eof(&self) -> Option<ClientFrame> {
+        let raw = self.from_client.lock().await.recv().await?;
+        Some(parse_client_frame(&raw).expect("valid client frame"))
+    }
+
     /// Await the next client REQUEST, panicking if a notification arrives first (test ergonomics).
     pub async fn expect_request(&self) -> (RequestId, String, Value) {
         match self.next_frame().await.expect("client frame") {

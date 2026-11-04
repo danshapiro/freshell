@@ -290,10 +290,19 @@ mod tests {
         let driver = tokio::spawn(async move {
             let mut reads = vec![];
             loop {
-                let request =
-                    tokio::time::timeout(Duration::from_secs(2), peer.expect_request()).await;
-                let Ok((id, method, params)) = request else {
+                let frame = tokio::time::timeout(Duration::from_secs(2), peer.next_frame_or_eof())
+                    .await
+                    .expect("fake app-server timed out waiting for a client request");
+                let Some(frame) = frame else {
                     break;
+                };
+                let (id, method, params) = match frame {
+                    freshell_codex::ClientFrame::Request { id, method, params } => {
+                        (id, method, params)
+                    }
+                    freshell_codex::ClientFrame::Notification { method, .. } => {
+                        panic!("observer dispatched an unexpected notification: {method}")
+                    }
                 };
                 reads.push((method.clone(), params.clone()));
                 if method == "initialize" {
@@ -548,8 +557,18 @@ mod tests {
         let (state,driver) = fixture(json!({"_historyUnavailable":true,"_historyError":"temporary provider read failure","thread":{"id":"child","parentThreadId":"parent","ephemeral":false,"status":{"type":"active"},"turns":[]}})).await;
         let result = state.read_child("parent", "child", None, None).await;
         state.shutdown().await;
-        let _ = driver.await.unwrap();
+        let reads = driver.await.unwrap();
         assert!(matches!(result,Err(ChildReadError::SourceUnavailable)),"temporary source failure must not become pending or permanently missing history: {result:?}");
+        assert!(reads.iter().any(|(method, params)| {
+            method == "thread/read"
+                && params["threadId"] == "child"
+                && params["includeTurns"] == true
+        }));
+        assert!(reads.iter().any(|(method, params)| {
+            method == "thread/read"
+                && params["threadId"] == "child"
+                && params["includeTurns"] == false
+        }));
     }
 
     #[tokio::test]
