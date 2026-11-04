@@ -83,3 +83,4 @@ examples/demo-projects/**/tsconfig.tsbuildinfo
 # Live managed-runtime gate build/evidence (reproducible, never committed).
 /.runtime-build/
 /.runtime-evidence/
+/.runtime-provider-parity-*/
