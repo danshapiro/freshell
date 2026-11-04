@@ -1122,6 +1122,20 @@ async fn dispatch_with_effects(
                         .await
                         .map_err(map_actor_error)?;
                     let after = actor.profile().await;
+                    // gc1p acceptance fix-up: a send-driven reroot (the
+                    // class-(ii) recovery's mint-new) must re-mint the host's
+                    // persisted native identity launch exactly like the
+                    // explicit fork/compact/rollback transitions. The
+                    // supervisor's identity commit advances the registry
+                    // launch's evidence revision; without this commit every
+                    // strict follow-up operation (question resolution,
+                    // capture) is refused against the stale launch binding.
+                    commit_fresh_native_transition(
+                        state,
+                        &actor,
+                        before.native_session_id.as_deref(),
+                    )
+                    .await?;
                     let native_session_id = after.native_session_id.clone();
                     let native_identity =
                         if after.provider == freshell_runtime_protocol::FreshProvider::Codex {
@@ -2683,6 +2697,7 @@ async fn commit_fresh_native_transition(
     if child.as_deref() == parent {
         return Ok(());
     }
+
     let refuse = || {
         RuntimeError::new(
             RuntimeErrorCode::RecoveryWrongIdentity,
@@ -2735,13 +2750,21 @@ async fn commit_fresh_native_transition(
     }
     launch.evidence_revision = launch.evidence_revision.checked_add(1).ok_or_else(refuse)?;
     launch.requested_native_session_id = Some(child.clone());
+    // gc1p acceptance fix-up: a send-driven reroot acknowledges its minted
+    // root through the typed native turn-start ack — the same AcceptedDispatch
+    // evidence class whose supervisor-side identity commit requires no
+    // embedded launch (the ack itself names the accepted child). Every other
+    // evidence shape must still embed the post-transition launch.
+    let accepted_dispatch_ack =
+        evidence["providerEvidence"]["source"].as_str() == Some("native_turn_start_ack");
     if evidence["nativeSessionId"].as_str() != Some(child.as_str())
-        || serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(
-            evidence["launch"].clone(),
-        )
-        .as_ref()
-        .ok()
-            != Some(&launch)
+        || (!accepted_dispatch_ack
+            && serde_json::from_value::<freshell_runtime_protocol::NativeIdentityLaunch>(
+                evidence["launch"].clone(),
+            )
+            .as_ref()
+            .ok()
+                != Some(&launch))
     {
         return Err(refuse());
     }
@@ -10883,6 +10906,11 @@ mod tests {
         captures: AtomicUsize,
         stops: AtomicUsize,
         native_live: AtomicBool,
+        /// The send-ack native identity transition fixture: when set, a
+        /// dispatch answers with this typed mint-new acknowledgement and
+        /// switches the identity evidence to the turn-start-ack shape.
+        send_native_identity:
+            std::sync::Mutex<Option<freshell_runtime_protocol::NativeDispatchIdentity>>,
     }
 
     #[async_trait]
@@ -10924,6 +10952,25 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(logical_attempt_id.map(str::to_owned));
+            if let Some(identity) = self.send_native_identity.lock().unwrap().clone() {
+                // The real transport acknowledges a mint-new root through the
+                // typed native turn-start ack (the same evidence shape
+                // `HostedFreshAgentTransport::dispatch` records).
+                let ack = serde_json::json!({
+                    "source":"native_turn_start_ack",
+                    "requestId":request_id.as_str(),
+                    "nativeSessionId":identity.native_session_id,
+                    "incarnationId":"send-reroot-incarnation",
+                });
+                *self.native_evidence.lock().unwrap() = Some(serde_json::json!({
+                    "nativeSessionId":identity.native_session_id,
+                    "providerEvidence":ack,
+                }));
+                return Ok(DispatchAck {
+                    native_identity: Some(identity),
+                    provider_ack_id: Some(request_id.to_string()),
+                });
+            }
             Ok(DispatchAck {
                 native_identity: None,
                 provider_ack_id: Some(request_id.to_string()),
@@ -11088,6 +11135,7 @@ mod tests {
                     captures: AtomicUsize::new(0),
                     stops: AtomicUsize::new(0),
                     native_live: AtomicBool::new(true),
+                    send_native_identity: std::sync::Mutex::new(None),
                 });
                 let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                     state.state_dir.join("transition-agent"),
@@ -11213,6 +11261,163 @@ mod tests {
         }
     }
 
+    /// gc1p acceptance fix-up: a send-driven reroot (the class-(ii) recovery's
+    /// mint-new, acknowledged through the typed native turn-start ack) must
+    /// re-mint the host's persisted native identity launch exactly like the
+    /// explicit fork/compact/rollback transitions do. The supervisor's
+    /// identity commit advances the registry launch's evidence revision, so a
+    /// host that keeps its pre-transition launch can never prove the current
+    /// committed identity again — every strict follow-up operation (question
+    /// resolution, capture) would be refused with the stale launch binding.
+    #[tokio::test]
+    async fn send_driven_native_reroot_commits_the_host_identity_launch() {
+        let state = test_host_state();
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "send-reroot-rpc".into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("fixture-native-thread".into()),
+        };
+        state.persisted.lock().await.native_identity_launch = Some(binding.clone());
+        state.persisted.lock().await.max_execution_generation = 1;
+        let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(Some(
+                serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
+            )),
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(Some(
+                freshell_runtime_protocol::NativeDispatchIdentity {
+                    previous_native_session_id: "fixture-native-thread".into(),
+                    native_session_id: "fixture-native-minted".into(),
+                    pending_naming_handle: None,
+                },
+            )),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("send-reroot-agent"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Codex,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: Some("fixture-native-thread".into()),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let persisted_before = state.persisted.lock().await.clone();
+        assert!(
+            current_native_observation(&state, &persisted_before)
+                .await
+                .is_some(),
+            "the pre-send observation must prove the pre-crash identity"
+        );
+        let reply = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    checkpoint_logical_attempt_id: None,
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::new(),
+                    text: "AWAITED_PLAN_RECOVERY".into(),
+                    settings: None,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        let HostResult::FreshAgentCommand {
+            native_identity,
+            native_session_id,
+            ..
+        } = reply
+        else {
+            panic!("fresh-agent command reply")
+        };
+        let identity = native_identity.expect("the send ack must carry the mint-new identity");
+        assert_eq!(identity.previous_native_session_id, "fixture-native-thread");
+        assert_eq!(identity.native_session_id, "fixture-native-minted");
+        assert_eq!(
+            native_session_id.as_deref(),
+            Some("fixture-native-minted"),
+            "the reply must report the minted root"
+        );
+        let persisted = state.persisted.lock().await.clone();
+        let launch = persisted
+            .native_identity_launch
+            .as_ref()
+            .expect("the send-driven reroot must keep a persisted launch");
+        assert_eq!(
+            launch.requested_native_session_id.as_deref(),
+            Some("fixture-native-minted"),
+            "the persisted launch must name the minted root"
+        );
+        assert_eq!(
+            launch.evidence_revision, 8,
+            "the persisted launch must advance exactly like the supervisor's identity commit"
+        );
+        let observation = current_native_observation(&state, &persisted)
+            .await
+            .expect("the recovered host must prove its current committed identity");
+        assert!(
+            observation.matches_launch(launch),
+            "the post-recovery observation must match the re-minted launch"
+        );
+        // The strict follow-up operations the parity contract drives after
+        // the recovery (question resolution) must stay admitted on the minted
+        // root: the guard the resolve handler enforces must pass, and the
+        // resolve must reach the actor's decision handling (the fixture
+        // carries no pending control, so the actor answers its typed
+        // unknown-decision verdict — never the guard's identity refusal).
+        ensure_current_fresh_native_observation(&state)
+            .await
+            .unwrap();
+        let resolve = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentResolve {
+                    incarnation_id: state.incarnation_id.clone(),
+                    decision_id: "managed_choice".into(),
+                    decision: serde_json::json!({"managed_choice":"Alpha"}),
+                },
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(
+                &resolve,
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::InvalidRequest,
+                    ..
+                })
+            ),
+            "the resolve must pass the identity guard and reach the actor's decision handling: {resolve:?}"
+        );
+        actor.stop().await.unwrap();
+    }
+
     /// The control plane must keep a worker even inside a half-CPU cgroup
     /// where `available_parallelism()` reports 1. Without the floor, one
     /// long synchronous workload step wedges the supervisor's Stop command
@@ -11265,6 +11470,7 @@ mod tests {
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(None),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("current-native-rpc-agent"),
@@ -11392,6 +11598,7 @@ mod tests {
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(false),
+            send_native_identity: std::sync::Mutex::new(None),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("claude-dead-native-agent"),
@@ -11472,6 +11679,7 @@ mod tests {
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(None),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-fixture-agent"),
@@ -12935,6 +13143,7 @@ mod tests {
                 captures: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
                 native_live: AtomicBool::new(true),
+                send_native_identity: std::sync::Mutex::new(None),
             });
             freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                 state_dir.join("publication-agent"),
@@ -13232,6 +13441,7 @@ mod tests {
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(None),
         })
     }
 
@@ -22659,6 +22869,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(None),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-configure-agent"),
@@ -22824,6 +23035,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(None),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("child-observer"),
@@ -22905,6 +23117,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             native_live: AtomicBool::new(true),
+            send_native_identity: std::sync::Mutex::new(None),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("catalog-observer"),
