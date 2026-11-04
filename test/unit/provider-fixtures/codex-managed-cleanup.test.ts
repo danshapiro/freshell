@@ -1,7 +1,20 @@
 // @vitest-environment node
-import { expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { afterEach, expect, it, vi } from 'vitest'
 
 import { cleanupManagedCodexParity, collectManagedCodexProviderDiagnostics } from '../../helpers/codex-managed-cleanup.js'
+
+vi.mock('node:child_process', async importOriginal => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
+  execFileSync: vi.fn(),
+}))
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllEnvs()
+  vi.useRealTimers()
+})
 
 function deferred() {
   let resolve!: () => void
@@ -37,7 +50,7 @@ function fixture() {
     owners,
     wire: { close: vi.fn(async () => { order.push('wire') }) },
     model: { stop: vi.fn(async () => { order.push('model') }) },
-    finalObservation: vi.fn(async () => ({ state: 'final' })),
+    finalObservation: vi.fn(async (_signal: AbortSignal) => ({ state: 'final' })),
     naming: {
       closeAllConnections: vi.fn(() => { order.push('naming-connections') }),
       close: vi.fn((callback: () => void) => { order.push('naming'); callback() }),
@@ -351,5 +364,289 @@ it('removes owned fixture paths when setup failed before runtime creation', asyn
   expect(f.resources.restoreGrants).toHaveBeenCalledOnce()
   expect(f.dependencies.removeDirectory.mock.calls.map(([directory]) => directory))
     .toEqual(expect.arrayContaining(['/virtual/grants', '/virtual/home']))
+  expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
+})
+
+// The path and Docker I/O boundaries are simulated; the helper itself must
+// bind and check the same environment that the independently qualified guest
+// supplies to the installed-Codex test.
+function qualifiedGuest(order: string[] = []) {
+  const env = {
+    FRESHELL_TASK4_GUEST_QUALIFIED: '1',
+    FRESHELL_TASK4_INSTALLED_CLEANUP_GUARD: '1',
+    FRESHELL_TASK4_DAEMON_ID: 'qualified-daemon',
+    FRESHELL_TASK4_DOCKER_SOCKET: '/qualified/docker.sock',
+    FRESHELL_TASK4_DOCKER_CLI: '/qualified/bin/docker',
+    DOCKER_HOST: 'unix:///qualified/docker.sock',
+    DOCKER_CONTEXT: undefined,
+    DOCKER_CERT_PATH: undefined,
+    DOCKER_TLS_VERIFY: undefined,
+    PATH: '/qualified/bin',
+  }
+  for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value)
+
+  const realpath = fs.realpathSync
+  const access = fs.accessSync
+  const stat = fs.statSync
+  vi.spyOn(fs, 'realpathSync').mockImplementation(((input: fs.PathLike) => {
+    if (String(input).startsWith('/qualified/')) return String(input)
+    return realpath(input)
+  }) as typeof fs.realpathSync)
+  vi.spyOn(fs, 'accessSync').mockImplementation((input, mode) => {
+    if (String(input) === '/qualified/bin/docker') return
+    if (String(input).startsWith('/different/')) throw new Error('not an executable')
+    return access(input, mode)
+  })
+  vi.spyOn(fs, 'statSync').mockImplementation(((input: fs.PathLike) => {
+    if (String(input) === '/qualified/bin/docker') return { isFile: () => true } as fs.Stats
+    if (String(input) === '/qualified/docker.sock') return { isSocket: () => true } as fs.Stats
+    return stat(input)
+  }) as typeof fs.statSync)
+
+  const info = vi.mocked(execFileSync)
+  info.mockReset()
+  info.mockImplementation((() => { order.push('daemon'); return 'qualified-daemon' }) as typeof execFileSync)
+  return info
+}
+
+function expectRetainedWithLocalCleanup(f: ReturnType<typeof fixture>, error: unknown) {
+  expect(error).toBeInstanceOf(AggregateError)
+  expect(nestedErrors(error).map(String).join('\n')).toContain('daemon')
+  expect(f.rig.stop).not.toHaveBeenCalled()
+  expect(f.dependencies.removeVolumes).not.toHaveBeenCalled()
+  expect(f.dependencies.removeDirectory).not.toHaveBeenCalled()
+  expect(f.resources.wire.close).toHaveBeenCalledOnce()
+  expect(f.resources.naming.closeAllConnections).toHaveBeenCalledOnce()
+  expect(f.resources.naming.close).toHaveBeenCalledOnce()
+  expect(f.resources.restoreGrants).toHaveBeenCalledOnce()
+}
+
+it.each(['changed', 'unavailable'])(
+  'retains an early assigned runtime with no owners when the qualified daemon is %s', async state => {
+    const f = fixture()
+    const info = qualifiedGuest(f.order)
+    if (state === 'changed') info.mockReturnValue('replacement-daemon' as never)
+    else info.mockImplementation(() => { throw new Error('private Docker stderr SECRET_VALUE') })
+    const work = { cancel: vi.fn(() => false), join: vi.fn(async () => {}) }
+
+    const error = await cleanupManagedCodexParity({ ...f.resources, owners: [], fixtureWork: work }, f.dependencies)
+      .then(() => undefined, reason => reason)
+
+    expectRetainedWithLocalCleanup(f, error)
+    expect(f.resources.finalObservation).not.toHaveBeenCalled()
+    expect(f.rig.runtime.writeIncident).not.toHaveBeenCalled()
+    expect(f.resources.model.stop).not.toHaveBeenCalled()
+    expect(f.dependencies.captureVolumes).not.toHaveBeenCalled()
+    expect(work.cancel).toHaveBeenCalledOnce()
+    expect(work.join).toHaveBeenCalledOnce()
+    expect(nestedErrors(error).map(String).join('\n')).not.toContain('SECRET_VALUE')
+  },
+)
+
+it.each([
+  ['missing guest qualification', 'FRESHELL_TASK4_GUEST_QUALIFIED', ''],
+  ['missing daemon identity', 'FRESHELL_TASK4_DAEMON_ID', ''],
+  ['malformed daemon identity', 'FRESHELL_TASK4_DAEMON_ID', 'bad\nidentity'],
+  ['relative socket', 'FRESHELL_TASK4_DOCKER_SOCKET', 'docker.sock'],
+  ['relative CLI', 'FRESHELL_TASK4_DOCKER_CLI', 'docker'],
+  ['different effective socket', 'DOCKER_HOST', 'unix:///different/docker.sock'],
+  ['Docker context override', 'DOCKER_CONTEXT', 'other-context'],
+  ['Docker certificate override', 'DOCKER_CERT_PATH', '/different/certs'],
+  ['Docker TLS override', 'DOCKER_TLS_VERIFY', '1'],
+  ['different effective CLI', 'PATH', '/different/bin'],
+])('rejects a qualified cleanup with %s before contacting Docker', async (_description, key, value) => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  vi.stubEnv(key, value)
+  const error = await cleanupManagedCodexParity({ ...f.resources, owners: [] }, f.dependencies)
+    .then(() => undefined, reason => reason)
+  expectRetainedWithLocalCleanup(f, error)
+  expect(info).not.toHaveBeenCalled()
+  expect(f.resources.finalObservation).not.toHaveBeenCalled()
+  expect(f.resources.model.stop).not.toHaveBeenCalled()
+  expect(f.dependencies.captureVolumes).not.toHaveBeenCalled()
+})
+
+it('checks the environment-bound daemon before observations and again immediately before owner stop', async () => {
+  const f = fixture()
+  const info = qualifiedGuest(f.order)
+  await cleanupManagedCodexParity(f.resources, f.dependencies)
+
+  expect(info).toHaveBeenCalledTimes(2)
+  expect(info).toHaveBeenCalledWith('docker', ['info', '--format', '{{.ID}}'], expect.objectContaining({ timeout: expect.any(Number) }))
+  expect(f.order).toEqual([
+    'daemon', 'incident', 'wire', 'model', 'capture', 'daemon', 'runtime', 'volumes',
+    'naming-connections', 'naming', 'restore', '/virtual/grants', '/virtual/home',
+  ])
+})
+
+it('retains captured resources when the daemon changes before the actual owner stop', async () => {
+  const f = fixture()
+  const info = qualifiedGuest(f.order)
+  info.mockImplementationOnce((() => { f.order.push('daemon'); return 'qualified-daemon' }) as typeof execFileSync)
+  info.mockImplementationOnce((() => { f.order.push('daemon'); return 'replacement-daemon' }) as typeof execFileSync)
+  const error = await cleanupManagedCodexParity(f.resources, f.dependencies).then(() => undefined, reason => reason)
+
+  expectRetainedWithLocalCleanup(f, error)
+  expect(f.resources.finalObservation).toHaveBeenCalledOnce()
+  expect(f.resources.model.stop).toHaveBeenCalledOnce()
+  expect(f.dependencies.captureVolumes).toHaveBeenCalledOnce()
+  expect(info).toHaveBeenCalledTimes(2)
+  expect(f.order.indexOf('capture')).toBeLessThan(f.order.lastIndexOf('daemon'))
+})
+
+it.each([
+  ['effective socket', 'DOCKER_HOST', 'unix:///different/docker.sock'],
+  ['effective CLI', 'PATH', '/different/bin'],
+  ['context', 'DOCKER_CONTEXT', 'other-context'],
+])('rechecks the %s immediately before stop', async (_description, key, value) => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  f.dependencies.captureVolumes.mockImplementation(() => {
+    vi.stubEnv(key, value)
+    return f.captured
+  })
+  const error = await cleanupManagedCodexParity(f.resources, f.dependencies).then(() => undefined, reason => reason)
+  expectRetainedWithLocalCleanup(f, error)
+  expect(info).toHaveBeenCalledOnce()
+  expect(f.dependencies.captureVolumes).toHaveBeenCalledOnce()
+})
+
+it('keeps the original admitted daemon identity when its environment value changes during cleanup', async () => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  f.dependencies.captureVolumes.mockImplementation(() => {
+    vi.stubEnv('FRESHELL_TASK4_DAEMON_ID', 'replacement-daemon')
+    return f.captured
+  })
+  info.mockReturnValueOnce('qualified-daemon' as never).mockReturnValueOnce('replacement-daemon' as never)
+  const error = await cleanupManagedCodexParity(f.resources, f.dependencies).then(() => undefined, reason => reason)
+  expectRetainedWithLocalCleanup(f, error)
+})
+
+it('checks the daemon on the grace-timer owner-stop path', async () => {
+  vi.useFakeTimers()
+  const f = fixture()
+  const info = qualifiedGuest()
+  info.mockReturnValueOnce('qualified-daemon' as never).mockReturnValueOnce('replacement-daemon' as never)
+  const observation = deferred()
+  f.resources.finalObservation.mockImplementation(async signal => {
+    signal.addEventListener('abort', () => observation.reject(new Error('observation cancelled')), { once: true })
+    await observation.promise
+    return { state: 'final' }
+  })
+  const result = cleanupManagedCodexParity(f.resources, f.dependencies).then(() => undefined, reason => reason)
+  try {
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(30_000)
+    const error = await result
+    expectRetainedWithLocalCleanup(f, error)
+    expect(info).toHaveBeenCalledTimes(2)
+    expect(nestedErrors(error).map(String).join('\n')).toContain('grace period')
+  } finally {
+    observation.resolve()
+    await flushMicrotasks()
+    vi.clearAllTimers()
+  }
+})
+
+it('reports unresolved work rather than waiting forever when the changed daemon cannot stop an active probe', async () => {
+  vi.useFakeTimers()
+  const f = fixture()
+  const info = qualifiedGuest()
+  info.mockReturnValueOnce('qualified-daemon' as never).mockReturnValueOnce('replacement-daemon' as never)
+  const observation = deferred()
+  let finished = false
+  f.resources.finalObservation.mockImplementation(async () => { await observation.promise; return { state: 'final' } })
+  const result = cleanupManagedCodexParity(f.resources, f.dependencies).then(
+    () => { finished = true; return undefined }, error => { finished = true; return error },
+  )
+  try {
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(finished).toBe(true)
+    const error = await result
+    expectRetainedWithLocalCleanup(f, error)
+    expect(nestedErrors(error).map(String).join('\n')).toContain('unresolved')
+  } finally {
+    observation.resolve()
+    await flushMicrotasks()
+    vi.clearAllTimers()
+  }
+})
+
+it('reports unresolved fixture work after a failed identity check and retains its directories', async () => {
+  vi.useFakeTimers()
+  const f = fixture()
+  qualifiedGuest().mockReturnValue('replacement-daemon' as never)
+  const joining = deferred()
+  const work = { cancel: vi.fn(() => true), join: vi.fn(() => joining.promise) }
+  let finished = false
+  const result = cleanupManagedCodexParity({ ...f.resources, fixtureWork: work }, f.dependencies).then(
+    () => { finished = true; return undefined }, error => { finished = true; return error },
+  )
+  try {
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(finished).toBe(true)
+    const error = await result
+    expectRetainedWithLocalCleanup(f, error)
+    expect(work.cancel).toHaveBeenCalledOnce()
+    expect(work.join).toHaveBeenCalledOnce()
+    expect(nestedErrors(error).map(String).join('\n')).toContain('unresolved')
+  } finally {
+    joining.resolve()
+    await flushMicrotasks()
+    vi.clearAllTimers()
+  }
+})
+
+it('still stops a confirmed qualified owner after volume capture fails', async () => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  const failure = new Error('volume capture failed')
+  f.dependencies.captureVolumes.mockImplementation(() => { throw failure })
+  const error = await cleanupManagedCodexParity(f.resources, f.dependencies).then(() => undefined, reason => reason)
+  expect(nestedErrors(error)).toContain(failure)
+  expect(info).toHaveBeenCalledTimes(2)
+  expect(f.rig.stop).toHaveBeenCalledOnce()
+  expect(f.dependencies.removeVolumes).not.toHaveBeenCalled()
+  expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
+})
+
+it('keeps no-rig cleanup harmless even when qualified guest inputs are unavailable', async () => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  vi.stubEnv('FRESHELL_TASK4_DAEMON_ID', '')
+  await cleanupManagedCodexParity({ ...f.resources, rig: undefined, wire: undefined, model: undefined,
+    finalObservation: undefined }, f.dependencies)
+  expect(info).not.toHaveBeenCalled()
+  expect(f.dependencies.captureVolumes).not.toHaveBeenCalled()
+  expect(f.dependencies.removeVolumes).not.toHaveBeenCalled()
+  expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
+  expect(f.resources.restoreGrants).toHaveBeenCalledOnce()
+})
+
+it('leaves the common qualified lifecycle unchanged without the installed cleanup opt-in', async () => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  vi.stubEnv('FRESHELL_TASK4_INSTALLED_CLEANUP_GUARD', undefined)
+  vi.stubEnv('FRESHELL_TASK4_DAEMON_ID', '')
+  await cleanupManagedCodexParity(f.resources, f.dependencies)
+  expect(info).not.toHaveBeenCalled()
+  expect(f.rig.stop).toHaveBeenCalledOnce()
+  expect(f.dependencies.removeVolumes).toHaveBeenCalledOnce()
+  expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
+})
+
+it('leaves ordinary nonqualified cleanup unchanged', async () => {
+  const f = fixture()
+  const info = qualifiedGuest()
+  vi.stubEnv('FRESHELL_TASK4_INSTALLED_CLEANUP_GUARD', undefined)
+  vi.stubEnv('FRESHELL_TASK4_GUEST_QUALIFIED', undefined)
+  await cleanupManagedCodexParity(f.resources, f.dependencies)
+  expect(info).not.toHaveBeenCalled()
+  expect(f.rig.stop).toHaveBeenCalledOnce()
+  expect(f.dependencies.removeVolumes).toHaveBeenCalledOnce()
   expect(f.dependencies.removeDirectory).toHaveBeenCalledTimes(2)
 })
