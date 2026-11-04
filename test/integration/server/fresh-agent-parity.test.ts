@@ -1033,6 +1033,7 @@ tool_timeout_sec = 120
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
+    if (!beforeCrash.view) throw new Error('Owned Codex runtime is missing before the native crash')
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
     // Kill only this receipt-owned, inspected release native PID. Archive its
