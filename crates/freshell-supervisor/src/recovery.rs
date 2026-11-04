@@ -4458,6 +4458,27 @@ impl Supervisor {
                 .preserve_nonloss_probe(soul_id, trigger, final_probe, context.write_fence())
                 .await;
         }
+        // Keep certificate construction and cleanup out of the polling frame
+        // that revalidates the host. Otherwise its large owned state remains
+        // on the stack while that final probe decodes a host reply.
+        Box::pin(self.certify_observed_loss(
+            soul_id,
+            trigger,
+            definitive_probe,
+            final_probe,
+            context,
+        ))
+        .await
+    }
+
+    async fn certify_observed_loss(
+        &self,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+        definitive_probe: RecoveryProbe,
+        final_probe: RecoveryProbe,
+        context: RecoveryContext,
+    ) -> Result<RecoveryResult, RuntimeError> {
         let path_evidence = match self
             .collect_loss_path_evidence(&context, &final_probe)
             .await
