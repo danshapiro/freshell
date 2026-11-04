@@ -7,6 +7,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ensureClaudeSidecarDependencies } from '../../../scripts/ensure-claude-sidecar.js'
+import { dependencyCacheIdentity } from '../../../docker/sandbox/dependency-cache.mjs'
 
 const SDK_NAME = '@anthropic-ai/claude-agent-sdk'
 const SDK_VERSION = '0.3.237'
@@ -209,6 +210,61 @@ function captureError(action: () => unknown): Error {
   }
   throw new Error('expected the action to throw')
 }
+
+function prepareSandboxFixture(fixture: WorkspaceFixture) {
+  const metadataDir = path.join(fixture.repoRoot, 'sandbox-metadata')
+  const foundation = `sha256:${'a'.repeat(64)}`
+  mkdirSync(metadataDir)
+  writeFileSync(path.join(metadataDir, 'foundation-id'), foundation)
+  const protocol = { version: 2, image: 'freshell-sandbox:dependencies-v2', cacheSuffix: 'dependencies-v2' }
+  writeFileSync(path.join(metadataDir, 'protocol.json'), JSON.stringify(protocol))
+  mkdirSync(path.join(fixture.repoRoot, 'docker/sandbox'), { recursive: true })
+  writeFileSync(path.join(fixture.repoRoot, 'docker/sandbox/protocol.json'), JSON.stringify(protocol))
+  const key = dependencyCacheIdentity(fixture.repoRoot, foundation, protocol.version)
+  const statePath = path.join(fixture.repoRoot, 'node_modules/.sandbox-deps-state')
+  mkdirSync(path.dirname(statePath), { recursive: true })
+  writeFileSync(statePath, `manager=pnpm\nmanager_version=${PNPM_VERSION}\nfingerprint=${'b'.repeat(64)}\ncache_identity=${key}\n`)
+  return { metadataDir, statePath, key, env: { ...fixture.env, FRESHELL_SANDBOX_DEPENDENCY_READONLY: '1', FRESHELL_SANDBOX_DEPENDENCY_KEY: key } }
+}
+
+describe('read-only prepared sandbox sidecar dependencies', () => {
+  it('reuses verified installed dependencies without a separate sidecar receipt, installer, or write', () => {
+    const fixture = buildWorkspaceFixture()
+    const prepared = prepareSandboxFixture(fixture)
+    const stateBefore = readFileSync(prepared.statePath, 'utf8')
+    const { execFileSync, invocations } = createSpawnSeam()
+
+    const receipt = ensureSidecar(fixture, execFileSync, { env: prepared.env, sandboxMetadataDir: prepared.metadataDir })
+
+    expect(receipt).toMatchObject({ repaired: false, packageVersion: SDK_VERSION, packageManagerVersion: PNPM_VERSION })
+    expect(invocations).toHaveLength(0)
+    expect(existsSync(fixture.receiptPath)).toBe(false)
+    expect(readFileSync(prepared.statePath, 'utf8')).toBe(stateBefore)
+  })
+
+  it.each([
+    ['SDK version', (f: WorkspaceFixture) => f.writeSdk('0.3.100')],
+    ['SDK entrypoint', (f: WorkspaceFixture) => rmSync(path.join(f.sidecarDir, 'node_modules', SDK_NAME, 'index.mjs'))],
+    ['native package', (f: WorkspaceFixture) => rmSync(path.join(f.sidecarDir, 'node_modules', `${SDK_NAME}-${process.platform}-${process.arch}`), { recursive: true })],
+    ['dependency input', (f: WorkspaceFixture) => writeFileSync(f.lockPath, 'changed input')],
+    ['missing state', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => rmSync(p.statePath)],
+    ['unreadable state', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => { rmSync(p.statePath); mkdirSync(p.statePath) }],
+    ['stale identity', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => writeFileSync(p.statePath, readFileSync(p.statePath, 'utf8').replace(p.key, '0'.repeat(64)))],
+    ['unpinned manager', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => writeFileSync(p.statePath, readFileSync(p.statePath, 'utf8').replace(PNPM_VERSION, '0.0.1'))],
+    ['unqualified selection', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => { delete (p.env as NodeJS.ProcessEnv).FRESHELL_SANDBOX_DEPENDENCY_KEY }],
+    ['missing metadata', (_f: WorkspaceFixture, p: ReturnType<typeof prepareSandboxFixture>) => rmSync(p.metadataDir, { recursive: true })],
+  ] as const)('refuses invalid %s without installing or writing despite a current sidecar receipt', (_name, invalidate) => {
+    const fixture = buildWorkspaceFixture({ writeReceipt: true })
+    const prepared = prepareSandboxFixture(fixture)
+    const receiptBefore = readFileSync(fixture.receiptPath, 'utf8')
+    invalidate(fixture, prepared)
+    const { execFileSync, invocations } = createSpawnSeam()
+
+    expect(() => ensureSidecar(fixture, execFileSync, { env: prepared.env, sandboxMetadataDir: prepared.metadataDir })).toThrow(/read-only sandbox/i)
+    expect(invocations).toHaveLength(0)
+    expect(readFileSync(fixture.receiptPath, 'utf8')).toBe(receiptBefore)
+  })
+})
 
 describe('Claude sidecar dependency readiness and repair', () => {
   it('returns a ready receipt without spawning pnpm when the installation and fingerprint are current', () => {
