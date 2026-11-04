@@ -11824,7 +11824,11 @@ mod tests {
     /// bridge beside the committed terminal owner.
     #[tokio::test]
     async fn an_attach_after_a_terminal_handoff_is_refused_typed() {
-        let (mut st, _killed) = state().await;
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
@@ -11874,11 +11878,12 @@ mod tests {
             ),
             freshell_ownership::CommitOutcome::Committed
         ));
+        while rx.try_recv().is_ok() {}
 
         // THE DELAYED ATTACH: the session is still in the lane's map —
         // the terminal-owner gate must answer the TYPED refusal (never
         // the wildcard reuse that restarts the serve bridge).
-        st.handle_attach_events(FreshAgentAttach {
+        let mut attach = FreshAgentAttach {
             request_id: None,
             view_id: None,
             tab_id: None,
@@ -11891,8 +11896,23 @@ mod tests {
             observed_generation: None,
             resume_session_id: None,
             session_ref: None,
-        })
-        .await;
+        };
+        attach.request_id = Some("opencode-terminal-handoff-attach".into());
+        attach.view_id = Some("opencode-terminal-handoff-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
+
+        let frames = captured.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1, "one requester settlement: {frames:?}");
+        assert!(matches!(
+            &frames[0],
+            ServerMessage::FreshAgentAttachFailed(failed)
+                if failed.request_id == "opencode-terminal-handoff-attach"
+                    && failed.view_id.as_deref() == Some("opencode-terminal-handoff-view")
+                    && failed.session_id == real_id
+                    && failed.code == "SESSION_RESERVED"
+        ));
+        assert!(rx.try_recv().is_err(), "reservation is requester-scoped");
 
         assert!(
             matches!(
@@ -15124,13 +15144,26 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_attach_events(attach_msg("does-not-exist")).await;
+        let mut attach = attach_msg("does-not-exist");
+        attach.request_id = Some("opencode-missing-attach".into());
+        attach.view_id = Some("opencode-missing-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
 
-        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "freshAgent.event");
-        assert_eq!(frame["sessionId"], "does-not-exist");
-        assert_eq!(frame["event"]["type"], "freshAgent.error");
-        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+        let frames = captured.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1, "one attach settlement: {frames:?}");
+        assert!(matches!(
+            &frames[0],
+            ServerMessage::FreshAgentAttachFailed(failed)
+                if failed.request_id == "opencode-missing-attach"
+                    && failed.view_id.as_deref() == Some("opencode-missing-view")
+                    && failed.session_id == "does-not-exist"
+                    && failed.code == "INVALID_SESSION_ID"
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the missing-session result is requester-only"
+        );
     }
 
     /// THE FIX (defect 2, opencode half): a durable `ses_*` session the shared `opencode
@@ -15234,17 +15267,55 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_attach_events(attach_msg("ses_some_durable_id"))
-            .await;
+        let mut attach = attach_msg("ses_some_durable_id");
+        attach.request_id = Some("opencode-resume-failure".into());
+        attach.view_id = Some("opencode-failure-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
 
-        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
+        let replies = captured.lock().expect("capture mutex").clone();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a failed attach has one settlement: {replies:?}"
+        );
+        assert!(matches!(
+            &replies[0],
+            ServerMessage::FreshAgentAttachFailed(failed)
+                if failed.request_id == "opencode-resume-failure"
+        ));
+        assert!(rx.try_recv().is_err(), "attach failure is requester-scoped");
+    }
+
+    #[tokio::test]
+    async fn attach_half_fence_is_a_requester_scoped_typed_failure() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+        let mut attach = attach_msg("opencode-half-fenced");
+        attach.request_id = Some("opencode-half-fence-attach".into());
+        attach.view_id = Some("opencode-half-fence-view".into());
+        attach.observed_epoch = Some(3);
+        let (reply, captured) = capturing_sink();
+
+        st.handle_attach(attach, reply).await;
+
+        let frames = captured.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1, "one attach settlement: {frames:?}");
+        assert!(matches!(
+            &frames[0],
+            ServerMessage::FreshAgentAttachFailed(failed)
+                if failed.request_id == "opencode-half-fence-attach"
+                    && failed.view_id.as_deref() == Some("opencode-half-fence-view")
+                    && failed.code == "INVALID_FENCE"
+        ));
         assert!(
-            frame["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("OPENCODE_ATTACH_RESUME_FAILED:"),
-            "{frame}"
+            st.sessions.lock().await.is_empty(),
+            "invalid attach must not resume"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid-fence failure is requester-only"
         );
     }
 
@@ -16431,17 +16502,31 @@ mod tests {
                 .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
             "the claim's revive fired even though the conditional refresh write was skipped"
         );
-        // The V7 gate held: the ONLY bindings entry for the session is the
-        // lineage seed — no laundered defaults row was written by the resume.
+        // The V7 gate held: resume records an identity rebind with
+        // `SettingsUpdate::Keep`, not a laundered defaults snapshot. The log
+        // therefore has the lineage seed plus the one identity rebind.
+        let bindings = fake.bindings.lock().unwrap();
+        let session_bindings: Vec<_> = bindings
+            .iter()
+            .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+            .collect();
         assert_eq!(
-            fake.bindings
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
-                .count(),
-            1,
-            "no laundered settings write for the lineage-only attach"
+            session_bindings.len(),
+            2,
+            "the lineage seed and one identity rebind are recorded"
+        );
+        assert!(matches!(
+            &session_bindings[1].settings,
+            crate::identity_sink::SettingsUpdate::Keep
+        ));
+        drop(bindings);
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "the conn-less lineage attach must not create default settings"
+        );
+        assert!(
+            !fake.was_recorded("opencode", DURABLE_ID),
+            "the conn-less lineage attach remains unrecorded after identity rebind"
         );
     }
 
@@ -16640,7 +16725,21 @@ mod tests {
         fake.seed_recorded_only("opencode", DURABLE_ID);
         state.set_identity_sink(fake);
 
-        state.handle_attach_events(attach_msg(DURABLE_ID)).await;
+        let mut attach = attach_msg(DURABLE_ID);
+        attach.request_id = Some("opencode-settings-warning-attach".into());
+        attach.view_id = Some("opencode-settings-warning-view".into());
+        let (reply, captured) = capturing_sink();
+        state.handle_attach(attach, reply).await;
+        let replies = captured.lock().expect("capture mutex").clone();
+        assert!(replies.iter().any(|frame| matches!(
+            frame,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "opencode-settings-warning-attach"
+                    && attached.session_id == DURABLE_ID
+        )), "settings recovery warning must not turn successful resume into attach failure: {replies:?}");
+        assert!(replies
+            .iter()
+            .all(|frame| !matches!(frame, ServerMessage::FreshAgentAttachFailed(_))));
 
         let mut found = false;
         while let Ok(frame) =
@@ -27933,7 +28032,7 @@ mod tests {
 
         // THE MAP-HIT FENCED ATTACH — the incident's three wasted attempts,
         // now the documented recovery verb.
-        st.handle_attach_events(FreshAgentAttach {
+        let mut attach = FreshAgentAttach {
             request_id: None,
             view_id: None,
             tab_id: None,
@@ -27946,8 +28045,30 @@ mod tests {
             observed_generation: Some(before.generation),
             resume_session_id: None,
             session_ref: None,
-        })
-        .await;
+        };
+        attach.request_id = Some("opencode-map-hit-recovery-attach".into());
+        attach.view_id = Some("opencode-map-hit-recovery-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
+
+        let frames = captured.lock().unwrap().clone();
+        let attached: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ServerMessage::FreshAgentAttached(attached) => Some(attached),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attached.len(), 1, "one requester result: {frames:?}");
+        assert!(matches!(
+            attached[0],
+            attached
+                if attached.request_id == "opencode-map-hit-recovery-attach"
+                    && attached.view_id.as_deref() == Some("opencode-map-hit-recovery-view")
+                    && attached.session_id == durable
+                    && attached.status == "idle"
+                    && attached.snapshot.as_ref().is_some_and(|snapshot| snapshot["status"] == "idle")
+        ));
 
         assert!(
             spawns.load(Ordering::SeqCst) > spawns_before,
@@ -27960,14 +28081,13 @@ mod tests {
             session_serve_bridge_alive(&st, &durable).await,
             "the attach must re-bridge the session"
         );
-        let frames = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.session.snapshot", Some("idle"))
-                && f["sessionId"].as_str() == Some(durable.as_str())
-        })
-        .await;
+        let frames = drain_frames(&mut rx);
         assert!(
-            !frames.is_empty(),
-            "the attach tail's snapshot push must arrive: {frames:?}"
+            !frames.iter().any(|frame| {
+                is_event(frame, "freshAgent.session.snapshot", Some("idle"))
+                    && frame["sessionId"].as_str() == Some(durable.as_str())
+            }),
+            "the synthetic attach snapshot is requester-only: {frames:?}"
         );
     }
 

@@ -7777,24 +7777,41 @@ pub(crate) mod tests {
     /// half-fence combinations refuse; nothing is spawned or resumed.
     #[tokio::test]
     async fn handle_attach_refuses_each_half_fenced_observation_typed() {
-        for (epoch, generation) in [(Some(3u64), None), (None, Some(7u64))] {
+        for (index, (session_type, suffix, epoch, generation)) in [
+            (SessionType::Freshclaude, "freshclaude", Some(3u64), None),
+            (SessionType::Freshclaude, "freshclaude", None, Some(7u64)),
+            (SessionType::Kilroy, "kilroy", Some(3u64), None),
+            (SessionType::Kilroy, "kilroy", None, Some(7u64)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (st, mut rx) = state_with_bus();
-            let mut msg = attach_msg("half-fenced");
+            let mut msg = attach_msg(&format!("{suffix}-half-fenced"));
+            msg.session_type = session_type;
+            msg.request_id = Some(format!("claude-half-fence-{index}"));
+            msg.view_id = Some(format!("claude-half-fence-view-{index}"));
             msg.observed_epoch = epoch;
             msg.observed_generation = generation;
+            let (reply, captured) = capturing_sink();
 
-            st.attach_for_test(msg).await;
+            st.handle_attach(msg, reply).await;
 
-            let raw = rx.try_recv().expect("the typed refusal frame");
-            let frame: Value = serde_json::from_str(&raw).unwrap();
-            assert_eq!(frame["type"], "freshAgent.event", "{frame}");
-            assert_eq!(frame["event"]["type"], "freshAgent.error", "{frame}");
-            assert_eq!(frame["event"]["code"], "INVALID_FENCE", "{frame}");
+            let frames = captured_json(&captured);
+            assert_eq!(frames.len(), 1, "one attach settlement: {frames:?}");
+            assert_eq!(frames[0]["type"], "freshAgent.attach.failed", "{frames:?}");
+            assert_eq!(frames[0]["requestId"], format!("claude-half-fence-{index}"));
+            assert_eq!(
+                frames[0]["viewId"],
+                format!("claude-half-fence-view-{index}")
+            );
+            assert_eq!(frames[0]["code"], "INVALID_FENCE", "{frames:?}");
+            assert!(frames[0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("together")));
             assert!(
-                frame["event"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("together")),
-                "the refusal names the pair rule: {frame}"
+                rx.try_recv().is_err(),
+                "the malformed-fence failure is requester-only"
             );
             // Nothing was spawned or resumed: the sessions map stays empty.
             assert!(
@@ -7808,17 +7825,32 @@ pub(crate) mod tests {
     /// must echo the message's session type or the client builds the wrong locator and the
     /// pane never goes `.lost`.
     #[tokio::test]
-    async fn handle_attach_untracked_kilroy_session_keeps_kilroy_session_type() {
+    async fn public_attach_missing_session_keeps_freshclaude_and_kilroy_types() {
         let (st, mut rx) = state_with_bus();
-        let mut msg = attach_msg("kilroy-gone");
-        msg.session_type = SessionType::Kilroy;
+        for (session_type, suffix) in [
+            (SessionType::Freshclaude, "freshclaude"),
+            (SessionType::Kilroy, "kilroy"),
+        ] {
+            let mut msg = attach_msg(&format!("{suffix}-gone"));
+            msg.session_type = session_type;
+            msg.request_id = Some(format!("{suffix}-gone-attach"));
+            msg.view_id = Some(format!("{suffix}-gone-view"));
+            let (reply, captured) = capturing_sink();
+            st.handle_attach(msg, reply).await;
 
-        st.attach_for_test(msg).await;
-
-        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["sessionType"], "kilroy");
-        assert_eq!(frame["provider"], "claude");
-        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+            let frames = captured_json(&captured);
+            assert_eq!(frames.len(), 1, "one attach settlement: {frames:?}");
+            assert_eq!(frames[0]["type"], "freshAgent.attach.failed");
+            assert_eq!(frames[0]["requestId"], format!("{suffix}-gone-attach"));
+            assert_eq!(frames[0]["viewId"], format!("{suffix}-gone-view"));
+            assert_eq!(frames[0]["sessionType"], suffix);
+            assert_eq!(frames[0]["provider"], "claude");
+            assert_eq!(frames[0]["code"], "INVALID_SESSION_ID");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the missing-session result is requester-only"
+        );
     }
 
     /// A page observing a live UUID receives its current status without
@@ -7826,15 +7858,41 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn handle_attach_tracked_session_acknowledges_its_status() {
         let (st, mut rx) = state_with_bus();
-        let id = uuid::Uuid::new_v4().to_string();
-        insert_fake_claude_session(&st, &id).await;
+        for (session_type, suffix) in [
+            (SessionType::Freshclaude, "freshclaude"),
+            (SessionType::Kilroy, "kilroy"),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            insert_fake_claude_session(&st, &id).await;
+            let mut msg = attach_msg(&id);
+            msg.session_type = session_type;
+            msg.request_id = Some(format!("{suffix}-tracked-idle-attach"));
+            msg.view_id = Some(format!("{suffix}-tracked-idle-view"));
+            let (reply, captured) = capturing_sink();
 
-        st.attach_for_test(attach_msg(&id)).await;
+            st.handle_attach(msg, reply).await;
 
-        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
-        assert_eq!(frame["sessionId"], id);
-        assert_eq!(frame["event"]["status"], "idle");
-        assert_eq!(st.sessions.lock().await.len(), 1);
+            let frames = captured_json(&captured);
+            let attached: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame["type"] == "freshAgent.attached")
+                .collect();
+            assert_eq!(attached.len(), 1, "one attach settlement: {frames:?}");
+            assert_eq!(
+                attached[0]["requestId"],
+                format!("{suffix}-tracked-idle-attach")
+            );
+            assert_eq!(attached[0]["viewId"], format!("{suffix}-tracked-idle-view"));
+            assert_eq!(attached[0]["sessionId"], id);
+            assert_eq!(attached[0]["sessionType"], suffix);
+            assert_eq!(attached[0]["status"], "idle");
+            assert_eq!(attached[0]["snapshot"]["status"], "idle");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the live attach snapshot is requester-only"
+        );
+        assert_eq!(st.sessions.lock().await.len(), 2);
     }
 
     // ── freshAgent.attach: resume-on-attach (restart parity, Task 6) ──────────────
@@ -7980,8 +8038,11 @@ pub(crate) mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
 
         let (st, mut rx) = state_with_bus();
-        st.attach_for_test(attach_msg_with_resume("client-nanoid-1", durable))
-            .await;
+        let mut attach = attach_msg_with_resume("client-nanoid-1", durable);
+        attach.request_id = Some("claude-cold-resume-attach".into());
+        attach.view_id = Some("claude-cold-resume-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         // A legacy pane now observes the canonical runtime.
@@ -7996,11 +8057,30 @@ pub(crate) mod tests {
             log.contains(durable),
             "sidecar create must carry the resume boot"
         );
-        // Idle snapshot frame, tagged with the client's id + the durable timeline id.
-        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
-        assert_eq!(frame["sessionId"], durable);
-        assert_eq!(frame["event"]["status"], "idle");
-        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        // The requester receives the resolved idle snapshot in its typed result;
+        // a peer sees canonical runtime events but no attach-only snapshot.
+        let frames = captured_json(&captured);
+        let attached = frames
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.attached")
+            .expect("the public attach result");
+        assert_eq!(attached["requestId"], "claude-cold-resume-attach");
+        assert_eq!(attached["viewId"], "claude-cold-resume-view");
+        assert_eq!(attached["sessionId"], durable);
+        assert_eq!(attached["status"], "idle");
+        assert_eq!(attached["snapshot"]["status"], "idle");
+        assert_eq!(attached["snapshot"]["timelineSessionId"], durable);
+        let shared: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert!(
+            !shared.iter().any(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["sessionId"] == durable
+            }),
+            "the cold-resume snapshot is requester-scoped: {shared:?}"
+        );
         drop(env);
     }
 
@@ -8022,21 +8102,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn attach_transient_spawn_failure_is_not_a_lost_frame() {
+    async fn public_attach_transient_spawn_failure_is_requester_scoped_for_both_modes() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let home = tempfile::tempdir().unwrap();
-        let durable = "99999999-9999-4999-8999-999999999999";
-        write_fake_transcript(home.path(), durable);
+        let durable_ids = [
+            "99999999-9999-4999-8999-999999999999",
+            "99999999-9999-4999-8999-999999999998",
+        ];
+        for durable in durable_ids {
+            write_fake_transcript(home.path(), durable);
+        }
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         std::env::set_var("FRESHELL_CLAUDE_NODE", "/nonexistent-node-binary");
         let (st, mut rx) = state_with_bus();
-        st.attach_for_test(attach_msg_with_resume("client-nanoid-3", durable))
-            .await;
+        for (index, (session_type, suffix, durable)) in [
+            (SessionType::Freshclaude, "freshclaude", durable_ids[0]),
+            (SessionType::Kilroy, "kilroy", durable_ids[1]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut attach =
+                attach_msg_with_resume(&format!("client-nanoid-failure-{index}"), durable);
+            attach.session_type = session_type;
+            attach.request_id = Some(format!("claude-{suffix}-resume-failure"));
+            attach.view_id = Some(format!("claude-{suffix}-failure-view"));
+            let (reply, captured) = capturing_sink();
+            st.handle_attach(attach, reply).await;
+            let frames = captured_json(&captured);
+            assert_eq!(frames.len(), 1, "one requester failure: {frames:?}");
+            assert_eq!(frames[0]["type"], "freshAgent.attach.failed");
+            assert_eq!(
+                frames[0]["requestId"],
+                format!("claude-{suffix}-resume-failure")
+            );
+            assert_eq!(frames[0]["viewId"], format!("claude-{suffix}-failure-view"));
+            assert_eq!(frames[0]["code"], "CLAUDE_ATTACH_RESUME_FAILED");
+            assert_eq!(frames[0]["sessionId"], durable);
+        }
         std::env::remove_var("FRESHELL_CLAUDE_NODE");
         std::env::remove_var("CLAUDE_CONFIG_DIR");
-        let err = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
-        assert_eq!(err["event"]["code"], "CLAUDE_ATTACH_RESUME_FAILED");
-        assert_eq!(err["sessionId"], "client-nanoid-3");
+        assert!(
+            rx.try_recv().is_err(),
+            "resume failures are requester-scoped"
+        );
         assert!(st.sessions.lock().await.is_empty());
     }
 
@@ -10893,33 +11002,71 @@ pub(crate) mod tests {
 
         // A delayed ATTACH: the tracked-and-alive fast path is BLOCKED
         // with the typed error (pre-d3: the silent parity return).
-        st.attach_for_test(freshell_protocol::FreshAgentAttach {
-            request_id: None,
-            view_id: None,
-            tab_id: None,
-            pane_id: None,
-            provider: freshell_protocol::AgentProvider::Claude,
-            session_id: placeholder.clone(),
-            session_type: SessionType::Freshclaude,
-            cwd: None,
-            observed_epoch: None,
-            observed_generation: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
-        .await;
-        // The typed attach refusal rides a freshAgent.event envelope
-        // (inner type freshAgent.error).
-        let attach_refused = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
-        assert_eq!(
-            attach_refused["event"]["code"],
-            json!("SESSION_RESERVED"),
-            "the delayed attach answers the TYPED refusal: {attach_refused}"
-        );
-        assert_eq!(
-            attach_refused["event"]["sessionId"],
-            json!(placeholder),
-            "the refusal names the addressed session"
+        for (session_type, suffix) in [
+            (SessionType::Freshclaude, "freshclaude"),
+            (SessionType::Kilroy, "kilroy"),
+        ] {
+            let delayed_attach = freshell_protocol::FreshAgentAttach {
+                request_id: Some(format!("delayed-handoff-{suffix}-attach")),
+                view_id: Some(format!("delayed-handoff-{suffix}-view")),
+                tab_id: None,
+                pane_id: None,
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: placeholder.clone(),
+                session_type,
+                cwd: None,
+                observed_epoch: None,
+                observed_generation: None,
+                resume_session_id: None,
+                session_ref: None,
+            };
+            let (reply, captured) = capturing_sink();
+            st.handle_attach(delayed_attach.clone(), reply).await;
+            let attach_frames = captured_json(&captured);
+            assert_eq!(
+                attach_frames.len(),
+                1,
+                "one typed attach refusal: {attach_frames:?}"
+            );
+            let attach_refused = &attach_frames[0];
+            assert_eq!(
+                attach_refused["type"],
+                json!("freshAgent.attach.failed"),
+                "the delayed attach answers through its public requester result"
+            );
+            assert_eq!(
+                attach_refused["requestId"],
+                format!("delayed-handoff-{suffix}-attach")
+            );
+            assert_eq!(
+                attach_refused["viewId"],
+                format!("delayed-handoff-{suffix}-view")
+            );
+            assert_eq!(
+                attach_refused["sessionType"], suffix,
+                "the typed refusal preserves the requested mode"
+            );
+            assert_eq!(
+                attach_refused["code"],
+                json!("SESSION_RESERVED"),
+                "the delayed attach answers the TYPED refusal: {attach_refused}"
+            );
+            assert_eq!(
+                attach_refused["sessionId"],
+                json!(placeholder),
+                "the refusal names the addressed session"
+            );
+        }
+        let shared_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert!(
+            !shared_frames.iter().any(|frame| {
+                frame["sessionId"] == placeholder
+                    && frame["event"]["type"] == "freshAgent.error"
+                    && frame["event"]["code"] == "SESSION_RESERVED"
+            }),
+            "requester failure never enters the shared bus: {shared_frames:?}"
         );
     }
 

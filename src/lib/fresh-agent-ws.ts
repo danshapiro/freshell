@@ -377,21 +377,10 @@ export function handleFreshAgentMessage(
           transition: 'handoff-committed',
         }))
       }
-      handleFreshAgentTransportEvent(dispatch, {
-        type: 'freshAgent.event',
-        ...locator,
-        event: {
-          type: 'freshAgent.error',
-          sessionId: failed.sessionId,
-          code: failed.code,
-          message: failed.message,
-          retryable: failed.retryable,
-          ownerKind: failed.ownerKind,
-          ownerGeneration: failed.ownerGeneration,
-          ownerEpoch: failed.ownerEpoch,
-          requestId: failed.requestId,
-        },
-      })
+      // Attach settlement belongs to the requesting view. Folding it as a
+      // session event would clear or alter shared status for every other view
+      // of this conversation; the component routes the correlated result to
+      // its own retry or notice path.
       return true
     }
     case 'freshAgent.event':

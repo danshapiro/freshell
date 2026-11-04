@@ -79,6 +79,12 @@ struct PresentationRoute {
     materialized: bool,
 }
 
+#[derive(Debug)]
+enum ReplayOutcome {
+    Complete,
+    Incomplete(String),
+}
+
 impl PresentationRoute {
     fn initial(session_id: impl Into<String>) -> Self {
         Self {
@@ -331,24 +337,51 @@ impl HostedFreshAgentProxy {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(frame);
                     });
-                    self.replay_once(
-                        soul,
-                        &provider,
-                        &message.session_id,
-                        &session_type,
-                        Some(&replay_sink),
-                        Some(head),
-                    )
-                    .await;
+                    let replay_outcome = self
+                        .replay_once(
+                            soul,
+                            &provider,
+                            &message.session_id,
+                            &session_type,
+                            Some(&replay_sink),
+                            Some(head),
+                        )
+                        .await;
                     let replay_messages = std::mem::take(
                         &mut *replay_messages
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner),
                     );
-                    AttachOutcome::attached_from_replay_for_session(
-                        Some(&message.session_id),
-                        replay_messages,
-                    )
+                    match replay_outcome {
+                        ReplayOutcome::Complete => AttachOutcome::attached_from_replay_for_session(
+                            Some(&message.session_id),
+                            replay_messages,
+                        ),
+                        ReplayOutcome::Incomplete(reason) => {
+                            tracing::warn!(
+                                event = "fresh_agent.gateway.attach_replay_incomplete",
+                                provider,
+                                session_id = %message.session_id,
+                                reason = %reason,
+                                "managed Freshagent attach replay did not reach its captured head"
+                            );
+                            AttachOutcome::Failed {
+                                failure: AttachFailure {
+                                    code: "MANAGED_FRESH_AGENT_REPLAY_INCOMPLETE".into(),
+                                    message: format!(
+                                        "managed fresh-agent replay is incomplete: {reason}"
+                                    ),
+                                    retryable: Some(true),
+                                    owner_kind: None,
+                                    owner_generation: None,
+                                    owner_epoch: None,
+                                },
+                                // Partial replay is held until every page and retained source
+                                // has been validated. It cannot reset the view before failure.
+                                legacy_messages: Vec::new(),
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1751,7 +1784,7 @@ impl HostedFreshAgentProxy {
         session_type: &str,
         requester: Option<&FrameSink>,
         max_sequence: Option<u64>,
-    ) {
+    ) -> ReplayOutcome {
         let mut before = if provider == "codex" {
             self.current_source(&soul).await
         } else {
@@ -1761,12 +1794,18 @@ impl HostedFreshAgentProxy {
         let mut replay_through = None;
         let mut retained_through = 0;
         loop {
-            let Ok(batch) = self
+            let batch = match self
                 .client
                 .fresh_agent_events(soul.clone(), cursor, 4096)
                 .await
-            else {
-                return;
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    return ReplayOutcome::Incomplete(format!(
+                        "journal page read failed at sequence {}: {error}",
+                        cursor.saturating_add(1)
+                    ));
+                }
             };
             let through = max_sequence.map_or(batch.head, |maximum| batch.head.min(maximum));
             let replay_through = *replay_through.get_or_insert(through);
@@ -1779,7 +1818,9 @@ impl HostedFreshAgentProxy {
                 );
                 before = after;
                 if !valid {
-                    return;
+                    return ReplayOutcome::Incomplete(
+                        "retained journal source changed or could not be validated".into(),
+                    );
                 }
             }
             if let Some(retained) = batch.retained_state {
@@ -1795,11 +1836,24 @@ impl HostedFreshAgentProxy {
                 retained_through = retained_through.max(batch.head.min(replay_through));
             }
             if batch.events.is_empty() {
-                return;
+                return if cursor >= replay_through {
+                    ReplayOutcome::Complete
+                } else {
+                    ReplayOutcome::Incomplete(format!(
+                        "journal ended at sequence {cursor} before captured head {replay_through}"
+                    ))
+                };
             }
             for event in batch.events {
                 if event.sequence > replay_through {
-                    return;
+                    return if cursor >= replay_through {
+                        ReplayOutcome::Complete
+                    } else {
+                        ReplayOutcome::Incomplete(format!(
+                            "journal page skipped captured head {replay_through} at sequence {}",
+                            event.sequence
+                        ))
+                    };
                 }
                 cursor = cursor.max(event.sequence);
                 if event.sequence > retained_through || is_request_receipt(&event.event) {
@@ -1821,7 +1875,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             if cursor >= replay_through {
-                return;
+                return ReplayOutcome::Complete;
             }
         }
     }

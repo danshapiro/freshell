@@ -32,6 +32,29 @@ fn attach_request_id(frame: &ServerMessage) -> Option<&str> {
     }
 }
 
+async fn attach_with_requester(
+    proxy: &Arc<HostedFreshAgentProxy>,
+    soul: SoulId,
+    request_id: &str,
+) -> Vec<ServerMessage> {
+    let (reply, frames) = capturing_attach_sink();
+    Arc::clone(proxy)
+        .handle_with_requester(
+            HostedFreshAgentCommand::Attach(
+                serde_json::from_value(serde_json::json!({
+                    "provider":"claude", "sessionId":NATIVE, "sessionType":"freshclaude",
+                    "requestId":request_id, "viewId":"requesting-view",
+                }))
+                .unwrap(),
+            ),
+            reply,
+        )
+        .await;
+    assert!(proxy.pollers.lock().await.contains(&soul));
+    let captured = frames.lock().unwrap().clone();
+    captured
+}
+
 // Runtime allocation/Stop are forbidden; a best-effort read-only probe after
 // Started may fail without blocking the independently verified live session.
 struct ReadinessBackend;
@@ -132,9 +155,16 @@ pub(super) struct ReadinessFixture {
     pub(super) control_socket: std::path::PathBuf,
     pub(super) native: Arc<std::sync::Mutex<(String, NativeIdentityObservation)>>,
     pub(super) events: Arc<std::sync::Mutex<Vec<AgentJournalEvent>>>,
+    pub(super) replay_controls: Arc<std::sync::Mutex<ReplayControls>>,
     pub(super) sent_roots: Arc<std::sync::Mutex<Vec<String>>>,
     pub(super) send_failure: Arc<std::sync::Mutex<Option<freshell_runtime_protocol::RuntimeError>>>,
     _tasks: OwnedTasks,
+}
+
+#[derive(Default)]
+pub(super) struct ReplayControls {
+    pub(super) fail_after_sequence: Option<u64>,
+    pub(super) retained_state: Option<serde_json::Value>,
 }
 
 pub(super) async fn readiness_fixture() -> ReadinessFixture {
@@ -255,12 +285,14 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
         observation.clone(),
     )));
     let events = Arc::new(std::sync::Mutex::new(Vec::<AgentJournalEvent>::new()));
+    let replay_controls = Arc::new(std::sync::Mutex::new(ReplayControls::default()));
     let sent_roots = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let send_failure = Arc::new(std::sync::Mutex::new(None));
     let host_send_failure = send_failure.clone();
-    let (host_native, host_events, host_sent_roots, host_launch) = (
+    let (host_native, host_events, host_replay_controls, host_sent_roots, host_launch) = (
         native.clone(),
         events.clone(),
+        replay_controls.clone(),
         sent_roots.clone(),
         launch.clone(),
     );
@@ -270,6 +302,7 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
             host_commands.lock().unwrap().push(envelope.body.clone());
             let live = host_ready.load(Ordering::SeqCst);
             let (native, current_observation) = host_native.lock().unwrap().clone();
+            let mut fail_event_read = false;
             let result = match envelope.body {
                 HostCommand::Hello {
                     incarnation_id,
@@ -346,35 +379,59 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                         "status":if live {"idle"} else {"closed"}, "turns":[], "capabilities":{"send":live},
                     }))
                 }
-                HostCommand::FreshAgentReadEvents { after_sequence, .. } => {
-                    let mut rows = vec![AgentJournalEvent {
-                        sequence: 1,
-                        event: AgentEvent::Exited {
-                            reason: "previous native query ended".into(),
-                        },
-                    }];
-                    rows.push(AgentJournalEvent { sequence:2, event:AgentEvent::Provider { payload:serde_json::json!({
+                HostCommand::FreshAgentReadEvents {
+                    after_sequence,
+                    max_events,
+                    ..
+                } => {
+                    let controls = host_replay_controls.lock().unwrap();
+                    fail_event_read = max_events > 1
+                        && controls
+                            .fail_after_sequence
+                            .is_some_and(|sequence| after_sequence >= sequence);
+                    if fail_event_read {
+                        HostResult::FreshAgentEvents(AgentEventBatch {
+                            retained_state: None,
+                            retained_from: 1,
+                            head: after_sequence,
+                            reset_required: false,
+                            events: Vec::new(),
+                        })
+                    } else {
+                        let mut rows = vec![AgentJournalEvent {
+                            sequence: 1,
+                            event: AgentEvent::Exited {
+                                reason: "previous native query ended".into(),
+                            },
+                        }];
+                        rows.push(AgentJournalEvent { sequence:2, event:AgentEvent::Provider { payload:serde_json::json!({
                         "type":"freshAgent.event", "provider":"claude", "sessionType":"freshclaude", "sessionId":NATIVE,
                         "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"closed"},
                     }) } });
-                    if live {
-                        rows.push(AgentJournalEvent { sequence:3, event:AgentEvent::Provider { payload:serde_json::json!({
+                        if live {
+                            rows.push(AgentJournalEvent { sequence:3, event:AgentEvent::Provider { payload:serde_json::json!({
                         "type":"freshAgent.event", "provider":"claude", "sessionType":"freshclaude", "sessionId":NATIVE,
                         "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"idle"},
                     }) } });
+                        }
+                        rows.extend(host_events.lock().unwrap().iter().cloned());
+                        let head = rows.last().map_or(0, |row| row.sequence);
+                        HostResult::FreshAgentEvents(AgentEventBatch {
+                            retained_state: if max_events > 1 {
+                                controls.retained_state.clone()
+                            } else {
+                                None
+                            },
+                            retained_from: 1,
+                            head,
+                            reset_required: false,
+                            events: rows
+                                .into_iter()
+                                .filter(|row| row.sequence > after_sequence)
+                                .take(max_events as usize)
+                                .collect(),
+                        })
                     }
-                    rows.extend(host_events.lock().unwrap().iter().cloned());
-                    let head = rows.last().map_or(0, |row| row.sequence);
-                    HostResult::FreshAgentEvents(AgentEventBatch {
-                        retained_state: None,
-                        retained_from: 1,
-                        head,
-                        reset_required: false,
-                        events: rows
-                            .into_iter()
-                            .filter(|row| row.sequence > after_sequence)
-                            .collect(),
-                    })
                 }
                 other => panic!(
                     "explicit resume must not create, stop or release provider work: {other:?}"
@@ -384,7 +441,14 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
                 &mut stream,
                 &HostReply {
                     request_id: envelope.request_id,
-                    result: Ok(result),
+                    result: if fail_event_read {
+                        Err(freshell_runtime_protocol::RuntimeError::new(
+                            RuntimeErrorCode::FaultInjected,
+                            "fixture injected journal read failure",
+                        ))
+                    } else {
+                        Ok(result)
+                    },
                 },
             )
             .await
@@ -432,6 +496,7 @@ pub(super) async fn readiness_fixture() -> ReadinessFixture {
         control_socket,
         native,
         events,
+        replay_controls,
         sent_roots,
         send_failure,
         _tasks,
@@ -480,10 +545,12 @@ async fn hosted_explicit_resume_restores_ended_query_before_created_and_one_orig
     let frames_a = frames_a.lock().unwrap().clone();
     let frames_b = frames_b.lock().unwrap().clone();
     assert!(frames_a.iter().any(|frame| matches!(frame,
-        ServerMessage::FreshAgentAttached(attached) if attached.request_id == "attach-a"
+        ServerMessage::FreshAgentAttached(attached)
+            if attached.request_id == "attach-a" && attached.status == "unknown"
     )));
     assert!(frames_b.iter().any(|frame| matches!(frame,
-        ServerMessage::FreshAgentAttached(attached) if attached.request_id == "attach-b"
+        ServerMessage::FreshAgentAttached(attached)
+            if attached.request_id == "attach-b" && attached.status == "unknown"
     )));
     assert!(
         frames_a
@@ -604,4 +671,197 @@ async fn hosted_explicit_resume_restores_ended_query_before_created_and_one_orig
             .accepted_command_count,
         1
     );
+}
+
+#[tokio::test]
+async fn hosted_attach_fails_when_replay_head_succeeds_but_first_page_fails() {
+    let fixture = readiness_fixture().await;
+    fixture.replay_controls.lock().unwrap().fail_after_sequence = Some(0);
+    let (proxy, mut peer) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+
+    let frames = attach_with_requester(&proxy, fixture.soul.clone(), "attach-page-fail").await;
+    assert_eq!(
+        frames.len(),
+        1,
+        "an incomplete replay has one settlement: {frames:?}"
+    );
+    assert!(matches!(
+        &frames[0],
+        ServerMessage::FreshAgentAttachFailed(failed)
+            if failed.request_id == "attach-page-fail"
+                && failed.retryable == Some(true)
+                && failed.code == "MANAGED_FRESH_AGENT_REPLAY_INCOMPLETE"
+    ));
+    assert!(
+        peer.try_recv().is_err(),
+        "replay failure is requester-scoped"
+    );
+    assert_eq!(
+        proxy.pollers.lock().await.len(),
+        1,
+        "the failed attach still owns one shared poller"
+    );
+}
+
+#[tokio::test]
+async fn hosted_attach_fails_after_a_partial_replay_page_without_publishing_it() {
+    let fixture = readiness_fixture().await;
+    fixture.replay_controls.lock().unwrap().fail_after_sequence = Some(4096);
+    {
+        let mut events = fixture.events.lock().unwrap();
+        for sequence in 4..=4100 {
+            events.push(AgentJournalEvent {
+                sequence,
+                event: AgentEvent::Provider {
+                    payload: serde_json::json!({
+                        "type":"freshAgent.event", "provider":"claude",
+                        "sessionType":"freshclaude", "sessionId":NATIVE,
+                        "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"idle"},
+                    }),
+                },
+            });
+        }
+    }
+    let (proxy, mut peer) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+
+    let frames = attach_with_requester(&proxy, fixture.soul.clone(), "attach-partial-fail").await;
+    assert_eq!(
+        frames.len(),
+        1,
+        "partial replay frames stay buffered until complete: {frames:?}"
+    );
+    assert!(matches!(
+        &frames[0],
+        ServerMessage::FreshAgentAttachFailed(failed)
+            if failed.request_id == "attach-partial-fail"
+                && failed.retryable == Some(true)
+                && failed.code == "MANAGED_FRESH_AGENT_REPLAY_INCOMPLETE"
+    ));
+    assert!(
+        peer.try_recv().is_err(),
+        "partial replay is not shared before failure"
+    );
+    assert_eq!(
+        proxy.pollers.lock().await.len(),
+        1,
+        "partial replay never starts a second poller"
+    );
+}
+
+#[tokio::test]
+async fn hosted_attach_fails_when_retained_replay_source_cannot_be_validated() {
+    let fixture = readiness_fixture().await;
+    fixture.replay_controls.lock().unwrap().retained_state = Some(serde_json::json!({
+        "source":{"soulId":"different-soul","incarnationId":"stale","hostBootId":"stale"},
+        "snapshot":{"provider":"claude","sessionType":"freshclaude","threadId":NATIVE,"status":"idle"},
+        "pendingControls":[],
+    }));
+    let (proxy, mut peer) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+
+    let frames = attach_with_requester(
+        &proxy,
+        fixture.soul.clone(),
+        "attach-retained-source-changed",
+    )
+    .await;
+    assert_eq!(
+        frames.len(),
+        1,
+        "invalid retained source has one requester failure: {frames:?}"
+    );
+    assert!(matches!(
+        &frames[0],
+        ServerMessage::FreshAgentAttachFailed(failed)
+            if failed.request_id == "attach-retained-source-changed"
+                && failed.retryable == Some(true)
+                && failed.code == "MANAGED_FRESH_AGENT_REPLAY_INCOMPLETE"
+    ));
+    assert!(
+        peer.try_recv().is_err(),
+        "invalid retained replay is requester-scoped"
+    );
+    assert_eq!(
+        proxy.pollers.lock().await.len(),
+        1,
+        "source validation retains one shared poller"
+    );
+}
+
+#[tokio::test]
+async fn hosted_attaches_keep_replay_requester_scoped_and_later_events_shared() {
+    let fixture = readiness_fixture().await;
+    fixture.ready.store(true, Ordering::SeqCst);
+    let (proxy, mut peer_a) = configure_proxy(
+        &fixture.control_socket,
+        HashMap::from([(("claude".into(), NATIVE.into()), fixture.soul.clone())]),
+    );
+    let mut peer_b = proxy.broadcast.subscribe();
+
+    let frames_a = attach_with_requester(&proxy, fixture.soul.clone(), "attach-shared-a").await;
+    let frames_b = attach_with_requester(&proxy, fixture.soul.clone(), "attach-shared-b").await;
+    assert!(
+        frames_a.iter().any(|frame| matches!(frame,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-shared-a" && attached.status == "idle"
+        )),
+        "the first view receives its own idle result: {frames_a:?}"
+    );
+    assert!(
+        frames_b.iter().any(|frame| matches!(frame,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-shared-b" && attached.status == "idle"
+        )),
+        "the second view receives its own idle result: {frames_b:?}"
+    );
+    assert!(frames_a
+        .iter()
+        .all(|frame| attach_request_id(frame) != Some("attach-shared-b")));
+    assert!(frames_b
+        .iter()
+        .all(|frame| attach_request_id(frame) != Some("attach-shared-a")));
+    assert_eq!(
+        proxy.pollers.lock().await.len(),
+        1,
+        "both views share one journal poller"
+    );
+    while peer_a.try_recv().is_ok() {}
+    while peer_b.try_recv().is_ok() {}
+
+    fixture.events.lock().unwrap().push(AgentJournalEvent {
+        sequence: 4,
+        event: AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.event", "provider":"claude",
+                "sessionType":"freshclaude", "sessionId":NATIVE,
+                "event":{"type":"freshAgent.status", "sessionId":NATIVE, "status":"running"},
+            }),
+        },
+    });
+    for (name, receiver) in [("peer A", &mut peer_a), ("peer B", &mut peer_b)] {
+        let shared = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let raw = receiver.recv().await.expect("shared bus remains open");
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["sessionId"] == NATIVE
+                    && frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "running"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name} did not receive the later shared event"));
+        assert_eq!(shared["provider"], "claude");
+    }
 }
