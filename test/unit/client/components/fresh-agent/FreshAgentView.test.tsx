@@ -13495,6 +13495,61 @@ describe('FreshAgentView', () => {
     await expectRenderedText('Saved native Codex answer')
   })
 
+  it('keeps a sibling running and streaming when an identified attach is refused', async () => {
+    const snapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+    const store = createStore()
+    const shared = {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshcodex' as const,
+      provider: 'codex' as const,
+      sessionId: snapshot.threadId,
+      sessionRef: { provider: 'codex' as const, sessionId: snapshot.threadId },
+      status: 'idle' as const,
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-a', content: {
+      ...shared, createRequestId: 'req-view-a', viewId: 'view-a',
+    } }))
+    store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-b', content: {
+      ...shared, createRequestId: 'req-view-b', viewId: 'view-b',
+    } }))
+    render(<Provider store={store}>
+      <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-a" />
+      <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-b" />
+    </Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    const attachB = sentFreshAgentMessages('freshAgent.attach').find((message) => message.viewId === 'view-b')!
+    const locator = { provider: 'codex' as const, sessionType: 'freshcodex' as const, sessionId: snapshot.threadId }
+    const sessionKey = `freshcodex:codex:${snapshot.threadId}`
+    act(() => store.dispatch(sessionSnapshotReceived({
+      ...locator,
+      status: 'running',
+      latestTurnId: 'turn-sibling-still-running',
+      streamingActive: true,
+    })))
+
+    const refusal = {
+      type: 'freshAgent.attach.failed',
+      requestId: attachB.requestId,
+      viewId: attachB.viewId,
+      ...locator,
+      sessionRef: shared.sessionRef,
+      status: 'failed',
+      code: 'FRESH_AGENT_CREATE_FAILED',
+      message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      retryable: false,
+    }
+    act(() => {
+      expect(handleFreshAgentMessage(store.dispatch, refusal)).toBe(true)
+      for (const listener of [...freshAgentMessageListeners]) listener(refusal)
+    })
+
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      status: 'running',
+      streamingActive: true,
+    })
+  })
+
   it('routes attach refusals only to the current request and view for two panes on one session', async () => {
     const snapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)

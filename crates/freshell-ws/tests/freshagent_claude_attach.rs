@@ -125,19 +125,35 @@ type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_and_complete_handshake(url: &str) -> TestWs {
+    connect_and_complete_handshake_with_capabilities(url, None).await
+}
+
+async fn connect_and_complete_reconciliation_handshake(url: &str) -> TestWs {
+    connect_and_complete_handshake_with_capabilities(
+        url,
+        Some(serde_json::json!({ "freshAgentReconciliationV1": true })),
+    )
+    .await
+}
+
+async fn connect_and_complete_handshake_with_capabilities(
+    url: &str,
+    capabilities: Option<Value>,
+) -> TestWs {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
-    ws.send(WsMessage::Text(
-        serde_json::json!({
-            "type": "hello",
-            "token": AUTH_TOKEN,
-            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send hello");
+    let mut hello = serde_json::json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+    });
+    if let Some(capabilities) = capabilities {
+        hello["capabilities"] = capabilities;
+    }
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
 
     // Drain the handshake frames (ready + whatever else precedes it) until `ready`.
     loop {
@@ -187,6 +203,35 @@ async fn await_frame(
     })
     .await
     .expect("expected frame did not arrive within budget")
+}
+
+async fn assert_no_attach_settlement(ws: &mut TestWs, request_id: &str, session_id: &str) {
+    let unexpected = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            let message = ws
+                .next()
+                .await
+                .expect("socket remains open while checking for an extra settlement")
+                .expect("no websocket error while checking for an extra settlement");
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).expect("valid server JSON");
+            let correlated_failure =
+                value["type"] == "freshAgent.attach.failed" && value["requestId"] == request_id;
+            let legacy_failure = value["type"] == "freshAgent.event"
+                && value["sessionId"] == session_id
+                && value["event"]["type"] == "freshAgent.error";
+            if correlated_failure || legacy_failure {
+                return value;
+            }
+        }
+    })
+    .await;
+
+    if let Ok(value) = unexpected {
+        panic!("unexpected attach settlement on socket: {value}");
+    }
 }
 
 /// A claude `freshAgent.attach` for a session id this server process does not track
@@ -559,5 +604,68 @@ async fn legacy_reject_freshagent_attach() {
     assert_eq!(
         create_count, 0,
         "no sidecar may spawn for a rejected legacy attach"
+    );
+}
+
+#[tokio::test]
+async fn negotiated_identified_legacy_attach_refusal_is_requester_only() {
+    let env = ClaudeSimEnvironment::new();
+    let url = spawn_server(&env).await;
+    let mut requester = connect_and_complete_reconciliation_handshake(&url).await;
+    let mut peer = connect_and_complete_reconciliation_handshake(&url).await;
+
+    send_json(
+        &mut requester,
+        &serde_json::json!({
+            "type": "freshAgent.attach",
+            "requestId": "legacy-attach-request",
+            "viewId": "legacy-attach-view",
+            "provider": "claude",
+            "sessionId": "cli-session-legacy-attach-modern",
+            "sessionType": "freshclaude",
+            "sessionRef": { "provider": "claude", "sessionId": "cli-session-legacy-attach-modern" },
+            "resumeSessionId": "legacy-durable-id",
+        }),
+    )
+    .await;
+
+    let failed = await_frame(&mut requester, Duration::from_secs(2), |value| {
+        value["type"] == "freshAgent.attach.failed" && value["requestId"] == "legacy-attach-request"
+    })
+    .await;
+    assert_eq!(failed["viewId"], "legacy-attach-view");
+    assert_eq!(failed["provider"], "claude");
+    assert_eq!(failed["sessionId"], "cli-session-legacy-attach-modern");
+    assert_eq!(failed["sessionType"], "freshclaude");
+    assert_eq!(
+        failed["sessionRef"],
+        serde_json::json!({
+            "provider": "claude",
+            "sessionId": "cli-session-legacy-attach-modern"
+        })
+    );
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["code"], "FRESH_AGENT_CREATE_FAILED");
+    assert_eq!(
+        failed["message"],
+        "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."
+    );
+    assert_eq!(failed["retryable"], false);
+
+    assert_no_attach_settlement(
+        &mut peer,
+        "legacy-attach-request",
+        "cli-session-legacy-attach-modern",
+    )
+    .await;
+    assert_no_attach_settlement(
+        &mut requester,
+        "legacy-attach-request",
+        "cli-session-legacy-attach-modern",
+    )
+    .await;
+    assert!(
+        env.rows("query").is_empty(),
+        "a rejected legacy attach must not query or launch a provider"
     );
 }

@@ -62,12 +62,12 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentAttached, FreshAgentCreateFailed,
-    FreshAgentDetached, FreshAgentEvent, PaneClosed, PaneClosedResult, PanesClosedResult, Pong,
-    ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel,
-    TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly, TerminalInputBlocked,
-    TerminalInputBlockedReason, TerminalKill, TerminalResize, FRESH_AGENT_DISABLED_REFUSAL,
-    LEGACY_RESUME_IDENTITY_REFUSAL,
+    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentAttachFailed, FreshAgentAttached,
+    FreshAgentCreateFailed, FreshAgentDetached, FreshAgentEvent, PaneClosed, PaneClosedResult,
+    PanesClosedResult, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
+    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly,
+    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
+    FRESH_AGENT_DISABLED_REFUSAL, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
@@ -1223,6 +1223,42 @@ async fn handle_client_text_with_view_routes(
                     .get("sessionId")
                     .and_then(|s| s.as_str())
                     .unwrap_or_default();
+                let provider = value
+                    .get("provider")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let session_type = value
+                    .get("sessionType")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if fresh_agent_views.fresh_agent_reconciliation_v1() {
+                    if let (Some(request_id), Some(view_id)) = (
+                        value.get("requestId").and_then(|request| request.as_str()),
+                        value.get("viewId").and_then(|view| view.as_str()),
+                    ) {
+                        let reply = ServerMessage::FreshAgentAttachFailed(FreshAgentAttachFailed {
+                            request_id: request_id.to_string(),
+                            view_id: Some(view_id.to_string()),
+                            provider,
+                            session_id: session_id.to_string(),
+                            session_type,
+                            session_ref: value.get("sessionRef").cloned().and_then(|session_ref| {
+                                serde_json::from_value::<SessionLocator>(session_ref).ok()
+                            }),
+                            status: "failed".to_string(),
+                            code: "FRESH_AGENT_CREATE_FAILED".to_string(),
+                            message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
+                            operation_id: None,
+                            retryable: Some(false),
+                            owner_kind: None,
+                            owner_generation: None,
+                            owner_epoch: None,
+                        });
+                        return send(ws_tx, &reply).await;
+                    }
+                }
                 let reply = ServerMessage::FreshAgentEvent(FreshAgentEvent {
                     event: serde_json::json!({
                         "type": "freshAgent.error",
@@ -1230,17 +1266,9 @@ async fn handle_client_text_with_view_routes(
                         "code": "FRESH_AGENT_CREATE_FAILED",
                         "message": LEGACY_RESUME_IDENTITY_REFUSAL,
                     }),
-                    provider: value
-                        .get("provider")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    provider,
                     session_id: session_id.to_string(),
-                    session_type: value
-                        .get("sessionType")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    session_type,
                 });
                 return send(ws_tx, &reply).await;
             }
