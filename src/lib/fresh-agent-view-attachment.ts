@@ -43,6 +43,14 @@ export type FreshAgentAttachDecision<T> = {
   requestId: string
 }
 
+/** A result settles only the current view's immutable attach decision. */
+export function freshAgentAttachResultMatchesDecision(
+  result: { requestId?: unknown; viewId?: unknown },
+  decision: { requestId: string; viewId: string },
+): boolean {
+  return result.requestId === decision.requestId && result.viewId === decision.viewId
+}
+
 /** Keep a request id for retries of the same attach decision. A new target,
  * explicit decision, or observed owner fence gets a new id. The connection's
  * ready handshake is intentionally not part of this identity. */

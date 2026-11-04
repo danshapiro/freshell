@@ -8142,7 +8142,9 @@ impl FreshCodexState {
             revision: None,
         };
         if let Some(frame) = adapter_event_to_frame(&event, &session_id) {
-            let _ = self.broadcast_tx.send(frame);
+            let message: ServerMessage = serde_json::from_str(&frame)
+                .expect("Codex adapter snapshot matches the server frame schema");
+            self.broadcast(&message);
         }
     }
 
@@ -27775,28 +27777,35 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
+        let mut attach = attach_msg("historical-thread-attach");
+        attach.request_id = Some("codex-cold-attach".into());
+        attach.view_id = Some("codex-cold-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
 
-        st.handle_attach_events(attach_msg("historical-thread-attach"))
-            .await;
-
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let raw = rx.recv().await.expect("bus stays open");
-                let frame: Value = serde_json::from_str(&raw).unwrap();
-                if frame["type"] == "freshAgent.event" {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("attach resumes and emits a session frame within the budget");
-
-        assert_eq!(frame["sessionId"], "historical-thread-attach");
-        assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
-        assert_eq!(frame["event"]["status"], "idle");
+        let replies = captured.lock().expect("capture mutex").clone();
+        let Some(ServerMessage::FreshAgentAttached(attached)) = replies.first() else {
+            panic!("the cold-resume request must receive its attach result: {replies:?}");
+        };
+        assert_eq!(attached.request_id, "codex-cold-attach");
+        assert_eq!(attached.session_id, "historical-thread-attach");
+        assert_eq!(
+            attached.snapshot.as_ref().unwrap()["type"],
+            "freshAgent.session.snapshot"
+        );
+        assert_eq!(attached.snapshot.as_ref().unwrap()["status"], "idle");
         assert_ne!(
-            frame["event"]["code"], "INVALID_SESSION_ID",
+            attached.snapshot.as_ref().unwrap()["code"],
+            "INVALID_SESSION_ID",
             "a resumable historical thread must never be declared lost"
+        );
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).all(|raw| {
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                !(frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot")
+            }),
+            "the cold-resume snapshot belongs to the requester, not the shared bus"
         );
 
         assert!(
@@ -28052,25 +28061,23 @@ pub(crate) mod tests {
             .to_string(),
         );
         let (st, mut rx) = state_with_bus();
+        let mut attach = attach_msg("truly-does-not-exist");
+        attach.request_id = Some("codex-missing-attach".into());
+        attach.view_id = Some("codex-missing-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
 
-        st.handle_attach_events(attach_msg("truly-does-not-exist"))
-            .await;
-
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let raw = rx.recv().await.expect("bus stays open");
-                let frame: Value = serde_json::from_str(&raw).unwrap();
-                if frame["type"] == "freshAgent.event" {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("attach resolves within the budget");
-
-        assert_eq!(frame["sessionId"], "truly-does-not-exist");
-        assert_eq!(frame["event"]["type"], "freshAgent.error");
-        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "one attach failure: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.attach.failed");
+        assert_eq!(frames[0]["requestId"], "codex-missing-attach");
+        assert_eq!(frames[0]["viewId"], "codex-missing-view");
+        assert_eq!(frames[0]["sessionId"], "truly-does-not-exist");
+        assert_eq!(frames[0]["code"], "INVALID_SESSION_ID");
+        assert!(
+            rx.try_recv().is_err(),
+            "the missing-thread failure is requester-only"
+        );
     }
 
     /// Decision-table row: NOT tracked + a transient resume failure (sidecar unreachable,
@@ -28088,18 +28095,59 @@ pub(crate) mod tests {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let (st, mut rx) = state_with_bus();
 
-        st.handle_attach_events(attach_msg("historical-thread-transient"))
-            .await;
+        let mut attach = attach_msg("historical-thread-transient");
+        attach.request_id = Some("codex-transient-failure".into());
+        attach.view_id = Some("codex-transient-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
         std::env::remove_var("CODEX_CMD");
+        let replies = captured.lock().expect("capture mutex").clone();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a failed attach has one settlement: {replies:?}"
+        );
+        let ServerMessage::FreshAgentAttachFailed(failed) = &replies[0] else {
+            panic!("a transient launch problem has a typed attach failure: {replies:?}");
+        };
+        assert_eq!(failed.request_id, "codex-transient-failure");
+        assert_eq!(failed.view_id.as_deref(), Some("codex-transient-view"));
+        assert_ne!(
+            failed.code, "INVALID_SESSION_ID",
+            "a transient launch failure is not a lost thread"
+        );
+        assert!(!failed.message.is_empty());
+        assert!(replies
+            .iter()
+            .all(|frame| !matches!(frame, ServerMessage::FreshAgentAttached(_))));
+        assert!(rx.try_recv().is_err(), "attach failure is requester-scoped");
+    }
 
-        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
+    #[tokio::test]
+    async fn handle_attach_half_fence_is_a_requester_scoped_typed_failure() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+        let mut attach = attach_msg("codex-half-fenced");
+        attach.request_id = Some("codex-half-fence-attach".into());
+        attach.view_id = Some("codex-half-fence-view".into());
+        attach.observed_epoch = Some(3);
+        let (reply, captured) = capturing_sink();
+
+        st.handle_attach(attach, reply).await;
+
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "one attach failure: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.attach.failed");
+        assert_eq!(frames[0]["requestId"], "codex-half-fence-attach");
+        assert_eq!(frames[0]["viewId"], "codex-half-fence-view");
+        assert_eq!(frames[0]["code"], "INVALID_FENCE");
         assert!(
-            frame["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("CODEX_ATTACH_RESUME_FAILED:"),
-            "{frame}"
+            st.sessions.lock().await.is_empty(),
+            "invalid attach must not resume"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the invalid-fence failure is requester-only"
         );
     }
 
@@ -28444,8 +28492,22 @@ pub(crate) mod tests {
         fake.seed_recorded_only("codex", "thread-y"); // was_recorded=true, load_settings=None
         state.set_identity_sink(fake);
 
-        // Same R3 entry point, attaching untracked "thread-y".
-        state.handle_attach_events(attach_msg("thread-y")).await;
+        // Same public attach entry point used by WS dispatch.
+        let mut attach = attach_msg("thread-y");
+        attach.request_id = Some("codex-settings-warning-attach".into());
+        attach.view_id = Some("codex-settings-warning-view".into());
+        let (reply, captured) = capturing_sink();
+        state.handle_attach(attach, reply).await;
+        let replies = captured.lock().expect("capture mutex").clone();
+        assert!(replies.iter().any(|frame| matches!(
+            frame,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "codex-settings-warning-attach"
+                    && attached.session_id == "thread-y"
+        )), "settings recovery warning must not turn successful resume into attach failure: {replies:?}");
+        assert!(replies
+            .iter()
+            .all(|frame| !matches!(frame, ServerMessage::FreshAgentAttachFailed(_))));
 
         let mut found = false;
         while let Ok(frame) =
@@ -29507,42 +29569,47 @@ pub(crate) mod tests {
         st.dead_thread_ttl = std::time::Duration::from_millis(50);
         let capture = tracing_capture::capture_by_session("finding-2-expiry-marker-unused");
 
-        st.handle_attach_events(attach_msg("thread-temporarily-dead"))
-            .await;
-        let first: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let raw = rx.recv().await.expect("bus stays open");
-                let frame: Value = serde_json::from_str(&raw).unwrap();
-                if frame["type"] == "freshAgent.event" {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("first attach resolves within the budget");
-        assert_eq!(first["event"]["code"], "INVALID_SESSION_ID");
+        let mut first_attach = attach_msg("thread-temporarily-dead");
+        first_attach.request_id = Some("codex-dead-cache-first-attach".into());
+        first_attach.view_id = Some("codex-dead-cache-view".into());
+        let (first_reply, first_capture) = capturing_sink();
+        st.handle_attach(first_attach, first_reply).await;
+        let first = captured_frames(&first_capture);
+        assert_eq!(first.len(), 1, "one first attach settlement: {first:?}");
+        assert_eq!(first[0]["type"], "freshAgent.attach.failed");
+        assert_eq!(first[0]["requestId"], "codex-dead-cache-first-attach");
+        assert_eq!(first[0]["code"], "INVALID_SESSION_ID");
+        assert!(
+            rx.try_recv().is_err(),
+            "the dead-thread result is requester-only"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Now the thread is genuinely resumable.
         configure_fake_codex_cmd("{}");
 
-        st.handle_attach_events(attach_msg("thread-temporarily-dead"))
-            .await;
-        let second: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let raw = rx.recv().await.expect("bus stays open");
-                let frame: Value = serde_json::from_str(&raw).unwrap();
-                if frame["type"] == "freshAgent.event" {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("second attach resolves within the budget");
-        assert_eq!(
-            second["event"]["type"], "freshAgent.session.snapshot",
-            "after the negative-cache TTL elapses, a retry must genuinely resume: {second}"
+        let mut second_attach = attach_msg("thread-temporarily-dead");
+        second_attach.request_id = Some("codex-dead-cache-retry-attach".into());
+        second_attach.view_id = Some("codex-dead-cache-view".into());
+        let (second_reply, second_capture) = capturing_sink();
+        st.handle_attach(second_attach, second_reply).await;
+        let second = captured_frames(&second_capture);
+        assert_eq!(second.len(), 1, "one retry settlement: {second:?}");
+        assert_eq!(second[0]["type"], "freshAgent.attached");
+        assert_eq!(second[0]["requestId"], "codex-dead-cache-retry-attach");
+        assert_eq!(second[0]["sessionId"], "thread-temporarily-dead");
+        let shared_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|raw| serde_json::from_str(&raw).ok())
+            .collect();
+        assert!(
+            !shared_frames.iter().any(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["sessionId"] == "thread-temporarily-dead"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["event"]["revision"].as_u64().is_none()
+            }),
+            "the synthetic attach snapshot is requester-only: {shared_frames:?}"
         );
         assert!(
             st.sessions
@@ -30413,6 +30480,61 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn attach_crash_recovery_uses_the_replacement_id_snapshot_for_its_requester() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut peer_bus) = state_with_bus();
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
+        let thread_id = create_real_fake_session(&st, &mut peer_bus).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
+        drain_create_time_snapshot(&mut peer_bus, &thread_id).await;
+
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "thread-respawned",
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let mut attach = attach_msg(&thread_id);
+        attach.request_id = Some("codex-replacement-recovery".into());
+        attach.view_id = Some("codex-replacement-view".into());
+        let (reply, requester) = capturing_sink();
+        st.handle_attach(attach, reply).await;
+
+        let replies = requester.lock().expect("requester capture mutex").clone();
+        let Some(ServerMessage::FreshAgentAttached(attached)) = replies.last() else {
+            panic!("replacement recovery must settle the attach requester: {replies:?}");
+        };
+        assert_eq!(attached.request_id, "codex-replacement-recovery");
+        assert_eq!(attached.session_id, "thread-respawned");
+        assert_eq!(
+            attached
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot["sessionId"].as_str()),
+            Some("thread-respawned"),
+            "the attached snapshot must name the recovered runtime, not the old id"
+        );
+        assert!(st.sessions.lock().await.contains_key("thread-respawned"));
+        assert!(!st.sessions.lock().await.contains_key(&thread_id));
+        let shared_frames: Vec<Value> = std::iter::from_fn(|| peer_bus.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert!(
+            shared_frames.iter().all(|frame| {
+                !(frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["event"].get("revision").is_none())
+            }),
+            "the attach-only replacement snapshot belongs to the requester; canonical revisioned provider snapshots remain shared: {shared_frames:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn send_after_crash_falls_back_for_native_missing_rollout_rpc() {
         assert_crash_mints_new_thread(
             json!({"code":-32600,"message":"no rollout found for thread id thread-original"}),
@@ -30720,7 +30842,7 @@ pub(crate) mod tests {
         drain_create_time_snapshot(&mut rx, &thread_id).await;
 
         configure_fake_codex_cmd("{}");
-        st.handle_attach_events(FreshAgentAttach {
+        let mut attach = FreshAgentAttach {
             request_id: None,
             view_id: None,
             tab_id: None,
@@ -30733,32 +30855,37 @@ pub(crate) mod tests {
             cwd: None,
             resume_session_id: None,
             session_ref: None,
-        })
-        .await;
+        };
+        attach.request_id = Some("codex-same-id-recovery".into());
+        attach.view_id = Some("codex-recovery-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
 
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                assert_ne!(
-                    frame["type"], "error",
-                    "attach recovers or reports honestly, never hangs silently: {frame}"
-                );
-                assert_ne!(
-                    frame["type"], "freshAgent.session.materialized",
-                    "resume-first recovery must not materialize a new durable identity: {frame}"
-                );
-                if frame["type"] == "freshAgent.event" {
-                    return frame;
-                }
-            }
-        })
-        .await
-        .expect("attach recovers within the budget");
-
-        assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
+        let replies = captured.lock().expect("capture mutex").clone();
+        let Some(ServerMessage::FreshAgentAttached(attached)) = replies.last() else {
+            panic!("attach recovers and settles its requester: {replies:?}");
+        };
+        assert_eq!(attached.request_id, "codex-same-id-recovery");
+        assert_eq!(attached.session_id, thread_id);
         assert_eq!(
-            frame["sessionId"], thread_id,
+            attached.snapshot.as_ref().unwrap()["type"],
+            "freshAgent.session.snapshot"
+        );
+        assert_eq!(
+            attached.snapshot.as_ref().unwrap()["sessionId"],
+            thread_id,
             "the post-recovery snapshot must carry the SAME thread id"
+        );
+        let shared_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert!(
+            shared_frames.iter().all(|frame| {
+                !(frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["event"].get("revision").is_none())
+            }),
+            "the attach-only recovery snapshot belongs to the requester; canonical revisioned provider snapshots remain shared: {shared_frames:?}"
         );
     }
 
@@ -35605,25 +35732,28 @@ pub(crate) mod tests {
         // THE TRACKED ATTACH: typed refusal (pre-r12 it proceeded to
         // ensure_session_alive and emitted a snapshot over the
         // terminal-owned session).
-        st.handle_attach_events(attach_msg(&thread_id)).await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-                .await
-                .expect("a frame within budget")
-                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
-                .expect("the bus stays open");
-            if frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == json!("freshAgent.error")
-                && frame["event"]["code"] == json!("SESSION_RESERVED")
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the tracked attach over a terminal-owned key never answered typed: {frame}"
-            );
-        }
+        let mut attach = attach_msg(&thread_id);
+        attach.request_id = Some("codex-terminal-owner-attach".into());
+        attach.view_id = Some("codex-terminal-owner-view".into());
+        let (reply, captured) = capturing_sink();
+        st.handle_attach(attach, reply).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "one requester failure: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.attach.failed");
+        assert_eq!(frames[0]["requestId"], "codex-terminal-owner-attach");
+        assert_eq!(frames[0]["viewId"], "codex-terminal-owner-view");
+        assert_eq!(frames[0]["code"], "SESSION_RESERVED");
+        let shared_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .collect();
+        assert!(
+            !shared_frames.iter().any(|frame| {
+                frame["sessionId"] == thread_id
+                    && frame["event"]["type"] == "freshAgent.error"
+                    && frame["event"]["code"] == "SESSION_RESERVED"
+            }),
+            "the reservation settlement stays with its requester: {shared_frames:?}"
+        );
         // The terminal's owner record is untouched.
         assert!(matches!(
             registry.observe(PROVIDER, &thread_id).state,

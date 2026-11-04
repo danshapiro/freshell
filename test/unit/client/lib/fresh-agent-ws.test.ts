@@ -85,8 +85,15 @@ describe('fresh-agent-ws', () => {
     })
   })
 
-  it('folds a requester attach failure and its current owner fence', () => {
+  it('folds an attach failure owner fence without applying the requester error to shared session state', () => {
     const store = createFreshAgentStore()
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      provider: 'codex',
+      sessionType: 'freshcodex',
+      sessionId: 'old-thread-key',
+      event: { type: 'freshAgent.session.snapshot', sessionId: 'old-thread-key', status: 'running' },
+    })
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.attach.failed',
       requestId: 'attach-result-2',
@@ -104,10 +111,8 @@ describe('fresh-agent-ws', () => {
       ownerGeneration: 12,
     })).toBe(true)
 
-    expect(store.getState().freshAgent.sessions['freshcodex:codex:old-thread-key']).toMatchObject({
-      lastErrorCode: 'SESSION_RESERVED',
-      lastError: 'retry after the current lifecycle operation',
-    })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:old-thread-key']).toMatchObject({ status: 'running' })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:old-thread-key']).not.toHaveProperty('lastErrorCode')
     expect(store.getState().freshAgent.runtimeOwners?.['codex:native-thread-key']).toMatchObject({
       epoch: 3,
       generation: 12,

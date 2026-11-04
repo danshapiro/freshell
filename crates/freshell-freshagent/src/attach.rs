@@ -46,7 +46,9 @@ pub enum AttachOutcome {
 impl AttachOutcome {
     pub fn from_messages(messages: Vec<ServerMessage>) -> Self {
         for message in &messages {
-            if let Some(failure) = failure_from_message(message) {
+            if let Some(failure) = failure_from_message(message)
+                .filter(|failure| !is_nonfatal_warning_code(&failure.code))
+            {
                 return Self::Failed {
                     failure,
                     legacy_messages: messages,
@@ -217,7 +219,8 @@ impl AttachOutcome {
                         provider: provider.clone(),
                         session_id: session_id.clone(),
                     });
-                    let mut messages = attach_side_messages(&legacy_messages, snapshot.as_ref());
+                    let mut messages =
+                        attach_side_messages(&legacy_messages, snapshot.as_ref(), None);
                     messages.push(ServerMessage::FreshAgentAttached(FreshAgentAttached {
                         request_id: request_id.clone(),
                         view_id: attach.view_id.clone(),
@@ -239,7 +242,7 @@ impl AttachOutcome {
                     failure,
                     legacy_messages,
                 } => {
-                    let mut messages = attach_side_messages(&legacy_messages, None);
+                    let mut messages = attach_side_messages(&legacy_messages, None, Some(&failure));
                     let session_id = resolved_session_id(attach, None, &legacy_messages);
                     let session_ref = Some(SessionLocator {
                         provider: provider.clone(),
@@ -326,6 +329,7 @@ fn resolved_session_id(
 fn attach_side_messages(
     messages: &[ServerMessage],
     snapshot: Option<&Value>,
+    settlement_failure: Option<&AttachFailure>,
 ) -> Vec<ServerMessage> {
     let snapshot_index = snapshot.and_then(|snapshot| {
         messages.iter().rposition(|message| match message {
@@ -333,23 +337,38 @@ fn attach_side_messages(
             _ => false,
         })
     });
+    // Providers enrich the typed outcome with the current owner after
+    // capturing its settlement event. Match its stable error identity and
+    // remove the last matching event, since an operation's settlement follows
+    // any earlier canonical history with the same error.
+    let settlement_index = settlement_failure.and_then(|failure| {
+        messages
+            .iter()
+            .rposition(|message| failure_matches(message, failure))
+    });
     messages
         .iter()
         .enumerate()
-        .filter(|(index, message)| {
-            let selected_snapshot = Some(*index) == snapshot_index;
-            !selected_snapshot && !is_attach_error(message)
+        .filter_map(|(index, message)| {
+            if Some(index) == snapshot_index {
+                return None;
+            }
+            if Some(index) == settlement_index {
+                return None;
+            }
+            Some(message.clone())
         })
-        .map(|(_, message)| message.clone())
         .collect()
 }
 
-fn is_attach_error(message: &ServerMessage) -> bool {
-    matches!(message, ServerMessage::Error(_))
-        || matches!(message,
-            ServerMessage::FreshAgentEvent(FreshAgentEvent { event, .. })
-                if event.get("type").and_then(Value::as_str) == Some("freshAgent.error")
-        )
+fn failure_matches(message: &ServerMessage, failure: &AttachFailure) -> bool {
+    failure_from_message(message).is_some_and(|candidate| {
+        candidate.code == failure.code && candidate.message == failure.message
+    })
+}
+
+fn is_nonfatal_warning_code(code: &str) -> bool {
+    matches!(code, "SETTINGS_RESET" | "THREAD_MEMORY_LOST")
 }
 
 pub async fn capture_attach_messages<T>(
@@ -368,10 +387,17 @@ pub async fn capture_attach_messages<T>(
 /// and provider output stay on the normal shared broadcast path.
 pub fn capture_attach_message(message: &ServerMessage) -> bool {
     let is_attach_result = match message {
-        ServerMessage::FreshAgentEvent(frame) => matches!(
-            frame.event.get("type").and_then(Value::as_str),
-            Some("freshAgent.session.snapshot" | "freshAgent.error")
-        ),
+        ServerMessage::FreshAgentEvent(frame) => {
+            match frame.event.get("type").and_then(Value::as_str) {
+                Some("freshAgent.session.snapshot") => true,
+                Some("freshAgent.error") => !frame
+                    .event
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_nonfatal_warning_code),
+                _ => false,
+            }
+        }
         ServerMessage::Error(_) => true,
         _ => false,
     };
@@ -582,5 +608,141 @@ mod tests {
                     && failed.session_id == "native-session"
                     && failed.session_ref.as_ref().is_some_and(|session_ref| session_ref.session_id == "native-session")
         ));
+    }
+
+    #[test]
+    fn modern_replay_preserves_historical_provider_errors_in_order() {
+        let historical_error = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: serde_json::json!({
+                "type": "freshAgent.error",
+                "sessionId": "native-session",
+                "code": "PROVIDER_WARNING",
+                "message": "a retained provider warning",
+            }),
+            provider: "claude".into(),
+            session_id: "native-session".into(),
+            session_type: "freshclaude".into(),
+        });
+        let latest_snapshot = serde_json::json!({
+            "type": "freshAgent.session.snapshot",
+            "sessionId": "native-session",
+            "status": "idle",
+        });
+        let replay_snapshot = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: latest_snapshot.clone(),
+            provider: "claude".into(),
+            session_id: "native-session".into(),
+            session_type: "freshclaude".into(),
+        });
+        let outcome = AttachOutcome::attached_from_replay_for_session(
+            Some("native-session"),
+            vec![historical_error.clone(), replay_snapshot],
+        );
+
+        let messages = AttachOutcome::requester_messages(&attach(Some("attach-9")), outcome);
+        assert_eq!(
+            messages.len(),
+            2,
+            "the historical error and ack each arrive once"
+        );
+        assert_eq!(messages[0], historical_error);
+        assert!(matches!(
+            &messages[1],
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-9"
+                    && attached.snapshot.as_ref() == Some(&latest_snapshot)
+        ));
+    }
+
+    #[test]
+    fn failed_attach_removes_the_settlement_after_an_identical_historical_error() {
+        let attach = attach(Some("attach-identical-error"));
+        let historical = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: "claude".into(),
+            session_id: "placeholder".into(),
+            session_type: "freshclaude".into(),
+            event: serde_json::json!({
+                "type":"freshAgent.error",
+                "sessionId":"placeholder",
+                "code":"SESSION_RESERVED",
+                "message":"retry after owner settles",
+            }),
+        });
+        let settlement = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            provider: "claude".into(),
+            session_id: "placeholder".into(),
+            session_type: "freshclaude".into(),
+            event: serde_json::json!({
+                "type":"freshAgent.error",
+                "sessionId":"placeholder",
+                "code":"SESSION_RESERVED",
+                "message":"retry after owner settles",
+                "ownerKind":"terminal",
+                "ownerGeneration":8,
+                "ownerEpoch":4,
+            }),
+        });
+        let outcome = AttachOutcome::Failed {
+            failure: AttachFailure {
+                code: "SESSION_RESERVED".into(),
+                message: "retry after owner settles".into(),
+                retryable: Some(true),
+                owner_kind: Some("terminal".into()),
+                owner_generation: Some(8),
+                owner_epoch: Some(4),
+            },
+            legacy_messages: vec![historical.clone(), settlement],
+        };
+
+        let messages = AttachOutcome::requester_messages(&attach, outcome);
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "history and typed result only: {messages:?}"
+        );
+        assert_eq!(
+            messages[0], historical,
+            "the canonical event remains in order"
+        );
+        assert!(matches!(
+            &messages[1],
+            ServerMessage::FreshAgentAttachFailed(failed)
+                if failed.request_id == "attach-identical-error"
+                    && failed.code == "SESSION_RESERVED"
+        ));
+    }
+
+    #[tokio::test]
+    async fn settings_reset_warning_does_not_settle_or_leave_the_shared_broadcast_path() {
+        let warning = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: serde_json::json!({
+                "type": "freshAgent.error",
+                "sessionId": "native-session",
+                "code": "SETTINGS_RESET",
+                "message": "reconfirm settings",
+            }),
+            provider: "codex".into(),
+            session_id: "native-session".into(),
+            session_type: "freshcodex".into(),
+        });
+
+        let (captured_value, captured_messages) =
+            capture_attach_messages(async { capture_attach_message(&warning) }).await;
+        assert!(
+            !captured_value,
+            "a canonical settings warning must continue through the shared broadcast path"
+        );
+        assert!(captured_messages.is_empty());
+        let outcome = AttachOutcome::from_messages(vec![snapshot("native-session", "idle")]);
+        let messages = AttachOutcome::requester_messages(&attach(Some("attach-10")), outcome);
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-10" && attached.status == "idle"
+        )));
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, ServerMessage::FreshAgentAttachFailed(_))));
     }
 }

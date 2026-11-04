@@ -10876,6 +10876,179 @@ describe('FreshAgentView', () => {
     expect(store.getState().panes.refreshRequestsByPane?.['tab-1']?.['pane-1']).toBeUndefined()
   })
 
+  it('refreshes after a successful correlated attach when the in-flight snapshot failed', async () => {
+    const initialRead = createDeferred<unknown>()
+    const snapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => initialRead.promise)
+      .mockResolvedValue(snapshot)
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-attach-refresh-after-failure',
+        viewId: 'view-attach-refresh-after-failure',
+        sessionId: snapshot.threadId,
+        status: 'idle',
+      },
+    }))
+
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    const attach = sentFreshAgentMessages('freshAgent.attach')[0]
+    expect(attach).toMatchObject({ requestId: expect.any(String), viewId: 'view-attach-refresh-after-failure' })
+    await act(async () => {
+      initialRead.reject(new Error('temporary snapshot read failure'))
+      await Promise.resolve()
+    })
+
+    act(() => {
+      for (const listener of [...freshAgentMessageListeners]) {
+        listener({
+          type: 'freshAgent.attached',
+          requestId: attach.requestId,
+          viewId: attach.viewId,
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          sessionId: snapshot.threadId,
+          status: 'idle',
+          snapshot: { type: 'freshAgent.session.snapshot', sessionId: snapshot.threadId, status: 'idle' },
+        })
+      }
+    })
+
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await expectRenderedText('Saved native Codex answer')
+  })
+
+  it('marks an attached hidden view dirty and refreshes its snapshot when revealed', async () => {
+    const initialRead = createDeferred<unknown>()
+    const snapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => initialRead.promise)
+      .mockResolvedValue(snapshot)
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-hidden-attach-refresh',
+        viewId: 'view-hidden-attach-refresh',
+        sessionId: snapshot.threadId,
+        status: 'idle',
+      },
+    }))
+
+    const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    const attach = sentFreshAgentMessages('freshAgent.attach')[0]
+    await act(async () => {
+      initialRead.reject(new Error('temporary hidden snapshot read failure'))
+      await Promise.resolve()
+    })
+    act(() => {
+      for (const listener of [...freshAgentMessageListeners]) {
+        listener({
+          type: 'freshAgent.attached',
+          requestId: attach.requestId,
+          viewId: attach.viewId,
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          sessionId: snapshot.threadId,
+          status: 'idle',
+          snapshot: { type: 'freshAgent.session.snapshot', sessionId: snapshot.threadId, status: 'idle' },
+        })
+      }
+    })
+    await act(async () => { await Promise.resolve() })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+    view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await expectRenderedText('Saved native Codex answer')
+  })
+
+  it('routes attach refusals only to the current request and view for two panes on one session', async () => {
+    const snapshot = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+    const store = createStore()
+    const shared = {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshcodex' as const,
+      provider: 'codex' as const,
+      sessionId: snapshot.threadId,
+      sessionRef: { provider: 'codex' as const, sessionId: snapshot.threadId },
+      status: 'idle' as const,
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-a', content: {
+      ...shared, createRequestId: 'req-view-a', viewId: 'view-a',
+    } }))
+    store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-b', content: {
+      ...shared, createRequestId: 'req-view-b', viewId: 'view-b',
+    } }))
+    render(<Provider store={store}>
+      <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-a" />
+      <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-b" />
+    </Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    const attachFor = (viewId: string) => sentFreshAgentMessages('freshAgent.attach').find((message) => message.viewId === viewId)!
+    const attachA = attachFor('view-a')
+    const attachB = attachFor('view-b')
+    expect(attachA.requestId).not.toBe(attachB.requestId)
+
+    act(() => {
+      for (const listener of [...freshAgentMessageListeners]) {
+        listener({
+          type: 'freshAgent.attach.failed',
+          requestId: attachB.requestId,
+          viewId: attachB.viewId,
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          sessionId: snapshot.threadId,
+          status: 'failed',
+          code: 'SESSION_RESERVED',
+          message: 'retry after the current lifecycle operation',
+          retryable: true,
+        })
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 1_050))
+    const afterCurrentFailure = sentFreshAgentMessages('freshAgent.attach')
+    expect(afterCurrentFailure.filter((message) => message.viewId === 'view-a')).toHaveLength(1)
+    expect(afterCurrentFailure.filter((message) => message.viewId === 'view-b')).toHaveLength(2)
+
+    const newerDecisionCount = afterCurrentFailure.length
+    act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-a' })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(newerDecisionCount + 1))
+    const newerAttachA = sentFreshAgentMessages('freshAgent.attach').filter((message) => message.viewId === 'view-a').at(-1)!
+    expect(newerAttachA.requestId).not.toBe(attachA.requestId)
+    act(() => {
+      for (const listener of [...freshAgentMessageListeners]) {
+        listener({
+          type: 'freshAgent.attach.failed',
+          requestId: attachA.requestId,
+          viewId: attachA.viewId,
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          sessionId: snapshot.threadId,
+          status: 'failed',
+          code: 'SESSION_RESERVED',
+          message: 'stale attach response',
+          retryable: true,
+        })
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 1_050))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(newerDecisionCount + 1)
+  })
+
   it('refreshes freshopencode on session.changed without reopening the bouncer', async () => {
     const store = createStore()
     let wsHandler: ((message: any) => void) | undefined

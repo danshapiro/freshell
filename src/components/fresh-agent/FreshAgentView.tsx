@@ -52,6 +52,7 @@ import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
   captureFreshAgentAttachDecision,
   detachFreshAgentView,
+  freshAgentAttachResultMatchesDecision,
   freshAgentViewAttachmentForPane,
   type FreshAgentAttachDecision,
 } from '@/lib/fresh-agent-view-attachment'
@@ -3332,6 +3333,23 @@ export function FreshAgentView({
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
+      const attachResultMatchesCurrentView = (result: { requestId?: unknown; viewId?: unknown; provider?: unknown; sessionType?: unknown }) => {
+        const attempt = attachmentAttemptRef.current
+        const current = paneContentRef.current
+        const viewId = current.viewId ?? current.createRequestId
+        if (
+          !attempt
+          || attempt.content.createRequestId !== current.createRequestId
+          || (attempt.content.viewId ?? attempt.content.createRequestId) !== viewId
+          || result.provider !== current.provider
+          || result.sessionType !== current.sessionType
+          || attachmentAttemptKey(appStore.getState(), current, attachDecisionSerialRef.current) !== attempt.key
+        ) return false
+        return freshAgentAttachResultMatchesDecision(result, {
+          requestId: attempt.requestId,
+          viewId,
+        })
+      }
       if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) {
         // A delayed acknowledgement still ends its old queue/reservation work.
         // It cannot change a stopped conversation's identity or start its actor.
@@ -3479,30 +3497,36 @@ export function FreshAgentView({
           },
         }))
       }
-      if (
-        message.type === 'freshAgent.attach.failed'
-        && message.sessionId === paneContentRef.current.sessionId
-        && message.ownerKind
-        && typeof message.ownerGeneration === 'number'
-      ) {
-        const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), paneContentRef.current)
-        dispatch(applyRefusalFence({
-          provider: canonicalSession?.provider ?? paneContentRef.current.provider,
-          sessionId: canonicalSession?.sessionId ?? message.sessionRef?.sessionId ?? message.sessionId,
-          ownerKind: message.ownerKind,
-          ownerGeneration: message.ownerGeneration,
-        }))
+      if (message.type === 'freshAgent.attached' && attachResultMatchesCurrentView(message)) {
+        // The attach result is the requesting view's acknowledgement that its
+        // snapshot is current. A visible pane retries a failed/stale read now;
+        // a hidden pane waits until reveal and then fetches once.
+        if (hiddenRef.current) markSnapshotDirty('transcript')
+        else requestSnapshotRefresh('event')
       }
-      if (
-        message.type === 'freshAgent.attach.failed'
-        && message.sessionId === paneContentRef.current.sessionId
-        && message.ownerKind !== 'terminal'
-        && message.code === 'SESSION_RESERVED'
-      ) {
-        // Task 14 (attach loser): a transient reservation re-drives the attach
-        // after the floor; exhaustion resolves via the single-pane reconcile.
-        // The banner is suppressed via lastErrorCode (never surfaced).
-        redriveAfterSessionReserved()
+      if (message.type === 'freshAgent.attach.failed') {
+        if (!attachResultMatchesCurrentView(message)) return
+        const current = paneContentRef.current
+        if (
+          message.sessionId === current.sessionId
+          && message.ownerKind
+          && typeof message.ownerGeneration === 'number'
+        ) {
+          const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), current)
+          dispatch(applyRefusalFence({
+            provider: canonicalSession?.provider ?? current.provider,
+            sessionId: canonicalSession?.sessionId ?? message.sessionRef?.sessionId ?? message.sessionId,
+            ownerKind: message.ownerKind,
+            ownerGeneration: message.ownerGeneration,
+          }))
+        }
+        if (message.ownerKind !== 'terminal' && message.code === 'SESSION_RESERVED' && message.retryable) {
+          // A transient reservation re-drives only the matching view's
+          // immutable attach decision.
+          redriveAfterSessionReserved()
+        } else {
+          setNotice(message.message || 'The conversation could not be attached.')
+        }
         return
       }
       if (
