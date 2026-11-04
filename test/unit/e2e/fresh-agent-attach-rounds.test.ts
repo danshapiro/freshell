@@ -122,6 +122,103 @@ const result = (
   ...overrides,
 })
 
+const openCodeTarget = {
+  ...target,
+  provider: 'opencode',
+  sessionType: 'freshopencode',
+}
+
+const openCodeAttach = (
+  epoch: number | null,
+  generation: number | null,
+  overrides: Record<string, unknown> = {},
+) => attach(epoch, generation, {
+  provider: openCodeTarget.provider,
+  sessionType: openCodeTarget.sessionType,
+  ...overrides,
+})
+
+const openCodePane = {
+  ...targetPane(),
+  mode: openCodeTarget.provider,
+  sessionRef: { provider: openCodeTarget.provider, sessionId: openCodeTarget.sessionId },
+}
+
+const openCodeResult = result('reconcile-one', 'respawn', {
+  verdicts: [{
+    paneKey: `${openCodeTarget.tabId}:${openCodeTarget.paneId}`,
+    verdict: 'respawn',
+    sessionRef: { provider: openCodeTarget.provider, sessionId: openCodeTarget.sessionId },
+  }],
+})
+
+const openCodeSnapshotRequest = (
+  requestId = 'snapshot-request',
+  overrides: Record<string, unknown> = {},
+) => snapshotRequest(requestId, {
+  provider: openCodeTarget.provider,
+  sessionType: openCodeTarget.sessionType,
+  ...overrides,
+})
+
+const openCodeSnapshotResponse = (
+  requestId = 'snapshot-request',
+  overrides: Record<string, unknown> = {},
+) => snapshotRestoreUnavailable(requestId, {
+  provider: openCodeTarget.provider,
+  sessionType: openCodeTarget.sessionType,
+  ...overrides,
+})
+
+function analyzeOpenCodeRespawn(options: {
+  requestOverrides?: Record<string, unknown>
+  responseOverrides?: Record<string, unknown>
+  responseRequestId?: string
+  responseStatus?: number
+  beforeSnapshot?: Array<Record<string, unknown>>
+  afterSnapshot?: Array<Record<string, unknown>>
+  snapshotBeforeOwner?: boolean
+} = {}) {
+  const start = [
+    ready(),
+    request('reconcile-one', [openCodePane]),
+    openCodeResult,
+    openCodeAttach(null, null),
+  ]
+  const ownerCommit = [
+    created({
+      provider: openCodeTarget.provider,
+      runtimeProvider: openCodeTarget.provider,
+      sessionType: openCodeTarget.sessionType,
+      sessionRef: { provider: openCodeTarget.provider, sessionId: openCodeTarget.sessionId },
+    }),
+    committedOwner({ provider: openCodeTarget.provider }),
+  ]
+  const snapshotRequestFrame = openCodeSnapshotRequest('snapshot-request', options.requestOverrides)
+  const snapshotResponseFrame = openCodeSnapshotResponse(options.responseRequestId, {
+    ...(options.responseStatus === undefined ? {} : { status: options.responseStatus }),
+    ...options.responseOverrides,
+  })
+  const attachFrames = options.snapshotBeforeOwner
+    ? [
+      snapshotRequestFrame,
+      snapshotResponseFrame,
+      ...ownerCommit,
+      openCodeAttach(2, 1),
+      openCodeAttach(2, 1),
+    ]
+    : [
+      ...ownerCommit,
+      ...(options.beforeSnapshot ?? [openCodeAttach(2, 1)]),
+      snapshotRequestFrame,
+      snapshotResponseFrame,
+      ...(options.afterSnapshot ?? [openCodeAttach(2, 1)]),
+    ]
+  const round = analyzeFreshAgentAttachRounds([...start, ...attachFrames], openCodeTarget).rounds[1]
+  if (!round) throw new Error('expected a target OpenCode reconcile round')
+  return round
+}
+
 describe('analyzeFreshAgentAttachRounds', () => {
   it('accepts an exact respawn create and current committed owner without requiring a later attach', () => {
     const completedRespawn = analyzeFreshAgentAttachRounds([
@@ -372,6 +469,74 @@ describe('analyzeFreshAgentAttachRounds', () => {
     expect(wrongGenerationRefusal.duplicateAttachments).toHaveLength(1)
     expect(secondExtraAfterRefusal.attachments.map((item) => item.retryAfterRestoreUnavailable)).toEqual([false, true, false])
     expect(secondExtraAfterRefusal.duplicateAttachments).toEqual([secondExtraAfterRefusal.attachments[2]])
+  })
+
+  it('allows one OpenCode snapshot retry after a respawn bootstrap and its unique committed-owner attach', () => {
+    const exactRecovery = analyzeOpenCodeRespawn()
+    expect(exactRecovery.attachments.map((item) => item.retryAfterRestoreUnavailable))
+      .toEqual([false, false, true])
+    expect(exactRecovery.duplicateAttachments).toEqual([])
+    expect(hasAuthoritativeFreshAgentRecoveryAction(exactRecovery, { epoch: 2, generation: 1 })).toBe(true)
+  })
+
+  it('requires a correlated typed 409 for the same OpenCode target and owner generation', () => {
+    const invalidResponses = [
+      analyzeOpenCodeRespawn({ responseStatus: 200 }),
+      analyzeOpenCodeRespawn({ responseRequestId: 'other-snapshot-request' }),
+      analyzeOpenCodeRespawn({ responseOverrides: { ownerGeneration: 2 } }),
+      analyzeOpenCodeRespawn({ responseOverrides: { sessionId: 'other-session' } }),
+      analyzeOpenCodeRespawn({ responseOverrides: { provider: 'claude' } }),
+      analyzeOpenCodeRespawn({ responseOverrides: { sessionType: 'freshclaude' } }),
+      analyzeOpenCodeRespawn({ responseOverrides: { viewId: 'other-view' } }),
+      analyzeOpenCodeRespawn({ responseOverrides: { tabId: 'other-tab' } }),
+      analyzeOpenCodeRespawn({ responseOverrides: { paneId: 'other-pane' } }),
+    ]
+    const invalidRequests = [
+      analyzeOpenCodeRespawn({ requestOverrides: { provider: 'claude' } }),
+      analyzeOpenCodeRespawn({ requestOverrides: { sessionType: 'freshclaude' } }),
+      analyzeOpenCodeRespawn({ requestOverrides: { sessionId: 'other-session' } }),
+      analyzeOpenCodeRespawn({ requestOverrides: { viewId: 'other-view' } }),
+      analyzeOpenCodeRespawn({ requestOverrides: { tabId: 'other-tab' } }),
+      analyzeOpenCodeRespawn({ requestOverrides: { paneId: 'other-pane' } }),
+    ]
+
+    expect(invalidResponses.every((round) => round.duplicateAttachments.length === 1)).toBe(true)
+    expect(invalidRequests.every((round) => round.duplicateAttachments.length === 1)).toBe(true)
+  })
+
+  it('does not reuse a snapshot refusal before its fence witness or for a second retry', () => {
+    const responseBeforeFenceWitness = analyzeOpenCodeRespawn({ snapshotBeforeOwner: true })
+    const secondRetry = analyzeOpenCodeRespawn({
+      afterSnapshot: [openCodeAttach(2, 1), openCodeAttach(2, 1)],
+    })
+
+    expect(responseBeforeFenceWitness.attachments.map((item) => item.retryAfterRestoreUnavailable))
+      .toEqual([false, false, false])
+    expect(responseBeforeFenceWitness.duplicateAttachments).toEqual([responseBeforeFenceWitness.attachments[2]])
+    expect(secondRetry.attachments.map((item) => item.retryAfterRestoreUnavailable))
+      .toEqual([false, false, true, false])
+    expect(secondRetry.duplicateAttachments).toEqual([secondRetry.attachments[3]])
+  })
+
+  it('does not authorize a typed snapshot retry when more than one owner-fenced attach is present', () => {
+    const multipleFencedWitnesses = analyzeOpenCodeRespawn({
+      beforeSnapshot: [openCodeAttach(2, 1), openCodeAttach(2, 1)],
+    })
+
+    expect(multipleFencedWitnesses.attachments.map((item) => item.retryAfterRestoreUnavailable))
+      .toEqual([false, false, false, false])
+    expect(multipleFencedWitnesses.duplicateAttachments).toEqual([
+      multipleFencedWitnesses.attachments[2],
+      multipleFencedWitnesses.attachments[3],
+    ])
+  })
+
+  it('keeps an all-200 duplicate attachment unauthorized after a respawn round', () => {
+    const all200Duplicate = analyzeOpenCodeRespawn({ responseStatus: 200 })
+
+    expect(all200Duplicate.attachments.map((item) => item.retryAfterRestoreUnavailable))
+      .toEqual([false, false, false])
+    expect(all200Duplicate.duplicateAttachments).toHaveLength(1)
   })
 
   it('detects duplicate sends within one ready round but allows a same-fence later round', () => {
