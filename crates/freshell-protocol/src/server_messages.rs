@@ -217,14 +217,16 @@ pub enum ServerMessage {
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
 pub const SERVER_MESSAGE_TYPES: [&str; 72] = [
+    "amplifier.activity.list.response",
+    "amplifier.activity.updated",
     // Promoted from EXTENSION_SERVER_MESSAGE_TYPES by the focused-repair
     // round 2 contract reconcile (pnpm run contract:generate re-froze the
     // inventory with the antigravity family; the extension const's doc
-    // names this exact promotion path).
+    // names this exact promotion path). Listed AFTER amplifier to match the
+    // frozen inventory's order exactly (focused repair round 4, Nit — the
+    // order is pinned by tests/inventory.rs).
     "antigravity.activity.list.response",
     "antigravity.activity.updated",
-    "amplifier.activity.list.response",
-    "amplifier.activity.updated",
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",

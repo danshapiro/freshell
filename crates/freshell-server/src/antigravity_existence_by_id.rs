@@ -72,6 +72,21 @@
 //! History/search keep the seam's single-root selection — a separate,
 //! older design, out of scope here.
 //!
+//! BINARY-AUTHORITY RESIDUAL (focused repair round 4, Major 1 — documented
+//! residual, not a code gap): the gate's by-id walk is FILESYSTEM
+//! EVIDENCE, never binary authority — no disk state can prove which store
+//! root the CURRENT CLI binary reads (migration corner: an old store
+//! populated while the new binary's store is empty, e.g. a CLI
+//! reinstall/switch that moved roots; `FRESHELL_ANTIGRAVITY_HOME` selects
+//! FRESHELL's read path, not the CLI's). In those corners the CLI's own
+//! missing-id warning (`warning: conversation "<id>" not found`, visible
+//! in the pane) is the final backstop, and the resulting substitution is
+//! neither silent nor identity-corrupting — the CLI's fresh conversation
+//! rebinds through the provider's natural identity fold, which clears the
+//! stale id. The follow-up surface is post-spawn warning detection
+//! (binary-authority verification: surface the CLI's own missing-id
+//! warning as a Freshell-visible fact), recorded as future work.
+//!
 //! Per-root tri-state contract (the ladder's core; mirrors
 //! [`crate::existence_by_id::ByIdAnswer`]):
 //! * transcript exists + readable ⇒ `Present`;
