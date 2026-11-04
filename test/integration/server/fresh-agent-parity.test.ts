@@ -1038,24 +1038,53 @@ tool_timeout_sec = 120
       return { ...metadata, copy }
     })
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
-    // Wait for the supervisor's post-provider-exit recovery for this soul to
-    // reach its terminal verdict BEFORE the recovery send, so the retained
-    // capture holds the real post-crash recovery sequence rather than a send
-    // that raced ahead of the timer-driven observer. Which blocked verdict is
-    // terminal depends on which side of the probe/archive race the observer's
-    // store probe lands: the replacement loop's RETRY_BUDGET block (probe
-    // pre-archive, three failed replacement opens) or the definitive
-    // store-absence block (probe post-archive, zero replacement attempts). The
-    // wait is event-conditioned on the supervisor's inventory recovery state,
-    // never a fixed sleep.
-    const blockedRecovery = await waitFor('supervisor post-crash recovery terminal blocked verdict for this soul', async () => {
+    // Await the supervisor observer's post-crash classification BEFORE the
+    // recovery send, so the retained capture holds the real post-crash
+    // sequence rather than a send that raced ahead of the timer-driven
+    // observer. A codex native-provider exit in a live host is classified
+    // send-recoverable: the observer records its typed lifecycle event,
+    // schedules NO whole-host replacement, and leaves the soul
+    // send-admitted, so the send itself drives the recovery. The wait is
+    // event-conditioned on the supervisor's lifecycle event stream for THIS
+    // soul, never a fixed sleep.
+    const supervisorLifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
+    let supervisorLifecycleCursor = 0
+    const readNewSupervisorLifecycle = (): any[] => {
+      if (!fs.existsSync(supervisorLifecyclePath)) return []
+      try {
+        const bytes = fs.statSync(supervisorLifecyclePath).size
+        if (bytes < supervisorLifecycleCursor) supervisorLifecycleCursor = 0
+        const stream = fs.openSync(supervisorLifecyclePath, 'r')
+        try {
+          const chunk = Buffer.alloc(bytes - supervisorLifecycleCursor)
+          fs.readSync(stream, chunk, 0, chunk.length, supervisorLifecycleCursor)
+          supervisorLifecycleCursor = bytes
+          return chunk.toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+        } finally { fs.closeSync(stream) }
+      } catch { return [] }
+    }
+    let classifiedExit: any
+    const classification = await waitFor('supervisor send-recoverable classification of the native exit for this soul', async () => {
+      if (!classifiedExit) {
+        classifiedExit = readNewSupervisorLifecycle().find((row: any) => row.event === 'supervisor.runtime_observer.native_exit_send_recoverable'
+          && row.data?.soulId === beforeCrash.view!.soulId
+          && row.data?.incarnationId === beforeCrash.view!.incarnationId
+          && row.data?.provider === 'codex'
+          && row.data?.nativeSessionId === view.nativeSessionId)
+      }
+      if (!classifiedExit) return undefined
       const row = (await rig.inventory()).find((row: any) => row.freshAgentSessionId === created.sessionId)
-      return row && row.recoveryState === 'blocked' && row.recoveryReason ? row : undefined
+      return row && row.recoveryState === 'live' && !row.recoveryReason ? { event: classifiedExit, row } : undefined
     }, 150_000)
+    // The classification admits the send: no recovery was scheduled for
+    // this soul after the classification event.
+    expect(readNewSupervisorLifecycle().some((row: any) => row.event === 'supervisor.runtime_observer.recovery_scheduled'
+      && row.data?.soulId === beforeCrash.view!.soulId
+      && Number(row.sequence) > Number(classification.event.sequence))).toBe(false)
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, blockedRecovery, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
+      archiveManifest, nativeExit, classification, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
@@ -1108,10 +1137,25 @@ tool_timeout_sec = 120
     expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
     expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
     expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
+    // Archived-byte immutability: no recovery path may write the archived
+    // original history. Re-read every archived file after the recovery and
+    // assert its bytes still hash to the archive-time digest — both the
+    // provider-container archives and the retained host-side copies.
+    const archivedRehash = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+      const fs=require('node:fs'),crypto=require('node:crypto');
+      const files=${JSON.stringify(archiveManifest.map((file: any) => ({ archive: file.archive, sha256: file.sha256, bytes: file.bytes })))};
+      process.stdout.write(JSON.stringify(files.map(file=>{const bytes=fs.readFileSync(file.archive);return{archive:file.archive,observedSha256:crypto.createHash('sha256').update(bytes).digest('hex'),observedBytes:bytes.length,expectedSha256:file.sha256,expectedBytes:file.bytes}})));`]))
+    for (const file of archivedRehash) {
+      expect(file.observedSha256, `archived original history must stay byte-identical: ${file.archive}`).toBe(file.expectedSha256)
+      expect(file.observedBytes).toBe(file.expectedBytes)
+      const copy = fs.readFileSync(archiveManifest.find((row: any) => row.archive === file.archive)!.copy)
+      expect(createHash('sha256').update(copy).digest('hex'), `retained archive copy must stay byte-identical: ${file.archive}`).toBe(file.expectedSha256)
+    }
     rig.runtime.writeIncident('freshcodex-managed-native-recovery', { userRef: created.sessionId, oldNativeRef: created.sessionRef,
-      newNativeRef: recoveredNameRef, beforeCrash, archiveManifest, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
+      newNativeRef: recoveredNameRef, beforeCrash, archiveManifest, archivedRehash, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
       oldName: await readName(), firstNewName: recoveredName, finalNewName: await readNameFor(recoveredNameRef),
-      nativeName: await readNativeName(recoveredId, recoveredNativeContext), recoveredNativeContext, newTraffic })
+      nativeName: await readNativeName(recoveredId, recoveredNativeContext), recoveredNativeContext, newTraffic,
+      classification, frames: wire.frames.slice(-30) })
 
   }, 360_000)
 })
