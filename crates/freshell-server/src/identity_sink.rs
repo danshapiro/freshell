@@ -3,9 +3,10 @@
 //! injects this adapter at wiring time.
 
 use freshell_freshagent::{
-    BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    RecordedGenesis, RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite,
-    SinkCommitWrite, SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
+    BindProvenance, BindingClaim, BindingClaimKind, ClaimCommit, FreshAgentBindingUpsert,
+    FreshAgentSettings, PaneIdentitySink, RecordedGenesis, RollbackRecord, SinkAliasClearWrite,
+    SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkMarkTurnInterruptedWrite,
+    SinkTakeTurnInterruptedWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -493,6 +494,71 @@ impl PaneIdentitySink for LedgerIdentitySink {
         Some(s)
     }
 
+    fn load_settings_for_recovery_claim(&self, claim: &BindingClaim) -> Option<FreshAgentSettings> {
+        if !matches!(
+            claim.kind,
+            BindingClaimKind::Starting | BindingClaimKind::Handoff
+        ) {
+            return None;
+        }
+
+        let registry = self.ownership.as_ref()?;
+        let snapshot = registry.observe(&claim.provider, &claim.session_id);
+        let is_current_claim = snapshot.epoch == claim.epoch
+            && match (claim.kind, &snapshot.state) {
+                (
+                    BindingClaimKind::Starting,
+                    freshell_ownership::OwnershipState::Starting {
+                        kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        operation_id,
+                        generation,
+                        ..
+                    },
+                ) => operation_id == &claim.operation_id && *generation == claim.generation,
+                (
+                    BindingClaimKind::Handoff,
+                    freshell_ownership::OwnershipState::Handoff {
+                        to_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        operation_id,
+                        generation,
+                        ..
+                    },
+                ) => operation_id == &claim.operation_id && *generation == claim.generation,
+                _ => false,
+            };
+        if !is_current_claim {
+            return None;
+        }
+
+        // Keep the ordinary FreshAgent settings path, but never return those
+        // values for a stale claim. The legacy fallback below is only for a
+        // historical terminal row after this exact transition claim is proven.
+        if let Some(settings) = self.load_settings(&claim.provider, &claim.session_id) {
+            return Some(settings);
+        }
+
+        let row = self
+            .ledger
+            .load_binding(&claim.provider, &claim.session_id)?;
+        if row.state != freshell_ws::pane_ledger::RowState::Bound
+            || row.live_terminal_id.is_none()
+            || row.pane_kind.as_deref() == Some("fresh-agent")
+        {
+            return None;
+        }
+
+        let settings = FreshAgentSettings {
+            collaboration_mode: row.collaboration_mode,
+            model: row.model,
+            sandbox: row.sandbox,
+            permission_mode: row.permission_mode,
+            effort: row.effort,
+            cwd: row.cwd,
+            plugins: row.plugins,
+        };
+        (settings != FreshAgentSettings::default()).then_some(settings)
+    }
+
     fn load_genesis(&self, provider: &str, session_id: &str) -> Option<RecordedGenesis> {
         // Memory-only against the write-through index, gated like
         // `load_settings` (only fresh-agent rows carry a genesis).
@@ -854,6 +920,325 @@ mod tests {
         PaneIdentitySink, SettingsUpdate,
     };
     use std::sync::Arc;
+
+    fn seed_historical_terminal_binding(
+        root: &std::path::Path,
+        provider: &str,
+        session_id: &str,
+        settings: &FreshAgentSettings,
+    ) -> Arc<freshell_ws::pane_ledger::PaneLedger> {
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            root.to_path_buf(),
+        )));
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider,
+                session_id,
+                terminal_id: "historical-terminal",
+                mode: provider,
+                cwd: settings.cwd.as_deref(),
+                create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                observed_epoch: None,
+                observed_generation: None,
+                now_ms: 100,
+            })
+            .expect("historical terminal binding seeds");
+        let row_path = root
+            .join("bindings")
+            .join(provider)
+            .join(format!("{session_id}.json"));
+        let mut row: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&row_path).unwrap()).unwrap();
+        row["collaborationMode"] = serde_json::json!(settings.collaboration_mode);
+        row["model"] = serde_json::json!(settings.model);
+        row["sandbox"] = serde_json::json!(settings.sandbox);
+        row["permissionMode"] = serde_json::json!(settings.permission_mode);
+        row["effort"] = serde_json::json!(settings.effort);
+        row["cwd"] = serde_json::json!(settings.cwd);
+        row["plugins"] = serde_json::json!(settings.plugins);
+        std::fs::write(&row_path, serde_json::to_vec(&row).unwrap()).unwrap();
+        drop(ledger);
+        Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            root.to_path_buf(),
+        )))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn starting_claim_recovers_and_rebinds_settings_from_a_dead_terminal_row() {
+        use freshell_ownership::{
+            BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let settings = FreshAgentSettings {
+            model: Some("remembered-model".into()),
+            effort: Some("low".into()),
+            cwd: Some("/workspace".into()),
+            ..FreshAgentSettings::default()
+        };
+        let ledger = seed_historical_terminal_binding(
+            root.path(),
+            "opencode",
+            "ses-dead-terminal-settings",
+            &settings,
+        );
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+        assert!(sink
+            .load_settings("opencode", "ses-dead-terminal-settings")
+            .is_none());
+        assert!(!sink.was_recorded("opencode", "ses-dead-terminal-settings"));
+
+        let operation_id = "recover-dead-terminal-settings";
+        let generation = match registry.begin_start(
+            "opencode",
+            "ses-dead-terminal-settings",
+            RuntimeOwnerKind::FreshAgent,
+            operation_id,
+            None,
+            "dead-terminal-settings-recovery",
+            0,
+        ) {
+            BeginOutcome::Granted { generation } => generation,
+            other => panic!(
+                "the dead terminal binding is recoverable after the liveness check: {other:?}"
+            ),
+        };
+        let claim = BindingClaim {
+            provider: "opencode".into(),
+            session_id: "ses-dead-terminal-settings".into(),
+            operation_id: operation_id.into(),
+            epoch: registry.boot_epoch(),
+            generation,
+            kind: BindingClaimKind::Starting,
+        };
+        let stale_claim = BindingClaim {
+            operation_id: "another-start".into(),
+            ..claim.clone()
+        };
+        assert!(
+            sink.load_settings_for_recovery_claim(&stale_claim)
+                .is_none(),
+            "a stale operation cannot read terminal-row settings"
+        );
+        let recovered = sink.load_settings_for_recovery_claim(&claim).expect(
+            "the current Starting claim reads the historical settings after liveness proof",
+        );
+        assert_eq!(recovered, settings);
+
+        sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
+            name_transition: None,
+            provider: claim.provider.clone(),
+            session_id: claim.session_id.clone(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(claim.epoch),
+            observed_generation: Some(claim.generation),
+            claim: Some(claim.clone()),
+            settings: SettingsUpdate::Replace(recovered.clone()),
+        })
+        .await
+        .expect("the exact Starting claim rebinds the terminal row");
+        let row = ledger
+            .load_binding(&claim.provider, &claim.session_id)
+            .expect("the recovered row remains durable");
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+        assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+        assert_eq!(row.live_terminal_id, None);
+        assert_eq!(row.model.as_deref(), Some("remembered-model"));
+        assert_eq!(row.effort.as_deref(), Some("low"));
+        assert!(
+            sink.load_settings_for_recovery_claim(&stale_claim)
+                .is_none(),
+            "a stale Starting claim cannot read settings even after the row becomes FreshAgent"
+        );
+        assert_eq!(
+            sink.load_settings(&claim.provider, &claim.session_id),
+            Some(settings)
+        );
+        assert!(sink.was_recorded(&claim.provider, &claim.session_id));
+        assert_eq!(
+            registry.commit_live(
+                &claim.provider,
+                &claim.session_id,
+                operation_id,
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(claim.session_id.clone()),
+                    pid: None,
+                    ownership_id: Some(operation_id.into()),
+                },
+            ),
+            CommitOutcome::Committed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoff_claim_recovers_settings_from_a_dead_terminal_row() {
+        use freshell_ownership::{
+            BeginOutcome, ObservedFence, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let settings = FreshAgentSettings {
+            model: Some("handoff-model".into()),
+            effort: Some("high".into()),
+            ..FreshAgentSettings::default()
+        };
+        let provider = "opencode";
+        let session_id = "ses-dead-terminal-handoff-settings";
+        let ledger = seed_historical_terminal_binding(root.path(), provider, session_id, &settings);
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let terminal_operation = "dead-terminal-handoff-source";
+        let terminal_generation = match registry.begin_start(
+            provider,
+            session_id,
+            RuntimeOwnerKind::Terminal,
+            terminal_operation,
+            None,
+            "dead-terminal-handoff-source",
+            0,
+        ) {
+            BeginOutcome::Granted { generation } => generation,
+            other => panic!("terminal owner starts: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_live(
+                provider,
+                session_id,
+                terminal_operation,
+                terminal_generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("historical-terminal".into()),
+                    live_session_key: None,
+                    pid: Some(42002),
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let before_handoff = registry.observe(provider, session_id);
+        let handoff_operation = "recover-terminal-settings-handoff";
+        let handoff_generation = match registry.begin_handoff(
+            provider,
+            session_id,
+            RuntimeOwnerKind::FreshAgent,
+            handoff_operation,
+            Some(ObservedFence {
+                epoch: before_handoff.epoch,
+                generation: before_handoff.generation,
+            }),
+            "dead-terminal-settings-recovery",
+            0,
+        ) {
+            BeginOutcome::Granted { generation } => generation,
+            other => panic!("verified dead terminal enters FreshAgent handoff: {other:?}"),
+        };
+        let claim = BindingClaim::handoff(
+            provider,
+            session_id,
+            handoff_operation,
+            registry.boot_epoch(),
+            handoff_generation,
+        );
+        let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+
+        assert_eq!(
+            sink.load_settings_for_recovery_claim(&claim),
+            Some(settings),
+            "the exact current Handoff claim also recovers historical terminal settings"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn starting_claim_does_not_recover_settings_from_a_live_terminal_binding() {
+        use freshell_ownership::{
+            BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let settings = FreshAgentSettings {
+            model: Some("remembered-model".into()),
+            effort: Some("low".into()),
+            ..FreshAgentSettings::default()
+        };
+        let ledger = seed_historical_terminal_binding(
+            root.path(),
+            "opencode",
+            "ses-live-terminal-settings",
+            &settings,
+        );
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let terminal_operation = "still-live-terminal";
+        let terminal_generation = match registry.begin_start(
+            "opencode",
+            "ses-live-terminal-settings",
+            RuntimeOwnerKind::Terminal,
+            terminal_operation,
+            None,
+            "live-terminal-binding",
+            0,
+        ) {
+            BeginOutcome::Granted { generation } => generation,
+            other => panic!("terminal owner starts: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_live(
+                "opencode",
+                "ses-live-terminal-settings",
+                terminal_operation,
+                terminal_generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("historical-terminal".into()),
+                    live_session_key: None,
+                    pid: Some(42001),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        );
+        let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+        let false_start_claim = BindingClaim {
+            provider: "opencode".into(),
+            session_id: "ses-live-terminal-settings".into(),
+            operation_id: "unauthorized-recovery".into(),
+            epoch: registry.boot_epoch(),
+            generation: terminal_generation + 1,
+            kind: BindingClaimKind::Starting,
+        };
+        assert!(sink
+            .load_settings_for_recovery_claim(&false_start_claim)
+            .is_none());
+        assert!(matches!(
+            registry.begin_start(
+                "opencode",
+                "ses-live-terminal-settings",
+                RuntimeOwnerKind::FreshAgent,
+                "freshagent-takeover",
+                None,
+                "active-terminal-refusal",
+                0,
+            ),
+            BeginOutcome::OwnedByOtherKind { .. }
+        ));
+        let row = ledger
+            .load_binding("opencode", "ses-live-terminal-settings")
+            .expect("the terminal row remains authoritative");
+        assert_eq!(row.pane_kind, None);
+        assert_eq!(row.live_terminal_id.as_deref(), Some("historical-terminal"));
+        assert_eq!(row.model.as_deref(), Some("remembered-model"));
+        assert_eq!(row.effort.as_deref(), Some("low"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn valid_starting_claim_replaces_dead_terminal_bindings_and_preserves_settings() {

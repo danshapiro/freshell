@@ -9238,6 +9238,23 @@ impl FreshCodexState {
         // completion; the not-tracked resume arms held their own claims).
         drop(tracked_attach_guard);
 
+        let settings = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|session| (session.model.clone(), session.effort.clone()));
+        if let Some((model, effort)) = settings {
+            self.broadcast(&crate::session_metadata::session_metadata_frame(
+                PROVIDER,
+                SESSION_TYPE,
+                &session_id,
+                (!model.is_empty()).then_some(model.as_str()),
+                effort.as_deref(),
+                None,
+            ));
+        }
+
         if !should_emit_snapshot {
             return;
         }
@@ -12358,6 +12375,26 @@ impl FreshCodexState {
             None,
         );
 
+        let binding_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                let (operation_id, handoff_generation) = handoff?;
+                let registry = self.ownership.as_ref()?;
+                Some(crate::identity_sink::BindingClaim::handoff(
+                    PROVIDER,
+                    thread_id,
+                    operation_id,
+                    registry.boot_epoch(),
+                    handoff_generation,
+                ))
+            });
+
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
         // SNAPSHOT — taken at claim start, after the lease and before the
         // sidecar spawn + `thread/resume` await — so a kill landing while
@@ -12416,7 +12453,14 @@ impl FreshCodexState {
         let sink = self.identity_sink();
         let recovered = sink
             .as_ref()
-            .and_then(|s| s.load_settings("codex", thread_id));
+            .and_then(|s| s.load_settings("codex", thread_id))
+            .or_else(|| {
+                sink.as_ref().and_then(|s| {
+                    binding_claim
+                        .as_ref()
+                        .and_then(|claim| s.load_settings_for_recovery_claim(claim))
+                })
+            });
         // A record miss with NO prior recording (pre-ship / historical / sidebar-opened
         // -- the populations the lifecycle resume paths exist to serve) is ROUTINE:
         // resume silently with defaults exactly as before. NO alarm, NO
@@ -12527,6 +12571,7 @@ impl FreshCodexState {
         }
 
         if recovered.is_some() {
+            let durable_explicit_model = rec.model.clone().filter(|model| !model.is_empty());
             let mut effective = CodexEffectiveSettings {
                 model: rec.model.clone().unwrap_or_default(),
                 effort: rec.effort.clone(),
@@ -12539,6 +12584,13 @@ impl FreshCodexState {
                     .and_then(CodexWorkMode::parse),
             };
             effective.adopt_native(&started.effective_settings);
+            // `thread/resume` reports the native thread's current model, which
+            // can be a provider default rather than this app's explicit
+            // next-turn choice. Keep a recorded model authoritative while
+            // still adopting native cwd and other effective runtime fields.
+            if let Some(model) = durable_explicit_model {
+                effective.model = model;
+            }
             rec.model = (!effective.model.is_empty()).then_some(effective.model);
             rec.effort = effective.effort;
             rec.cwd = effective.cwd;
@@ -12584,25 +12636,6 @@ impl FreshCodexState {
         // record's settings snapshot -- blank only when no record was recoverable
         // (never-recorded historical sessions resume on defaults, exactly as before
         // this fix). (Lease completion happens right after the insert -- see below.)
-        let binding_claim = own_ticket
-            .as_ref()
-            .and_then(|ticket| {
-                crate::identity_sink::BindingClaim::from_ticket(
-                    ticket,
-                    crate::identity_sink::BindingClaimKind::Starting,
-                )
-            })
-            .or_else(|| {
-                let (operation_id, handoff_generation) = handoff?;
-                let registry = self.ownership.as_ref()?;
-                Some(crate::identity_sink::BindingClaim::handoff(
-                    PROVIDER,
-                    thread_id,
-                    operation_id,
-                    registry.boot_epoch(),
-                    handoff_generation,
-                ))
-            });
         let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
         let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
         let mut binding_guard = Some(self.registered_binding_guard(
@@ -32399,9 +32432,16 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let op_log = tempfile::NamedTempFile::new().unwrap();
         configure_fake_codex_cmd(
-            &json!({ "appendThreadOperationLogPath": op_log.path().to_str().unwrap() }).to_string(),
+            &json!({
+                "appendThreadOperationLogPath": op_log.path().to_str().unwrap(),
+                // A resume can report the provider's default even when the
+                // explicit next-turn model in the ledger differs. The durable
+                // model must remain authoritative over this native echo.
+                "effectiveThreadSettings": { "model": "fixture-model" },
+            })
+            .to_string(),
         );
-        let (state, _bus) = state_with_bus();
+        let (state, mut bus_rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         let recorded = crate::identity_sink::FreshAgentSettings {
             collaboration_mode: Some("plan".into()),
@@ -32421,19 +32461,32 @@ pub(crate) mod tests {
         state.handle_attach(attach_msg("thread-9")).await;
 
         // (1) The registered session carries the recovered settings:
-        let sessions = state.sessions.lock().await;
-        let s = sessions.get("thread-9").expect("session registered");
-        assert_eq!(s.model, "gpt-5.3-codex-spark");
-        assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
-        assert_eq!(s.permission_mode.as_deref(), Some("on-request"));
-        assert_eq!(s.effort.as_deref(), Some("high"));
-        let mut expected = recorded;
-        // The provider may establish a different working directory on resume.
-        expected.cwd = s.cwd.clone();
-        drop(sessions);
+        let expected = {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get("thread-9").expect("session registered");
+            assert_eq!(s.model, "gpt-5.3-codex-spark");
+            assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+            assert_eq!(s.permission_mode.as_deref(), Some("on-request"));
+            assert_eq!(s.effort.as_deref(), Some("high"));
+            let mut expected = recorded;
+            // The provider may establish a different working directory on resume.
+            expected.cwd = s.cwd.clone();
+            expected
+        };
 
         // The resumed runtime must not erase the next restart's settings.
         assert_eq!(fake.load_settings("codex", "thread-9"), Some(expected));
+
+        let frames = drain(&mut bus_rx).await;
+        let metadata = frames
+            .iter()
+            .find(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.metadata"
+            })
+            .expect("a cold attach publishes its effective settings to every view");
+        assert_eq!(metadata["event"]["model"], "gpt-5.3-codex-spark");
+        assert_eq!(metadata["event"]["effort"], "high");
 
         // The fake app-server's log write lands from a SEPARATE OS process (see the
         // single-flight test above) -- poll briefly for it before the one real read.
@@ -32457,6 +32510,47 @@ pub(crate) mod tests {
         let entry: serde_json::Value = serde_json::from_str(resume_line).unwrap();
         assert_eq!(entry["params"]["model"], "gpt-5.3-codex-spark");
         assert_eq!(entry["params"]["sandbox"], "workspace-write");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_uses_native_model_when_record_has_no_explicit_model() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({ "effectiveThreadSettings": { "model": "fixture-model" } }).to_string(),
+        );
+        let (state, _bus_rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "codex",
+            "thread-native-model-fallback",
+            crate::identity_sink::FreshAgentSettings {
+                collaboration_mode: Some("plan".into()),
+                model: None,
+                sandbox: Some("workspace-write".into()),
+                permission_mode: Some("on-request".into()),
+                effort: Some("high".into()),
+                cwd: Some("/w".into()),
+                plugins: None,
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        state
+            .handle_attach(attach_msg("thread-native-model-fallback"))
+            .await;
+
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get("thread-native-model-fallback")
+            .expect("resumed session is registered");
+        assert_eq!(session.model, "fixture-model");
+        drop(sessions);
+        assert_eq!(
+            fake.load_settings("codex", "thread-native-model-fallback")
+                .and_then(|settings| settings.model),
+            Some("fixture-model".into()),
+            "the native model remains the fallback when no explicit model was recorded"
+        );
     }
 
     /// V7/A10: record misses are ROUTINE (pre-ship sessions, sidebar-opened historical

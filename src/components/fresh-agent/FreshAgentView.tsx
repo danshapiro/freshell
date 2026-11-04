@@ -825,6 +825,18 @@ function attachmentSendKey(attempt: AttachmentAttempt): string {
   return JSON.stringify([attempt.key, attempt.fence?.epoch ?? null, attempt.fence?.generation ?? null])
 }
 
+function attachmentTargetKey(content: FreshAgentPaneContent): string {
+  const sessionRef = effectiveSessionRef(content)
+  return JSON.stringify([
+    content.provider,
+    content.sessionType,
+    sessionRef?.provider ?? content.provider,
+    sessionRef?.sessionId ?? content.sessionId ?? null,
+    content.createRequestId,
+    content.viewId ?? content.createRequestId,
+  ])
+}
+
 function currentAttachmentPaneContent(
   state: ReturnType<AppStore['getState']>,
   tabId: string,
@@ -2018,6 +2030,14 @@ export function FreshAgentView({
   const attachmentAttemptRef = useRef<AttachmentAttempt | null>(null)
   const blockedAttachmentAttemptRef = useRef<{ attempt: AttachmentAttempt, owner: RuntimeOwnerRecord } | null>(null)
   const lastConnectionAttachSentKeyRef = useRef<string | null>(null)
+  const currentOwnerAttachForPendingReconcileRef = useRef<{
+    targetKey: string
+    fence: ObservedOwnerFence | undefined
+    reconcileEpoch: number
+    pendingSince: number
+    bootId: string | null
+    readySequence: number
+  } | null>(null)
   const attachDecisionSerialRef = useRef(0)
   const previousLifecycleBlockedRef = useRef(lifecycleBlocked)
   // Pre-verdict create wait (fresh-agent leg of Task 8's pattern): a pane
@@ -2293,6 +2313,49 @@ export function FreshAgentView({
   }, [appStore, paneId, sendFreshAgentMessage, tabId])
 
   const sendConnectionFreshAgentAttach = useCallback((attempt: AttachmentAttempt): boolean => {
+    const state = appStore.getState()
+    const currentContent = currentAttachmentPaneContent(state, tabId, paneId, paneContentRef.current)
+    const targetKey = attachmentTargetKey(currentContent)
+    const pendingSince = state.panes.reconcilePendingPanes?.[`${tabId}:${paneId}`]
+    const currentOwnerAttachForPendingReconcile = currentOwnerAttachForPendingReconcileRef.current
+    const canonicalSession = resolveCanonicalPaneSession(state, currentContent)
+    const currentOwner = canonicalSession
+      ? selectSessionRuntimeOwner(state, canonicalSession.provider, canonicalSession.sessionId)
+      : undefined
+    const currentFenceIsCommittedFreshAgent = currentOwner?.ownerKind === 'fresh-agent'
+      && currentOwner.transition === 'handoff-committed'
+      && currentOwner.fenced !== true
+      && currentOwner.epoch === attempt.fence?.epoch
+      && currentOwner.generation === attempt.fence?.generation
+    if (currentOwnerAttachForPendingReconcile) {
+      const sameTargetAndFence = currentOwnerAttachForPendingReconcile.targetKey === targetKey
+        && currentOwnerAttachForPendingReconcile.fence?.epoch === attempt.fence?.epoch
+        && currentOwnerAttachForPendingReconcile.fence?.generation === attempt.fence?.generation
+      const sameReadyRound = currentOwnerAttachForPendingReconcile.bootId === (state.connection.bootId ?? null)
+        && currentOwnerAttachForPendingReconcile.readySequence === (state.connection.readySequence ?? 0)
+      const completedSamePendingReconcile = sameTargetAndFence
+        && sameReadyRound
+        && currentFenceIsCommittedFreshAgent
+        && pendingSince === undefined
+        && (currentContent.reconcileEpoch ?? 0) === currentOwnerAttachForPendingReconcile.reconcileEpoch + 1
+      if (completedSamePendingReconcile) {
+        // A connection producer already attached this view under the current
+        // owner fence while its exact pane-reconcile request was pending. The
+        // matching reconcile result authorizes the same target/fence, so
+        // consume that one overlap and mark its lifecycle key as handled. A
+        // later reconcile has a further epoch and remains a separate decision.
+        currentOwnerAttachForPendingReconcileRef.current = null
+        lastConnectionAttachSentKeyRef.current = attachmentSendKey(attempt)
+        return true
+      }
+      const stillWaitingForCapturedDecision = pendingSince === currentOwnerAttachForPendingReconcile.pendingSince
+        && (currentContent.reconcileEpoch ?? 0) === currentOwnerAttachForPendingReconcile.reconcileEpoch
+        && sameTargetAndFence
+        && sameReadyRound
+        && currentFenceIsCommittedFreshAgent
+      if (!stillWaitingForCapturedDecision) currentOwnerAttachForPendingReconcileRef.current = null
+    }
+
     // The boot-id effect and WsClient's onReconnect callback both observe the
     // same ready handshake. Collapse those duplicate producers by the exact
     // attachment decision and captured fence, while keeping a new ready,
@@ -2300,9 +2363,21 @@ export function FreshAgentView({
     const key = attachmentSendKey(attempt)
     if (lastConnectionAttachSentKeyRef.current === key) return true
     const sent = sendFencedFreshAgentAttach(attempt)
-    if (sent) lastConnectionAttachSentKeyRef.current = key
+    if (sent) {
+      lastConnectionAttachSentKeyRef.current = key
+      if (typeof pendingSince === 'number' && currentFenceIsCommittedFreshAgent) {
+        currentOwnerAttachForPendingReconcileRef.current = {
+          targetKey,
+          fence: attempt.fence,
+          reconcileEpoch: attempt.content.reconcileEpoch ?? 0,
+          pendingSince,
+          bootId: state.connection.bootId ?? null,
+          readySequence: state.connection.readySequence ?? 0,
+        }
+      } else currentOwnerAttachForPendingReconcileRef.current = null
+    }
     return sent
-  }, [sendFencedFreshAgentAttach])
+  }, [appStore, paneId, sendFencedFreshAgentAttach, tabId])
 
   const enqueueFreshAgentAttach = useCallback((attempt: AttachmentAttempt) => {
     getRebindQueue().enqueue({
@@ -3315,6 +3390,22 @@ export function FreshAgentView({
     paneContent.sessionType,
     sendConnectionFreshAgentAttach,
   ])
+
+  useEffect(() => {
+    const candidate = currentOwnerAttachForPendingReconcileRef.current
+    if (!candidate) return
+    const currentEpoch = paneContent.reconcileEpoch ?? 0
+    const samePendingDecision = reconcilePendingSince === candidate.pendingSince
+      && currentEpoch === candidate.reconcileEpoch
+    const completedPendingDecision = reconcilePendingSince === undefined
+      && currentEpoch === candidate.reconcileEpoch + 1
+    if (!samePendingDecision && !completedPendingDecision) {
+      // A different request superseded the captured pending reconcile, or
+      // that request ended without its attach fold. Never let a later
+      // reconcile inherit the one-shot owner/reconcile coalescing marker.
+      currentOwnerAttachForPendingReconcileRef.current = null
+    }
+  }, [paneContent.reconcileEpoch, reconcilePendingSince])
 
   useEffect(() => {
     const state = appStore.getState()

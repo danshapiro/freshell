@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { analyzeFreshAgentAttachRounds } from '../../e2e-browser/helpers/fresh-agent-attach-rounds.js'
+import {
+  analyzeFreshAgentAttachRounds,
+  hasAuthoritativeFreshAgentRecoveryAction,
+} from '../../e2e-browser/helpers/fresh-agent-attach-rounds.js'
 
 const target = {
   sessionId: 'ses-shared',
@@ -72,6 +75,38 @@ const committedOwner = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
+const snapshotRequest = (requestId = 'snapshot-request', overrides: Record<string, unknown> = {}) => ({
+  direction: 'http-request',
+  type: 'freshAgent.snapshot.request',
+  requestId,
+  method: 'GET',
+  provider: target.provider,
+  sessionType: target.sessionType,
+  sessionId: target.sessionId,
+  viewId: target.viewId,
+  tabId: target.tabId,
+  paneId: target.paneId,
+  ...overrides,
+})
+
+const snapshotRestoreUnavailable = (requestId = 'snapshot-request', overrides: Record<string, unknown> = {}) => ({
+  direction: 'http-response',
+  type: 'freshAgent.snapshot.response',
+  requestId,
+  method: 'GET',
+  provider: target.provider,
+  sessionType: target.sessionType,
+  sessionId: target.sessionId,
+  viewId: target.viewId,
+  tabId: target.tabId,
+  paneId: target.paneId,
+  status: 409,
+  code: 'RESTORE_UNAVAILABLE',
+  ownerKind: 'fresh-agent',
+  ownerGeneration: 1,
+  ...overrides,
+})
+
 const result = (
   reconcileId = 'reconcile-one',
   verdict = 'attach',
@@ -88,6 +123,241 @@ const result = (
 })
 
 describe('analyzeFreshAgentAttachRounds', () => {
+  it('accepts an exact respawn create and current committed owner without requiring a later attach', () => {
+    const completedRespawn = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      created(),
+      committedOwner(),
+    ], target).rounds[1]
+    const missingCreated = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      committedOwner(),
+    ], target).rounds[1]
+    const wrongCreated = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      created({ viewId: 'other-view' }),
+      committedOwner(),
+    ], target).rounds[1]
+    const staleOwner = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      created(),
+      committedOwner({ epoch: 3 }),
+    ], target).rounds[1]
+
+    expect(completedRespawn.attachments).toEqual([])
+    expect(completedRespawn.respawnCreatedFrameIndex).toBeGreaterThan(completedRespawn.authorizationFrameIndex)
+    expect(completedRespawn.respawnCommittedOwnerFrameIndex).toBeGreaterThan(completedRespawn.authorizationFrameIndex)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(completedRespawn, { epoch: 2, generation: 1 })).toBe(true)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(completedRespawn, { epoch: 3, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(missingCreated, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(wrongCreated, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(staleOwner, { epoch: 2, generation: 1 })).toBe(false)
+  })
+
+  it('accepts a respawn attach only after the matching current owner commits in that round', () => {
+    const exactAttachRecovery = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      committedOwner(),
+      attach(2, 1),
+    ], target).rounds[1]
+    const ownerAfterAttach = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      attach(2, 1),
+      committedOwner(),
+    ], target).rounds[1]
+    const staleOwner = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      committedOwner({ epoch: 1 }),
+      attach(2, 1),
+    ], target).rounds[1]
+    const wrongSessionOwner = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      committedOwner({ sessionId: 'other-session' }),
+      attach(2, 1),
+    ], target).rounds[1]
+    const ownerBeforeResult = analyzeFreshAgentAttachRounds([
+      ready(),
+      committedOwner(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      attach(2, 1),
+    ], target).rounds[1]
+    const wrongViewAttach = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      committedOwner(),
+      attach(2, 1, { viewId: 'other-view' }),
+    ], target).rounds[1]
+    const duplicateAttach = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'respawn'),
+      committedOwner(),
+      attach(2, 1),
+      attach(2, 1),
+    ], target).rounds[1]
+
+    expect(hasAuthoritativeFreshAgentRecoveryAction(exactAttachRecovery, { epoch: 2, generation: 1 })).toBe(true)
+    expect(exactAttachRecovery.respawnCommittedOwnerFrameIndex)
+      .toBeLessThan(exactAttachRecovery.attachments[0].frameIndex)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(ownerAfterAttach, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(staleOwner, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(wrongSessionOwner, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(ownerBeforeResult, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(wrongViewAttach, { epoch: 2, generation: 1 })).toBe(false)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(duplicateAttach, { epoch: 2, generation: 1 })).toBe(false)
+  })
+
+  it('continues to require exactly one current-fence attach for an attach verdict', () => {
+    const exactAttach = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'attach'),
+      attach(2, 1),
+    ], target).rounds[1]
+    const missingAttach = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'attach'),
+    ], target).rounds[1]
+
+    expect(hasAuthoritativeFreshAgentRecoveryAction(exactAttach, { epoch: 2, generation: 1 })).toBe(true)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(missingAttach, { epoch: 2, generation: 1 })).toBe(false)
+  })
+
+  it('attributes target attaches sent during its pending reconcile request and keeps overlap duplicates visible', () => {
+    const attachBeforeResult = analyzeFreshAgentAttachRounds([
+      ready(),
+      request('pending-target'),
+      committedOwner(),
+      attach(2, 1),
+      result('pending-target', 'attach'),
+    ], target)
+    const duplicateAcrossResult = analyzeFreshAgentAttachRounds([
+      ready(),
+      request('pending-target'),
+      committedOwner(),
+      attach(2, 1),
+      result('pending-target', 'attach'),
+      attach(2, 1),
+    ], target)
+    const mismatchedRequest = analyzeFreshAgentAttachRounds([
+      ready(),
+      request('other-target', [{ ...targetPane(), paneKey: 'other-tab:other-pane' }]),
+      committedOwner(),
+      attach(2, 1),
+      result('other-target', 'attach'),
+    ], target)
+    const mismatchedSessionRequest = analyzeFreshAgentAttachRounds([
+      ready(),
+      request('other-session', [{
+        ...targetPane(),
+        sessionRef: { provider: target.provider, sessionId: 'other-session' },
+      }]),
+      committedOwner(),
+      attach(2, 1),
+      result('other-session', 'attach'),
+    ], target)
+
+    expect(attachBeforeResult.rounds[0].attachments).toEqual([])
+    expect(attachBeforeResult.rounds[1].attachments).toMatchObject([
+      { frameIndex: 3, observedEpoch: 2, observedGeneration: 1 },
+    ])
+    expect(attachBeforeResult.rounds[1].attachments[0].roundId).toBe(attachBeforeResult.rounds[1].id)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(attachBeforeResult.rounds[1], { epoch: 2, generation: 1 })).toBe(true)
+
+    expect(duplicateAcrossResult.rounds[1].attachments).toHaveLength(2)
+    expect(duplicateAcrossResult.rounds[1].duplicateAttachments).toEqual([
+      duplicateAcrossResult.rounds[1].attachments[1],
+    ])
+    expect(hasAuthoritativeFreshAgentRecoveryAction(duplicateAcrossResult.rounds[1], { epoch: 2, generation: 1 })).toBe(false)
+
+    expect(mismatchedRequest.validReconcileRoundIds).toEqual([])
+    expect(mismatchedRequest.rounds[0].attachments).toHaveLength(1)
+    expect(mismatchedSessionRequest.validReconcileRoundIds).toEqual([])
+    expect(mismatchedSessionRequest.rounds[0].attachments).toHaveLength(1)
+  })
+
+  it('authorizes one same-fence attach retry only after the exact typed snapshot refusal', () => {
+    const exactRecovery = analyzeFreshAgentAttachRounds([
+      ready(),
+      request(),
+      result('reconcile-one', 'attach'),
+      committedOwner(),
+      attach(2, 1),
+      snapshotRequest(),
+      snapshotRestoreUnavailable(),
+      attach(2, 1),
+    ], target).rounds[1]
+    const duplicateWithoutRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(), attach(2, 1), attach(2, 1),
+    ], target).rounds[1]
+    const uncorrelatedRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(), attach(2, 1),
+      snapshotRequest('snapshot-request', { sessionId: 'other-session' }),
+      snapshotRestoreUnavailable('snapshot-request'),
+      attach(2, 1),
+    ], target).rounds[1]
+    const wrongViewRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(), attach(2, 1),
+      snapshotRequest('snapshot-request', { viewId: 'other-view' }),
+      snapshotRestoreUnavailable('snapshot-request'),
+      attach(2, 1),
+    ], target).rounds[1]
+    const wrongRequestIdRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(), committedOwner(), attach(2, 1),
+      snapshotRequest('snapshot-request'),
+      snapshotRestoreUnavailable('other-snapshot-request'),
+      attach(2, 1),
+    ], target).rounds[1]
+    const staleRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(),
+      snapshotRequest(), snapshotRestoreUnavailable(),
+      attach(2, 1), attach(2, 1),
+    ], target).rounds[1]
+    const wrongGenerationRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(), committedOwner(), attach(2, 1),
+      snapshotRequest(), snapshotRestoreUnavailable('snapshot-request', { ownerGeneration: 0 }),
+      attach(2, 1),
+    ], target).rounds[1]
+    const secondExtraAfterRefusal = analyzeFreshAgentAttachRounds([
+      ready(), request(), result(), committedOwner(), attach(2, 1),
+      snapshotRequest(), snapshotRestoreUnavailable(),
+      attach(2, 1), attach(2, 1),
+    ], target).rounds[1]
+
+    expect(exactRecovery.attachments.map((item) => item.retryAfterRestoreUnavailable)).toEqual([false, true])
+    expect(exactRecovery.duplicateAttachments).toEqual([])
+    expect(hasAuthoritativeFreshAgentRecoveryAction(exactRecovery, { epoch: 2, generation: 1 })).toBe(true)
+    expect(duplicateWithoutRefusal.duplicateAttachments).toHaveLength(1)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(duplicateWithoutRefusal, { epoch: 2, generation: 1 })).toBe(false)
+    expect(uncorrelatedRefusal.duplicateAttachments).toHaveLength(1)
+    expect(hasAuthoritativeFreshAgentRecoveryAction(uncorrelatedRefusal, { epoch: 2, generation: 1 })).toBe(false)
+    expect(wrongViewRefusal.duplicateAttachments).toHaveLength(1)
+    expect(wrongRequestIdRefusal.duplicateAttachments).toHaveLength(1)
+    expect(staleRefusal.duplicateAttachments).toHaveLength(1)
+    expect(wrongGenerationRefusal.duplicateAttachments).toHaveLength(1)
+    expect(secondExtraAfterRefusal.attachments.map((item) => item.retryAfterRestoreUnavailable)).toEqual([false, true, false])
+    expect(secondExtraAfterRefusal.duplicateAttachments).toEqual([secondExtraAfterRefusal.attachments[2]])
+  })
+
   it('detects duplicate sends within one ready round but allows a same-fence later round', () => {
     const analysis = analyzeFreshAgentAttachRounds([
       ready(),

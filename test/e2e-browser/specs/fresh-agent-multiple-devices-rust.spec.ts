@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { test, expect } from '../helpers/fixtures.js'
 import {
   analyzeFreshAgentAttachRounds,
+  hasAuthoritativeFreshAgentRecoveryAction,
   type FreshAgentAttachRoundAnalysis,
   type FreshAgentAttachRoundTarget,
 } from '../helpers/fresh-agent-attach-rounds.js'
@@ -31,6 +32,36 @@ function findFreshAgentLeaf(node: any): any {
     }
   }
   return null
+}
+
+async function waitForAcceptedFreshAgentSend(
+  frames: ReadonlyArray<Record<string, unknown>>,
+  text: string,
+): Promise<string> {
+  let requestId = ''
+  await expect.poll(() => {
+    const request = frames.find((frame) => frame.direction === 'sent'
+      && frame.type === 'freshAgent.send'
+      && frame.text === text)
+    requestId = typeof request?.requestId === 'string' ? request.requestId : ''
+    return requestId
+  }, {
+    timeout: 20_000,
+    message: `desktop submitted the exact warm prompt before configuration`,
+  }).not.toBe('')
+
+  let acceptedSessionId = ''
+  await expect.poll(() => {
+    const accepted = frames.find((frame) => frame.direction === 'received'
+      && frame.type === 'freshAgent.send.accepted'
+      && frame.requestId === requestId)
+    acceptedSessionId = typeof accepted?.sessionId === 'string' ? accepted.sessionId : ''
+    return acceptedSessionId
+  }, {
+    timeout: 30_000,
+    message: `desktop observed requestId-correlated acceptance after the warm-turn binding refresh`,
+  }).not.toBe('')
+  return acceptedSessionId
 }
 
 async function waitForPaneStatus(device: FreshAgentDeviceView, status: RegExp): Promise<void> {
@@ -702,6 +733,204 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       restartWithDeadTerminalBinding,
       restartServer,
     }) => {
+      const snapshotHttpTraffic: Record<'desktop' | 'mobile', Array<Record<string, unknown>>> = {
+        desktop: [],
+        mobile: [],
+      }
+      const snapshotRequestIds: Record<'desktop' | 'mobile', WeakMap<object, string>> = {
+        desktop: new WeakMap(),
+        mobile: new WeakMap(),
+      }
+      const snapshotRequestSequences: Record<'desktop' | 'mobile', number> = { desktop: 0, mobile: 0 }
+      const disableForcedOpenCodeSnapshot409 = process.env.FRESHELL_TEST_NO_FORCED_OPENCODE_409 === '1'
+      let forceOpenCodeSnapshot409 = false
+      let forcedSnapshot409Count = 0
+      let forcedSnapshot409RequestId: string | null = null
+      let forcedSnapshot409Generation: number | null = null
+      let forcedSnapshot409FirstAttachAtMs: number | null = null
+      let forcedSnapshot409ResponseAtMs: number | null = null
+      if (mode === 'freshopencode' && !disableForcedOpenCodeSnapshot409) {
+        await mobile.page.route('**/api/fresh-agent/threads/**', async (route) => {
+          const request = route.request()
+          const url = new URL(request.url())
+          const expectedPath = `/api/fresh-agent/threads/${encodeURIComponent(session.sessionType)}/${encodeURIComponent(session.provider)}/${encodeURIComponent(session.sessionId)}`
+          if (!forceOpenCodeSnapshot409
+            || forcedSnapshot409Count > 0
+            || request.method() !== 'GET'
+            || url.pathname !== expectedPath
+            || url.searchParams.get('trigger') !== 'event'
+            || forcedSnapshot409Generation === null) {
+            await route.continue()
+            return
+          }
+          const waitStartedAt = Date.now()
+          let committedOwner: Record<string, unknown> | null = null
+          while (Date.now() - waitStartedAt < 30_000) {
+            const currentReady = [...frames.mobile].reverse().find((frame) =>
+              frame.direction === 'received'
+              && frame.type === 'ready'
+              && typeof frame.capturedAtMs === 'number')
+            const currentOwner = [...frames.mobile].reverse().find((frame) =>
+              frame.direction === 'received'
+              && frame.type === 'session.runtimeOwner'
+              && frame.provider === session.provider
+              && frame.sessionId === session.sessionId
+              && frame.ownerKind === 'fresh-agent'
+              && frame.transition === 'handoff-committed'
+              && typeof frame.capturedAtMs === 'number'
+              && currentReady
+              && Number(frame.capturedAtMs) > Number(currentReady.capturedAtMs))
+            if (currentOwner
+              && typeof currentOwner.epoch === 'number'
+              && typeof currentOwner.generation === 'number') {
+              const currentAttach = frames.mobile.find((frame) =>
+                frame.direction === 'sent'
+                && frame.type === 'freshAgent.attach'
+                && frame.viewId === mobile.viewId
+                && frame.tabId === mobile.tabId
+                && frame.paneId === mobile.paneId
+                && frame.sessionId === session.sessionId
+                && frame.observedEpoch === currentOwner.epoch
+                && frame.observedGeneration === currentOwner.generation
+                && typeof frame.capturedAtMs === 'number'
+                && Number(frame.capturedAtMs) > Number(currentOwner.capturedAtMs))
+              if (currentAttach) {
+                committedOwner = currentOwner
+                forcedSnapshot409FirstAttachAtMs = Number(currentAttach.capturedAtMs)
+                break
+              }
+            }
+            await new Promise((resolve) => setTimeout(resolve, 10))
+          }
+          if (!committedOwner || typeof committedOwner.generation !== 'number') {
+            throw new Error('forced snapshot 409 did not observe a current-owner commit and fenced attach first')
+          }
+          forcedSnapshot409Generation = committedOwner.generation
+          forceOpenCodeSnapshot409 = false
+          forcedSnapshot409Count += 1
+          forcedSnapshot409RequestId = snapshotRequestIds.mobile.get(request) ?? null
+          forcedSnapshot409ResponseAtMs = Date.now()
+          await route.fulfill({
+            status: 409,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              status: 'error',
+              code: 'RESTORE_UNAVAILABLE',
+              message: `Session ${session.sessionId} is still running on the server.`,
+              ownerKind: 'fresh-agent',
+              ownerGeneration: forcedSnapshot409Generation,
+            }),
+          })
+        })
+      }
+      for (const [deviceName, device] of [['desktop', desktop], ['mobile', mobile]] as const) {
+        device.page.on('request', (request) => {
+          const url = new URL(request.url())
+          if (!url.pathname.startsWith('/api/fresh-agent/threads/')) return
+          const requestId = `${deviceName}-snapshot-${++snapshotRequestSequences[deviceName]}`
+          snapshotRequestIds[deviceName].set(request, requestId)
+          const [, , routePrefix, collection, rawSessionType, rawProvider, rawSessionId] = url.pathname.split('/')
+          if (routePrefix !== 'fresh-agent' || collection !== 'threads'
+            || !rawSessionType || !rawProvider || !rawSessionId) return
+          const row = {
+            capturedAtMs: Date.now(),
+            direction: 'request',
+            type: 'freshAgent.snapshot.request',
+            requestId,
+            method: request.method(),
+            pathname: url.pathname,
+            trigger: url.searchParams.get('trigger'),
+            sessionType: decodeURIComponent(rawSessionType),
+            provider: decodeURIComponent(rawProvider),
+            sessionId: decodeURIComponent(rawSessionId),
+            viewId: device.viewId,
+            tabId: device.tabId,
+            paneId: device.paneId,
+          }
+          snapshotHttpTraffic[deviceName].push(row)
+          frames[deviceName].push({ ...row, direction: 'http-request' })
+        })
+        device.page.on('response', async (response) => {
+          const url = new URL(response.url())
+          if (!url.pathname.startsWith('/api/fresh-agent/threads/')) return
+          const [, , routePrefix, collection, rawSessionType, rawProvider, rawSessionId] = url.pathname.split('/')
+          if (routePrefix !== 'fresh-agent' || collection !== 'threads'
+            || !rawSessionType || !rawProvider || !rawSessionId) return
+          const row: Record<string, unknown> = {
+            capturedAtMs: Date.now(),
+            direction: 'response',
+            type: 'freshAgent.snapshot.response',
+            requestId: snapshotRequestIds[deviceName].get(response.request()) ?? null,
+            method: response.request().method(),
+            pathname: url.pathname,
+            trigger: url.searchParams.get('trigger'),
+            status: response.status(),
+            sessionType: decodeURIComponent(rawSessionType),
+            provider: decodeURIComponent(rawProvider),
+            sessionId: decodeURIComponent(rawSessionId),
+            viewId: device.viewId,
+            tabId: device.tabId,
+            paneId: device.paneId,
+          }
+          if (response.status() === 409) {
+            try {
+              const body = await response.json() as Record<string, unknown>
+              row.body = body
+              row.code = body.code
+              row.ownerKind = body.ownerKind
+              row.ownerGeneration = body.ownerGeneration
+            } catch (error) {
+              row.bodyReadError = error instanceof Error ? error.message : String(error)
+            }
+          }
+          snapshotHttpTraffic[deviceName].push(row)
+          frames[deviceName].push({ ...row, direction: 'http-response' })
+        })
+      }
+      // The server accepts the warm send only after its provider-specific
+      // post-send binding/settings refresh. Do not let the initial idle pane
+      // snapshot race that write before this scenario configures its baseline.
+      const initialSessionId = session.sessionId
+      const acceptedSessionId = await waitForAcceptedFreshAgentSend(
+        frames.desktop,
+        'stage1 warm session for multiple devices',
+      )
+      if (mode === 'freshopencode' && !disableForcedOpenCodeSnapshot409) {
+        // OpenCode starts with a request-scoped placeholder id. The accepted
+        // warm send is the durable materialization boundary; after it, the
+        // desktop and mobile panes must both fold that same identity before
+        // the settings/binding assertions use the shared session id.
+        if (acceptedSessionId !== initialSessionId) {
+          for (const [deviceName, deviceFrames] of [
+            ['desktop', frames.desktop],
+            ['mobile', frames.mobile],
+          ] as const) {
+            await expect.poll(() => deviceFrames.some((frame) => frame.direction === 'received'
+              && frame.type === 'freshAgent.session.materialized'
+              && frame.previousSessionId === initialSessionId
+              && frame.provider === session.provider
+              && frame.sessionType === session.sessionType
+              && frame.sessionId === acceptedSessionId), {
+              timeout: 30_000,
+              message: deviceName + ' observes the warm OpenCode placeholder materialize to the accepted session id',
+            }).toBe(true)
+          }
+        }
+        for (const [deviceName, device] of [
+          ['desktop', desktop],
+          ['mobile', mobile],
+        ] as const) {
+          await expect.poll(async () => findFreshAgentLeaf(
+            await device.harness.getPaneLayout(device.tabId),
+          )?.content?.sessionRef?.sessionId ?? null, {
+            timeout: 30_000,
+            message: deviceName + ' pane stores the requestId-correlated accepted OpenCode session id',
+          }).toBe(acceptedSessionId)
+        }
+        session.sessionId = acceptedSessionId
+      } else {
+        expect(acceptedSessionId).toBe(session.sessionId)
+      }
       const startCountBefore = native.runtimeStartCount(session.sessionId)
       const desktopReadyBefore = await desktop.harness.getLastReadyAt()
       const mobileReadyBefore = await mobile.harness.getLastReadyAt()
@@ -735,46 +964,108 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       expect(desktopBaseline.length, 'desktop target pane had attached before server recovery').toBeGreaterThan(0)
       expect(mobileBaseline.length, 'mobile target pane had attached before server recovery').toBeGreaterThan(0)
       expect(desktopBaseline.some((tuple) => tuple.observedEpoch === 1
-        && tuple.observedGeneration === 1), 'desktop baseline attach carries the original owner fence').toBe(true)
+        && tuple.observedGeneration === 1), 'desktop baseline attach carries the original owner fence; observed '
+        + JSON.stringify(desktopBaseline)).toBe(true)
       expect(mobileBaseline.some((tuple) => tuple.observedEpoch === 1
-        && tuple.observedGeneration === 1), 'mobile baseline attach carries the original owner fence').toBe(true)
+        && tuple.observedGeneration === 1), 'mobile baseline attach carries the original owner fence; observed '
+        + JSON.stringify(mobileBaseline)).toBe(true)
 
       // Seed a settings value before recovery. The restart helper adds a
       // durable failed-transition fence for this generation, then recovery
       // restores a newer legitimate owner. The later configure must cross
       // that fence and survive a second server restart.
-      await desktop.page.evaluate(({ provider, sessionType, sessionId }) => {
+      const baselineConfigureRequestId = 'stage1-dead-binding-configure-baseline'
+      const bindingBeforeBaselineConfigure = await native.readBinding(session.sessionId)
+      const baselineExpectedModel = mode === 'freshcodex'
+        ? 'fakeprov/fakemodel'
+        : bindingBeforeBaselineConfigure.model ?? null
+      const baselineConfigureSettings = mode === 'freshcodex'
+        ? { model: 'fakeprov/fakemodel', effort: 'low' }
+        : { effort: 'low' }
+      const baselineSettingsFrameCursors = {
+        desktop: frames.desktop.length,
+        mobile: frames.mobile.length,
+      }
+      await desktop.page.evaluate(({ provider, sessionType, sessionId, requestId, settings }) => {
         window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
           type: 'freshAgent.configure',
-          requestId: 'stage1-dead-binding-configure-baseline',
+          requestId,
           provider,
           sessionType,
           sessionId,
-          settings: { effort: 'low' },
+          settings,
         })
-      }, session)
-      for (const deviceFrames of [frames.desktop, frames.mobile]) {
-        await expect.poll(() => deviceFrames.some((frame) => frame.direction === 'received'
-          && frame.type === 'freshAgent.event'
-          && frame.sessionId === session.sessionId
-          && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.metadata'
-          && (frame.event as Record<string, unknown> | undefined)?.effort === 'low'), {
+      }, { ...session, requestId: baselineConfigureRequestId, settings: baselineConfigureSettings })
+      const baselineMetadataFor = (deviceFrames: JsonRow[], frameCursor: number) =>
+        deviceFrames.slice(frameCursor).flatMap((frame, offset) => {
+          const event = frame.event as Record<string, unknown> | undefined
+          if (!(frame.direction === 'received'
+            && frame.type === 'freshAgent.event'
+            && frame.sessionId === session.sessionId
+            && event?.type === 'freshAgent.session.metadata')) return []
+          return [{
+            frameIndex: frameCursor + offset,
+            ...(typeof event.requestId === 'string' ? { requestId: event.requestId } : {}),
+            model: event.model,
+            effort: event.effort,
+          }]
+        })
+      for (const [deviceName, deviceFrames, frameCursor] of [
+        ['desktop', frames.desktop, baselineSettingsFrameCursors.desktop],
+        ['mobile', frames.mobile, baselineSettingsFrameCursors.mobile],
+      ] as const) {
+        await expect.poll(() => baselineMetadataFor(deviceFrames, frameCursor), {
           timeout: 30_000,
-          message: 'both devices observe the baseline settings before recovery',
-        }).toBe(true)
+          message: deviceName + ' observes this configure\'s baseline settings before recovery',
+        }).toContainEqual(expect.objectContaining({
+          ...(mode === 'freshcodex' ? { requestId: baselineConfigureRequestId } : {}),
+          model: baselineExpectedModel,
+          effort: 'low',
+        }))
       }
+      await expect.poll(async () => {
+        const binding = await native.readBinding(session.sessionId)
+        return { model: binding.model ?? null, effort: binding.effort ?? null }
+      }, {
+        timeout: 30_000,
+        message: 'baseline configure is durable before dead-binding recovery starts',
+      }).toEqual({ model: baselineExpectedModel, effort: 'low' })
+      await test.info().attach(`task3-baseline-${mode}`, {
+        body: JSON.stringify({
+          mode,
+          target: { provider: session.provider, sessionType: session.sessionType, sessionId: session.sessionId },
+          baselineFence: { epoch: 1, generation: 1 },
+          desktopBaselineAttachments: desktopBaseline,
+          mobileBaselineAttachments: mobileBaseline,
+          configureRequestId: baselineConfigureRequestId,
+          expectedSettings: { model: baselineExpectedModel, effort: 'low' },
+          desktopMetadataFrames: baselineMetadataFor(frames.desktop, baselineSettingsFrameCursors.desktop),
+          mobileMetadataFrames: baselineMetadataFor(frames.mobile, baselineSettingsFrameCursors.mobile),
+        }, null, 2),
+        contentType: 'application/json',
+      })
       const baselineBinding = await native.readBinding(session.sessionId)
-      expect(baselineBinding).toMatchObject({ effort: 'low' })
+      expect({ model: baselineBinding.model ?? null, effort: baselineBinding.effort ?? null })
+        .toEqual({ model: baselineExpectedModel, effort: 'low' })
+      const ownerGenerationFromBinding = (binding: Record<string, unknown>) => {
+        if (typeof binding.ownerGeneration !== 'number') {
+          throw new Error(`expected a durable owner fence, got ${JSON.stringify(binding)}`)
+        }
+        return binding.ownerGeneration
+      }
 
       const expectRecoveryAttachRounds = async (
         deviceName: 'desktop' | 'mobile',
         device: { viewId: string; tabId: string; paneId: string },
         deviceFrames: ReadonlyArray<Record<string, unknown>>,
         baselineFrameCount: number,
+        expectedRecoveryFence: { epoch: number; generation: number },
+        endFrameCount?: number,
       ) => {
-        await expect.poll(() => {
+        await expect.poll(async () => {
           const analysis = analyzeFreshAgentAttachRounds(deviceFrames, targetFor(device))
-          const recoveryRounds = analysis.rounds.filter((round) => round.authorizationFrameIndex >= baselineFrameCount)
+          const recoveryRounds = analysis.rounds.filter((round) => round.authorizationFrameIndex >= baselineFrameCount
+            && (endFrameCount === undefined || round.authorizationFrameIndex < endFrameCount))
           const readyRounds = recoveryRounds.filter((round) => round.kind === 'ready')
           const positiveReconcileRounds = recoveryRounds.filter((round) => round.kind === 'reconcile')
           const bindingReconcileRounds = positiveReconcileRounds.filter((round) =>
@@ -784,27 +1075,107 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
           const authoritativeByRound = bindingReconcileRounds.map((round) => ({
             roundId: round.id,
             verdict: round.targetVerdict,
-            count: round.attachments.filter((attachment) => !attachment.retryAfterSessionReserved
-              && attachment.observedEpoch === 2
-              && attachment.observedGeneration === 1).length,
+            count: hasAuthoritativeFreshAgentRecoveryAction(round, expectedRecoveryFence) ? 1 : 0,
+            fencedAttachCount: round.attachments.filter((attachment) => !attachment.retryAfterSessionReserved
+              && !attachment.retryAfterRestoreUnavailable
+              && attachment.observedEpoch === expectedRecoveryFence.epoch
+              && attachment.observedGeneration === expectedRecoveryFence.generation).length,
+            respawnCreatedFrameIndex: round.respawnCreatedFrameIndex,
+            respawnCommittedOwnerFence: round.respawnCommittedOwnerFence,
+            respawnCommittedOwnerFrameIndex: round.respawnCommittedOwnerFrameIndex,
           }))
           const missingAuthoritativeRounds = authoritativeByRound.filter((round) => round.count !== 1)
           const bootstrapByRound = recoveryRounds.map((round) => ({
             roundId: round.id,
             verdict: round.targetVerdict,
             count: round.attachments.filter((attachment) => !attachment.retryAfterSessionReserved
+              && !attachment.retryAfterRestoreUnavailable
               && attachment.observedEpoch === null
               && attachment.observedGeneration === null).length,
           }))
           const bootstrapCount = bootstrapByRound.reduce((total, round) => total + round.count, 0)
-          const authoritativeCount = recoveryAttachments.filter((attachment) => !attachment.retryAfterSessionReserved
-            && attachment.observedEpoch === 2
-            && attachment.observedGeneration === 1).length
+          const authoritativeCount = authoritativeByRound.reduce((count, round) => count + round.count, 0)
           const unexpectedTuples = recoveryAttachments.filter((attachment) => !(
             (attachment.observedEpoch === null && attachment.observedGeneration === null)
-            || (attachment.observedEpoch === 2 && attachment.observedGeneration === 1)
+            || (attachment.observedEpoch === expectedRecoveryFence.epoch
+              && attachment.observedGeneration === expectedRecoveryFence.generation)
           ))
           const allSessionAttaches = analysis.rounds.flatMap((round) => round.attachments)
+          const connectionReconcileTraffic = deviceFrames.flatMap((frame, frameIndex) => {
+            if (frame.type !== 'ready' && frame.type !== 'pane.reconcile.request'
+              && frame.type !== 'pane.reconcile.result') return []
+            const panes = Array.isArray(frame.panes) ? frame.panes.map((value) => {
+              const pane = value as Record<string, unknown>
+              return {
+                paneKey: pane.paneKey,
+                kind: pane.kind,
+                mode: pane.mode,
+                createRequestId: pane.createRequestId,
+                sessionRef: pane.sessionRef,
+                resumeSessionId: pane.resumeSessionId,
+              }
+            }) : undefined
+            return [{
+              frameIndex,
+              direction: frame.direction,
+              type: frame.type,
+              bootId: frame.bootId,
+              serverInstanceId: frame.serverInstanceId,
+              capabilities: frame.capabilities,
+              reconcileId: frame.reconcileId,
+              panes,
+              verdicts: frame.verdicts,
+            }]
+          })
+          const respawnRequestIds = new Set(bindingReconcileRounds
+            .filter((round) => round.targetVerdict === 'respawn')
+            .map((round) => round.respawnCreateRequestId)
+            .filter((requestId): requestId is string => typeof requestId === 'string'))
+          const respawnTraffic = deviceFrames.flatMap((frame, frameIndex) => {
+            if (frame.type !== 'freshAgent.create' && frame.type !== 'freshAgent.created'
+              && frame.type !== 'freshAgent.create.failed' && frame.type !== 'session.runtimeOwner'
+              && frame.type !== 'freshAgent.attach') return []
+            const sessionRef = frame.sessionRef as Record<string, unknown> | undefined
+            const targetIdentity = frame.provider === session.provider
+              && (frame.sessionId === session.sessionId
+                || (sessionRef?.provider === session.provider && sessionRef.sessionId === session.sessionId))
+            const targetRequest = typeof frame.requestId === 'string'
+              && respawnRequestIds.has(frame.requestId)
+            if (!targetIdentity && !targetRequest) return []
+            return [{
+              frameIndex,
+              direction: frame.direction,
+              type: frame.type,
+              requestId: frame.requestId,
+              viewId: frame.viewId,
+              tabId: frame.tabId,
+              paneId: frame.paneId,
+              provider: frame.provider,
+              sessionType: frame.sessionType,
+              sessionId: frame.sessionId,
+              sessionRef: frame.sessionRef,
+              epoch: frame.epoch,
+              generation: frame.generation,
+              ownerKind: frame.ownerKind,
+              transition: frame.transition,
+              operationId: frame.operationId,
+              fenced: frame.fenced,
+              observedEpoch: frame.observedEpoch,
+              observedGeneration: frame.observedGeneration,
+              code: frame.code,
+            }]
+          })
+          const reconcileActionFrames = deviceFrames.flatMap((frame, frameIndex) => {
+            const event = frame.event as Record<string, unknown> | undefined
+            const targetFreshAgentEvent = frame.type === 'freshAgent.event'
+              && frame.sessionId === session.sessionId
+            if (frame.type !== 'ready' && frame.type !== 'pane.reconcile.request'
+              && frame.type !== 'pane.reconcile.result' && frame.type !== 'freshAgent.create'
+              && frame.type !== 'freshAgent.created' && frame.type !== 'freshAgent.create.failed'
+              && frame.type !== 'freshAgent.attach' && frame.type !== 'session.runtimeOwner'
+              && !targetFreshAgentEvent) return []
+            return [{ frameIndex, ...frame }]
+          })
           if (
             readyRounds.length > 0
             && positiveReconcileRounds.length > 0
@@ -813,53 +1184,123 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
             && duplicateAttachments.length === 0
             && missingAuthoritativeRounds.length === 0
             && unexpectedTuples.length === 0
-          ) return null
+          ) {
+            if (bindingReconcileRounds.some((round) => round.targetVerdict === 'respawn')) {
+              await test.info().attach(
+                `fresh-agent-respawn-${deviceName}-${expectedRecoveryFence.epoch}-${baselineFrameCount}`,
+                {
+                  body: JSON.stringify({
+                    device: deviceName,
+                    intendedView: { viewId: device.viewId, tabId: device.tabId, paneId: device.paneId },
+                    expectedRecoveryFence,
+                    bindingRounds: bindingReconcileRounds.map((round) => ({
+                      id: round.id,
+                      verdict: round.targetVerdict,
+                      authorizationFrameIndex: round.authorizationFrameIndex,
+                      respawnCreateRequestId: round.respawnCreateRequestId,
+                      respawnCreatedFrameIndex: round.respawnCreatedFrameIndex,
+                      respawnCommittedOwnerFence: round.respawnCommittedOwnerFence,
+                      respawnCommittedOwnerFrameIndex: round.respawnCommittedOwnerFrameIndex,
+                      attachments: round.attachments,
+                    })),
+                    respawnTraffic,
+                  }, null, 2),
+                  contentType: 'application/json',
+                },
+              )
+            }
+            return null
+          }
           return {
             device: deviceName,
             intendedView: { viewId: device.viewId, tabId: device.tabId, paneId: device.paneId },
             expectedBaselineFence: { observedEpoch: 1, observedGeneration: 1 },
-            expectedRecovery: 'one non-retry (2,1) attach in each positive target attach/respawn round; one null-to-fenced upgrade requires matching respawn create and committed owner; duplicate same-fence sends require SESSION_RESERVED',
+            expectedRecovery: `attach verdict => exactly one non-retry (${expectedRecoveryFence.epoch},${expectedRecoveryFence.generation}) attach; respawn verdict => exact target create acknowledgment plus current committed owner fence (${expectedRecoveryFence.epoch},${expectedRecoveryFence.generation}) with optional single follow-up attach; duplicate same-fence sends require SESSION_RESERVED`,
             observedRecoveryCounts: { bootstrapCount, authoritativeCount },
             authoritativeByRound,
             bootstrapByRound,
             missingAuthoritativeRounds,
             duplicateAttachments,
             unexpectedRecoveryTuples: unexpectedTuples,
+            connectionReconcileTraffic,
+            snapshotHttpTraffic: JSON.stringify(snapshotHttpTraffic[deviceName]),
+            forcedSnapshot409: mode === 'freshopencode' ? {
+              count: forcedSnapshot409Count,
+              requestId: forcedSnapshot409RequestId,
+              ownerGeneration: forcedSnapshot409Generation,
+              firstFencedAttachAtMs: forcedSnapshot409FirstAttachAtMs,
+              responseAtMs: forcedSnapshot409ResponseAtMs,
+            } : null,
+            reconcileActionFrames: JSON.stringify(reconcileActionFrames),
+            respawnTraffic: JSON.stringify(respawnTraffic),
             readyRounds: readyRounds.map((round) => ({
               id: round.id,
               bootId: round.bootId,
               authorizationFrameIndex: round.authorizationFrameIndex,
               attachments: round.attachments,
             })),
-            allRecoveryRounds: recoveryRounds.map((round) => ({
+            allRecoveryRounds: JSON.stringify(recoveryRounds.map((round) => ({
               id: round.id,
               kind: round.kind,
               bootId: round.bootId,
               reconcileId: round.reconcileId,
               targetVerdict: round.targetVerdict,
               authorizationFrameIndex: round.authorizationFrameIndex,
+              respawnCreateRequestId: round.respawnCreateRequestId,
+              respawnNullBootstrapFrameIndex: round.respawnNullBootstrapFrameIndex,
+              respawnCreatedFrameIndex: round.respawnCreatedFrameIndex,
+              respawnCommittedOwnerFence: round.respawnCommittedOwnerFence,
+              respawnCommittedOwnerFrameIndex: round.respawnCommittedOwnerFrameIndex,
               attachments: round.attachments,
               duplicateAttachments: round.duplicateAttachments,
-            })),
+            }))),
             sessionAttachTuples: allSessionAttaches,
             validReconcileRoundIds: analysis.validReconcileRoundIds,
           }
         }, {
           timeout: 30_000,
-          message: deviceName + ' target view sends once in each authorized ready/reconcile round',
+          message: deviceName + ' target view performs one authorized attach/create action per target reconcile round',
         }).toBeNull()
       }
 
-      await restartWithDeadTerminalBinding()
+      await restartWithDeadTerminalBinding(session.sessionId)
       await Promise.all([
         desktop.harness.waitForConnectionAfter(desktopReadyBefore, 60_000),
         mobile.harness.waitForConnectionAfter(mobileReadyBefore, 60_000),
       ])
+      const recoveredBinding = await native.readBinding(session.sessionId)
+      expect({ model: recoveredBinding.model ?? null, effort: recoveredBinding.effort ?? null })
+        .toEqual({ model: baselineExpectedModel, effort: 'low' })
+      const recoveredFence = {
+        epoch: await native.readBootEpoch(),
+        generation: ownerGenerationFromBinding(recoveredBinding),
+      }
 
       await Promise.all([
-        expectRecoveryAttachRounds('desktop', desktop, frames.desktop, desktopFrameCountBefore),
-        expectRecoveryAttachRounds('mobile', mobile, frames.mobile, mobileFrameCountBefore),
+        expectRecoveryAttachRounds(
+          'desktop', desktop, frames.desktop, desktopFrameCountBefore, recoveredFence,
+        ),
+        expectRecoveryAttachRounds(
+          'mobile', mobile, frames.mobile, mobileFrameCountBefore, recoveredFence,
+        ),
       ])
+      for (const [deviceName, deviceFrames, frameCursor] of [
+        ['desktop', frames.desktop, desktopFrameCountBefore],
+        ['mobile', frames.mobile, mobileFrameCountBefore],
+      ] as const) {
+        await expect.poll(() => deviceFrames.slice(frameCursor).some((frame) => {
+          const event = frame.event as Record<string, unknown> | undefined
+          return frame.direction === 'received'
+            && frame.type === 'freshAgent.event'
+            && frame.sessionId === session.sessionId
+            && event?.type === 'freshAgent.session.metadata'
+            && event.model === baselineExpectedModel
+            && event.effort === 'low'
+        }), {
+          timeout: 30_000,
+          message: deviceName + ' receives the recovered model and effort after reconnecting',
+        }).toBe(true)
+      }
       await expect.poll(() => native.runtimeStartCount(session.sessionId), {
         timeout: 60_000,
         message: 'both device attaches share one recovered native runtime',
@@ -898,6 +1339,7 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
           && frame.type === 'freshAgent.event'
           && frame.sessionId === session.sessionId
           && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.metadata'
+          && (frame.event as Record<string, unknown> | undefined)?.model === baselineExpectedModel
           && (frame.event as Record<string, unknown> | undefined)?.effort === 'high'), {
           timeout: 30_000,
           message: 'the recovered session broadcasts configured metadata to both devices',
@@ -926,6 +1368,11 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       const mobileSettingsFrameCursor = frames.mobile.length
       const desktopSettingsReady = await desktop.harness.getLastReadyAt()
       const mobileSettingsReady = await mobile.harness.getLastReadyAt()
+      if (mode === 'freshopencode') {
+        const ownerBeforeRestart = await native.readBinding(session.sessionId)
+        forcedSnapshot409Generation = ownerGenerationFromBinding(ownerBeforeRestart)
+        forceOpenCodeSnapshot409 = true
+      }
       await restartServer()
       await Promise.all([
         desktop.harness.waitForConnectionAfter(desktopSettingsReady, 60_000),
@@ -935,9 +1382,13 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         waitForPaneStatus(desktop, /^(connected|idle)$/),
         waitForPaneStatus(mobile, /^(connected|idle)$/),
       ])
-      expect(await native.readBinding(session.sessionId)).toMatchObject({
-        effort: 'high',
-      })
+      const persistedBinding = await native.readBinding(session.sessionId)
+      expect({ model: persistedBinding.model ?? null, effort: persistedBinding.effort ?? null })
+        .toEqual({ model: baselineExpectedModel, effort: 'high' })
+      const persistedFence = {
+        epoch: await native.readBootEpoch(),
+        generation: ownerGenerationFromBinding(persistedBinding),
+      }
       for (const [deviceName, deviceFrames, frameCursor] of [
         ['desktop', frames.desktop, desktopSettingsFrameCursor],
         ['mobile', frames.mobile, mobileSettingsFrameCursor],
@@ -946,6 +1397,7 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
           && frame.type === 'freshAgent.event'
           && frame.sessionId === session.sessionId
           && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.metadata'
+          && (frame.event as Record<string, unknown> | undefined)?.model === baselineExpectedModel
           && (frame.event as Record<string, unknown> | undefined)?.effort === 'high'), {
           timeout: 30_000,
           message: deviceName + ' receives persisted settings after reconnecting',
@@ -960,10 +1412,64 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         waitForAttachRoundQuiet(frames.mobile, targetFor(mobile)),
       ])
       await Promise.all([
-        expectRecoveryAttachRounds('desktop', desktop, frames.desktop, desktopFrameCountBefore),
-        expectRecoveryAttachRounds('mobile', mobile, frames.mobile, mobileFrameCountBefore),
+        expectRecoveryAttachRounds(
+          'desktop', desktop, frames.desktop, desktopFrameCountBefore, recoveredFence, desktopSettingsFrameCursor,
+        ),
+        expectRecoveryAttachRounds(
+          'mobile', mobile, frames.mobile, mobileFrameCountBefore, recoveredFence, mobileSettingsFrameCursor,
+        ),
+        expectRecoveryAttachRounds(
+          'desktop', desktop, frames.desktop, desktopSettingsFrameCursor, persistedFence,
+        ),
+        expectRecoveryAttachRounds(
+          'mobile', mobile, frames.mobile, mobileSettingsFrameCursor, persistedFence,
+        ),
       ])
-      expect(native.runtimeStartCount(session.sessionId)).toBe(startCountBefore + 1)
+      // One recovery start was shared by both views; the second deliberate
+      // server restart then starts one new runtime for the next boot.
+      expect(native.runtimeStartCount(session.sessionId)).toBe(startCountBefore + 2)
+      if (mode === 'freshopencode') {
+        const captureReconnectFrames = (deviceFrames: ReadonlyArray<Record<string, unknown>>, cursor: number) =>
+          deviceFrames.slice(cursor).filter((frame) => {
+            if (frame.type === 'ready' || frame.type === 'pane.reconcile.request'
+              || frame.type === 'pane.reconcile.result' || frame.type === 'freshAgent.attach'
+              || frame.type === 'freshAgent.create' || frame.type === 'freshAgent.created'
+              || frame.type === 'freshAgent.create.failed' || frame.type === 'session.runtimeOwner') return true
+            const event = frame.event as Record<string, unknown> | undefined
+            return frame.type === 'freshAgent.event'
+              && frame.sessionId === session.sessionId
+              && (event?.type === 'freshAgent.error' || event?.type === 'freshAgent.session.metadata')
+          })
+        const targetSnapshotTraffic = (deviceName: 'desktop' | 'mobile') =>
+          snapshotHttpTraffic[deviceName]
+            .filter((row) => typeof row.pathname === 'string'
+              && row.pathname.endsWith(encodeURIComponent(session.sessionId)))
+            .sort((left, right) => Number(left.capturedAtMs) - Number(right.capturedAtMs))
+        const correlationEvidence = {
+          sessionId: session.sessionId,
+          expectedFence: persistedFence,
+          forcedSnapshot409: {
+            count: forcedSnapshot409Count,
+            requestId: forcedSnapshot409RequestId,
+            ownerGeneration: forcedSnapshot409Generation,
+            firstFencedAttachAtMs: forcedSnapshot409FirstAttachAtMs,
+            responseAtMs: forcedSnapshot409ResponseAtMs,
+          },
+          desktop: {
+            snapshotHttp: targetSnapshotTraffic('desktop'),
+            websocket: captureReconnectFrames(frames.desktop, desktopSettingsFrameCursor),
+          },
+          mobile: {
+            snapshotHttp: targetSnapshotTraffic('mobile'),
+            websocket: captureReconnectFrames(frames.mobile, mobileSettingsFrameCursor),
+          },
+        }
+        console.log('TASK3_OPENCODE_RECONNECT_CORRELATION=' + JSON.stringify(correlationEvidence))
+        await test.info().attach('task3-opencode-second-restart-correlation', {
+          body: JSON.stringify(correlationEvidence, null, 2),
+          contentType: 'application/json',
+        })
+      }
     }))
   }
 

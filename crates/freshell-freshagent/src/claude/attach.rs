@@ -190,6 +190,16 @@ impl FreshClaudeState {
             &status,
             session_type_str(msg.session_type),
         ));
+        if let Some(stated) = self.stated_settings(&key).await {
+            reply(crate::session_metadata::session_metadata_frame(
+                PROVIDER,
+                session_type_str(msg.session_type),
+                &native_id,
+                stated.model.as_deref(),
+                stated.effort.as_deref(),
+                stated.permission_mode.as_deref(),
+            ));
+        }
         drop(guard);
         Ok(Some(native_id))
     }
