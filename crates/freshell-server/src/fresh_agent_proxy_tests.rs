@@ -2319,6 +2319,250 @@ async fn send_refusals_surface_typed_recovery_and_open_failure_codes() {
     }
 }
 
+/// gc1p Step 0 fence proof (substituted for the parity case per the task
+/// brief): the hosted gateway's `post_barrier_admission` fence, proven
+/// across the recovery's mint-new identity commit. A managed fresh-agent
+/// session holds no ownership coordinator record in the web process (the
+/// gateway is a proxy; the provider writer lives in the session host), so no
+/// observable (epoch, generation) pair can ever be attached to a hosted
+/// parity send — the fence is proven here instead, against a real
+/// `Live{FreshAgent}` record:
+/// * a send carrying the CURRENT observed pair is admitted and reaches the
+///   supervisor (the happy fence path, previously unexercised);
+/// * the mint-new identity commit (the recovery moves the native root under
+///   the same durable public reference; the registry residue is the old
+///   native root aliased to the canonical key) does NOT invalidate the
+///   PRE-commit observed pair — the second prompt through the original
+///   reference is still admitted, and a send addressed to the pre-commit
+///   native root resolves the same fence through the alias;
+/// * the fence is a real gate: a superseded generation, a foreign epoch,
+///   and a half-sent pair are each typed-refused without ever reaching the
+///   supervisor.
+#[tokio::test]
+async fn fenced_recovery_send_survives_the_identity_commit() {
+    use freshell_ownership::{
+        BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("fenced-send.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let public = "managed-codex-fence".to_string();
+    let old_native_root = "native-root-before-crash".to_string();
+    let admitted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let record = Arc::clone(&admitted);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health => Ok(AdminResult::Health {
+                    control_epoch: 12,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::FreshAgentSend(send) => {
+                    record.lock().unwrap().push(send.text.clone());
+                    Ok(AdminResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    })
+                }
+                other => panic!("an admitted fenced send does no other provider work: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let (proxy, mut receiver) = configure_proxy(
+        &socket,
+        HashMap::from([
+            (
+                ("codex".into(), public.clone()),
+                SoulId::parse("fenced-recovery-soul").unwrap(),
+            ),
+            (
+                ("codex".into(), old_native_root.clone()),
+                SoulId::parse("fenced-recovery-soul").unwrap(),
+            ),
+        ]),
+    );
+    let ownership = Arc::new(RuntimeOwnershipRegistry::with_epoch(4321));
+    proxy.set_ownership(ownership.clone());
+    let fresh_agent_owner = || OwnerIdentity {
+        kind: RuntimeOwnerKind::FreshAgent,
+        terminal_id: None,
+        live_session_key: Some("fence-live-key".to_string()),
+        pid: None,
+        ownership_id: None,
+    };
+    let BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        &public,
+        RuntimeOwnerKind::FreshAgent,
+        "op-open",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("the fresh-agent start must be granted")
+    };
+    assert_eq!(
+        ownership.commit_live("codex", &public, "op-open", generation, fresh_agent_owner()),
+        CommitOutcome::Committed
+    );
+    let observed = ownership.observe("codex", &public);
+    assert_eq!(observed.epoch, 4321);
+    let admitted_count = || admitted.lock().unwrap().len();
+    let fenced_send = |session_id: &str, epoch, generation, text: &str| {
+        let message: freshell_protocol::FreshAgentSend = serde_json::from_value(
+            serde_json::json!({
+                "provider":"codex","sessionId":session_id,"sessionType":"freshcodex",
+                "text":text,"observedEpoch":epoch,"observedGeneration":generation
+            }),
+        )
+        .unwrap();
+        HostedFreshAgentCommand::Send(message)
+    };
+
+    // (1) The current observed pair admits the send through the fence and
+    // the prompt reaches the supervisor.
+    Arc::clone(&proxy)
+        .handle(fenced_send(
+            &public,
+            Some(observed.epoch),
+            Some(observed.generation),
+            "post-crash recovery prompt",
+        ))
+        .await;
+    assert_eq!(
+        *admitted.lock().unwrap(),
+        ["post-crash recovery prompt".to_string()],
+        "the pair-matched fenced send must reach the supervisor"
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "an admitted fenced send broadcasts no error frame"
+    );
+
+    // (2) The mint-new identity commit: the old native root becomes the
+    // durable alias of the canonical public key while the recovery mints
+    // the new native conversation under the same public reference. The
+    // PRE-commit observed pair still admits the second prompt, and the
+    // pre-commit native root resolves the same fence through the alias.
+    assert_eq!(
+        ownership.alias_vacant_key(
+            "codex",
+            &old_native_root,
+            &public,
+            "op-identity-commit",
+            "recovery",
+        ),
+        CommitOutcome::Committed
+    );
+    Arc::clone(&proxy)
+        .handle(fenced_send(
+            &public,
+            Some(observed.epoch),
+            Some(observed.generation),
+            "second prompt on the same durable reference",
+        ))
+        .await;
+    assert_eq!(
+        admitted_count(),
+        2,
+        "the identity commit must not invalidate the pre-commit observed pair"
+    );
+    Arc::clone(&proxy)
+        .handle(fenced_send(
+            &old_native_root,
+            Some(observed.epoch),
+            Some(observed.generation),
+            "recovery follow-up through the pre-commit native root",
+        ))
+        .await;
+    assert_eq!(
+        admitted_count(),
+        3,
+        "the aliased pre-commit native root resolves the same live fence"
+    );
+    assert!(receiver.try_recv().is_err());
+
+    // (3) The fence is a real gate. A superseding same-kind handoff bumps
+    // the generation; the pre-commit pair is then typed-refused, and so are
+    // a foreign epoch and a half-sent pair — none reach the supervisor.
+    let BeginOutcome::Granted { generation } = ownership.begin_handoff(
+        "codex",
+        &public,
+        RuntimeOwnerKind::FreshAgent,
+        "op-refresh",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("the superseding handoff must be granted")
+    };
+    assert_eq!(
+        ownership.commit_live("codex", &public, "op-refresh", generation, fresh_agent_owner()),
+        CommitOutcome::Committed
+    );
+    assert_ne!(
+        ownership.observe("codex", &public).generation,
+        observed.generation,
+        "the fixture must have superseded the observed generation"
+    );
+    let refused_sends = [
+        (
+            fenced_send(
+                &public,
+                Some(observed.epoch),
+                Some(observed.generation),
+                "stale observed pair",
+            ),
+            "fresh-agent session changed while the checkpoint was being captured",
+        ),
+        (
+            fenced_send(&public, Some(observed.epoch + 1), None, "half-sent pair"),
+            "fresh-agent ownership fence is incomplete",
+        ),
+        (
+            fenced_send(&public, Some(9999), Some(0), "foreign epoch"),
+            "fresh-agent session changed while the checkpoint was being captured",
+        ),
+    ];
+    for (message, expected_message) in refused_sends {
+        let texts_before = admitted_count();
+        Arc::clone(&proxy).handle(message).await;
+        let frame = receiver.try_recv().expect("the refused fenced send is visible");
+        let ServerMessage::FreshAgentEvent(event) = serde_json::from_str(&frame).unwrap() else {
+            panic!("expected a nested fresh-agent event: {frame}")
+        };
+        assert_eq!(event.session_id, "managed-codex-fence");
+        assert_eq!(event.event["type"], "freshAgent.error");
+        assert_eq!(
+            event.event["code"], "FRESH_AGENT_STALE_SESSION",
+            "the fence refusal must be the typed stale-session code"
+        );
+        assert_eq!(
+            event.event["message"], expected_message,
+            "the fence refusal must name its exact closed reason"
+        );
+        assert_eq!(
+            admitted_count(),
+            texts_before,
+            "a refused fenced send must never reach the supervisor"
+        );
+    }
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn hosted_configure_for_an_unknown_soul_answers_a_nested_error_not_a_lost_session() {
     let dir = tempfile::tempdir().unwrap();
