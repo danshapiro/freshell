@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tarfile
 import traceback
 import traceback
 import uuid
@@ -20,7 +21,8 @@ LABEL = "org.freshell.dependency-test"
 FOUNDATION = "com.freshell.sandbox.dependency-foundation"
 PROTOCOL = "com.freshell.sandbox.dependency-protocol"
 CASES = ("singleflight", "coherence", "readonly", "reuse", "failure",
-         "interruption", "legacy", "inputs-during-prepare", "node-linker-input", "admission")
+         "interruption", "legacy", "inputs-during-prepare", "node-linker-input", "admission",
+         "standard-builder")
 
 
 def require(value, message):
@@ -130,6 +132,7 @@ class Fixture:
         self.root.mkdir(mode=0o700)
         self.results.mkdir(mode=0o700)
         self.projects, self.jobs, self.direct, self.images = [], [], [], {}
+        self.standard_images = set()
         self.containers, self.targets = {}, {}
         self.command_count = 0
         require(not self.capture(["docker", "volume", "ls", "--format",
@@ -329,6 +332,8 @@ class Fixture:
         return tag,item["Id"]
 
     def run_case(self):
+        if self.case == "standard-builder":
+            return standard_builder(self)
         if self.case == "admission":
             return admission(self)
         if self.case == "inputs-during-prepare":
@@ -515,16 +520,77 @@ class Fixture:
                 found=self.capture(["docker","image","inspect",tag],okay=False)
                 if found.returncode == 0:
                     item=json.loads(found.stdout)[0]
-                    require(item["Config"]["Labels"].get(LABEL) == self.token and
+                    require((item["Config"]["Labels"].get(LABEL) == self.token or
+                             (tag in self.standard_images and expected is not None)) and
                             (expected is None or item["Id"] == expected),
                             "task image ownership changed")
                     self.capture(["docker","image","rm",tag])  # Exact tag, no prune.
+            # Retain the small synthetic inputs, never mounted dependency or
+            # target data, before removing this fixture's host files.
+            with tarfile.open(self.results / "fixture-inputs.tar.gz", "w:gz") as archive:
+                for file in self.root.rglob("*"):
+                    relative = file.relative_to(self.root)
+                    if file.is_file() and not any(part in ("node_modules", "target", ".git")
+                                                  for part in relative.parts):
+                        archive.add(file, arcname=str(relative), recursive=False)
             shutil.rmtree(self.root)
         write(self.results/"cleanup.json",json.dumps({
             "wrappersJoined":all(j["process"].poll() is not None for j in self.jobs),
             "commands":self.command_count,"volumes":volumes,
             "errors":errors,"temporaryRootRetained":self.root.exists()}),0o600)
         require(not errors,"owned settlement failed; retain private evidence")
+
+
+def standard_builder(f):
+    """Run the production builder: workload changes reuse actual prepared trees."""
+    a = f.project("builder")
+    for relative in ("scripts/sandbox-build.sh", "docker/sandbox/Dockerfile",
+                     "docker/sandbox/entrypoint.sh"):
+        shutil.copyfile(REPO / relative, a / relative)
+        (a / relative).chmod((REPO / relative).stat().st_mode & 0o777)
+    original = (a / "docker/sandbox/Dockerfile").read_text()
+    # Content in the real foundation stage, not an inherited runtime label.
+    boundary = "FROM ${FRESHELL_SANDBOX_FOUNDATION_IMAGE} AS sandbox-runtime"
+    require(boundary in original, "real foundation/runtime boundary missing")
+    identities = []
+
+    def build_and_import(name):
+        tag = "freshell-sandbox:deptest-" + f.token + "-" + name
+        require(f.capture(["docker", "image", "inspect", tag], okay=False)
+                .returncode != 0, "task image already existed")
+        env = os.environ.copy()
+        env.update(FRESHELL_SANDBOX_IMAGE=tag, TMPDIR=str(f.root))
+        f.standard_images.add(tag)
+        f.capture(["bash", str(a / "scripts/sandbox-build.sh")],
+                  env=env, timeout=600)
+        item = f.image(tag)
+        # The standard builder sets no test ownership label. Record the exact
+        # ID immediately; cleanup checks that ID before removing only our tag.
+        f.images[tag] = item["Id"]
+        job = f.start(a, name, image=tag)
+        f.finish(job)
+        ack = f.ack(job)
+        require(ack["imports"] == 1, "actual prepared dependency import missing")
+        identities.append({"image": item["Id"],
+                           "foundation": item["Config"]["Labels"][FOUNDATION],
+                           "key": ack["key"], "installs": f.installs(a)})
+        write(f.results / "builder-identities.json", json.dumps(identities), 0o600)
+        return identities[-1]
+
+    first = build_and_import("builder-first")
+    with (a / "docker/sandbox/entrypoint.sh").open("a") as source:
+        source.write("\n# Test fixture workload-only revision.\n")
+    second = build_and_import("builder-workload")
+    require(first["foundation"] == second["foundation"],
+            "standard builder changed foundation for a workload-only edit")
+    require(first["key"] == second["key"] and second["installs"] == 1,
+            "standard builder reinstalled unchanged dependencies")
+    write(a / "docker/sandbox/Dockerfile", original.replace(boundary,
+          'RUN printf "fixture-toolchain-revision\\n" > /usr/local/share/freshell-foundation-revision\n' + boundary))
+    third = build_and_import("builder-foundation")
+    require(third["foundation"] != first["foundation"] and
+            third["key"] != first["key"] and third["installs"] == 2,
+            "actual foundation content change reused the old prepared tree")
 
 
 def inputs_during_prepare(f):

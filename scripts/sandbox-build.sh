@@ -44,7 +44,9 @@ if docker image inspect "${FOUNDATION_BUILD_TAG}" >/dev/null 2>&1; then
 fi
 # Build-time networking retains the existing bridge workaround. Runtime
 # network, process, memory and user limits are owned by sandbox-test.sh.
-docker build --network=host --target dependency-foundation \
+# The foundation ID is installed-content identity. Attestation manifests carry
+# build-specific metadata and would re-key unchanged dependency trees.
+docker build --network=host --provenance=false --sbom=false --target dependency-foundation \
   --build-arg "UID=$(id -u)" --build-arg "GID=$(id -g)" \
   --iidfile "${FOUNDATION_ID_FILE}" -t "${FOUNDATION_BUILD_TAG}" \
   "${REPO_ROOT}/docker/sandbox"
