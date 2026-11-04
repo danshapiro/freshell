@@ -332,6 +332,40 @@ metadata and verify backups where the selected update can open or change the
 registry. The ordinary web/client update has no mode approval gate; the updater
 requires the exact word `APPROVED` only for `--all` and `--durable-only`.
 
+### Retaining processes from a legacy installation
+
+The supervisor can continue an already running protocol-1 terminal host after
+verifying its recorded incarnation, container ownership, configuration, boot
+identity, and execution generation. This compatibility path supports terminal
+input, output, resizing, status, and the older host's supported controls. It
+does not create native recovery evidence or enable protocol-2 fresh-agent
+operations on that host. New hosts use protocol 2. Missing ownership evidence
+or a changed boot or generation blocks continuation without launching a
+replacement. Recheck the retained identities and working input/output in the
+isolated upgrade rehearsal.
+
+A saved Codex terminal can also reuse its retained host-side app-server when
+the exact native session and terminal-sidecar ownership record verify against
+the running process. This restore keeps its existing host ownership even when
+the client negotiates managed routing. A lost claim refuses the restore;
+it must not silently launch another writer. This process remains host-managed
+and is still reported by the normal updater's ownership census. Other
+host-managed providers need a separately verified recovery procedure.
+
+An installation without the authenticated readiness or maintenance APIs
+cannot use the current updater for its initial upgrade. Its deliberate
+bootstrap needs a concrete, separately approved procedure recording the
+actual service owners, retained processes, host-agent interruption and recovery,
+candidate artifacts, consistent old-schema backup, and old-build readability
+checks. Preserve the exact running executables as well as the installed files:
+a running deleted executable can differ from its installed pathname. Before
+any candidate registry opener, an aborted bootstrap must select the verified
+prior executable before starting the prior service. After a schema upgrade or
+new writes, preserve the state and follow the fix-forward guidance below.
+The reset-capable updater modes still reset managed sessions.
+
+### Upgrade procedure
+
 1. Identify the actual port-3001 server owner and supervisor owner, effective
    unit/drop-in or launcher commands, PID/cwd/executable, startup build identity,
    registry/schema, control/runtime roots, image digest, and client, sidecar,
