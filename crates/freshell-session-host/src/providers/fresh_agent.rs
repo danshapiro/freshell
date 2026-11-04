@@ -3513,6 +3513,250 @@ await import(parameters.source)
         assert!(surviving_start.is_none(), "the failed resume's owned descendant must be confirmed terminal before mint-new acceptance");
     }
 
+    /// gc1p Fix B1: a codex session whose host process and durable actor are
+    /// alive but whose native provider process died (its rollout history
+    /// archived away, so `thread/resume` proves `no rollout found`) must route
+    /// `HostCommand::FreshAgentSend` to the actor's recover-on-send — minting
+    /// a new native conversation and committing the typed identity — instead
+    /// of being refused at the send-time native-observation guard. The
+    /// readiness gate (`FreshAgentPrepareNative`) answers the same
+    /// classification with an honest recoverable verdict that carries no
+    /// fabricated native identity. A freshly minted thread's pending naming
+    /// handle is expected `None` (validator new-assumption 2).
+    #[tokio::test]
+    async fn codex_native_exit_in_a_live_host_routes_send_to_recover_on_send() {
+        let logs = tempfile::tempdir().unwrap();
+        let requests = logs.path().join("send-guard-requests.jsonl");
+        let mut behavior = json!({"recordTurns":true,"appendRequestLogPath":requests,
+            "exitProcessAfterMethodsOnce":["turn/start"],
+            "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("original-native-exit"),
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id thread-new-1"}}}
+        });
+        let fixture = native_codex_fixture(behavior.clone()).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("send-guard-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("first-before-exit").unwrap(),
+                "first native input".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.transport.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the original owned executable must exit");
+
+        let mut host = crate::tests::test_host_state();
+        let incarnation = Arc::get_mut(&mut host).unwrap().incarnation_id.clone();
+        {
+            let mut persisted = host.persisted.lock().await;
+            persisted.max_execution_generation = 1;
+            persisted.native_identity_launch =
+                Some(freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: incarnation.clone(),
+                    launch_nonce: "send-guard-launch".into(),
+                    evidence_revision: 0,
+                    execution_generation: 1,
+                    requested_native_session_id: Some("thread-new-1".into()),
+                });
+        }
+        *host.fresh_agent.lock().await = Some(actor.clone());
+
+        // The readiness gate must answer the send-recoverable class with the
+        // honest verdict: the durable actor is intact and no current native
+        // identity exists to report.
+        let prepared = crate::dispatch(
+            crate::tests::authenticated_host_envelope(
+                &host,
+                freshell_runtime_protocol::HostCommand::FreshAgentPrepareNative {
+                    incarnation_id: incarnation.clone(),
+                },
+            ),
+            &host,
+        )
+        .await
+        .map_err(|error| error.message);
+        assert!(
+            matches!(
+                prepared.as_ref(),
+                Ok(freshell_runtime_protocol::HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    native_session_id: None,
+                    native_identity: None,
+                    ..
+                })
+            ),
+            "class-(ii) native readiness must return the honest recoverable verdict: {prepared:?}"
+        );
+
+        behavior["threadStartThreadId"] = json!(uuid::Uuid::new_v4().to_string());
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::dispatch(
+                crate::tests::authenticated_host_envelope(
+                    &host,
+                    freshell_runtime_protocol::HostCommand::FreshAgentSend {
+                        incarnation_id: incarnation.clone(),
+                        request_id: RequestId::parse("recover-on-send").unwrap(),
+                        text: "recovery native input".into(),
+                        settings: None,
+                        checkpoint_logical_attempt_id: None,
+                    },
+                ),
+                &host,
+            ),
+        )
+        .await
+        .expect("the send-guard route must settle")
+        .map_err(|error| error.message);
+        assert!(
+            matches!(
+                recovered.as_ref(),
+                Ok(freshell_runtime_protocol::HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    native_identity: Some(
+                        freshell_runtime_protocol::NativeDispatchIdentity {
+                            previous_native_session_id,
+                            native_session_id,
+                            pending_naming_handle: None,
+                        },
+                    ),
+                    native_session_id: Some(observed),
+                    ..
+                }) if previous_native_session_id == "thread-new-1"
+                    && native_session_id.as_str() == observed.as_str()
+                    && observed != "thread-new-1"
+            ),
+            "the send-recoverable class must reach the actor's recover-on-send and commit the typed identity: {recovered:?}"
+        );
+        assert!(
+            fixture.transport.is_live().await,
+            "the recovery send must have respawned a live native provider"
+        );
+        assert_eq!(
+            actor.profile().await.native_session_id.as_deref(),
+            recovered
+                .as_ref()
+                .ok()
+                .and_then(|result| match result {
+                    freshell_runtime_protocol::HostResult::FreshAgentCommand {
+                        native_session_id,
+                        ..
+                    } => native_session_id.clone(),
+                    _ => None,
+                })
+                .as_deref(),
+            "the actor's durable profile must carry the minted root"
+        );
+        actor.stop().await.unwrap();
+    }
+
+    /// gc1p Fix B1 fence: a codex actor the supervisor's stop path already
+    /// stopped keeps refusing input exactly as today — the send-recoverable
+    /// route never revives a stopped actor and never mints a replacement
+    /// conversation for it.
+    #[tokio::test]
+    async fn stopped_codex_actor_still_refuses_input_without_minting() {
+        let logs = tempfile::tempdir().unwrap();
+        let requests = logs.path().join("stopped-actor-requests.jsonl");
+        let mut behavior = json!({"recordTurns":true,"appendRequestLogPath":requests,
+            "exitProcessAfterMethodsOnce":["turn/start"],
+            "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("original-native-exit"),
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id thread-new-1"}}}
+        });
+        let fixture = native_codex_fixture(behavior.clone()).await;
+        let actor = FreshAgentHostActor::open(
+            fixture.dir.path().join("stopped-actor"),
+            fixture.profile.clone(),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        actor
+            .dispatch(
+                RequestId::parse("first-before-stop").unwrap(),
+                "first native input".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.transport.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the original owned executable must exit");
+        actor.clone().stop().await.unwrap();
+
+        let mut host = crate::tests::test_host_state();
+        let incarnation = Arc::get_mut(&mut host).unwrap().incarnation_id.clone();
+        {
+            let mut persisted = host.persisted.lock().await;
+            persisted.max_execution_generation = 1;
+            persisted.native_identity_launch =
+                Some(freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: incarnation.clone(),
+                    launch_nonce: "stopped-actor-launch".into(),
+                    evidence_revision: 0,
+                    execution_generation: 1,
+                    requested_native_session_id: Some("thread-new-1".into()),
+                });
+        }
+        *host.fresh_agent.lock().await = Some(actor.clone());
+        behavior["threadStartThreadId"] = json!(uuid::Uuid::new_v4().to_string());
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+
+        let result = crate::dispatch(
+            crate::tests::authenticated_host_envelope(
+                &host,
+                freshell_runtime_protocol::HostCommand::FreshAgentSend {
+                    incarnation_id: incarnation.clone(),
+                    request_id: RequestId::parse("stopped-actor-input").unwrap(),
+                    text: "must not revive a stopped actor".into(),
+                    settings: None,
+                    checkpoint_logical_attempt_id: None,
+                },
+            ),
+            &host,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(freshell_runtime_protocol::RuntimeError {
+                    code: freshell_runtime_protocol::RuntimeErrorCode::RecoveryWrongIdentity,
+                    ..
+                })
+            ),
+            "a stopped actor must keep today's typed refusal: {result:?}"
+        );
+        let thread_starts = std::fs::read_to_string(&requests)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<Value>(line)
+                    .map(|row| row["method"] == "thread/start")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            thread_starts, 1,
+            "the refused stopped-actor input must never mint a replacement conversation"
+        );
+    }
+
     #[tokio::test]
     async fn task010_unknown_owned_cleanup_retains_claim_and_never_replays_input() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

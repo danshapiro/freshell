@@ -1018,28 +1018,53 @@ async fn dispatch_with_effects(
                 HostCommand::FreshAgentPrepareNative { incarnation_id } => {
                     let _native_command = state.fresh_native_command.lock().await;
                     ensure_incarnation(&incarnation_id, state)?;
-                    ensure_current_fresh_native_observation(state).await?;
+                    ensure_current_fresh_native_observation_routed(
+                        state,
+                        NativeObservationRoute::RecoverableOnSend,
+                    )
+                    .await?;
                     let persisted = state.persisted.lock().await.clone();
-                    let observation = current_native_observation(state, &persisted)
-                        .await
-                        .ok_or_else(|| {
-                            RuntimeError::new(
-                                RuntimeErrorCode::RecoveryWrongIdentity,
-                                "native readiness returned without current provider proof",
-                            )
-                        })?;
                     let actor = state
                         .fresh_agent
                         .lock()
                         .await
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
-                    Ok(HostResult::FreshAgentCommand {
-                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
-                        claude_fork: actor.claude_fork_recipe().await,
-                        native_identity: None,
-                        native_session_id: Some(observation.native_session_id),
-                    })
+                    match current_native_observation(state, &persisted).await {
+                        Some(observation) => Ok(HostResult::FreshAgentCommand {
+                            state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                            claude_fork: actor.claude_fork_recipe().await,
+                            native_identity: None,
+                            native_session_id: Some(observation.native_session_id),
+                        }),
+                        // gc1p Fix B1: the send-recoverable codex class has no
+                        // current native identity to report — the honest
+                        // readiness verdict certifies the durable actor is
+                        // intact and the next send drives recover-on-send.
+                        // It must never fabricate an observation.
+                        None if codex_native_exit_is_send_recoverable(&actor).await => {
+                            append_event_with_secret(
+                                &state.state_dir,
+                                &state.secret,
+                                "host.native_readiness.send_recoverable",
+                                serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
+                                    "executionGeneration":persisted.max_execution_generation,
+                                    "controlEpoch":persisted.max_control_epoch,
+                                    "reason":"CODEX_NATIVE_EXIT_SEND_RECOVERABLE"}),
+                            )
+                            .ok();
+                            Ok(HostResult::FreshAgentCommand {
+                                state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                                claude_fork: actor.claude_fork_recipe().await,
+                                native_identity: None,
+                                native_session_id: None,
+                            })
+                        }
+                        None => Err(RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "native readiness returned without current provider proof",
+                        )),
+                    }
                 }
                 HostCommand::FreshAgentResumePending { incarnation_id } => {
                     let _native_command = state.fresh_native_command.lock().await;
@@ -1075,7 +1100,11 @@ async fn dispatch_with_effects(
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let _native_command = state.fresh_native_command.lock().await;
-                    ensure_current_fresh_native_observation(state).await?;
+                    ensure_current_fresh_native_observation_routed(
+                        state,
+                        NativeObservationRoute::RecoverableOnSend,
+                    )
+                    .await?;
                     let actor = state
                         .fresh_agent
                         .lock()
@@ -2727,7 +2756,71 @@ async fn commit_fresh_native_transition(
     Ok(())
 }
 
+/// Session-host copy of the gc1p Fix B1 provider-exit classification.
+///
+/// The supervisor owns the canonical definition
+/// (`freshell_supervisor::inventory::classify_fresh_provider_exit`); this
+/// crate cannot depend on the supervisor at runtime, so the rule is
+/// duplicated here and pinned to the supervisor definition by the
+/// `provider_exit_classification_matches_the_supervisor_definition` parity
+/// test over the full input space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshProviderExitClass {
+    /// The session-host process itself is gone (or the exit is another
+    /// whole-host failure class): the supervisor's whole-host replacement
+    /// and RETRY_BUDGET policy govern.
+    WholeHostLoss,
+    /// A codex native provider exited while the session-host process and its
+    /// durable actor remain intact: the soul stays send-admitted and the
+    /// next send drives the actor's recover-on-send.
+    CodexSendRecoverable,
+}
+
+fn classify_fresh_provider_exit(
+    provider: &str,
+    host_alive: bool,
+    native_alive: bool,
+) -> FreshProviderExitClass {
+    if host_alive && !native_alive && provider == "codex" {
+        FreshProviderExitClass::CodexSendRecoverable
+    } else {
+        FreshProviderExitClass::WholeHostLoss
+    }
+}
+
+/// Whether this actor's state is the codex send-recoverable exit class: the
+/// provider is codex, this host process runs the guard with the durable actor
+/// present (and the actor just proved it is not stopped by completing
+/// `prepare_native_readiness`), and the native provider session is not live.
+async fn codex_native_exit_is_send_recoverable(
+    actor: &Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+) -> bool {
+    let provider = actor.profile().await.provider;
+    let native_alive = actor.is_live().await;
+    classify_fresh_provider_exit(provider.as_str(), /* host_alive */ true, native_alive)
+        == FreshProviderExitClass::CodexSendRecoverable
+}
+
+/// Which native-observation guard behavior a handler enforces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeObservationRoute {
+    /// Refuse whenever the current native observation is unavailable — the
+    /// pre-existing behavior of every guarded handler.
+    Strict,
+    /// Additionally route a codex native exit in a live host (host process
+    /// and durable actor intact, native session dead) to the actor's
+    /// recover-on-send instead of refusing with NATIVE_IDENTITY_UNOBSERVED.
+    RecoverableOnSend,
+}
+
 async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<(), RuntimeError> {
+    ensure_current_fresh_native_observation_routed(state, NativeObservationRoute::Strict).await
+}
+
+async fn ensure_current_fresh_native_observation_routed(
+    state: &HostState,
+    route: NativeObservationRoute,
+) -> Result<(), RuntimeError> {
     let persisted = state.persisted.lock().await.clone();
     // The typed deterministic transport exists only in the explicit fixture
     // build. Its counters never certify native mode readiness.
@@ -2753,6 +2846,26 @@ async fn ensure_current_fresh_native_observation(state: &HostState) -> Result<()
             && current.max_execution_generation == persisted.max_execution_generation
             && current_native_observation(state, &current).await.is_some()
         {
+            return Ok(());
+        }
+        // gc1p Fix B1: a codex native exit inside this live host is
+        // send-recoverable. The mint path itself proves ownership through
+        // the durable actor's journal (the task010 owned-tree discipline),
+        // so routing the send to the actor's recover-on-send never writes
+        // into an identity this host cannot prove it owns.
+        if route == NativeObservationRoute::RecoverableOnSend
+            && codex_native_exit_is_send_recoverable(&actor).await
+        {
+            append_event_with_secret(
+                &state.state_dir,
+                &state.secret,
+                "host.native_input.send_recoverable_route",
+                serde_json::json!({"severity":"info","incarnationId":state.incarnation_id,
+                    "executionGeneration":persisted.max_execution_generation,
+                    "controlEpoch":persisted.max_control_epoch,
+                    "reason":"CODEX_NATIVE_EXIT_SEND_RECOVERABLE"}),
+            )
+            .ok();
             return Ok(());
         }
     }
@@ -10759,7 +10872,7 @@ mod tests {
         FreshProvider, RequestId,
     };
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct RpcFixtureTransport {
         native_evidence: std::sync::Mutex<Option<serde_json::Value>>,
@@ -10769,10 +10882,14 @@ mod tests {
         operations: AtomicUsize,
         captures: AtomicUsize,
         stops: AtomicUsize,
+        native_live: AtomicBool,
     }
 
     #[async_trait]
     impl FreshAgentTransport for RpcFixtureTransport {
+        async fn is_live(&self) -> bool {
+            self.native_live.load(Ordering::SeqCst)
+        }
         async fn native_identity_evidence(&self) -> Option<serde_json::Value> {
             self.native_evidence.lock().unwrap().clone()
         }
@@ -10970,6 +11087,7 @@ mod tests {
                     operations: AtomicUsize::new(0),
                     captures: AtomicUsize::new(0),
                     stops: AtomicUsize::new(0),
+                    native_live: AtomicBool::new(true),
                 });
                 let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                     state.state_dir.join("transition-agent"),
@@ -11146,6 +11264,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("current-native-rpc-agent"),
@@ -11218,6 +11337,119 @@ mod tests {
         actor.stop().await.unwrap();
     }
 
+    /// gc1p Fix B1 parity pin: the session host's duplicated provider-exit
+    /// classification must produce identical outputs to the supervisor's
+    /// canonical definition for every input, so both gates on the send path
+    /// enforce one rule.
+    #[test]
+    fn provider_exit_classification_matches_the_supervisor_definition() {
+        for provider in ["codex", "claude", "kilroy", "opencode", "shell", ""] {
+            for host_alive in [true, false] {
+                for native_alive in [true, false] {
+                    assert_eq!(
+                        format!(
+                            "{:?}",
+                            classify_fresh_provider_exit(provider, host_alive, native_alive)
+                        ),
+                        format!(
+                            "{:?}",
+                            freshell_supervisor::inventory::classify_fresh_provider_exit(
+                                provider,
+                                host_alive,
+                                native_alive
+                            )
+                        ),
+                        "provider={provider} host_alive={host_alive} native_alive={native_alive}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// gc1p Fix B1 fence: a claude session in the same dead-native state
+    /// (host process and durable actor intact, native provider session not
+    /// live) keeps refusing at the send-time guard exactly as today — the
+    /// send-recoverable route is scoped to codex managed sessions.
+    #[tokio::test]
+    async fn claude_dead_native_input_still_refuses_at_the_send_guard() {
+        let state = test_host_state();
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "claude-dead-native".into(),
+            evidence_revision: 0,
+            execution_generation: 1,
+            requested_native_session_id: Some("fixture-native-thread".into()),
+        };
+        state.persisted.lock().await.native_identity_launch = Some(binding.clone());
+        let transport = Arc::new(RpcFixtureTransport {
+            native_evidence: std::sync::Mutex::new(Some(
+                serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1}),
+            )),
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(false),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("claude-dead-native-agent"),
+            FreshAgentProfile {
+                naming_handle: None,
+                collaboration_mode: None,
+                provider: FreshProvider::Claude,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(actor.clone());
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    checkpoint_logical_attempt_id: None,
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::parse("claude-dead-native-send").unwrap(),
+                    text: "must not reach a dead claude native".into(),
+                    settings: None,
+                },
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::RecoveryWrongIdentity,
+                    ..
+                })
+            ),
+            "a claude session in the dead-native state must keep today's guard refusal: {result:?}"
+        );
+        assert_eq!(
+            transport.dispatches.load(Ordering::SeqCst),
+            0,
+            "the refused claude input must never reach the actor's transport"
+        );
+        actor.stop().await.unwrap();
+    }
+
     #[tokio::test]
     async fn authenticated_fresh_agent_rpc_keeps_one_host_owned_transport_until_explicit_stop() {
         let state = test_host_state();
@@ -11239,6 +11471,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-fixture-agent"),
@@ -12701,6 +12934,7 @@ mod tests {
                 operations: AtomicUsize::new(0),
                 captures: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
+                native_live: AtomicBool::new(true),
             });
             freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                 state_dir.join("publication-agent"),
@@ -12997,6 +13231,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
         })
     }
 
@@ -22423,6 +22658,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("rpc-configure-agent"),
@@ -22587,6 +22823,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("child-observer"),
@@ -22667,6 +22904,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            native_live: AtomicBool::new(true),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
             state.state_dir.join("catalog-observer"),

@@ -2671,15 +2671,85 @@ impl Supervisor {
                 ));
             }
         }
+        // gc1p Fix B1: a codex native exit inside this still-live host is
+        // send-recoverable. The classification is derived locally from the
+        // facts this gate already holds (the host just answered an
+        // authenticated status observation), mirroring the fenced shape of
+        // `can_prepare`: the same desired-state, incarnation, and
+        // non-fixture conditions, evaluated for the codex live-host class.
+        let codex_send_recoverable = |current: &crate::registry::RecoveryContext,
+                                      status: &HostStatus| {
+            !fixture
+                && current.provider.as_str() == "codex"
+                && current.fresh_agent.is_some()
+                && current.desired_state == freshell_runtime_protocol::DesiredState::Running
+                && current.prior_handle.incarnation_id() == active.incarnation_id()
+                && classify_send_recoverable_exit(current, status)
+                    == crate::inventory::FreshProviderExitClass::CodexSendRecoverable
+        };
+        let mut send_recoverable = codex_send_recoverable(&current, &status);
+        // The codex readiness arm mirrors `can_prepare`: while the claude arm
+        // restores a live native identity, the codex class-(ii) preparation
+        // proves the still-live host and its durable actor accept the
+        // recover-on-send lane (the honest verdict carries no current native
+        // identity to re-report).
+        if send_recoverable
+            && crate::recovery::current_native_observation(&current, &status).is_none()
+        {
+            let before = current.write_fence();
+            let result = self
+                .await_running_startup(
+                    soul_id,
+                    "prepare_fresh_native_readiness",
+                    self.send_authenticated_host_command(
+                        active.incarnation_id().clone(),
+                        active.runtime_dir(),
+                        &host,
+                        HostCommand::FreshAgentPrepareNative {
+                            incarnation_id: active.incarnation_id().clone(),
+                        },
+                    ),
+                )
+                .await??;
+            if !matches!(
+                result,
+                HostResult::FreshAgentCommand {
+                    state: CommandState::Completed | CommandState::ProviderAcked,
+                    ..
+                }
+            ) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "unexpected fresh-agent native readiness reply",
+                ));
+            }
+            status = self
+                .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+                .await?;
+            current = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if current.write_fence() != before {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "fresh-agent owner or intent changed during native readiness",
+                ));
+            }
+            send_recoverable = codex_send_recoverable(&current, &status);
+        }
         if current.desired_state != freshell_runtime_protocol::DesiredState::Running
             || current.prior_handle.incarnation_id() != active.incarnation_id()
-            || status.exited
-            || (!fixture
-                && (!host
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "native-identity-observation-v1")
-                    || crate::recovery::current_native_observation(&current, &status).is_none()))
+            || (!send_recoverable
+                && (status.exited
+                    || (!fixture
+                        && (!host
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "native-identity-observation-v1")
+                            || crate::recovery::current_native_observation(&current, &status)
+                                .is_none()))))
         {
             append_event(
                 &self.config.lifecycle_log,
@@ -5931,6 +6001,22 @@ enum FreshAgentNativeIdentityUpdate {
     Unchanged,
     Record,
     Transition,
+}
+
+/// Derive the provider-exit class for the admission gate from facts the gate
+/// already holds: the session host answered an authenticated status
+/// observation (host_alive), and that status reports the native provider
+/// session liveness. Pure classification lives in
+/// `crate::inventory::classify_fresh_provider_exit`.
+fn classify_send_recoverable_exit(
+    current: &crate::registry::RecoveryContext,
+    status: &HostStatus,
+) -> crate::inventory::FreshProviderExitClass {
+    crate::inventory::classify_fresh_provider_exit(
+        current.provider.as_str(),
+        /* host_alive */ true,
+        /* native_alive */ !status.exited,
+    )
 }
 
 fn classify_fresh_agent_operation_identity(
@@ -9196,6 +9282,404 @@ mod opencode_transfer_restart_tests {
                 RecoveryProbe::ReattachReady { .. }
             ));
         }
+        responder.abort();
+        let _ = responder.await;
+    }
+
+    /// gc1p Fix B1 (validator new-assumption 1): the typed dispatch-identity
+    /// commit — the only durable move of a native root on the send path —
+    /// runs its writer-claim clause against the ORIGINAL claim on the old
+    /// root. Pin that the original claim exists when the clause runs, that
+    /// the commit succeeds only through it, and that a missing original
+    /// claim refuses the transition instead of minting unowned identity.
+    #[tokio::test]
+    async fn codex_dispatch_identity_commit_runs_against_the_original_writer_claim() {
+        use freshell_runtime_protocol::NativeDispatchIdentity;
+        use rusqlite::OptionalExtension;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), dir.path())
+                .await;
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+            params![soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::json!({
+                    "sessionId":"codex-send-recoverable","provider":"codex",
+                    "sessionType":"freshcodex","runtimeVariant":"codex-app-server-v1",
+                    "providerStoreId":"fresh-store","nativeSessionId":"old-owned-root",
+                    "cwd":dir.path(),"workspacePath":dir.path(),"runAsUid":65534,"runAsGid":0
+                })
+                .to_string(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "old-owned-root".into(),
+            )
+            .await
+            .unwrap();
+
+        let claim_owner = |native: &str| -> Option<String> {
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.query_row(
+                "SELECT incarnation_id FROM writer_claims WHERE provider='codex' AND provider_store_id='fresh-store' AND native_session_id=?1",
+                params![native],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(
+            claim_owner("old-owned-root").as_deref(),
+            Some(prepared.incarnation_id.as_str()),
+            "the original writer claim on the old root must exist before the commit runs"
+        );
+
+        registry
+            .record_fresh_agent_dispatch_identity(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                NativeDispatchIdentity {
+                    previous_native_session_id: "old-owned-root".into(),
+                    native_session_id: "minted-new-root".into(),
+                    pending_naming_handle: None,
+                },
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(
+            context.native_session_id.as_deref(),
+            Some("minted-new-root"),
+            "the typed commit is the only durable move of the native root"
+        );
+        assert_eq!(
+            claim_owner("old-owned-root"),
+            None,
+            "the committed transition retires the old root's claim"
+        );
+        assert_eq!(
+            claim_owner("minted-new-root").as_deref(),
+            Some(prepared.incarnation_id.as_str()),
+            "the minted root is claimed by the same surviving incarnation"
+        );
+
+        // The clause is load-bearing: the same transition against a recorded
+        // old root whose original claim is absent must refuse.
+        let bare_soul = SoulId::new();
+        let bare = crate::registry::tests::materialize_fresh_runtime(
+            &registry,
+            bare_soul.clone(),
+            dir.path(),
+        )
+        .await;
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex',native_session_id='unclaimed-old-root' WHERE soul_id=?1",
+            params![bare_soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::json!({
+                    "sessionId":"codex-unclaimed","provider":"codex",
+                    "sessionType":"freshcodex","runtimeVariant":"codex-app-server-v1",
+                    "providerStoreId":"fresh-store","nativeSessionId":"unclaimed-old-root",
+                    "cwd":dir.path(),"workspacePath":dir.path(),"runAsUid":65534,"runAsGid":0
+                })
+                .to_string(),
+                bare.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            matches!(
+                registry
+                    .record_fresh_agent_dispatch_identity(
+                        bare_soul.clone(),
+                        bare.incarnation_id.clone(),
+                        NativeDispatchIdentity {
+                            previous_native_session_id: "unclaimed-old-root".into(),
+                            native_session_id: "another-new-root".into(),
+                            pending_naming_handle: None,
+                        },
+                    )
+                    .await,
+                Err(crate::registry::RegistryError::NativeIdentityConflict)
+            ),
+            "a missing original writer claim must refuse the typed commit"
+        );
+    }
+
+    /// gc1p Fix B1: a send against a codex soul whose native provider exited
+    /// inside a LIVE host is admitted through the typed send-recoverable
+    /// branch (driving the actor's recover-on-send, whose typed identity
+    /// commit moves the native root) instead of the blanket status.exited
+    /// refusal. A send against a genuinely dead host still refuses with the
+    /// existing typed error.
+    #[tokio::test]
+    async fn codex_native_exit_in_a_live_host_admits_the_send_through_the_recoverable_class() {
+        use freshell_runtime_protocol::{NativeDispatchIdentity, NativeIdentityObservation};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), dir.path())
+                .await;
+        let runtime = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+            params![soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+            params![
+                runtime.to_string_lossy(),
+                serde_json::json!({
+                    "sessionId":"codex-send-recoverable","provider":"codex",
+                    "sessionType":"freshcodex","runtimeVariant":"codex-app-server-v1",
+                    "providerStoreId":"fresh-store","nativeSessionId":"old-owned-root",
+                    "cwd":dir.path(),"workspacePath":dir.path(),"runAsUid":65534,"runAsGid":0
+                })
+                .to_string(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "old-owned-root".into(),
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let inputs = Arc::new(AtomicUsize::new(0));
+        let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let responder = {
+            let preparations = Arc::clone(&preparations);
+            let inputs = Arc::clone(&inputs);
+            let incarnation = prepared.incarnation_id.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => {
+                            assert_eq!(incarnation_id, incarnation);
+                            Ok(HostResult::Hello {
+                                proof: host_proof(
+                                    b"synthetic-secret",
+                                    &challenge,
+                                    &boot,
+                                    &incarnation_id,
+                                ),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![
+                                    "owned-provider-config-v1".into(),
+                                    "provider-store-probe-v1".into(),
+                                    "native-identity-observation-v1".into(),
+                                ],
+                                effective_limits: context.requested_limits,
+                            })
+                        }
+                        HostCommand::Status { incarnation_id } => {
+                            assert_eq!(incarnation_id, incarnation);
+                            // The native provider process is dead; the host
+                            // process keeps answering with no current native
+                            // identity observation.
+                            Ok(HostResult::Status {
+                                native_session_id: None,
+                                native_identity_observation: None::<NativeIdentityObservation>,
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(123),
+                                worker_launch_count: 1,
+                                max_control_epoch: registry.control_epoch(),
+                                max_execution_generation: 1,
+                                fixture_evidence: serde_json::json!({
+                                    "workload":"fresh-agent","exited":true
+                                }),
+                                exited: true,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
+                        HostCommand::FreshAgentPrepareNative { incarnation_id } => {
+                            assert_eq!(incarnation_id, incarnation);
+                            preparations.fetch_add(1, Ordering::SeqCst);
+                            // The readiness arm's honest class-(ii) verdict:
+                            // the durable actor is intact and the next send
+                            // drives recover-on-send; there is no current
+                            // native identity to report.
+                            Ok(HostResult::FreshAgentCommand {
+                                state: CommandState::ProviderAcked,
+                                claude_fork: None,
+                                native_identity: None,
+                                native_session_id: None,
+                            })
+                        }
+                        HostCommand::FreshAgentSend { incarnation_id, .. } => {
+                            assert_eq!(incarnation_id, incarnation);
+                            inputs.fetch_add(1, Ordering::SeqCst);
+                            // The actor's recover-on-send minted a new native
+                            // conversation and acknowledged the typed
+                            // identity transition from the old dead root.
+                            Ok(HostResult::FreshAgentCommand {
+                                state: CommandState::ProviderAcked,
+                                claude_fork: None,
+                                native_identity: Some(NativeDispatchIdentity {
+                                    previous_native_session_id: "old-owned-root".into(),
+                                    native_session_id: "minted-new-root".into(),
+                                    pending_naming_handle: None,
+                                }),
+                                native_session_id: Some("minted-new-root".into()),
+                            })
+                        }
+                        other => panic!("unexpected host command {other:?}"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            })
+        };
+        let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+            &dir,
+            registry.clone(),
+            crate::backend::BackendRuntimeState::Running,
+        );
+
+        // RED target: this send must be admitted (driving the actor lane)
+        // instead of the blanket status.exited refusal.
+        assert_eq!(
+            supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    soul.clone(),
+                    "recovery input".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            CommandState::ProviderAcked,
+            "the send-recoverable class must admit the send through the actor lane"
+        );
+        assert_eq!(
+            preparations.load(Ordering::SeqCst),
+            1,
+            "the codex readiness arm must mirror can_prepare before the gate"
+        );
+        assert_eq!(
+            inputs.load(Ordering::SeqCst),
+            1,
+            "the admitted send must reach the host actor lane"
+        );
+        let after = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(
+            after.native_session_id.as_deref(),
+            Some("minted-new-root"),
+            "the typed identity commit must move the native root durably"
+        );
+
+        // A genuinely dead host still refuses with the existing typed error.
+        let dead_soul = SoulId::new();
+        let dead = crate::registry::tests::materialize_fresh_runtime(
+            &registry,
+            dead_soul.clone(),
+            dir.path(),
+        )
+        .await;
+        let dead_runtime = dir.path().join("dead-host");
+        std::fs::create_dir(&dead_runtime).unwrap();
+        std::fs::write(dead_runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+            params![dead_soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+            params![
+                dead_runtime.to_string_lossy(),
+                serde_json::json!({
+                    "sessionId":"codex-dead-host","provider":"codex",
+                    "sessionType":"freshcodex","runtimeVariant":"codex-app-server-v1",
+                    "providerStoreId":"fresh-store","nativeSessionId":"dead-old-root",
+                    "cwd":dir.path(),"workspacePath":dir.path(),"runAsUid":65534,"runAsGid":0
+                })
+                .to_string(),
+                dead.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                dead_soul.clone(),
+                dead.incarnation_id.clone(),
+                "dead-old-root".into(),
+            )
+            .await
+            .unwrap();
+        // No host socket: the session-host process is genuinely dead.
+        assert_eq!(
+            supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    dead_soul.clone(),
+                    "dead host input".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::HostUnreachable,
+            "a send against a genuinely dead host must keep the existing typed refusal"
+        );
+        assert_eq!(
+            inputs.load(Ordering::SeqCst),
+            1,
+            "the dead host's input must never reach an actor lane"
+        );
         responder.abort();
         let _ = responder.await;
     }

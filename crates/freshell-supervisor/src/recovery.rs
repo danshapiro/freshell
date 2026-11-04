@@ -2137,6 +2137,35 @@ impl Supervisor {
                     if context.provider == "shell" {
                         return Ok(shell_terminal_end_probe(context));
                     }
+                    if context.fresh_agent.as_ref().is_some_and(|agent| {
+                        agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    }) && !deterministic_fresh_fixture(context)
+                        && crate::inventory::classify_fresh_provider_exit(
+                            context.provider.as_str(),
+                            /* host_alive: the authenticated host answered status */ true,
+                            /* native_alive */ !status.exited,
+                        ) == crate::inventory::FreshProviderExitClass::CodexSendRecoverable
+                    {
+                        // gc1p Fix B1: a codex native exit inside a live host
+                        // classifies as send-recoverable. The pipeline never
+                        // probes the archived store (either archive-race side
+                        // would block or replace against the dead root) and
+                        // never prepares a whole-host replacement: the still-
+                        // live host and its durable actor reattach, and the
+                        // next send drives recover-on-send through the typed
+                        // identity commit.
+                        crate::service::append_event(
+                            &self.config.lifecycle_log,
+                            "supervisor.recovery.native_exit_send_recoverable",
+                            serde_json::json!({
+                                "soulId": context.soul_id,
+                                "incarnationId": context.prior_handle.incarnation_id(),
+                                "provider": context.provider,
+                                "nativeSessionId": context.native_session_id,
+                            }),
+                        );
+                        return Ok(live_reattach_probe(context, &status));
+                    }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &*context,
                         status

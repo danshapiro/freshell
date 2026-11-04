@@ -29,6 +29,45 @@ const MAX_STARTUP_RECOVERY_CONCURRENCY: usize = 16;
 const DEFAULT_STARTUP_SOUL_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_OBSERVER_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Classification of an observed fresh-agent provider exit. Pure over the
+/// three facts every gate on the send path already holds: the managed
+/// fresh-agent provider, the session-host process liveness, and the native
+/// provider-session liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshProviderExitClass {
+    /// The session-host process itself is gone (or the exit is another
+    /// whole-host failure class). Whole-host replacement and the bounded
+    /// 2s/10s RETRY_BUDGET policy keep governing recovery exactly as before.
+    WholeHostLoss,
+    /// A codex native provider exited while the session-host process and its
+    /// durable actor remain intact. The soul stays send-admitted: no
+    /// whole-host replacement runs, and the next send drives the actor's
+    /// recover-on-send, whose typed `NativeDispatchIdentity` commit moves the
+    /// native root durably.
+    CodexSendRecoverable,
+}
+
+/// Classify a fresh-agent provider-exit observation from facts each gate
+/// derives locally. `host_alive` is the session-host process liveness (an
+/// answered authenticated status observation at the supervisor; the running
+/// host process with its durable actor at the session host). `native_alive`
+/// is the native provider-session liveness that observation reports
+/// (`!status.exited` at the supervisor; the actor transport's liveness at the
+/// session host). Only a codex native exit inside a live host is
+/// send-recoverable; every other class keeps the existing whole-host
+/// replacement policy.
+pub fn classify_fresh_provider_exit(
+    provider: &str,
+    host_alive: bool,
+    native_alive: bool,
+) -> FreshProviderExitClass {
+    if host_alive && !native_alive && provider == "codex" {
+        FreshProviderExitClass::CodexSendRecoverable
+    } else {
+        FreshProviderExitClass::WholeHostLoss
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupSoulResult {
     pub soul_id: SoulId,
@@ -337,22 +376,60 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
-                                Ok(_) => {
-                                    if view.provider.as_deref() != Some("shell")
-                                        && !matches!(
-                                            view.durability_state,
-                                            DurabilityState::ResumeCaptured
-                                                | DurabilityState::CheckpointCaptured
-                                                | DurabilityState::IntrinsicallyNonResumable
+                                Ok(status) => {
+                                    if handle.fresh_agent().is_some_and(|agent| {
+                                        !crate::registry::deterministic_fresh_agent_fixture(
+                                            view.provider.as_deref().unwrap_or_default(),
+                                            agent,
                                         )
+                                    }) && classify_fresh_provider_exit(
+                                        handle
+                                            .fresh_agent()
+                                            .map(|agent| agent.provider.as_str())
+                                            .unwrap_or_default(),
+                                        /* host_alive */ true,
+                                        /* native_alive */ !status.exited,
+                                    ) == FreshProviderExitClass::CodexSendRecoverable
                                     {
-                                        // Publish initial native proof even when nobody reads
-                                        // output. The existing probe refreshes ownership under
-                                        // the lifecycle lock and reuses the capture retry gate.
-                                        supervisor.probe_recovery(view.soul_id.clone()).await?;
+                                        // gc1p Fix B1: the host process and its
+                                        // durable actor are intact; only the
+                                        // native provider died. The soul stays
+                                        // send-admitted — the next send drives
+                                        // the actor's recover-on-send — so no
+                                        // whole-host replacement is scheduled.
+                                        // The typed observation is the honest
+                                        // record of the classification.
+                                        append_event(
+                                            &supervisor.config.lifecycle_log,
+                                            "supervisor.runtime_observer.native_exit_send_recoverable",
+                                            serde_json::json!({
+                                                "soulId": view.soul_id,
+                                                "incarnationId": handle.incarnation_id(),
+                                                "provider": view.provider,
+                                                "nativeSessionId": view.native_session_id,
+                                            }),
+                                        );
+                                        None
+                                    } else if status.exited {
+                                        Some(RecoveryTrigger::ProviderExit)
+                                    } else {
+                                        if view.provider.as_deref() != Some("shell")
+                                            && !matches!(
+                                                view.durability_state,
+                                                DurabilityState::ResumeCaptured
+                                                    | DurabilityState::CheckpointCaptured
+                                                    | DurabilityState::IntrinsicallyNonResumable
+                                            )
+                                        {
+                                            // Publish initial native proof even when nobody reads
+                                            // output. The existing probe refreshes ownership under
+                                            // the lifecycle lock and reuses the capture retry gate.
+                                            supervisor
+                                                .probe_recovery(view.soul_id.clone())
+                                                .await?;
+                                        }
+                                        None
                                     }
-                                    None
                                 }
                                 Err(error) => {
                                     append_event(
@@ -507,11 +584,17 @@ mod tests {
         stale_observation: Arc<AtomicBool>,
         probe_unavailable: Arc<AtomicBool>,
         stop_during_probe: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
+        probe_definitively_unavailable: Arc<AtomicBool>,
         peer: JoinHandle<()>,
     }
 
     impl ObserverFixture {
         async fn new(fresh: bool) -> Self {
+            Self::new_with_backend_state(fresh, BackendRuntimeState::Running).await
+        }
+
+        async fn new_with_backend_state(fresh: bool, backend_state: BackendRuntimeState) -> Self {
             let root = Arc::new(tempfile::tempdir().unwrap());
             let registry = Registry::open(root.path().join("registry"), None).unwrap();
             let soul = SoulId::new();
@@ -581,18 +664,22 @@ mod tests {
             let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
                 &root,
                 registry.clone(),
-                BackendRuntimeState::Running,
+                backend_state,
             );
             let probes = Arc::new(AtomicUsize::new(0));
             let stale_observation = Arc::new(AtomicBool::new(false));
             let probe_unavailable = Arc::new(AtomicBool::new(false));
             let stop_during_probe = Arc::new(AtomicBool::new(false));
+            let exited = Arc::new(AtomicBool::new(false));
+            let probe_definitively_unavailable = Arc::new(AtomicBool::new(false));
             let peer = {
                 let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
                 let probes = Arc::clone(&probes);
                 let stale_observation = Arc::clone(&stale_observation);
                 let probe_unavailable = Arc::clone(&probe_unavailable);
                 let stop_during_probe = Arc::clone(&stop_during_probe);
+                let exited = Arc::clone(&exited);
+                let probe_definitively_unavailable = Arc::clone(&probe_definitively_unavailable);
                 let soul = soul.clone();
                 tokio::spawn(async move {
                     let boot = HostBootId::new();
@@ -626,12 +713,13 @@ mod tests {
                             }
                             HostCommand::Status { incarnation_id } => {
                                 assert_eq!(incarnation_id, launch.incarnation_id);
-                                Ok(HostResult::Status {
-                                    host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
-                                    max_control_epoch: registry.control_epoch(), max_execution_generation: 1,
-                                    fixture_evidence: serde_json::json!({}), exited: false,
-                                    native_session_id: Some("observer-root".into()),
-                                    native_identity_observation: Some(NativeIdentityObservation {
+                                let observation = if exited.load(Ordering::SeqCst) {
+                                    // A dead native provider cannot certify a
+                                    // current identity observation; the host
+                                    // process itself keeps answering.
+                                    None
+                                } else {
+                                    Some(NativeIdentityObservation {
                                         native_session_id: "observer-root".into(),
                                         incarnation_id: if stale_observation.load(Ordering::SeqCst) {
                                             freshell_runtime_protocol::IncarnationId::new()
@@ -641,29 +729,56 @@ mod tests {
                                         source: if fresh { NativeIdentitySource::FreshProviderHandshake }
                                             else { NativeIdentitySource::CodexAppServer },
                                         evidence_digest: "b".repeat(64),
-                                    }),
+                                    })
+                                };
+                                Ok(HostResult::Status {
+                                    host_boot_id: boot.clone(), worker_pid: Some(42), worker_launch_count: 1,
+                                    max_control_epoch: registry.control_epoch(), max_execution_generation: 1,
+                                    fixture_evidence: serde_json::json!({}),
+                                    exited: exited.load(Ordering::SeqCst),
+                                    native_session_id: observation
+                                        .as_ref()
+                                        .map(|observation| observation.native_session_id.clone()),
+                                    native_identity_observation: observation,
                                     opencode_transfer_receipt: None, opencode_adoption: Default::default(),
                                 })
                             }
                             HostCommand::ProbeRecovery { incarnation_id, resume_spec, .. } => {
                                 assert_eq!(incarnation_id, launch.incarnation_id);
                                 probes.fetch_add(1, Ordering::SeqCst);
-                                let spec = resume_spec.expect("the observer must select one exact native root");
-                                assert_eq!(spec.provider_session.native_session_id, "observer-root");
-                                assert_eq!(spec.provider_session.provider, "codex");
-                                assert!(matches!(
-                                    freshell_agent_runtime::probe_provider_store(&provider_home, &spec),
-                                    freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
-                                ), "a real provider store read must verify the requested root");
-                                if stop_during_probe.load(Ordering::SeqCst) {
-                                    registry.begin_stop(soul.clone()).await.unwrap();
-                                }
-                                if probe_unavailable.load(Ordering::SeqCst) {
-                                    Err(RuntimeError::new(RuntimeErrorCode::HostUnreachable, "synthetic native store transport unavailable"))
-                                } else {
-                                    Ok(HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
-                                        evidence_revision: spec.evidence_revision, resume_spec: spec,
+                                if probe_definitively_unavailable.load(Ordering::SeqCst) {
+                                    // The post-archive race side: the exact
+                                    // store probe classifies the archived
+                                    // root as definitively absent.
+                                    Ok(HostResult::RecoveryProbe(RecoveryProbe::DefinitivelyUnavailable {
+                                        path: freshell_runtime_protocol::RecoveryPath::NativeResume,
+                                        reason: "archived native store is definitively absent".into(),
+                                        evidence: vec![format!(
+                                            "incarnationId={}",
+                                            launch.incarnation_id
+                                        )],
+                                        store_state:
+                                            freshell_runtime_protocol::EvidenceStoreState::NotApplicable,
+                                        negative_paths: Vec::new(),
                                     }))
+                                } else {
+                                    let spec = resume_spec.expect("the observer must select one exact native root");
+                                    assert_eq!(spec.provider_session.native_session_id, "observer-root");
+                                    assert_eq!(spec.provider_session.provider, "codex");
+                                    assert!(matches!(
+                                        freshell_agent_runtime::probe_provider_store(&provider_home, &spec),
+                                        freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+                                    ), "a real provider store read must verify the requested root");
+                                    if stop_during_probe.load(Ordering::SeqCst) {
+                                        registry.begin_stop(soul.clone()).await.unwrap();
+                                    }
+                                    if probe_unavailable.load(Ordering::SeqCst) {
+                                        Err(RuntimeError::new(RuntimeErrorCode::HostUnreachable, "synthetic native store transport unavailable"))
+                                    } else {
+                                        Ok(HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                                            evidence_revision: spec.evidence_revision, resume_spec: spec,
+                                        }))
+                                    }
                                 }
                             }
                             other => panic!("observer evidence must not require output, launch, or Stop commands: {other:?}"),
@@ -688,6 +803,8 @@ mod tests {
                 stale_observation,
                 probe_unavailable,
                 stop_during_probe,
+                exited,
+                probe_definitively_unavailable,
                 peer,
             }
         }
@@ -725,6 +842,10 @@ mod tests {
                 .recovery_context(self.soul.clone())
                 .await
                 .unwrap()
+        }
+
+        fn lifecycle(&self) -> String {
+            std::fs::read_to_string(self.root.path().join("lifecycle.jsonl")).unwrap_or_default()
         }
     }
 
@@ -814,5 +935,157 @@ mod tests {
             "a verified read cannot publish after durable Stop"
         );
         assert_ne!(context.durability_state, DurabilityState::ResumeCaptured);
+    }
+
+    /// gc1p Fix B1 pin: the classification is pure over exactly its three
+    /// facts, and only a codex native exit inside a live host is
+    /// send-recoverable. Every other provider, a dead host, and a live
+    /// native keep the whole-host-loss class.
+    #[test]
+    fn provider_exit_classification_is_pure_over_provider_host_and_native_liveness() {
+        for provider in ["codex", "claude", "kilroy", "opencode", "shell", ""] {
+            for host_alive in [true, false] {
+                for native_alive in [true, false] {
+                    let class = classify_fresh_provider_exit(provider, host_alive, native_alive);
+                    let expected = if provider == "codex" && host_alive && !native_alive {
+                        FreshProviderExitClass::CodexSendRecoverable
+                    } else {
+                        FreshProviderExitClass::WholeHostLoss
+                    };
+                    assert_eq!(
+                        class, expected,
+                        "provider={provider} host_alive={host_alive} native_alive={native_alive}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// gc1p Fix B1: a codex managed fresh-agent whose native provider exited
+    /// while the host process and its durable actor remain intact classifies
+    /// as send-recoverable, not whole-host-replaceable. The observer must not
+    /// schedule whole-host recovery (no store probe, no replacement, no retry
+    /// budget), the soul must stay in its live/recovery-neutral state, and the
+    /// classification must be recorded as a typed observation event.
+    #[tokio::test]
+    async fn observer_classifies_a_codex_native_exit_in_a_live_host_as_send_recoverable() {
+        let fixture = ObserverFixture::new(true).await;
+        fixture.observe().await;
+        fixture.assert_captured().await;
+        let before = fixture.context().await;
+        let prior_incarnation = before.prior_handle.incarnation_id().clone();
+
+        // The native provider process dies; the host process keeps answering.
+        fixture.exited.store(true, Ordering::SeqCst);
+        fixture.observe().await;
+
+        assert_eq!(
+            fixture.probes.load(Ordering::SeqCst),
+            1,
+            "a send-recoverable native exit must not probe the store on either archive-race side"
+        );
+        let after = fixture.context().await;
+        assert_eq!(
+            after.recovery_state,
+            RecoveryState::Live,
+            "the soul must stay send-admitted in its live/recovery-neutral state"
+        );
+        assert!(
+            after.recovery_attempt_id.is_none(),
+            "the send-recoverable classification reserves no recovery attempt"
+        );
+        assert_eq!(
+            after.prior_handle.incarnation_id(),
+            &prior_incarnation,
+            "no whole-host replacement may be prepared"
+        );
+        let lifecycle = fixture.lifecycle();
+        assert!(
+            lifecycle.contains("supervisor.runtime_observer.native_exit_send_recoverable"),
+            "the typed send-recoverable classification must be recorded: {lifecycle}"
+        );
+        assert!(
+            !lifecycle.contains("supervisor.runtime_observer.recovery_scheduled"),
+            "a send-recoverable native exit must not schedule whole-host recovery: {lifecycle}"
+        );
+    }
+
+    /// gc1p Fix B1 fence: a dead host process still classifies as
+    /// whole-host-replaceable — the observer keeps scheduling provider-exit
+    /// recovery exactly as before for the host-loss class.
+    #[tokio::test]
+    async fn observer_keeps_whole_host_recovery_for_a_dead_host_process() {
+        let fixture =
+            ObserverFixture::new_with_backend_state(true, BackendRuntimeState::Missing).await;
+        fixture.observe().await;
+        let lifecycle = fixture.lifecycle();
+        assert!(
+            lifecycle.contains("supervisor.runtime_observer.recovery_scheduled")
+                && lifecycle.contains("provider_exit"),
+            "a host-process death observation must still schedule provider-exit recovery: {lifecycle}"
+        );
+        assert!(
+            !lifecycle.contains("native_exit_send_recoverable"),
+            "a dead host process must never classify as send-recoverable: {lifecycle}"
+        );
+    }
+
+    /// gc1p Fix B1 (b)-side reach: even when the recovery pipeline is entered
+    /// for a codex live-host/dead-native soul (startup reconcile after a
+    /// supervisor restart, a due retry, or a manual request), the
+    /// classification governs its response: the archived store is never
+    /// probed, no replacement is prepared, and the soul reattaches live so
+    /// the next send can drive recover-on-send.
+    #[tokio::test]
+    async fn codex_native_exit_recovery_pipeline_reattaches_without_probing_the_archived_store() {
+        let fixture = ObserverFixture::new(true).await;
+        fixture.observe().await;
+        fixture.assert_captured().await;
+        let before = fixture.context().await;
+        let prior_incarnation = before.prior_handle.incarnation_id().clone();
+
+        fixture.exited.store(true, Ordering::SeqCst);
+        fixture
+            .probe_definitively_unavailable
+            .store(true, Ordering::SeqCst);
+        fixture.observe().await;
+        assert_eq!(fixture.probes.load(Ordering::SeqCst), 1);
+
+        let result = Box::pin(fixture.supervisor.recover(RecoverRequest {
+            soul_id: fixture.soul.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: Some(before.intent_revision),
+            expected_control_epoch: Some(fixture.supervisor.registry.control_epoch()),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            result.outcome,
+            RecoveryOutcome::Reattached,
+            "the pipeline must reattach a send-recoverable soul instead of probing or blocking: {:?}",
+            result.probe
+        );
+        assert_eq!(
+            fixture.probes.load(Ordering::SeqCst),
+            1,
+            "the archived store must not be probed on either race side"
+        );
+        let after = fixture.context().await;
+        assert_eq!(after.recovery_state, RecoveryState::Live);
+        assert!(
+            after.recovery_attempt_id.is_none(),
+            "the reattached send-recoverable soul carries no recovery attempt"
+        );
+        assert_eq!(
+            after.prior_handle.incarnation_id(),
+            &prior_incarnation,
+            "no whole-host replacement may run for the send-recoverable class"
+        );
+        assert!(
+            fixture
+                .lifecycle()
+                .contains("supervisor.recovery.native_exit_send_recoverable"),
+            "the pipeline must record its send-recoverable classification"
+        );
     }
 }
