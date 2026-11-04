@@ -642,6 +642,7 @@ mod tests {
                                             else { NativeIdentitySource::CodexAppServer },
                                         evidence_digest: "b".repeat(64),
                                     }),
+                                    native_readiness_receipt: None,
                                     opencode_transfer_receipt: None, opencode_adoption: Default::default(),
                                 })
                             }

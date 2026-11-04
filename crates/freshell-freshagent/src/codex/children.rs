@@ -59,8 +59,8 @@ impl FreshCodexState {
         let (raw, materialized, unmaterialized) = match read {
             Ok(raw) => (raw, true, false),
             Err(error) => {
-                let unmaterialized =
-                    is_codex_include_turns_unavailable(&error) || is_codex_thread_not_found(&error);
+                let unmaterialized = is_codex_include_turns_unavailable(&error)
+                    || is_codex_thread_not_found(&error, "thread/read", child_thread_id);
                 tracing::warn!(provider=PROVIDER, session_id=%parent, child_thread_id, error=%error, "freshagent.codex.child_history_unavailable");
                 match client.read_thread(child_thread_id, false).await {
                     Ok(raw) => (raw, false, unmaterialized),
@@ -290,16 +290,37 @@ mod tests {
         let driver = tokio::spawn(async move {
             let mut reads = vec![];
             loop {
-                let request =
-                    tokio::time::timeout(Duration::from_secs(2), peer.expect_request()).await;
-                let Ok((id, method, params)) = request else {
+                let frame = tokio::time::timeout(Duration::from_secs(2), peer.next_frame_or_eof())
+                    .await
+                    .expect("fake app-server timed out waiting for a client request");
+                let Some(frame) = frame else {
                     break;
+                };
+                let (id, method, params) = match frame {
+                    freshell_codex::ClientFrame::Request { id, method, params } => {
+                        (id, method, params)
+                    }
+                    freshell_codex::ClientFrame::Notification { method, .. } => {
+                        panic!("observer dispatched an unexpected notification: {method}")
+                    }
                 };
                 reads.push((method.clone(), params.clone()));
                 if method == "initialize" {
                     peer.respond(&id, json!({"userAgent":"fixture", "codexHome":"/owned", "platformFamily":"unix", "platformOs":"linux"}));
                     let _ = peer.expect_notification().await;
                 } else if method == "thread/read" {
+                    if params["threadId"] != parent["thread"]["id"]
+                        && child["_missingRollout"] == true
+                    {
+                        peer.respond_error(
+                            &id,
+                            -32600,
+                            child["_missingRolloutMessage"]
+                                .as_str()
+                                .unwrap_or("no rollout found for thread id child"),
+                        );
+                        continue;
+                    }
                     if params["threadId"] != parent["thread"]["id"]
                         && params["includeTurns"] == true
                         && child["_historyUnavailable"] == true
@@ -419,6 +440,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_read_classifies_only_exact_native_missing_rollout_for_its_read_request() {
+        for (message, expected_status) in [
+            (
+                "no rollout found for thread id child",
+                "history_unavailable",
+            ),
+            (
+                "no rollout found for thread id another-child",
+                "source_unavailable",
+            ),
+        ] {
+            let child = json!({
+                "_missingRollout": true,
+                "_missingRolloutMessage": message,
+                "thread": {
+                    "id":"child",
+                    "parentThreadId":"parent",
+                    "status":{"type":"active"},
+                    "ephemeral":false,
+                    "turns":[]
+                }
+            });
+            let (state, driver) = fixture(child).await;
+            let result = state.read_child("parent", "child", None, None).await;
+            state.shutdown().await;
+            let reads = driver.await.unwrap();
+
+            if expected_status == "history_unavailable" {
+                let unavailable = result.expect("the exact missing child is unavailable history");
+                assert_eq!(unavailable["status"], "unavailable");
+                assert_eq!(unavailable["reason"], "history_unavailable");
+                assert_eq!(unavailable["retryable"], false);
+            } else {
+                assert!(matches!(result, Err(ChildReadError::SourceUnavailable)));
+            }
+            assert!(reads.iter().any(|(method, params)| {
+                method == "thread/read"
+                    && params["threadId"] == "child"
+                    && params["includeTurns"] == true
+            }));
+            assert!(reads.iter().any(|(method, params)| {
+                method == "thread/read"
+                    && params["threadId"] == "child"
+                    && params["includeTurns"] == false
+            }));
+            assert!(reads.iter().all(|(method, _)| matches!(
+                method.as_str(),
+                "initialize" | "thread/read" | "thread/turns/list"
+            )));
+        }
+    }
+
+    #[tokio::test]
     async fn child_read_pending_materialization_is_bounded_and_ephemeral_is_terminal() {
         for ephemeral in [false, true] {
             let (state, driver) = fixture(json!({"thread":{"id":"child","parentThreadId":"parent","ephemeral":ephemeral,"status":{"type":"active"},"turns":[]}})).await;
@@ -483,8 +557,18 @@ mod tests {
         let (state,driver) = fixture(json!({"_historyUnavailable":true,"_historyError":"temporary provider read failure","thread":{"id":"child","parentThreadId":"parent","ephemeral":false,"status":{"type":"active"},"turns":[]}})).await;
         let result = state.read_child("parent", "child", None, None).await;
         state.shutdown().await;
-        let _ = driver.await.unwrap();
+        let reads = driver.await.unwrap();
         assert!(matches!(result,Err(ChildReadError::SourceUnavailable)),"temporary source failure must not become pending or permanently missing history: {result:?}");
+        assert!(reads.iter().any(|(method, params)| {
+            method == "thread/read"
+                && params["threadId"] == "child"
+                && params["includeTurns"] == true
+        }));
+        assert!(reads.iter().any(|(method, params)| {
+            method == "thread/read"
+                && params["threadId"] == "child"
+                && params["includeTurns"] == false
+        }));
     }
 
     #[tokio::test]

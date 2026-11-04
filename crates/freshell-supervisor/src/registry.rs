@@ -5,10 +5,12 @@ use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
     FreshAgentLaunchSpec, FreshAgentTurnSettings, FreshProvider, GrantId, HostBootId,
     IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget,
-    NativeDispatchIdentity, NoticeId, OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor,
-    RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
-    RequestId, RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
+    NativeDispatchIdentity, NativeIdentityLaunch, NativeIdentityObservation,
+    NativeReadinessReceipt, NativeReadinessRecoveryAuthorization, NoticeId,
+    OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason,
+    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -108,6 +110,49 @@ type StoppedRepairTargetReceiptFenceRow = (
     u64,
     String,
     String,
+);
+type NativeReadinessAuthorizationSoulRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+);
+type NativeReadinessAuthorizationTargetRow = (
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    u64,
+    String,
+    Option<i64>,
+);
+type NativeReadinessReceiptCommitRow = (
+    String,
+    Option<String>,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
 );
 
 #[derive(Debug, thiserror::Error)]
@@ -834,6 +879,18 @@ impl RecoveryWriteFence {
     pub(crate) fn for_incarnation(mut self, incarnation_id: IncarnationId) -> Self {
         self.active_incarnation_id = incarnation_id;
         self
+    }
+
+    pub(crate) fn native_readiness_fence(&self) -> freshell_runtime_protocol::NativeReadinessFence {
+        freshell_runtime_protocol::NativeReadinessFence {
+            control_epoch: self.control_epoch,
+            intent_revision: self.intent_revision,
+            identity_revision: self.identity_revision,
+            evidence_revision: self.evidence_revision,
+            native_import_revision: self.native_import_revision,
+            recovery_attempt_id: self.recovery_attempt_id.clone(),
+            active_incarnation_id: self.active_incarnation_id.clone(),
+        }
     }
 }
 
@@ -3116,6 +3173,31 @@ impl Registry {
         .map(|_| ())
     }
 
+    /// Commit a provider-verified Codex recovery root transition against the
+    /// exact write fence captured before the provider readiness operation.
+    /// The fresh provider proof can take long enough for stop, restart, or
+    /// another identity update to win; in that case the transition must not
+    /// adopt the result from the stale operation.
+    pub(crate) async fn record_fresh_agent_recovery_identity_fenced(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        identity: NativeDispatchIdentity,
+        fence: RecoveryWriteFence,
+    ) -> Result<RecoveryWriteFence, RegistryError> {
+        self.transition_native_session_evidenced_fenced(
+            soul_id,
+            incarnation_id,
+            &identity.previous_native_session_id,
+            &identity.native_session_id,
+            fence,
+            NativeSessionTransitionEvidence::AcceptedDispatch {
+                pending_naming_handle: identity.pending_naming_handle,
+            },
+        )
+        .await
+    }
+
     pub async fn transition_native_session_fenced(
         &self,
         soul_id: SoulId,
@@ -4722,6 +4804,427 @@ impl Registry {
         }).await
     }
 
+    /// Issue the narrow startup authority that permits a replacement Codex
+    /// host to try the exact saved root and, only after typed not-found plus a
+    /// fresh store census, mint a new root. The authorization is derived from
+    /// the live registry rows so a caller cannot manufacture a fence by
+    /// relabeling an older incarnation's snapshot.
+    pub async fn authorize_native_readiness_recovery(
+        &self,
+        soul_id: SoulId,
+        target_incarnation_id: IncarnationId,
+        source_launch: NativeIdentityLaunch,
+        resume_spec: ResumeSpec,
+    ) -> Result<Option<NativeReadinessRecoveryAuthorization>, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let fence = load_recovery_write_fence(&tx, &soul_id)?;
+            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            if fence.active_incarnation_id != target_incarnation_id {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let (provider, provider_store_id, native_session_id, desired, recovery_state,
+                intent_revision, identity_revision, evidence_revision, native_import_revision,
+                attempt_raw, resume_raw): NativeReadinessAuthorizationSoulRow = tx.query_row(
+                "SELECT provider,provider_store_id,native_session_id,desired_state,recovery_state,\
+                 intent_revision,identity_revision,evidence_revision,native_import_revision,\
+                 recovery_attempt_id,resume_spec FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                    row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+            )?;
+            if provider != FreshProvider::Codex.as_str()
+                || resume_spec.provider_session.provider != FreshProvider::Codex.as_str()
+                || attempt_raw.is_none()
+            {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let attempt_raw = attempt_raw.expect("checked above");
+            let attempt_id = RecoveryAttemptId::parse(attempt_raw.clone())
+                .map_err(|_| RegistryError::Integrity("invalid recovery attempt id".into()))?;
+            let Some(resume_raw) = resume_raw else {
+                return Err(RegistryError::NativeIdentityConflict);
+            };
+            let persisted_resume: ResumeSpec = serde_json::from_str(&resume_raw)?;
+            if persisted_resume != resume_spec {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let target: NativeReadinessAuthorizationTargetRow = tx.query_row(
+                "SELECT i.launch_state,i.launch_nonce,i.execution_generation,\
+                 i.native_identity_launch,i.fresh_agent_spec,i.prior_incarnation_id,\
+                 i.recovery_attempt_id,a.soul_id,a.prior_incarnation_id,a.intent_revision,\
+                 a.verdict,a.finished_at FROM incarnations i \
+                 JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id \
+                 WHERE i.incarnation_id=?1 AND i.soul_id=?2 AND a.attempt_id=?3",
+                params![target_incarnation_id.as_str(),soul_id.as_str(),attempt_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                    row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,
+                    row.get(10)?,row.get(11)?)),
+            )?;
+            let target_launch: NativeIdentityLaunch = target.3
+                .as_deref()
+                .ok_or(RegistryError::NativeIdentityConflict)
+                .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+            let target_spec: FreshAgentLaunchSpec = target.4
+                .as_deref()
+                .ok_or(RegistryError::NativeIdentityConflict)
+                .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+            let prior_incarnation_id = IncarnationId::parse(
+                target.5.clone().ok_or(RegistryError::NativeIdentityConflict)?,
+            ).map_err(|_| RegistryError::NativeIdentityConflict)?;
+            let attempt_prior = IncarnationId::parse(
+                target.8.clone().ok_or(RegistryError::NativeIdentityConflict)?,
+            ).map_err(|_| RegistryError::NativeIdentityConflict)?;
+            let prior_state: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT launch_state,cleanup_state FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2",
+                    params![prior_incarnation_id.as_str(),soul_id.as_str()],
+                    |row| Ok((row.get(0)?,row.get(1)?)),
+                )
+                .optional()?;
+
+            let exact_replacement = desired == "running"
+                && recovery_state == "recovering"
+                && target.0 == "starting"
+                && target.1 == source_launch.launch_nonce
+                && target.2 == source_launch.execution_generation
+                && target.6.as_deref() == Some(attempt_id.as_str())
+                && target.7 == soul_id.as_str()
+                && target.9 == intent_revision
+                && target.10 == "replacement_prepared"
+                && target.11.is_none()
+                && prior_incarnation_id == attempt_prior
+                && prior_state.as_ref().is_some_and(|(state, cleanup)| {
+                    state == "stopped" && cleanup == "verified_empty"
+                })
+                && attempt_raw == target.6.clone().unwrap_or_default()
+                && target_launch == source_launch
+                && source_launch.incarnation_id == target_incarnation_id
+                && source_launch.evidence_revision == evidence_revision
+                && source_launch.requested_native_session_id.as_deref()
+                    == native_session_id.as_deref()
+                && native_session_id.as_deref()
+                    == Some(resume_spec.provider_session.native_session_id.as_str())
+                && provider_store_id == resume_spec.provider_session.provider_store_id
+                && target_spec.provider == FreshProvider::Codex
+                && target_spec.session_type == "freshcodex"
+                && target_spec.native_session_id.as_deref() == native_session_id.as_deref()
+                && target_spec.provider_store_id == provider_store_id
+                && resume_spec.mode == target_spec.session_type
+                && resume_spec.runtime_variant == target_spec.runtime_variant
+                && resume_spec.evidence_revision == evidence_revision
+                && target_launch.execution_generation > 0
+                && identity_revision == fence.identity_revision
+                && evidence_revision == fence.evidence_revision
+                && native_import_revision == fence.native_import_revision;
+            if !exact_replacement {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let claim_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_claims WHERE provider=?1 AND \
+                 provider_store_id=?2 AND native_session_id=?3 AND soul_id=?4 \
+                 AND incarnation_id=?5 AND intent_revision=?6)",
+                params![provider,provider_store_id,native_session_id.as_deref(),soul_id.as_str(),
+                    target_incarnation_id.as_str(),intent_revision],
+                |row| row.get(0),
+            )?;
+            if !claim_exists {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let authorization = NativeReadinessRecoveryAuthorization {
+                source_fence: fence.native_readiness_fence(),
+                source_launch,
+                prior_incarnation_id,
+                resume_spec_sha256: freshell_runtime_protocol::resume_spec_sha256(&resume_spec),
+            };
+            if !authorization.is_valid_for(&target_spec, &resume_spec) {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            tx.commit()?;
+            Ok(Some(authorization))
+        }).await
+    }
+
+    /// Commit a cold-host Codex root replacement together with its exact
+    /// observation. The only non-authorized path is an exact replay of the
+    /// receipt already stored by this incarnation after a lost supervisor
+    /// reply.
+    pub async fn record_native_readiness_recovery_receipt(
+        &self,
+        soul_id: SoulId,
+        receipt: NativeReadinessReceipt,
+        observation: NativeIdentityObservation,
+        authorization: Option<NativeReadinessRecoveryAuthorization>,
+        resume_spec: Option<ResumeSpec>,
+    ) -> Result<RecoveryWriteFence, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !receipt.is_valid()
+                || receipt.absence_evidence.is_none()
+                || observation.native_session_id != receipt.identity.native_session_id
+                || !observation.matches_launch(&receipt.next_launch)
+                || !observation.matches_provider(FreshProvider::Codex.as_str(), true)
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let target_incarnation_id = receipt.source_launch.incarnation_id.clone();
+            let receipt_raw = serde_json::to_string(&receipt)?;
+            let current: NativeReadinessReceiptCommitRow = tx.query_row(
+                "SELECT s.provider,s.native_session_id,s.intent_revision,s.identity_revision,\
+                 s.evidence_revision,s.native_import_revision,s.recovery_attempt_id,\
+                 s.resume_spec,i.native_identity_launch,i.native_identity_observation,\
+                 i.native_readiness_receipt,i.launch_state,i.fresh_agent_spec,i.prior_incarnation_id \
+                 FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id \
+                 WHERE s.soul_id=?1 AND i.incarnation_id=?2",
+                params![soul_id.as_str(),target_incarnation_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                    row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,
+                    row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)),
+            )?;
+            if current.10.as_deref() == Some(receipt_raw.as_str())
+                && current.1.as_deref() == Some(receipt.identity.native_session_id.as_str())
+                && current.8.as_deref().and_then(|raw| serde_json::from_str::<NativeIdentityLaunch>(raw).ok())
+                    .as_ref() == Some(&receipt.next_launch)
+                && current.9.as_deref().and_then(|raw| serde_json::from_str::<NativeIdentityObservation>(raw).ok())
+                    .as_ref() == Some(&observation)
+            {
+                let fence = load_recovery_write_fence(&tx, &soul_id)?;
+                let attempt_id = receipt.source_fence.recovery_attempt_id
+                    .as_ref().ok_or(RegistryError::NativeIdentityConflict)?;
+                let prior_incarnation_id = receipt.absence_evidence
+                    .as_ref().ok_or(RegistryError::NativeIdentityConflict)?
+                    .prior_incarnation_id.clone();
+                let expected_identity_revision = receipt.source_fence.identity_revision
+                    .checked_add(1).ok_or(RegistryError::NativeIdentityConflict)?;
+                let recovery_state: String = tx.query_row(
+                    "SELECT recovery_state FROM souls WHERE soul_id=?1",
+                    params![soul_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                let attempt: (String, String, u64, String, Option<i64>) = tx.query_row(
+                    "SELECT i.launch_state,i.prior_incarnation_id,a.intent_revision,a.verdict,a.finished_at \
+                     FROM incarnations i JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id \
+                     WHERE i.soul_id=?1 AND i.incarnation_id=?2 AND i.recovery_attempt_id=?3 \
+                     AND a.soul_id=?1 AND a.prior_incarnation_id=?4",
+                    params![soul_id.as_str(),target_incarnation_id.as_str(),attempt_id.as_str(),
+                        prior_incarnation_id.as_str()],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                )?;
+                let finished_success = attempt.3 == "succeeded" && attempt.4.is_some();
+                let still_prepared = attempt.3 == "replacement_prepared" && attempt.4.is_none();
+                let attempt_state_matches =
+                    (finished_success && current.6.is_none() && recovery_state == "live")
+                        || (still_prepared
+                            && current.6.as_deref() == Some(attempt_id.as_str())
+                            && recovery_state == "recovering");
+                let persisted_target: FreshAgentLaunchSpec = current.12
+                    .as_deref()
+                    .ok_or(RegistryError::NativeIdentityConflict)
+                    .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+                let next_claim: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM writer_claims WHERE provider='codex' \
+                     AND provider_store_id=(SELECT provider_store_id FROM souls WHERE soul_id=?1) \
+                     AND native_session_id=?2 AND soul_id=?1 AND incarnation_id=?3 \
+                     AND intent_revision=?4)",
+                    params![soul_id.as_str(),receipt.identity.native_session_id,
+                        target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+                    |row| row.get(0),
+                )?;
+                let exact_replay = fence.active_incarnation_id == target_incarnation_id
+                    && fence.control_epoch >= receipt.source_fence.control_epoch
+                    && fence.intent_revision == receipt.source_fence.intent_revision
+                    && fence.identity_revision == expected_identity_revision
+                    && fence.evidence_revision == receipt.next_launch.evidence_revision
+                    && fence.native_import_revision == receipt.source_fence.native_import_revision
+                    && current.2 == receipt.source_fence.intent_revision
+                    && current.3 == expected_identity_revision
+                    && current.4 == receipt.next_launch.evidence_revision
+                    && current.5 == receipt.source_fence.native_import_revision
+                    && current.7.is_none()
+                    && current.0 == FreshProvider::Codex.as_str()
+                    && current.1.as_deref() == Some(receipt.identity.native_session_id.as_str())
+                    && persisted_target.provider == FreshProvider::Codex
+                    && persisted_target.provider_store_id
+                        == receipt.absence_evidence.as_ref().unwrap().provider_store_id
+                    && persisted_target.native_session_id.as_deref()
+                        == Some(receipt.identity.native_session_id.as_str())
+                    && matches!(attempt.0.as_str(), "starting" | "running")
+                    && attempt.1 == prior_incarnation_id.as_str()
+                    && attempt.2 == receipt.source_fence.intent_revision
+                    && attempt_state_matches
+                    && next_claim
+                    && current.11 == attempt.0;
+                if exact_replay {
+                    tx.commit()?;
+                    return Ok(fence);
+                }
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let authorization = authorization.ok_or(RegistryError::NativeIdentityConflict)?;
+            let resume_spec = resume_spec.ok_or(RegistryError::NativeIdentityConflict)?;
+            let recovery_state: String = tx.query_row(
+                "SELECT recovery_state FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let target_spec: FreshAgentLaunchSpec = current.12
+                .as_deref()
+                .ok_or(RegistryError::NativeIdentityConflict)
+                .and_then(|raw| serde_json::from_str(raw).map_err(RegistryError::from))?;
+            if !authorization.is_valid_for(&target_spec, &resume_spec)
+                || receipt.resume_spec_sha256.as_deref()
+                    != Some(authorization.resume_spec_sha256.as_str())
+                || authorization.source_fence != receipt.source_fence
+                || authorization.source_launch != receipt.source_launch
+                || receipt.source_launch.incarnation_id != target_incarnation_id
+                || current.0 != FreshProvider::Codex.as_str()
+                || current.1.as_deref() != receipt.source_launch.requested_native_session_id.as_deref()
+                || current.2 != receipt.source_fence.intent_revision
+                || current.3 != receipt.source_fence.identity_revision
+                || current.4 != receipt.source_fence.evidence_revision
+                || current.5 != receipt.source_fence.native_import_revision
+                || current.6.as_deref() != receipt.source_fence.recovery_attempt_id.as_ref().map(RecoveryAttemptId::as_str)
+                || current.7.as_deref().is_none_or(|raw| serde_json::from_str::<ResumeSpec>(raw).ok().as_ref() != Some(&resume_spec))
+                || current.8.as_deref().and_then(|raw| serde_json::from_str::<NativeIdentityLaunch>(raw).ok()).as_ref()
+                    != Some(&receipt.source_launch)
+                || recovery_state != "recovering"
+                || current.11 != "starting"
+                || current.13.as_deref() != Some(authorization.prior_incarnation_id.as_str())
+                || !receipt.absence_evidence.as_ref().is_some_and(|absence| {
+                    absence.prior_incarnation_id == authorization.prior_incarnation_id
+                        && absence.provider == FreshProvider::Codex.as_str()
+                        && absence.provider_store_id == target_spec.provider_store_id
+                        && absence.native_session_id == resume_spec.provider_session.native_session_id
+                        && absence.evidence_revision == receipt.source_launch.evidence_revision
+                        && freshell_agent_runtime::native_absence_census_matches(
+                            &absence.provider,
+                            &absence.provider_store_id,
+                            &absence.native_session_id,
+                            absence.evidence_revision,
+                            absence.store_state,
+                            std::slice::from_ref(&absence.census_reference),
+                        )
+                        && freshell_agent_runtime::native_absence_census_environment_matches(
+                            &resume_spec,
+                            std::slice::from_ref(&absence.census_reference),
+                        )
+                })
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let attempt_id = authorization.source_fence.recovery_attempt_id
+                .clone().ok_or(RegistryError::NativeIdentityConflict)?;
+            let mut fence = RecoveryWriteFence {
+                control_epoch: receipt.source_fence.control_epoch,
+                intent_revision: receipt.source_fence.intent_revision,
+                identity_revision: receipt.source_fence.identity_revision,
+                evidence_revision: receipt.source_fence.evidence_revision,
+                native_import_revision: receipt.source_fence.native_import_revision,
+                recovery_attempt_id: Some(attempt_id.clone()),
+                active_incarnation_id: target_incarnation_id.clone(),
+            };
+            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            let attempt_ok: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recovery_attempts a JOIN incarnations i \
+                 ON i.recovery_attempt_id=a.attempt_id WHERE a.attempt_id=?1 AND a.soul_id=?2 \
+                 AND a.prior_incarnation_id=?3 AND a.intent_revision=?4 \
+                 AND a.verdict='replacement_prepared' AND a.finished_at IS NULL \
+                 AND i.incarnation_id=?5 AND i.prior_incarnation_id=a.prior_incarnation_id \
+                 AND i.recovery_attempt_id=?1 AND i.launch_state='starting')",
+                params![attempt_id.as_str(),soul_id.as_str(),authorization.prior_incarnation_id.as_str(),
+                    receipt.source_fence.intent_revision,target_incarnation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !attempt_ok {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let old_root = receipt.identity.previous_native_session_id.as_str();
+            let new_root = receipt.identity.native_session_id.as_str();
+            let old_claim: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_claims WHERE provider='codex' \
+                 AND provider_store_id=?1 AND native_session_id=?2 AND soul_id=?3 \
+                 AND incarnation_id=?4 AND intent_revision=?5)",
+                params![target_spec.provider_store_id,old_root,soul_id.as_str(),
+                    target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+                |row| row.get(0),
+            )?;
+            let new_claim: Option<String> = tx.query_row(
+                "SELECT incarnation_id FROM writer_claims WHERE provider='codex' \
+                 AND provider_store_id=?1 AND native_session_id=?2",
+                params![target_spec.provider_store_id,new_root],
+                |row| row.get(0),
+            ).optional()?;
+            if !old_claim
+                || new_claim
+                    .as_ref()
+                    .is_some_and(|owner| owner != target_incarnation_id.as_str())
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let mut updated_spec = target_spec;
+            updated_spec.native_session_id = Some(new_root.to_string());
+            if let Some(reference) = updated_spec.session_ref.as_mut() {
+                if reference.provider != FreshProvider::Codex.as_str()
+                    || reference.session_id != old_root
+                {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                reference.session_id = new_root.to_string();
+            }
+            tx.execute(
+                "DELETE FROM writer_claims WHERE provider='codex' AND provider_store_id=?1 \
+                 AND native_session_id=?2 AND soul_id=?3 AND incarnation_id=?4 AND intent_revision=?5",
+                params![updated_spec.provider_store_id,old_root,soul_id.as_str(),
+                    target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+            )?;
+            if new_claim.is_none() {
+                tx.execute(
+                    "INSERT INTO writer_claims(provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES('codex',?1,?2,?3,?4,?5)",
+                    params![updated_spec.provider_store_id,new_root,soul_id.as_str(),
+                        target_incarnation_id.as_str(),receipt.source_fence.intent_revision],
+                )?;
+            }
+            let next_identity_revision = receipt.source_fence.identity_revision.checked_add(1)
+                .ok_or_else(|| RegistryError::Integrity("identity revision overflow".into()))?;
+            let changed = tx.execute(
+                "UPDATE souls SET native_session_id=?1,identity_revision=?2,evidence_revision=?3,\
+                 resume_spec=NULL,allocation_state=CASE WHEN allocation_state='verified_durable' \
+                 THEN allocation_state ELSE 'materializing' END,updated_at=?4 WHERE soul_id=?5 \
+                 AND desired_state='running' AND recovery_state='recovering' \
+                 AND intent_revision=?6 AND identity_revision=?7 AND evidence_revision=?8 \
+                 AND native_import_revision=?9 AND recovery_attempt_id=?10",
+                params![new_root,next_identity_revision,receipt.next_launch.evidence_revision,now_millis(),
+                    soul_id.as_str(),receipt.source_fence.intent_revision,receipt.source_fence.identity_revision,
+                    receipt.source_fence.evidence_revision,receipt.source_fence.native_import_revision,
+                    attempt_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let changed = tx.execute(
+                "UPDATE incarnations SET native_identity_launch=?1,native_identity_observation=?2,\
+                 native_readiness_receipt=?3,fresh_agent_spec=?4,updated_at=?5 \
+                 WHERE incarnation_id=?6 AND native_identity_launch=?7 AND launch_state='starting'",
+                params![serde_json::to_string(&receipt.next_launch)?,serde_json::to_string(&observation)?,
+                    receipt_raw,serde_json::to_string(&updated_spec)?,now_millis(),
+                    target_incarnation_id.as_str(),serde_json::to_string(&receipt.source_launch)?],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            fence.identity_revision = next_identity_revision;
+            fence.evidence_revision = receipt.next_launch.evidence_revision;
+            let successor = load_recovery_write_fence(&tx, &soul_id)?;
+            tx.commit()?;
+            Ok(successor)
+        }).await
+    }
+
     pub async fn record_native_identity_observation(
         &self,
         soul_id: SoulId,
@@ -5177,6 +5680,70 @@ fn update_fresh_agent_settings_in_tx(
     )?;
     if changed != 1 {
         return Err(RegistryError::UnknownIncarnation(incarnation_id.clone()));
+    }
+    update_fresh_agent_resume_settings_in_tx(conn, soul_id, &spec)?;
+    Ok(())
+}
+
+/// Keep the exact stored recovery launch profile aligned with settings accepted
+/// by the live host. These fields do not select or prove a native store; cwd
+/// does, so it deliberately stays bound to the captured resume evidence.
+fn update_fresh_agent_resume_settings_in_tx(
+    conn: &Connection,
+    soul_id: &SoulId,
+    launch: &FreshAgentLaunchSpec,
+) -> Result<(), RegistryError> {
+    let persisted: Option<(String, String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT provider,provider_store_id,native_session_id,resume_spec FROM souls WHERE soul_id=?1",
+            params![soul_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((provider, store, Some(native_session_id), Some(encoded_resume))) = persisted else {
+        return Ok(());
+    };
+    if provider != launch.provider.as_str()
+        || store != launch.provider_store_id
+        || launch.native_session_id.as_deref() != Some(native_session_id.as_str())
+    {
+        return Ok(());
+    }
+
+    let mut resume: ResumeSpec = serde_json::from_str(&encoded_resume)
+        .map_err(|_| RegistryError::Integrity("invalid fresh-agent resume spec".into()))?;
+    if resume.provider_session.provider != provider
+        || resume.provider_session.provider_store_id != store
+        || resume.provider_session.native_session_id != native_session_id
+    {
+        return Ok(());
+    }
+
+    let profile_changed = resume.model != launch.model
+        || resume.reasoning_effort != launch.effort
+        || resume.permission_mode != launch.permission_mode;
+    if !profile_changed {
+        return Ok(());
+    }
+    resume.model = launch.model.clone();
+    resume.reasoning_effort = launch.effort.clone();
+    resume.permission_mode = launch.permission_mode.clone();
+    let encoded_resume_updated = serde_json::to_string(&resume)
+        .map_err(|_| RegistryError::Integrity("encode fresh-agent resume spec".into()))?;
+    let changed = conn.execute(
+        "UPDATE souls SET resume_spec=?1,updated_at=?2 WHERE soul_id=?3 AND provider=?4 AND provider_store_id=?5 AND native_session_id=?6 AND resume_spec=?7",
+        params![
+            encoded_resume_updated,
+            now_millis(),
+            soul_id.as_str(),
+            provider,
+            store,
+            native_session_id,
+            encoded_resume,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(RegistryError::NativeIdentityConflict);
     }
     Ok(())
 }
@@ -5726,6 +6293,7 @@ fn create_schema(
             launch_policy TEXT,
             native_identity_launch TEXT,
             native_identity_observation TEXT,
+            native_readiness_receipt TEXT,
             launch_state TEXT NOT NULL,
             host_boot_id TEXT,
             execution_generation INTEGER NOT NULL,
@@ -6484,6 +7052,9 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
     }
     if schema == 19 {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "incarnations", "native_readiness_receipt")? {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN native_readiness_receipt TEXT;")?;
+        }
         if !column_exists(&tx, "input_commands", "fresh_agent_send_refusal")? {
             tx.execute_batch(
                 "ALTER TABLE input_commands ADD COLUMN fresh_agent_send_refusal TEXT;",
@@ -6492,6 +7063,20 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.execute_batch("UPDATE installation SET schema_version=20,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
         tx.commit()?;
         schema = 20;
+    }
+    if schema == 20 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "incarnations", "native_readiness_receipt")? {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN native_readiness_receipt TEXT;")?;
+        }
+        if !column_exists(&tx, "input_commands", "fresh_agent_send_refusal")? {
+            tx.execute_batch(
+                "ALTER TABLE input_commands ADD COLUMN fresh_agent_send_refusal TEXT;",
+            )?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=21,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 21;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -9597,6 +10182,107 @@ pub(crate) mod tests {
         prepared
     }
 
+    async fn materialize_codex_recovery_runtime(
+        registry: &Registry,
+        soul_id: SoulId,
+        workspace: &Path,
+    ) -> PreparedLaunch {
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let root = "codex-native-old";
+        let store = "codex-recovery-store";
+        let mut launch = prep(soul_id, RequestId::new(), "codex-recovery-fence");
+        launch.provider = "codex".into();
+        launch.provider_store_id = store.into();
+        launch.native_session_id = Some(root.into());
+        launch.fresh_agent = Some(FreshAgentLaunchSpec {
+            naming_handle: Some("pending-codex-name".into()),
+            collaboration_mode: None,
+            session_id: "codex-presentation".into(),
+            provider: freshell_runtime_protocol::FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-cli".into(),
+            provider_store_id: store.into(),
+            cwd: workspace.clone(),
+            workspace_path: workspace,
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("test-model".into()),
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: Some(root.into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        });
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        let runtime_dir = format!("/tmp/freshell-runtime-test/{}", prepared.incarnation_id);
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    launch_policy: None,
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: format!("container-{}", prepared.incarnation_id),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: PathBuf::from(&runtime_dir),
+                    host_binary_path: PathBuf::from(format!("{runtime_dir}/host")),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let launch = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: prepared.launch_nonce.as_str().into(),
+            evidence_revision: registry
+                .recovery_context(prepared.soul_id.clone())
+                .await
+                .unwrap()
+                .evidence_revision,
+            execution_generation: grant.execution_generation,
+            requested_native_session_id: Some(root.into()),
+        };
+        registry
+            .bind_native_identity_launch(launch.clone())
+            .await
+            .unwrap();
+        let context = registry
+            .recovery_context(prepared.soul_id.clone())
+            .await
+            .unwrap();
+        registry
+            .record_native_identity_observation(
+                prepared.soul_id.clone(),
+                freshell_runtime_protocol::NativeIdentityObservation {
+                    native_session_id: root.into(),
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: launch.launch_nonce,
+                    evidence_revision: launch.evidence_revision,
+                    source: freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake,
+                    evidence_digest: "a".repeat(64),
+                },
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+        prepared
+    }
+
     #[tokio::test]
     async fn request_dedupe_returns_same_incarnation_and_conflict_rejects_changed_payload() {
         let dir = tempfile::tempdir().unwrap();
@@ -10826,6 +11512,183 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn codex_settings_changes_update_stored_resume_profile_without_changing_evidence() {
+        struct SettingsChangeCase {
+            configure: bool,
+            model: &'static str,
+            effort: Option<Option<String>>,
+            expected_effort: Option<&'static str>,
+        }
+        let cases = [
+            SettingsChangeCase {
+                configure: false,
+                model: "turn-model",
+                effort: Some(None),
+                expected_effort: None,
+            },
+            SettingsChangeCase {
+                configure: true,
+                model: "configured-model",
+                effort: None,
+                expected_effort: Some("low"),
+            },
+        ];
+        for SettingsChangeCase {
+            configure,
+            model,
+            effort,
+            expected_effort,
+        } in cases
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                materialize_codex_recovery_runtime(&registry, soul.clone(), dir.path()).await;
+            let recovery_cwd = dir.path().join("recovery-cwd");
+            std::fs::create_dir(&recovery_cwd).unwrap();
+            let recovery_cwd = std::fs::canonicalize(recovery_cwd).unwrap();
+
+            registry
+                .update_fresh_agent_settings(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    FreshAgentTurnSettings {
+                        effort: Some(Some("low".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            open_connection(&registry.inner.db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE souls SET durability_state='checkpoint_captured',allocation_state='verified_durable',checkpoint_revision=1 WHERE soul_id=?1",
+                    params![soul.as_str()],
+                )
+                .unwrap();
+
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let candidate = crate::resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .expect("observed Codex identity has an exact resume profile");
+            assert_eq!(candidate.checkpoint_revision, 1);
+            assert_eq!(candidate.checkpoint_references.len(), 1);
+            let stored = registry
+                .store_verified_resume_spec_fenced(soul.clone(), candidate, context.write_fence())
+                .await
+                .unwrap();
+
+            let settings = FreshAgentTurnSettings {
+                collaboration_mode: None,
+                cwd: Some(recovery_cwd.to_string_lossy().into_owned()),
+                model: Some(model.into()),
+                effort,
+                permission_mode: Some("on-request".into()),
+                sandbox: None,
+            };
+            if configure {
+                registry
+                    .configure_fresh_agent_settings(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        settings,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                registry
+                    .update_fresh_agent_settings(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        settings,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let recovered = registry.recovery_context(soul).await.unwrap();
+            let recovered_launch = recovered
+                .fresh_agent
+                .as_ref()
+                .expect("fresh-agent launch profile remains persisted");
+            assert_eq!(recovered_launch.cwd, recovery_cwd.to_string_lossy());
+            assert_eq!(recovered_launch.model.as_deref(), Some(model));
+            assert_eq!(recovered_launch.effort.as_deref(), expected_effort);
+            assert_eq!(
+                recovered_launch.permission_mode.as_deref(),
+                Some("on-request"),
+            );
+            let original_store_cwd = stored.cwd.clone();
+            let mut expected_resume = stored;
+            expected_resume.model = Some(model.into());
+            expected_resume.reasoning_effort = expected_effort.map(str::to_owned);
+            expected_resume.permission_mode = Some("on-request".into());
+            assert_eq!(
+                recovered.resume_spec,
+                Some(expected_resume),
+                "accepted turn/config settings must mirror into the exact stored resume profile without changing its identity or evidence"
+            );
+            assert_eq!(
+                recovered.resume_spec.as_ref().map(|spec| spec.cwd.as_str()),
+                Some(original_store_cwd.as_str()),
+                "the proved native-store selection cwd must remain unchanged while the current launch setting advances"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_settings_do_not_rebind_a_resume_profile_to_a_different_native_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            materialize_codex_recovery_runtime(&registry, soul.clone(), dir.path()).await;
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let candidate = crate::resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .expect("observed Codex identity has an exact resume profile");
+        let stored = registry
+            .store_verified_resume_spec_fenced(soul.clone(), candidate, context.write_fence())
+            .await
+            .unwrap();
+
+        let mut mismatched = stored;
+        mismatched.provider_session.native_session_id = "different-native-session".into();
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET resume_spec=?1 WHERE soul_id=?2",
+                params![serde_json::to_string(&mismatched).unwrap(), soul.as_str()],
+            )
+            .unwrap();
+
+        registry
+            .update_fresh_agent_settings(
+                soul.clone(),
+                prepared.incarnation_id,
+                FreshAgentTurnSettings {
+                    collaboration_mode: None,
+                    cwd: None,
+                    model: Some("updated-model".into()),
+                    effort: Some(Some("high".into())),
+                    permission_mode: Some("on-request".into()),
+                    sandbox: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let recovered = registry.recovery_context(soul).await.unwrap();
+        assert_eq!(recovered.resume_spec, Some(mismatched));
+        assert_eq!(
+            recovered.fresh_agent.unwrap().model.as_deref(),
+            Some("updated-model")
+        );
+    }
+
+    #[tokio::test]
     async fn retry_budget_is_persisted_and_manual_retry_rearms_without_identity_change() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path(), None).unwrap();
@@ -11951,6 +12814,136 @@ pub(crate) mod tests {
                 .native_session_id,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn codex_readiness_transition_requires_its_original_write_fence() {
+        #[derive(Clone, Copy)]
+        enum InterveningChange {
+            None,
+            Evidence,
+            StopIntent,
+            NewIncarnation,
+        }
+
+        for change in [
+            InterveningChange::None,
+            InterveningChange::Evidence,
+            InterveningChange::StopIntent,
+            InterveningChange::NewIncarnation,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                materialize_codex_recovery_runtime(&registry, soul.clone(), dir.path()).await;
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let fence = context.write_fence();
+
+            match change {
+                InterveningChange::None => {}
+                InterveningChange::Evidence => {
+                    open_connection(&registry.inner.db_path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE souls SET evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+                            params![soul.as_str()],
+                        )
+                        .unwrap();
+                }
+                InterveningChange::StopIntent => {
+                    registry.begin_stop(soul.clone()).await.unwrap();
+                }
+                InterveningChange::NewIncarnation => {
+                    let replacement = IncarnationId::new();
+                    let replacement_nonce = LaunchNonce::new();
+                    open_connection(&registry.inner.db_path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE incarnations SET launch_state='stopped',cleanup_state='verified_empty' WHERE incarnation_id=?1",
+                            params![prepared.incarnation_id.as_str()],
+                        )
+                        .unwrap();
+                    open_connection(&registry.inner.db_path)
+                        .unwrap()
+                        .execute(
+                            "INSERT INTO incarnations(incarnation_id,soul_id,launch_nonce,launch_state,execution_generation,requested_limits,cleanup_state,created_at,updated_at) SELECT ?1,soul_id,?2,'running',execution_generation,requested_limits,'none',created_at+1,updated_at+1 FROM incarnations WHERE incarnation_id=?3",
+                            params![replacement.as_str(), replacement_nonce.as_str(), prepared.incarnation_id.as_str()],
+                        )
+                        .unwrap();
+                }
+            }
+
+            let transition = registry
+                .record_fresh_agent_recovery_identity_fenced(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    NativeDispatchIdentity {
+                        previous_native_session_id: "codex-native-old".into(),
+                        native_session_id: "codex-native-recovered".into(),
+                        pending_naming_handle: Some("pending-codex-name".into()),
+                    },
+                    fence,
+                )
+                .await;
+
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            let stored_root: Option<String> = conn
+                .query_row(
+                    "SELECT native_session_id FROM souls WHERE soul_id=?1",
+                    params![soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let old_claims: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id='codex-native-old'",
+                    params![soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let new_claims: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id='codex-native-recovered'",
+                    params![soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            match change {
+                InterveningChange::None => {
+                    transition.expect("unmodified readiness fence should commit");
+                    let current = registry.recovery_context(soul.clone()).await.unwrap();
+                    assert_eq!(
+                        current.native_session_id.as_deref(),
+                        Some("codex-native-recovered")
+                    );
+                    assert_eq!(current.evidence_revision, context.evidence_revision + 1);
+                    assert_eq!(current.identity_revision, context.identity_revision + 1);
+                    assert_eq!(
+                        current
+                            .native_identity_launch
+                            .as_ref()
+                            .unwrap()
+                            .requested_native_session_id
+                            .as_deref(),
+                        Some("codex-native-recovered")
+                    );
+                    assert_eq!(
+                        current.fresh_agent.as_ref().unwrap().session_id,
+                        "codex-presentation"
+                    );
+                    assert_eq!((old_claims, new_claims), (0, 1));
+                }
+                InterveningChange::Evidence
+                | InterveningChange::StopIntent
+                | InterveningChange::NewIncarnation => {
+                    assert!(transition.is_err(), "stale readiness fence must not commit");
+                    assert_eq!(stored_root.as_deref(), Some("codex-native-old"));
+                    assert_eq!((old_claims, new_claims), (1, 0));
+                }
+            }
+        }
     }
 
     #[tokio::test]

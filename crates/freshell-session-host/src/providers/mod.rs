@@ -18,6 +18,7 @@ pub(crate) use deterministic_fresh_agent::run_state_worker as run_fresh_agent_fi
 #[cfg(feature = "fresh-agent-fixtures")]
 pub(crate) use deterministic_fresh_agent::run_worker as run_fresh_agent_fixture_worker;
 pub(crate) use fresh_agent::open_hosted_fresh_agent;
+pub(crate) use fresh_agent::open_hosted_fresh_agent_with_native_recovery;
 
 pub(crate) use codex::run_naming_proof;
 pub(crate) use codex::run_owned_cleanup;

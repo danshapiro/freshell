@@ -2113,6 +2113,7 @@ mod tests {
                                     fixture_evidence: serde_json::json!({}),
                                     native_session_id: Some(native),
                                     native_identity_observation: None,
+                                    native_readiness_receipt: None,
                                     opencode_transfer_receipt: None,
                                     opencode_adoption: Default::default(),
                                 }
@@ -2127,6 +2128,7 @@ mod tests {
                                 exited: original,
                                 native_session_id: Some(native),
                                 native_identity_observation: None,
+                                native_readiness_receipt: None,
                                 opencode_transfer_receipt: None,
                                 opencode_adoption: Default::default(),
                             },

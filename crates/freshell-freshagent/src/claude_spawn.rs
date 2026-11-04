@@ -602,6 +602,27 @@ impl SidecarTreeGuard {
         Self { tree: Tree::None }
     }
 
+    /// Build a process-group guard for a child that was spawned with
+    /// `process_group(0)`. This validates that the child is the group's leader
+    /// before allowing the guard to signal the group, so callers cannot use a
+    /// provider child PID to target an unrelated group.
+    #[cfg(unix)]
+    pub fn for_spawned_process_group(child: &Child) -> Option<Self> {
+        let pid = i32::try_from(child.id()?).ok()?;
+        if pid <= 1 {
+            return None;
+        }
+        // SAFETY: getpgid only reads the process-group id for this still-owned
+        // child. Tokio has not reaped it while `Child::id()` remains Some.
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid != pid {
+            return None;
+        }
+        Some(Self {
+            tree: Tree::ProcessGroup { pgid, gone: false },
+        })
+    }
+
     pub fn is_guarded(&self) -> bool {
         !matches!(self.tree, Tree::None)
     }

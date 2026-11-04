@@ -980,6 +980,22 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         // dialog this scenario asserted at its original drafting was
         // removed by the no-modal dead-session rework — that was the
         // pre-existing red this gated rewrite fixes.)
+        await expect.poll(async () => {
+          const leafNow = await findLeafById(harness, tabId!, paneId)
+          return leafNow?.content?.restoreError?.reason ?? null
+        }, { timeout: 60_000 }).toBe('durable_artifact_missing')
+        await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
+        await expect.poll(async () => {
+          // The old terminalId is a runtime handle and is stripped when the
+          // browser reloads. The dead pane still has a current xterm surface,
+          // so inspect it by the stable pane identity rather than asking the
+          // harness for a no-longer-registered terminalId (the deflake
+          // lookup from PR #902).
+          const buffer = await harness.getPaneTerminalBuffer(paneId)
+          return typeof buffer === 'string'
+            ? buffer.split(DEAD_SESSION_BUFFER_NOTICE).length - 1
+            : 0
+        }, { timeout: 60_000 }).toBe(1)
         const parkedLeaf = await findLeafById(harness, tabId!, paneId)
         expect(parkedLeaf?.content?.sessionRef).toMatchObject({ provider: 'antigravity', sessionId: boundId })
         expect(parkedLeaf?.content?.restoreError).toMatchObject({ code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' })
@@ -988,12 +1004,8 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         // belongs to the CREATE door (Parts B and C below), which the
         // stood-down pane never enters.
         expect(parkedLeaf?.content?.launchFailure).toBeFalsy()
-        // The pane's own (stale, client-side) buffer carries the one
-        // dead-session notice line.
-        await expect.poll(async () => {
-          const buffer = (await harness.getTerminalBuffer(terminalId)) ?? ''
-          return buffer.includes(DEAD_SESSION_BUFFER_NOTICE)
-        }, { timeout: 60_000 }).toBe(true)
+        // (The one dead-session notice line in the pane's own buffer is
+        // asserted above by the pane-identity poll — the deflake lookup.)
 
         // NO spawn happened for the parked pane: the argv log still holds
         // EXACTLY the original fresh launch (row 0) — no resume attempt, no

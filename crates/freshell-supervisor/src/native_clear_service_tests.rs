@@ -133,7 +133,7 @@ impl Fixture {
                         proof: host_proof(host_secret, &challenge, &boot, &incarnation_id),
                         capabilities: vec![
                             "native-identity-observation-v1".into(),
-                            "fresh-agent-native-readiness-v1".into(),
+                            HOST_CAPABILITY_NATIVE_READINESS_RECEIPT_V1.into(),
                         ],
                         effective_limits: crate::checkpoints::tests::limits(),
                     }),
@@ -287,6 +287,7 @@ impl Fixture {
                             exited: state.ended,
                             native_session_id: (!state.ended).then(|| state.root.clone()),
                             native_identity_observation: state.observation.clone(),
+                            native_readiness_receipt: None,
                             opencode_transfer_receipt: None,
                             opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
                         })

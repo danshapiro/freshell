@@ -633,21 +633,20 @@ describe('TerminalView lifecycle updates', () => {
     }
   })
 
-  it('registers the pane-scoped buffer key that survives terminalId loss (delta fix focused review, finding 2)', async () => {
-    // E2E notice-line assertions must read the xterm buffer API
-    // (renderer-independent), but the terminalId-keyed registration
-    // unregisters exactly when an exited pane clears its terminalId — the
-    // moment the durable-park notice line lands. The PANE-scoped registry
-    // keeps the same buffer reachable by pane id for the component's whole
-    // lifetime, and never leaks into getRegisteredTerminalIds (whose
-    // consumers treat every key as a terminal id).
+  it('registers the pane surface through terminalId loss, recovery, and unmount', async () => {
     const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
-    const emulator = new actual.Terminal({ cols: 13, rows: 12, allowProposedApi: true })
+    const emulator = new actual.Terminal({ cols: 40, rows: 8, allowProposedApi: true })
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({
-      terminalId: undefined, status: 'creating',
+      terminalId: undefined,
+      status: 'running',
+      restoreError: buildRestoreError('durable_artifact_missing'),
+      sessionRef: { provider: 'claude', sessionId: 'native-root' },
     })
+    expect(paneContent.terminalId).toBeUndefined()
     installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
     const harness = window.__FRESHELL_TEST_HARNESS__!
+    const getPaneBuffer = harness.getPaneTerminalBuffer!
+    harness.setTerminalNetworkEffectsSuppressed(paneId, true)
     const view = render(<Provider store={store}>
       <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
     </Provider>)
@@ -655,15 +654,27 @@ describe('TerminalView lifecycle updates', () => {
     expect(term, 'xterm surface must be mounted without a terminalId').toBeTruthy()
     term.buffer = emulator.buffer
     try {
-      const line = 'pane-scoped-buffer-witness-line'
-      await new Promise<void>(done => emulator.write(line, done))
-      // The pane-scoped key reads the pane's rendered buffer.
-      expect(harness.getPaneTerminalBuffer?.(paneId)).toContain(line)
-      // The pane-scoped registry is SEPARATE: this pane registers no
-      // terminalId key at all.
+      // A dead-session pane has a current xterm surface even though its old
+      // runtime terminalId was stripped during restore.
+      expect(getPaneBuffer(paneId)).toEqual(expect.any(String))
+      expect(harness.getTerminalBuffer('term-after-recovery')).toBeNull()
       expect(harness.getRegisteredTerminalIds()).not.toContain(paneId)
+
+      const output = 'PANE_SURFACE_BUFFER'
+      await new Promise<void>(done => emulator.write(`${output}\r\n`, done))
+      expect(getPaneBuffer(paneId)).toContain(output)
+
+      const recoveredContent = { ...paneContent, terminalId: 'term-after-recovery' }
+      view.rerender(<Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={recoveredContent} />
+      </Provider>)
+      expect(getPaneBuffer(paneId)).toContain(output)
+      expect(harness.getTerminalBuffer('term-after-recovery')).toContain(output)
+      expect(harness.getRegisteredTerminalIds()).not.toContain(paneId)
+
       view.unmount()
-      expect(harness.getPaneTerminalBuffer?.(paneId)).toBeNull()
+      expect(getPaneBuffer(paneId)).toBeNull()
+      expect(harness.getTerminalBuffer('term-after-recovery')).toBeNull()
     } finally {
       view.unmount()
       emulator.dispose()

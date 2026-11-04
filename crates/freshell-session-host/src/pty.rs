@@ -602,7 +602,7 @@ impl HostedPty {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::CommandAmbiguous,
                     "input may already have reached the PTY; refusing automatic redispatch",
-                ))
+                ));
             }
             BeginDisposition::Dispatch => {}
         }
