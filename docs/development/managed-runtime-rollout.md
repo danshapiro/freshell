@@ -349,8 +349,26 @@ the exact native session and terminal-sidecar ownership record verify against
 the running process. This restore keeps its existing host ownership even when
 the client negotiates managed routing. A lost claim refuses the restore;
 it must not silently launch another writer. This process remains host-managed
-and is still reported by the normal updater's ownership census. Other
-host-managed providers need a separately verified recovery procedure.
+and is still reported by the normal updater's ownership census.
+
+An existing host Claude conversation resumes through its original host
+history when a terminal tab restores or opens that exact native identity.
+The source must have one verified transcript, native UUID, original working
+directory, and selected Claude configuration root. The source is checked
+again before spawning; a missing, ambiguous, or changed source refuses without
+starting a replacement. Existing managed adoption runs first, and fresh
+managed creates keep their normal route. Direct REST creation refuses a
+verified host-history resume and directs the caller to its terminal tab.
+This preserves the conversation, not the old Claude process, and the resumed
+terminal remains host-managed. Qualify the actual source and interruption
+plan before bootstrap.
+
+Host OpenCode terminal resumes use the exact-session transfer path. Qualify
+the actual native identities, source and pinned target schema, required
+descendants and assets, and imported native history. Native history readback
+alone does not establish live PTY adoption; verify that separately after the
+approved startup. Other host-managed providers need a separately verified
+recovery procedure.
 
 An installation without the authenticated readiness or maintenance APIs
 cannot use the current updater for its initial upgrade. Its deliberate
