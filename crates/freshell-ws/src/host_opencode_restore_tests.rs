@@ -444,8 +444,8 @@ time.sleep(60)
             other.send(WireMessage::Text(create.to_string())).await.map_err(|e|e.to_string())?;
             let adopted=frame_for(&mut other,&request).await?;other.close(None).await.ok();
             if adopted["terminalId"]!=terminal||std::fs::read_to_string(&receipt).unwrap()!=before||registry.directory().len()!=1{return Err(format!("duplicate restored another writer: {adopted:?}"))}
-            if kind=="unrelated_wal" {
-                if held_wal.lock().unwrap().is_none()||!data.join("opencode.db-wal").is_file(){return Err("unrelated committed WAL mutation was not exercised".into())}
+            if kind=="unrelated_wal" && (held_wal.lock().unwrap().is_none()||!data.join("opencode.db-wal").is_file()) {
+                return Err("unrelated committed WAL mutation was not exercised".into())
             }
         }
         Ok(())
