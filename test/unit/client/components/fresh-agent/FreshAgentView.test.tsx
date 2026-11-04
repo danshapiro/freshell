@@ -4622,6 +4622,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith({
         type: 'freshAgent.attach',
+        requestId: expect.any(String),
         viewId: expect.any(String),
         sessionId: 'ses_attach_route',
         sessionType: 'freshopencode',
@@ -4632,6 +4633,8 @@ describe('FreshAgentView', () => {
         paneId: 'pane-1',
       })
     })
+    const firstAttachRequestId = sentFreshAgentMessages('freshAgent.attach')[0]?.requestId
+    expect(firstAttachRequestId).toEqual(expect.any(String))
     expect(reconnectHandler).toBeTypeOf('function')
 
     wsMock.send.mockClear()
@@ -4644,6 +4647,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith({
         type: 'freshAgent.attach',
+        requestId: firstAttachRequestId,
         viewId: expect.any(String),
         sessionId: 'ses_attach_route',
         sessionType: 'freshopencode',
@@ -4654,6 +4658,7 @@ describe('FreshAgentView', () => {
         paneId: 'pane-1',
       })
     })
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]?.requestId).toBe(firstAttachRequestId)
   })
 
   it('sends through fresh-agent WS actions with pane settings when available', async () => {
@@ -10855,6 +10860,7 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith({
         type: 'freshAgent.attach',
+        requestId: expect.any(String),
         viewId: expect.any(String),
         sessionId: 'thread-refresh',
         sessionType: 'freshcodex',

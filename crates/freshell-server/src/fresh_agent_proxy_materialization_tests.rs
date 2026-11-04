@@ -183,7 +183,7 @@ async fn verified_clear_materializes_current_ref_and_reload_resumes_same_soul() 
         "type":"freshAgent.session.materialized", "provider":"claude", "sessionType":"freshclaude",
         "previousSessionId":"older-public-parent", "sessionId":PARENT,
         "sessionRef":{"provider":"claude", "sessionId":PARENT},
-    }) }, "claude", CHILD, "freshclaude", None).await;
+    }) }, "claude", CHILD, "freshclaude", None, None).await;
     assert_eq!(
         reloaded
             .presentation_routes
@@ -242,7 +242,7 @@ async fn delayed_clear_events_materialize_the_latest_current_root_once() {
             "type":"freshAgent.event", "provider":"claude", "sessionType":"freshclaude", "sessionId":current,
             "event":{"type":"freshAgent.session.init", "sessionId":current, "cliSessionId":current,
                 "nativeIdentityEvidence":clear_evidence(&fixture.launch, previous, current, digest).0},
-        }) }, "claude", PARENT, "freshclaude", None).await;
+        }) }, "claude", PARENT, "freshclaude", None, None).await;
     }
 
     let mut materializations = Vec::new();
@@ -303,6 +303,7 @@ async fn codex_materialization_rekeys_only_its_route_and_later_events_use_native
             MANAGED,
             "freshcodex",
             None,
+            None,
         )
         .await;
     let materialized = next_frame(&mut receiver, "freshAgent.session.materialized").await;
@@ -335,6 +336,7 @@ async fn codex_materialization_rekeys_only_its_route_and_later_events_use_native
             MANAGED,
             "freshcodex",
             Some(1),
+            None,
         )
         .await;
     let completion = next_frame(&mut receiver, "freshAgent.event").await;
@@ -359,6 +361,7 @@ async fn codex_materialization_rekeys_only_its_route_and_later_events_use_native
             "codex",
             MANAGED,
             "freshcodex",
+            None,
             None,
         )
         .await;

@@ -10,6 +10,7 @@ use freshell_protocol::{
     FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentRecoveryStop,
     FreshAgentRedo, FreshAgentSend, FreshAgentUndo,
 };
+use freshell_terminal::FrameSink;
 use futures::future::BoxFuture;
 use std::sync::{Arc, OnceLock};
 
@@ -103,7 +104,11 @@ pub trait HostedFreshAgentGateway: Send + Sync {
     fn attention_marks(&self) -> BoxFuture<'_, Vec<freshell_protocol::FreshAgentAttentionMark>> {
         Box::pin(async { Vec::new() })
     }
-    fn dispatch(self: Arc<Self>, command: HostedFreshAgentCommand) -> BoxFuture<'static, ()>;
+    fn dispatch(
+        self: Arc<Self>,
+        command: HostedFreshAgentCommand,
+        requester: FrameSink,
+    ) -> BoxFuture<'static, ()>;
 }
 
 static GATEWAY: OnceLock<Arc<dyn HostedFreshAgentGateway>> = OnceLock::new();
@@ -124,14 +129,14 @@ pub(crate) async fn retained_attention_marks() -> Vec<freshell_protocol::FreshAg
     }
 }
 
-pub(crate) fn dispatch_if_installed(message: &ClientMessage) -> bool {
+pub(crate) fn dispatch_if_installed(message: &ClientMessage, requester: FrameSink) -> bool {
     let Some(gateway) = GATEWAY.get() else {
         return false;
     };
     let HostedRoute::Gateway(command) = hosted_route(message) else {
         return false;
     };
-    let task = Arc::clone(gateway).dispatch(*command);
+    let task = Arc::clone(gateway).dispatch(*command, requester);
     tokio::spawn(task);
     true
 }

@@ -7613,6 +7613,14 @@ async fn opencode_map_hit_success_preserves_durable_owner(attach: bool) {
     );
     let mut replies = h.ws_state.broadcast_tx.subscribe();
     if attach {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture_target = Arc::clone(&captured);
+        let requester: freshell_terminal::FrameSink = Arc::new(move |frame| {
+            capture_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame);
+        });
         h.ws_state
             .fresh_opencode
             .handle_attach(
@@ -7621,8 +7629,23 @@ async fn opencode_map_hit_success_preserves_durable_owner(attach: bool) {
                     "sessionType": "freshopencode", "provider": "opencode"
                 }))
                 .unwrap(),
+                requester,
             )
             .await;
+        let replies = std::mem::take(
+            &mut *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        assert!(
+            replies.iter().any(|frame| match frame {
+                freshell_protocol::ServerMessage::FreshAgentEvent(event) => {
+                    event.event["type"] == "freshAgent.session.snapshot" && event.session_id == id
+                }
+                _ => false,
+            }),
+            "successful attach should return its legacy snapshot to the requester: {replies:?}"
+        );
     } else {
         h.ws_state
             .fresh_opencode

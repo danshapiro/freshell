@@ -14,6 +14,35 @@ export const FreshAgentViewAttachmentSchema = z.object({
 }).strict()
 export type FreshAgentViewAttachment = z.infer<typeof FreshAgentViewAttachmentSchema>
 
+const FreshAgentAttachResultBaseSchema = z.object({
+  requestId: z.string().min(1),
+  viewId: z.string().min(1).optional(),
+  provider: FreshAgentRuntimeProviderSchema,
+  sessionId: z.string().min(1),
+  sessionType: FreshAgentSessionTypeSchema,
+  sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
+  operationId: z.string().min(1).optional(),
+  retryable: z.boolean().optional(),
+  ownerKind: z.enum(['terminal', 'fresh-agent']).optional(),
+  ownerGeneration: z.number().int().nonnegative().optional(),
+  ownerEpoch: z.number().int().nonnegative().optional(),
+}).strict()
+
+export const FreshAgentAttachedSchema = FreshAgentAttachResultBaseSchema.extend({
+  type: z.literal('freshAgent.attached'),
+  status: z.enum(['running', 'idle', 'unknown']),
+  snapshot: z.record(z.string(), z.unknown()).optional(),
+}).strict()
+export type FreshAgentAttached = z.infer<typeof FreshAgentAttachedSchema>
+
+export const FreshAgentAttachFailedSchema = FreshAgentAttachResultBaseSchema.extend({
+  type: z.literal('freshAgent.attach.failed'),
+  status: z.literal('failed'),
+  code: z.string().min(1),
+  message: z.string(),
+}).strict()
+export type FreshAgentAttachFailed = z.infer<typeof FreshAgentAttachFailedSchema>
+
 export const FreshAgentThreadLocatorSchema = z.object({
   sessionType: FreshAgentSessionTypeSchema,
   provider: FreshAgentRuntimeProviderSchema,

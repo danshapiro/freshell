@@ -51,7 +51,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 71,
+    "count": 73,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -71,6 +71,8 @@
       "extension.server.starting",
       "extension.server.stopped",
       "extensions.registry",
+      "freshAgent.attach.failed",
+      "freshAgent.attached",
       "freshAgent.checkpoint.outcome",
       "freshAgent.create.failed",
       "freshAgent.created",

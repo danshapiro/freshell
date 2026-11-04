@@ -61,6 +61,60 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 }
 
 describe('fresh-agent-ws', () => {
+  it('folds a requester attach result and its snapshot into the shared session', () => {
+    const store = createFreshAgentStore()
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.attached',
+      requestId: 'attach-result-1',
+      viewId: 'view-mobile',
+      provider: 'claude',
+      sessionId: 'thread-attach-result',
+      sessionType: 'freshclaude',
+      status: 'running',
+      snapshot: {
+        type: 'freshAgent.session.snapshot',
+        sessionId: 'thread-attach-result',
+        status: 'running',
+        latestTurnId: 'turn-live',
+      },
+    })).toBe(true)
+
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:thread-attach-result']).toMatchObject({
+      status: 'running',
+      lost: false,
+    })
+  })
+
+  it('folds a requester attach failure and its current owner fence', () => {
+    const store = createFreshAgentStore()
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.attach.failed',
+      requestId: 'attach-result-2',
+      viewId: 'view-mobile',
+      provider: 'codex',
+      sessionId: 'old-thread-key',
+      sessionRef: { provider: 'codex', sessionId: 'native-thread-key' },
+      sessionType: 'freshcodex',
+      status: 'failed',
+      code: 'SESSION_RESERVED',
+      message: 'retry after the current lifecycle operation',
+      retryable: true,
+      ownerKind: 'fresh-agent',
+      ownerEpoch: 3,
+      ownerGeneration: 12,
+    })).toBe(true)
+
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:old-thread-key']).toMatchObject({
+      lastErrorCode: 'SESSION_RESERVED',
+      lastError: 'retry after the current lifecycle operation',
+    })
+    expect(store.getState().freshAgent.runtimeOwners?.['codex:native-thread-key']).toMatchObject({
+      epoch: 3,
+      generation: 12,
+      ownerKind: 'fresh-agent',
+    })
+  })
+
   it('routes native patches outside the session slice and fences complete items and stale init incarnations', () => {
     const store = createFreshAgentStore()
     const outer = { type: 'freshAgent.event' as const, sessionId: 'native-live', sessionType: 'freshcodex' as const, provider: 'codex' as const }

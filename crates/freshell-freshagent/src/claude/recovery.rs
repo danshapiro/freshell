@@ -170,6 +170,8 @@ impl FreshClaudeState {
             previous_end_reason = ?dead.as_ref().map(|dead| dead.reason.as_str()),
             "recovering the conversation through the attach runtime path");
         let msg = FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: if is_canonical_claude_uuid(wire_id) {
                 durable.clone()
@@ -317,6 +319,8 @@ impl FreshClaudeState {
             // An uncached disk-only lane has nowhere to retain preferences.
             // Establish the existing conversation, then configure that runtime.
             let attach = FreshAgentAttach {
+                request_id: None,
+                view_id: None,
                 provider: freshell_protocol::AgentProvider::Claude,
                 session_id: durable.clone(),
                 session_type: msg.session_type,

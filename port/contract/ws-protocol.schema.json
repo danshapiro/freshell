@@ -530,6 +530,10 @@
                   "const": true,
                   "type": "boolean"
                 },
+                "freshAgentReconciliationV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "managedRuntimeV1": {
                   "const": true,
                   "type": "boolean"
@@ -2039,6 +2043,10 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "resumeSessionId": {
               "type": "string"
             },
@@ -2833,6 +2841,10 @@
             },
             "type": {
               "const": "freshAgent.fork",
+              "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
               "type": "string"
             }
           },
@@ -3512,6 +3524,10 @@
           ],
           "type": "string"
         },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "resumeSessionId": {
           "type": "string"
         },
@@ -3857,6 +3873,10 @@
                 "codex",
                 "opencode"
               ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
               "type": "string"
             },
             "resumeSessionId": {
@@ -4654,6 +4674,10 @@
             "type": {
               "const": "freshAgent.fork",
               "type": "string"
+            },
+            "viewId": {
+              "minLength": 1,
+              "type": "string"
             }
           },
           "required": [
@@ -5331,6 +5355,10 @@
         "type": {
           "const": "freshAgent.fork",
           "type": "string"
+        },
+        "viewId": {
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
@@ -5911,6 +5939,10 @@
           "additionalProperties": false,
           "properties": {
             "freshAgentAttentionReplayV1": {
+              "const": true,
+              "type": "boolean"
+            },
+            "freshAgentReconciliationV1": {
               "const": true,
               "type": "boolean"
             },
@@ -8912,6 +8944,10 @@
       "additionalProperties": false,
       "properties": {
         "freshAgentAttentionReplayV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "freshAgentReconciliationV1": {
           "const": true,
           "type": "boolean"
         },

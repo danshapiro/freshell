@@ -36,6 +36,7 @@
 //! [`FreshAgentState::shutdown`] (SIGTERM + the `/proc` ownership sweep) and, as a
 //! backstop, by the harness sentinel sweep — no orphans.
 
+pub mod attach;
 /// The per-session attention clock and edge builders shared by the fresh-agent
 /// lanes (design 2026-10-22 §3.2, §5.5).
 pub(crate) mod attention;
@@ -3011,6 +3012,9 @@ impl FreshAgentState {
     }
 
     pub(crate) fn broadcast(&self, msg: &ServerMessage) {
+        if crate::attach::capture_attach_message(msg) {
+            return;
+        }
         if let Ok(frame) = serde_json::to_string(msg) {
             // A send with no live receivers is fine (returns Err) — the capture socket
             // subscribed before the handshake, so it will observe every broadcast.

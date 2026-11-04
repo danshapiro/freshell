@@ -2704,6 +2704,9 @@ impl FreshCodexState {
     }
 
     fn broadcast(&self, msg: &ServerMessage) {
+        if crate::attach::capture_attach_message(msg) {
+            return;
+        }
         match msg {
             ServerMessage::FreshAgentCreated(created) => {
                 self.attention.observe(&created.session_id, SESSION_TYPE)
@@ -7842,7 +7845,45 @@ impl FreshCodexState {
     /// snapshot, because those represent genuinely new state the client has never observed
     /// (a new thread id, or a session this connection is only now discovering) -- not an
     /// unconditional repeat of already-known state.
-    pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+    pub async fn handle_attach(
+        &self,
+        msg: FreshAgentAttach,
+        reply: FrameSink,
+    ) -> crate::attach::AttachOutcome {
+        let outcome = self.handle_attach_inner(msg.clone()).await;
+        for message in crate::attach::AttachOutcome::requester_messages(&msg, outcome.clone()) {
+            reply(message);
+        }
+        outcome
+    }
+
+    async fn handle_attach_inner(&self, msg: FreshAgentAttach) -> crate::attach::AttachOutcome {
+        let (_, messages) =
+            crate::attach::capture_attach_messages(self.handle_attach_events(msg.clone())).await;
+        let current_status = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(&msg.session_id)
+                .map(|session| {
+                    if session
+                        .active_turn
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some()
+                    {
+                        "running"
+                    } else {
+                        "idle"
+                    }
+                })
+                .unwrap_or("unknown")
+        };
+        crate::attach::AttachOutcome::from_messages(messages)
+            .with_status_snapshot(&msg.session_id, current_status)
+            .with_current_owner(self.ownership_snapshot(PROVIDER, &msg.session_id))
+    }
+
+    async fn handle_attach_events(&self, msg: FreshAgentAttach) {
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — before any
         // state interaction. The attach never proceeds as a silently
@@ -18137,7 +18178,7 @@ pub(crate) mod tests {
         let stall = fake.arm_post_commit_stall("codex", thread);
         let st2 = st.clone();
         let attach = tokio::spawn(async move {
-            st2.handle_attach(attach_msg(thread)).await;
+            st2.handle_attach_events(attach_msg(thread)).await;
         });
         stall
             .applied
@@ -18355,7 +18396,7 @@ pub(crate) mod tests {
         // The commit's io failure knob: every durable write from here errs —
         // commit_claim's Err is the Finding-5 shape.
         fake.set_fail_writes(true);
-        st.handle_attach(attach_msg(thread)).await;
+        st.handle_attach_events(attach_msg(thread)).await;
 
         let mut saw_resume_failed = false;
         while let Ok(raw) = rx.try_recv() {
@@ -22188,7 +22229,7 @@ pub(crate) mod tests {
             arm_delayed_exact_cleanup(&state);
         let st = state.clone();
         let attach = attach_msg(&id);
-        let task = tokio::spawn(async move { st.handle_attach(attach).await });
+        let task = tokio::spawn(async move { st.handle_attach_events(attach).await });
         let (resumed_id, sidecar_pid, sidecar_ownership_id) =
             tokio::time::timeout(Duration::from_secs(20), registration_rx)
                 .await
@@ -22288,7 +22329,7 @@ pub(crate) mod tests {
             arm_delayed_exact_cleanup(&state);
         let st = state.clone();
         let attach = attach_msg(&id);
-        let task = tokio::spawn(async move { st.handle_attach(attach).await });
+        let task = tokio::spawn(async move { st.handle_attach_events(attach).await });
         let (recovered_id, sidecar_pid, sidecar_ownership_id) =
             tokio::time::timeout(Duration::from_secs(20), registration_rx)
                 .await
@@ -22390,7 +22431,7 @@ pub(crate) mod tests {
             arm_delayed_exact_cleanup(&state);
         let st = state.clone();
         let attach = attach_msg(&old_id);
-        let task = tokio::spawn(async move { st.handle_attach(attach).await });
+        let task = tokio::spawn(async move { st.handle_attach_events(attach).await });
         let (new_id, sidecar_pid, sidecar_ownership_id) =
             tokio::time::timeout(Duration::from_secs(20), registration_rx)
                 .await
@@ -23434,7 +23475,8 @@ pub(crate) mod tests {
 
         // Conn-less attach reconstructs the session (all-blank settings),
         // seeding the OLD row's stamps (focused-ep1-r4 Finding 2).
-        st.handle_attach(attach_msg("thread-lineage-adopt")).await;
+        st.handle_attach_events(attach_msg("thread-lineage-adopt"))
+            .await;
         let observed = st.get_snapshot("thread-lineage-adopt", None).await.unwrap();
         assert_eq!(observed["settings"]["model"], "fixture-model");
         assert_eq!(
@@ -23564,7 +23606,8 @@ pub(crate) mod tests {
         .expect("seed binding write ok");
         st.set_identity_sink(fake.clone());
 
-        st.handle_attach(attach_msg("thread-row-seeded")).await;
+        st.handle_attach_events(attach_msg("thread-row-seeded"))
+            .await;
 
         {
             let guard = st.sessions.lock().await;
@@ -23672,7 +23715,8 @@ pub(crate) mod tests {
         .expect("seed binding write ok");
         st.set_identity_sink(fake.clone());
 
-        st.handle_attach(attach_msg("thread-unattributed")).await;
+        st.handle_attach_events(attach_msg("thread-unattributed"))
+            .await;
 
         {
             let guard = st.sessions.lock().await;
@@ -27705,6 +27749,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             observed_epoch: None,
@@ -27730,7 +27776,7 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
 
-        st.handle_attach(attach_msg("historical-thread-attach"))
+        st.handle_attach_events(attach_msg("historical-thread-attach"))
             .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -27821,7 +27867,7 @@ pub(crate) mod tests {
 
         // The attach-resume (the fake app server answers thread/resume with
         // the requested id — the donor test's fixture).
-        st.handle_attach(attach_msg(thread)).await;
+        st.handle_attach_events(attach_msg(thread)).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             if st.sessions.lock().await.contains_key(thread) {
@@ -27911,7 +27957,7 @@ pub(crate) mod tests {
         let gate = fake.arm_claim_commit_gate("codex", thread);
         let st2 = st.clone();
         let attach = tokio::spawn(async move {
-            st2.handle_attach(attach_msg(thread)).await;
+            st2.handle_attach_events(attach_msg(thread)).await;
         });
 
         // The resume reached its commit point (the provider resume SUCCEEDED).
@@ -28007,7 +28053,8 @@ pub(crate) mod tests {
         );
         let (st, mut rx) = state_with_bus();
 
-        st.handle_attach(attach_msg("truly-does-not-exist")).await;
+        st.handle_attach_events(attach_msg("truly-does-not-exist"))
+            .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -28041,7 +28088,7 @@ pub(crate) mod tests {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let (st, mut rx) = state_with_bus();
 
-        st.handle_attach(attach_msg("historical-thread-transient"))
+        st.handle_attach_events(attach_msg("historical-thread-transient"))
             .await;
         std::env::remove_var("CODEX_CMD");
 
@@ -28081,8 +28128,8 @@ pub(crate) mod tests {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_attach(attach_msg("racey-thread")),
-            st2.handle_attach(attach_msg("racey-thread")),
+            st1.handle_attach_events(attach_msg("racey-thread")),
+            st2.handle_attach_events(attach_msg("racey-thread")),
         );
 
         let mut idle_snapshots = 0;
@@ -28135,19 +28182,14 @@ pub(crate) mod tests {
         std::fs::remove_file(&log_path).ok();
     }
 
-    /// WIRE-SHAPE PARITY: attaching to a tracked, still-alive session (no crash, no
-    /// respawn) must be a pure no-op on the wire -- NO frame at all -- matching the
-    /// reference's `attach()` (`adapter.ts:871-874`), which only remembers thread settings
-    /// and never pushes an event. This replaces the two former tests
-    /// (`handle_attach_known_session_emits_{running,idle}_snapshot_when_*`), which asserted
-    /// the OLD, over-eager behavior the fresh-agent wire-shape differential capture
-    /// (`test/unit/port/oracle/freshagent-wireshape-differential.test.ts`) proved diverges
-    /// from the original: the differential showed an identical `create -> send ->
-    /// turn-complete` sequence on both servers, then the Rust port ALONE emitted one extra
-    /// `freshAgent.event{event.type:'freshAgent.session.snapshot'}` frame after `attach`.
     #[tokio::test]
-    async fn handle_attach_known_alive_session_emits_no_frame_regardless_of_turn_state() {
+    async fn handle_attach_known_alive_session_acknowledges_only_its_requester() {
         for active_turn in [Some("turn-1".to_string()), None] {
+            let expected_status = if active_turn.is_some() {
+                "running"
+            } else {
+                "idle"
+            };
             let (transport, _peer) = freshell_codex::new_channel_transport();
             let (client, _notifs) = CodexAppServerClient::connect(transport);
             let client = Arc::new(client);
@@ -28163,24 +28205,54 @@ pub(crate) mod tests {
             )
             .await;
 
-            st.handle_attach(FreshAgentAttach {
-                tab_id: None,
-                pane_id: None,
-                observed_epoch: None,
-                observed_generation: None,
-                provider: freshell_protocol::AgentProvider::Codex,
-                session_id: "thread-1".to_string(),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                cwd: None,
-                resume_session_id: None,
-                session_ref: None,
-            })
+            let (reply, captured) = capturing_sink();
+            st.handle_attach(
+                FreshAgentAttach {
+                    request_id: Some("codex-attach-1".into()),
+                    view_id: Some("codex-view-1".into()),
+                    tab_id: None,
+                    pane_id: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                },
+                reply,
+            )
             .await;
 
+            let replies = captured.lock().expect("captured mutex").clone();
+            assert_eq!(replies.len(), 1);
+            let ServerMessage::FreshAgentAttached(attached) = &replies[0] else {
+                panic!("expected one typed attach acknowledgement, got {replies:?}");
+            };
+            assert_eq!(attached.request_id, "codex-attach-1");
+            assert_eq!(attached.view_id.as_deref(), Some("codex-view-1"));
+            assert_eq!(attached.status, expected_status);
+            assert_eq!(
+                attached.snapshot.as_ref().unwrap()["status"],
+                expected_status
+            );
+
+            let peer_frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|raw| serde_json::from_str(&raw).unwrap())
+                .collect();
             assert!(
-                rx.try_recv().is_err(),
-                "attach to a tracked, alive session must broadcast nothing (byte-parity with \
-                 the reference's no-op attach()), regardless of whether a turn is active"
+                peer_frames.iter().all(|frame| {
+                    !matches!(
+                        frame["type"].as_str(),
+                        Some("freshAgent.attached" | "freshAgent.attach.failed")
+                    ) && !(frame["type"] == "freshAgent.event"
+                        && matches!(
+                            frame["event"]["type"].as_str(),
+                            Some("freshAgent.session.snapshot" | "freshAgent.error")
+                        ))
+                }),
+                "attach-only results and snapshots must not broadcast to peer views; +                 ordinary metadata broadcasts remain shared: {peer_frames:?}"
             );
         }
     }
@@ -28219,7 +28291,7 @@ pub(crate) mod tests {
         // Simulate the restart path exactly as the existing R3 tests above do
         // (`handle_attach_unknown_session_*`): attach to "thread-9", which is NOT in
         // the in-memory map.
-        state.handle_attach(attach_msg("thread-9")).await;
+        state.handle_attach_events(attach_msg("thread-9")).await;
 
         // (1) The registered session carries the recovered settings:
         let expected = {
@@ -28297,7 +28369,7 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
 
         state
-            .handle_attach(attach_msg("thread-native-model-fallback"))
+            .handle_attach_events(attach_msg("thread-native-model-fallback"))
             .await;
 
         let sessions = state.sessions.lock().await;
@@ -28333,7 +28405,7 @@ pub(crate) mod tests {
         state.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
 
         // Same R3 entry point as above for an untracked "thread-x".
-        state.handle_attach(attach_msg("thread-x")).await;
+        state.handle_attach_events(attach_msg("thread-x")).await;
 
         // Bounded drain: NO SETTINGS_RESET frame may appear.
         while let Ok(frame) =
@@ -28373,7 +28445,7 @@ pub(crate) mod tests {
         state.set_identity_sink(fake);
 
         // Same R3 entry point, attaching untracked "thread-y".
-        state.handle_attach(attach_msg("thread-y")).await;
+        state.handle_attach_events(attach_msg("thread-y")).await;
 
         let mut found = false;
         while let Ok(frame) =
@@ -29127,7 +29199,8 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_attach(attach_msg("thread-A-requested")).await;
+        st.handle_attach_events(attach_msg("thread-A-requested"))
+            .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -29246,7 +29319,8 @@ pub(crate) mod tests {
             .get("thread-A-crashed")
             .cloned();
         assert!(prior_before_attach.is_none(), "the fixture's writer death must be confirmed before testing resume: {prior_before_attach:?}");
-        st.handle_attach(attach_msg("thread-A-crashed")).await;
+        st.handle_attach_events(attach_msg("thread-A-crashed"))
+            .await;
 
         let mut observed = Vec::new();
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -29384,7 +29458,7 @@ pub(crate) mod tests {
         let capture = tracing_capture::capture_by_session("finding-2-storm-marker-unused");
 
         for attempt in 0..5 {
-            st.handle_attach(attach_msg("thread-permanently-dead"))
+            st.handle_attach_events(attach_msg("thread-permanently-dead"))
                 .await;
 
             let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -29433,7 +29507,7 @@ pub(crate) mod tests {
         st.dead_thread_ttl = std::time::Duration::from_millis(50);
         let capture = tracing_capture::capture_by_session("finding-2-expiry-marker-unused");
 
-        st.handle_attach(attach_msg("thread-temporarily-dead"))
+        st.handle_attach_events(attach_msg("thread-temporarily-dead"))
             .await;
         let first: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -29453,7 +29527,7 @@ pub(crate) mod tests {
         // Now the thread is genuinely resumable.
         configure_fake_codex_cmd("{}");
 
-        st.handle_attach(attach_msg("thread-temporarily-dead"))
+        st.handle_attach_events(attach_msg("thread-temporarily-dead"))
             .await;
         let second: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -29525,8 +29599,8 @@ pub(crate) mod tests {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_attach(attach_msg("thread-race-not-yet-dead")),
-            st2.handle_attach(attach_msg("thread-race-not-yet-dead")),
+            st1.handle_attach_events(attach_msg("thread-race-not-yet-dead")),
+            st2.handle_attach_events(attach_msg("thread-race-not-yet-dead")),
         );
 
         // Both racing attaches must resolve honestly (the thread really is gone), never
@@ -30646,7 +30720,9 @@ pub(crate) mod tests {
         drain_create_time_snapshot(&mut rx, &thread_id).await;
 
         configure_fake_codex_cmd("{}");
-        st.handle_attach(FreshAgentAttach {
+        st.handle_attach_events(FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             observed_epoch: None,
@@ -30906,7 +30982,9 @@ pub(crate) mod tests {
         let attach_thread_id = thread_id.clone();
         let attach_task = tokio::spawn(async move {
             st_attach
-                .handle_attach(FreshAgentAttach {
+                .handle_attach_events(FreshAgentAttach {
+                    request_id: None,
+                    view_id: None,
                     tab_id: None,
                     pane_id: None,
                     observed_epoch: None,
@@ -31004,7 +31082,9 @@ pub(crate) mod tests {
         drain_create_time_snapshot(&mut rx, &thread_id).await;
 
         configure_fake_codex_cmd("{}");
-        st.handle_attach(FreshAgentAttach {
+        st.handle_attach_events(FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             observed_epoch: None,
@@ -34237,7 +34317,9 @@ pub(crate) mod tests {
 
         // THE STALE ATTACH: observed generation is the PRE-advance value —
         // typed refusal (SESSION_RESERVED), never a recreation.
-        st.handle_attach(FreshAgentAttach {
+        st.handle_attach_events(FreshAgentAttach {
+            request_id: None,
+            view_id: None,
             tab_id: None,
             pane_id: None,
             observed_epoch: Some(before.epoch),
@@ -35523,7 +35605,7 @@ pub(crate) mod tests {
         // THE TRACKED ATTACH: typed refusal (pre-r12 it proceeded to
         // ensure_session_alive and emitted a snapshot over the
         // terminal-owned session).
-        st.handle_attach(attach_msg(&thread_id)).await;
+        st.handle_attach_events(attach_msg(&thread_id)).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
