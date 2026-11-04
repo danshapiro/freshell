@@ -36,6 +36,14 @@ enum ResumeSpecCapturePhase {
     RecoveryPrior,
 }
 
+enum LiveAcceptance {
+    NativeObservation,
+    RetainedTerminal {
+        host_boot_id: HostBootId,
+        execution_generation: u64,
+    },
+}
+
 enum NativeSessionTransitionEvidence {
     Operation(Option<freshell_runtime_protocol::ClaudeForkRecipe>),
     ClaudeClear(freshell_runtime_protocol::NativeIdentityObservation),
@@ -4765,6 +4773,66 @@ impl Registry {
         incarnation_id: IncarnationId,
         fence: RecoveryWriteFence,
     ) -> Result<(), RegistryError> {
+        self.mark_recovery_live_with_acceptance(
+            soul_id,
+            incarnation_id,
+            fence,
+            LiveAcceptance::NativeObservation,
+        )
+        .await
+    }
+
+    /// Verify custody of an already accepted pre-native terminal. This only
+    /// certifies continuation of its existing process, never native recovery.
+    pub(crate) async fn verify_retained_terminal_continuation(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        host_boot_id: HostBootId,
+        execution_generation: u64,
+        fence: RecoveryWriteFence,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction()?;
+            validate_retained_terminal_continuation(
+                &tx,
+                &soul_id,
+                &incarnation_id,
+                &host_boot_id,
+                execution_generation,
+                &fence,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_retained_terminal_live(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        host_boot_id: HostBootId,
+        execution_generation: u64,
+        fence: RecoveryWriteFence,
+    ) -> Result<(), RegistryError> {
+        self.mark_recovery_live_with_acceptance(
+            soul_id,
+            incarnation_id,
+            fence,
+            LiveAcceptance::RetainedTerminal {
+                host_boot_id,
+                execution_generation,
+            },
+        )
+        .await
+    }
+
+    async fn mark_recovery_live_with_acceptance(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        fence: RecoveryWriteFence,
+        acceptance: LiveAcceptance,
+    ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul_id, &fence)?;
@@ -4785,7 +4853,12 @@ impl Registry {
                     reason: "STOP_INTENT_OR_STALE_INCARNATION".into(),
                 });
             }
-            validate_live_native_observation(&tx,&soul_id,&incarnation_id)?;
+            match &acceptance {
+                LiveAcceptance::NativeObservation=>validate_live_native_observation(&tx,&soul_id,&incarnation_id)?,
+                LiveAcceptance::RetainedTerminal{host_boot_id,execution_generation}=>validate_retained_terminal_continuation(
+                    &tx,&soul_id,&incarnation_id,host_boot_id,*execution_generation,&fence,
+                )?,
+            }
             if let Some(attempt) = fence.recovery_attempt_id.as_ref() {
                 let replacement: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM recovery_attempts a JOIN incarnations i ON i.recovery_attempt_id=a.attempt_id WHERE a.attempt_id=?1 AND a.verdict='replacement_prepared' AND a.finished_at IS NULL AND i.incarnation_id=?2 AND i.prior_incarnation_id=a.prior_incarnation_id)", params![attempt.as_str(),incarnation_id.as_str()],|r|r.get(0))?;
                 if replacement {
@@ -6870,6 +6943,48 @@ mod deterministic_fixture_admission_tests {
             }
         }
     }
+}
+
+fn validate_retained_terminal_continuation(
+    conn: &rusqlite::Transaction<'_>,
+    soul: &SoulId,
+    incarnation: &IncarnationId,
+    host_boot_id: &HostBootId,
+    execution_generation: u64,
+    fence: &RecoveryWriteFence,
+) -> Result<(), RegistryError> {
+    validate_recovery_write_fence(conn, soul, fence)?;
+    if &fence.active_incarnation_id != incarnation {
+        return Err(RegistryError::InvalidState(
+            "retained terminal incarnation changed".into(),
+        ));
+    }
+    let eligible: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id
+         WHERE i.soul_id=?1 AND i.incarnation_id=?2 AND s.desired_state='running'
+           AND i.launch_state='running' AND i.cleanup_state='none'
+           AND i.terminal_spec IS NOT NULL AND json_extract(i.terminal_spec,'$.mode')=s.provider
+           AND i.fresh_agent_spec IS NULL AND i.fixture_kind IS NULL
+           AND i.native_identity_launch IS NULL AND i.native_identity_observation IS NULL
+           AND i.provider_preparation_pending=0 AND i.grant_id IS NOT NULL
+           AND i.host_boot_id=?3 AND i.execution_generation=?4 AND i.execution_generation>0
+           AND NOT EXISTS(SELECT 1 FROM recovery_attempts a WHERE a.attempt_id=i.recovery_attempt_id
+                          AND a.verdict='replacement_prepared' AND a.finished_at IS NULL))",
+        params![
+            soul.as_str(),
+            incarnation.as_str(),
+            host_boot_id.as_str(),
+            execution_generation
+        ],
+        |row| row.get(0),
+    )?;
+    if !eligible {
+        return Err(RegistryError::RecoveryBlocked {
+            soul_id: soul.clone(),
+            reason: "RETAINED_TERMINAL_OWNER_UNCONFIRMED".into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_live_native_observation(

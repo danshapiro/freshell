@@ -211,6 +211,9 @@ mod provider_callback_budget_tests;
 #[cfg(test)]
 #[path = "provider_preparation_tests.rs"]
 mod provider_preparation_tests;
+#[cfg(test)]
+#[path = "retained_host_tests.rs"]
+mod retained_host_tests;
 impl Drop for AuthLookupScope {
     fn drop(&mut self) {
         self.authorities
@@ -2530,8 +2533,9 @@ impl Supervisor {
                 return Err(error);
             }
         };
-        let response = self
-            .send_authenticated_host_command(
+        let response = async {
+            self.verify_retained_terminal_owner(&handle, &host).await?;
+            self.send_authenticated_host_command(
                 handle.incarnation_id().clone(),
                 handle.runtime_dir(),
                 &host,
@@ -2541,7 +2545,9 @@ impl Supervisor {
                     data,
                 },
             )
-            .await;
+            .await
+        }
+        .await;
         match response {
             Ok(HostResult::TerminalInput {
                 state: CommandState::Completed,
@@ -2593,6 +2599,7 @@ impl Supervisor {
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
+        self.verify_retained_terminal_owner(&handle, &host).await?;
         match self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -4018,6 +4025,7 @@ impl Supervisor {
         // Stop intent alone is not EOF; only an actual completion record or
         // the exact incarnation's persisted verified-empty state can end it.
         let retained_only = source.stopped || source.verified_empty;
+        let mut retained_host_output = false;
         let live = if retained_only {
             None
         } else {
@@ -4026,6 +4034,15 @@ impl Supervisor {
                     let host = self
                         .authenticate_host(&source.incarnation_id, &source.runtime_dir)
                         .await?;
+                    retained_host_output = host.is_retained_v1();
+                    if retained_host_output {
+                        let handle = self
+                            .registry
+                            .owned_handle(source.incarnation_id.clone())
+                            .await
+                            .map_err(map_registry)?;
+                        self.verify_retained_terminal_owner(&handle, &host).await?;
+                    }
                     self.send_authenticated_host_command(
                         source.incarnation_id.clone(),
                         &source.runtime_dir,
@@ -4042,7 +4059,7 @@ impl Supervisor {
                 .await,
             )
         };
-        let output = match live {
+        let mut output = match live {
             Some(Ok(HostResult::TerminalOutput(output))) => output,
             Some(Ok(_)) => {
                 return Err(RuntimeError::new(
@@ -4084,6 +4101,12 @@ impl Supervisor {
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?
             }
         };
+        if retained_host_output {
+            // V1 identifies the existing terminal process, but cannot provide
+            // the incarnation-bound native observations required by v2.
+            // Keep its bytes readable without promoting its old native census.
+            output.native_session_id = None;
+        }
         timing.phase("owner_validation");
         let current = self.registry.retained_output_source(soul_id.clone()).await;
         if current.as_ref().ok().is_none_or(|current| {
@@ -5797,6 +5820,7 @@ impl Supervisor {
         let secret = std::fs::read(runtime_dir.join("secret")).map_err(io_runtime)?;
         let challenge = uuid::Uuid::new_v4().to_string();
         let deadline = Instant::now() + Duration::from_secs(8);
+        let mut wire_version = HostWireVersion::Current;
         // The connect retry tolerates a host that has not bound its socket
         // yet. Once connected, the reply itself is bounded by the same budget
         // every other host command uses: a host that accepts and then goes
@@ -5805,7 +5829,7 @@ impl Supervisor {
         loop {
             match UnixStream::connect(&socket).await {
                 Ok(mut stream) => {
-                    let envelope = Envelope::new(
+                    let mut envelope = Envelope::new(
                         RequestId::new(),
                         ControlRole::Supervisor,
                         HostCommand::Hello {
@@ -5813,9 +5837,26 @@ impl Supervisor {
                             challenge: challenge.clone(),
                         },
                     );
+                    envelope.protocol_version = wire_version.number();
                     let reply =
                         exchange_host_frame_classified(&mut stream, &envelope, budget, &socket)
                             .await?;
+                    if reply.request_id != envelope.request_id {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostAuthenticationFailed,
+                            "session host hello reply request mismatch",
+                        )
+                        .into());
+                    }
+                    if wire_version == HostWireVersion::Current
+                        && matches!(&reply.result,Err(error) if error.code == RuntimeErrorCode::ProtocolVersionMismatch)
+                    {
+                        // Hello has no side effects. A correlated version refusal
+                        // permits one fresh connection to an existing v1 host;
+                        // authentication and every later command remain required.
+                        wire_version = HostWireVersion::RetainedV1;
+                        continue;
+                    }
                     match reply.result? {
                         HostResult::Hello {
                             host_boot_id,
@@ -5833,6 +5874,7 @@ impl Supervisor {
                                 .into());
                             }
                             return Ok(AuthenticatedHost {
+                                wire_version,
                                 host_boot_id,
                                 secret,
                                 effective_limits,
@@ -6152,6 +6194,13 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, ClassifiedFailure> {
+        if !host.supports_command(&command) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedOperation,
+                "retained protocol-v1 hosts support existing terminal controls only",
+            )
+            .into());
+        }
         let startup_authority = match &command {
             HostCommand::GrantExecution {
                 soul_id,
@@ -6163,6 +6212,7 @@ impl Supervisor {
         let budget = self.host_command_budgets.for_command(&command);
         let command = with_host_dispatch_budget(command, budget);
         let mut envelope = Envelope::new(RequestId::new(), ControlRole::Supervisor, command);
+        envelope.protocol_version = host.wire_version.number();
         envelope.auth = Some(host_proof(
             &host.secret,
             "command-auth",
@@ -6186,6 +6236,13 @@ impl Supervisor {
         } else {
             exchange.await?
         };
+        if reply.request_id != envelope.request_id {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "session host command reply request mismatch",
+            )
+            .into());
+        }
         reply.result.map_err(Into::into)
     }
 
@@ -8187,10 +8244,52 @@ fn ensure_host_actor_state_dir(
 
 #[derive(Clone)]
 pub(crate) struct AuthenticatedHost {
+    wire_version: HostWireVersion,
     pub(crate) capabilities: Vec<String>,
     host_boot_id: HostBootId,
     secret: Vec<u8>,
     effective_limits: RuntimeLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostWireVersion {
+    Current,
+    RetainedV1,
+}
+
+impl HostWireVersion {
+    fn number(self) -> u32 {
+        match self {
+            Self::Current => CONTROL_PROTOCOL_VERSION,
+            Self::RetainedV1 => 1,
+        }
+    }
+}
+
+impl AuthenticatedHost {
+    pub(crate) fn is_retained_v1(&self) -> bool {
+        self.wire_version == HostWireVersion::RetainedV1
+    }
+
+    pub(crate) fn confirms_status_boot(&self, status: &HostStatus) -> bool {
+        self.host_boot_id == status.host_boot_id
+    }
+
+    fn supports_command(&self, command: &HostCommand) -> bool {
+        if !self.is_retained_v1() {
+            return true;
+        }
+        let capability = match command {
+            HostCommand::Hello { .. } | HostCommand::Status { .. } => return true,
+            HostCommand::TerminalInput { .. } | HostCommand::TerminalResize { .. } => "terminal-v1",
+            HostCommand::TerminalReadOutput { .. } => "output-replay-v1",
+            HostCommand::Stop { .. } => "stop-v1",
+            HostCommand::SecurityProbe { .. } => "security-probe-v1",
+            HostCommand::RuntimeMetrics { .. } => "runtime-metrics-v1",
+            _ => return false,
+        };
+        self.capabilities.iter().any(|value| value == capability)
+    }
 }
 pub(crate) struct AcceptedGrant {
     native_identity_observation: Option<freshell_runtime_protocol::NativeIdentityObservation>,
@@ -9639,6 +9738,7 @@ mod host_command_budget_tests {
 
     fn authenticated() -> AuthenticatedHost {
         AuthenticatedHost {
+            wire_version: super::HostWireVersion::Current,
             capabilities: Vec::new(),
             host_boot_id: HostBootId::new(),
             secret: b"synthetic-host-secret".to_vec(),
