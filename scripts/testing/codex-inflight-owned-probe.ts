@@ -198,6 +198,17 @@ export async function checkInFlightOwnedProbe(input: {
     failures.push({ phase: 'probe_settlement', kind: 'exception' })
     errors.push(probeResult.reason)
   }
+  if ((caseFailed || cleanupResult.status === 'rejected')
+    && probeResult.status === 'fulfilled' && probeResult.value.kind === 'rejected') {
+    const error = probeResult.value.error
+    const cause = error instanceof Error ? error.cause as { signal?: string } | undefined : undefined
+    const expectedCancellation = cleanupResult.status === 'fulfilled' && stopCalls === 1 && inFlightAtStop
+      && cause?.signal === 'SIGKILL'
+    if (!expectedCancellation) {
+      failures.push({ phase: 'probe', kind: 'unexpected_rejection' })
+      errors.push(error)
+    }
+  }
   if (failures.length) {
     event('real_probe.failed', { daemonId, containerId, cli: cli ?? null, containerOperation: inside ?? null,
       ownerStopCalls: stopCalls, cleanupStatus: cleanupResult.status,

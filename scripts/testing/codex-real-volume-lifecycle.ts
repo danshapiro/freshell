@@ -21,11 +21,16 @@ type Fixture = {
   captured?: Captured
 }
 type Attachment = { name: string; volume: string; runId: string; id?: string }
+type CasePhase = 'owner_setup' | 'prepare' | 'fixture_setup' | 'fixture_absence' | 'fixture_create' | 'fixture_capture'
+  | 'changed_owner' | 'attachment_create' | 'attached' | 'unreserved_setup' | 'unreserved_cleanup'
+  | 'unreserved_stop_calls' | 'unreserved_before_stop' | 'unreserved_after_stop' | 'unreserved_final_absence'
+  | 'unproven_capture'
 type State = {
   rig: ManagedRuntimeOwner
   fixtures: Fixture[]
   attachments: Attachment[]
   stopped: boolean
+  caseProgress: { phase: CasePhase; observed?: boolean | number }
 }
 type CleanupFailure =
   | { phase: 'attachment_remove' | 'volume_capture' | 'volume_remove' | 'volume_observation' | 'cleanup'; kind: 'exception' }
@@ -33,9 +38,42 @@ type CleanupFailure =
   | { phase: 'volume_retention'; kind: 'unconfirmed' }
 type OperationStatus = 'not_started' | 'succeeded' | 'failed'
 
-function event(name: string, fields: Record<string, unknown> = {}): void {
+function eventLine(name: string, fields: Record<string, unknown>): string {
   const severity = /failure|failed|recovery_required/.test(name) ? 'error' : 'info'
-  process.stdout.write(`${JSON.stringify({ severity, event: name, ...fields })}\n`)
+  return `${JSON.stringify({ severity, event: name, ...fields })}\n`
+}
+
+function event(name: string, fields: Record<string, unknown> = {}): void {
+  process.stdout.write(eventLine(name, fields))
+}
+
+// Use the same ordered stream as ordinary events and wait until the identity
+// has reached its destination before an operation can create the resource.
+function recoveryIdentity(name: string, fields: Record<string, unknown>): Promise<void> {
+  const data = eventLine(name, fields)
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => reject(error)
+    process.stdout.once('error', onError)
+    try {
+      process.stdout.write(data, error => {
+        if (error) {
+          // Writable streams emit their error after the write callback.
+          setImmediate(() => process.stdout.off('error', onError))
+          reject(error)
+        } else {
+          process.stdout.off('error', onError)
+          resolve()
+        }
+      })
+    } catch (error) {
+      process.stdout.off('error', onError)
+      reject(error)
+    }
+  })
+}
+
+function caseProgress(state: State, phase: CasePhase, observed?: boolean | number): void {
+  state.caseProgress = observed === undefined ? { phase } : { phase, observed }
 }
 
 // Do not include Docker stderr, process environments, or command strings in
@@ -107,6 +145,19 @@ function volumeExists(name: string): boolean {
   return names.split('\n').includes(name)
 }
 
+function requireDaemon(expected: string): void {
+  if (docker('daemon_identity', ['info', '--format', '{{.ID}}']) !== expected) {
+    throw new Error('fixture daemon identity changed; retain ownership for recovery')
+  }
+}
+
+function volumeExistsOnExpectedDaemon(name: string, daemonId: string): boolean {
+  requireDaemon(daemonId)
+  const exists = volumeExists(name)
+  requireDaemon(daemonId)
+  return exists
+}
+
 function inspectVolume(name: string): { Name: string; Driver: string; Options: unknown; Labels: Record<string, string> } {
   return JSON.parse(docker('volume_inspect', ['volume', 'inspect', name, '--format', '{{json .}}']))
 }
@@ -119,7 +170,8 @@ function assertLabels(fixture: Fixture): void {
   assert.deepEqual(actual.Labels, fixture.labels)
 }
 
-function createFixture(state: State, daemonId: string): Fixture {
+async function createFixture(state: State, daemonId: string): Promise<Fixture> {
+  caseProgress(state, 'fixture_setup')
   const installationId = `task4-${randomUUID()}`
   const soulId = `task4-${randomUUID()}`
   const providerVolumeName = `freshell-provider-${createHash('sha256')
@@ -143,12 +195,18 @@ function createFixture(state: State, daemonId: string): Fixture {
   }
   const fixture: Fixture = { owner, labels, attempted: false }
   state.fixtures.push(fixture)
-  assert.equal(volumeExists(providerVolumeName), false, 'never adopt a pre-existing volume')
+  caseProgress(state, 'fixture_absence')
+  const exists = volumeExistsOnExpectedDaemon(providerVolumeName, daemonId)
+  caseProgress(state, 'fixture_absence', exists)
+  assert.equal(exists, false, 'never adopt a pre-existing volume')
+  caseProgress(state, 'fixture_create')
+  await recoveryIdentity('real_volume.volume_attempt', { daemonId, volume: providerVolumeName, labels, operation: 'create' })
   fixture.attempted = true
   const created = docker('volume_create', ['volume', 'create', '--driver', 'local',
     ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]), providerVolumeName])
   assert.equal(created, providerVolumeName)
   assertLabels(fixture)
+  caseProgress(state, 'fixture_capture')
   fixture.captured = captureInitialProviderVolumes([owner])
   assert.equal(fixture.captured.length, 1)
   event('real_volume.created_unreserved', { daemonId, volume: providerVolumeName, labels })
@@ -158,7 +216,7 @@ function createFixture(state: State, daemonId: string): Fixture {
 function removeCaptured(fixture: Fixture): void {
   assert.ok(fixture.captured)
   assert.deepEqual(cleanupInitialProviderVolumes(fixture.captured), [fixture.owner.providerVolumeName])
-  assert.equal(volumeExists(fixture.owner.providerVolumeName), false)
+  assert.equal(volumeExistsOnExpectedDaemon(fixture.owner.providerVolumeName, fixture.owner.daemonId), false)
   fixture.attempted = false
 }
 
@@ -189,7 +247,7 @@ function removeAttachment(attachment: Attachment): void {
 
 function newState(repo: string): State {
   const rig = new ManagedRuntimeOwner(() => { throw new Error('no web server is needed for volume checks') }, repo)
-  const state: State = { rig, fixtures: [], attachments: [], stopped: false }
+  const state: State = { rig, fixtures: [], attachments: [], stopped: false, caseProgress: { phase: 'owner_setup' } }
   event('real_volume.owner_created', { runId: rig.runtime.runId, testRoot: rig.runtime.testRoot, evidenceDir: rig.runtime.evidenceDir })
   return state
 }
@@ -238,7 +296,15 @@ export async function settle(state: State): Promise<void> {
       captureVolumes: (...args: Parameters<typeof managedCodexCleanupDependencies.captureVolumes>) => {
         const started = Date.now()
         try {
-          const captured = managedCodexCleanupDependencies.captureVolumes(...args)
+          const [owners, budgetMs] = args
+          if (owners.length) {
+            const daemonId = owners[0].daemonId
+            if (owners.some(owner => owner.daemonId !== daemonId)) throw new Error('fixture owners use different daemons')
+            requireDaemon(daemonId)
+          }
+          const remaining = budgetMs - Math.max(0, Date.now() - started)
+          if (remaining <= 0) throw new Error('fixture volume capture exceeded its time budget')
+          const captured = managedCodexCleanupDependencies.captureVolumes(owners, remaining)
           captureStatus = 'succeeded'
           return captured
         } catch (error) {
@@ -272,7 +338,7 @@ export async function settle(state: State): Promise<void> {
   if (state.stopped) {
     for (const fixture of attempted) {
       try {
-        if (!volumeExists(fixture.owner.providerVolumeName)) fixture.attempted = false
+        if (!volumeExistsOnExpectedDaemon(fixture.owner.providerVolumeName, fixture.owner.daemonId)) fixture.attempted = false
       } catch (error) {
         failures.push({ phase: 'volume_observation', kind: 'exception' })
         errors.push(error)
@@ -303,7 +369,7 @@ async function runVolumeCase(state: State, body: () => Promise<void>): Promise<v
   try { await body() } catch (error) { caseFailed = true; caseError = error }
   try { await settle(state) } catch (error) { cleanupFailed = true; cleanupError = error }
   if (caseFailed) {
-    event('real_volume.case_failed', { failures: [{ phase: 'case',
+    event('real_volume.case_failed', { failures: [{ ...state.caseProgress,
       kind: caseError instanceof assert.AssertionError ? 'assertion' : 'operation' }], ownerStopped: state.stopped })
   }
   if (caseFailed && cleanupFailed) throw new AggregateError([caseError, cleanupError], 'real volume case and cleanup failed')
@@ -314,15 +380,19 @@ async function runVolumeCase(state: State, body: () => Promise<void>): Promise<v
 export async function ownershipAndUnreserved(repo: string, daemonId: string): Promise<void> {
   const state = newState(repo)
   await runVolumeCase(state, async () => {
+    caseProgress(state, 'prepare')
     await state.rig.runtime.prepare()
-    const changed = createFixture(state, daemonId)
+    const changed = await createFixture(state, daemonId)
+    caseProgress(state, 'changed_owner')
     const previous = changed.captured!
     // Replace only the proven, unattached task-owned volume. Docker volume
     // labels are immutable; the replacement is a distinct owned fixture.
     assertLabels(changed)
     assert.deepEqual(cleanupInitialProviderVolumes(previous), [changed.owner.providerVolumeName])
-    assert.equal(volumeExists(changed.owner.providerVolumeName), false)
+    assert.equal(volumeExistsOnExpectedDaemon(changed.owner.providerVolumeName, daemonId), false)
     changed.labels = { ...changed.labels, 'freshell.input.reservation': randomUUID(), 'freshell.input.incarnation': `task4-${randomUUID()}` }
+    await recoveryIdentity('real_volume.volume_attempt', { daemonId, volume: changed.owner.providerVolumeName,
+      labels: changed.labels, operation: 'replace' })
     const replacement = docker('volume_replace', ['volume', 'create', '--driver', 'local',
       ...Object.entries(changed.labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]), changed.owner.providerVolumeName])
     assert.equal(replacement, changed.owner.providerVolumeName)
@@ -336,15 +406,21 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
     removeCaptured(changed)
     event('real_volume.case_passed', { case: 'changed_owner', volume: changed.owner.providerVolumeName })
 
-    const attached = createFixture(state, daemonId)
+    const attached = await createFixture(state, daemonId)
+    caseProgress(state, 'attachment_create')
     const attachment: Attachment = { name: `task4-attachment-${randomUUID()}`, volume: attached.owner.providerVolumeName, runId: state.rig.runtime.runId }
     state.attachments.push(attachment)
     assert.equal(attachmentId(attachment), undefined)
+    await recoveryIdentity('real_volume.attachment_attempt', { daemonId, name: attachment.name, volume: attachment.volume,
+      runId: attachment.runId, labels: { 'com.freshell.runtime-test-run-id': attachment.runId } })
     const id = docker('container_create', ['container', 'create', '--name', attachment.name,
       '--label', `com.freshell.runtime-test-run-id=${attachment.runId}`,
       '--mount', `type=volume,source=${attachment.volume},target=/task4-volume`, state.rig.runtime.imageRef, 'sh', '-c', 'true'])
     assert.match(id, /^[a-f0-9]{64}$/)
     attachment.id = id
+    await recoveryIdentity('real_volume.attachment_created', { daemonId, name: attachment.name, volume: attachment.volume,
+      runId: attachment.runId, containerId: id })
+    caseProgress(state, 'attached')
     assert.equal(attachmentId(attachment), id)
     const holders = docker('volume_holders', ['container', 'ls', '-a', '--no-trunc', '--filter', `volume=${attachment.volume}`, '--format', '{{.ID}}'])
     assert.ok(holders.split('\n').includes(id))
@@ -355,7 +431,8 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
     removeCaptured(attached)
     event('real_volume.case_passed', { case: 'attached', volume: attachment.volume })
 
-    const unreserved = createFixture(state, daemonId)
+    const unreserved = await createFixture(state, daemonId)
+    caseProgress(state, 'unreserved_setup')
     let beforeStop = false
     let afterStop = false
     let stopCalls = 0
@@ -372,12 +449,19 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
     }
     assert.equal(state.rig.runtime.broker.initialProviderVolumeCreations().length, 0)
     assert.equal(state.rig.runtime.broker.receipts().length, 0)
+    caseProgress(state, 'unreserved_cleanup')
     await cleanupManagedCodexParity({ rig, owners: [unreserved.owner], wire: undefined, model: undefined,
       finalObservation: undefined, naming: undefined, restoreGrants: undefined, grantsDirectory: undefined, home: undefined })
+    caseProgress(state, 'unreserved_stop_calls', Math.min(stopCalls, 2))
     assert.equal(stopCalls, 1)
+    caseProgress(state, 'unreserved_before_stop', beforeStop)
     assert.equal(beforeStop, true)
+    caseProgress(state, 'unreserved_after_stop', afterStop)
     assert.equal(afterStop, true)
-    assert.equal(volumeExists(unreserved.owner.providerVolumeName), false)
+    caseProgress(state, 'unreserved_final_absence')
+    const finalExists = volumeExistsOnExpectedDaemon(unreserved.owner.providerVolumeName, daemonId)
+    caseProgress(state, 'unreserved_final_absence', finalExists)
+    assert.equal(finalExists, false)
     unreserved.attempted = false
     event('real_volume.case_passed', { case: 'unreserved_outer_removal', volume: unreserved.owner.providerVolumeName,
       stopCalls, beforeStop, afterStop, finalExists: false, reservations: 0, receipts: 0 })
@@ -387,8 +471,10 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
 async function unprovenCapture(repo: string, daemonId: string): Promise<void> {
   const state = newState(repo)
   await runVolumeCase(state, async () => {
+    caseProgress(state, 'prepare')
     await state.rig.runtime.prepare()
-    const fixture = createFixture(state, daemonId)
+    const fixture = await createFixture(state, daemonId)
+    caseProgress(state, 'unproven_capture')
     // Preserve the valid capture before the actual owner removes its binary.
     const capture = fixture.captured!
     let stopCalls = 0
@@ -421,9 +507,13 @@ async function unprovenCapture(repo: string, daemonId: string): Promise<void> {
   })
 }
 
+let executablePhase: 'preflight' | 'ownership_and_unreserved' | 'unproven_capture' = 'preflight'
+
 async function main(): Promise<void> {
   const { repo, daemonId } = requireQualifiedGuest()
+  executablePhase = 'ownership_and_unreserved'
   await ownershipAndUnreserved(repo, daemonId)
+  executablePhase = 'unproven_capture'
   await unprovenCapture(repo, daemonId)
   event('real_volume.completed', { passedCases: 4, daemonId })
 }
@@ -431,7 +521,8 @@ async function main(): Promise<void> {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => {
     // No raw Docker stderr, daemon response, command, or environment in metadata.
-    event('real_volume.failed', { errorKind: error instanceof assert.AssertionError ? 'assertion' : 'operation' })
+    event('real_volume.failed', { phase: executablePhase,
+      errorKind: error instanceof assert.AssertionError ? 'assertion' : 'operation' })
     process.exitCode = 1
   })
 }
