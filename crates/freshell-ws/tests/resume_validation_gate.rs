@@ -143,6 +143,7 @@ async fn spawn_server_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -342,6 +343,7 @@ async fn spawn_managed_codex_server_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
@@ -1236,6 +1238,7 @@ async fn spawn_antigravity_server_with_probe(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),

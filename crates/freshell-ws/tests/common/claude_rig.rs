@@ -453,8 +453,9 @@ impl ClaudeRig {
         )
     }
 
-    /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`,
-    /// `can_use_tool`, `control`, `emission`); see `test/fixtures/claude-cli-sim/query.mjs`.
+    /// The simulator's ledger rows of one kind (`query`, `boot`, `cold`,
+    /// `prompt`, `can_use_tool`, `control`, `emission`); see
+    /// `test/fixtures/claude-cli-sim/query.mjs`.
     pub fn ledger_rows(&self, kind: &str) -> Vec<Value> {
         assert_eq!(
             self.kind,
@@ -1097,6 +1098,7 @@ async fn spawn_rig_server(
     let cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>> = Arc::new(Vec::new());
 
     let state = WsState {
+        session_index_ready: None,
         layout,
         terminal_meta: Default::default(),
         pane_ledger: pane_ledger

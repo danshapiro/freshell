@@ -501,6 +501,7 @@ async fn spawn_antigravity_server_with_probe(
     let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = WsState {
+        session_index_ready: None,
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(

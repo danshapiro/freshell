@@ -237,6 +237,13 @@ pub struct HelloCapabilities {
     /// Replay attention missed during a same-page disconnect, seeded on reload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fresh_agent_attention_replay_v1: Option<bool>,
+    /// Session-index readiness opt-in (auto-restore-warming Task 2): the
+    /// client understands `ready.sessionIndexReady` and the
+    /// `sessions.index.ready` boot broadcast. Additive optional — absent on
+    /// the frozen client and stripped-tolerant on older servers (no version
+    /// bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_index_ready_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

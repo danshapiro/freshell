@@ -40,7 +40,7 @@ import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { canReplayManagedTerminal, managedTerminalPaneStatus } from '@/lib/managed-terminal.js'
-import { buildReconcileRequestForPanes, DEAD_SESSION_RECONCILE_NOTICES, foldVerdicts, isDeadSessionReconcileNotice } from '@/lib/pane-reconcile'
+import { buildReconcileRequestForPanes, DEAD_SESSION_RECONCILE_NOTICES, foldVerdicts, isDeadSessionReconcileNotice, isSessionStoreUnreadableReconcileNotice } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
@@ -430,22 +430,60 @@ const DEAD_SESSION_BUFFER_NOTICES = {
     "[This pane's saved session no longer exists on disk - close this pane or start a new one]",
   respawnExhausted:
     "[This pane's saved session could not be resumed - close this pane or start a new one]",
+  // Unreadable-store line (auto-restore-warming delta fix, finding 1;
+  // focused review round 3, finding 2): the copy claims ONLY what the
+  // verdict proves — the session IDENTITY is preserved; the saved
+  // conversation itself may be lost if the store is damaged (the verdict
+  // proves the record reference survived, never that the store content
+  // did). Recovery is a reconnect retry once the store is readable.
+  // Plain and honest, no jargon, no unproven safety claim.
+  storeUnreadable:
+    "[This pane's saved session store could not be read - the session identity is preserved, but its saved conversation may be lost; reconnect to retry once the store is readable]",
 } as const
 
-/** Buffer-line variant for a dead-copy mint (category match). */
+/** Buffer-line variant for a durable restore-notice mint (category match). */
 function deadSessionBufferNoticeForMint(notice: string): string {
+  if (isSessionStoreUnreadableReconcileNotice(notice)) {
+    return DEAD_SESSION_BUFFER_NOTICES.storeUnreadable
+  }
   return notice === DEAD_SESSION_RECONCILE_NOTICES.respawnExhausted
     ? DEAD_SESSION_BUFFER_NOTICES.respawnExhausted
     : DEAD_SESSION_BUFFER_NOTICES.missing
 }
 
 /**
+ * The restoreError reasons that own a DURABLE notice-line mint (one visible
+ * in-buffer explanation line each, through the shared no-modal machinery):
+ * a dead-adjudicated pane (durable_artifact_missing) and an
+ * unreadable-store pane (session_store_unreadable — auto-restore-warming
+ * delta fix, finding 1). Every other reason keeps today's behavior (no
+ * buffer line; the pane's own recovery/error surfaces explain it).
+ */
+function noticeLineRestoreErrorReason(
+  reason: string | undefined,
+): 'durable_artifact_missing' | 'session_store_unreadable' | null {
+  return reason === 'durable_artifact_missing' || reason === 'session_store_unreadable'
+    ? (reason as 'durable_artifact_missing' | 'session_store_unreadable')
+    : null
+}
+
+/**
  * Idempotency identity for the dead-session notice line: a re-keyed pane
  * (Replace pane, respawn, identity repair) is a NEW identity whose next
- * death writes fresh; the same identity re-adjudicated is the same line.
+ * death writes fresh; the same identity re-adjudicated with the SAME
+ * reason is the same line. The notice-line REASON rides the key beside the
+ * pane identity (delta fix focused review, finding 1): a verdict
+ * transition durable_artifact_missing <-> session_store_unreadable on the
+ * SAME identity and surface produces a NEW key, so the writer re-arms and
+ * the verdict's CURRENT explanation is written — a pane-identity-only key
+ * let the first reason's at-apply record satisfy the invariant forever and
+ * the stale explanation survived the verdict change.
  */
-function deadSessionNoticeIdentityKey(content: TerminalPaneContent | null | undefined): string {
-  return `${content?.createRequestId ?? ''}|${content?.sessionRef?.sessionId ?? '-'}`
+function deadSessionNoticeIdentityKey(
+  content: TerminalPaneContent | null | undefined,
+  latchReason: 'durable_artifact_missing' | 'session_store_unreadable' | null,
+): string {
+  return `${content?.createRequestId ?? ''}|${content?.sessionRef?.sessionId ?? '-'}|${latchReason ?? '-'}`
 }
 
 type StartupProbeReplayDiscardState = {
@@ -968,8 +1006,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
   // dead-notice record, the notice line is (re-)issued — queue-ordered,
   // generation-adopting — into that surface. The at-apply record below
-  // (identity key `createRequestId|sessionId` + surface epoch + mint copy)
-  // is the loop guard: it only ever claims an epoch the line actually landed
+  // (identity key `createRequestId|sessionId|reason` + surface epoch + mint
+  // copy — the reason rides the key so a verdict transition re-arms the
+  // writer, delta fix focused review finding 1) is the loop guard: it only
+  // ever claims an epoch the line actually landed
   // on, so the skip branch is honest (skip ⟺ the line is on the current
   // surface). The epoch bumps at every xterm surface birth (init) and at
   // every beginMountedReconstruction reset completion — i.e. at every event
@@ -1996,15 +2036,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // deferred surface mounts.
   const writeDeadSessionNoticeIfPending = useCallback(() => {
     const content = contentRef.current
+    // Copy source resolution is LATCH-CATEGORY-scoped (delta fix finding 1):
+    // a durable mint of the OTHER category (a stale dead copy under an
+    // unreadable latch, or vice versa) is not a copy source for this latch —
+    // exactly as a corrected/duplicate one-shot notice never was.
+    const latchReason = noticeLineRestoreErrorReason(content?.restoreError?.reason)
     const notice = content?.reconcileNotice
-    const mint = notice !== undefined && isDeadSessionReconcileNotice(notice) ? notice : null
+    const mint = latchReason !== null
+      && notice !== undefined
+      && (latchReason === 'durable_artifact_missing'
+        ? isDeadSessionReconcileNotice(notice)
+        : isSessionStoreUnreadableReconcileNotice(notice))
+      ? notice
+      : null
     const term = termRef.current
     if (!term) {
       // Surface not mounted (provider-wait window): the resident mint
       // stays in the store until a surface exists to write it.
       return
     }
-    const key = deadSessionNoticeIdentityKey(content)
+    // The key carries the latch REASON beside the pane identity (delta fix
+    // focused review, finding 1): a reason transition is a NEW key, so the
+    // at-apply record of the OTHER reason never satisfies this invariant —
+    // the writer re-arms and the new explanation is written.
+    const key = deadSessionNoticeIdentityKey(content, latchReason)
     if (deadSessionNoticeQueuedWriteIsLive(key)) {
       // A queued copy of this identity is still the current queue regime's
       // write: FIFO delivery is owed. The resident mint needs no action.
@@ -2168,6 +2223,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalModes(tid)
     }
   }, [terminalContent?.terminalId])
+
+  // Pane-scoped buffer registration (delta fix focused review, finding 2):
+  // e2e notice-line assertions read the xterm buffer API
+  // (renderer-independent), but the terminalId-keyed registration above
+  // unregisters exactly when an exited pane clears its terminalId — the
+  // moment the durable-park notice line lands. This registration keeps the
+  // SAME buffer text reachable under the pane id for this component's whole
+  // lifetime. It lives in the harness's SEPARATE pane-scoped registry
+  // (getRegisteredTerminalIds keeps returning terminalIds only, because
+  // its consumers treat every key as a terminal id).
+  useEffect(() => {
+    if (!window.__FRESHELL_TEST_HARNESS__ || !paneId) return
+    window.__FRESHELL_TEST_HARNESS__.registerPaneTerminalBuffer?.(paneId, () => {
+      const t = termRef.current
+      if (!t) return ''
+      return terminalBufferText(t.buffer.active)
+    })
+    return () => {
+      window.__FRESHELL_TEST_HARNESS__?.unregisterPaneTerminalBuffer?.(paneId)
+    }
+  }, [paneId])
 
   // Sync visibility at commit phase (layout effect, not passive effect): a
   // passive effect would leave a window where a queued attach callback could
@@ -3561,10 +3637,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   // ── Dead-notice invariant effect (no-modal contract, LEVEL-TRIGGERED —
   // focused review 3, round 4) ──
-  // INVARIANT: whenever this pane is dead-adjudicated (restoreError reason
-  // durable_artifact_missing) and its CURRENT surface epoch has no APPLIED
-  // dead-notice record, the notice line is (re-)issued — queue-ordered,
-  // generation-adopting — into that surface. The writer's level check
+  // INVARIANT: whenever this pane holds a durable notice-line latch
+  // (restoreError reason durable_artifact_missing OR
+  // session_store_unreadable — delta fix finding 1 widened the regime to
+  // the unreadable-store sibling) and its CURRENT surface epoch has no
+  // APPLIED dead-notice record, the notice line is (re-)issued —
+  // queue-ordered, generation-adopting — into that surface. The writer's
+  // level check
   // (writeDeadSessionNoticeIfPending) IS the invariant observation; the
   // at-apply record per epoch is the loop guard. This effect REPLACES the
   // edge-triggered settle-event enumeration of the prior rounds (rejection
@@ -3598,9 +3677,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // termRef.current set (declaration-order effect execution).
   useEffect(() => {
     const content = contentRef.current
-    if (content?.restoreError?.reason !== 'durable_artifact_missing') {
-      // Latch cleared (or a non-dead reason): re-arm the idempotency state
-      // so a later re-death of the SAME identity writes again.
+    if (noticeLineRestoreErrorReason(content?.restoreError?.reason) === null) {
+      // Latch cleared (or a reason with no notice-line category): re-arm
+      // the idempotency state so a later re-latch of the SAME identity
+      // writes again.
       deadSessionNoticeStateRef.current = null
       deadSessionNoticeQueuedWriteRef.current = null
       return
@@ -6535,13 +6615,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           // One-shot reconcile notice (respawn/fresh verdicts — corrected,
           // fresh-by-reason, duplicate copies): render it now that the pane
-          // anchored, then clear it from the store. The dead-session mint is
-          // the RESIDENT durable copy source with exactly TWO writers (the
-          // INVALID_TERMINAL_ID stand-down gate and the notice effect's
-          // settled-surface writers) and is cleared with the dead latch by
-          // the store folds — this anchor neither writes nor clears it.
+          // anchored, then clear it from the store. The DURABLE mints (the
+          // dead copy and the unreadable-store copy) are the RESIDENT copy
+          // sources with their own machinery (the INVALID_TERMINAL_ID
+          // stand-down gate and the notice effect's settled-surface
+          // writers) and are cleared with their latches by the store folds
+          // — this anchor neither writes nor clears them, exactly like the
+          // attach path's retention (focused review round 4: the
+          // unreadable-store pane's create lane is never stood down, so
+          // this anchor is reachable with that latch persisting and must
+          // not consume its mint — the folds remain its only consumer, on
+          // error-cleared / pane-recovered).
           const createdReconcileNotice = contentRef.current?.reconcileNotice
-          if (createdReconcileNotice && !isDeadSessionReconcileNotice(createdReconcileNotice)) {
+          if (
+            createdReconcileNotice
+            && !isDeadSessionReconcileNotice(createdReconcileNotice)
+            && !isSessionStoreUnreadableReconcileNotice(createdReconcileNotice)
+          ) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
             if (createdReconcileNotice === RECONCILE_NOTICE_FRESH_BY_RACE) {
               setFreshByRaceNotice(createdReconcileNotice)
@@ -7661,13 +7751,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           })
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
-          // clear it from the store. The dead-session mint is the RESIDENT
-          // durable copy source with exactly TWO writers (the
-          // INVALID_TERMINAL_ID stand-down gate and the no-terminalId notice
-          // effect) and is cleared with the dead latch by the store folds —
-          // this anchor neither writes nor clears it.
+          // clear it from the store. The DURABLE mints (the dead copy and,
+          // since the delta fix finding 1, the unreadable-store copy) are
+          // the RESIDENT copy sources with their own machinery (the
+          // INVALID_TERMINAL_ID stand-down gate and the no-terminalId
+          // notice effect) and are cleared with their latches by the store
+          // folds — this anchor neither writes nor clears them.
           const attachReconcileNotice = contentRef.current?.reconcileNotice
-          if (attachReconcileNotice && !isDeadSessionReconcileNotice(attachReconcileNotice)) {
+          if (
+            attachReconcileNotice
+            && !isDeadSessionReconcileNotice(attachReconcileNotice)
+            && !isSessionStoreUnreadableReconcileNotice(attachReconcileNotice)
+          ) {
             writeLocalXtermNotice(term, `\r\n${attachReconcileNotice}\r\n`)
             dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
           }

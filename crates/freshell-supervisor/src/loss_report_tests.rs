@@ -2224,6 +2224,103 @@ fn cleanup(prepared: &PreparedLoss) -> LossCleanupReport {
 }
 
 #[tokio::test]
+async fn verified_loss_cleanup_preserves_an_unadmitted_send_refusal() {
+    use crate::registry::InputJournalDisposition;
+    use freshell_runtime_protocol::RequestId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, original) = prepared_context(dir.path()).await;
+    let queued = RequestId::parse("queued-before-loss").unwrap();
+    let completed = RequestId::parse("completed-before-loss").unwrap();
+    for request in [&queued, &completed] {
+        registry
+            .begin_input(
+                original.soul_id.clone(),
+                (*request).clone(),
+                b"already admitted",
+                Some(b"null"),
+            )
+            .await
+            .unwrap();
+    }
+    registry
+        .mark_input_completed(original.soul_id.clone(), completed.clone())
+        .await
+        .unwrap();
+    let initial = registry.recovery_context(original.soul_id).await.unwrap();
+    registry
+        .mark_recovery_blocked(
+            initial.soul_id.clone(),
+            None,
+            RecoveryBlockReason::StoreUnreadable,
+            Vec::new(),
+            initial.write_fence(),
+        )
+        .await
+        .unwrap();
+    let request = RequestId::parse("refused-before-loss").unwrap();
+    let refusal = registry
+        .refuse_blocked_unadmitted_input(
+            initial.soul_id.clone(),
+            request.clone(),
+            b"unsent prompt",
+            b"null",
+        )
+        .await
+        .unwrap()
+        .expect("the blocked input must be refused");
+    let blocked = registry
+        .recovery_context(initial.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked.accepted_command_count,
+        initial.accepted_command_count
+    );
+    let prepared = registry
+        .prepare_loss(decision_for(&registry, &blocked).unwrap())
+        .await
+        .unwrap();
+    registry
+        .finalize_loss_cleanup(
+            prepared.certificate.incident_id.clone(),
+            StopOutcome::VerifiedEmpty,
+            cleanup(&prepared),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registry
+            .recorded_input_outcome(
+                initial.soul_id.clone(),
+                request,
+                b"unsent prompt",
+                Some(b"null"),
+            )
+            .await
+            .unwrap(),
+        Some(InputJournalDisposition::Refused(refusal))
+    );
+    let database = Connection::open(registry.database_path()).unwrap();
+    for (request, expected) in [(&queued, "cancelled"), (&completed, "completed")] {
+        let state: String = database
+            .query_row(
+                "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                params![initial.soul_id.as_str(), request.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, expected);
+    }
+    let after = registry.recovery_context(initial.soul_id).await.unwrap();
+    assert_eq!(after.accepted_command_count, initial.accepted_command_count);
+    assert_eq!(
+        after.dispatched_command_count,
+        initial.dispatched_command_count
+    );
+}
+
+#[tokio::test]
 async fn dispatched_missing_identity_cannot_certify_loss() {
     for (provider, mode) in [
         ("claude", "claude"),
@@ -3113,7 +3210,8 @@ fn test_repair_scope(
 #[tokio::test]
 async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() {
     use freshell_runtime_protocol::{
-        LostSoulRepairTarget, RequestId, RestoreLostSoulsRequest, RuntimeErrorCode,
+        AdminCommand, ControlRole, Envelope, LostSoulRepairTarget, RequestId,
+        RestoreLostSoulsRequest, RuntimeErrorCode,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -3140,21 +3238,32 @@ async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() 
     let scope = test_repair_scope(&registry, &targets);
     targets[4].expected_intent_revision += 1;
     let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: scope.source_selection(),
+        targets,
+        canonical_owners: Vec::new(),
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
     let result = supervisor
-        .restore_lost_souls(
-            RequestId::new(),
-            RestoreLostSoulsRequest {
-                scope_id: scope.scope_id.clone(),
-                source: scope.source_selection(),
-                targets,
-                canonical_owners: Vec::new(),
-                expected_control_epoch: Some(registry.control_epoch()),
-            },
-        )
+        .restore_lost_souls(RequestId::new(), request.clone())
         .await;
-
     assert_eq!(
         result.unwrap_err().code,
+        RuntimeErrorCode::StaleIntentRevision
+    );
+
+    // The authenticated control path must preserve the same stale-revision
+    // refusal while polling this large recovery operation on the normal stack.
+    let mut envelope = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::RestoreLostSouls(request),
+    );
+    envelope.auth = Some("synthetic-secret".into());
+    let dispatched = supervisor.dispatch(envelope).await;
+    assert_eq!(
+        dispatched.result.unwrap_err().code,
         RuntimeErrorCode::StaleIntentRevision
     );
 }

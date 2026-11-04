@@ -7,10 +7,13 @@ import {
   validateExternalSelection,
 } from '../../scripts/testing/e2e-external-target.js'
 import { EXTERNAL_MANAGED_SPEC_NAMES, parseExternalBrowserArguments, resolveManagedExternalDescriptor } from '../../scripts/testing/runtime-external-browser.js'
+import { p2G01PlaywrightArtifactPaths } from '../../scripts/testing/external-browser-sandbox.js'
 
 const pairedFixtureConfigured = Boolean(process.env.FRESHELL_E2E_EXTERNAL_FIXTURE_KIND
   || process.env.FRESHELL_MANAGED_ENVIRONMENT_FIXTURE || process.env.FRESHELL_CODE_CHECKPOINT_FIXTURE)
 export const managedExternal = pairedFixtureConfigured ? null : resolveManagedExternalDescriptor(process.env)
+export const managedExternalP2G01Artifacts = managedExternal
+  ? p2G01PlaywrightArtifactPaths(process.env) : undefined
 if (managedExternal) {
   const spec = process.env.FRESHELL_RUNTIME_EXTERNAL_SPEC
   if (!spec) throw new Error('owned external spec selection is required')
@@ -36,10 +39,6 @@ if (externalFixture && process.argv.some(arg => arg === 'test' || arg === '--pro
  * positive local command.
  */
 export const LOCAL_ONLY_SPECS = [{
-  spec: 'mcp-qa-smoke-rust.spec.ts',
-  selector: '--project=chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts',
-  classification: 'local-only-provider-binary',
-}, {
   spec: 'runtime-terminal-continuity-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts',
   classification: 'local-only-docker-supervisor',
@@ -92,6 +91,7 @@ const continuityRequested = process.env.FRESHELL_SMOKE
 
 export default defineConfig({
   testDir: './specs',
+  outputDir: managedExternalP2G01Artifacts?.outputDir,
   fullyParallel: !managedExternal,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,

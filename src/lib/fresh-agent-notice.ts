@@ -26,3 +26,13 @@ export function formatFreshAgentNotice(notice: Pick<LiveNotice, 'message' | 'rat
   if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return notice.message
   return `${notice.message} It resets at ${formatResetTime(resetsAt, now)}.`
 }
+
+/** Codex uses these notices to update retained diagnostics rather than the transient banner. */
+export function isCodexRetainedDiagnosticNotice(provider: string, code: string): boolean {
+  return provider === 'codex' && (
+    code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR'
+    || code === 'CODEX_UNATTRIBUTED_PROVIDER_ERROR_CLEARED'
+    || code === 'CODEX_PENDING_PROVIDER_ERROR'
+    || code === 'CODEX_PENDING_PROVIDER_ERROR_CLEARED'
+  )
+}

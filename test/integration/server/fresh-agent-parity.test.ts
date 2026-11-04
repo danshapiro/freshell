@@ -28,6 +28,11 @@ const providers = [
   { provider: 'opencode', sessionType: 'freshopencode', config: 'custom-xdg/opencode/opencode.jsonc' },
 ] as const
 
+// Native name synchronization allows retries no sooner than 5s and then
+// 30s after the first two failed cycles. Include one 20s Codex metadata
+// request and worker scheduling margin for the final attempt.
+const NATIVE_NAME_SYNC_TIMEOUT_MS = 60_000
+
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -109,7 +114,7 @@ describe('hosted fresh-agent provider inputs', () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
     workspace = path.join(homeDir, 'workspace')
     fs.mkdirSync(workspace)
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     onecli = fakeOnecliGrants(providers.map(row => row.provider))
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     const xdgConfigHome = path.join(homeDir, 'custom-xdg')
@@ -342,11 +347,19 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const sendId = `send-${randomUUID()}`
     wire.send({ type: 'freshAgent.send', provider: row.provider, sessionType: row.sessionType,
       sessionId: created.sessionId, requestId: sendId, text: 'fixture prompt' })
-    const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
-      && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
-    expect(materialized.sessionId).toBe(recorded.nativeSessionId)
-    await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
-      && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    if (row.provider === 'codex') {
+      expect(created.sessionRef).toEqual({ provider: 'codex', sessionId: recorded.nativeSessionId })
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === 'codex' && frame.sessionId === created.sessionId)
+      expect(wire.frames.filter(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === 'codex' && frame.previousSessionId === created.sessionId)).toEqual([])
+    } else {
+      const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
+        && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
+      expect(materialized.sessionId).toBe(recorded.nativeSessionId)
+      await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
+        && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
+    }
 
     const resumeId = `resume-${randomUUID()}`
     wire.send({ type: 'freshAgent.create', requestId: resumeId,
@@ -425,7 +438,7 @@ describe('installed Codex through the managed gateway and durable actor', () => 
     fs.mkdirSync(path.join(workspace, '.agents'))
     fs.mkdirSync(path.join(workspace, '.codex'))
     fs.writeFileSync(path.join(workspace, 'child-input.txt'), 'managed-child-command-ran\n')
-    execFileSync('git', ['init', '--quiet', workspace])
+    execFileSync('git', ['init', '--quiet', workspace], { timeout: 30_000, killSignal: 'SIGKILL' })
     const xdg = path.join(home, 'xdg')
     prepareProviderParityUserRoots(home, xdg)
     grants = fakeOnecliGrants(['codex'])
@@ -639,7 +652,7 @@ tool_timeout_sec = 120
         process.stdout.write(JSON.stringify({mcp:fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split(String.fromCharCode(10)).filter(Boolean).map(JSON.parse):[],effects:fs.readdirSync(${JSON.stringify(path.join(workspace, 'allowed'))}).map(name=>{const p=${JSON.stringify(path.join(workspace, 'allowed'))}+'/'+name;return{name,uid:fs.statSync(p).uid,content:fs.readFileSync(p,'utf8')}})}));`]))
       } catch (error) { nativeFiles = { error: String(error) } }
       let traffic: unknown = retainedModelTraffic
-      try { if (model) traffic = model.traffic } catch (error) { traffic = { retained: retainedModelTraffic, error: String(error) } }
+      try { if (model) traffic = await model.readTraffic() } catch (error) { traffic = { retained: retainedModelTraffic, error: String(error) } }
       const logDirectory = path.join(home, '.freshell', 'logs')
       const requestLogFiles = fs.readdirSync(logDirectory).filter(name => name.startsWith('rust-server.jsonl'))
       const publicHttpRequests = requestLogFiles.flatMap(name => fs.readFileSync(path.join(logDirectory, name), 'utf8').split('\n')).flatMap(line => {
@@ -653,9 +666,21 @@ tool_timeout_sec = 120
       const publicApiCounts = { total: apiRequests.length,
         byRoute: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.route] = (counts[row.route] ?? 0) + 1; return counts }, {}),
         byStatus: apiRequests.reduce<Record<string, number>>((counts, row) => { counts[row.status] = (counts[row.status] ?? 0) + 1; return counts }, {}) }
+      const relevantNativeNameLogs = (output: string) => output.split('\n')
+        .filter(line => /freshagent\.native_name_refused|freshagent\.codex\.native_name_failed|session_names\.native_route_unavailable/i.test(line))
+        .slice(-100)
+      const captureNativeNameLogs = (capture: () => string) => {
+        try { return relevantNativeNameLogs(capture()) }
+        catch (error) { return [`capture_failed: ${String(error).slice(0, 500)}`] }
+      }
+      const nativeNameDiagnostics = {
+        supervisorLifecycle: captureNativeNameLogs(() =>
+          fs.readFileSync(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8')),
+      }
       return { created, initialView: view, currentViews, nativeContext, final,
         fixtureContext: model?.context, traffic, sentControls: wire.sentControls, frames: wire.frames,
-        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, ownedHostEvidence: ownedHostEvidence() }
+        nativeFiles, hostDiagnostics, observationReadTraffic, publicHttpRequests, publicApiCounts, nativeNameDiagnostics,
+        ownedHostEvidence: ownedHostEvidence() }
     }
     const catalogResponse = await fetch(`${rig.info.baseUrl}/api/fresh-agent/model-capabilities/freshcodex?${new URLSearchParams({ sessionId: created.sessionId, sessionRef: JSON.stringify(created.sessionRef), cwd: workspace })}`, { headers })
     expect(catalogResponse.ok, await catalogResponse.clone().text()).toBe(true)
@@ -673,7 +698,7 @@ tool_timeout_sec = 120
       return value.status === 'idle' && JSON.stringify(value.turns).includes('Managed native final answer.') ? value : undefined
     })
     expect(saved.settings).toMatchObject({ model: 'contract-model', effort: 'xhigh', sandbox: 'workspace-write', permissionMode: 'untrusted', cwd: workspace })
-    expect(model.traffic[0].body.reasoning.effort).toBe('xhigh')
+    expect((await model.readTraffic())[0].body.reasoning.effort).toBe('xhigh')
     await send('AWAITED_PLAN', { collaborationMode: 'plan' })
     const pending = await waitFor('managed native awaited Plan control', async () => {
       const value = await snapshot()
@@ -693,15 +718,45 @@ tool_timeout_sec = 120
     })
     expect(asyncSnapshot.pendingQuestions).toHaveLength(0)
     expect(JSON.stringify(asyncSnapshot.turns)).toContain('Which managed environment?')
-    await send('Question: Which managed environment? Answer: Staging.', { effort: null })
-    await waitFor('managed contextual answer at loopback model', () => model!.traffic.some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
-    await waitFor('managed contextual answer completion', async () => (await snapshot()).status === 'idle' ? true : undefined)
+    const contextualAnswer = await send('Question: Which managed environment? Answer: Staging.', { effort: null })
+    expect(contextualAnswer.submittedTurnId).toBeTruthy()
+    await waitFor('managed contextual answer at loopback model', async () => (await model!.readTraffic()).some((row: any) => JSON.stringify(row.body.input).includes('Answer: Staging.')) ? true : undefined)
+    const contextualTurnId = contextualAnswer.submittedTurnId
+    const contextualCompletion = await wire.wait(frame => frame.type === 'freshAgent.event'
+      && frame.event?.type === 'freshAgent.transcript.patch'
+      && frame.provider === 'codex'
+      && frame.sessionType === 'freshcodex'
+      && frame.event.ops?.some((operation: any) => operation.op === 'settleTurn'
+        && operation.nativeTurnId === contextualTurnId
+        && operation.status === 'completed'))
+    const adoptionFrameCursor = wire.frames.length
     const resumedResponse = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ agent: 'codex', cwd: workspace, sessionRef: { provider: 'codex', sessionId: view.nativeSessionId } }) })
     expect(resumedResponse.ok, await resumedResponse.clone().text()).toBe(true)
     const resumed = await resumedResponse.json()
-    const paneId = resumed.data?.paneId ?? resumed.paneId
-    expect(paneId).toBeTruthy()
+    const { paneId, tabId, sessionId: adoptedStreamSessionId } = resumed.data
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    expect(paneId).toMatch(uuidPattern)
+    expect(tabId).toMatch(uuidPattern)
+    expect(adoptedStreamSessionId).toBe(view.nativeSessionId)
+    expect(adoptedStreamSessionId).toBe(created.sessionRef.sessionId)
+    const adoptedTab = await waitFor('native adoption tab acknowledgement', () => wire.frames.slice(adoptionFrameCursor)
+      .find(frame => frame.type === 'ui.command' && frame.command === 'tab.create'
+        && frame.payload?.id === tabId && frame.payload?.paneId === paneId))
+    expect(adoptedTab.payload.paneContent).toMatchObject({ kind: 'fresh-agent', provider: 'codex',
+      sessionType: 'freshcodex', sessionId: adoptedStreamSessionId, status: 'connected' })
+    const adoptionRequestId = adoptedTab.payload.paneContent.createRequestId
+    expect(adoptionRequestId).toEqual(expect.any(String))
+    expect(adoptionRequestId).not.toHaveLength(0)
+    const adoptedCreated = await waitFor('native adoption create acknowledgement', () => wire.frames.slice(adoptionFrameCursor)
+      .find(frame => frame.type === 'freshAgent.created' && frame.requestId === adoptionRequestId))
+    expect(adoptedCreated).toMatchObject({ provider: 'codex', runtimeProvider: 'codex',
+      sessionType: 'freshcodex', sessionId: adoptedStreamSessionId })
+    expect(adoptedCreated.sessionRef).toEqual({ provider: 'codex', sessionId: view.nativeSessionId })
+    const aliasView = await rig.runningViewForFreshSession(created.sessionId)
+    expect(aliasView).toMatchObject({ soulId: view.soulId, incarnationId: view.incarnationId,
+      containerId: providerContainerId, hostBootId: view.hostBootId, nativeSessionId: view.nativeSessionId,
+      provider: 'codex', freshAgentSessionType: 'freshcodex', freshAgentSessionId: created.sessionId })
     const captureResponse = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(captureResponse.ok, await captureResponse.clone().text()).toBe(true)
     expect(await captureResponse.text()).toContain('Managed native final answer.')
@@ -722,6 +777,8 @@ tool_timeout_sec = 120
       const mcpWait = await standaloneMcp.callFreshellAction('wait-for', { target: paneId, pattern: 'Managed native final answer.', timeout: 0 })
       expect(mcpWait).toMatchObject({ status: 'ok', data: { matched: true } })
       rig.runtime.writeIncident('freshcodex-managed-native-standalone-integration', { paneId, userRef: created.sessionId,
+        adoption: { response: resumed, tab: adoptedTab, created: adoptedCreated, aliasView,
+          before: { contextualTurnId, completion: contextualCompletion }, frameCursor: adoptionFrameCursor },
         nativeSessionId: view.nativeSessionId, cli: { entry: cliEntry, capture: cliCapture.stdout },
         mcp: { entry: standalone.path, capture: mcpCapture, wait: mcpWait } })
     } finally {
@@ -729,13 +786,23 @@ tool_timeout_sec = 120
     }
     expect((await inspectNativeContext()).pid).toBe(nativeContext.pid)
     const durableNameRef = { kind: 'session', provider: 'codex', sessionId: view.nativeSessionId }
-    const readNameFor = async (ref: unknown) => {
+    const readNameUpdateFor = async (ref: unknown) => {
       const response = await observeRead('/api/session-names/read', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify({ refs: [ref] }) })
       expect(response.ok, `name read ${response.status}: ${await response.clone().text()}`).toBe(true)
-      return (await response.json()).names[0]?.record
+      return (await response.json()).names[0]
     }
+    const readNameFor = async (ref: unknown) => (await readNameUpdateFor(ref))?.record
     const readName = () => readNameFor(durableNameRef)
+    const waitForNativeNameSync = (ref: unknown, expected: any, label: string) => waitFor(label, async () => {
+      const update = await readNameUpdateFor(ref)
+      return update?.record?.revision === expected.revision
+        && update.record.name === expected.name
+        && update.nativeSync?.status === 'synced'
+        && update.nativeSync.desiredRevision === expected.revision
+        ? update
+        : undefined
+    }, NATIVE_NAME_SYNC_TIMEOUT_MS)
     const nativeMetadata = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path');
       const env=Object.fromEntries(fs.readFileSync('/proc/${nativeContext.pid}/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
@@ -765,7 +832,7 @@ tool_timeout_sec = 120
     expect(hostMetadataAccess).toMatchObject({ uid: 0, root: { uid: 65534, mode: '700' }, readError: 'EACCES' })
     expect(nativeMetadata.headers).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'session_meta', id: view.nativeSessionId })]))
     rig.runtime.writeIncident('freshcodex-managed-native-before-naming', { created, view, nativeContext, nativeMetadata, fixtureContext: model.context, saved, asyncSnapshot,
-      hostMetadataAccess, traffic: model.traffic, final: await snapshot() })
+      hostMetadataAccess, traffic: await model.readTraffic(), final: await snapshot() })
     const durableName = await waitFor('managed native durable shared name', async () => {
       const record = await readName()
       return record?.ref?.sessionId === view.nativeSessionId ? record : undefined
@@ -792,12 +859,13 @@ tool_timeout_sec = 120
         if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
     const nativeNameBeforeWait = await readNativeName()
     rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
+    await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization')
     await waitFor('managed native name writeback', async () => {
       const observation = await readNativeName()
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
     }, 15_000)
     rig.runtime.writeIncident('freshcodex-managed-native-journey', { created, view, nativeContext, context: model.context,
-      traffic: model.traffic, saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
+      traffic: await model.readTraffic(), saved, asyncSnapshot, canonicalName, nativeName: await readNativeName(), final: await snapshot() })
 
     const approval = async (decision: 'accept' | 'cancel', threadId = view.nativeSessionId) => {
       const pending = await waitFor('actual managed native approval', async () => {
@@ -823,13 +891,16 @@ tool_timeout_sec = 120
       const control = choice === 'READONLY' || choice === 'RESTRICTED' ? undefined : await approval(decision)
       const completed = await waitFor(`managed ${choice} command result`, async () => {
         const value = await snapshot()
+        const nativeTurnId = value.turns.find((turn: any) => turn.role === 'user'
+          && turn.items?.some((item: any) => item.text === 'MANAGED_EFFECT_'+choice))?.nativeTurnId
         return value.status === 'idle' && JSON.stringify(value.turns).includes('MANAGED_EFFECT_'+choice)
+          && typeof nativeTurnId === 'string' && nativeTurnId.length > 0
           && !value.pendingApprovals.some((pending: any) => pending.requestId === control?.requestId)
           && wire.frames.slice(frameCursor).some(frame => {
-            const event = frame.type === 'freshAgent.event' ? frame.event : frame
-            const nativeTurn = value.turns.find((turn: any) => turn.role === 'user' && turn.items?.some((item: any) => item.text === 'MANAGED_EFFECT_'+choice))?.nativeTurnId
-            return event.type === 'freshAgent.transcript.patch' && event.sessionId === created.sessionId
-              && event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurn && ['completed', 'interrupted', 'failed'].includes(op.status))
+            return frame.type === 'freshAgent.event' && frame.provider === 'codex' && frame.sessionType === 'freshcodex'
+              && frame.sessionId === adoptedStreamSessionId && frame.event?.type === 'freshAgent.transcript.patch'
+              && frame.event.sessionId === adoptedStreamSessionId
+              && frame.event.ops?.some((op: any) => op.op === 'settleTurn' && op.nativeTurnId === nativeTurnId && ['completed', 'interrupted', 'failed'].includes(op.status))
           })
           && (choice === 'DECLINE' || JSON.stringify(value.turns).includes('Managed '+file+' result:')) ? value : undefined
       })
@@ -840,7 +911,7 @@ tool_timeout_sec = 120
         // Native0.164 can return a failed unifiedExec result to the model
         // without persisting a commandExecution history item. Read the real
         // native tool result, never the fixture's repeated assistant phrase.
-        const command = model.traffic.flatMap((row: any) => row.body?.input ?? [])
+        const command = (await model.readTraffic()).flatMap((row: any) => row.body?.input ?? [])
           .filter((item: any) => item.type === 'function_call_output' && item.call_id === 'call_effect_readonly').at(-1)
         expect(command?.output).toMatch(/Process exited with code [1-9][0-9]*/)
         expect(command?.output).toContain('Output:\n65534\n')
@@ -912,7 +983,7 @@ tool_timeout_sec = 120
     rig.runtime.writeIncident('freshcodex-managed-native-durable-child', { registered, childControl, childResponse, childSaved, parent: await snapshot() })
     const beforeRestart = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(), name: await readName() }
     expect(beforeRestart.name).toEqual(canonicalName)
-    const previousTraffic = model.traffic
+    const previousTraffic = await model.readTraffic()
     retainedModelTraffic = previousTraffic
     rig.runtime.writeIncident('freshcodex-managed-native-before-host-restart', { beforeRestart, canonicalName, effects, mcpResults, registered, childControl, childResponse, childSaved, traffic: previousTraffic })
     await model.stop()
@@ -945,9 +1016,9 @@ tool_timeout_sec = 120
     expect(afterRestart.threadId).toBe(view.nativeSessionId)
     expect(JSON.stringify(afterRestart.turns)).toContain('MANAGED_NATIVE_FIRST')
     expect(await readName()).toEqual(canonicalName)
-    expect(model.traffic.filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
+    expect((await model.readTraffic()).filter((row: any) => row.path === '/v1/responses')).toHaveLength(1)
     rig.runtime.writeIncident('freshcodex-managed-native-tools-restart', { created, nativeContext, canonicalName, effects, mcpResults,
-      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: model.traffic, finalName: await readName() })
+      registered, childControl, childResponse, childSaved, beforeRestart, restarted, afterRestart, traffic: previousTraffic, restartedTraffic: await model.readTraffic(), finalName: await readName() })
 
     const recoveryCwd = path.join(workspace, 'recovery-cwd')
     fs.mkdirSync(recoveryCwd)
@@ -961,7 +1032,7 @@ tool_timeout_sec = 120
     expect(recoverySettings).toMatchObject({ cwd: recoveryCwd, model: 'contract-model', effort: 'xhigh',
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
-      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: model.traffic.length }
+      name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
     // Kill only this receipt-owned, inspected release native PID. Archive its
@@ -996,7 +1067,7 @@ tool_timeout_sec = 120
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
     const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: model.traffic.slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
+      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
@@ -1034,18 +1105,21 @@ tool_timeout_sec = 120
       headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ target: recoveredNameRef,
         name: 'Managed recovered saved name', nameIntent: 'user' }) })
     expect(renamedRecovery.ok, await renamedRecovery.clone().text()).toBe(true)
+    const recoveredCanonicalName = await readNameFor(recoveredNameRef)
+    expect(recoveredCanonicalName).toMatchObject({ ref: recoveredNameRef, name: 'Managed recovered saved name', source: 'manual' })
     rig.runtime.writeIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
       oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await readName(), firstNewName: recoveredName,
       manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archiveManifest })
     const recoveredNativeContext = await inspectNativeContext()
     expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
+    await waitForNativeNameSync(recoveredNameRef, recoveredCanonicalName, 'recovered native name synchronization')
     await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
     const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)
     const capture = await recoveredCapture.text()
     expect(capture).toContain('Managed recovery second answer.')
     expect(capture).not.toContain('MANAGED_NATIVE_FIRST')
-    const newTraffic = model.traffic.slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
+    const newTraffic = (await model.readTraffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
     expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
     expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
     expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)

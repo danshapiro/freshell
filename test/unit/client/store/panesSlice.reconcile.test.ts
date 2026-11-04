@@ -18,7 +18,9 @@ import panesReducer, {
   initLayout,
   updatePaneContent,
   applyReconcileAttach,
+  applyFreshAgentReconcileAttach,
   resetPaneForReconcileCreate,
+  resetFreshAgentPaneForReconcileCreate,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
   setReconcileWarming,
@@ -36,7 +38,7 @@ import {
   resetPersistedPanesCacheForTests,
   resetPersistedLayoutCacheForTests,
 } from '../../../../src/store/persistMiddleware'
-import type { PaneNode, TerminalPaneContent } from '../../../../src/store/paneTypes'
+import type { PaneNode, TerminalPaneContent, FreshAgentPaneContent } from '../../../../src/store/paneTypes'
 
 function emptyState(): PanesState {
   return {
@@ -80,6 +82,34 @@ function terminalContent(state: PanesState, tabId: string, paneId: string): Term
   const content = findTerminalLeaf(root, paneId)
   if (!content) throw new Error(`no terminal pane ${paneId} in tab ${tabId}`)
   return content
+}
+
+function stateWithFreshAgentPane(overrides: Partial<FreshAgentPaneContent> = {}): PanesState {
+  return panesReducer(emptyState(), initLayout({
+    tabId: 'tab1',
+    paneId: 'p1',
+    content: {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'cr-keep',
+      ...overrides,
+    } as any,
+  }))
+}
+
+function freshAgentContent(state: PanesState, tabId: string, paneId: string): FreshAgentPaneContent {
+  const root = state.layouts[tabId]
+  if (!root) throw new Error(`no layout for tab ${tabId}`)
+  const leaf = (function find(node: PaneNode): FreshAgentPaneContent | undefined {
+    if (node.type === 'leaf') {
+      if (node.id === paneId && node.content.kind === 'fresh-agent') return node.content
+      return undefined
+    }
+    return find(node.children[0]) ?? find(node.children[1])
+  })(root)
+  if (!leaf) throw new Error(`no fresh-agent pane ${paneId} in tab ${tabId}`)
+  return leaf
 }
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
@@ -429,9 +459,9 @@ describe('reconcile reducers', () => {
     expect(terminalContent(s, 'tab1', 'p1').reconcileNotice).toBeUndefined()
   })
 
-  it('reconcile warming is set and cleared as one slice-level field', () => {
-    let s = panesReducer(undefined, setReconcileWarming({ count: 2, paneRefs: [{ tabId: 't1', paneId: 'p1' }, { tabId: 't1', paneId: 'p2' }] }))
-    expect(s.reconcileWarming).toEqual({ count: 2, paneRefs: [{ tabId: 't1', paneId: 'p1' }, { tabId: 't1', paneId: 'p2' }] })
+  it('reconcile warming is set and cleared as one slice-level field (paneRefs identity-bound)', () => {
+    let s = panesReducer(undefined, setReconcileWarming({ count: 2, paneRefs: [{ tabId: 't1', paneId: 'p1', createRequestId: 'cr-p1' }, { tabId: 't1', paneId: 'p2', createRequestId: 'cr-p2' }] }))
+    expect(s.reconcileWarming).toEqual({ count: 2, paneRefs: [{ tabId: 't1', paneId: 'p1', createRequestId: 'cr-p1' }, { tabId: 't1', paneId: 'p2', createRequestId: 'cr-p2' }] })
     s = panesReducer(s, clearReconcileWarming())
     expect(s.reconcileWarming).toBeNull()
   })
@@ -451,6 +481,93 @@ describe('reconcile reducers', () => {
     expect(after.terminalId).toBe('term-new')
     expect(after.pendingReconcile).toBeUndefined()
     expect(after.createRequestId).toBe('cr-keep')
+  })
+})
+
+describe('reconcile fold identity guards (auto-restore-warming round-2 finding 2)', () => {
+  // A response can only clear/warm a pane whose createRequestId matches:
+  // every fold reducer takes the REQUEST-observed createRequestId as
+  // `expectedCreateRequestId` and no-ops when the pane's CURRENT content was
+  // re-keyed since (Replace pane keeps the paneId but mints new content).
+  it('applyReconcileAttach no-ops on an expectedCreateRequestId mismatch (stale verdict for replaced content)', () => {
+    const state = stateWithTerminalPane({ createRequestId: 'cr-new', terminalId: undefined, status: 'creating' })
+    const next = panesReducer(state, applyReconcileAttach({
+      tabId: 'tab1', paneId: 'p1', terminalId: 't-live', serverInstanceId: 'srv-1',
+      expectedCreateRequestId: 'cr-old',
+    }))
+    const c = terminalContent(next, 'tab1', 'p1')
+    expect(c.createRequestId).toBe('cr-new')
+    expect(c.terminalId).toBeUndefined()
+    expect(c.status).toBe('creating')
+    expect(c.reconcileEpoch).toBeUndefined()
+  })
+
+  it('applyReconcileAttach still folds when the expected identity matches', () => {
+    const state = stateWithTerminalPane({ createRequestId: 'cr-keep', terminalId: undefined, status: 'creating' })
+    const next = panesReducer(state, applyReconcileAttach({
+      tabId: 'tab1', paneId: 'p1', terminalId: 't-live',
+      expectedCreateRequestId: 'cr-keep',
+    }))
+    expect(terminalContent(next, 'tab1', 'p1').terminalId).toBe('t-live')
+    expect(terminalContent(next, 'tab1', 'p1').status).toBe('running')
+  })
+
+  it('resetPaneForReconcileCreate no-ops on an expectedCreateRequestId mismatch', () => {
+    const state = stateWithTerminalPane({ createRequestId: 'cr-new', terminalId: 't-1', status: 'running', sessionRef: undefined })
+    const next = panesReducer(state, resetPaneForReconcileCreate({
+      tabId: 'tab1', paneId: 'p1', intent: 'respawn',
+      sessionRef: { provider: 'claude', sessionId: 'srv-truth' },
+      expectedCreateRequestId: 'cr-old',
+    }))
+    const c = terminalContent(next, 'tab1', 'p1')
+    expect(c.createRequestId).toBe('cr-new')
+    expect(c.terminalId).toBe('t-1')
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.pendingReconcile).toBeUndefined()
+    expect(c.reconcileEpoch).toBeUndefined()
+    expect(c.status).toBe('running')
+  })
+
+  it('resetPaneForReconcileCreate still folds when the expected identity matches', () => {
+    const state = stateWithTerminalPane({ createRequestId: 'cr-keep', terminalId: 't-1', status: 'running' })
+    const next = panesReducer(state, resetPaneForReconcileCreate({
+      tabId: 'tab1', paneId: 'p1', intent: 'respawn',
+      sessionRef: { provider: 'claude', sessionId: 'srv-truth' },
+      expectedCreateRequestId: 'cr-keep',
+    }))
+    const c = terminalContent(next, 'tab1', 'p1')
+    expect(c.pendingReconcile).toBe('respawn')
+    expect(c.sessionRef).toEqual({ provider: 'claude', sessionId: 'srv-truth' })
+  })
+
+  it('applyFreshAgentReconcileAttach no-ops on an expectedCreateRequestId mismatch', () => {
+    const state = stateWithFreshAgentPane({ createRequestId: 'cr-fa-new', status: 'creating' })
+    const next = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId: 'tab1', paneId: 'p1',
+      sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+      expectedCreateRequestId: 'cr-fa-old',
+    }))
+    const c = freshAgentContent(next, 'tab1', 'p1')
+    expect(c.createRequestId).toBe('cr-fa-new')
+    expect(c.sessionId).toBeUndefined()
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.status).toBe('creating')
+    expect(c.reconcileEpoch).toBeUndefined()
+  })
+
+  it('resetFreshAgentPaneForReconcileCreate no-ops on an expectedCreateRequestId mismatch', () => {
+    const state = stateWithFreshAgentPane({ createRequestId: 'cr-fa-new', status: 'connected', sessionId: 'sess-live' })
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId: 'tab1', paneId: 'p1', intent: 'respawn',
+      sessionRef: { provider: 'claude', sessionId: 'srv-truth' },
+      expectedCreateRequestId: 'cr-fa-old',
+    }))
+    const c = freshAgentContent(next, 'tab1', 'p1')
+    expect(c.createRequestId).toBe('cr-fa-new')
+    expect(c.sessionId).toBe('sess-live')
+    expect(c.status).toBe('connected')
+    expect(c.pendingReconcile).toBeUndefined()
+    expect(c.reconcileEpoch).toBeUndefined()
   })
 })
 
@@ -479,7 +596,7 @@ describe('reconcile persistence stripping', () => {
     store.dispatch(initLayout({ tabId, paneId: 'p1', content: { kind: 'terminal', mode: 'claude', createRequestId: 'cr-keep' } }))
     // Sets all three per-pane volatile fields: pendingReconcile, reconcileNotice, reconcileEpoch
     store.dispatch(resetPaneForReconcileCreate({ tabId, paneId: 'p1', intent: 'fresh', reason: 'identity_never_observed' }))
-    store.dispatch(setReconcileWarming({ count: 1, paneRefs: [{ tabId, paneId: 'p1' }] }))
+    store.dispatch(setReconcileWarming({ count: 1, paneRefs: [{ tabId, paneId: 'p1', createRequestId: 'cr-keep' }] }))
 
     // Live state has all volatile fields
     const live = store.getState().panes

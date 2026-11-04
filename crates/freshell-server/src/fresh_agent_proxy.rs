@@ -11,13 +11,13 @@ use freshell_freshagent::rest_lane::{
 };
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
-    AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,
-    FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend, FreshAgentSessionMaterialized,
-    ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    AgentProvider, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
+    FreshAgentForked, FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
-    AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
+    AgentEvent, CommandState, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
     FreshAgentProviderStartDiagnostic, FreshAgentRollbackDirection, FreshAgentRollbackMode,
     FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeDiagnosticCode,
     RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
@@ -170,15 +170,17 @@ impl HostedFreshAgentProxy {
         let provider = message.provider;
         let session_id = message.session_id.clone();
         let session_type = message.session_type;
+        let public_request_id = message.request_id.clone();
         let checkpoint_logical_attempt_id = message
             .checkpoint_intent
             .as_ref()
             .map(|intent| intent.logical_attempt_id.clone());
         if let Err(reason) = self.post_barrier_admission(&message) {
-            self.error_event_code(
+            self.send_error(
                 &provider,
                 &session_id,
                 session_type,
+                public_request_id.as_deref(),
                 "FRESH_AGENT_STALE_SESSION",
                 reason,
             );
@@ -189,13 +191,14 @@ impl HostedFreshAgentProxy {
             .as_deref()
             .and_then(|value| RequestId::parse(value.to_string()).ok())
             .unwrap_or_default();
-        let result = match self
+        let outcome = match self
             .resolve_soul(&provider, session_type, &session_id)
             .await
         {
             Some(soul) => {
                 let settings = turn_settings(message.settings, message.cwd);
-                self.client
+                let result = self
+                    .client
                     .fresh_agent_send(
                         request_id,
                         soul,
@@ -203,19 +206,98 @@ impl HostedFreshAgentProxy {
                         settings,
                         checkpoint_logical_attempt_id,
                     )
-                    .await
-                    .map(|_| ())
+                    .await;
+                classify_hosted_send(provider, result)
             }
-            None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+            None => HostedSendOutcome::Refused(
+                "The hosted session could not be reached; this message was not sent.".to_string(),
+            ),
         };
-        if result.is_err() {
-            self.error_event(
+        match outcome {
+            HostedSendOutcome::Accepted => {}
+            HostedSendOutcome::Refused(reason) => self.send_error(
                 &provider,
                 &session_id,
                 session_type,
-                "managed fresh-agent input was not accepted",
-            );
+                public_request_id.as_deref(),
+                "MANAGED_FRESH_AGENT_ERROR",
+                &reason,
+            ),
+            HostedSendOutcome::Ambiguous(reason) if provider == AgentProvider::Codex => self
+                .send_error(
+                    &provider,
+                    &session_id,
+                    session_type,
+                    public_request_id.as_deref(),
+                    "MANAGED_FRESH_AGENT_ERROR",
+                    &reason,
+                ),
+            HostedSendOutcome::Ambiguous(reason) => {
+                tracing::warn!(provider=%provider_wire(&provider), session_id,
+                    request_id=?public_request_id, "freshagent.hosted_send.ambiguous");
+                let mut event = serde_json::json!({
+                    "type":"freshAgent.send.uncertain", "sessionId":session_id, "message":reason,
+                });
+                if let Some(request_id) = public_request_id.as_deref().filter(|id| !id.is_empty()) {
+                    event["requestId"] = serde_json::json!(request_id);
+                }
+                self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event,
+                    provider: provider_wire(&provider),
+                    session_id,
+                    session_type: session_type_wire(session_type),
+                }));
+            }
         }
+    }
+
+    fn send_error(
+        &self,
+        provider: &AgentProvider,
+        session_id: &str,
+        session_type: SessionType,
+        request_id: Option<&str>,
+        legacy_code: &str,
+        message: &str,
+    ) {
+        tracing::warn!(
+            provider = %provider_wire(provider),
+            session_id,
+            request_id = ?request_id,
+            delivery_ambiguous = message.starts_with("CODEX_DELIVERY_AMBIGUOUS:")
+                || message.starts_with("FRESH_AGENT_DELIVERY_AMBIGUOUS:"),
+            "freshagent.hosted_send.failed"
+        );
+        let Some(request_id) = request_id.filter(|request_id| !request_id.is_empty()) else {
+            if let Some(reason) = message.strip_prefix("SESSION_RESERVED: ") {
+                self.error_event_code(
+                    provider,
+                    session_id,
+                    session_type,
+                    "SESSION_RESERVED",
+                    reason,
+                );
+                return;
+            }
+            self.error_event_code(provider, session_id, session_type, legacy_code, message);
+            return;
+        };
+        self.send(ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::InternalError,
+            message: message.into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            request_id: Some(request_id.into()),
+            provider_preparation_failure: None,
+            actual_session_ref: None,
+            expected_session_ref: None,
+            retry_after_ms: None,
+            terminal_exit_code: None,
+            terminal_id: None,
+            live_terminal_id: None,
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
+        }));
     }
 
     pub(crate) fn set_session_naming(&self, naming: Arc<dyn SessionNaming>) {
@@ -297,15 +379,23 @@ impl HostedFreshAgentProxy {
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
                 {
-                    Some(soul) => self.client.fresh_agent_interrupt(soul).await,
+                    Some(soul) => {
+                        self.client
+                            .fresh_agent_interrupt_with_request_id(soul, message.request_id.clone())
+                            .await
+                    }
                     None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
                 };
-                if result.is_err() {
-                    self.error_event(
+                if let Err(error) = result {
+                    self.operation_error_event(
                         &message.provider,
                         &message.session_id,
                         message.session_type,
-                        "managed fresh-agent interrupt failed",
+                        &error,
+                        "Stopping the agent",
+                        message.request_id.as_deref(),
+                        false,
+                        None,
                     );
                 }
             }
@@ -346,7 +436,10 @@ impl HostedFreshAgentProxy {
                         &message.session_id,
                         message.session_type,
                         &error,
-                        "managed fresh-agent configure was not accepted",
+                        "Changing agent settings",
+                        Some(request_id.as_str()),
+                        false,
+                        None,
                     );
                 }
             }
@@ -395,13 +488,18 @@ impl HostedFreshAgentProxy {
             }
             HostedFreshAgentCommand::Elicitation(message) => {
                 if message.provider != AgentProvider::Codex {
-                    self.error_event_code(
-                        &message.provider,
-                        &message.session_id,
-                        message.session_type,
+                    let mut event = fresh_agent_error_payload(
                         "UNSUPPORTED_CAPABILITY",
                         "MCP elicitation is not supported for this provider.",
                     );
+                    event["requestId"] = serde_json::json!(decision_id(message.request_id));
+                    event["operationReceipt"] = serde_json::json!(true);
+                    self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event,
+                        provider: provider_wire(&message.provider),
+                        session_id: message.session_id,
+                        session_type: session_type_wire(message.session_type),
+                    }));
                     return;
                 }
                 self.resolve_decision(message.provider, message.session_id, message.session_type, decision_id(message.request_id),
@@ -430,7 +528,7 @@ impl HostedFreshAgentProxy {
                     Some(soul) => self
                         .client
                         .fresh_agent_compact(
-                            request_id,
+                            request_id.clone(),
                             soul,
                             message.instructions.clone(),
                             message.cwd.clone(),
@@ -445,7 +543,10 @@ impl HostedFreshAgentProxy {
                         &message.session_id,
                         message.session_type,
                         &error,
-                        "managed fresh-agent compact was not accepted",
+                        "Compacting the conversation",
+                        Some(request_id.as_str()),
+                        false,
+                        None,
                     );
                 }
             }
@@ -465,7 +566,7 @@ impl HostedFreshAgentProxy {
                     Some(soul) => self
                         .client
                         .fresh_agent_fork(
-                            request_id,
+                            request_id.clone(),
                             soul.clone(),
                             session_id.clone(),
                             message.input,
@@ -505,11 +606,15 @@ impl HostedFreshAgentProxy {
                             }),
                         }));
                     }
-                    Err(_) => self.error_event(
+                    Err(error) => self.operation_error_event(
                         &provider,
                         &session_id,
                         session_type,
-                        "managed provider-native fork failed without creating another soul",
+                        &error,
+                        "Forking the conversation",
+                        Some(request_id.as_str()),
+                        false,
+                        None,
                     ),
                 }
             }
@@ -1111,23 +1216,35 @@ impl HostedFreshAgentProxy {
         decision_id: String,
         decision: serde_json::Value,
     ) {
+        // This ID identifies one answer attempt; the question ID is reused on
+        // retry. Only the host journal can establish which source admitted it.
+        let attempt_id = RequestId::new().as_str().to_owned();
         let result = match self
             .resolve_soul(&provider, session_type, &session_id)
             .await
         {
             Some(soul) => self
                 .client
-                .fresh_agent_resolve(soul, decision_id, decision)
+                .fresh_agent_resolve_with_attempt_id(
+                    soul,
+                    decision_id.clone(),
+                    decision,
+                    Some(attempt_id.clone()),
+                )
                 .await
                 .map(|_| ()),
             None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
         };
-        if result.is_err() {
-            self.error_event(
+        if let Err(error) = result {
+            self.operation_error_event(
                 &provider,
                 &session_id,
                 session_type,
-                "managed fresh-agent decision was not accepted",
+                &error,
+                "Sending the answer",
+                Some(&decision_id),
+                false,
+                Some(&attempt_id),
             );
         }
     }
@@ -1143,7 +1260,7 @@ impl HostedFreshAgentProxy {
             turn_id,
             cwd,
         } = invocation;
-        let parsed_request_id = RequestId::parse(request_id);
+        let parsed_request_id = RequestId::parse(request_id.clone());
         let result = match (
             parsed_request_id,
             self.resolve_soul(&provider, session_type, &session_id)
@@ -1176,7 +1293,13 @@ impl HostedFreshAgentProxy {
                 &session_id,
                 session_type,
                 &error,
-                "managed fresh-agent rollback was not accepted",
+                match direction {
+                    FreshAgentRollbackDirection::Undo => "Undoing the conversation",
+                    FreshAgentRollbackDirection::Redo => "Redoing the conversation",
+                },
+                Some(&request_id),
+                true,
+                None,
             );
         }
     }
@@ -1235,6 +1358,7 @@ impl HostedFreshAgentProxy {
         tokio::spawn(async move {
             let mut cursor = 0;
             let mut retained_through = 0;
+            let mut replay_through = None;
             let mut source_before = if provider == "codex" {
                 proxy.current_source(&soul).await
             } else {
@@ -1259,10 +1383,12 @@ impl HostedFreshAgentProxy {
                                 tracing::warn!(provider, soul_id=%soul, "freshagent.gateway.retained_source_changed");
                                 cursor = 0;
                                 retained_through = 0;
+                                replay_through = None;
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
                         }
+                        let replay_through = *replay_through.get_or_insert(batch.head);
                         if let Some(retained) = batch.retained_state {
                             let presentation = proxy
                                 .presentation_routes
@@ -1318,10 +1444,14 @@ impl HostedFreshAgentProxy {
                             // Materialization is the explicit event transition at which the
                             // client rekeys its pane to the provider-native session id. Keep
                             // subsequent invalidators on that same route.
+                            let mut forwarded_event = event.event;
+                            if event.sequence <= replay_through {
+                                mark_replayed_control_receipt(&mut forwarded_event);
+                            }
                             proxy
                                 .forward_polled_event(
                                     &soul,
-                                    event.event,
+                                    forwarded_event,
                                     &provider,
                                     &presentation_session_id,
                                     &session_type,
@@ -1495,9 +1625,14 @@ impl HostedFreshAgentProxy {
                 }
                 cursor = cursor.max(event.sequence);
                 if event.sequence > retained_through || is_request_receipt(&event.event) {
+                    let mut replayed_event = event.event;
+                    // A newly attaching pane causes this journal replay to be
+                    // broadcast to existing panes too. Identify historical
+                    // operation receipts so those panes can keep newer errors.
+                    mark_replayed_control_receipt(&mut replayed_event);
                     self.forward_polled_event(
                         &soul,
-                        event.event,
+                        replayed_event,
                         provider,
                         presentation_session_id,
                         session_type,
@@ -1521,9 +1656,7 @@ impl HostedFreshAgentProxy {
         session_type: &str,
         attention_since: Option<i64>,
     ) {
-        let materialized_session_id = (provider != "codex")
-            .then(|| materialized_session_id(&event))
-            .flatten();
+        let materialized_session = materialized_session(&event);
         let confirmed_clear = self
             .confirmed_claude_clear(soul, &event, provider, session_type)
             .await;
@@ -1570,13 +1703,20 @@ impl HostedFreshAgentProxy {
                 route.session_id = session_id;
             }
         }
-        if materialized_session_id
+        if materialized_session
             .as_ref()
-            .is_some_and(|session_id| route.materialized && session_id != &route.session_id)
+            .is_some_and(|(previous_session_id, session_id)| {
+                route.materialized
+                    && session_id != &route.session_id
+                    && !(provider == "codex"
+                        && previous_session_id.as_deref() == Some(route.session_id.as_str()))
+            })
         {
             // The journal replays from cursor zero. After a fork, an older
             // parent materialization must not move this soul back off its
-            // current native session.
+            // current native session. Codex crash recovery can legitimately
+            // mint a new root, but only when the materialization names the
+            // current route as its previous session.
             return;
         }
 
@@ -1611,7 +1751,7 @@ impl HostedFreshAgentProxy {
         }
 
         let presentation_id = route.session_id.clone();
-        if let Some(session_id) = materialized_session_id {
+        if let Some((_, session_id)) = materialized_session {
             route.session_id = session_id;
             route.materialized = true;
         }
@@ -1919,10 +2059,19 @@ impl HostedFreshAgentProxy {
         session_id: &str,
         session_type: SessionType,
         error: &freshell_runtime_client::ClientError,
-        fallback: &str,
+        operation: &str,
+        request_id: Option<&str>,
+        rollback: bool,
+        operation_attempt_id: Option<&str>,
     ) {
-        let code = operation_error_code(error);
-        self.error_event_code(provider, session_id, session_type, code, fallback);
+        let event =
+            operation_error_payload(error, operation, request_id, rollback, operation_attempt_id);
+        self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event,
+            provider: provider_wire(provider),
+            session_id: session_id.into(),
+            session_type: session_type_wire(session_type),
+        }));
     }
 
     fn error_event_code(
@@ -1945,6 +2094,83 @@ impl HostedFreshAgentProxy {
         if let Ok(frame) = serde_json::to_string(&message) {
             let _ = self.broadcast.send(frame);
         }
+    }
+}
+
+enum HostedSendOutcome {
+    Accepted,
+    Refused(String),
+    Ambiguous(String),
+}
+
+/// Only a typed, already-public provider diagnostic may contribute its text.
+/// Unknown transport failures remain uncertain and body-free for every caller.
+fn classify_hosted_send(
+    provider: AgentProvider,
+    result: Result<CommandState, freshell_runtime_client::ClientError>,
+) -> HostedSendOutcome {
+    use freshell_runtime_client::ClientError;
+    use freshell_runtime_protocol::FreshAgentSendDiagnosticOutcome;
+    let prefix = if provider == AgentProvider::Codex {
+        "CODEX_DELIVERY_AMBIGUOUS:"
+    } else {
+        "FRESH_AGENT_DELIVERY_AMBIGUOUS:"
+    };
+    let ambiguous = || {
+        format!("{prefix} The hosted session could not confirm whether this message was delivered.")
+    };
+    let refused = || "The provider did not accept this message.".to_string();
+    match result {
+        Ok(CommandState::ProviderAcked | CommandState::Completed) => HostedSendOutcome::Accepted,
+        Ok(CommandState::Cancelled) => HostedSendOutcome::Refused(refused()),
+        Ok(_) => HostedSendOutcome::Ambiguous(ambiguous()),
+        Err(ClientError::Runtime {
+            fresh_agent_send_diagnostic: Some(diagnostic),
+            ..
+        }) => match (diagnostic.outcome, diagnostic.message) {
+            (FreshAgentSendDiagnosticOutcome::Refused, message) => {
+                HostedSendOutcome::Refused(message.unwrap_or_else(refused))
+            }
+            (FreshAgentSendDiagnosticOutcome::Ambiguous, Some(message))
+                if message.starts_with(prefix) =>
+            {
+                HostedSendOutcome::Ambiguous(message)
+            }
+            (FreshAgentSendDiagnosticOutcome::Ambiguous, Some(message)) => {
+                HostedSendOutcome::Ambiguous(format!("{prefix} {message}"))
+            }
+            (FreshAgentSendDiagnosticOutcome::Ambiguous, None) => {
+                HostedSendOutcome::Ambiguous(ambiguous())
+            }
+        },
+        // This exact supervisor message is a fixed, body-free refusal before
+        // the input is admitted to the host.
+        Err(ClientError::Runtime {
+            code: RuntimeErrorCode::RecoveryBlocked,
+            message,
+            ..
+        }) if message == "fresh-agent input requires the current committed native identity" => {
+            HostedSendOutcome::Refused(message)
+        }
+        Err(ClientError::Runtime {
+            code: RuntimeErrorCode::RequestIdConflict,
+            ..
+        }) => HostedSendOutcome::Refused(
+            "This message could not be sent because its request ID was already used.".into(),
+        ),
+        Err(ClientError::Runtime {
+            code: RuntimeErrorCode::InvalidRequest,
+            ..
+        }) => HostedSendOutcome::Refused(
+            "The hosted session rejected this message or its settings.".into(),
+        ),
+        Err(ClientError::Runtime {
+            code: RuntimeErrorCode::RecoveryBlocked,
+            ..
+        }) => HostedSendOutcome::Refused(
+            "The hosted session is not ready to receive this message.".into(),
+        ),
+        Err(_) => HostedSendOutcome::Ambiguous(ambiguous()),
     }
 }
 
@@ -2033,8 +2259,6 @@ impl HostedFreshAgentGateway for HostedFreshAgentProxy {
 mod native_naming;
 #[path = "fresh_agent_proxy_rest.rs"]
 mod rest;
-#[cfg(test)]
-use rest::provider_event_completes_turn;
 
 fn resume_view_matches(
     view: &freshell_runtime_protocol::RuntimeView,
@@ -2204,12 +2428,71 @@ fn decision_id(value: StringOrNumber) -> String {
 
 fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'static str {
     match error.runtime_code() {
+        Some(RuntimeErrorCode::InvalidRequest) => "INVALID_REQUEST",
+        Some(RuntimeErrorCode::UnknownSoul) => "SESSION_UNAVAILABLE",
+        Some(RuntimeErrorCode::HostUnreachable) => "HOST_UNREACHABLE",
+        Some(RuntimeErrorCode::BackendUnavailable) => "BACKEND_UNAVAILABLE",
+        Some(RuntimeErrorCode::OwnershipMismatch) => "OWNERSHIP_MISMATCH",
+        Some(RuntimeErrorCode::StaleControlEpoch) => "STALE_CONTROL_EPOCH",
+        Some(RuntimeErrorCode::RegistryBusy) => "REGISTRY_BUSY",
         Some(RuntimeErrorCode::UnsupportedOperation) => "UNSUPPORTED_CAPABILITY",
         Some(RuntimeErrorCode::OperationImplementationUnavailable) => "IMPLEMENTATION_UNAVAILABLE",
         Some(RuntimeErrorCode::CommandAmbiguous) => "COMMAND_AMBIGUOUS",
         Some(RuntimeErrorCode::RequestIdConflict) => "REQUEST_ID_CONFLICT",
         _ => "MANAGED_FRESH_AGENT_ERROR",
     }
+}
+
+fn operation_outcome_uncertain(error: &freshell_runtime_client::ClientError) -> bool {
+    // Failures after dispatch can also arise while the supervisor records the
+    // result, so an opaque host, registry or connection error is not proof of
+    // refusal. Only these typed rejections establish that no action ran.
+    !matches!(
+        error.runtime_code(),
+        Some(
+            RuntimeErrorCode::InvalidRequest
+                | RuntimeErrorCode::UnsupportedOperation
+                | RuntimeErrorCode::OperationImplementationUnavailable
+                | RuntimeErrorCode::RequestIdConflict
+        )
+    )
+}
+
+fn operation_error_payload(
+    error: &freshell_runtime_client::ClientError,
+    operation: &str,
+    request_id: Option<&str>,
+    rollback: bool,
+    operation_attempt_id: Option<&str>,
+) -> serde_json::Value {
+    let code = operation_error_code(error);
+    let uncertain = operation_outcome_uncertain(error);
+    let message = if uncertain {
+        format!("{operation} could not be confirmed. Check the conversation before trying again.")
+    } else {
+        match code {
+            "UNSUPPORTED_CAPABILITY" => format!("{operation} is not supported for this agent."),
+            "IMPLEMENTATION_UNAVAILABLE" => format!("{operation} is not currently available."),
+            "REQUEST_ID_CONFLICT" => format!("{operation} conflicts with an earlier request. Refresh the conversation before trying again."),
+            _ => format!("{operation} could not be completed."),
+        }
+    };
+    let mut event = fresh_agent_error_payload(code, &message);
+    event["operationReceipt"] = serde_json::json!(true);
+    event["operationFallback"] = serde_json::json!(true);
+    if uncertain {
+        event["operationOutcomeUncertain"] = serde_json::json!(true);
+    }
+    if let Some(request_id) = request_id {
+        event["requestId"] = serde_json::json!(request_id);
+    }
+    if let Some(attempt_id) = operation_attempt_id {
+        event["operationAttemptId"] = serde_json::json!(attempt_id);
+    }
+    if rollback {
+        event["rollback"] = serde_json::json!(true);
+    }
+    event
 }
 
 fn create_client_error_reason(error: &freshell_runtime_client::ClientError) -> &'static str {
@@ -2250,9 +2533,11 @@ fn is_request_receipt(event: &AgentEvent) -> bool {
             payload["event"]["type"].as_str(),
             Some(
                 "checkpointTurnIdentity"
+                    | "freshAgent.operation.started"
                     | "freshAgent.rolledBack"
                     | "freshAgent.redone"
                     | "freshAgent.error"
+                    | "freshAgent.operation.error"
             )
         ) {
         &payload["event"]
@@ -2267,6 +2552,27 @@ fn is_request_receipt(event: &AgentEvent) -> bool {
     receipt["requestId"]
         .as_str()
         .is_some_and(|id| !id.is_empty())
+}
+
+fn mark_replayed_control_receipt(event: &mut AgentEvent) {
+    let AgentEvent::Provider { payload } = event else {
+        return;
+    };
+    if payload["type"] != "freshAgent.event"
+        || payload["event"]["operationReceipt"] != true
+        || payload["event"]["rollback"] == true
+    {
+        return;
+    }
+    match payload["event"]["type"].as_str() {
+        Some("freshAgent.operation.started") => {
+            payload["event"]["operationAttemptReplay"] = serde_json::json!(true)
+        }
+        Some("freshAgent.error" | "freshAgent.operation.error") => {
+            payload["event"]["operationReceiptReplay"] = serde_json::json!(true)
+        }
+        _ => {}
+    }
 }
 
 fn retained_batch_matches_source(
@@ -2332,25 +2638,31 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
     }
 }
 
-fn materialized_session_id(event: &AgentEvent) -> Option<String> {
+fn materialized_session(event: &AgentEvent) -> Option<(Option<String>, String)> {
     let AgentEvent::Provider { payload } = event else {
         return None;
     };
-    find_materialized_session_id(payload)
+    find_materialized_session(payload)
 }
 
-fn find_materialized_session_id(payload: &serde_json::Value) -> Option<String> {
+fn find_materialized_session(payload: &serde_json::Value) -> Option<(Option<String>, String)> {
     let object = payload.as_object()?;
     if object.get("type").and_then(serde_json::Value::as_str)
         == Some("freshAgent.session.materialized")
     {
-        return object
+        let session_id = object
             .get("sessionId")
             .and_then(serde_json::Value::as_str)
             .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned)?;
+        let previous_session_id = object
+            .get("previousSessionId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.is_empty())
             .map(str::to_owned);
+        return Some((previous_session_id, session_id));
     }
-    object.values().find_map(find_materialized_session_id)
+    object.values().find_map(find_materialized_session)
 }
 
 fn stable_hex(value: &str) -> String {

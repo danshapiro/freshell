@@ -116,7 +116,7 @@ describe('FreshAgentChildObserver', () => {
     opener.remove()
   })
 
-  it('contains Tab and Shift-Tab, uses the latest Escape callback, and returns focus to its opener', async () => {
+  it('wraps only through visible sequential controls, uses the latest Escape callback, and returns focus to its opener', async () => {
     vi.mocked(api.get).mockResolvedValue(readable())
     const opener = document.createElement('button')
     document.body.append(opener)
@@ -125,16 +125,28 @@ describe('FreshAgentChildObserver', () => {
     const latestClose = vi.fn()
     const { rerender, unmount } = render(<FreshAgentChildObserver parent={parent} childThreadId="child" onClose={initialClose} />)
     await screen.findByText('Exact observed child')
+    const dialog = screen.getByRole('dialog', { name: 'Child conversation' })
     const close = screen.getByRole('button', { name: 'Close child conversation' })
-    const lastControl = screen.getByRole('button', { name: 'Copy turn', exact: true })
+    const refresh = screen.getByRole('button', { name: 'Refresh child history' })
+    const copyTurn = screen.getByRole('button', { name: 'Copy turn', exact: true })
+    copyTurn.closest('[role="toolbar"]')!.style.display = 'none'
+    const programmaticOnly = document.createElement('button')
+    programmaticOnly.textContent = 'Programmatic focus only'
+    programmaticOnly.tabIndex = -1
+    dialog.append(programmaticOnly)
+    const disabled = document.createElement('button')
+    disabled.textContent = 'Disabled control'
+    disabled.disabled = true
+    dialog.append(disabled)
+
     expect(close).toHaveFocus()
     fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })
-    expect(lastControl).toHaveFocus()
-    fireEvent.keyDown(lastControl, { key: 'Tab' })
+    expect(refresh).toHaveFocus()
+    fireEvent.keyDown(refresh, { key: 'Tab' })
     expect(close).toHaveFocus()
     rerender(<FreshAgentChildObserver parent={parent} childThreadId="child" onClose={latestClose} />)
     expect(close).toHaveFocus()
-    fireEvent.keyDown(lastControl, { key: 'Escape' })
+    fireEvent.keyDown(close, { key: 'Escape' })
     expect(initialClose).not.toHaveBeenCalled()
     expect(latestClose).toHaveBeenCalledTimes(1)
     unmount()

@@ -28,8 +28,8 @@ afterEach(() => {
 function fixture() {
   const root = fs.mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'freshell-build-preflight-'))
   owned.push(root)
-  execFileSync('git', ['init', '--quiet', root])
-  execFileSync('git', ['-C', root, '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'])
+  execFileSync('git', ['init', '--quiet', root], { timeout: 30_000, killSignal: 'SIGKILL' })
+  execFileSync('git', ['-C', root, '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'], { timeout: 30_000, killSignal: 'SIGKILL' })
   const manifestPath = path.join(root, 'docs/development/runtime-provider-capabilities.json')
   fs.mkdirSync(path.dirname(manifestPath), { recursive: true })
   fs.copyFileSync(path.resolve(import.meta.dirname, '../../../../docs/development/runtime-provider-capabilities.json'), manifestPath)
@@ -126,7 +126,7 @@ describe('managed runtime build preparation before suite startup', () => {
     // A later server build overwrites Cargo's shared output, including the newest managed variant.
     execFileSync(f.command.program, [
       ...f.command.args, 'build', '--locked', '--release', '-p', 'freshell-server', '--features', 'managed-provider-qualification',
-    ], { cwd: f.root, env: f.project.config.env })
+    ], { timeout: 30_000, killSignal: 'SIGKILL', cwd: f.root, env: f.project.config.env })
     expect(f.rows()).toHaveLength(7)
     const cargoServer = path.join(f.project.config.env.CARGO_TARGET_DIR, 'release', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
     expect(fs.readFileSync(cargoServer, 'utf8')).toContain('release:managed-provider-qualification')

@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 72,
+  "messageCount": 73,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3215,6 +3215,9 @@
             "paneReconcileV1": {
               "type": "boolean"
             },
+            "sessionIndexReadyV1": {
+              "type": "boolean"
+            },
             "terminalInterestV1": {
               "type": "boolean"
             },
@@ -3920,6 +3923,20 @@
       },
       "required": [
         "revision",
+        "type"
+      ],
+      "type": "object"
+    },
+    "sessions.index.ready": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "sessions.index.ready",
+          "type": "string"
+        }
+      },
+      "required": [
         "type"
       ],
       "type": "object"
@@ -4767,7 +4784,8 @@
                 "missing_canonical_identity",
                 "invalid_legacy_restore_target",
                 "provider_runtime_failed",
-                "durable_artifact_missing"
+                "durable_artifact_missing",
+                "session_store_unreadable"
               ],
               "type": "string"
             }

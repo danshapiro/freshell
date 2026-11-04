@@ -250,6 +250,7 @@ describe('handleUiCommand', () => {
 
     expect(captureUiScreenshot).toHaveBeenCalledWith(
       { scope: 'view', paneId: undefined, tabId: undefined },
+      'req-1',
     )
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'ui.screenshot.result',
@@ -308,6 +309,7 @@ describe('handleUiCommand', () => {
 
     expect(captureUiScreenshot).toHaveBeenCalledWith(
       { scope: 'pane', paneId: 'pane-x', tabId: undefined },
+      'req-err',
     )
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'ui.screenshot.result',

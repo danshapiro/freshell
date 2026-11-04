@@ -1016,13 +1016,12 @@ JS
     echo "[e2e-cloud] WARNING: task-indexed Playwright footer or empty-shard evidence for all ${shards} task(s) was not present in Cloud Logging after five attempts." >&2
   fi
 
-  # Print logs from every shard. Retry traces are retained as bounded base64
-  # JSONL chunks in Cloud Logging; redact their bytes here so a successful
-  # retry's terminal receipt remains readable while retaining the immutable
-  # artifact id and first-attempt stack in the underlying logs.
+  # Print logs from every shard. Retry traces and review screenshots retain
+  # their raw bytes in Cloud Logging; redact only their displayed data so the
+  # terminal receipt stays readable while preserving the artifacts remotely.
   local display_log_output
   display_log_output=$(printf '%s\n' "$log_output" | sed -E \
-    '/"event":"e2e_playwright_retry_trace_chunk"/ s/("data":")[^"]*/\1<retained-in-cloud-logging>/' )
+    '/"event"[[:space:]]*:[[:space:]]*"(e2e_playwright_retry_trace_chunk|compact_panel_screenshot)"/ s/("data"[[:space:]]*:[[:space:]]*")[^"]*/\1<retained-in-cloud-logging>/' )
   echo "$display_log_output"
 
   # Cloud Run turns structured stdout JSON into jsonPayload, which the human

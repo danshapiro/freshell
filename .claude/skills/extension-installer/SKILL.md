@@ -22,9 +22,13 @@ serve it with an independent static-file server first.
 - Confirm the CLI command works on the host and determine whether it needs a
   fixed working directory or environment variables.
 - Use an absolute symlink target. Freshell scans symlinked directories.
-- Never restart the live Freshell server without the user's explicit approval.
-  Installing files is safe; activating a new extension waits for the next
-  approved restart.
+- Activate extension changes by running `pnpm exec tsx scripts/update-managed-runtime.ts` from a host shell in the deployment
+  checkout. The default update restarts only the web service and does not
+  restart the durable supervisor or managed sessions. Managed panes run
+  inside soul containers and do not own the host systemd user manager or
+  deployment checkout. The reset-capable `--all` and `--durable-only` modes
+  require the exact word `APPROVED` and are unnecessary for ordinary extension
+  activation.
 
 ## Supported manifest
 
@@ -112,11 +116,11 @@ best current examples for coding agents.
    ```
 
 6. Confirm the link resolves with `readlink -f`.
-7. Report that activation requires a Freshell restart. Restart only when the
-   user has explicitly approved restarting the live server.
-8. After an approved restart, inspect server logs, `GET /api/extensions`, and
-   the New Tab picker. Launch the extension and verify its real terminal
-   behavior.
+7. Run the default managed updater from the host shell to restart the web
+   service and activate the extension without restarting the supervisor or
+   its managed sessions.
+8. Inspect server logs, `GET /api/extensions`, and the New Tab picker. Launch
+   the extension and verify its real terminal behavior.
 
 Freshell scans `~/.freshell/extensions/`, then `.freshell/extensions/` relative
 to the server working directory, then the built-in `extensions/` directory.
@@ -131,7 +135,8 @@ The first manifest with a duplicate name wins.
 - Command unavailable: install/build it or set the configured `envVar` to its
   absolute executable path.
 - Changed files have no effect: extensions are scanned only at server startup;
-  wait for an approved restart.
+  run the default managed updater from the host shell to restart the web
+  service. No mode approval is needed for that web/client update.
 - Existing `client` or `server` manifest: explain that it is historical and
   unavailable in the Rust runtime. For a web service, run it independently and
   open its URL in a browser pane.
@@ -142,6 +147,8 @@ The first manifest with a duplicate name wins.
 - `category` is `"cli"`, with one `cli` block and no `client` or `server` block.
 - The executable and any referenced artifacts exist and run on this host.
 - The symlink resolves to the intended stable directory.
-- No live restart occurred without explicit user approval.
+- Ordinary web/client activation uses the default mode. Only `--all` and
+  `--durable-only` reset managed coding sessions and require the exact word
+  `APPROVED`.
 - After activation, logs are clean, the picker entry appears, and launching it
   exercises the configured CLI.

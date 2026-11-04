@@ -565,6 +565,33 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         driver.retire_identity(&ev.terminal_id);
                         continue;
                     }
+                    // Background recovery waits behind maintenance without
+                    // claiming the session or recording a provider failure.
+                    // `admit_when_open` atomically obtains the permit when a
+                    // temporary lease releases; shutdown commitment drops the
+                    // event quietly because this process is being replaced.
+                    let _host_agent_permit = if let Some(gate) = driver.host_agent_admission() {
+                        match gate.admit_when_open().await {
+                            Ok(permit) => Some(permit),
+                            Err(
+                                freshell_freshagent::host_agent_admission::AdmissionError::ShutdownLatched,
+                            ) => {
+                                driver.retire_identity(&ev.terminal_id);
+                                let _ = driver.take_cancel(&ev.terminal_id);
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    terminal_id = %ev.terminal_id,
+                                    error = %error,
+                                    "terminal.auto_resume.admission_wait_failed"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     if !driver
                         .claim_session(
                             &provider,
@@ -830,6 +857,14 @@ pub(crate) struct ReplacedAnnouncement<'a> {
 /// rounds / complete==false path). A sync signature would force blocking a
 /// runtime worker.
 pub(crate) trait AutoResumeDriver: Send + 'static {
+    /// Production supplies the server-wide maintenance admission gate. Test
+    /// drivers may omit it when exercising unrelated recovery decisions.
+    fn host_agent_admission(
+        &self,
+    ) -> Option<freshell_freshagent::host_agent_admission::HostAgentAdmissionGate> {
+        None
+    }
+
     fn cap_exhausted(&self, create_request_id: &str) -> bool;
 
     /// CREATE-ANSWER ORDERING GUARD (Gate 1): true while the originating
@@ -1028,6 +1063,12 @@ fn session_locator(provider: &str, session_id: &str) -> freshell_protocol::Sessi
 }
 
 impl AutoResumeDriver for WsAutoResumeDriver {
+    fn host_agent_admission(
+        &self,
+    ) -> Option<freshell_freshagent::host_agent_admission::HostAgentAdmissionGate> {
+        Some(self.state.fresh_opencode.host_agent_admission())
+    }
+
     fn cap_exhausted(&self, create_request_id: &str) -> bool {
         self.state.registry.respawn_exhausted(create_request_id)
     }
@@ -2116,6 +2157,8 @@ mod tests {
     #[derive(Clone)]
     struct FakeDriver {
         inner: Arc<Mutex<FakeState>>,
+        admission:
+            Arc<Mutex<Option<freshell_freshagent::host_agent_admission::HostAgentAdmissionGate>>>,
     }
 
     impl FakeDriver {
@@ -2153,7 +2196,15 @@ mod tests {
                     requeue_tx: None,
                     requeued: Vec::new(),
                 })),
+                admission: Arc::new(Mutex::new(None)),
             }
+        }
+
+        fn set_admission_gate(
+            &self,
+            gate: freshell_freshagent::host_agent_admission::HostAgentAdmissionGate,
+        ) {
+            *self.admission.lock().expect("fake admission lock") = Some(gate);
         }
 
         fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
@@ -2276,6 +2327,12 @@ mod tests {
     }
 
     impl AutoResumeDriver for FakeDriver {
+        fn host_agent_admission(
+            &self,
+        ) -> Option<freshell_freshagent::host_agent_admission::HostAgentAdmissionGate> {
+            self.admission.lock().expect("fake admission lock").clone()
+        }
+
         fn cap_exhausted(&self, _create_request_id: &str) -> bool {
             self.lock().cap_exhausted
         }
@@ -2470,6 +2527,38 @@ mod tests {
         // — the unconditional pre-emit tail retire must still restore the
         // crash invariant.
         assert!(fake.retired().contains(&"t1".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_waits_for_maintenance_release_without_claiming_or_failing() {
+        use freshell_freshagent::host_agent_admission::HostAgentAdmissionGate;
+        use std::time::Duration;
+
+        let gate = HostAgentAdmissionGate::new();
+        let lease = gate
+            .begin_quiesce("updater-test", Duration::from_secs(60))
+            .unwrap();
+        gate.drain(&lease, Duration::from_secs(1)).await.unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_admission_gate(gate.clone());
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![10]));
+        tx.send(crash("t-paused", 1, "claude", Some("cr-paused"), 5_000))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        drain().await;
+
+        assert!(fake.claim_calls().is_empty());
+        assert!(fake.respawn_calls().is_empty());
+        assert!(fake.fail_calls().is_empty());
+
+        gate.release(&lease).unwrap();
+        drain().await;
+        assert_eq!(fake.claim_calls(), vec!["cr-paused"]);
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert!(fake.fail_calls().is_empty());
     }
 
     /// Gate-1 pin (create-answer ordering guard): a crash whose originating
@@ -3556,6 +3645,7 @@ mod tests {
         let registry = freshell_terminal::TerminalRegistry::new()
             .with_ownership(std::sync::Arc::clone(&ownership));
         let state = crate::WsState {
+            session_index_ready: None,
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             terminal_meta: Default::default(),

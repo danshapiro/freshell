@@ -342,3 +342,16 @@ describe('readProcessSnapshot POSIX resilience (ps ENOBUFS failure classes, /pro
     expect(records).toEqual(expectedTreeRecords)
   })
 })
+
+describe('synchronous child watchdog', () => {
+  it('bounds a stuck child without relying on the Vitest timer', () => {
+    // This child cannot complete on its own. No elapsed-time assertion or
+    // startup deadline is needed: the native wait must forcibly terminate it.
+    const result = runCommand(process.execPath, [
+      '-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)",
+    ], 100)
+    expect((result.error as NodeJS.ErrnoException | undefined)?.code).toBe('ETIMEDOUT')
+    expect(result.status).toBeNull()
+    expect(result.signal).toBe('SIGKILL')
+  })
+})

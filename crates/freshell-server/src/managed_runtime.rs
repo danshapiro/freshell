@@ -533,6 +533,7 @@ impl ServerManagedRuntimeController {
                     message: "recovery is already in progress".into(),
                     diagnostic_code: None,
                     fresh_agent_provider_start_diagnostic: None,
+                    fresh_agent_send_diagnostic: None,
                 })?;
         let result = self
             .client
@@ -545,6 +546,19 @@ impl ServerManagedRuntimeController {
             .await;
         self.publish_recovery(&soul, sequence, &result).await;
         result
+    }
+
+    async fn may_forward_fresh_opencode_input(&self, terminal: &ManagedTerminalDescriptor) -> bool {
+        let slots = self.recovery.slots.lock().await;
+        let Some(slot) = slots.get(&terminal.soul_id) else {
+            return false;
+        };
+        if slot.task_in_flight || slot.incarnation_id.as_deref() != Some(&terminal.incarnation_id) {
+            return false;
+        }
+        slot.publication.result().is_some_and(|result| {
+            fresh_opencode_terminal_input_wait_matches(&result.view, terminal)
+        })
     }
 }
 
@@ -940,35 +954,38 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         data: String,
     ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
         Box::pin(async move {
-            let soul_key = terminal.soul_id;
+            let soul_key = terminal.soul_id.clone();
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
             if self.recovery_in_flight(&soul_key).await {
                 return Err(ManagedTerminalInputError::RecoveryPending);
             }
             if self.blocked_recovery(&soul_key).await?.is_some() {
-                // New user input is an explicit retry/repair signal. Re-arm the
-                // persisted flap ceiling and prove continuity before accepting
-                // any bytes; never substitute a fresh provider session.
-                let sequence = self
-                    .begin_recovery(&soul, true)
-                    .await
-                    .ok_or(ManagedTerminalInputError::RecoveryPending)?;
-                let result = self
-                    .client
-                    .recover(soul.clone(), RecoveryTrigger::ManualRetry)
-                    .await;
-                self.publish_recovery(&soul, sequence, &result).await;
-                let recovered = result.map_err(managed_terminal_input_error)?;
-                match recovered.outcome {
-                    RecoveryOutcome::Reattached
-                    | RecoveryOutcome::Replaced
-                    | RecoveryOutcome::AlreadyLive => {}
-                    _ => {
-                        return Err(if recovery_pending(&recovered) {
-                            ManagedTerminalInputError::RecoveryPending
-                        } else {
-                            ManagedTerminalInputError::RecoveryBlocked
-                        });
+                let exception_allowed = self.may_forward_fresh_opencode_input(&terminal).await;
+                if !exception_allowed {
+                    // New user input is an explicit retry/repair signal. Re-arm the
+                    // persisted flap ceiling and prove continuity before accepting
+                    // any bytes; never substitute a fresh provider session.
+                    let sequence = self
+                        .begin_recovery(&soul, true)
+                        .await
+                        .ok_or(ManagedTerminalInputError::RecoveryPending)?;
+                    let result = self
+                        .client
+                        .recover(soul.clone(), RecoveryTrigger::ManualRetry)
+                        .await;
+                    self.publish_recovery(&soul, sequence, &result).await;
+                    let recovered = result.map_err(managed_terminal_input_error)?;
+                    match recovered.outcome {
+                        RecoveryOutcome::Reattached
+                        | RecoveryOutcome::Replaced
+                        | RecoveryOutcome::AlreadyLive => {}
+                        _ => {
+                            return Err(if recovery_pending(&recovered) {
+                                ManagedTerminalInputError::RecoveryPending
+                            } else {
+                                ManagedTerminalInputError::RecoveryBlocked
+                            });
+                        }
                     }
                 }
             }
@@ -1240,6 +1257,63 @@ fn managed_descriptor_from_view(
         create_request_id: reconcile_create_request_id
             .or_else(|| view.terminal_create_request_id.clone()),
     })
+}
+
+fn fresh_opencode_terminal_input_wait_matches(
+    view: &RuntimeView,
+    terminal: &ManagedTerminalDescriptor,
+) -> bool {
+    // Transfer and adoption launches require a native resume identity, which
+    // is reflected in the descriptor's resume_session_id. Fixture and
+    // Fresh Agent workloads use different view identities and are excluded.
+    terminal.mode == "opencode"
+        && terminal.resume_session_id.is_none()
+        && terminal.create_request_id.is_some()
+        && terminal.soul_id == view.soul_id.as_str()
+        && terminal.incarnation_id == view.incarnation_id.as_str()
+        && terminal.terminal_id == view.terminal_id.as_deref().unwrap_or_default()
+        && managed_terminal_stream_matches_view(
+            &terminal.stream_id,
+            view.terminal_stream_id.as_deref().unwrap_or_default(),
+        )
+        && terminal.create_request_id.as_deref() == view.terminal_create_request_id.as_deref()
+        && view.terminal_mode.as_deref() == Some("opencode")
+        && view.provider.as_deref() == Some("opencode")
+        && view.launch_state == LaunchState::Running
+        && view.desired_state == DesiredState::Running
+        && view.recovery_state == RecoveryState::Blocked
+        && view.recovery_reason.as_deref() == Some("CAPABILITY_PENDING")
+        && view.container_id.is_some()
+        && view.host_boot_id.is_some()
+        && view.execution_generation > 0
+        && view.native_session_id.is_none()
+        && view.native_identity_observation.is_none()
+        && view.terminal_resume_session_id.is_none()
+        && view.fresh_agent_session_id.is_none()
+        && view.fresh_agent_create_request_id.is_none()
+        && view.fresh_agent_session_type.is_none()
+        && view.fresh_agent_runtime_variant.is_none()
+        && view.prior_incarnation_id.is_none()
+        && view.recovery_attempt_id.is_none()
+}
+
+fn managed_terminal_stream_matches_view(terminal_stream_id: &str, view_stream_id: &str) -> bool {
+    if terminal_stream_id == view_stream_id {
+        return true;
+    }
+
+    // RuntimeView keeps the launch's base stream id. After a managed output
+    // read, the terminal registry stores the concrete session-host PTY epoch,
+    // which is `<base>-hostboot-<uuid>` (see session-host/src/pty.rs). That
+    // hostboot id is minted for the PTY epoch and is distinct from the
+    // supervisor's RuntimeView.host_boot_id.
+    let Some(host_boot) = terminal_stream_id
+        .strip_prefix(view_stream_id)
+        .and_then(|suffix| suffix.strip_prefix("-hostboot-"))
+    else {
+        return false;
+    };
+    uuid::Uuid::parse_str(host_boot).is_ok_and(|parsed| parsed.to_string() == host_boot)
 }
 
 fn reusable_running_view(
@@ -2889,6 +2963,106 @@ mod tests {
         let mut stopped = running;
         stopped.launch_state = freshell_runtime_protocol::LaunchState::Stopped;
         assert!(reusable_running_view(&[stopped], &soul, "terminal-stable").is_err());
+    }
+
+    #[test]
+    fn capability_pending_first_input_exception_requires_exact_fresh_opencode_terminal() {
+        let soul = SoulId::new();
+        let incarnation = IncarnationId::new();
+        let view: RuntimeView = serde_json::from_value(serde_json::json!({
+            "soulId": soul,
+            "incarnationId": incarnation,
+            "launchState": "running",
+            "cleanupState": "none",
+            "intentRevision": 1,
+            "containerId": "container-owned-by-supervisor",
+            "hostBootId": freshell_runtime_protocol::HostBootId::new(),
+            "executionGeneration": 1,
+            "terminalId": "terminal-fresh-opencode",
+            "terminalStreamId": "stream-fresh-opencode",
+            "terminalMode": "opencode",
+            "terminalCreateRequestId": "create-fresh-opencode",
+            "desiredState": "running",
+            "recoveryState": "blocked",
+            "recoveryReason": "CAPABILITY_PENDING",
+            "provider": "opencode"
+        }))
+        .unwrap();
+        let terminal = ManagedTerminalDescriptor {
+            soul_id: soul.to_string(),
+            incarnation_id: incarnation.to_string(),
+            terminal_id: "terminal-fresh-opencode".into(),
+            stream_id: "stream-fresh-opencode".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: Some("create-fresh-opencode".into()),
+        };
+
+        assert!(fresh_opencode_terminal_input_wait_matches(&view, &terminal));
+
+        // A managed output read changes the server's terminal descriptor to
+        // the concrete PTY epoch (base stream plus the session-host boot id),
+        // while the durable runtime view retains the base stream id.
+        let mut active_epoch = terminal.clone();
+        active_epoch.stream_id = format!(
+            "{}-{}",
+            terminal.stream_id,
+            freshell_runtime_protocol::HostBootId::new()
+        );
+        assert!(
+            fresh_opencode_terminal_input_wait_matches(&view, &active_epoch),
+            "the active host-qualified output epoch for this durable stream must remain eligible"
+        );
+
+        let mut unrelated_epoch = terminal.clone();
+        unrelated_epoch.stream_id = format!(
+            "stream-unrelated-{}",
+            freshell_runtime_protocol::HostBootId::new()
+        );
+        assert!(
+            !fresh_opencode_terminal_input_wait_matches(&view, &unrelated_epoch),
+            "an unrelated stream epoch must not become eligible"
+        );
+
+        let mut malformed_epoch = terminal.clone();
+        malformed_epoch.stream_id = format!("{}-hostboot-not-a-uuid", terminal.stream_id);
+        assert!(
+            !fresh_opencode_terminal_input_wait_matches(&view, &malformed_epoch),
+            "the host-qualified epoch suffix must have the generated HostBootId form"
+        );
+
+        let mut resumed = terminal.clone();
+        resumed.resume_session_id = Some("existing-session".into());
+        assert!(!fresh_opencode_terminal_input_wait_matches(&view, &resumed));
+
+        let mut wrong_terminal = terminal.clone();
+        wrong_terminal.terminal_id = "other-terminal".into();
+        assert!(!fresh_opencode_terminal_input_wait_matches(
+            &view,
+            &wrong_terminal
+        ));
+
+        let mut other_reason = view.clone();
+        other_reason.recovery_reason = Some("SESSION_EXITED".into());
+        assert!(!fresh_opencode_terminal_input_wait_matches(
+            &other_reason,
+            &terminal
+        ));
+
+        let mut identity_observed = view.clone();
+        identity_observed.native_session_id = Some("ses_observed".into());
+        assert!(!fresh_opencode_terminal_input_wait_matches(
+            &identity_observed,
+            &terminal
+        ));
+
+        let mut fresh_agent = view.clone();
+        fresh_agent.fresh_agent_session_id = Some("fresh-session".into());
+        assert!(!fresh_opencode_terminal_input_wait_matches(
+            &fresh_agent,
+            &terminal
+        ));
     }
 
     #[test]

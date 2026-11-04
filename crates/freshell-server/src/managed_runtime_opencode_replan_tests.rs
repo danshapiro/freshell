@@ -189,6 +189,7 @@ mod uncertain_launch {
                                 state: CommandState::ProviderAcked,
                                 claude_fork: None,
                                 native_session_id: Some(current.native_session_id.clone()),
+                                native_identity: None,
                             }
                         }
                         other => panic!("unexpected fixture host command {other:?}"),

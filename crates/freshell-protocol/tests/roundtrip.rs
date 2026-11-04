@@ -1169,3 +1169,116 @@ fn combined_codex_controls_and_naming_fields_roundtrip_against_generated_contrac
     });
     server_roundtrip(&ready.to_string(), "ready");
 }
+
+// --------------------------------------------------------------------------
+// auto-restore-warming Task 2: `sessionIndexReadyV1` + `sessions.index.ready`.
+// --------------------------------------------------------------------------
+
+/// The readiness broadcast frame round-trips its exact marker shape, and the
+/// serialized marker the freshell-ws forward-site gate substring-matches is
+/// pinned HERE — a serialization change fails in this test, not silently
+/// in production. Extension-surface frame (beyond the generated frozen
+/// inventory until the next contract reconcile — see
+/// `EXTENSION_SERVER_MESSAGE_TYPES`), so this is a direct serde round-trip,
+/// not `server_roundtrip`'s frozen-schema validation.
+#[test]
+fn sessions_index_ready_frame_roundtrips() {
+    let msg = ServerMessage::SessionsIndexReady(SessionsIndexReady {});
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(json, serde_json::json!({"type": "sessions.index.ready"}));
+    let back: ServerMessage = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, ServerMessage::SessionsIndexReady(_)));
+    // The freshell-ws forward-site gate matches on this exact serialized
+    // marker; pin it so a serialization change fails HERE, not in prod.
+    assert!(serde_json::to_string(&msg)
+        .unwrap()
+        .contains(r#""type":"sessions.index.ready""#));
+}
+
+/// The `ready.sessionIndexReady` state field is additive-optional: the
+/// negotiated shape serializes it; `None` (the frozen-client shape) omits
+/// the key entirely, keeping legacy ready frames byte-identical.
+#[test]
+fn ready_serializes_session_index_ready_state_additively() {
+    let ready = Ready {
+        timestamp: "2026-11-02T00:00:00.000Z".to_string(),
+        boot_id: Some("boot-1".to_string()),
+        server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
+        capabilities: None,
+        runtime_owners: None,
+        fresh_agent_attention: None,
+        session_index_ready: Some(true),
+    };
+    let wire = serde_json::to_value(ServerMessage::Ready(ready)).unwrap();
+    assert_eq!(wire["sessionIndexReady"], true, "{wire}");
+    let back: ServerMessage = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(
+        back,
+        ServerMessage::Ready(Ready {
+            timestamp: "2026-11-02T00:00:00.000Z".to_string(),
+            boot_id: Some("boot-1".to_string()),
+            server_instance_id: Some("srv-1".to_string()),
+            build_id: None,
+            capabilities: None,
+            runtime_owners: None,
+            fresh_agent_attention: None,
+            session_index_ready: Some(true),
+        })
+    );
+
+    let frozen = Ready {
+        timestamp: "2026-11-02T00:00:00.000Z".to_string(),
+        boot_id: Some("boot-1".to_string()),
+        server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
+        capabilities: None,
+        runtime_owners: None,
+        fresh_agent_attention: None,
+        session_index_ready: None,
+    };
+    let wire = serde_json::to_value(ServerMessage::Ready(frozen)).unwrap();
+    assert!(
+        wire.get("sessionIndexReady").is_none(),
+        "the frozen ready shape omits the field entirely: {wire}"
+    );
+}
+
+/// `hello.capabilities.sessionIndexReadyV1` parses as an opt-in flag; an
+/// absent flag stays `None` and a round-trip never invents it.
+#[test]
+fn hello_capabilities_parse_session_index_ready_v1() {
+    let wire = json!({
+        "type": "hello",
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "token": "t",
+        "capabilities": { "sessionIndexReadyV1": true }
+    });
+    let msg: ClientMessage = serde_json::from_value(wire).expect("hello parses");
+    let ClientMessage::Hello(hello) = msg else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        hello.capabilities.and_then(|c| c.session_index_ready_v1),
+        Some(true)
+    );
+
+    // Frozen-client shape: no sessionIndexReadyV1 anywhere. Round-trip must
+    // not invent the field (skip_serializing_if).
+    let wire = json!({
+        "type": "hello",
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "token": "t",
+        "capabilities": { "terminalOutputBatchV1": true }
+    });
+    let msg: ClientMessage = serde_json::from_value(wire.clone()).expect("hello parses");
+    let back = serde_json::to_value(&msg).expect("serializes");
+    assert_eq!(back, wire);
+    let ClientMessage::Hello(hello) = msg else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        hello.capabilities.and_then(|c| c.session_index_ready_v1),
+        None
+    );
+}

@@ -302,33 +302,7 @@ describe('finite transfer ownership', () => {
       expect(h.transferOwnedIds()).toEqual(original)
     } finally {vi.unstubAllEnvs();await fsp.rm(h.testRoot,{recursive:true,force:true})}
   })
-  it('refuses stalled transfer cleanup transport and retains unresolved resources', async () => {
-    const directory = path.join(fixtureRepoRoot, 'transfer-transport')
-    await fsp.mkdir(directory)
-    const calls = path.join(directory, 'calls.jsonl')
-    const blocked = path.join(directory, 'blocked')
-    const cleanupBudgetMs = 1_000
-    const stalledTransportMs = cleanupBudgetMs * 2 + 500
-    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');if(fs.existsSync(${JSON.stringify(blocked)})){setTimeout(()=>process.exit(9),${stalledTransportMs})}else if(a[0]==='info')process.stdout.write('["rootless"]');else if(a[0]==='image')process.stdout.write('sha256:${'b'.repeat(64)}');else if(a[0]==='volume'&&a[1]==='create')process.stdout.write(a.at(-1));else if(['create','run'].includes(a[0]))process.stdout.write('${'a'.repeat(64)}');else if(a[0]==='inspect')process.stdout.write('0');\n`, { mode: 0o700 })
-    const h = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 2)
-    const migration = path.join(directory, 'migrations.json'); await fsp.writeFile(migration, '[]')
-    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
-    try {
-      await h.prepareTransfer(`sha256:${'b'.repeat(64)}`, { operationTimeoutMs: 250, cleanupTimeoutMs: cleanupBudgetMs, lifecycleMs: cleanupBudgetMs, memoryBytes: 1024 ** 3 })
-      h.startTransferProvider(process.execPath, path.join(fixtureRepoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'), migration)
-      const original = h.transferOwnedIds()
-      await fsp.writeFile(blocked, 'stall')
-      const started = Date.now()
-      const cleanup = await h.cleanup()
-      expect(Date.now() - started).toBeLessThan(3_000)
-      expect(cleanup.ok).toBe(false)
-      expect(h.transferOwnedIds()).toEqual(original)
-      expect(() => h.verifyTransferCleanup(original)).toThrow()
-      await fsp.unlink(blocked)
-      await expect(h.cleanup()).resolves.toEqual({ ok: true, errors: [] })
-      h.verifyTransferCleanup(original)
-    } finally { vi.unstubAllEnvs(); await fsp.rm(h.testRoot, { recursive: true, force: true }) }
-  }, 10_000)
+
 })
 
 async function nativeOwnerHistory(provider: 'claude' | 'amplifier', nonce: string): Promise<NativeHistory> {

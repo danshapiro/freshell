@@ -475,6 +475,12 @@ export const HelloSchema = z.object({
     // frozen client shape.
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
+    // Session-index readiness (auto-restore-warming Task 2): the client
+    // understands `ready.sessionIndexReady` and the `sessions.index.ready`
+    // boot broadcast. Additive optional — DECLARED here, not just sent
+    // (ws-client), because zod strips undeclared keys (same strip hazard as
+    // above); absent for the frozen client shape.
+    sessionIndexReadyV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -1288,6 +1294,11 @@ export const ReadyCapabilitiesSchema = z
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
     freshAgentAttentionReplayV1: z.literal(true).optional(),
+    // Session-index readiness echo (auto-restore-warming Task 2): present
+    // iff the client's hello opted in via capabilities.sessionIndexReadyV1 —
+    // mirrors the Rust `session_index_ready_v1` (serde camelCase). Additive
+    // optional; the frozen shape omits it entirely.
+    sessionIndexReadyV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1851,6 +1862,24 @@ export type SessionsChangedMessage = {
 }
 
 /**
+ * `sessions.index.ready` (auto-restore-warming Task 2): the server emits
+ * this broadcast once per boot when the session index completes its first
+ * sweep. A bare marker — the CURRENT readiness state rides
+ * `ready.sessionIndexReady` at handshake time; this frame only announces
+ * the readiness TRANSITION. Capability-gated at the forward site: a
+ * connection whose hello did not negotiate `sessionIndexReadyV1` never
+ * receives it (frozen-client inertness), so receiving it implies the
+ * negotiation. Additive server→client only; WS_PROTOCOL_VERSION stays 10
+ * (pre-frame servers simply never send it).
+ */
+export const SessionsIndexReadySchema = z.object({
+  type: z.literal('sessions.index.ready'),
+})
+
+export type SessionsIndexReadyMessage = z.infer<typeof SessionsIndexReadySchema>
+export type SessionsIndexReady = z.infer<typeof SessionsIndexReadySchema>
+
+/**
  * Unified agent names (Task 1): the canonical name broadcast. Published only
  * after the server's `SessionNames` store successfully commits or adopts a
  * document generation, in local generation order. The payload IS a
@@ -2189,6 +2218,7 @@ export type ServerMessage =
   | TerminalStuckMessage
   | SessionNameUpdatedMessage
   | SessionsChangedMessage
+  | SessionsIndexReadyMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
   | PerfLoggingMessage

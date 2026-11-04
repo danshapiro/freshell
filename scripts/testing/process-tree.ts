@@ -14,7 +14,7 @@ export interface CommandResult {
    * Signal that killed the child, or null after a normal exit. Optional so
    * injected test runners can omit it; runCommand always reports it. It is
    * the only reliable discriminator between the two ENOBUFS shapes: a
-   * maxBuffer overflow SIGTERMs the child, while a spawn-side failure (pipe
+   * maxBuffer overflow signals the child, while a spawn-side failure (pipe
    * or socketpair creation) never starts the child and reports null.
    */
   signal?: NodeJS.Signals | null
@@ -84,8 +84,8 @@ const PS_RETRY_DELAY_MS = 250
  * Run a command synchronously and collect stdout/stderr. Exported for the
  * unit suite's real-spawn maxBuffer pin.
  */
-export function runCommand(command: string, args: readonly string[]): CommandResult {
-  const result = spawnSync(command, [...args], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER_BYTES })
+export function runCommand(command: string, args: readonly string[], timeoutMs = 30_000): CommandResult {
+  const result = spawnSync(command, [...args], { timeout: timeoutMs, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER_BYTES })
   return {
     status: result.status,
     signal: result.signal,
@@ -274,7 +274,7 @@ export function readProcessSnapshot(
       const records = readProcSnapshot(opts.procRoot ?? '/proc')
       // Observability: a silent fallback would hide the ps failure that
       // caused it. The warning carries the discriminating fields — signal
-      // (SIGTERM = the child was killed, the maxBuffer-overflow shape;
+      // (non-null signal = the child was killed, the maxBuffer-overflow shape;
       // null = the child never ran, a spawn-side failure), status, and the
       // captured output sizes — so a recurrence can be classified instead
       // of re-guessed.
@@ -317,7 +317,7 @@ function capturedByteLength(value: string | undefined): number | undefined {
  * the sibling testing scripts use (see run-source-runtime-tests.ts) — so a
  * rescued read stays observable and severity/event-filterable like the rest
  * of the tooling output. Carries the ps failure's discriminating fields:
- * `signal` (SIGTERM = the child was killed, e.g. maxBuffer overflow; null =
+ * `signal` (non-null = the child was killed, e.g. maxBuffer overflow; null =
  * the child never ran, a spawn-side failure), `status`, and the captured
  * output sizes (absent when the runner captured no such stream).
  */

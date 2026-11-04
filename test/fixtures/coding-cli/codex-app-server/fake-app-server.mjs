@@ -25,6 +25,8 @@ if (process.argv[2] === 'fake-durable-writer') {
   appendWitness()
 
   const server = net.createServer((socket) => {
+    // The reply acknowledges a completed write; callers need no timer sleep.
+    appendWitness()
     socket.end('fake codex durable writer\n')
   })
   server.listen(0, '127.0.0.1', () => {
@@ -34,6 +36,7 @@ if (process.argv[2] === 'fake-durable-writer') {
     }
     fs.writeFileSync(portPath, `${address.port}\n`, 'utf8')
     fs.writeFileSync(readyPath, `${process.pid}\n`, 'utf8')
+    process.send?.({ type: 'durable-writer.ready' })
   })
   const timer = setInterval(appendWitness, intervalMs)
   process.on('SIGTERM', () => {
@@ -398,7 +401,7 @@ function successResult(method, params) {
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
       const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
-      if (behavior.liveTranscript) {
+      if (behavior.liveTranscript || behavior.turnFailure) {
         turn.status = 'inProgress'
         turn.items = [turn.items[0]]
       }
@@ -634,12 +637,32 @@ if (behavior.spawnDurableWriter) {
       ...process.env,
       FAKE_CODEX_WRITER_IGNORE_SIGTERM: behavior.durableWriterIgnoresSigterm ? '1' : '',
     },
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
-  durableWriterChild.unref()
   if (behavior.durableWriterPidPath) {
     fs.writeFileSync(behavior.durableWriterPidPath, `${durableWriterChild.pid}\n`, 'utf8')
   }
+  // Establish the writer before exposing the app-server handshake. Readiness is
+  // a child acknowledgement, independent of startup speed and host contention.
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      durableWriterChild.off('message', onMessage)
+      durableWriterChild.off('error', onError)
+      durableWriterChild.off('exit', onExit)
+    }
+    const onError = (error) => { cleanup(); reject(error) }
+    const onExit = (code, signal) => onError(new Error(`durable writer exited before readiness: ${code ?? signal}`))
+    const onMessage = (message) => {
+      if (message?.type !== 'durable-writer.ready') return
+      cleanup()
+      resolve()
+    }
+    durableWriterChild.on('message', onMessage)
+    durableWriterChild.once('error', onError)
+    durableWriterChild.once('exit', onExit)
+  })
+  durableWriterChild.unref()
+  durableWriterChild.channel?.unref()
 }
 
 const wss = portFile
@@ -1045,6 +1068,13 @@ wss.on('connection', (socket) => {
           turn: { id: result.turn.id, status: 'inProgress' },
         })
         const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        if (behavior.turnFailure && !behavior.liveTranscript) {
+          const threadId = message.params.threadId
+          const turnId = result.turn.id
+          const item = result.turn.items[0]
+          broadcastNotification('item/started', { threadId, turnId, item })
+          broadcastNotification('item/completed', { threadId, turnId, item })
+        }
         if (behavior.liveTranscript && (!behavior.liveTranscriptPrompts || behavior.liveTranscriptPrompts.some(marker => prompt.includes(marker)))) {
           const threadId = message.params.threadId
           const turnId = result.turn.id
@@ -1098,16 +1128,26 @@ wss.on('connection', (socket) => {
           interrupted = response.cancelled === true
         }
         await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
-        behavior.threadStatuses[message.params?.threadId] = 'idle'
+        const recorded = loadRecordedTurns(message.params.threadId)
+        const finished = recorded.find((turn) => turn.id === result.turn.id)
+        if (finished && behavior.turnFailure) {
+          finished.status = interrupted ? 'interrupted' : 'failed'
+          finished.error = interrupted ? null : behavior.turnFailure
+          persistRecordedTurns(message.params.threadId, recorded)
+        }
+        const terminalStatus = interrupted ? 'interrupted' : behavior.turnFailure ? 'failed' : 'completed'
+        const lifecycleFirst = behavior.failureLifecycleFirst && terminalStatus === 'failed'
+        behavior.threadStatuses[message.params?.threadId] = lifecycleFirst ? 'systemError' : 'idle'
         broadcastNotification('thread/status/changed', {
           threadId: message.params?.threadId,
-          status: { type: 'idle' },
+          status: { type: lifecycleFirst ? 'systemError' : 'idle' },
         })
+        if (lifecycleFirst) await new Promise((resolve) => setTimeout(resolve, 100))
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
           turn: behavior.terminalItemsView
-            ? projectTurnItemsView({ ...loadRecordedTurns(message.params.threadId).find(turn => turn.id === result.turn.id), status: interrupted ? 'interrupted' : 'completed' }, behavior.terminalItemsView)
-            : { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
+            ? projectTurnItemsView({ ...finished, status: terminalStatus }, behavior.terminalItemsView)
+            : { id: result.turn.id, status: terminalStatus, ...(terminalStatus === 'failed' ? { error: behavior.turnFailure } : {}) },
         })
       }
       if (method === 'initialize') {

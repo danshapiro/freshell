@@ -11,6 +11,27 @@ export type FreshAgentChildParent = Omit<FreshAgentChildRead, 'childThreadId'> &
 const MAX_READS = 5
 const log = createLogger('FreshAgentChildObserver')
 
+function getFocusableControls(container: HTMLElement): HTMLElement[] {
+  const selectors = 'button, a[href], input, select, textarea, [tabindex]'
+  return Array.from(container.querySelectorAll<HTMLElement>(selectors)).filter((node) => {
+    if (node.tabIndex < 0 || node.matches(':disabled') || node.closest('[hidden], [inert], [aria-hidden="true"]')) return false
+
+    // A transcript turn's action toolbar is in the DOM while its `hidden`
+    // class keeps it out of the tab order until hover. Check every ancestor
+    // because a descendant's computed `display` does not reflect a hidden
+    // parent.
+    let ancestor: HTMLElement | null = node
+    while (ancestor) {
+      if (window.getComputedStyle(ancestor).display === 'none') return false
+      if (ancestor === container) break
+      ancestor = ancestor.parentElement
+    }
+
+    const visibility = window.getComputedStyle(node).visibility
+    return visibility !== 'hidden' && visibility !== 'collapse'
+  })
+}
+
 export function FreshAgentChildObserver({ parent, childThreadId, onClose }: { parent: FreshAgentChildParent; childThreadId: string; onClose: () => void }) {
   const [observation, setObservation] = useState<FreshAgentChildObservation>()
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot>()
@@ -67,7 +88,7 @@ export function FreshAgentChildObserver({ parent, childThreadId, onClose }: { pa
       <section role="dialog" aria-modal="true" aria-label="Child conversation" className="flex max-h-[90vh] w-full max-w-4xl flex-col rounded border bg-background shadow-xl" onKeyDown={(event) => {
         if (event.key === 'Escape') { event.stopPropagation(); onClose() }
         if (event.key === 'Tab') {
-          const nodes = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button, a[href], [tabindex="0"]')).filter((node) => !node.hasAttribute('disabled'))
+          const nodes = getFocusableControls(event.currentTarget)
           const first = nodes[0], last = nodes[nodes.length - 1]
           if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
           else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }

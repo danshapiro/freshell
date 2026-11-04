@@ -288,7 +288,24 @@ async fn create_terminal_or_content_tab_with_delivery(
             broadcast,
         );
     }
-    create_terminal_tab(&state, name, &body, restore_key.as_deref(), broadcast).await
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("shell");
+    let host_agent_permit = if mode == "shell" {
+        None
+    } else {
+        match crate::try_host_agent_admission(&state) {
+            Ok(permit) => Some(std::sync::Arc::new(permit)),
+            Err(response) => return *response,
+        }
+    };
+    create_terminal_tab(
+        &state,
+        name,
+        &body,
+        restore_key.as_deref(),
+        broadcast,
+        host_agent_permit,
+    )
+    .await
 }
 
 /// The "cheap" content kinds (`router.ts:720-723`): no process, no rollback
@@ -1228,15 +1245,39 @@ impl HandoffSpawnWatch {
     }
 }
 
-/// [`spawn_terminal_pane`], parameterized on an in-flight handoff's spawn
-/// token (kata b8ke Task 4): the public entry point delegates with `None`.
+/// Test convenience wrapper for creates that do not exercise REST admission.
+#[cfg(test)]
 pub(crate) async fn spawn_terminal_pane(
     state: &FreshAgentState,
     body: &Value,
     tab_id: &str,
     pane_id: &str,
 ) -> Result<TerminalSpawnResult, Box<Response>> {
-    spawn_terminal_pane_with_handoff(state, body, tab_id, pane_id, None).await
+    spawn_terminal_pane_with_admission(state, body, tab_id, pane_id, None).await
+}
+
+/// REST terminal routes acquire admission before mutating their layout. Move
+/// that permit into the detached settle task so canceling the HTTP future
+/// cannot let maintenance pass its drain while a host process is still being
+/// created or recorded.
+pub(crate) async fn spawn_terminal_pane_with_admission(
+    state: &FreshAgentState,
+    body: &Value,
+    tab_id: &str,
+    pane_id: &str,
+    host_agent_permit: Option<
+        std::sync::Arc<crate::host_agent_admission::HostAgentAdmissionPermit>,
+    >,
+) -> Result<TerminalSpawnResult, Box<Response>> {
+    spawn_terminal_pane_with_handoff_and_admission(
+        state,
+        body,
+        tab_id,
+        pane_id,
+        None,
+        host_agent_permit,
+    )
+    .await
 }
 
 /// The terminal-mode spawn pipeline (`router.ts:724-793` for create,
@@ -1264,6 +1305,20 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     tab_id: &str,
     pane_id: &str,
     handoff: Option<&HandoffToken>,
+) -> Result<TerminalSpawnResult, Box<Response>> {
+    spawn_terminal_pane_with_handoff_and_admission(state, body, tab_id, pane_id, handoff, None)
+        .await
+}
+
+async fn spawn_terminal_pane_with_handoff_and_admission(
+    state: &FreshAgentState,
+    body: &Value,
+    tab_id: &str,
+    pane_id: &str,
+    handoff: Option<&HandoffToken>,
+    host_agent_permit: Option<
+        std::sync::Arc<crate::host_agent_admission::HostAgentAdmissionPermit>,
+    >,
 ) -> Result<TerminalSpawnResult, Box<Response>> {
     let mode = body
         .get("mode")
@@ -2220,6 +2275,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         use_managed_runtime,
         host_os,
         is_wsl,
+        host_agent_permit,
         amplifier_stub,
         ownership_start_terminal_id,
         adopt_attach_window_op: _rest_adopt_guard
@@ -2310,6 +2366,12 @@ struct GatedSettleInputs {
     registry: freshell_terminal::TerminalRegistry,
     /// Frozen at the REST door so the pre-spawn witness and settled row agree.
     use_managed_runtime: bool,
+    /// Admission for a REST host-agent start. This lives on the detached
+    /// settle task while the handler keeps its own reference through final
+    /// pane publication. An aborted handler drops its reference, but the
+    /// detached settle continues to hold admission until it finishes.
+    host_agent_permit:
+        Option<std::sync::Arc<crate::host_agent_admission::HostAgentAdmissionPermit>>,
     /// Hoisted spawn-environment inputs (Task 11): computed ONCE in
     /// [`spawn_terminal_pane`] so the amplifier windows-arm guard there and
     /// the spawn-spec construction here can never disagree.
@@ -2369,6 +2431,7 @@ async fn settle_gated_create(
         handoff_observed,
         registry,
         use_managed_runtime,
+        host_agent_permit: _host_agent_permit,
         host_os,
         is_wsl,
         amplifier_stub,
@@ -3563,6 +3626,9 @@ async fn create_terminal_tab(
     body: &Value,
     restore_key: Option<&str>,
     broadcast: bool,
+    host_agent_permit: Option<
+        std::sync::Arc<crate::host_agent_admission::HostAgentAdmissionPermit>,
+    >,
 ) -> Response {
     // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
     // `layoutStore.createTab()` before `registry.create()`) so the CLI env
@@ -3573,7 +3639,15 @@ async fn create_terminal_tab(
     // like Node's `ensureSnapshot()` bootstrap.
     let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
 
-    let spawned = match spawn_terminal_pane(state, body, &tab_id, &pane_id).await {
+    let spawned = match spawn_terminal_pane_with_admission(
+        state,
+        body,
+        &tab_id,
+        &pane_id,
+        host_agent_permit.clone(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(resp) => {
             // Node's failed-create catch closes the store tab it minted
@@ -8007,6 +8081,75 @@ if (args.includes('app-server')) {{
     }
 
     #[tokio::test]
+    async fn maintenance_gate_refuses_rest_agent_create_split_and_respawn_but_keeps_shell_open() {
+        let state = state_with_registry();
+        let gate = state.host_agent_admission();
+        let router = app(state.clone());
+        let (status, shell) = post(router.clone(), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "{shell}");
+        let pane_id = shell["data"]["paneId"].as_str().unwrap().to_string();
+        let shell_terminal_id = shell["data"]["terminalId"].as_str().unwrap().to_string();
+        let (status, fresh_agent) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({"agent":"opencode"}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fresh_agent}");
+        let fresh_agent_pane_id = fresh_agent["data"]["paneId"].as_str().unwrap().to_string();
+        let before_split = state.layout.get_normalized_snapshot(None);
+        let lease = gate
+            .begin_quiesce("maintenance-route-test", std::time::Duration::from_secs(30))
+            .unwrap();
+        gate.drain(&lease, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let split_uri = format!("/api/panes/{pane_id}/split");
+        let respawn_uri = format!("/api/panes/{pane_id}/respawn");
+        let send_uri = format!("/api/panes/{fresh_agent_pane_id}/send-keys");
+        for (uri, body) in [
+            ("/api/tabs", json!({"agent":"claude"})),
+            (
+                "/api/tabs",
+                json!({
+                    "mode":"claude",
+                    "cwd":std::env::temp_dir().to_string_lossy()
+                }),
+            ),
+            (split_uri.as_str(), json!({"agent":"claude"})),
+            (split_uri.as_str(), json!({"mode":"claude"})),
+            (
+                respawn_uri.as_str(),
+                json!({
+                    "mode":"claude",
+                    "cwd":std::env::temp_dir().to_string_lossy()
+                }),
+            ),
+            (send_uri.as_str(), json!({"text":"start or resume"})),
+        ] {
+            let (status, response) = post(router.clone(), uri, body, true).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {response}");
+            assert_eq!(
+                response["code"],
+                json!("HOST_AGENT_MAINTENANCE"),
+                "{uri}: {response}"
+            );
+        }
+        assert_eq!(state.layout.get_normalized_snapshot(None), before_split);
+
+        // Ordinary shell creation remains available while coding-agent
+        // admission is paused.
+        let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&shell_terminal_id);
+        registry.kill(body["data"]["terminalId"].as_str().unwrap());
+        gate.release(&lease).unwrap();
+    }
+
+    #[tokio::test]
     async fn zero_permit_gate_times_out_rest_create_with_503() {
         // 0 permits => acquire can never succeed => deterministic Timeout.
         // The cheapest "gate is actually on the REST path" pin (same trick
@@ -8399,6 +8542,202 @@ if (args.includes('app-server')) {{
         for tid in &all_forked {
             registry.kill(tid);
         }
+    }
+
+    /// A REST handler can be canceled after the detached settle has queued for
+    /// its spawn slot. Maintenance admission must outlive that handler and stay
+    /// held until the detached host-agent spawn and bookkeeping finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborted_rest_agent_create_keeps_maintenance_admission_until_settled() {
+        let argv_file = unique_argv_file("host-admission-abort");
+        let state = state_with_registry().with_cli_commands(Arc::new(vec![recording_cli_spec(
+            "admissioncli",
+            &argv_file,
+        )]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let host_gate = state.host_agent_admission();
+        let spawn_gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&spawn_gate), std::time::Duration::from_secs(30));
+        let router = app(state);
+        let before = registry
+            .inventory()
+            .into_iter()
+            .map(|terminal| terminal.terminal_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        let held_spawn_slot = spawn_gate
+            .acquire_uncancellable(std::time::Duration::from_secs(1))
+            .await
+            .expect("test holds the only spawn slot");
+        let queued_before = spawn_gate.queued_total();
+        let request = tokio::spawn(async move {
+            post(router, "/api/tabs", json!({"mode":"admissioncli"}), true).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while spawn_gate.queued_total() == queued_before {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("REST create reached the detached settle and queued for its spawn slot");
+        assert_eq!(host_gate.status().active_permits, 1);
+
+        request.abort();
+        let _ = request.await;
+        let lease = host_gate
+            .begin_quiesce(
+                "aborted-rest-create-test",
+                std::time::Duration::from_secs(10),
+            )
+            .expect("maintenance lease starts after the request is canceled");
+        let first_drain = host_gate
+            .drain(&lease, std::time::Duration::from_millis(30))
+            .await;
+
+        // Let the detached settle finish even if the assertion below detects
+        // the regression. This keeps the test's PTY and admission count tidy.
+        drop(held_spawn_slot);
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let created = registry
+                    .inventory()
+                    .into_iter()
+                    .map(|terminal| terminal.terminal_id)
+                    .filter(|terminal_id| !before.contains(terminal_id))
+                    .collect::<Vec<_>>();
+                if !created.is_empty() {
+                    break created;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached create should finish after the test releases its spawn slot");
+        for terminal_id in &created {
+            registry.kill(terminal_id);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while host_gate.status().active_permits != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("settle releases maintenance admission after bookkeeping");
+        host_gate
+            .drain(&lease, std::time::Duration::from_secs(1))
+            .await
+            .expect("maintenance can drain after the detached create has settled");
+        host_gate.release(&lease).unwrap();
+        let _ = std::fs::remove_file(argv_file);
+
+        assert_eq!(
+            first_drain,
+            Err(crate::host_agent_admission::AdmissionError::DrainTimeout),
+            "maintenance must not pass its drain while a canceled REST create is still settling"
+        );
+    }
+
+    /// The route still has to publish the pane into the layout after the
+    /// detached settle returns. Hold that synchronous publication on the
+    /// tabs lock and prove maintenance cannot drain in the gap between the
+    /// settled process and its visible pane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maintenance_admission_lives_through_rest_pane_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let argv_file = unique_argv_file("host-admission-publication");
+        let hook_finished = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_finished);
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "admissioncli",
+                &argv_file,
+            )]))
+            .with_terminal_created_hook(Arc::new(move |_| {
+                hook_flag.store(true, Ordering::Release);
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let host_gate = state.host_agent_admission();
+        let router = app(state.clone());
+        let before = registry
+            .inventory()
+            .into_iter()
+            .map(|terminal| terminal.terminal_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        // `create_terminal_tab` takes this lock only after the detached
+        // settle returns, immediately before attaching the pane content.
+        let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_lock_tx, release_lock_rx) = std::sync::mpsc::channel();
+        let lock_state = state.clone();
+        let lock_holder = std::thread::spawn(move || {
+            let held_tabs = lock_state.tabs.lock().expect("tabs mutex");
+            let _ = lock_acquired_tx.send(());
+            let _ = release_lock_rx.recv();
+            drop(held_tabs);
+        });
+        lock_acquired_rx
+            .await
+            .expect("test thread acquired the tabs mutex");
+        let request = tokio::spawn(async move {
+            post(router, "/api/tabs", json!({"mode":"admissioncli"}), true).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !hook_finished.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("terminal settle reached its final create hook");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !request.is_finished(),
+            "the request must still be blocked before pane publication"
+        );
+
+        let lease = host_gate
+            .begin_quiesce(
+                "rest-pane-publication-test",
+                std::time::Duration::from_secs(10),
+            )
+            .expect("maintenance lease starts during the publication tail");
+        let first_drain = host_gate
+            .drain(&lease, std::time::Duration::from_millis(30))
+            .await;
+
+        release_lock_tx
+            .send(())
+            .expect("release the test thread's tabs mutex");
+        lock_holder
+            .join()
+            .expect("tabs mutex holder thread completes");
+        let (status, body) = request.await.expect("REST request task");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminal id")
+            .to_string();
+        assert!(
+            registry
+                .inventory()
+                .iter()
+                .any(|terminal| !before.contains(&terminal.terminal_id)),
+            "the REST create publishes its terminal before returning"
+        );
+        registry.kill(&terminal_id);
+        host_gate
+            .drain(&lease, std::time::Duration::from_secs(1))
+            .await
+            .expect("maintenance drains after the route publishes the pane");
+        host_gate.release(&lease).unwrap();
+        let _ = std::fs::remove_file(argv_file);
+
+        assert_eq!(
+            first_drain,
+            Err(crate::host_agent_admission::AdmissionError::DrainTimeout),
+            "maintenance must not pass its drain before the created pane is published"
+        );
     }
 
     // ── D8 session-ref lease, REST rung (ks38) ──────────────────────────────

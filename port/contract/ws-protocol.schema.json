@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 93,
+  "schemaCount": 94,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -730,6 +730,10 @@
                   "type": "boolean"
                 },
                 "paneReconcileV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
+                "sessionIndexReadyV1": {
                   "const": true,
                   "type": "boolean"
                 },
@@ -5918,6 +5922,10 @@
               "const": true,
               "type": "boolean"
             },
+            "sessionIndexReadyV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "terminalInterestV1": {
               "const": true,
               "type": "boolean"
@@ -8941,6 +8949,10 @@
           "const": true,
           "type": "boolean"
         },
+        "sessionIndexReadyV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "terminalInterestV1": {
           "const": true,
           "type": "boolean"
@@ -9055,6 +9067,20 @@
       "required": [
         "provider",
         "sessionId"
+      ],
+      "type": "object"
+    },
+    "SessionsIndexReadySchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "sessions.index.ready",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
       ],
       "type": "object"
     },
