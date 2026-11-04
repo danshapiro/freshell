@@ -45,14 +45,16 @@ Managed-runtime lifecycle and reaping tests use the stricter mode:
 scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex <destructive-test-name>"
 ```
 
-`--runtime-suite` is intentionally incompatible with `--corpus`. It uses `--network none`, a
-read-only container root with only explicit tmpfs/bind/volume write locations and enables
-`no-new-privileges` for the requested command. Before that container starts, a separate disposable
-container on the dedicated bridge prepares the fingerprinted Node dependencies and runs
-`cargo fetch --locked` when `Cargo.lock` exists. Only this fixed preparation has networking and
-a writable root; it never receives the requested command or mounts provider homes or admin
-sockets. Preparation failure stops the run before the requested command starts. The command's
-container reuses those volumes with Cargo in offline mode, so a cold cache needs no manual warm-up.
+Ordinary and `--runtime-suite` invocations both use a separate disposable container on the
+dedicated bridge to prepare Node dependencies, then mount the completed dependency trees
+read-only for the requested command. Preparation failure stops the run before that command starts.
+
+`--runtime-suite` is intentionally incompatible with `--corpus`. Its command uses `--network none`,
+a read-only container root with explicit writable locations, and `no-new-privileges`.
+Its fixed preparation also runs `cargo fetch --locked` when `Cargo.lock` exists. Within this
+strict mode only preparation has networking and a writable root; it never receives the requested
+command or mounts provider homes or admin sockets. The caller uses Cargo offline, so a cold
+cache needs no manual warm-up. Ordinary callers retain their usual network and root settings.
 The root entrypoint may initialize cache-volume ownership, but it always drops
 to the unprivileged `sandbox` UID before test code and the self-test verifies that test code has zero
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
@@ -186,19 +188,25 @@ lock presence, npm's `package-lock.json` first so legacy branches keep their
   project root's writability, and the bind-mounted repo is not writable by the
   sandbox user, so the default probe would fail every install. The store uses
   the sandbox-owned `freshell-sandbox-pnpm-store` volume. This keeps it writable
-  under `--runtime-suite`'s read-only container root and lets its offline
-  dependency install reuse packages prepared by an ordinary sandbox run.
+  under `--runtime-suite`'s read-only container root. The fixed preparation
+  reuses this downloaded package store for normal frozen installation.
 - Install success is recorded in `node_modules/.sandbox-deps-state` — a
   fingerprint over the manager and its version, the install policy flags, the
   root manifest, the selected manager's lock/config files, and the workspace
   member manifests. This replaces the old one-shot `.sandbox-npm-ci-done`
   marker; an old npm marker or npm-era volume never satisfies the pnpm state
-  (and vice versa), and any manager/lock/manifest/policy change forces a
-  reinstall on the next run.
-- Before a reinstall, the previous tree is purged — but only through the
-  wrapper's named volume mounts (a direct `docker run` without those volumes
-  fails closed on the install instead of ever deleting the bind-mounted
-  repo's real `node_modules`).
+  (and vice versa). The separate prepared-cache key selects three volumes
+  from the dependency foundation, manager-authoritative inputs, and declared
+  installed-layout revision. Changed key inputs select another set; completed
+  trees are reused and never purged or replaced. A completed tree whose state
+  disagrees is refused rather than reinstalled.
+- Only cold or incomplete selected trees are purged before normal frozen
+  preparation, through the wrapper's named mounts. A direct `docker run`
+  without those mounts fails closed instead of deleting the repo's real
+  `node_modules`. An install-policy or tool-cache-link change that changes
+  the installed result requires an explicit layout revision in
+  `dependency-cache.mjs`, an image rebuild, and repreparation of affected
+  contract derivatives. Preserve previous prepared sets.
 - The state file lives inside the install volume, so wiping the volume wipes
   the state with it.
 
@@ -269,9 +277,19 @@ also runs this focused test as Proof 7, followed by cold strict startup as Proof
 scripts/sandbox-build.sh
 ```
 
-Rebuild after any change to `docker/sandbox/Dockerfile` or `docker/sandbox/entrypoint.sh`. The
-image is tagged `freshell-sandbox:dependencies-v2` and Docker layer caching keeps rebuilds fast unless a
-step earlier in the Dockerfile changed.
+Rebuild after changes to `docker/sandbox/Dockerfile`, `entrypoint.sh`,
+`dependency-cache.mjs`, or `protocol.json`. An already-present image is not rebuilt
+automatically. The default tag is `freshell-sandbox:dependencies-v2`; set
+`FRESHELL_SANDBOX_IMAGE` when rebuilding an explicitly selected development tag.
+Docker layer caching keeps rebuilds fast unless an earlier build input changed.
+Reprepare native/custom contract derivatives after rebuilding their base; the
+closed verifier still checks the qualified base and derived workload separately.
+
+A host/image helper disagreement can emit `sandbox_dependency_inputs_changed`
+even when dependency files are unchanged: the host selects a key with the
+worktree helper, while the container checks it with its baked helper. Check the
+image rebuild inputs above as well as changes to dependency files. The refusal
+preserves the existing prepared tree and never runs the caller or retries silently.
 
 The canonical image includes the native development libraries for the whole Rust workspace:
 DBus and the Tauri desktop shell's GTK3, WebKit2GTK 4.1 (with libsoup3), and Ayatana
