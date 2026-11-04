@@ -1,7 +1,7 @@
 // Real-daemon cases remain unrun. Independent guest qualification and an
 // external bounded guest driver are mandatory; see the accompanying report.
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -98,7 +98,7 @@ function childOf(root: string, candidate: string): boolean {
 }
 
 /** This is a second check, never a substitute for independent qualification. */
-function requireQualifiedGuest(): { repo: string; daemonId: string } {
+export function requireQualifiedGuest(): { repo: string; daemonId: string } {
   if (process.env.FRESHELL_TASK4_GUEST_QUALIFIED !== '1') throw new Error('qualified guest receipt required')
   const expectedRepo = process.env.FRESHELL_TASK4_SOURCE_ROOT
   const taskRoot = process.env.FRESHELL_TASK4_PRIVATE_ROOT
@@ -252,7 +252,11 @@ function newState(repo: string): State {
   return state
 }
 
-export async function settle(state: State): Promise<void> {
+export async function settle(state: State, options: {
+  expectedDaemonId?: string
+  onOwnerStop?: () => void
+  onOwnerStopResult?: (result: Awaited<ReturnType<ManagedRuntimeOwner['stop']>>) => void
+} = {}): Promise<void> {
   const failures: CleanupFailure[] = []
   const errors: unknown[] = []
   for (const attachment of state.attachments) {
@@ -277,7 +281,10 @@ export async function settle(state: State): Promise<void> {
       stop: async () => {
         const started = Date.now()
         try {
+          if (options.expectedDaemonId) requireDaemon(options.expectedDaemonId)
+          options.onOwnerStop?.()
           const result = await state.rig.stop()
+          options.onOwnerStopResult?.(result)
           state.stopped = result.ok
           ownerStatus = result.ok ? 'succeeded' : 'failed'
           if (!result.ok) failures.push({ phase: 'owner_stop', kind: 'reported_failure' })
@@ -535,6 +542,238 @@ async function unprovenCapture(repo: string, daemonId: string): Promise<void> {
     removeCaptured(fixture)
     event('real_volume.case_passed', { case: 'unproven_capture_owner_stop', volume: fixture.owner.providerVolumeName, stopCalls })
   })
+}
+
+type CaptureBudgetInput = { repo: string; daemonId: string; socket: string; privateRoot: string; dockerCli: string }
+
+function capturePathStatus(name: string): 'absent' | 'present' | 'unknown' {
+  try { fs.lstatSync(name); return 'present' }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'unknown' }
+}
+
+function captureControlStartTicks(pid: number): string {
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+  const ticks = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+  assert.match(ticks ?? '', /^\d+$/)
+  return ticks
+}
+
+// This child only delays two responses for one exact volume. It never owns the
+// runtime, sends signals, or accepts arbitrary Docker operations.
+function startCaptureBudgetControl(input: CaptureBudgetInput, socket: string, volume: string) {
+  const child = spawn(process.execPath, [path.join(input.repo, 'scripts/testing/codex-one-volume-forwarder.mjs')], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      FRESHELL_TASK4_GUEST_QUALIFIED: process.env.FRESHELL_TASK4_GUEST_QUALIFIED,
+      FRESHELL_TASK4_FORWARD_MODE: 'capture_timeout', FRESHELL_TASK4_FORWARD_SOCKET: socket,
+      FRESHELL_TASK4_DOCKER_SOCKET: input.socket, FRESHELL_TASK4_PRIVATE_ROOT: input.privateRoot,
+      FRESHELL_TASK4_FORWARD_VOLUME: volume, FRESHELL_TASK4_DAEMON_ID: input.daemonId,
+    },
+  })
+  let resolveReady!: () => void
+  let rejectReady!: (error: Error) => void
+  const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
+  void ready.catch(() => {})
+  let readySeen = false, invalid = false, buffer = ''
+  const records: Array<Record<string, unknown>> = []
+  child.stdout.on('data', (chunk: Buffer | string) => {
+    buffer += chunk.toString()
+    if (Buffer.byteLength(buffer) > 64 * 1024) { invalid = true; return }
+    for (;;) {
+      const end = buffer.indexOf('\n')
+      if (end < 0) break
+      const line = buffer.slice(0, end)
+      buffer = buffer.slice(end + 1)
+      try {
+        const row = JSON.parse(line) as Record<string, unknown>
+        records.push(row)
+        if (row.event === 'forwarder.ready') {
+          if (readySeen || row.mode !== 'capture_timeout' || row.socket !== socket || row.daemonId !== input.daemonId || row.volume !== volume) invalid = true
+          else { readySeen = true; resolveReady() }
+        }
+      } catch { invalid = true }
+    }
+  })
+  child.stdout.on('error', () => { invalid = true })
+  child.stderr.on('data', () => {})
+  child.stderr.on('error', () => { invalid = true })
+  const settled = new Promise<{ ok: boolean; infoFinishedAt: number | null }>(resolve => {
+    child.once('error', () => { invalid = true; if (!readySeen) rejectReady(new Error('forwarder unavailable')) })
+    child.once('close', (code, signal) => {
+      if (!readySeen) rejectReady(new Error('forwarder did not become ready'))
+      const selected = (event: string, kind: string) => records.filter(row => row.event === event && row.kind === kind)
+      const listHeld = selected('forwarder.daemon_response_held', 'volume_list')
+      const listFinished = selected('forwarder.hold_finished', 'volume_list')
+      const infoHeld = selected('forwarder.daemon_response_held', 'info')
+      const infoFinished = selected('forwarder.hold_finished', 'info')
+      const finished = records.filter(row => row.event === 'forwarder.settled' && row.mode === 'capture_timeout'
+        && row.ok === true && row.phase === 4 && row.socketStillExists === false
+        && row.active === 0 && row.upstreams === 0 && row.sockets === 0)
+      const all = [listHeld[0], listFinished[0], infoHeld[0], infoFinished[0], finished[0]]
+      const positions = all.map(row => records.indexOf(row))
+      const ordered = positions.every((position, index) => position >= 0 && (index === 0 || position > positions[index - 1]))
+      const holdsMatch = [listHeld[0], infoHeld[0]].every(row => row?.daemonId === input.daemonId && row.volume === volume && row.status === 200)
+        && listHeld[0]?.holdMs === 4000 && infoHeld[0]?.holdMs === 7000
+        && typeof listFinished[0]?.elapsedMs === 'number' && listFinished[0].elapsedMs >= 4000 && listFinished[0].clientClosed === false
+        && typeof infoFinished[0]?.elapsedMs === 'number' && infoFinished[0].elapsedMs >= 7000 && infoFinished[0].clientClosed === true
+      const allowed = new Set(['forwarder.ready', 'forwarder.daemon_response_held', 'forwarder.hold_finished', 'forwarder.settled'])
+      const counts = listHeld.length === 1 && listFinished.length === 1 && infoHeld.length === 1 && infoFinished.length === 1 && finished.length === 1
+      const infoFinishedAt = typeof infoFinished[0]?.atMs === 'number' ? infoFinished[0].atMs : null
+      resolve({ ok: code === 0 && signal === null && !invalid && !buffer && readySeen && counts && ordered && holdsMatch
+        && infoFinishedAt !== null && records.every(row => allowed.has(String(row.event))), infoFinishedAt })
+    })
+  })
+  return { child, ready, settled }
+}
+
+/** Separate unreserved-volume case; only an independently admitted guest may run it. */
+export async function runCaptureBudgetCase(input: CaptureBudgetInput): Promise<void> {
+  assert.equal(process.env.DOCKER_HOST, `unix://${input.socket}`)
+  assert.ok(path.isAbsolute(input.privateRoot) && path.isAbsolute(input.socket) && path.isAbsolute(input.dockerCli))
+  const root = fs.realpathSync(input.privateRoot)
+  assert.notEqual(root, path.parse(root).root)
+  const forwardSocket = path.join(root, 'forward.sock')
+  assert.ok(Buffer.byteLength(forwardSocket) < 104)
+  const state = newState(input.repo)
+  let fixture: Fixture | undefined
+  let savedCapture: Captured | undefined
+  let control: ReturnType<typeof startCaptureBudgetControl> | undefined
+  let controlResult: Awaited<ReturnType<typeof startCaptureBudgetControl>['settled']> | undefined
+  let controlJoined = true, controlTicks: string | null = null
+  let stopRequested = false, stopCalls = 0, stopResult: Awaited<ReturnType<ManagedRuntimeOwner['stop']>> | undefined
+  let ownerStopStartedAt: number | null = null, captureStartedAt: number | null = null, captureDurationMs: number | null = null
+  let captureError: unknown, ownerStopError: unknown, cleanupError: unknown, retainedBeforeRecovery: boolean | null = null
+  let captureStatus: OperationStatus = 'not_started'
+  let bodyComplete = false, forwarderSocketStatus: 'absent' | 'present' | 'unknown' | undefined
+  const failures: Array<{ phase: string; kind: string }> = []
+  const errors: unknown[] = []
+
+  try {
+    caseProgress(state, 'prepare')
+    await state.rig.runtime.prepare()
+    fixture = await createFixture(state, input.daemonId)
+    savedCapture = fixture.captured
+    assert.ok(savedCapture && savedCapture.length === 1)
+    assert.deepEqual(savedCapture[0].owner, fixture.owner)
+    assert.deepEqual(savedCapture[0].labels, fixture.labels)
+    await recoveryIdentity('real_capture_budget.saved_capture', { daemonId: input.daemonId, runId: state.rig.runtime.runId,
+      owner: savedCapture[0].owner, labels: savedCapture[0].labels })
+    assert.equal(state.rig.runtime.broker.initialProviderVolumeCreations().length, 0)
+    assert.equal(state.rig.runtime.broker.receipts().length, 0)
+    assert.equal(capturePathStatus(forwardSocket), 'absent')
+    await recoveryIdentity('real_capture_budget.fixture', { daemonId: input.daemonId, runId: state.rig.runtime.runId,
+      volume: fixture.owner.providerVolumeName })
+    control = startCaptureBudgetControl(input, forwardSocket, fixture.owner.providerVolumeName)
+    controlJoined = false
+    assert.ok(control.child.pid && Number.isSafeInteger(control.child.pid))
+    controlTicks = captureControlStartTicks(control.child.pid)
+    await recoveryIdentity('real_capture_budget.forwarder', { daemonId: input.daemonId, volume: fixture.owner.providerVolumeName,
+      pid: control.child.pid, startTicks: controlTicks })
+    await control.ready
+    const rig = {
+      runtime: state.rig.runtime,
+      stop: async () => {
+        stopRequested = true
+        try {
+          process.env.DOCKER_HOST = `unix://${input.socket}`
+          requireDaemon(input.daemonId)
+          stopCalls++
+          ownerStopStartedAt = Date.now()
+          stopResult = await state.rig.stop()
+          state.stopped = stopResult.ok
+          return stopResult
+        } catch (error) { ownerStopError = error; throw error }
+      },
+    }
+    const dependencies = {
+      ...managedCodexCleanupDependencies,
+      captureVolumes: (...args: Parameters<typeof managedCodexCleanupDependencies.captureVolumes>) => {
+        captureStartedAt = Date.now()
+        try { const result = managedCodexCleanupDependencies.captureVolumes(...args); captureStatus = 'succeeded'; return result }
+        catch (error) { captureStatus = 'failed'; captureError = error; throw error }
+        finally { captureDurationMs = Math.max(0, Date.now() - captureStartedAt) }
+      },
+    }
+    process.env.DOCKER_HOST = `unix://${forwardSocket}`
+    try {
+      await cleanupManagedCodexParity({ rig, owners: [fixture.owner], wire: undefined, model: undefined,
+        finalObservation: undefined, naming: undefined, restoreGrants: undefined, grantsDirectory: undefined, home: undefined }, dependencies)
+    } catch (error) { cleanupError = error }
+    finally { process.env.DOCKER_HOST = `unix://${input.socket}` }
+    assert.ok(cleanupError instanceof AggregateError)
+    assert.deepEqual(cleanupError.errors, [captureError])
+    assert.equal((captureError as NodeJS.ErrnoException | undefined)?.code, 'ETIMEDOUT')
+    assert.ok(captureDurationMs !== null && captureDurationMs >= 9000 && captureDurationMs <= 15_000)
+    assert.equal(stopCalls, 1)
+    assert.equal(stopResult?.ok, true)
+    assert.ok(captureStartedAt !== null && ownerStopStartedAt !== null
+      && ownerStopStartedAt - captureStartedAt >= 9000 && ownerStopStartedAt - captureStartedAt <= 15_000)
+    controlResult = await control.settled
+    controlJoined = true
+    assert.equal(controlResult.ok, true)
+    assert.ok(controlResult.infoFinishedAt !== null && ownerStopStartedAt <= controlResult.infoFinishedAt)
+    forwarderSocketStatus = capturePathStatus(forwardSocket)
+    assert.equal(forwarderSocketStatus, 'absent')
+    retainedBeforeRecovery = volumeExistsOnExpectedDaemon(fixture.owner.providerVolumeName, input.daemonId)
+    assert.equal(retainedBeforeRecovery, true)
+    assert.equal(state.rig.runtime.broker.initialProviderVolumeCreations().length, 0)
+    assert.equal(state.rig.runtime.broker.receipts().length, 0)
+    fixture.captured = savedCapture
+    removeCaptured(fixture)
+    bodyComplete = true
+  } catch (error) {
+    failures.push({ phase: 'case', kind: error instanceof assert.AssertionError ? 'assertion' : 'operation' })
+    errors.push(error)
+  }
+
+  process.env.DOCKER_HOST = `unix://${input.socket}`
+  if (control && !controlJoined) {
+    try { controlResult = await control.settled; controlJoined = true }
+    catch (error) { failures.push({ phase: 'control', kind: 'operation' }); errors.push(error) }
+  }
+  if (control && controlJoined && forwarderSocketStatus === undefined) forwarderSocketStatus = capturePathStatus(forwardSocket)
+  if (!controlJoined) failures.push({ phase: 'control', kind: 'unsettled' })
+  else if (controlResult && !controlResult.ok) failures.push({ phase: 'control', kind: 'reported_failure' })
+  if (forwarderSocketStatus && forwarderSocketStatus !== 'absent') failures.push({ phase: 'socket', kind: 'unsettled' })
+  if (ownerStopError) { failures.push({ phase: 'owner_stop', kind: 'operation' }); errors.push(ownerStopError) }
+  else if (stopRequested && stopResult && !stopResult.ok) failures.push({ phase: 'owner_stop', kind: 'reported_failure' })
+  if (!stopRequested && !control) {
+    let daemonConfirmed = false
+    try { requireDaemon(input.daemonId); daemonConfirmed = true }
+    catch (error) { failures.push({ phase: 'owner_stop', kind: 'unsettled' }); errors.push(error) }
+    if (daemonConfirmed) {
+      try {
+        await settle(state, { expectedDaemonId: input.daemonId,
+          onOwnerStop: () => { stopRequested = true; stopCalls++ },
+          onOwnerStopResult: result => { stopResult = result } })
+      } catch (error) {
+        failures.push({ phase: 'cleanup', kind: 'operation' }); errors.push(error)
+        if (!stopRequested) failures.push({ phase: 'owner_stop', kind: 'unsettled' })
+      }
+    }
+  } else if (!stopRequested && controlJoined) {
+    try {
+      requireDaemon(input.daemonId)
+      stopRequested = true; stopCalls++; stopResult = await state.rig.stop(); state.stopped = stopResult.ok
+      if (!stopResult.ok) failures.push({ phase: 'owner_stop', kind: 'reported_failure' })
+    } catch (error) { failures.push({ phase: 'owner_stop', kind: 'operation' }); errors.push(error) }
+  } else if (!stopRequested) {
+    failures.push({ phase: 'owner_stop', kind: 'unsettled' })
+  }
+  if (state.fixtures.some(value => value.attempted)) failures.push({ phase: 'volume_retention', kind: 'unconfirmed' })
+  if (failures.length || !bodyComplete) {
+    event('real_capture_budget.recovery_required', { daemonId: input.daemonId, runId: state.rig.runtime.runId,
+      volume: fixture?.owner.providerVolumeName ?? state.fixtures[0]?.owner.providerVolumeName ?? null,
+      forwarderPid: control?.child.pid ?? null, forwarderStartTicks: controlTicks,
+      forwarderSocket: forwarderSocketStatus && forwarderSocketStatus !== 'absent' ? forwardSocket : null,
+      controlJoined, controlOk: controlResult?.ok ?? null, stopRequested, stopCalls,
+      ownerStopOk: stopResult?.ok ?? (state.stopped ? true : null), captureStatus, captureDurationMs,
+      retainedBeforeRecovery, failures })
+    throw new AggregateError(errors, 'capture-budget case or cleanup failed')
+  }
+  event('real_capture_budget.completed', { daemonId: input.daemonId, runId: state.rig.runtime.runId,
+    volume: fixture!.owner.providerVolumeName, captureFailed: true, captureDurationMs, stopCalls,
+    ownerStopOk: true, retainedBeforeRecovery, passedCases: 1 })
 }
 
 let executablePhase: 'preflight' | 'ownership_and_unreserved' | 'unproven_capture' = 'preflight'
