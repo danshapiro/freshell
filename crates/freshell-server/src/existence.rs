@@ -83,15 +83,17 @@ pub use crate::existence_by_id::{
     CodexRolloutExistenceLocator,
 };
 // Antigravity by-id locator (plan Task 7): same focused-sibling convention.
-// The production wiring (main.rs) installs the UNION-root locator
-// (focused repair round 2, Major 1): it walks EVERY candidate store root,
-// never only the seam's single resolved root. The single-root
-// constructor's re-export is test-only (the existence/gate tests mirror
-// one-store-root wirings over an already-resolved home).
+// The production wiring (main.rs) installs the AUTHORITY-LADDER locator
+// (focused repair round 3, Major 1): by-id answers are rooted in the
+// binary's own store, resolved per the operator-override /
+// single-populated / dual-populated ladder (see
+// antigravity_existence_by_id.rs). The single-root constructor's
+// re-export is test-only (the existence/gate tests mirror one-store-root
+// wirings over an already-resolved home).
 #[cfg(test)]
 pub use crate::antigravity_existence_by_id::antigravity_transcript_locator;
 pub use crate::antigravity_existence_by_id::{
-    antigravity_union_root_locator, AntigravityTranscriptLocator,
+    antigravity_authority_root_locator, AntigravityTranscriptLocator,
 };
 
 pub struct IndexExistenceProbe {
@@ -311,6 +313,10 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                             }
                             ByIdAnswer::Absent => SessionExistence::Absent,
                             ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                            // Never produced by the amplifier locator; the
+                            // antigravity ladder's defer maps fail-open like
+                            // Unreadable if a future locator ever emits it.
+                            ByIdAnswer::Defer => SessionExistence::Unknown,
                         };
                     }
                 }
@@ -440,6 +446,9 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                 return SessionExistence::Present;
                             }
                             ByIdAnswer::Unreadable => return SessionExistence::Unknown,
+                            // Never produced by the amplifier locator; mapped
+                            // fail-open like Unreadable if ever emitted.
+                            ByIdAnswer::Defer => return SessionExistence::Unknown,
                             ByIdAnswer::Absent => {}
                         }
                     }
@@ -451,15 +460,20 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // AntigravitySource drops parse-failed transcripts (no
                 // ownership record, no usable workspace path), so a
                 // conversation dir on disk can be index-invisible yet
-                // resumable. CHEAP single-open check (the amplifier/opencode
-                // class, NOT codex's gate-only ~1s walk), so it stays on
+                // resumable. CHEAP single-open check per resolved authority
+                // root (the amplifier/opencode class, NOT codex's gate-only
+                // ~1s walk; the round-3 authority ladder adds two cheap
+                // brain/ readdirs for the population probe), so it stays on
                 // this sync reconcile-consulted path and improves
                 // pane-reconcile dead-session answers; since the
                 // resume-gate activation (2026-11-03) `exists_for_gate`
                 // ALSO consults it directly (the gate block below), so
                 // after this arm `Absent` for antigravity is POSITIVE
                 // absence for BOTH callers. An unreadable store is
-                // honest Unknown (G28: bounded deferral), NEVER Absent.
+                // honest Unknown (G28: bounded deferral), NEVER Absent —
+                // and so is the ladder's dual-root Defer (focused repair
+                // round 3, Major 1): an ambiguous store must not adjudicate
+                // a found conversation dead OR present; the binary decides.
                 if provider == "antigravity" {
                     if let Some(locator) = &self.antigravity_transcript_locator {
                         match locator(session_id) {
@@ -474,6 +488,11 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                 return SessionExistence::Present;
                             }
                             ByIdAnswer::Unreadable => return SessionExistence::Unknown,
+                            // Dual-root defer (round 3, Major 1): the id was
+                            // found but the store-root authority is ambiguous
+                            // — Unknown, never a finalized Absent that could
+                            // adjudicate a live conversation dead.
+                            ByIdAnswer::Defer => return SessionExistence::Unknown,
                             ByIdAnswer::Absent => {}
                         }
                     }
@@ -532,16 +551,20 @@ impl SessionExistenceProbe for IndexExistenceProbe {
         // the root-existence pre-check, and passing it through fails open
         // (map_existence → Unknown → Proceed) straight into the CLI's
         // silent fresh conversation. Validate all three against the same
-        // on-disk by-id walk the Absent arm uses (the production locator
-        // walks EVERY candidate root — focused repair round 2, Major 1 —
-        // so a conversation in an unselected root validates too): disk
-        // Present confirms (and feeds the observed set — module-doc
-        // invariant), disk Absent corrects to Absent (typed refusal —
-        // absent from ALL candidate roots the locator's `File::open`s
-        // give NotFound, positive absence: the CLI never ran on this
-        // machine), disk Unreadable defers as Unknown (G28 fail-open).
-        // Absent itself needs no re-check — the warm-Absent arm at
-        // exists() already disk-verified it.
+        // on-disk by-id walk the Absent arm uses — the production locator
+        // is the AUTHORITY LADDER (focused repair round 3, Major 1): by-id
+        // answers are rooted in the binary's own store (operator override;
+        // the single conversation-bearing candidate; the dual-populated
+        // defer), so the ladder never answers Present for an id the
+        // resolved authority root cannot resume: disk Present confirms
+        // (and feeds the observed set — module-doc invariant), disk Absent
+        // corrects to Absent (typed refusal — the resolved authority's
+        // `File::open`s give NotFound, positive absence), disk Unreadable
+        // defers as Unknown (G28 fail-open), and the dual-root Defer
+        // defers as Unknown too (the binary's own missing-ID warning is
+        // visible in the pane — the documented pre-gate behavior, never a
+        // silent substitution). Absent itself needs no re-check — the
+        // warm-Absent arm at exists() already disk-verified it.
         if provider == "antigravity" {
             if let Some(locator) = &self.antigravity_transcript_locator {
                 match base {
@@ -558,6 +581,11 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                             }
                             ByIdAnswer::Absent => SessionExistence::Absent,
                             ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                            // Dual-root defer (round 3, Major 1): found on
+                            // disk, but the binary's read root is ambiguous
+                            // — Unknown defers to the CLI (fail-open), never
+                            // a wrong-root Present, never a typed refusal.
+                            ByIdAnswer::Defer => SessionExistence::Unknown,
                         };
                     }
                     _ => {}
@@ -578,6 +606,9 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         SessionExistence::Present
                     }
                     ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                    // Never produced by the codex locator; mapped fail-open
+                    // like Unreadable if ever emitted.
+                    ByIdAnswer::Defer => SessionExistence::Unknown,
                     ByIdAnswer::Absent => SessionExistence::Absent,
                 };
             }

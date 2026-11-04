@@ -7947,12 +7947,20 @@ pub enum RespawnedIdentity {
     FreshUnbound,
 }
 
-/// A successful respawn: the new terminal id plus its identity disposition.
+/// A successful respawn: the new terminal id, its identity disposition,
+/// and — for the FreshUnbound shape only — the gate's stale-id notice
+/// (the operator-visible text naming the refused conversation) for the
+/// hub to carry on `terminal.replaced` (focused repair round 3, Major 2:
+/// the Recovering frame broadcast inside the respawn names the stale id
+/// but is addressed to the NEW terminal id, which the pane cannot know
+/// before the replacement announcement — the replaced frame is the path
+/// the pane actually consumes).
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct RespawnOutcome {
     pub terminal_id: String,
     pub identity: RespawnedIdentity,
+    pub stale_session_notice: Option<String>,
 }
 
 /// Spawns a replacement agent terminal from a server-side identity.
@@ -8043,6 +8051,16 @@ pub async fn respawn_agent_terminal(
     } else {
         RespawnedIdentity::Resumed
     };
+    // Focused repair round 3, Major 2: carry the gate's stale-id notice on
+    // the outcome for the FreshUnbound shape ONLY — the hub relays it on
+    // `terminal.replaced` (the path the pane actually consumes; see
+    // RespawnOutcome's doc). Resumed/MintedReplacement pass no notice
+    // (their folds stay exactly as today).
+    let stale_session_notice = if respawned_identity == RespawnedIdentity::FreshUnbound {
+        outcome.notice.clone()
+    } else {
+        None
+    };
     if let Some(stale) = outcome.stale_session_id.as_deref() {
         tracing::warn!(
             mode = %req.mode,
@@ -8086,9 +8104,14 @@ pub async fn respawn_agent_terminal(
         // the direct create path refuses with the typed SESSION_MISSING
         // error (GC3). The pane comes back with NO saved identity and binds
         // the conversation the CLI mints on its next clean typed prompt
-        // (the documented natural rebind; README's binding paragraph). The
-        // Recovering frame broadcast above (naming the stale id) keeps the
-        // user informed.
+        // (the documented natural rebind; README's binding paragraph).
+        // The Recovering frame broadcast above names the stale id, but it
+        // is addressed to the NEW terminal id — which the pane cannot know
+        // before `terminal.replaced` — and the replaced fold clears the
+        // recovery notice, so the notice the pane ACTUALLY consumes is the
+        // one carried on the replaced frame (focused repair round 3, Major
+        // 2: `RespawnOutcome::stale_session_notice` → the hub's
+        // `emit_replaced` → the frame's `staleSessionNotice`).
         let msg =
             freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
                 recovery_summary: None,
@@ -8586,6 +8609,7 @@ pub async fn respawn_agent_terminal(
     Ok(RespawnOutcome {
         terminal_id,
         identity: respawned_identity,
+        stale_session_notice,
     })
 }
 

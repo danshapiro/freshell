@@ -1658,6 +1658,16 @@ export type TerminalReplacedMessage = {
    * keeps the recorded ref (still correct); `minted_replacement` keeps
    * it too (the accepted AD-3 shape). */
   identityDisposition?: 'resumed' | 'minted_replacement' | 'fresh_unbound'
+  /** Focused repair round 3, Major 2 (additive/optional): the gate's
+   * stale-id notice naming the REFUSED conversation, carried ONLY on the
+   * `fresh_unbound` shape — the path the pane actually consumes. The
+   * server also broadcasts the notice as a `terminal.status{recovering}`
+   * frame, but for the NEW terminal id BEFORE this frame, which the pane
+   * (matching by the OLD id it knows) can never see — and this replaced
+   * fold clears the recovery notice. The client surfaces it as a
+   * pane-level dismissible notice. `resumed`/`minted_replacement` frames
+   * omit it. Prose is presentational-only. */
+  staleSessionNotice?: string
 }
 
 export type TerminalOutputMessage = {

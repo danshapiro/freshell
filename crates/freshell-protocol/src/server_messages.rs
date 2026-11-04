@@ -1845,6 +1845,20 @@ pub struct TerminalReplaced {
     /// legacy client fold). See [`TerminalReplacedIdentityDisposition`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_disposition: Option<TerminalReplacedIdentityDisposition>,
+    /// The gate's stale-id notice (focused repair round 3, Major 2 —
+    /// additive/optional: absent keeps the legacy frame byte-shape):
+    /// the operator-visible text naming the REFUSED stale conversation,
+    /// carried on the path the pane ACTUALLY consumes. The server also
+    /// broadcasts the notice as a `terminal.status{recovering}` frame,
+    /// but for the NEW terminal id BEFORE this frame — the pane matches
+    /// frames by the OLD id it knows, never sees that one, and this
+    /// replaced fold clears the recovery notice — so without this field
+    /// the fresh pane shows no explanation naming the lost conversation.
+    /// Only the `FreshUnbound` disposition carries it; `Resumed` and
+    /// `MintedReplacement` frames omit it (their folds stay exactly as
+    /// today). Prose is presentational-only (council 7w4h/xkhx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_session_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

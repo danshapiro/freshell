@@ -305,7 +305,11 @@ CLI panes). Resuming a saved conversation validates the id against the
 on-disk store before launching: a conversation whose transcript still exists
 resumes exactly (`agy --conversation <id>`), while a stale id is refused
 with a visible notice and nothing is spawned in its place — start a new
-conversation explicitly instead.
+conversation explicitly instead. When both the default and the snap store
+roots hold conversations, Freshell cannot know which one the CLI reads: a
+saved id found in either root is handed to the CLI to decide (its own
+missing-id warning appears in the pane), and a startup log line tells the
+operator to set `FRESHELL_ANTIGRAVITY_HOME` to disambiguate the store.
 
 ### Standalone CLI and MCP client
 

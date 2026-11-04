@@ -6,6 +6,7 @@
 //! module's `pub(super)` scaffolding helpers.
 use super::tests::{direct_locator_over, probe_over, temp_claude_home, write_session};
 use super::*;
+use crate::antigravity_existence_by_id::antigravity_authority_root_locator_with_override;
 use crate::antigravity_existence_by_id::conversation_transcript_path;
 use crate::existence_by_id::codex_rollout_on_disk;
 
@@ -759,46 +760,41 @@ fn antigravity_cold_index_missing_store_root_gate_answers_absent_not_unavailable
     let _ = std::fs::remove_dir_all(&parent);
 }
 
-/// Focused repair round 2, Major 1 — the dual-root host. The SEAM
-/// (`provider_layout::antigravity_home`) resolves ONE root (env override >
-/// default root when it holds conversations > snap root), but the binary's
-/// WRITE root is not necessarily the seam's read root: the snap binary
-/// pins its store under `$HOME/snap` while the same host can also hold
-/// conversations in the default root (the real-provider smoke scans EVERY
-/// candidate root for exactly this reason). A valid conversation that
-/// exists ONLY in the unselected root must NOT be refused with a false
-/// SESSION_MISSING: the gate's by-id locator must find it in ANY
-/// candidate root.
+/// Focused repair round 2, Major 1 (REWORKED for round 3's authority
+/// ladder): the single-populated host. The snap root is the ONLY candidate
+/// root holding conversations, so the ladder resolves it as the binary's
+/// store (strong evidence: the binary wrote those conversations) and the
+/// gate must find a snap conversation Present — never a false SESSION_MISSING.
+/// (The round-2 union pinned this with the DEFAULT root also populated;
+/// under the ladder that dual-populated host is the AMBIGUOUS defer shape,
+/// pinned separately by
+/// `antigravity_gate_dual_populated_store_defers_to_the_binary`.)
 ///
-/// Scenario: the default root holds a DIFFERENT conversation (so the seam
-/// selects it — `root_holds_conversations(default)` wins) and the
-/// conversation under test lives ONLY in the snap root. The probe wiring
-/// mirrors `main.rs`: the `AntigravitySource` and the provider_roots entry
-/// over the seam's single resolved root; the by-id locator over the
-/// candidate roots.
+/// Scenario: ONLY the snap root holds a conversation (the default root
+/// never ran the CLI). The probe wiring mirrors `main.rs`: the
+/// `AntigravitySource` and the provider_roots entry over the seam's single
+/// resolved root; the by-id locator over the candidate roots.
 #[tokio::test]
 async fn antigravity_gate_finds_a_conversation_only_in_the_snap_root() {
-    let user_home = rv_temp_dir("agy-dual-root");
-    let default_root = user_home.join(".gemini").join("antigravity-cli");
+    let user_home = rv_temp_dir("agy-single-store");
     let snap_root = user_home
         .join("snap")
         .join("antigravity-cli")
         .join("common")
         .join(".gemini")
         .join("antigravity-cli");
-    let default_conv = "11111111-2222-3333-4444-555555555560";
     let snap_conv = "11111111-2222-3333-4444-555555555561";
-    seed_parseable_agy_conversation(&default_root, default_conv);
     seed_parseable_agy_conversation(&snap_root, snap_conv);
-    // Scenario precondition: the seam's documented selection — a default
-    // root that HOLDS conversations wins over the snap root (guarded on
-    // the ambient env override being unset; an ambient override would
-    // change the seam's choice but not the union answer below).
+    // Scenario precondition: the seam's documented selection — with the
+    // default root holding no conversations, the conversation-bearing snap
+    // root wins (guarded on the ambient env override being unset; an
+    // ambient override would change the seam's choice but not the gate
+    // answers below, which the by-id locator owns).
     if std::env::var_os("FRESHELL_ANTIGRAVITY_HOME").is_none() {
         assert_eq!(
             freshell_sessions::provider_layout::resolve_antigravity_home(&user_home).home,
-            default_root,
-            "scenario precondition: the seam selects the conversation-bearing default root"
+            snap_root,
+            "scenario precondition: the seam selects the conversation-bearing snap root"
         );
     }
     let seam_root = freshell_sessions::provider_layout::antigravity_home(&user_home);
@@ -816,15 +812,17 @@ async fn antigravity_gate_finds_a_conversation_only_in_the_snap_root() {
         None,
         HashMap::from([("antigravity".to_string(), seam_root.clone())]),
     )
-    // The union-root locator (focused repair round 2, Major 1) — the
-    // production wiring's shape: every candidate store root, not only
-    // the seam's single resolved root.
-    .with_antigravity_transcript_locator(antigravity_union_root_locator(&user_home));
+    // The production root locator (focused repair round 3, Major 1) —
+    // the authority-ladder shape: every candidate store root, resolved
+    // per the operator override / single-populated / dual-populated
+    // ladder.
+    .with_antigravity_transcript_locator(antigravity_authority_root_locator(&user_home));
     index.warm().await;
     assert_eq!(
         probe.exists_for_gate("antigravity", snap_conv),
         SessionExistence::Present,
-        "a valid conversation in the unselected snap root must not be refused (SESSION_MISSING)"
+        "a valid conversation in the snap root — the only conversation-bearing \
+         store on this host — must not be refused (SESSION_MISSING)"
     );
     assert_eq!(
         probe.exists("antigravity", snap_conv),
@@ -835,7 +833,178 @@ async fn antigravity_gate_finds_a_conversation_only_in_the_snap_root() {
     assert_eq!(
         probe.exists_for_gate("antigravity", "00000000-1111-2222-3333-444444444444"),
         SessionExistence::Absent,
-        "absent from ALL candidate roots stays positive Absent"
+        "absent from the resolved store stays positive Absent"
+    );
+    let _ = std::fs::remove_dir_all(&user_home);
+}
+
+/// Focused repair round 3, Major 1 — the dual-root host's GC3 hazard. The
+/// round-2 union answered Present for an id found in ANY candidate root,
+/// but the binary reads only ITS OWN store root: on a host where BOTH
+/// candidate roots hold conversations, a wrong-root Present proceeds to
+/// the CLI, which silently starts a fresh conversation (the exact
+/// no-silent-replacement violation the gate exists to prevent). The
+/// authority ladder treats a dual-populated store as genuine ambiguity
+/// Freshell cannot resolve: an id found in EITHER root answers Unknown
+/// (defer to the binary — its own missing-ID warning is visible in the
+/// pane, the documented pre-gate behavior; NEVER a silent substitution),
+/// an id found in NEITHER root answers Absent (the typed refusal —
+/// honest positive absence), and an unreadable-found-nowhere id answers
+/// Unreadable (fail-open, G28).
+///
+/// Scenario: the default root holds a DIFFERENT conversation (so the seam
+/// selects it) and the conversation under test lives in the snap root —
+/// both roots populated. The probe wiring mirrors `main.rs`.
+#[tokio::test]
+async fn antigravity_gate_dual_populated_store_defers_to_the_binary() {
+    let user_home = rv_temp_dir("agy-dual-defer");
+    let default_root = user_home.join(".gemini").join("antigravity-cli");
+    let snap_root = user_home
+        .join("snap")
+        .join("antigravity-cli")
+        .join("common")
+        .join(".gemini")
+        .join("antigravity-cli");
+    let default_conv = "11111111-2222-3333-4444-555555555562";
+    let snap_conv = "11111111-2222-3333-4444-555555555563";
+    seed_parseable_agy_conversation(&default_root, default_conv);
+    seed_parseable_agy_conversation(&snap_root, snap_conv);
+    let seam_root = freshell_sessions::provider_layout::antigravity_home(&user_home);
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![
+            Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+                seam_root.clone(),
+            )) as Arc<dyn SessionSource>,
+        ],
+        Duration::from_millis(50),
+        None,
+    ));
+    let probe = IndexExistenceProbe::new(
+        Arc::clone(&index),
+        None,
+        HashMap::from([("antigravity".to_string(), seam_root.clone())]),
+    )
+    .with_antigravity_transcript_locator(antigravity_authority_root_locator(&user_home));
+    index.warm().await;
+    // The id found in the seam-UNSELECTED root: defer, never Present — a
+    // Present here is a wrong-root Present the CLI cannot resume.
+    assert_eq!(
+        probe.exists_for_gate("antigravity", snap_conv),
+        SessionExistence::Unknown,
+        "a dual-populated store is genuine ambiguity: an id found in either \
+         root defers to the binary (Unknown), never a wrong-root Present"
+    );
+    assert_eq!(
+        probe.exists("antigravity", snap_conv),
+        SessionExistence::Unknown,
+        "the sync warm-Absent adjudication defers too — it must not adjudicate \
+         the conversation dead (Absent) OR present on ambiguous evidence"
+    );
+    // The same defer holds for an id found in the seam-SELECTED root: the
+    // binary's read root is still unknowable.
+    assert_eq!(
+        probe.exists_for_gate("antigravity", default_conv),
+        SessionExistence::Unknown,
+        "the defer is symmetric — an id in the seam-selected root is equally \
+         unreadable by the binary's own (unknown) root"
+    );
+    // An id found in NEITHER root answers Absent — the typed refusal stays
+    // honest (positive absence over both candidates).
+    assert_eq!(
+        probe.exists_for_gate("antigravity", "00000000-1111-2222-3333-444444444444"),
+        SessionExistence::Absent,
+        "absent from BOTH populated roots stays positive Absent — the typed refusal"
+    );
+    let _ = std::fs::remove_dir_all(&user_home);
+}
+
+/// Focused repair round 3, Major 1 — the operator override is
+/// AUTHORITATIVE: with `FRESHELL_ANTIGRAVITY_HOME` set, by-id answers come
+/// from that root ALONE (the operator declared the store). An id found
+/// only in another candidate root is Absent — the round-2 union answered
+/// Present for it, sending the CLI a wrong-root id it silently replaces
+/// with a fresh conversation (GC3). The override's OWN conversation stays
+/// Present, and a warm-index hit over a DIFFERENT root is corrected to
+/// Absent before the gate trusts it.
+///
+/// `env_override` is composed into the candidate list explicitly (never
+/// process-global env mutation): the same with-override shape the
+/// production constructor bakes at wiring time.
+#[tokio::test]
+async fn antigravity_gate_env_override_is_authoritative_alone() {
+    let user_home = rv_temp_dir("agy-override-authority");
+    let default_root = user_home.join(".gemini").join("antigravity-cli");
+    let override_root = user_home.join("custom-agy-store");
+    let override_conv = "11111111-2222-3333-4444-555555555564";
+    let default_conv = "11111111-2222-3333-4444-555555555565";
+    seed_parseable_agy_conversation(&override_root, override_conv);
+    seed_parseable_agy_conversation(&default_root, default_conv);
+    // The seam (ambient env unset in this process) selects the
+    // conversation-bearing default root — the index source. The gate's
+    // by-id locator carries the OPERATOR override instead.
+    let seam_root = freshell_sessions::provider_layout::antigravity_home(&user_home);
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![
+            Arc::new(freshell_sessions::antigravity::AntigravitySource::new(
+                seam_root.clone(),
+            )) as Arc<dyn SessionSource>,
+        ],
+        Duration::from_millis(50),
+        None,
+    ));
+    let probe = IndexExistenceProbe::new(
+        Arc::clone(&index),
+        None,
+        HashMap::from([("antigravity".to_string(), seam_root.clone())]),
+    )
+    .with_antigravity_transcript_locator(antigravity_authority_root_locator_with_override(
+        &user_home,
+        Some(override_root.to_str().unwrap()),
+    ));
+    index.warm().await;
+    // The override's own conversation: Present (the authority root holds it).
+    assert_eq!(
+        probe.exists_for_gate("antigravity", override_conv),
+        SessionExistence::Present,
+        "the operator-declared store root answers for its own conversations"
+    );
+    // An id found ONLY in the default root (the seam's pick, warm in the
+    // index): the override declares the store — the id is positively
+    // Absent, and the warm hit must be CORRECTED before the gate trusts it.
+    assert_eq!(
+        probe.exists_for_gate("antigravity", default_conv),
+        SessionExistence::Absent,
+        "an id outside the authoritative override root is Absent — never a \
+         wrong-root Present the CLI silently replaces"
+    );
+    // Reconcile's plain `exists()` keeps answering a WARM INDEX HIT from
+    // the seam's selected root (history/reconcile keep the seam's
+    // single-root selection — out of scope for the ladder): the hit says
+    // the conversation exists ON DISK, which it does. The GATE is where
+    // resumability by the binary's own store is decided, and it corrected
+    // the hit to Absent above.
+    assert_eq!(
+        probe.exists("antigravity", default_conv),
+        SessionExistence::Present,
+        "a warm index hit over the seam root stays Present on the reconcile \
+         path — the ladder corrects the GATE, not the index read"
+    );
+    // The warm-ABSENT arm DOES consult the ladder: an id the index does
+    // not carry and the override does not hold answers from the override
+    // ALONE (positive Absent — never rescued from another candidate root).
+    let snap_root = user_home
+        .join("snap")
+        .join("antigravity-cli")
+        .join("common")
+        .join(".gemini")
+        .join("antigravity-cli");
+    let snap_conv = "11111111-2222-3333-4444-555555555566";
+    seed_parseable_agy_conversation(&snap_root, snap_conv);
+    assert_eq!(
+        probe.exists("antigravity", snap_conv),
+        SessionExistence::Absent,
+        "the sync warm-Absent adjudication answers from the override alone — \
+         an id found only in a non-authoritative candidate root is Absent"
     );
     let _ = std::fs::remove_dir_all(&user_home);
 }

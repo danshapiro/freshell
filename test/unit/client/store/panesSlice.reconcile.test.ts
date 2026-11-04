@@ -24,6 +24,9 @@ import panesReducer, {
   setReconcileWarming,
   clearReconcileWarming,
   setReconcilePendingPanes,
+  setPaneStaleSessionNotice,
+  clearPaneStaleSessionNotice,
+  startNewManagedRuntimeConversation,
 } from '../../../../src/store/panesSlice'
 import type { PanesState } from '../../../../src/store/panesSlice'
 import { buildRestoreError } from '@shared/session-contract'
@@ -168,6 +171,73 @@ describe('reconcile reducers', () => {
     const c = terminalContent(next, 'tab1', 'p1')
     expect(c.terminalId).toBe('term-new')
     expect(c.sessionRef).toEqual({ provider: 'antigravity', sessionId: 'kept-conversation' })
+  })
+
+  // Focused repair round 3, Major 2 — the FreshUnbound stale-session
+  // notice: a pane-level dismissible notice mirroring the crash trace
+  // (znhn item 1). Written by the terminal.replaced fold when the frame
+  // carries staleSessionNotice; cleared by user dismissal; never written
+  // by the resumed/minted shapes.
+  it('setPaneStaleSessionNotice writes the notice and clearPaneStaleSessionNotice dismisses it', () => {
+    const notice = 'Saved antigravity session deleted-conversation could not be found on disk — started a fresh session instead.'
+    const state = stateWithTerminalPane({
+      terminalId: 'term-old',
+      status: 'running',
+      sessionRef: undefined,
+    })
+    const written = panesReducer(state, setPaneStaleSessionNotice({
+      tabId: 'tab1',
+      paneId: 'p1',
+      staleSessionNotice: notice,
+    }))
+    expect(terminalContent(written, 'tab1', 'p1').staleSessionNotice).toBe(notice)
+
+    const cleared = panesReducer(written, clearPaneStaleSessionNotice({ tabId: 'tab1', paneId: 'p1' }))
+    expect(terminalContent(cleared, 'tab1', 'p1').staleSessionNotice).toBeUndefined()
+  })
+
+  // The notice survives content merges (normalizePaneContent is a
+  // whitelist — without the line the "survives reload" property dies at
+  // the first merge) and is cleared when a genuinely NEW conversation
+  // starts (the crash-trace rule's sibling: the fresh conversation is not
+  // the refused one; the respawn branch keeps it — same conversation).
+  it('staleSessionNotice survives content merges and clears on a fresh conversation', () => {
+    const notice = 'Saved antigravity session deleted-conversation could not be found on disk — started a fresh session instead.'
+    const state = stateWithTerminalPane({
+      terminalId: 'term-old',
+      status: 'running',
+      staleSessionNotice: notice,
+    })
+    // A content merge (the normalize whitelist) keeps the notice.
+    const merged = panesReducer(state, updatePaneContent({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: { ...terminalContent(state, 'tab1', 'p1'), terminalId: 'term-new' },
+    }))
+    expect(terminalContent(merged, 'tab1', 'p1').staleSessionNotice).toBe(notice)
+
+    // A deliberate new conversation clears it (startNewManagedRuntimeConversation).
+    const started = panesReducer(merged, startNewManagedRuntimeConversation({ tabId: 'tab1', paneId: 'p1' }))
+    expect(terminalContent(started, 'tab1', 'p1').staleSessionNotice).toBeUndefined()
+
+    // The reconcile fresh create (no resumable sessionRef) clears it too;
+    // the respawn create (same conversation) keeps it — the pane's mode
+    // must match the sessionRef provider for the respawn to hold.
+    const respawnable = stateWithTerminalPane({
+      mode: 'antigravity',
+      terminalId: 'term-old',
+      status: 'running',
+      staleSessionNotice: notice,
+    })
+    const respawned = panesReducer(respawnable, resetPaneForReconcileCreate({
+      tabId: 'tab1', paneId: 'p1', intent: 'respawn',
+      sessionRef: { provider: 'antigravity', sessionId: 'live-conversation' },
+    }))
+    expect(terminalContent(respawned, 'tab1', 'p1').staleSessionNotice).toBe(notice)
+    const fresh = panesReducer(respawnable, resetPaneForReconcileCreate({
+      tabId: 'tab1', paneId: 'p1', intent: 'fresh',
+    }))
+    expect(terminalContent(fresh, 'tab1', 'p1').staleSessionNotice).toBeUndefined()
   })
 
   // Task-009b (goal 4): a verdict that CONFIRMS the pane's exact current

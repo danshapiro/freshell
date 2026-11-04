@@ -481,6 +481,13 @@ async fn respawn_with_absent_session_spawns_fresh_and_retires_binding() {
         "amplifier is a fresh-id-minting provider: the gate-fired respawn \
          reports the AD-3 minter disposition"
     );
+    // Focused repair round 3, Major 2: the minter shape passes NO stale-id
+    // notice — only FreshUnbound carries it (the fresh terminal here HAS an
+    // identity, the minted id; its fold stays exactly as today).
+    assert_eq!(
+        outcome.stale_session_notice, None,
+        "the MintedReplacement respawn outcome carries no stale-id notice"
+    );
 
     // 2. The stale row is retired SessionMissing — never retried forever.
     let stale_row = ledger

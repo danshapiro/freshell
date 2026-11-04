@@ -28,6 +28,8 @@ import {
   setPaneCrashTrace,
   setPaneLaunchFailure,
   clearPaneCrashTrace,
+  setPaneStaleSessionNotice,
+  clearPaneStaleSessionNotice,
   splitPane,
   mergePaneContent,
   updatePaneContent,
@@ -6660,6 +6662,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 crashTrace: { exitCode: msg.exitCode, resumedAtMs: Date.now() },
               })
             )
+            // Focused repair round 3, Major 2: the FreshUnbound replacement
+            // carries the gate's stale-id notice on THIS frame — the path the
+            // pane actually consumes. The respawn's Recovering broadcast
+            // names the stale id too, but it is addressed to the NEW terminal
+            // id, which this pane (matching by the OLD id) cannot know before
+            // this frame — and this fold clears the recovery notice anyway.
+            // Without the carried notice the fresh pane would show no
+            // explanation naming the lost conversation. Resumed/MintedReplacement
+            // frames carry no notice and write nothing here.
+            if (msg.staleSessionNotice) {
+              dispatch(
+                setPaneStaleSessionNotice({
+                  tabId,
+                  paneId: paneIdRef.current,
+                  staleSessionNotice: msg.staleSessionNotice,
+                })
+              )
+            }
             // Fold the new terminalId into this pane via the ONE reducer built
             // for server-supplied rebinds (mirrors pane-reconcile.ts:428-436).
             // applyReconcileAttach unconditionally overwrites serverInstanceId
@@ -7974,6 +7994,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Keep recovery diagnostics in state, but show only actionable failures.
   const visibleNotice = managedTerminal ? null : activeNotice
   const visibleCrashTrace = managedTerminal ? null : terminalContent.crashTrace
+  // Round 3, Major 2: the FreshUnbound stale-session notice (the crash
+  // trace's dismissible sibling) — hidden on managed panes like the trace.
+  const visibleStaleSessionNotice = managedTerminal ? null : terminalContent.staleSessionNotice
   const showBlockingSpinner = terminalContent.status === 'creating'
     && !isManagedRuntimeRecoveryPending(terminalContent.recoverySummary)
     && !hasFatalConnectionError
@@ -8027,7 +8050,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   ))
   const showExitBanner = Boolean(
     !managedRecoveryDecision
-    && isAgentPane && (visibleNotice || visibleCrashTrace || showSettledDead || killedSessionVacant)
+    && isAgentPane && (visibleNotice || visibleCrashTrace || visibleStaleSessionNotice || showSettledDead || killedSessionVacant)
   )
 
   // ── kata b8ke: typed recovery surfaces ──
@@ -8390,6 +8413,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             exitCode={exitRecord?.exitCode ?? null}
             notice={visibleNotice ?? null}
             crashTrace={visibleCrashTrace ?? null}
+            staleSessionNotice={visibleStaleSessionNotice ?? null}
             settledDead={showSettledDead}
             vacantRecovery={killedSessionVacant}
             resumeCycles={managedTerminal ? null : resumeCycles}
@@ -8397,6 +8421,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               terminalContent.sessionRef && terminalContent.sessionRef.provider === terminalContent.mode
             )}
             onDismissCrashTrace={() => dispatch(clearPaneCrashTrace({ tabId, paneId }))}
+            onDismissStaleSessionNotice={() => dispatch(clearPaneStaleSessionNotice({ tabId, paneId }))}
             onRelaunch={() => {
               // Discard the OLD crash's lifecycle entry: if the relaunch
               // create is rejected (pane settles 'error' with no new

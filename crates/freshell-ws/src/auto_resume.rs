@@ -605,14 +605,19 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                     )
                                     .await
                                 {
-                                    driver.emit_replaced(
-                                        &ev.terminal_id,
-                                        &outcome.terminal_id,
-                                        ev.exit_code,
+                                    driver.emit_replaced(ReplacedAnnouncement {
+                                        old_terminal_id: &ev.terminal_id,
+                                        new_terminal_id: &outcome.terminal_id,
+                                        exit_code: ev.exit_code,
                                         attempt,
                                         max_attempts,
-                                        replacement_identity_disposition(outcome.identity),
-                                    );
+                                        identity_disposition: replacement_identity_disposition(
+                                            outcome.identity,
+                                        ),
+                                        // Resumed/MintedReplacement pass no
+                                        // stale-id notice (round 3, Major 2).
+                                        stale_session_notice: None,
+                                    });
                                     // One successful auto-resume = one breaker
                                     // cycle (znhn item 2). Re-fetch the entry —
                                     // the earlier borrow ended before the awaits.
@@ -646,8 +651,12 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                             // SESSION_MISSING error). The pane has NO saved
                             // identity and binds the conversation the CLI
                             // mints through the provider's natural rebind;
-                            // the respawn's Recovering notice (naming the
-                            // stale id) keeps the user informed.
+                            // the replaced frame carries the gate's notice
+                            // naming the stale id (round 3, Major 2) — the
+                            // respawn's Recovering broadcast names it too,
+                            // but addressed to the NEW terminal id the pane
+                            // cannot match, and this fold clears the
+                            // recovery notice.
                             crate::terminal::RespawnedIdentity::FreshUnbound => {
                                 driver.fail_claim(&provider, &session_id, &key);
                                 tracing::info!(
@@ -660,16 +669,24 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                      identity-less fresh conversation — the stale claim is \
                                      released, never completed against it"
                                 );
-                                driver.emit_replaced(
-                                    &ev.terminal_id,
-                                    &outcome.terminal_id,
-                                    ev.exit_code,
+                                driver.emit_replaced(ReplacedAnnouncement {
+                                    old_terminal_id: &ev.terminal_id,
+                                    new_terminal_id: &outcome.terminal_id,
+                                    exit_code: ev.exit_code,
                                     attempt,
                                     max_attempts,
-                                    replacement_identity_disposition(
+                                    identity_disposition: replacement_identity_disposition(
                                         crate::terminal::RespawnedIdentity::FreshUnbound,
                                     ),
-                                );
+                                    // Focused repair round 3, Major 2: carry the
+                                    // gate's notice naming the stale id on the
+                                    // frame the pane consumes — the pane knows
+                                    // only the OLD terminal id, so the respawn's
+                                    // Recovering broadcast (addressed to the
+                                    // NEW id) can never reach it, and this fold
+                                    // clears the recovery notice anyway.
+                                    stale_session_notice: outcome.stale_session_notice.as_deref(),
+                                });
                                 // The respawn still happened — one breaker cycle
                                 // (the fresh generation shares the createRequestId
                                 // and must stay inside the crash-loop bound).
@@ -722,6 +739,28 @@ fn replacement_identity_disposition(
         Respawned::MintedReplacement => Disposition::MintedReplacement,
         Respawned::FreshUnbound => Disposition::FreshUnbound,
     }
+}
+
+/// The `terminal.replaced` announcement's payload — the frame fields the
+/// hub hands the driver, grouped so the trait method stays inside
+/// clippy's argument-count bound once round 3 (Major 2) added the
+/// stale-id notice.
+pub(crate) struct ReplacedAnnouncement<'a> {
+    pub old_terminal_id: &'a str,
+    pub new_terminal_id: &'a str,
+    pub exit_code: i64,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
+    /// Focused repair round 3, Major 2: the gate's operator-visible notice
+    /// naming the REFUSED stale conversation, passed ONLY on the FreshUnbound
+    /// shape — the frame is the path the pane actually consumes (the
+    /// respawn's Recovering broadcast names the stale id but is addressed
+    /// to the NEW terminal id, which the pane cannot match before this
+    /// frame, and this fold clears the recovery notice).
+    /// `Resumed`/`MintedReplacement` pass `None` (their folds stay exactly
+    /// as today).
+    pub stale_session_notice: Option<&'a str>,
 }
 
 /// Orchestrator-facing effects, faked in unit tests.
@@ -833,15 +872,17 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     /// no `previousSessionId`) folds without hitting the client's
     /// association conflict rule. `Resumed`/`MintedReplacement` keep the
     /// legacy client fold (the pane's recorded ref is preserved).
-    fn emit_replaced(
-        &self,
-        old: &str,
-        new: &str,
-        exit_code: i64,
-        attempt: u32,
-        max_attempts: u32,
-        identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
-    );
+    ///
+    /// `stale_session_notice` (focused repair round 3, Major 2) is the
+    /// gate's operator-visible notice naming the REFUSED stale
+    /// conversation, passed ONLY on the FreshUnbound shape — the frame
+    /// is the path the pane actually consumes (the respawn's Recovering
+    /// broadcast names the stale id but is addressed to the NEW terminal
+    /// id, which the pane cannot match before this frame, and this fold
+    /// clears the recovery notice). `Resumed`/`MintedReplacement` pass
+    /// `None` (their folds stay exactly as today). See
+    /// [`ReplacedAnnouncement`].
+    fn emit_replaced(&self, announcement: ReplacedAnnouncement<'_>);
     /// Broadcast the settle frame — `terminal.status { status: 'exited' }`
     /// for the OLD terminal id (znhn item 3). Every agent-mode settle emits
     /// it: the client clears the recovering notice on a FRAME, never on a
@@ -1466,26 +1507,19 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         broadcast_frame(&self.state, terminal_id, "recovering", &msg);
     }
 
-    fn emit_replaced(
-        &self,
-        old: &str,
-        new: &str,
-        exit_code: i64,
-        attempt: u32,
-        max_attempts: u32,
-        identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
-    ) {
+    fn emit_replaced(&self, announcement: ReplacedAnnouncement<'_>) {
         let msg = freshell_protocol::ServerMessage::TerminalReplaced(
             freshell_protocol::TerminalReplaced {
-                old_terminal_id: old.to_string(),
-                new_terminal_id: new.to_string(),
-                exit_code,
-                attempt,
-                max_attempts,
-                identity_disposition: Some(identity_disposition),
+                old_terminal_id: announcement.old_terminal_id.to_string(),
+                new_terminal_id: announcement.new_terminal_id.to_string(),
+                exit_code: announcement.exit_code,
+                attempt: announcement.attempt,
+                max_attempts: announcement.max_attempts,
+                identity_disposition: Some(announcement.identity_disposition),
+                stale_session_notice: announcement.stale_session_notice.map(str::to_string),
             },
         );
-        broadcast_frame(&self.state, old, "replaced", &msg);
+        broadcast_frame(&self.state, announcement.old_terminal_id, "replaced", &msg);
     }
 
     fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
@@ -1889,6 +1923,11 @@ mod tests {
         /// `replaced` — recorded separately so the existing
         /// `(old, new, attempt)` assertions stay untouched.
         replaced_dispositions: Vec<freshell_protocol::TerminalReplacedIdentityDisposition>,
+        /// Stale-id notices carried by the emitted `terminal.replaced`
+        /// announcements (focused repair round 3, Major 2), parallel to
+        /// `replaced` — `Some(text)` only on the FreshUnbound shape;
+        /// Resumed/MintedReplacement record `None`.
+        replaced_stale_notices: Vec<Option<String>>,
         respawns: Vec<RespawnSpec>,
         claims: Vec<String>,
         completes: Vec<String>,
@@ -1933,10 +1972,12 @@ mod tests {
                     respawn_result: Ok(RespawnOutcome {
                         terminal_id: "t-new".into(),
                         identity: crate::terminal::RespawnedIdentity::Resumed,
+                        stale_session_notice: None,
                     }),
                     recovering: Vec::new(),
                     replaced: Vec::new(),
                     replaced_dispositions: Vec::new(),
+                    replaced_stale_notices: Vec::new(),
                     respawns: Vec::new(),
                     claims: Vec::new(),
                     completes: Vec::new(),
@@ -2020,6 +2061,9 @@ mod tests {
             &self,
         ) -> Vec<freshell_protocol::TerminalReplacedIdentityDisposition> {
             self.lock().replaced_dispositions.clone()
+        }
+        fn replaced_stale_notices(&self) -> Vec<Option<String>> {
+            self.lock().replaced_stale_notices.clone()
         }
         fn respawn_calls(&self) -> Vec<RespawnSpec> {
             self.lock().respawns.clone()
@@ -2167,18 +2211,17 @@ mod tests {
                 panic!("test-injected driver panic");
             }
         }
-        fn emit_replaced(
-            &self,
-            old: &str,
-            new: &str,
-            _exit_code: i64,
-            attempt: u32,
-            _max_attempts: u32,
-            identity_disposition: freshell_protocol::TerminalReplacedIdentityDisposition,
-        ) {
+        fn emit_replaced(&self, announcement: ReplacedAnnouncement<'_>) {
             let mut s = self.lock();
-            s.replaced.push((old.to_string(), new.to_string(), attempt));
-            s.replaced_dispositions.push(identity_disposition);
+            s.replaced.push((
+                announcement.old_terminal_id.to_string(),
+                announcement.new_terminal_id.to_string(),
+                announcement.attempt,
+            ));
+            s.replaced_dispositions
+                .push(announcement.identity_disposition);
+            s.replaced_stale_notices
+                .push(announcement.stale_session_notice.map(str::to_string));
         }
         fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
             self.lock().settled_frames.push((
@@ -2299,6 +2342,13 @@ mod tests {
         assert_eq!(
             fake.replaced_dispositions(),
             vec![freshell_protocol::TerminalReplacedIdentityDisposition::Resumed]
+        );
+        // Focused repair round 3, Major 2: the Resumed shape passes NO
+        // stale-id notice — its fold stays exactly as today.
+        assert_eq!(
+            fake.replaced_stale_notices(),
+            vec![None],
+            "the Resumed replacement carries no staleSessionNotice"
         );
         assert!(
             fake.recovering_calls()
@@ -2571,9 +2621,11 @@ mod tests {
     async fn fresh_unbound_respawn_releases_the_claim_and_still_replaces() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
+        let stale_notice = "Saved antigravity session stale-agy could not be found on disk — started a fresh session instead.";
         fake.set_respawn_result(Ok(RespawnOutcome {
             terminal_id: "t-new".into(),
             identity: crate::terminal::RespawnedIdentity::FreshUnbound,
+            stale_session_notice: Some(stale_notice.to_string()),
         }));
         let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
@@ -2607,6 +2659,18 @@ mod tests {
             fake.replaced_dispositions(),
             vec![freshell_protocol::TerminalReplacedIdentityDisposition::FreshUnbound],
             "the FreshUnbound replacement carries the fresh_unbound identity disposition"
+        );
+        // Focused repair round 3, Major 2: the FreshUnbound replacement
+        // carries the gate's notice NAMING the stale id on the frame the
+        // pane actually consumes — the respawn's Recovering broadcast
+        // names it too, but addressed to the NEW terminal id the pane
+        // cannot match before this frame, and this fold clears the
+        // recovery notice. Without the carried notice the fresh pane
+        // shows no explanation naming the lost conversation.
+        assert_eq!(
+            fake.replaced_stale_notices(),
+            vec![Some(stale_notice.to_string())],
+            "the FreshUnbound replacement carries the gate's stale-id notice"
         );
         assert!(
             fake.settled_reasons().is_empty(),

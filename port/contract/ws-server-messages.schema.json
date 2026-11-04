@@ -5856,6 +5856,9 @@
         "oldTerminalId": {
           "type": "string"
         },
+        "staleSessionNotice": {
+          "type": "string"
+        },
         "type": {
           "const": "terminal.replaced",
           "type": "string"

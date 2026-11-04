@@ -681,6 +681,66 @@ fn terminal_replaced_identity_disposition_is_optional_and_additive() {
 }
 
 #[test]
+fn terminal_replaced_stale_session_notice_is_optional_and_additive() {
+    // Focused repair round 3, Major 2: the FreshUnbound replacement
+    // carries the gate's stale-id notice on the path the pane ACTUALLY
+    // consumes. The server also broadcasts a terminal.status{recovering}
+    // frame with the notice, but for the NEW terminal id — before
+    // terminal.replaced — so the pane (which knows the OLD id) can never
+    // match it and the replaced fold clears the recovery notice: without
+    // this field the fresh pane shows no explanation naming the lost
+    // conversation. Additive/optional: absent keeps the legacy frame
+    // byte-shape; Resumed/MintedReplacement frames omit it (their folds
+    // stay exactly as today).
+    //
+    // Wire-level (serde_json::Value) assertions so the contract failure is
+    // observable at RUNTIME against a pre-field build, not only as a
+    // compile error: a server that ignores the key drops it on
+    // re-serialization.
+    let legacy = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3}"#;
+    let msg: ServerMessage = serde_json::from_str(legacy).expect("parse legacy");
+    let reser = serde_json::to_value(&msg).expect("serialize legacy");
+    assert_eq!(reser["type"], "terminal.replaced");
+    assert!(
+        reser.get("staleSessionNotice").is_none(),
+        "absent notice keeps the legacy frame byte-shape — no key on the wire"
+    );
+    // The full FreshUnbound shape: disposition + notice naming the stale id
+    // ride through unchanged and conform to the frozen (regenerated) schema.
+    let wire = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3,"identityDisposition":"fresh_unbound","staleSessionNotice":"Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead."}"#;
+    let msg: ServerMessage = serde_json::from_str(wire).expect("parse fresh_unbound shape");
+    let reser = serde_json::to_value(&msg).expect("serialize fresh_unbound shape");
+    assert_eq!(
+        reser["staleSessionNotice"],
+        "Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.",
+        "the stale-id notice must survive the round-trip on the wire"
+    );
+    assert_eq!(reser["identityDisposition"], "fresh_unbound");
+    // Struct-level pin (the field exists — round 3's green shape): the
+    // parsed frame carries the disposition and the notice; the legacy
+    // frame's wire-level absence assertion above pins the None shape.
+    match msg {
+        ServerMessage::TerminalReplaced(r) => {
+            assert_eq!(
+                r.identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+            assert_eq!(
+                r.stale_session_notice.as_deref(),
+                Some("Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.")
+            );
+        }
+        other => panic!("expected TerminalReplaced, got {other:?}"),
+    }
+    let schema = outbound_schema()["messages"]["terminal.replaced"].clone();
+    assert!(
+        !schema.is_null(),
+        "no frozen schema for server `terminal.replaced`"
+    );
+    assert_conforms(&validator(&schema), &reser, "terminal.replaced");
+}
+
+#[test]
 fn terminal_status_exited_settle_frame_roundtrips() {
     // znhn item 3: the auto-resume SETTLE frame — status 'exited' on the
     // existing terminal.status message, with the typed resumeCycles field

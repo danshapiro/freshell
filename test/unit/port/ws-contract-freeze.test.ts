@@ -21,6 +21,11 @@ import {
 const ZOD_BACKED_SERVER_MESSAGES = [
   'amplifier.activity.list.response',
   'amplifier.activity.updated',
+  // Focused repair round 2's contract reconcile promoted the antigravity
+  // activity family (plan Task 8) from the extension const into the frozen
+  // Zod-backed surface — the overlap guard must compare them too.
+  'antigravity.activity.list.response',
+  'antigravity.activity.updated',
   'claude.activity.list.response',
   'claude.activity.updated',
   'codex.activity.list.response',

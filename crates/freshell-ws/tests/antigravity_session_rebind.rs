@@ -1744,6 +1744,30 @@ async fn antigravity_crash_respawn_with_deleted_conversation_releases_the_stale_
         .expect("new terminal id")
         .to_string();
 
+    // 4b. Focused repair round 3, Major 2: the replaced frame — the path
+    //     the pane ACTUALLY consumes — carries the gate's stale-id notice.
+    //     The Recovering frame below (step 5) names the stale id too, but
+    //     it is addressed to the NEW terminal id, which the pane cannot
+    //     know yet (it learns the id only from THIS frame), and the
+    //     replaced fold clears the pane's recovery notice — so without
+    //     the carried notice the fresh pane would show no explanation
+    //     naming the lost conversation.
+    assert_eq!(
+        replaced["identityDisposition"], "fresh_unbound",
+        "the FreshUnbound replacement announces its identity disposition: {replaced}"
+    );
+    let stale_notice = replaced["staleSessionNotice"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the replaced frame must carry staleSessionNotice: {replaced}"));
+    assert!(
+        stale_notice.contains(conv.as_str()),
+        "the carried notice names the stale conversation id: {stale_notice}"
+    );
+    assert!(
+        stale_notice.contains("could not be found"),
+        "the carried notice explains the fresh replacement: {stale_notice}"
+    );
+
     // 5. The Recovering notice naming the stale id was broadcast (the
     //    respawn's gate block) — the user is informed, on the record.
     assert!(

@@ -132,6 +132,13 @@ function normalizePaneContent(
     const codexDurability = sanitizeCodexDurabilityRef(input.codexDurability)
     const restoreError = sanitizeRestoreError((input as { restoreError?: unknown }).restoreError)
     const crashTrace = sanitizeCrashTrace((input as { crashTrace?: unknown }).crashTrace)
+    // Focused repair round 3, Major 2: the stale-session notice rides the
+    // whitelist like crashTrace (a plain string — the reconcileNotice
+    // typeof pattern) so it survives hydrate/merges; persistence is a
+    // denylist and persistMiddleware keeps it.
+    const staleSessionNotice = typeof (input as { staleSessionNotice?: unknown }).staleSessionNotice === 'string'
+      ? (input as { staleSessionNotice?: string }).staleSessionNotice
+      : undefined
     const launchFailure = normalizeLaunchFailure((input as { launchFailure?: unknown }).launchFailure)
     const handoffError = normalizeHandoffError((input as { handoffError?: unknown }).handoffError)
     return {
@@ -169,6 +176,9 @@ function normalizePaneContent(
       // "survives reload" property silently dies here even though the
       // persistMiddleware strip and persistedState load both keep it).
       ...(crashTrace ? { crashTrace } : {}),
+      // Focused repair round 3, Major 2: the FreshUnbound stale-session
+      // notice survives the same way (persistent until dismissed).
+      ...(staleSessionNotice ? { staleSessionNotice } : {}),
       // kata b8ke typed failure surfaces (VOLATILE): survive identity-preserving
       // merges; a wholesale content swap omits them and clears them.
       ...(launchFailure ? { launchFailure } : {}),
@@ -2007,6 +2017,10 @@ export const panesSlice = createSlice({
         content.pendingReconcile = undefined
         content.reconcileEpoch = undefined
         content.crashTrace = undefined
+        // Round 3, Major 2: the new conversation has its own identity — the
+        // stale-session notice about the abandoned one must not leak onto it
+        // (the crashTrace rule's sibling).
+        content.staleSessionNotice = undefined
         content.launchFailure = undefined
         content.handoffError = undefined
         content.namingHandle = undefined
@@ -2771,6 +2785,9 @@ export const panesSlice = createSlice({
         // trace belongs to the retired session and must not leak onto it.
         // The 'respawn' branch deliberately KEEPS it (same conversation).
         content.crashTrace = undefined
+        // Round 3, Major 2: same rule for the FreshUnbound stale-session
+        // notice — the fresh conversation is not the refused one.
+        content.staleSessionNotice = undefined
       }
       content.pendingReconcile = intent
       // A1 fix: same-createRequestId folds are only observable via the epoch bump.
@@ -2967,6 +2984,26 @@ export const panesSlice = createSlice({
       if (content && content.crashTrace) delete content.crashTrace
     },
 
+    // Focused repair round 3, Major 2 (the setPaneCrashTrace pattern's
+    // sibling): the FreshUnbound stale-session notice — written on the
+    // terminal.replaced fold when the frame carries staleSessionNotice
+    // (the path the pane actually consumes), cleared by user dismissal.
+    // Resumed/MintedReplacement frames never write it.
+    setPaneStaleSessionNotice: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; staleSessionNotice: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (content) content.staleSessionNotice = action.payload.staleSessionNotice
+    },
+    clearPaneStaleSessionNotice: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (content && content.staleSessionNotice) delete content.staleSessionNotice
+    },
+
     setReconcileWarming: (state, action: PayloadAction<ReconcileWarmingState>) => {
       state.reconcileWarming = action.payload
     },
@@ -3137,6 +3174,8 @@ export const {
   clearPaneCloseError,
   setPaneCrashTrace,
   clearPaneCrashTrace,
+  setPaneStaleSessionNotice,
+  clearPaneStaleSessionNotice,
   setReconcileWarming,
   clearReconcileWarming,
   setReconcilePendingPanes,

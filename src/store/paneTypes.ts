@@ -387,6 +387,16 @@ export type TerminalPaneContent = {
   /** znhn item 1: persisted deliberately — do NOT add to
    * stripTransientSessionFields. Absent on old layouts = no trace. */
   crashTrace?: CrashTrace
+  /** Focused repair round 3, Major 2 (the setPaneCrashTrace pattern's
+   * sibling): the gate's stale-id notice naming the REFUSED conversation,
+   * carried on the `terminal.replaced` frame (`staleSessionNotice`, the
+   * fresh_unbound shape only) — the path the pane actually consumes; the
+   * respawn's Recovering broadcast names it too but is addressed to the NEW
+   * terminal id the pane cannot match. Persisted deliberately (survives
+   * reload until dismissed) — do NOT add to stripTransientSessionFields;
+   * rides the normalizePaneContent whitelist. Absent on old layouts = no
+   * notice. */
+  staleSessionNotice?: string
   /**
    * Unified agent names (Task 1): the canonical naming identity this pane's
    * name resolves through — a pending handle while provider identity is
