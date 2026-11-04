@@ -275,6 +275,17 @@ describe('analyzeFreshAgentAttachRounds', () => {
       attach(2, 1),
       result('other-session', 'attach'),
     ], target)
+    const supersededByMismatchedSession = analyzeFreshAgentAttachRounds([
+      ready(),
+      request('matching-session'),
+      request('newer-other-session', [{
+        ...targetPane(),
+        sessionRef: { provider: target.provider, sessionId: 'other-session' },
+      }]),
+      committedOwner(),
+      attach(2, 1),
+      result('matching-session', 'attach'),
+    ], target)
 
     expect(attachBeforeResult.rounds[0].attachments).toEqual([])
     expect(attachBeforeResult.rounds[1].attachments).toMatchObject([
@@ -293,6 +304,11 @@ describe('analyzeFreshAgentAttachRounds', () => {
     expect(mismatchedRequest.rounds[0].attachments).toHaveLength(1)
     expect(mismatchedSessionRequest.validReconcileRoundIds).toEqual([])
     expect(mismatchedSessionRequest.rounds[0].attachments).toHaveLength(1)
+    expect(supersededByMismatchedSession.validReconcileRoundIds).toEqual([])
+    expect(supersededByMismatchedSession.rounds[0].attachments).toMatchObject([
+      { frameIndex: 4, observedEpoch: 2, observedGeneration: 1 },
+    ])
+    expect(supersededByMismatchedSession.rounds.map((round) => round.kind)).toEqual(['ready'])
   })
 
   it('authorizes one same-fence attach retry only after the exact typed snapshot refusal', () => {

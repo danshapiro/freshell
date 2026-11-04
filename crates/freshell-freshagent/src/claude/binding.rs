@@ -183,7 +183,7 @@ impl FreshClaudeState {
         let Some(sink) = self.identity_sink() else {
             return Ok(());
         };
-        let (session_id, session_type, settings, stamp, _guard) = {
+        let (session_id, session_type, settings, stamp, claim, _guard) = {
             let sessions = self.sessions.lock().await;
             // The receipt's process tag survives a native reset. Resolve the
             // current UUID from that exact runtime after the control await.
@@ -205,6 +205,24 @@ impl FreshClaudeState {
                 ),
                 None => None,
             };
+            let claim = stamp.as_ref().and_then(|stamp| {
+                (stamp.owner.ownership_id.as_deref() == Some(stamp.operation_id.as_str())).then(
+                    || {
+                        crate::identity_sink::BindingClaim::live_fresh_agent(
+                            PROVIDER,
+                            id,
+                            &stamp.operation_id,
+                            stamp.epoch,
+                            stamp.generation,
+                        )
+                    },
+                )
+            });
+            if self.ownership.is_some() && claim.is_none() {
+                return Err(std::io::Error::other(
+                    "the configured runtime has no exact Live Freshagent binding claim",
+                ));
+            }
             let observed = stamp
                 .as_ref()
                 .map(|stamp| freshell_ownership::ObservedFence {
@@ -230,6 +248,7 @@ impl FreshClaudeState {
                 session.session_type.clone(),
                 session.configuration.settings.clone(),
                 stamp,
+                claim,
                 guard,
             )
         };
@@ -245,7 +264,7 @@ impl FreshClaudeState {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: stamp.as_ref().map(|stamp| stamp.epoch),
             observed_generation: stamp.as_ref().map(|stamp| stamp.generation),
-            claim: None,
+            claim,
             settings: crate::identity_sink::SettingsUpdate::Replace(settings),
         })
         .await?;

@@ -216,7 +216,6 @@ export function analyzeFreshAgentAttachRounds(
   const validReconcileRoundIds: string[] = []
   const pendingReconciles = new Map<string, PendingReconcile>()
   const pendingSnapshotRequests = new Map<string, PendingSnapshotRequest>()
-  const nonDuplicateAttachments = new WeakSet<FreshAgentAttachObservation>()
   let readyContext: ReadyContext | null = null
   let startingOwner: OwnerFence | null = null
   let liveUpgradeFence: OwnerFence | null = null
@@ -261,8 +260,7 @@ export function analyzeFreshAgentAttachRounds(
         existingDuplicates.add(attachment)
       } else if (pending.sourceRound.attachments.length > 0
         && !attachment.retryAfterSessionReserved
-        && !attachment.retryAfterRestoreUnavailable
-        && !nonDuplicateAttachments.has(attachment)) {
+        && !attachment.retryAfterRestoreUnavailable) {
         existingDuplicates.add(attachment)
       }
       pending.sourceRound.attachments.push(attachment)
@@ -370,6 +368,17 @@ export function analyzeFreshAgentAttachRounds(
         pendingReconciles.set(reconcileId, null)
         continue
       }
+      const targetPaneKey = target.tabId + ':' + target.paneId
+      // The pane key identifies the view slot even when its current session is
+      // no longer the target. A newer schema-valid decision for that slot
+      // invalidates an older provisional decision before identity matching.
+      if (panes.some((pane) => pane.paneKey === targetPaneKey)) {
+        for (const [previousId, previous] of pendingReconciles) {
+          if (previous?.targetPaneKey !== targetPaneKey) continue
+          rollbackPendingRound(previous)
+          pendingReconciles.set(previousId, null)
+        }
+      }
       const targetPane = targetPaneForRequest(panes, target)
       const targetCreateRequestId = targetPane ? nonEmptyString(targetPane.createRequestId) : null
       if (!targetPane || !targetCreateRequestId || panes.length > 200) {
@@ -377,15 +386,9 @@ export function analyzeFreshAgentAttachRounds(
         continue
       }
 
-      const targetPaneKey = target.tabId + ':' + target.paneId
       // A newer reconcile decision supersedes an unfinished one for the same
       // view. Return its captured traffic to the source round before opening
       // the newer window; this keeps the pending attribution one-shot.
-      for (const [previousId, previous] of pendingReconciles) {
-        if (previous?.targetPaneKey !== targetPaneKey) continue
-        rollbackPendingRound(previous)
-        pendingReconciles.set(previousId, null)
-      }
       const round = makeRound({
         id: 'pending-reconcile:' + reconcileId,
         kind: 'reconcile',
