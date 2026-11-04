@@ -228,12 +228,15 @@ fn title_derives_from_first_user_input_content_at_200_chars() {
 /// `step_index` + a second-granularity `created_at`) is the CLI's
 /// failure-path record, produced by API/network failure retries. It
 /// carries no content/thinking, so it stays a NON-message record in the
-/// parser: the unknown-type arm is its deliberate home (the same
-/// discipline the evidence report recorded as "no parser change is
-/// indicated"), and this pin holds it there — no message, no summary,
-/// no title, no stamp fold — while the surrounding real-shaped records
-/// still own the row. A record shaped exactly per the receipt (with a
-/// NEWER stamp than the reply) proves the stamp does not move.
+/// parser: no message, no summary, no title, no tokens — this pin holds
+/// it there. Round 4 (final-delta Fix 4) additionally folds its stamp
+/// (a failed turn IS activity), which THIS mid-transcript shape cannot
+/// discriminate — the retry reply's later stamp still owns the maximum —
+/// so the companion failed-turn pin
+/// (`failed_turn_error_message_stamp_owns_last_activity`) discriminates
+/// the fold. A record shaped exactly per the receipt (mid-transcript,
+/// before a successful retry reply) proves the message-level fields
+/// stay the reply's and the user's.
 #[test]
 fn error_message_record_parses_as_a_non_message_record() {
     let content = concat!(
@@ -252,11 +255,50 @@ fn error_message_record_parses_as_a_non_message_record() {
     );
     assert_eq!(meta.title.as_deref(), Some("Prompt that hit a dead proxy"));
     assert_eq!(meta.summary.as_deref(), Some("Retried and replied."));
-    // The stamps come from the real-shaped records only: the ERROR_MESSAGE
-    // record's own NEWER created_at (20:00:09) moves nothing.
+    // The stamps: the fold is max-harmless here — the reply's later
+    // created_at (20:00:12) still owns last_activity_at, with the
+    // ERROR_MESSAGE stamp (20:00:09) folded under it (the discriminating
+    // case is the companion failed-turn pin).
     assert_eq!(meta.created_at, Some(1_793_304_001_000));
     assert_eq!(meta.last_activity_at, Some(1_793_304_012_000));
-    // The record is COUNTED (it is real bytes on disk) but stays inert.
+    // The record is COUNTED (it is real bytes on disk) but contributes no
+    // message-level field.
     assert_eq!(meta.message_count, 3);
     assert_eq!(meta.token_usage, Some(usage(7, 8, 0, 15)));
+}
+
+/// Final-delta review round 4, Fix 4 — the fold the round-2 pin could not
+/// discriminate. ERROR_MESSAGE is a KNOWN contract record (round 2), so
+/// its `created_at` is real activity evidence — a failed turn IS activity —
+/// and folds into the session clock exactly like the other known record
+/// types. The round-2 pin cannot see that fold (its error stamp 20:00:09
+/// precedes the reply's 20:00:12, so the asserted maximum holds either
+/// way); THIS pin is the failed-turn shape the fix is about: the error
+/// record is the LAST timestamp in the transcript (the turn died — no
+/// reply ever lands), so `last_activity_at` must equal the error's own
+/// stamp. Everything else about the record stays inert: no message, no
+/// summary, no title, no tokens.
+#[test]
+fn failed_turn_error_message_stamp_owns_last_activity() {
+    let content = concat!(
+        r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Prompt that killed the turn"}"#,
+        "\n",
+        r#"{"type":"ERROR_MESSAGE","source":"SYSTEM","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:09Z","error":"connection error: dial tcp: unreachable"}"#,
+    );
+    let meta = parse_antigravity_session_content(content, "e2").expect("parses");
+    // The user record still owns every message-level field; the error
+    // record contributed none of them.
+    assert_eq!(
+        meta.first_user_message.as_deref(),
+        Some("Prompt that killed the turn")
+    );
+    assert_eq!(meta.title.as_deref(), Some("Prompt that killed the turn"));
+    assert_eq!(meta.summary, None); // an error record is not a reply
+    assert_eq!(meta.token_usage, None);
+    // The clock: the user record owns created_at (min fold); the failed
+    // turn's error record owns last_activity_at (max fold) — failure
+    // activity never looks older than the prompt that caused it.
+    assert_eq!(meta.created_at, Some(1_793_304_001_000));
+    assert_eq!(meta.last_activity_at, Some(1_793_304_009_000));
+    assert_eq!(meta.message_count, 2);
 }

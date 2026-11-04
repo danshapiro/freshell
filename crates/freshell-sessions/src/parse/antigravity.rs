@@ -10,10 +10,12 @@
 //! type (evidenced 2026-11-03, same report's overlay-conformant
 //! receipts) is the failure-path `ERROR_MESSAGE` (src=SYSTEM,
 //! status=DONE, carries `error` + `step_index` + `created_at`): it
-//! carries no content/thinking, so it is deliberately INERT here — a
-//! non-message record left in the unknown-type arm (no message, no
-//! summary, no stamp fold; pinned by the fixture-parity suite's
-//! ERROR_MESSAGE test). Real records carry NO
+//! carries no content/thinking, so it stays a NON-message record here —
+//! its `created_at` folds into the session clock exactly like the other
+//! known types (a failed turn IS activity; final-delta round 4), but
+//! nothing else about it is read (no message extraction, no summary, no
+//! token fold; pinned by the fixture-parity suite's ERROR_MESSAGE
+//! tests). Real records carry NO
 //! conversation id and NO workspace evidence: the conversation id IS
 //! the `brain/<id>` directory name (passed in by the caller), and `cwd`
 //! is `None` for real transcripts (rows group under an unknown project).
@@ -71,7 +73,7 @@ fn parse_antigravity_token_fields(obj: &Value) -> Option<TokenSummary> {
 
 /// Fold one recognized record's `created_at` into the meta clock:
 /// `created_at` = min, `last_activity_at` = max (codex semantic-fold
-/// model). The real vocabulary is closed (all five types carry real
+/// model). The real vocabulary is closed (all six types carry real
 /// stamps), so every recognized record folds.
 fn fold_ts(meta: &mut ParsedSessionMeta, value: Option<&Value>) {
     if let Some(at) = value.and_then(parse_timestamp_ms) {
@@ -162,7 +164,13 @@ pub fn parse_antigravity_session_content(
                 fold_ts(&mut meta, obj.get("created_at"));
                 meta.token_usage = parse_antigravity_token_fields(&obj).or(meta.token_usage.take());
             }
-            "GENERIC" | "SYSTEM_MESSAGE" | "CHECKPOINT" => {
+            // The inert known types: no message extraction, no tokens —
+            // only their stamps fold. ERROR_MESSAGE is the failure-path
+            // record: a failed turn IS activity (final-delta round 4), so
+            // its `created_at` folds like every known type while
+            // everything else about it stays inert (no message, no
+            // summary, no token fold).
+            "GENERIC" | "SYSTEM_MESSAGE" | "CHECKPOINT" | "ERROR_MESSAGE" => {
                 parsed_semantic += 1;
                 fold_ts(&mut meta, obj.get("created_at"));
             }
