@@ -471,7 +471,7 @@ git commit -m "fix(freshagent): establish recovered identities under exact owner
 - Produces: `handle_attach(msg: FreshAgentAttach, reply: FrameSink)` for all default providers; typed `AttachOutcome` returned by inner helpers, and outer-only requester `attached`/`attach.failed` emission. Hosted gateway dispatch has the same requester context.
 - Produces Rust test rig with two authenticated actual sockets and provider audit/release gates using `common::claude_rig` Sim/Cli plus existing Codex/OpenCode native fixtures. Its methods send parsed real protocol messages, await matching request replies, and count actual boot/submit/decision calls.
 
-- [ ] **Step 1: Add red tests**
+- [x] **Step 1: Add red tests**
 
 ```text
 Rust test 'attach_requester_isolation': A streams; B attaches to the same
@@ -492,13 +492,13 @@ legacy callers keep their old event payload shape while receiving attach-only
 frames on their own connection.
 ```
 
-- [ ] **Step 2: Red**
+- [x] **Step 2: Red**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices attach_requester_isolation"`
 
 Expected FAIL: Codex emits no acknowledgment, OpenCode/cold snapshots or errors broadcast, or hosted replay reaches A.
 
-- [ ] **Step 3: Production patch**
+- [x] **Step 3: Production patch**
 
 ```text
 Attach carries optional requestId/viewId; attached and attach.failed contain
@@ -521,7 +521,7 @@ attach always settles its requester. A typed obsolete-owner failure includes
 the complete current pair/kind, preserving terminal divergence semantics.
 ```
 
-- [ ] **Step 4: Green**
+- [x] **Step 4: Green**
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagent_multiple_devices attach_requester_isolation"`
 
@@ -531,11 +531,11 @@ Expected PASS for four modes.
 Also pass the protocol/WS client negotiation tests and confirm a legacy
 connection receives only the prior event shape on its own sink.
 
-- [ ] **Step 5: Refactor**
+- [x] **Step 5: Refactor**
 
 Use one outcome-to-requester adapter for default providers; keep provider-specific startup logic and ordinary broadcasts. Remove global attach-only error helpers only where converted.
 
-- [ ] **Step 6: Impacted verification**
+- [x] **Step 6: Impacted verification**
 
 Run: `pnpm run contract:generate`
 
@@ -549,7 +549,7 @@ Run: `pnpm run test:vitest run test/unit/client/lib/ws-client.test.ts test/unit/
 
 Run: `pnpm run typecheck`; expected PASS, plus Step 4 browser selector. These cover all attach dispatch callers and managed gateway routing.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add shared/ws-protocol.ts shared/fresh-agent-contract.ts src/lib/ws-client.ts src/lib/fresh-agent-view-attachment.ts src/components/fresh-agent/FreshAgentView.tsx crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/hosted_fresh_agent.rs crates/freshell-ws/src/hosted_fresh_agent_tests.rs crates/freshell-freshagent/src/claude/attach.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/fresh_agent_proxy_readiness_tests.rs crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/common/multiple_devices.rs crates/freshell-ws/tests/freshagent_claude_observers.rs test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/lib/ws-client.test.ts test/unit/client/lib/fresh-agent-ws.test.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
