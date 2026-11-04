@@ -67,9 +67,11 @@ import type { Page } from '@playwright/test'
  *   8. Delete `brain/<id>/` under the isolated HOME. PART A: the restart
  *      resume attempt spawns NOTHING — the reconcile door intercepts the
  *      deleted store (`dead_session`/`session_not_on_disk`, no provider
- *      carve-out) into the loud user-driven Dead-sessions dialog, so no
- *      restore spawn ever happens on the restart path. PART B: a direct
- *      create-door restore attempt (this spec's raw WS client) launches
+ *      carve-out), parks the pane with `durable_artifact_missing`, and
+ *      writes the exact missing-session notice into its terminal buffer
+ *      (no modal), so no restore spawn happens on the restart path. PART B
+ *      drives a direct create-door restore attempt (this spec's raw WS
+ *      client), which launches
  *      with `--conversation <id>` (the antigravity resume gate is deferred
  *      by design — Task 7's honest-restore: no SpawnFresh substitution),
  *      and the PROBED real-binary contract (v1.4.10 + v1.4.12, round-6
@@ -102,6 +104,8 @@ const FAKE_AGY_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-agy-t
 const SEEDED_PROVIDERS = ['antigravity']
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const DEAD_SESSION_BUFFER_NOTICE =
+  "[This pane's saved session no longer exists on disk - close this pane or start a new one]"
 
 // ── per-spec-owned helper copies (the repo convention: copied, not imported) ──
 
@@ -925,25 +929,33 @@ test.describe('Google CLI history + exact resume (Rust): antigravity identity, d
         // The pane-reconcile door consults the session-existence probe
         // BEFORE any restore spawn: a session that WAS on disk and is now
         // gone answers the typed `dead_session` verdict with reason
-        // `session_not_on_disk` (reconcile.rs's §5.3 rows 4/4b gate), and
-        // the client parks the pane in the batched Dead sessions dialog —
-        // "dead_session is a UI state, not a deletion — nothing is
-        // auto-closed; every row waits for an explicit user decision"
-        // (DeadSessionPanel). NO resume attempt, NO spawn, NO replacement:
-        // the restart flow surfaces the missing store DISTINCTLY through a
-        // deliberate user-driven choice. (DEVIATION from the plan's
+        // `session_not_on_disk` (reconcile.rs's §5.3 rows 4/4b gate). The
+        // current no-modal contract parks the pane with the durable
+        // `durable_artifact_missing` latch and writes the missing-session
+        // notice into its terminal buffer. NO resume attempt, NO spawn, NO
+        // replacement. (DEVIATION from the plan's
         // scenario-8 wording — recorded in the task report: the plan
         // assumed the restart restore would reach the CREATE door and the
         // CLI's own error would print in-pane; the shipped reconcile door
-        // intercepts first, which is strictly MORE protective. The
-        // create-door behavior the plan describes — launch with
+        // intercepts first. The create-door behavior the plan describes —
+        // launch with
         // `--conversation <id>`, the CLI's own error surfaces, never a
         // replacement — is pinned by Part B below, end to end.)
-        const dialog = page.getByRole('dialog', { name: 'Dead sessions' })
-        await expect(dialog).toBeVisible({ timeout: 60_000 })
-        await expect(dialog.getByText('antigravity — session_not_on_disk')).toBeVisible()
-        await expect(dialog.getByRole('button', { name: 'Start fresh here' })).toBeVisible()
-        await expect(dialog.getByRole('button', { name: 'Close pane' })).toBeVisible()
+        await expect.poll(async () => {
+          const leafNow = await findLeafById(harness, tabId!, paneId)
+          return leafNow?.content?.restoreError?.reason ?? null
+        }, { timeout: 60_000 }).toBe('durable_artifact_missing')
+        await expect(page.getByRole('dialog', { name: 'Dead sessions' })).toHaveCount(0)
+        await expect.poll(async () => {
+          // The old terminalId is a runtime handle and is stripped when the
+          // browser reloads. The dead pane still has a current xterm surface,
+          // so inspect it by the stable pane identity rather than asking the
+          // harness for a no-longer-registered terminalId.
+          const buffer = await harness.getPaneTerminalBuffer(paneId)
+          return typeof buffer === 'string'
+            ? buffer.split(DEAD_SESSION_BUFFER_NOTICE).length - 1
+            : 0
+        }, { timeout: 60_000 }).toBe(1)
 
         // The parked pane keeps its identity (never a substituted fresh id)
         // and carries the per-pane missing-store breadcrumb

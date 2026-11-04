@@ -1079,8 +1079,10 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
         );
         evidence.push(reference.clone());
         for row in negative_paths.iter_mut().filter(|row| {
-            row.path == RecoveryPath::NativeResume
-                && row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+            row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+                && (row.path == RecoveryPath::NativeResume
+                    || (spec.provider_session.provider == "codex"
+                        && row.path == RecoveryPath::CheckpointRestore))
         }) {
             row.evidence_refs.push(reference.clone());
         }
@@ -1312,6 +1314,7 @@ fn probe_selected_provider_identity(
                 .join("projects"),
             expected,
             provider,
+            &[RecoveryPath::NativeResume],
         ),
         "codex" => probe_bounded_tree(
             &selection
@@ -1322,6 +1325,7 @@ fn probe_selected_provider_identity(
                 .join("sessions"),
             expected,
             provider,
+            &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore],
         ),
         "amplifier" => probe_amplifier(provider_home, expected),
         "opencode" => probe_opencode(provider_home, expected, selection),
@@ -2154,7 +2158,12 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     }
 }
 
-fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderStoreProbe {
+fn probe_bounded_tree(
+    root: &Path,
+    expected: &str,
+    provider: &str,
+    absence_paths: &[RecoveryPath],
+) -> ProviderStoreProbe {
     if let Err(probe) = inspect_native_path(Path::new(""), root) {
         return probe;
     }
@@ -2191,7 +2200,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
                     "selected provider native store is absent".into(),
                     vec![root.display().to_string()],
                     EvidenceStoreState::Missing,
-                    &[RecoveryPath::NativeResume],
+                    absence_paths,
                 );
             }
             Err(_) => {
@@ -2332,7 +2341,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
             "selected provider native store has no matching owner".into(),
             vec![root.display().to_string()],
             EvidenceStoreState::PresentReadable,
-            &[RecoveryPath::NativeResume],
+            absence_paths,
         ),
         1 => ProviderStoreProbe::Ready { evidence: matches },
         _ => blocked(
@@ -3704,6 +3713,60 @@ mod tests {
             matches!(probe, ProviderStoreProbe::DefinitivelyUnavailable { .. }),
             "lineage alone cannot own a rollout: {probe:?}"
         );
+    }
+
+    #[test]
+    fn native_probe_codex_complete_rollout_absence_covers_rollout_only_checkpoint_path() {
+        for root_is_present in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join(".codex/sessions");
+            if root_is_present {
+                fs::create_dir_all(&root).unwrap();
+                fs::write(
+                    root.join("other-session.jsonl"),
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"type":"session_meta","payload":{"id":"other-session","cwd":"/work"}})
+                    ),
+                )
+                .unwrap();
+            }
+            let expected = "11111111-2222-3333-4444-555555555555";
+            let spec = resume_spec_for_test("codex", expected, home.path());
+
+            let probe = probe_provider_store(home.path(), &spec);
+            let ProviderStoreProbe::DefinitivelyUnavailable {
+                negative_paths,
+                store_state,
+                ..
+            } = probe
+            else {
+                panic!("complete Codex inspection should prove exact rollout absence: {probe:?}");
+            };
+            assert_eq!(
+                negative_paths
+                    .iter()
+                    .map(|row| row.path)
+                    .collect::<Vec<_>>(),
+                [RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore]
+            );
+            assert!(negative_paths.iter().all(|row| {
+                row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+                    && row.store_state == store_state
+                    && row
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference.starts_with(NATIVE_CENSUS_PREFIX))
+            }));
+            assert_eq!(
+                store_state,
+                if root_is_present {
+                    EvidenceStoreState::PresentReadable
+                } else {
+                    EvidenceStoreState::Missing
+                }
+            );
+        }
     }
 
     #[test]

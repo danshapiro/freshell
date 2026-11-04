@@ -7,7 +7,7 @@ import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
@@ -19,6 +19,19 @@ import type { InitialProviderVolumeAuthorization } from '../../../scripts/testin
 // @ts-expect-error The native model-wire fixture is also used by the offline Node runner.
 import { startInManagedContext } from '../providers/codex-local-provider.mjs'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
+import {
+  startSupervisorCrashDiagnostics,
+  type SafeGdbSummary,
+  type SupervisorCrashDiagnosticHandle,
+} from '../../helpers/supervisor-crash-diagnostics.js'
+import {
+  appendNativeSyncSample,
+  readNativeTitleDiagnosticFacts,
+  summarizeNativeLifecycleBusyRefusals,
+  summarizeNativeNameDurableState,
+  summarizeNativeNameWorkerLogs,
+  type NativeSyncDiagnosticSample,
+} from '../../helpers/native-name-timeout-diagnostics.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const runFile = promisify(execFile)
@@ -27,6 +40,182 @@ const providers = [
   { provider: 'codex', sessionType: 'freshcodex', config: '.codex/config.toml' },
   { provider: 'opencode', sessionType: 'freshopencode', config: 'custom-xdg/opencode/opencode.jsonc' },
 ] as const
+
+type DiagnosticRead<T> = { ok: true; value: T } | { ok: false; error: { name: string; code?: string } }
+
+function readBoundedTail(filePath: string, maxBytes: number): string {
+  const descriptor = fs.openSync(filePath, 'r')
+  try {
+    const size = fs.fstatSync(descriptor).size
+    const length = Math.min(size, maxBytes)
+    const bytes = Buffer.alloc(length)
+    fs.readSync(descriptor, bytes, 0, length, size - length)
+    return bytes.toString('utf8')
+  } finally {
+    fs.closeSync(descriptor)
+  }
+}
+
+async function captureDiagnosticRead<T>(read: () => T | Promise<T>): Promise<DiagnosticRead<T>> {
+  try { return { ok: true, value: await read() } }
+  catch (error) {
+    const value = error as NodeJS.ErrnoException
+    const name = typeof value.name === 'string' && /^[A-Za-z][A-Za-z0-9]*$/.test(value.name)
+      ? value.name : 'Error'
+    const code = typeof value.code === 'string' && /^[A-Z0-9_]+$/.test(value.code) ? value.code : undefined
+    return { ok: false, error: { name, ...(code ? { code } : {}) } }
+  }
+}
+
+type CreateFailureRig = Pick<ManagedRuntimeBrowserRig, 'runtime' | 'supervisor' | 'web' | 'inventory'>
+
+function safeCreateFailureFrame(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { present: false }
+  const frame = value as Record<string, unknown>
+  const code = typeof frame.code === 'string' && /^[A-Z0-9_]+$/.test(frame.code) ? frame.code : undefined
+  const requestId = typeof frame.requestId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(frame.requestId)
+    ? frame.requestId : undefined
+  return {
+    present: true,
+    type: frame.type === 'freshAgent.create.failed' ? frame.type : 'unknown',
+    ...(code ? { code } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(typeof frame.retryable === 'boolean' ? { retryable: frame.retryable } : {}),
+    ...(frame.ownerKind === 'terminal' || frame.ownerKind === 'fresh-agent' ? { ownerKind: frame.ownerKind } : {}),
+    ...(typeof frame.ownerGeneration === 'number' ? { ownerGeneration: frame.ownerGeneration } : {}),
+    ...(typeof frame.ownerEpoch === 'number' ? { ownerEpoch: frame.ownerEpoch } : {}),
+    messageCaptured: false,
+  }
+}
+
+function summarizeCreateFailureLogs(value: string) {
+  const tail = value.slice(-6000)
+  const records = tail.split('\n').flatMap(line => {
+    try {
+      const row = JSON.parse(line) as Record<string, unknown>
+      const event = typeof row.event === 'string' && /^[a-z][a-z0-9_.-]{0,159}$/.test(row.event)
+        ? row.event : undefined
+      const severityValue = row.severity ?? row.level
+      const severity = typeof severityValue === 'string'
+        && ['trace', 'debug', 'info', 'warn', 'warning', 'error'].includes(severityValue.toLowerCase())
+        ? severityValue.toLowerCase() : undefined
+      const runtimeCodeValue = row.runtime_code ?? row.runtimeCode
+      const runtimeCode = typeof runtimeCodeValue === 'string' && /^[A-Z0-9_]+$/.test(runtimeCodeValue)
+        ? runtimeCodeValue : undefined
+      return event || severity || runtimeCode ? [{ ...(severity ? { severity } : {}), ...(event ? { event } : {}), ...(runtimeCode ? { runtimeCode } : {}) }] : []
+    } catch { return [] }
+  }).slice(-24)
+  return {
+    lineCount: tail.split('\n').filter(line => line.length > 0).length,
+    records,
+    markers: {
+      connectionRefused: /connection refused/i.test(tail),
+      missingFile: /no such file or directory/i.test(tail),
+      permissionDenied: /permission denied/i.test(tail),
+      panic: /\bpanic\b/i.test(tail),
+    },
+  }
+}
+
+function safeCreateFailureWarnings(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.slice(-16).flatMap(row => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return []
+    const warning = row as Record<string, unknown>
+    const event = typeof warning.event === 'string' && /^[a-z][a-z0-9_.-]{0,159}$/.test(warning.event)
+      ? warning.event : undefined
+    const provider = ['claude', 'codex', 'opencode', 'amplifier'].includes(String(warning.provider))
+      ? String(warning.provider) : undefined
+    const runtimeCodeValue = warning.runtime_code
+    const runtimeCode = typeof runtimeCodeValue === 'string' && /^[A-Z0-9_]+$/.test(runtimeCodeValue)
+      ? runtimeCodeValue : undefined
+    return event || provider || runtimeCode
+      ? [{ ...(event ? { event } : {}), ...(provider ? { provider } : {}), ...(runtimeCode ? { runtimeCode } : {}) }]
+      : []
+  })
+}
+
+function summarizeContainerState(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { available: false }
+  const state = value as Record<string, unknown>
+  const status = ['created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead']
+    .includes(String(state.Status)) ? String(state.Status) : undefined
+  return {
+    available: true,
+    ...(status ? { status } : {}),
+    ...(typeof state.Running === 'boolean' ? { running: state.Running } : {}),
+    ...(typeof state.ExitCode === 'number' ? { exitCode: state.ExitCode } : {}),
+    ...(typeof state.OOMKilled === 'boolean' ? { oomKilled: state.OOMKilled } : {}),
+    ...(typeof state.Error === 'string' ? { errorPresent: state.Error.length > 0 } : {}),
+  }
+}
+
+async function captureCreateFailureEvidence(
+  provider: typeof providers[number]['provider'],
+  created: unknown,
+  providerWarnings: unknown,
+  rig: CreateFailureRig,
+) {
+  const { containerId, controlSocket } = rig.supervisor
+  const [state, logs, socket, web] = await Promise.all([
+    captureDiagnosticRead(() => summarizeContainerState(rig.runtime.inspectContainer(containerId).State)),
+    captureDiagnosticRead(() => summarizeCreateFailureLogs(rig.runtime.containerLogs(containerId))),
+    captureDiagnosticRead(() => {
+      const info = fs.lstatSync(controlSocket)
+      return { exists: true, isSocket: info.isSocket() }
+    }),
+    captureDiagnosticRead(() => summarizeCreateFailureLogs(
+      Object.values(rig.web.capturedOutput()).join('\n'))),
+  ])
+  return {
+    provider,
+    originalCreateFailure: safeCreateFailureFrame(created),
+    providerWarnings: safeCreateFailureWarnings(providerWarnings),
+    supervisor: { containerId, state, logs, controlSocketPresent: Boolean(controlSocket), socket },
+    web,
+  }
+}
+
+describe('hosted fresh-agent create-failure diagnostics', () => {
+  it('keeps the original failure and captures each available source independently', async () => {
+    const created = { type: 'freshAgent.create.failed', requestId: 'create-1', code: 'SUPERVISOR_IO', message: 'private provider output' }
+    const inventory = vi.fn(() => { throw new Error('inventory must not mask the create failure') })
+    const rig = {
+      supervisor: { containerId: 'supervisor-1', controlSocket: '/tmp/supervisor.sock' },
+      runtime: {
+        inspectContainer: () => { throw Object.assign(new Error('inspect unavailable'), { code: 'ENOENT' }) },
+        containerLogs: () => '{"severity":"ERROR","event":"fresh_agent.create.inventory_failed","runtime_code":"SUPERVISOR_IO","error":"private provider output"}\npanic details fixture-secret-byte-alpha',
+      },
+      web: { capturedOutput: () => ({ stdout: 'server output private provider output', stderr: '' }) },
+      inventory,
+    } as unknown as CreateFailureRig
+
+    const evidence = await captureCreateFailureEvidence('codex', created, [{
+      event: 'fresh_agent.create.inventory_failed', provider: 'codex', runtime_code: 'SUPERVISOR_IO', error: 'private provider output',
+    }], rig)
+
+    expect(evidence.originalCreateFailure).toEqual({
+      present: true, type: 'freshAgent.create.failed', requestId: 'create-1', code: 'SUPERVISOR_IO', messageCaptured: false,
+    })
+    expect(evidence.supervisor.state).toEqual({ ok: false, error: { name: 'Error', code: 'ENOENT' } })
+    expect(evidence.supervisor.logs).toEqual({ ok: true, value: {
+      lineCount: 2,
+      records: [{ severity: 'error', event: 'fresh_agent.create.inventory_failed', runtimeCode: 'SUPERVISOR_IO' }],
+      markers: { connectionRefused: false, missingFile: false, permissionDenied: false, panic: true },
+    } })
+    expect(evidence.supervisor.socket).toEqual({ ok: false, error: { name: 'Error', code: 'ENOENT' } })
+    expect(evidence.web).toEqual({ ok: true, value: {
+      lineCount: 1, records: [],
+      markers: { connectionRefused: false, missingFile: false, permissionDenied: false, panic: false },
+    } })
+    expect(evidence.providerWarnings).toEqual([{
+      event: 'fresh_agent.create.inventory_failed', provider: 'codex', runtimeCode: 'SUPERVISOR_IO',
+    }])
+    expect(JSON.stringify(evidence)).not.toContain('fixture-secret-byte-alpha')
+    expect(JSON.stringify(evidence)).not.toContain('private provider output')
+    expect(inventory).not.toHaveBeenCalled()
+  })
+})
 
 // Native name synchronization allows retries no sooner than 5s and then
 // 30s after the first two failed cycles. Include one 20s Codex metadata
@@ -236,10 +425,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .filter(key => typeof row[key] === 'string').map(key => [key,
               row[key].replace(/fixture-secret-byte(?:-[a-z]+)?/g, '<redacted>')])))
       } catch { /* The original create failure remains the primary diagnostic. */ }
-      rig.runtime.writeIncident(`fresh-parity-${row.provider}-create-failure`, { providerInputs })
-      throw new Error(`${JSON.stringify(created)}; providerInputs=${JSON.stringify(providerInputs)}; inventory=${JSON.stringify(await rig.inventory())}; web=${JSON.stringify(rig.web.capturedOutput())}; supervisor=${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-6000)}`)
+      const evidence = await captureCreateFailureEvidence(row.provider, created, providerInputs, rig)
+      const incidentSaved = await captureDiagnosticRead(() =>
+        rig.runtime.writeIncident(`fresh-parity-${row.provider}-create-failure`, evidence))
+      throw new Error(`${JSON.stringify(safeCreateFailureFrame(created))}; create-failure evidence ${incidentSaved.ok ? 'saved' : 'could not be saved'}`)
     }
-    expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
+    expect(created.type, JSON.stringify(safeCreateFailureFrame(created))).toBe('freshAgent.created')
     expect(created.nameRef).toEqual({ kind: 'pending', id: namingHandle })
     expect(created.sessionName?.name).toBeTruthy()
     const view = await waitFor('hosted fresh-agent soul', async () => {
@@ -425,6 +616,10 @@ describe('installed Codex through the managed gateway and durable actor', () => 
   let naming: http.Server
   let retainedModelTraffic: any[] = []
   let finalObservation: (() => Promise<unknown>) | undefined
+  let supervisorCrashDiagnostics: SupervisorCrashDiagnosticHandle | undefined
+  let supervisorObserverSummary: SafeGdbSummary | undefined
+  let supervisorObserverFinalizeFailed = false
+  let pausedSessionHost: { containerId: string; incarnationId: string; pid: number } | undefined
   const namingRequests: string[] = []
   const owners: InitialProviderVolumeAuthorization[] = []
 
@@ -460,7 +655,10 @@ describe('installed Codex through the managed gateway and durable actor', () => 
         FRESHELL_GEMINI_BASE_URL: `http://127.0.0.1:${namingAddress.port}` }, { XDG_CONFIG_HOME: xdg }, 'test',
       { enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: [] }, home,
       { workspaceRoots: [workspace], providerInputRoots: [], bootstrapFiles: Object.values(grants.grants), defaultCwd: workspace })
+    const captureSupervisorCrash = process.env.FRESHELL_CAPTURE_SUPERVISOR_CRASH === '1'
+    if (captureSupervisorCrash) rig.runtime.enableSupervisorPtraceForDiagnostics()
     await rig.start()
+    if (captureSupervisorCrash) supervisorCrashDiagnostics = await startSupervisorCrashDiagnostics(rig)
     const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
     source = await readProviderParitySource(rig.runtime, health.data.installation_id)
     const catalog = path.join(home, '.codex', 'models.json')
@@ -514,20 +712,99 @@ tool_timeout_sec = 120
   }, 900_000)
 
   afterAll(async () => {
+    let cleanupConfirmed: boolean | undefined
+    let teardownError: unknown
+    const serverFailureFacts = () => {
+      let serverProcessAlive = false
+      try { rig.web.processEvidence(); serverProcessAlive = true } catch { /* The owned server may have exited. */ }
+      const output = rig.web.capturedOutput()
+      const stdoutTail = output.stdout.slice(-256 * 1024)
+      const stderrTail = output.stderr.slice(-256 * 1024)
+      const combinedTail = `${stdoutTail}\n${stderrTail}`
+      const count = (pattern: RegExp) => (combinedTail.match(pattern) ?? []).length
+      return {
+        serverProcessAlive,
+        supervisorControlSocketPresent: fs.existsSync(rig.supervisor.controlSocket),
+        capturedStdoutBytes: Buffer.byteLength(output.stdout),
+        capturedStderrBytes: Buffer.byteLength(output.stderr),
+        inspectedTailBytes: Buffer.byteLength(combinedTail),
+        markerCounts: {
+          stackOverflow: count(/stack overflow|stack limit exceeded/gi),
+          rustPanic: count(/panicked at|fatal runtime error|panic in a function that cannot unwind/gi),
+          abortOrSegfault: count(/SIGABRT|SIGSEGV|signal (?:6|11)\b/gi),
+          outOfMemory: count(/out of memory|memory allocation of .* failed|oom-kill/gi),
+        },
+      }
+    }
+    const rememberTeardownError = (error: unknown) => {
+      teardownError = teardownError === undefined
+        ? error
+        : new AggregateError([teardownError, error], 'multiple installed-Codex rig teardown steps failed')
+    }
+    const retirePausedSessionHost = () => {
+      if (!rig || !pausedSessionHost) return
+      try {
+        if (rig.runtime.isContainerRunning(pausedSessionHost.containerId)) {
+          rig.runtime.killOwnedRuntimeExact(pausedSessionHost.containerId)
+        }
+        pausedSessionHost = undefined
+      } catch (error) { rememberTeardownError(error) }
+    }
+    // Retire a paused host before final observations or fixture shutdown can
+    // wait on it. Keep the finalizer retry below in case Docker is transiently
+    // unavailable on this first exact-container cleanup attempt.
+    retirePausedSessionHost()
     try {
       if (rig && finalObservation) {
         try { rig.runtime.writeIncident('freshcodex-managed-native-final-state', await finalObservation()) }
-        catch (error) { rig.runtime.writeIncident('freshcodex-managed-native-final-state-error', { error: String(error) }) }
+        catch (error) {
+          rig.runtime.writeIncident('freshcodex-managed-native-final-state-error', {
+            error: String(error), serverFailureFacts: serverFailureFacts(),
+          })
+        }
       }
       await wire?.close()
       await model?.stop()
-      if (rig) {
-        const volumes = captureProviderParityVolumes(owners)
-        const cleanup = await rig.stop()
-        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-        cleanupProviderParityVolumes(volumes)
-      }
+    } catch (error) {
+      rememberTeardownError(error)
     } finally {
+      if (supervisorCrashDiagnostics) {
+        try { supervisorObserverSummary = await supervisorCrashDiagnostics.finalizeObserver() }
+        catch { supervisorObserverFinalizeFailed = true }
+      }
+      if (rig) {
+        retirePausedSessionHost()
+        let volumes: ReturnType<typeof captureProviderParityVolumes> | undefined
+        try { volumes = captureProviderParityVolumes(owners) }
+        catch (error) { rememberTeardownError(error) }
+        try {
+          const cleanup = await rig.stop()
+          cleanupConfirmed = cleanup.ok
+          if (!cleanup.ok) rememberTeardownError(new Error(cleanup.errors.join('\n') || 'managed rig cleanup failed'))
+          else if (volumes) cleanupProviderParityVolumes(volumes)
+        } catch (error) {
+          cleanupConfirmed = false
+          rememberTeardownError(error)
+        }
+      }
+    }
+    try {
+      if (teardownError !== undefined) throw teardownError
+    } finally {
+      if (supervisorCrashDiagnostics) {
+        try {
+          rig.runtime.writeIncident('freshcodex-managed-supervisor-gdb-diagnostics', {
+            policy: supervisorCrashDiagnostics.policy,
+            probes: supervisorCrashDiagnostics.probes,
+            observer: supervisorObserverSummary ?? supervisorCrashDiagnostics.collectObserver(),
+            observerFinalizeFailed: supervisorObserverFinalizeFailed,
+            cleanupConfirmed,
+          })
+        } catch { /* optional diagnostics never replace the product-test result */ }
+        if (cleanupConfirmed === true) {
+          try { supervisorCrashDiagnostics.removeTemporaryFiles() } catch { /* task-owned temp cleanup is best effort */ }
+        }
+      }
       if (naming) {
         naming.closeAllConnections()
         await new Promise<void>(resolve => naming.close(() => resolve()))
@@ -538,6 +815,31 @@ tool_timeout_sec = 120
     }
   }, 180_000)
 
+  it('keeps supervisor crash diagnostics opt-in', () => {
+    const enabled = process.env.FRESHELL_CAPTURE_SUPERVISOR_CRASH === '1'
+    const inspected = rig.runtime.inspectContainer(rig.supervisor.containerId)
+    const capAdd = (inspected.HostConfig.CapAdd ?? []).map((value: string) => value.replace(/^CAP_/, '')).sort()
+    expect(capAdd).toEqual(['CHOWN', 'DAC_OVERRIDE', ...(enabled ? ['SYS_PTRACE'] : [])])
+    if (!enabled) {
+      expect(supervisorCrashDiagnostics).toBeUndefined()
+      return
+    }
+
+    expect(supervisorCrashDiagnostics).toBeDefined()
+    const diagnostics = supervisorCrashDiagnostics!
+    expect(diagnostics.policy).toMatchObject({ defaultSeccomp: true, network: 'none', privileged: false,
+      threadDbMatchesTarget: true })
+    expect(diagnostics.collectObserver()).toMatchObject({ attached: true })
+    expect(diagnostics.probes.sigsegv).toMatchObject({ targetExitCode: 139, gdbExitCode: 0,
+      threadCount: expect.any(Number), workerThreadCount: 3 })
+    expect(diagnostics.probes.sigterm).toMatchObject({ targetExitCode: 0, gdbExitCode: 0,
+      handlerCleanup: true, targetReaped: true })
+    for (const frame of diagnostics.probes.sigsegv.frames) {
+      expect(Object.keys(frame).sort()).toEqual(['frame', 'symbol', 'thread'])
+      expect(frame.symbol).not.toContain('(')
+    }
+  })
+
   it('uses the installed wrapper for catalog, settings, saved output and exact native controls', async () => {
     const requestId = `native-managed-${randomUUID()}`
     owners.push(authorizeFreshAgentParityRequest(rig.runtime.broker, source, 'codex', requestId))
@@ -547,27 +849,23 @@ tool_timeout_sec = 120
     const created = await wire.wait(frame => frame.requestId === requestId
       && ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type))
     if (created.type !== 'freshAgent.created') {
-      const inventory = await rig.inventory()
-      const providerFiles = await Promise.all(inventory.filter(row => row.containerId).map(async row => {
-        try { return { containerId: row.containerId, files: await rig.ownedProviderExec(row.containerId!, ['node', '-e', `const fs=require('node:fs');process.stdout.write(JSON.stringify({mcpModulePresent:fs.existsSync(${JSON.stringify(path.join(workspace, 'managed-mcp.mjs'))}),config:fs.readFileSync('/home/freshell/provider/.codex/config.toml','utf8')}))`]) } }
-        catch { return { containerId: row.containerId, unavailable: true } }
-      }))
-      const nativeLogs = [...rig.runtime.broker.receiptIds()].map(containerId => {
-        try { return { containerId, logs: rig.runtime.containerLogs(containerId) } }
-        catch { return { containerId, unavailable: true } }
-      })
-      rig.runtime.writeIncident('freshcodex-managed-native-create-failure', { created, inventory, nativeLogs, providerFiles,
-        supervisor: rig.runtime.containerLogs(rig.supervisor.containerId), web: rig.web.capturedOutput() })
+      const evidence = await captureCreateFailureEvidence('codex', created, [], rig)
+      const incidentSaved = await captureDiagnosticRead(() =>
+        rig.runtime.writeIncident('freshcodex-managed-native-create-failure', evidence))
+      if (!incidentSaved.ok) {
+        throw new Error(`${JSON.stringify(safeCreateFailureFrame(created))}; create-failure evidence could not be saved`)
+      }
     }
-    expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
+    expect(created.type, JSON.stringify(safeCreateFailureFrame(created))).toBe('freshAgent.created')
     const view = await waitFor('native managed provider', async () => {
       const row = await rig.runningViewForFreshSession(created.sessionId)
       return row?.containerId && row.nativeSessionId ? row : undefined
     })
     let providerContainerId = view.containerId!
     expect(await rig.ownedProviderExec(providerContainerId, ['/opt/freshell-codex/launch', '--version'])).toContain('0.164.0')
-    const inspectNativeContext = async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    const inspectNativeContext = async (expectedCwd = workspace) => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs');const layout=JSON.parse(fs.readFileSync('/opt/freshell-codex/layout.json','utf8'));
+      const expectedCwd=${JSON.stringify(expectedCwd)};
       const candidates=fs.readdirSync('/proc').filter(p=>Number.isInteger(Number(p))).flatMap(pid=>{try{
         const status=fs.readFileSync('/proc/'+pid+'/status','utf8');const field=k=>status.split(String.fromCharCode(10)).find(line=>line.startsWith(k+':'))?.slice(k.length+1).trim();
         let executable,exeError,appServer=false;try{executable=fs.readlinkSync('/proc/'+pid+'/exe')}catch(error){exeError=error.code}
@@ -576,8 +874,18 @@ tool_timeout_sec = 120
         let cwd,cwdError,workspace;try{cwd=fs.readlinkSync('/proc/'+pid+'/cwd');const s=fs.statSync(cwd);let writable=false;try{fs.accessSync(cwd,fs.constants.W_OK);writable=true}catch{}workspace={uid:s.uid,gid:s.gid,mode:(s.mode&511).toString(8),writable}}catch(error){cwdError=error.code}
         return[{pid:Number(pid),parentPid:Number(field('PPid')),state:field('State'),uid:Number(field('Uid')?.split(String.fromCharCode(9))[0]),gid:Number(field('Gid')?.split(String.fromCharCode(9))[0]),
           executable,exeError,appServer,cwd,cwdError,workspace,noNewPrivs:field('NoNewPrivs'),capEff:field('CapEff')}];
-      }catch{return[]}});const found=candidates.filter(row=>row.executable===layout.nativeExecutable&&row.appServer);
-      if(found.length!==1)throw Error('Expected one actual installed native Codex app-server: '+JSON.stringify({expectedNative:layout.nativeExecutable,matches:found.length,candidates}));process.stdout.write(JSON.stringify(found[0]));`]))
+      }catch{return[]}});const found=candidates.filter(row=>row.executable===layout.nativeExecutable&&row.appServer&&row.cwd===expectedCwd);
+      if(found.length!==1)throw Error('Expected one actual installed native Codex app-server for the accepted working directory: '+JSON.stringify({expectedNative:layout.nativeExecutable,expectedCwd,matches:found.length,candidates}));process.stdout.write(JSON.stringify(found[0]));`]))
+    const inspectNativeAppServers = async () => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+      const fs=require('node:fs');const layout=JSON.parse(fs.readFileSync('/opt/freshell-codex/layout.json','utf8'));
+      const servers=fs.readdirSync('/proc').filter(pid=>Number.isInteger(Number(pid))).flatMap(pid=>{try{
+        if(fs.readlinkSync('/proc/'+pid+'/exe')!==layout.nativeExecutable)return[];
+        const cmdline=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split(String.fromCharCode(0));
+        if(!cmdline.includes('app-server'))return[];
+        const cwd=fs.readlinkSync('/proc/'+pid+'/cwd');
+        return[{pid:Number(pid),cwd}];
+      }catch{return[]}});
+      process.stdout.write(JSON.stringify(servers));`]))
     const nativeContext = await inspectNativeContext()
     expect(nativeContext).toMatchObject({ uid: 65534, gid: 0, cwd: workspace, noNewPrivs: '1', capEff: '0000000000000000',
       workspace: { gid: 0, mode: '770', writable: true } })
@@ -635,6 +943,129 @@ tool_timeout_sec = 120
         return [{ directory: entry, profile: Object.fromEntries(fields.filter(key => key in profile).map(key => [key, profile[key]])) }]
       }) : []
       return { lifecycle, actorProfiles }
+    }
+    const supervisorLifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
+    const readSupervisorLifecycle = () => {
+      try {
+        return readBoundedTail(supervisorLifecyclePath, 8 * 1024 * 1024).split('\n').flatMap(line => {
+          try { return [JSON.parse(line)] } catch { return [] }
+        })
+      } catch { return [] }
+    }
+    const coldRecoveryFailureStages = new Set([
+      'authorization', 'persisted_receipt', 'missing_authorization', 'absence_census',
+      'absence_probe_ready', 'absence_probe_blocked', 'absence_probe_unexpected',
+      'absence_census_selection_mismatch', 'absence_census_environment_mismatch',
+      'absence_census_reference_missing', 'absence_evidence_invalid',
+      'replacement_identity', 'before_rebind_evidence', 'rebound_receipt',
+      'after_rebind_evidence', 'startup_evidence',
+    ])
+    const coldRecoveryProviderStartCauses = new Set([
+      'exact_resume_validation', 'exact_resume_app_server_start', 'exact_resume_rpc',
+      'exact_resume_create_rejected', 'exact_resume_identity', 'exact_resume_settings_reapply',
+      'replacement_validation', 'replacement_app_server_start', 'replacement_thread_start',
+      'replacement_create_finalize', 'replacement_create_rejected', 'replacement_identity',
+      'unsupported',
+    ])
+    const coldRecoveryProviderStartDiagnostics = new Set([
+      'authentication', 'arguments', 'listener', 'configuration', 'network',
+      'unclassified', 'no_diagnostic',
+    ])
+    const coldRecoveryProbeKinds = new Set(['ready', 'blocked', 'unexpected'])
+    const coldRecoveryProbeReasons = new Set([
+      'CAPABILITY_PENDING', 'CREDENTIALS_EXPIRED', 'RATE_LIMITED', 'PROVIDER_UNAVAILABLE',
+      'STORE_UNREADABLE', 'STORE_MISSING', 'WORKSPACE_UNAVAILABLE', 'INCOMPATIBLE_BINARY',
+      'UNSUPPORTED_PROTOCOL', 'AMBIGUOUS_IDENTITY', 'IMPLEMENTATION_UNAVAILABLE',
+      'INSUFFICIENT_RESOURCES', 'RETRY_BUDGET', 'STOP_INTENT', 'OLD_RUNTIME_NOT_EMPTY',
+      'WRONG_NATIVE_IDENTITY', 'COMMAND_AMBIGUOUS',
+    ])
+    const coldRecoveryStoreStates = new Set(['unknown', 'not_applicable', 'missing', 'present_readable', 'present_unreadable'])
+    const coldRecoveryDiagnostics = () => {
+      const lifecycleRows = readSupervisorLifecycle()
+      const supervisorEvents = lifecycleRows
+        .filter(row => [
+          'supervisor.runtime_observer.recovery_scheduled', 'supervisor.recovery_retry.settled',
+          'supervisor.recovery_retry.exhausted', 'supervisor.recovery.activation_failed',
+        ].includes(row.event))
+        .slice(-32)
+        .map(row => ({
+          sequence: Number.isSafeInteger(row.sequence) ? row.sequence : undefined,
+          event: row.event,
+          trigger: typeof row.data?.trigger === 'string' ? row.data.trigger : undefined,
+          reason: typeof row.data?.reason === 'string' ? row.data.reason : undefined,
+          incarnationId: typeof row.data?.incarnationId === 'string' ? row.data.incarnationId : undefined,
+          nativeReadinessFailureStage: coldRecoveryFailureStages.has(row.data?.nativeReadinessFailureStage)
+            ? row.data.nativeReadinessFailureStage : undefined,
+          nativeReadinessProbeKind: coldRecoveryProbeKinds.has(row.data?.nativeReadinessProbeKind)
+            ? row.data.nativeReadinessProbeKind : undefined,
+          nativeReadinessProbeReason: coldRecoveryProbeReasons.has(row.data?.nativeReadinessProbeReason)
+            ? row.data.nativeReadinessProbeReason : undefined,
+          nativeReadinessStoreState: coldRecoveryStoreStates.has(row.data?.nativeReadinessStoreState)
+            ? row.data.nativeReadinessStoreState : undefined,
+        }))
+      const storeProbeSelections = lifecycleRows
+        .filter(row => [
+          'supervisor.recovery.codex_readiness_store_probe', 'supervisor.recovery.store_probe',
+          'supervisor.recovery.unconfirmed_worker_store_probe',
+        ].includes(row.event))
+        .slice(-16)
+        .map(row => {
+          const probe = row.data?.probe
+          const probeData = probe?.data
+          const resumeSpec = probeData?.resumeSpec ?? probeData?.resume_spec
+          const providerSession = resumeSpec?.providerSession ?? resumeSpec?.provider_session
+          const environment = resumeSpec?.environment ?? {}
+          const providerHome = resumeSpec?.providerHome ?? resumeSpec?.provider_home
+          const selectedCodexHome = typeof environment.CODEX_HOME === 'string'
+            ? environment.CODEX_HOME
+            : typeof providerHome === 'string' ? path.join(providerHome, '.codex') : undefined
+          return {
+            sequence: Number.isSafeInteger(row.sequence) ? row.sequence : undefined,
+            event: row.event,
+            probeKind: ['resume_ready', 'definitively_unavailable', 'blocked'].includes(probe?.kind)
+              ? probe.kind : undefined,
+            provider: providerSession?.provider === 'codex' ? 'codex' : undefined,
+            expectedNativeRootMatches: providerSession?.nativeSessionId === view.nativeSessionId
+              || providerSession?.native_session_id === view.nativeSessionId,
+            providerHome: typeof providerHome === 'string' ? providerHome : undefined,
+            selectedCodexHome,
+            selectedHomeMatchesNativeProcess: selectedCodexHome === effectiveCodexHome,
+          }
+        })
+      const hostEvents = fs.readdirSync(rig.supervisor.runtimeRoot, { withFileTypes: true })
+        .filter(entry => entry.isDirectory() && entry.name.startsWith('incarnation-'))
+        .flatMap(entry => {
+          const file = path.join(rig.supervisor.runtimeRoot, entry.name, 'host-lifecycle.jsonl')
+          if (!fs.existsSync(file)) return []
+          const events = readBoundedTail(file, 256 * 1024).split('\n').flatMap(line => {
+            try { return [JSON.parse(line)] } catch { return [] }
+          })
+          return events.filter(row => [
+            'host.fresh_agent.open_failed', 'host.native_identity.readiness_receipt_committed', 'host.grant_timing',
+          ].includes(row.event)).slice(-16).map(row => ({
+            incarnationId: entry.name,
+            event: row.event,
+            nativeReadinessFailureStage: coldRecoveryFailureStages.has(row.data?.nativeReadinessFailureStage)
+              ? row.data.nativeReadinessFailureStage : undefined,
+            nativeReadinessProviderStartCause: coldRecoveryProviderStartCauses.has(row.data?.nativeReadinessProviderStartCause)
+              ? row.data.nativeReadinessProviderStartCause : undefined,
+            providerStartDiagnostic: coldRecoveryProviderStartDiagnostics.has(row.data?.providerStartDiagnostic)
+              ? row.data.providerStartDiagnostic : undefined,
+            nativeReadinessProbeKind: coldRecoveryProbeKinds.has(row.data?.nativeReadinessProbeKind)
+              ? row.data.nativeReadinessProbeKind : undefined,
+            nativeReadinessProbeReason: coldRecoveryProbeReasons.has(row.data?.nativeReadinessProbeReason)
+              ? row.data.nativeReadinessProbeReason : undefined,
+            nativeReadinessStoreState: coldRecoveryStoreStates.has(row.data?.nativeReadinessStoreState)
+              ? row.data.nativeReadinessStoreState : undefined,
+            outcome: ['accepted', 'refused'].includes(row.data?.outcome) ? row.data.outcome : undefined,
+            errorCode: typeof row.data?.errorCode === 'string' && /^[A-Z0-9_]+$/.test(row.data.errorCode)
+              ? row.data.errorCode : undefined,
+            completedStages: Array.isArray(row.data?.stages)
+              ? row.data.stages.flatMap((stage: any) => typeof stage?.stage === 'string'
+                && /^[a-z_]+$/.test(stage.stage) ? [stage.stage] : []) : undefined,
+          }))
+        })
+      return { supervisorEvents, hostEvents, storeProbeSelections }
     }
     finalObservation = async () => {
       let final: unknown
@@ -794,15 +1225,57 @@ tool_timeout_sec = 120
     }
     const readNameFor = async (ref: unknown) => (await readNameUpdateFor(ref))?.record
     const readName = () => readNameFor(durableNameRef)
-    const waitForNativeNameSync = (ref: unknown, expected: any, label: string) => waitFor(label, async () => {
-      const update = await readNameUpdateFor(ref)
-      return update?.record?.revision === expected.revision
-        && update.record.name === expected.name
-        && update.nativeSync?.status === 'synced'
-        && update.nativeSync.desiredRevision === expected.revision
-        ? update
-        : undefined
-    }, NATIVE_NAME_SYNC_TIMEOUT_MS)
+    const waitForNativeNameSync = async (
+      ref: unknown,
+      expected: any,
+      label: string,
+      expectedNativeSessionId: string,
+      readNativeTitleOnce: () => Promise<unknown>,
+      timeoutMs = NATIVE_NAME_SYNC_TIMEOUT_MS,
+    ) => {
+      const samples: NativeSyncDiagnosticSample[] = []
+      let sample = 0
+      try {
+        return await waitFor(label, async () => {
+          const update = await readNameUpdateFor(ref)
+          appendNativeSyncSample(samples, update, ++sample)
+          return update?.record?.revision === expected.revision
+            && update.record.name === expected.name
+            && update.nativeSync?.status === 'synced'
+            && update.nativeSync.desiredRevision === expected.revision
+            ? update
+            : undefined
+        }, timeoutMs)
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== `timed out waiting for ${label}`) throw error
+
+        const [serverDeferrals, durableState, supervisorBusyRefusals, nativeTitleAtTimeout] = await Promise.all([
+          captureDiagnosticRead(() => summarizeNativeNameWorkerLogs(
+            [Object.values(rig.web.capturedOutput()).join('\n'),
+              readBoundedTail(path.join(rig.web.info.logsDir, 'rust-server.jsonl'), 64 * 1024)])),
+          captureDiagnosticRead(() => summarizeNativeNameDurableState(
+            fs.readFileSync(path.join(rig.web.info.homeDir, '.freshell', 'session-names.json'), 'utf8'),
+            'codex', expectedNativeSessionId, expected.revision)),
+          captureDiagnosticRead(() => summarizeNativeLifecycleBusyRefusals(
+            readBoundedTail(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 64 * 1024),
+            expectedNativeSessionId)),
+          readNativeTitleDiagnosticFacts(readNativeTitleOnce, expectedNativeSessionId, expected.name),
+        ])
+        const diagnostic = {
+          waitLabel: label,
+          ...(Number.isSafeInteger(expected.revision) ? { expectedRevision: expected.revision } : {}),
+          syncSampleCount: samples.length,
+          syncSamples: samples,
+          serverDeferrals,
+          durableState,
+          supervisorBusyRefusals,
+          nativeTitleAtTimeout,
+        }
+        try { rig.runtime.writeIncident('freshcodex-managed-native-sync-timeout', diagnostic) }
+        catch { /* Keep the original synchronization timeout as the test failure. */ }
+        throw error
+      }
+    }
     const nativeMetadata = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path');
       const env=Object.fromEntries(fs.readFileSync('/proc/${nativeContext.pid}/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
@@ -844,6 +1317,8 @@ tool_timeout_sec = 120
     expect(renamed.ok, await renamed.clone().text()).toBe(true)
     const canonicalName = await readName()
     expect(canonicalName).toMatchObject({ ref: durableNameRef, name: 'Managed native saved name', source: 'manual' })
+    const nativeSessionId = view.nativeSessionId
+    if (typeof nativeSessionId !== 'string') throw new Error('Managed Codex view has no native session ID')
     const readNativeName = async (nativeId = view.nativeSessionId, context = nativeContext) => JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs');const argv=fs.readFileSync('/proc/${context.pid}/cmdline','utf8').split(String.fromCharCode(0));
       const endpoint=argv[argv.indexOf('--listen')+1];const target=new URL(endpoint);
@@ -859,7 +1334,8 @@ tool_timeout_sec = 120
         if(frame.id===2)finish(null,{id:frame.result.thread.id,title:frame.result.thread.name??null});});`]))
     const nativeNameBeforeWait = await readNativeName()
     rig.runtime.writeIncident('freshcodex-managed-native-name-writeback', { canonicalName, nativeNameBeforeWait, view, nativeContext })
-    await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization')
+    await waitForNativeNameSync(durableNameRef, canonicalName, 'managed native name synchronization',
+      nativeSessionId, () => readNativeName(nativeSessionId, nativeContext), 150_000)
     await waitFor('managed native name writeback', async () => {
       const observation = await readNativeName()
       return observation.id === view.nativeSessionId && observation.title === canonicalName.name ? observation : undefined
@@ -1035,9 +1511,21 @@ tool_timeout_sec = 120
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.readTraffic()).length }
     expect(beforeCrash.name).toEqual(canonicalName)
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
+    // Pause only this receipt-owned session host so it cannot take the live
+    // readiness path while the provider history is removed. The supervisor
+    // must recover through a new host and its durable cold-start receipt.
+    const lifecycleBeforeHostPause = readSupervisorLifecycle()
+    const supervisorSequenceBeforeHostPause = lifecycleBeforeHostPause.reduce((latest, row) =>
+      Number.isSafeInteger(row.sequence) ? Math.max(latest, row.sequence) : latest, 0)
+    const stoppedSessionHostPid = rig.signalOwnedSessionHostExact(
+      providerContainerId, beforeCrash.view!.incarnationId, 'SIGSTOP')
+    pausedSessionHost = {
+      containerId: providerContainerId,
+      incarnationId: beforeCrash.view!.incarnationId,
+      pid: stoppedSessionHostPid,
+    }
     // Kill only this receipt-owned, inspected release native PID. Archive its
     // REAL native-generated history after exit, keeping every original byte.
-    // The host stays live; no internal exited flag or Started event is forged.
     rig.runtime.killOwnedRuntimePidExact(providerContainerId, beforeCrash.nativeContext.pid)
     const nativeExit = await waitFor('exact native process terminal state before history archive', async () => {
       const state = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
@@ -1064,10 +1552,305 @@ tool_timeout_sec = 120
       return { ...metadata, copy }
     })
     fs.writeFileSync(path.join(archiveDirectory, 'manifest.json'), JSON.stringify(archiveManifest, null, 2), { mode: 0o600 })
+    const effectiveCodexHome = nativeMetadata.env.CODEX_HOME
+      ?? path.join(nativeMetadata.env.HOME, '.codex')
+    const providerHome = nativeMetadata.env.HOME
+    const digestPath = (value: string) => createHash('sha256').update(value).digest('hex')
+    const archiveManifestDiagnostics = {
+      fileCount: archiveManifest.length,
+      fileSamples: archiveManifest.slice(0, 16).map((file: any) => ({
+        sourcePathSha256: digestPath(file.source),
+        archivePathSha256: digestPath(file.archive),
+        contentSha256: file.sha256,
+        bytes: file.bytes,
+      })),
+      fileSamplesTruncated: archiveManifest.length > 16,
+      archivedTargetRollout: archiveManifest.some((file: any) => file.source === originalRollout),
+      archivedStateDatabaseCount: archiveManifest.filter((file: any) => /^state_[0-9]+[.]sqlite(?:-wal|-shm)?$/.test(path.basename(file.source))).length,
+      archivedSessionIndex: archiveManifest.some((file: any) => path.basename(file.source) === 'session_index.jsonl'),
+    }
+    const postArchiveCensus = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+      const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),{TextDecoder}=require('node:util');
+      const codexHome=${JSON.stringify(effectiveCodexHome)},providerHome=${JSON.stringify(providerHome)},expected=${JSON.stringify(view.nativeSessionId)};
+      const explicitCodexHome=${JSON.stringify(typeof nativeMetadata.env.CODEX_HOME==='string')},sessionRoot=path.join(codexHome,'sessions');
+      const limits={entries:50000,files:8192,statBytes:536870912,bytesPerFile:1048576,totalReadBytes:268435456,depth:8,pathBytes:4096,pathComponents:128,errorSamples:16,matchSamples:16};
+      const errorCodes=['unreadable','read_error','symlink','nonregular','non_jsonl','first_record_missing','malformed','conflicting_owner','truncated','limit_hit'];
+      const errorCounts=Object.fromEntries(errorCodes.map(code=>[code,0])),errorSamples=[],matches=[],fileSummaries=[];
+      let complete=true,stopped=false,totalEntries=0,totalFiles=0,totalStatBytes=0n,totalReadBytes=0,jsonlFiles=0,reproductionCandidate=null;
+      let sessionDirectoryState='missing',matchingPathSamplesTruncated=false,fileSummariesTruncated=false;
+      const digest=value=>crypto.createHash('sha256').update(value).digest('hex');
+      const mark=(code,file)=>{complete=false;errorCounts[code]++;if(errorSamples.length<limits.errorSamples)errorSamples.push({code,pathSha256:digest(file)})};
+      const ioCode=error=>error?.code==='EACCES'||error?.code==='EPERM'?'unreadable':error?.code==='ELOOP'?'symlink':'read_error';
+      const countEntry=file=>{if(totalEntries>=limits.entries){mark('limit_hit',file);stopped=true;fileSummariesTruncated=true;return false}totalEntries++;return true};
+      const addStatBytes=(file,metadata)=>{if(!metadata.isFile())return true;const size=metadata.size;if(size>BigInt(limits.statBytes)-totalStatBytes){mark('limit_hit',file);stopped=true;fileSummariesTruncated=true;return false}totalStatBytes+=size;return true};
+      const lstat=(file,allowMissing=false)=>{try{const metadata=fs.lstatSync(file,{bigint:true});if(!addStatBytes(file,metadata))return undefined;return metadata}catch(error){if(allowMissing&&error?.code==='ENOENT')return null;mark(ioCode(error),file);return undefined}};
+      const access=(file,mode)=>{try{fs.accessSync(file,mode);return true}catch{return false}};
+      const inspectDirectory=(target,requireRead)=>{
+        const result={absolute:path.isAbsolute(target),exists:false,directory:false,canonical:false,readable:false,searchable:false};
+        if(target.length>limits.pathBytes){mark('limit_hit',target);stopped=true;return result}
+        if(!result.absolute){mark('read_error',target);return result}
+        const parsed=path.parse(target),parts=target.slice(parsed.root.length).split(path.sep).filter(Boolean);
+        if(parts.length>limits.pathComponents){mark('limit_hit',target);stopped=true;return result}
+        let current=parsed.root;
+        const components=parts.length?parts:[''];
+        for(let index=0;index<components.length;index++){
+          const part=components[index];if(part)current=path.join(current,part);
+          if(!countEntry(current))return result;
+          const metadata=lstat(current,true);
+          if(metadata===null||!metadata)return result;
+          if(index===components.length-1)result.exists=true;
+          if(metadata.isSymbolicLink()){mark('symlink',current);return result}
+          if(!metadata.isDirectory()){mark('nonregular',current);return result}
+          const searchable=access(current,fs.constants.X_OK);
+          if(!searchable){mark('unreadable',current);return result}
+          if(index===components.length-1){
+            result.exists=true;result.directory=true;result.searchable=searchable;
+            result.readable=access(current,fs.constants.R_OK);
+            try{result.canonical=fs.realpathSync.native(target)===path.resolve(target)}catch(error){mark(ioCode(error),current);return result}
+            if(requireRead&&!result.readable)mark('unreadable',current);
+            return result;
+          }
+        }
+        return result;
+      };
+      const homeProbe=inspectDirectory(codexHome,false),rootProbe=inspectDirectory(sessionRoot,true);
+      let matchingOwnerCount=0;
+      const addMatch=file=>{matchingOwnerCount++;if(matches.length<limits.matchSamples)matches.push(digest(file));else matchingPathSamplesTruncated=true};
+      const saveFileSummary=summary=>{if(fileSummaries.length<limits.files)fileSummaries.push(summary);else fileSummariesTruncated=true};
+      const addUnavailableFileSummary=(file,listed,outcome)=>{
+        saveFileSummary({pathSha256:digest(file),bytes:listed?Number(listed.size):null,
+          mode:listed?Number(listed.mode&0o777n).toString(8):null,firstRecordType:'unreadable',ownerNonempty:false,
+          ownerMatchesExpected:false,recordCount:0,complete:false,truncated:outcome==='prefix_incomplete',parseOutcome:outcome});
+      };
+      const inspectOwner=(file,listed)=>{
+        let descriptor,owner,firstRecord=true,lineStart=0,finished=false,rawBytes=null;
+        const summary={pathSha256:digest(file),bytes:Number(listed.size),mode:Number(listed.mode&0o777n).toString(8),
+          firstRecordType:'missing',ownerNonempty:false,ownerMatchesExpected:false,recordCount:0,complete:false,truncated:false,parseOutcome:'unreadable'};
+        const finish=()=>{
+          if(finished)return owner;finished=true;
+          summary.ownerNonempty=typeof owner==='string'&&owner.trim().length>0;
+          summary.ownerMatchesExpected=owner===expected;
+          if(summary.complete)summary.parseOutcome=summary.ownerMatchesExpected?'target_owner':'valid_other';
+          if(summary.complete&&summary.parseOutcome==='valid_other'&&rawBytes&&rawBytes.length<=262144){reproductionCandidate={pathSha256:summary.pathSha256,bytes:rawBytes.length,contentSha256:digest(rawBytes),base64:rawBytes.toString('base64')}}
+          if(summary.ownerMatchesExpected)addMatch(file);
+          saveFileSummary(summary);
+          return owner;
+        };
+        const fileIssue=(code,outcome,truncated=false)=>{
+          mark(code,file);summary.complete=false;summary.parseOutcome=outcome;summary.truncated ||= truncated;
+        };
+        try{
+          descriptor=fs.openSync(file,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0));
+          const opened=fs.fstatSync(descriptor,{bigint:true});
+          if(!opened.isFile()){fileIssue('nonregular','unreadable');return finish()}
+          if(opened.dev!==listed.dev||opened.ino!==listed.ino||opened.size!==listed.size){fileIssue('truncated','prefix_incomplete',true);return finish()}
+          const extent=Number(opened.size);
+          if(!Number.isSafeInteger(extent)){fileIssue('limit_hit','prefix_incomplete',true);return finish()}
+          const remaining=limits.totalReadBytes-totalReadBytes;
+          const byteLimit=Math.min(extent,limits.bytesPerFile,remaining);
+          if(byteLimit<extent){fileIssue('truncated','prefix_incomplete',true);mark('limit_hit',file)}
+          if(byteLimit===0&&extent>0){stopped=true;fileSummariesTruncated=true;return finish()}
+          const buffer=Buffer.alloc(byteLimit);let count=0;
+          while(count<byteLimit){const read=fs.readSync(descriptor,buffer,count,byteLimit-count,count);if(read===0)break;count+=read;totalReadBytes+=read}
+          rawBytes=Buffer.from(buffer.subarray(0,count));
+          if(count<byteLimit)fileIssue('truncated','prefix_incomplete',true);
+          const after=fs.fstatSync(descriptor,{bigint:true});
+          if(after.dev!==opened.dev||after.ino!==opened.ino||after.size!==opened.size)fileIssue('truncated','prefix_incomplete',true);
+          const completeFile=count===extent&&after.size===opened.size;
+          summary.complete=completeFile;
+          const decoder=new TextDecoder('utf-8',{fatal:true});
+          const inspectLine=(end)=>{
+            const line=buffer.subarray(lineStart,end);lineStart=end+1;
+            if(line.every(byte=>byte===9||byte===10||byte===13||byte===32))return true;
+            let row;try{row=JSON.parse(decoder.decode(line))}catch{if(firstRecord)summary.firstRecordType='malformed';fileIssue('malformed','malformed');return false}
+            summary.recordCount++;
+            if(firstRecord){
+              firstRecord=false;
+              summary.firstRecordType=row&&typeof row==='object'&&!Array.isArray(row)&&row.type==='session_meta'?'session_meta':'other';
+              if(!row||typeof row!=='object'||Array.isArray(row)||row.type!=='session_meta'){
+                fileIssue('first_record_missing','malformed');return false
+              }
+            }
+            if(row&&typeof row==='object'&&!Array.isArray(row)&&row.type==='session_meta'){
+              const id=row.payload&&typeof row.payload==='object'&&!Array.isArray(row.payload)?row.payload.id:undefined;
+              if(typeof id!=='string'||!id.trim()){fileIssue('malformed','malformed');return false}
+              if(owner===undefined)owner=id;
+              else if(owner!==id){fileIssue('conflicting_owner','owner_conflict');return false}
+            }
+            return true;
+          };
+          for(let index=0;index<count;index++){
+            if(buffer[index]===10&&!inspectLine(index))return finish();
+          }
+          if(completeFile&&lineStart<count&&!inspectLine(count))return finish();
+          if(firstRecord&&completeFile)fileIssue('first_record_missing','malformed');
+          if(!completeFile){summary.complete=false;summary.truncated=true;if(summary.parseOutcome==='unreadable')summary.parseOutcome='prefix_incomplete'}
+          return finish();
+        }catch(error){fileIssue(ioCode(error),'unreadable');return finish()}
+        finally{if(descriptor!==undefined){try{fs.closeSync(descriptor)}catch{fileIssue('read_error','unreadable')}}}
+      };
+      const walk=(directory,depth,isSelectedRoot=false)=>{
+        if(stopped)return;
+        if(depth>=limits.depth){mark('limit_hit',directory);stopped=true;fileSummariesTruncated=true;return}
+        let handle;try{handle=fs.opendirSync(directory)}catch(error){mark(ioCode(error),directory);fileSummariesTruncated=true;if(isSelectedRoot)sessionDirectoryState='unreadable';return}
+        try{
+          while(!stopped){
+            let entry;try{entry=handle.readSync()}catch(error){mark(ioCode(error),directory);fileSummariesTruncated=true;if(isSelectedRoot)sessionDirectoryState='unreadable';break}
+            if(!entry)break;
+            const file=path.join(directory,entry.name);if(!countEntry(file))break;
+            const metadata=lstat(file);
+            if(!metadata){if(entry.name.endsWith('.jsonl'))addUnavailableFileSummary(file,undefined,stopped?'prefix_incomplete':'unreadable');continue}
+            if(metadata.isSymbolicLink()){mark('symlink',file);if(entry.name.endsWith('.jsonl'))addUnavailableFileSummary(file,metadata,'unreadable');continue}
+            if(metadata.isDirectory()){walk(file,depth+1);continue}
+            if(!metadata.isFile()){mark('nonregular',file);if(entry.name.endsWith('.jsonl'))addUnavailableFileSummary(file,metadata,'unreadable');continue}
+            if(totalFiles>=limits.files){mark('limit_hit',file);stopped=true;fileSummariesTruncated=true;if(entry.name.endsWith('.jsonl'))addUnavailableFileSummary(file,metadata,'prefix_incomplete');break}
+            totalFiles++;
+            if(!entry.name.endsWith('.jsonl')){mark('non_jsonl',file);continue}
+            jsonlFiles++;inspectOwner(file,metadata);
+          }
+        }finally{try{handle.closeSync()}catch(error){if(error?.code!=='ERR_DIR_CLOSED'){mark(ioCode(error),directory);if(isSelectedRoot)sessionDirectoryState='unreadable'}}}
+      };
+      if(rootProbe.exists&&rootProbe.directory&&rootProbe.readable&&rootProbe.searchable){sessionDirectoryState='readable';if(countEntry(sessionRoot))walk(sessionRoot,0,true)}
+      else if(rootProbe.exists){sessionDirectoryState='unreadable'}
+      process.stdout.write(JSON.stringify({localBoundedClassificationOnly:true,authenticatedRustProbeAuthoritative:true,complete,
+        providerHomePathSha256:digest(providerHome||''),selectedCodexHomePathSha256:digest(codexHome),selectedSessionsRootPathSha256:digest(sessionRoot),
+        selectedCodexHomeExplicit:explicitCodexHome,selectedCodexHomeAbsolute:homeProbe.absolute,selectedCodexHomeExists:homeProbe.exists,
+        selectedCodexHomeAvailable:homeProbe.exists&&homeProbe.directory&&homeProbe.canonical&&homeProbe.searchable,
+        selectedCodexHomeCanonical:homeProbe.canonical,selectedCodexHomeReadable:homeProbe.readable,selectedCodexHomeSearchable:homeProbe.searchable,
+        selectedSessionsRootAbsolute:rootProbe.absolute,selectedSessionsRootExists:rootProbe.exists,selectedSessionsRootDirectory:rootProbe.directory,
+        selectedSessionsRootAvailable:sessionDirectoryState==='readable',
+        selectedSessionsRootCanonical:rootProbe.canonical,selectedSessionsRootReadable:rootProbe.readable,selectedSessionsRootSearchable:rootProbe.searchable,
+        sessionDirectoryState,totalEntries,totalFiles,totalStatBytes:totalStatBytes.toString(),totalReadBytes,jsonlFiles,
+        targetHeaderCount:matchingOwnerCount,targetPathSha256:matches,matchingPathSamplesTruncated,fileSummaries,fileSummariesTruncated,
+        reproductionFile:complete&&jsonlFiles===1&&fileSummaries.length===1?reproductionCandidate:null,
+        limits,errorCounts,errorSamples}));`]))
+    const reproductionFile = postArchiveCensus.reproductionFile
+    delete postArchiveCensus.reproductionFile
+    let privateRolloutCopy: Record<string, unknown> = { outcome: 'not_available' }
+    if (reproductionFile && postArchiveCensus.complete && postArchiveCensus.jsonlFiles === 1
+      && postArchiveCensus.fileSummaries.length === 1 && reproductionFile.bytes <= 262_144) {
+      try {
+        const bytes = Buffer.from(reproductionFile.base64, 'base64')
+        const valid = bytes.length === reproductionFile.bytes
+          && createHash('sha256').update(bytes).digest('hex') === reproductionFile.contentSha256
+          && postArchiveCensus.fileSummaries[0].pathSha256 === reproductionFile.pathSha256
+          && postArchiveCensus.fileSummaries[0].parseOutcome === 'valid_other'
+        if (valid) {
+          const copy = path.join(archiveDirectory, `remaining-${reproductionFile.pathSha256}.jsonl`)
+          fs.writeFileSync(copy, bytes, { mode: 0o600, flag: 'wx' })
+          fs.chmodSync(copy, 0o600)
+          const copiedMode = fs.statSync(copy).mode & 0o777
+          privateRolloutCopy = {
+            outcome: copiedMode === 0o600 ? 'preserved' : 'mode_mismatch',
+            pathSha256: reproductionFile.pathSha256,
+            contentSha256: reproductionFile.contentSha256,
+            bytes: reproductionFile.bytes,
+            mode: copiedMode.toString(8),
+          }
+        } else {
+          privateRolloutCopy = { outcome: 'integrity_mismatch' }
+        }
+      } catch {
+        privateRolloutCopy = { outcome: 'write_failed' }
+      }
+    }
+    postArchiveCensus.privateRolloutCopy = privateRolloutCopy
+    const preArchiveTargetPaths = nativeMetadata.headers
+      .filter((header: any) => header.type === 'session_meta' && header.id === view.nativeSessionId)
+      .map((header: any) => createHash('sha256').update(header.path).digest('hex'))
+    rig.runtime.writeIncident('freshcodex-managed-native-crash-archive-census', {
+      codexHomePathSha256: postArchiveCensus.selectedCodexHomePathSha256,
+      providerHomePathSha256: postArchiveCensus.providerHomePathSha256,
+      preArchiveHeaderCount: nativeMetadata.headers.length,
+      preArchiveDirectoryErrorCount: nativeMetadata.errors.length,
+      preArchiveTargetHeaderCount: preArchiveTargetPaths.length,
+      preArchiveTargetPathSha256: preArchiveTargetPaths.slice(0, 16),
+      preArchiveTargetPathSamplesTruncated: preArchiveTargetPaths.length > 16,
+      archive: archiveManifestDiagnostics,
+      postArchiveCensus,
+    })
+    expect(postArchiveCensus.complete).toBe(true)
+    expect(postArchiveCensus.sessionDirectoryState).toBe('readable')
+    expect(postArchiveCensus.targetHeaderCount).toBe(0)
+    const beforeColdHostRetirement = await rig.runningViewForFreshSession(created.sessionId)
+    expect(beforeColdHostRetirement?.incarnationId).toBe(beforeCrash.view!.incarnationId)
+    expect(beforeColdHostRetirement?.nativeSessionId).toBe(view.nativeSessionId)
+    expect(rig.runtime.isContainerRunning(providerContainerId)).toBe(true)
+    const priorHostTraffic = await model.readTraffic()
+    retainedModelTraffic = [...retainedModelTraffic, ...priorHostTraffic]
+    // The actor is paused, so a provider-exit observer cannot complete an
+    // in-place readiness change. Retire its exact container before waiting
+    // for the observer, forcing recovery to open a new actor process.
+    expect(stoppedSessionHostPid).toBeGreaterThan(1)
+    rig.runtime.killOwnedRuntimeExact(providerContainerId)
+    pausedSessionHost = undefined
+    model = undefined
+    let coldRecovery: { trigger: any; settled: any }
+    try {
+      coldRecovery = await waitFor('cold Codex replacement recovery settlement', async () => {
+        const rows = readSupervisorLifecycle()
+        const trigger = rows.find(row => row.sequence > supervisorSequenceBeforeHostPause
+          && row.event === 'supervisor.runtime_observer.recovery_scheduled'
+          && row.data?.soulId === beforeCrash.view!.soulId
+          && row.data?.trigger === 'host_unreachable')
+        if (!trigger) return undefined
+        const settlements = rows.filter(row => row.sequence > trigger.sequence
+          && row.data?.soulId === beforeCrash.view!.soulId
+          && ['supervisor.recovery_retry.settled', 'supervisor.recovery_retry.exhausted']
+            .includes(row.event))
+        for (const settled of settlements.reverse()) {
+          if (settled.event === 'supervisor.recovery_retry.exhausted') return { trigger, settled }
+          if (settled.data?.reason !== 'recovered' || typeof settled.data?.incarnationId !== 'string') continue
+          const hostPath = path.join(rig.supervisor.runtimeRoot,
+            settled.data.incarnationId, 'host-lifecycle.jsonl')
+          try {
+            const hostEvents = readBoundedTail(hostPath, 1024 * 1024).split('\n').flatMap(line => {
+              try { return [JSON.parse(line)] } catch { return [] }
+            })
+            if (hostEvents.some(row => row.event === 'host.native_identity.readiness_receipt_committed')) {
+              return { trigger, settled }
+            }
+          } catch { /* A later settlement may still carry its host receipt. */ }
+        }
+        return undefined
+      }, 150_000)
+    } catch (error) {
+      const diagnostic = coldRecoveryDiagnostics()
+      try { rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-failed', diagnostic) } catch { /* Preserve the recovery failure. */ }
+      throw new Error(`cold Codex host recovery did not settle: ${error instanceof Error ? error.message : String(error)}; ${JSON.stringify(diagnostic)}`)
+    }
+    const coldRecoveryDiagnostic = coldRecoveryDiagnostics()
+    rig.runtime.writeIncident('freshcodex-managed-native-cold-recovery-settlement', coldRecoveryDiagnostic)
+    expect(coldRecovery.trigger.data.trigger).toBe('host_unreachable')
+    expect(coldRecovery.settled.event).toBe('supervisor.recovery_retry.settled')
+    expect(coldRecovery.settled.data.reason).toBe('recovered')
+    expect(coldRecovery.settled.data.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
+    const recovered = await waitFor('cold replacement Codex actor running', async () => {
+      const current = await rig.runningViewForFreshSession(created.sessionId)
+      if (!current || !current.containerId || !current.hostBootId
+        || current.incarnationId !== coldRecovery.settled.data.incarnationId
+        || !rig.runtime.isContainerRunning(current.containerId)) return undefined
+      return current
+    })
+    expect(recovered.incarnationId).not.toBe(beforeCrash.view!.incarnationId)
+    expect(recovered.hostBootId).not.toBe(beforeCrash.view!.hostBootId)
+    expect(recovered.nativeSessionId).toBeTruthy()
+    expect(recovered.nativeSessionId).not.toBe(view.nativeSessionId)
+    providerContainerId = recovered.containerId!
+    const recoveredHostLifecyclePath = path.join(rig.supervisor.runtimeRoot,
+      recovered.incarnationId, 'host-lifecycle.jsonl')
+    const recoveredHostEvents = readBoundedTail(recoveredHostLifecyclePath, 1024 * 1024)
+      .split('\n').flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
+    expect(recoveredHostEvents.some(row => row.event === 'host.native_identity.readiness_receipt_committed'))
+      .toBe(true)
+    model = await startInManagedContext(rig, { containerId: providerContainerId, handlerSource })
     const recoveryAccepted = await send('AWAITED_PLAN_RECOVERY')
-    const recovered = await rig.runningViewForFreshSession(created.sessionId)
     rig.runtime.writeIncident('freshcodex-managed-native-crash-first-send', { userRef: created.sessionId, beforeCrash,
-      archiveManifest, nativeExit, recoveryAccepted, recovered, newTraffic: (await model.readTraffic()).slice(beforeCrash.trafficCursor), frames: wire.frames.slice(-30) })
+      archive: archiveManifestDiagnostics, nativeExit, recoveryAccepted, recovered, coldRecovery: {
+        trigger: coldRecovery.trigger.event, outcome: coldRecovery.settled.event,
+        reason: coldRecovery.settled.data.reason, incarnationId: coldRecovery.settled.data.incarnationId,
+        receiptCommitted: true,
+      }, newTraffic: await model.readTraffic(), frames: wire.frames.slice(-30) })
     // Acceptance must durably commit the new native source before returning.
     expect(recovered?.nativeSessionId).toBeTruthy()
     expect(recovered!.nativeSessionId).not.toBe(view.nativeSessionId)
@@ -1109,24 +1892,53 @@ tool_timeout_sec = 120
     expect(recoveredCanonicalName).toMatchObject({ ref: recoveredNameRef, name: 'Managed recovered saved name', source: 'manual' })
     rig.runtime.writeIncident('freshcodex-managed-native-recovery-name-progress', { userRef: created.sessionId,
       oldNativeRef: durableNameRef, newNativeRef: recoveredNameRef, oldName: await readName(), firstNewName: recoveredName,
-      manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archiveManifest })
-    const recoveredNativeContext = await inspectNativeContext()
-    expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, noNewPrivs: '1', capEff: '0000000000000000' })
-    await waitForNativeNameSync(recoveredNameRef, recoveredCanonicalName, 'recovered native name synchronization')
+      manualNewName: await readNameFor(recoveredNameRef), recovered, recoveryControl, second, archive: archiveManifestDiagnostics })
+    const recoveredNativeContext = await inspectNativeContext(recoveryCwd)
+    expect(recoveredNativeContext).toMatchObject({ uid: 65534, gid: 0, cwd: recoveryCwd,
+      noNewPrivs: '1', capEff: '0000000000000000' })
+    let observedNativeAppServers: Array<{ pid: number; cwd: string }> = []
+    const recoveredNativeAppServers = await waitFor('failed exact-resume app-server reaped after cold recovery', async () => {
+      observedNativeAppServers = await inspectNativeAppServers()
+      return observedNativeAppServers.length === 1
+        && observedNativeAppServers[0].pid === recoveredNativeContext.pid
+        && observedNativeAppServers[0].cwd === recoveryCwd
+        ? observedNativeAppServers
+        : undefined
+    }, 10_000).catch(() => {
+      throw new Error(`unexpected Codex app-server processes after cold recovery: ${JSON.stringify(observedNativeAppServers)}`)
+    })
+    expect(recoveredNativeAppServers).toEqual([{ pid: recoveredNativeContext.pid, cwd: recoveryCwd }])
+    // Busy refusals back off to a durable 60s cooldown after six attempts.
+    // Leave room for that retry and its provider read/write confirmation.
+    await waitForNativeNameSync(recoveredNameRef, recoveredCanonicalName, 'recovered native name synchronization',
+      recoveredId, () => readNativeName(recoveredId, recoveredNativeContext), 150_000)
     await waitFor('recovered source native name writeback', async () => (await readNativeName(recoveredId, recoveredNativeContext)).title === 'Managed recovered saved name' ? true : undefined, 15_000)
     const recoveredCapture = await fetch(`${rig.info.baseUrl}/api/panes/${paneId}/capture`, { headers })
     expect(recoveredCapture.ok, await recoveredCapture.clone().text()).toBe(true)
     const capture = await recoveredCapture.text()
     expect(capture).toContain('Managed recovery second answer.')
     expect(capture).not.toContain('MANAGED_NATIVE_FIRST')
-    const newTraffic = (await model.readTraffic()).slice(beforeCrash.trafficCursor).filter((row: any) => row.path === '/v1/responses')
+    const newTraffic = (await model.readTraffic()).filter((row: any) => row.path === '/v1/responses')
     expect(newTraffic.filter((row: any) => row.body.input.filter((item: any) => item.role === 'user').at(-1)?.content?.some((part: any) => part.text?.includes('MANAGED_RECOVERY_SECOND')))).toHaveLength(1)
     expect(newTraffic.every((row: any) => !JSON.stringify(row.body.input).includes('MANAGED_NATIVE_FIRST'))).toBe(true)
     expect((await rig.inventory()).filter(row => row.provider === 'codex' && row.nativeSessionId === recoveredId && row.launchState === 'running')).toHaveLength(1)
     rig.runtime.writeIncident('freshcodex-managed-native-recovery', { userRef: created.sessionId, oldNativeRef: created.sessionRef,
-      newNativeRef: recoveredNameRef, beforeCrash, archiveManifest, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
+      newNativeRef: recoveredNameRef, beforeCrash, archive: archiveManifestDiagnostics, nativeExit, recoveryAccepted, recovered, recoveryControl, second, capture,
       oldName: await readName(), firstNewName: recoveredName, finalNewName: await readNameFor(recoveredNameRef),
       nativeName: await readNativeName(recoveredId, recoveredNativeContext), recoveredNativeContext, newTraffic })
 
   }, 360_000)
+
+  it('finalizes the supervisor GDB observer before teardown', async () => {
+    if (process.env.FRESHELL_CAPTURE_SUPERVISOR_CRASH !== '1') return
+    expect(supervisorCrashDiagnostics).toBeDefined()
+    const summary = await supervisorCrashDiagnostics!.finalizeObserver()
+    expect(summary).toMatchObject({
+      attached: true,
+      observerStopped: true,
+      observerStopRequested: true,
+      exitCode: expect.any(Number),
+    })
+    expect(rig.runtime.inspectContainer(rig.supervisor.containerId).State?.Running).toBe(true)
+  })
 })

@@ -41,6 +41,31 @@ async fn event(ws: &mut TestWs, kind: &str) -> Value {
         }
     }
 }
+async fn materialized_or_attach_error(ws: &mut TestWs) -> Value {
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    for _ in 0..20u8 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = tokio::time::timeout(
+            remaining.max(std::time::Duration::from_millis(1)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for a freshAgent.session.materialized frame"))
+        .expect("stream not ended")
+        .expect("no ws error");
+        let Message::Text(raw) = message else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&raw).expect("json frame");
+        if value["type"] == "freshAgent.event" && value["event"]["type"] == "freshAgent.error" {
+            panic!("Codex attach failed before session materialization: {value}");
+        }
+        if value["type"] == "freshAgent.session.materialized" {
+            return value;
+        }
+    }
+    panic!("freshAgent.session.materialized never arrived within 20 frames");
+}
 async fn run_replay(async_question: bool) {
     let _guard = ENV.lock().await;
     let dir = tempfile::tempdir().unwrap();
@@ -164,16 +189,26 @@ async fn replay_after_native_exit(mint_new: bool) {
         }
     }
     let before = ready(&url).await;
-    std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR",if mint_new {json!({"threadStartThreadId":"replay-new","overrides":{"thread/resume":{"error":{"code":-32001,"message":"Thread not found"}}}})} else {json!({})}.to_string());
+    std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR",if mint_new {json!({"threadStartThreadId":"replay-new","overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id replay-old"}}}})} else {json!({})}.to_string());
     state.fresh_codex.handle_attach(serde_json::from_value(json!({"provider":"codex","sessionType":"freshcodex","sessionId":old,"cwd":dir.path()})).unwrap()).await;
     let current = if mint_new {
-        next_frame_of_type(&mut ws, "freshAgent.session.materialized").await["sessionId"]
+        materialized_or_attach_error(&mut ws).await["sessionId"]
             .as_str()
-            .unwrap()
+            .expect("materialized session id")
             .to_string()
     } else {
         old.to_string()
     };
+    if mint_new {
+        assert_eq!(
+            current, "replay-new",
+            "replacement must use the fake server's newly minted id"
+        );
+        assert_ne!(
+            current, old,
+            "materialization must move the old id to a distinct new id"
+        );
+    }
     let after = ready(&url).await;
     state
         .fresh_codex

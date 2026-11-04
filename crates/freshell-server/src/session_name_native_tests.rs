@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use super::{
     NativeCallResult, NativeNameBackend, NativeNameReadback, NativeNameTarget, NativeOutcomeFold,
-    SessionNameWorker,
+    SessionNameWorker, WORKER_POLL_INTERVAL,
 };
 use crate::session_names::SessionNames;
 
@@ -157,6 +157,14 @@ fn document_json(dir: &std::path::Path) -> Value {
     serde_json::from_slice(&bytes).expect("document parses")
 }
 
+fn native_entry_for_target(doc: &Value, target: &SessionNameRef) -> Value {
+    let key = crate::session_names::name_ref_key(target);
+    doc["nativeWrite"]
+        .get(&key)
+        .expect("target has native state")
+        .clone()
+}
+
 /// How long a real-clock test waits for a worker cycle to converge. A cycle
 /// is several durable transactions, so it takes as long as the disk does;
 /// this bound only turns a series that never converges into a failure
@@ -225,7 +233,22 @@ enum WriteStep {
     },
     /// Ambiguous answer; the write never lands.
     Undelivered,
+    /// The supervisor refused the request before host/native dispatch.
+    LifecycleBusy,
+    /// The provider acknowledged the write but the subsequent read still
+    /// reports the old title, exercising confirmation-only retry behavior.
+    ConfirmWithoutApplying,
     Unsupported,
+}
+
+enum ReadStep {
+    /// Read the scripted provider's current title.
+    Current,
+    /// The read timed out or lost its response. Reads do not mutate the
+    /// provider, so this must not poison an acknowledged write receipt.
+    Ambiguous,
+    /// The supervisor refused the request before host/native dispatch.
+    LifecycleBusy,
 }
 
 /// A deterministic in-memory provider: reads answer the shared provider-side
@@ -234,31 +257,58 @@ enum WriteStep {
 struct ScriptedBackend {
     reads: AtomicU32,
     writes: AtomicU32,
+    confirmed_writes: Arc<AtomicU32>,
     provider_title: Arc<Mutex<Option<String>>>,
     steps: Mutex<VecDeque<WriteStep>>,
+    read_steps: Mutex<VecDeque<ReadStep>>,
+    write_titles: Mutex<Vec<String>>,
+    write_locations: Mutex<Vec<NativeLocation>>,
+    read_locations: Mutex<Vec<NativeLocation>>,
+    probe_locations: Mutex<Vec<NativeLocation>>,
     /// One-shot read gate: the FIRST read parks until the gate is notified
     /// (tests use this to mutate the store while a cycle is mid-flight —
     /// the worker holds the background guard, never the document lock).
     gate_armed: AtomicBool,
     gate_arrived: Arc<tokio::sync::Notify>,
     gate_open: Arc<tokio::sync::Notify>,
+    probe_gate_armed: AtomicBool,
+    probe_gate_arrived: Arc<tokio::sync::Notify>,
+    probe_gate_open: Arc<tokio::sync::Notify>,
 }
 
 impl ScriptedBackend {
     fn new(steps: Vec<WriteStep>) -> Arc<Self> {
+        Self::new_with_reads(steps, Vec::new())
+    }
+
+    fn new_with_reads(steps: Vec<WriteStep>, read_steps: Vec<ReadStep>) -> Arc<Self> {
         Arc::new(Self {
             reads: AtomicU32::new(0),
             writes: AtomicU32::new(0),
+            confirmed_writes: Arc::new(AtomicU32::new(0)),
             provider_title: Arc::new(Mutex::new(None)),
             steps: Mutex::new(steps.into_iter().collect()),
+            read_steps: Mutex::new(read_steps.into_iter().collect()),
+            write_titles: Mutex::new(Vec::new()),
+            write_locations: Mutex::new(Vec::new()),
+            read_locations: Mutex::new(Vec::new()),
+            probe_locations: Mutex::new(Vec::new()),
             gate_armed: AtomicBool::new(false),
             gate_arrived: Arc::new(tokio::sync::Notify::new()),
             gate_open: Arc::new(tokio::sync::Notify::new()),
+            probe_gate_armed: AtomicBool::new(false),
+            probe_gate_arrived: Arc::new(tokio::sync::Notify::new()),
+            probe_gate_open: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
     fn arm_read_gate(self: &Arc<Self>) -> Arc<Self> {
         self.gate_armed.store(true, Ordering::SeqCst);
+        Arc::clone(self)
+    }
+
+    fn arm_probe_gate(self: &Arc<Self>) -> Arc<Self> {
+        self.probe_gate_armed.store(true, Ordering::SeqCst);
         Arc::clone(self)
     }
 
@@ -270,47 +320,112 @@ impl ScriptedBackend {
         self.writes.load(Ordering::SeqCst)
     }
 
+    fn confirmed_writes(&self) -> u32 {
+        self.confirmed_writes.load(Ordering::SeqCst)
+    }
+
+    fn write_titles(&self) -> Vec<String> {
+        self.write_titles.lock().unwrap().clone()
+    }
+
+    fn write_locations(&self) -> Vec<NativeLocation> {
+        self.write_locations.lock().unwrap().clone()
+    }
+
+    fn read_locations(&self) -> Vec<NativeLocation> {
+        self.read_locations.lock().unwrap().clone()
+    }
+
+    fn probe_locations(&self) -> Vec<NativeLocation> {
+        self.probe_locations.lock().unwrap().clone()
+    }
+
     fn set_title(&self, title: Option<&str>) {
         *self.provider_title.lock().unwrap() = title.map(str::to_string);
     }
 }
 
 impl NativeNameBackend for ScriptedBackend {
-    fn read(&self, _target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+    fn read(&self, target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.read_locations.lock().unwrap().push(target.location);
+        let step = self.read_steps.lock().unwrap().pop_front();
         if self.gate_armed.swap(false, Ordering::SeqCst) {
             self.gate_arrived.notify_one();
             let open = Arc::clone(&self.gate_open);
             let provider_title = Arc::clone(&self.provider_title);
             return Box::pin(async move {
                 open.notified().await;
-                let title = provider_title.lock().unwrap().clone();
-                NativeCallResult::Confirmed(NativeNameReadback { title })
+                match step {
+                    Some(ReadStep::LifecycleBusy) => NativeCallResult::LifecycleBusy,
+                    Some(ReadStep::Ambiguous) => {
+                        NativeCallResult::Ambiguous("scripted read timeout".to_string())
+                    }
+                    Some(ReadStep::Current) | None => {
+                        let title = provider_title.lock().unwrap().clone();
+                        NativeCallResult::Confirmed(NativeNameReadback { title })
+                    }
+                }
             });
         }
         let title = self.provider_title.lock().unwrap().clone();
-        Box::pin(async move { NativeCallResult::Confirmed(NativeNameReadback { title }) })
+        Box::pin(async move {
+            match step {
+                Some(ReadStep::LifecycleBusy) => NativeCallResult::LifecycleBusy,
+                Some(ReadStep::Ambiguous) => {
+                    NativeCallResult::Ambiguous("scripted read timeout".to_string())
+                }
+                Some(ReadStep::Current) | None => {
+                    NativeCallResult::Confirmed(NativeNameReadback { title })
+                }
+            }
+        })
     }
 
-    fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
-        Box::pin(async move { true })
+    fn route_available(&self, target: NativeNameTarget) -> super::NativeProbeFuture {
+        self.probe_locations.lock().unwrap().push(target.location);
+        if self.probe_gate_armed.swap(false, Ordering::SeqCst) {
+            self.probe_gate_arrived.notify_one();
+            let open = Arc::clone(&self.probe_gate_open);
+            Box::pin(async move {
+                open.notified().await;
+                super::NativeProbeResult::Available
+            })
+        } else {
+            Box::pin(async move { super::NativeProbeResult::Available })
+        }
     }
 
     fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
+        self.write_titles
+            .lock()
+            .unwrap()
+            .push(attempt.title.clone());
+        self.write_locations
+            .lock()
+            .unwrap()
+            .push(attempt.target.location.clone());
         let step = self
             .steps
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or(WriteStep::Confirm);
+        let confirmed_writes = Arc::clone(&self.confirmed_writes);
         let provider_title = Arc::clone(&self.provider_title);
         Box::pin(async move {
             match step {
                 WriteStep::Confirm => {
+                    confirmed_writes.fetch_add(1, Ordering::SeqCst);
                     *provider_title.lock().unwrap() = Some(attempt.title.clone());
                     NativeCallResult::Confirmed(())
                 }
+                WriteStep::ConfirmWithoutApplying => {
+                    confirmed_writes.fetch_add(1, Ordering::SeqCst);
+                    NativeCallResult::Confirmed(())
+                }
+                WriteStep::LifecycleBusy => NativeCallResult::LifecycleBusy,
                 WriteStep::AmbiguousLateApply { delay_ms } => {
                     // The provider applies the write LATE via a detached
                     // task: the effect survives even though this client-side
@@ -611,6 +726,538 @@ async fn confirmed_write_and_readback_synchronizes_the_exact_revision() {
     );
 }
 
+/// A supervisor refusal before dispatch releases the cycle/read reservation
+/// and becomes due after a short persisted backoff. A later fresh claim uses
+/// the same current title and route and performs one successful write.
+#[tokio::test]
+async fn lifecycle_busy_pre_read_defers_without_spending_native_budgets() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_000_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-read", "/h/.claude").await;
+    let backend =
+        ScriptedBackend::new_with_reads(vec![WriteStep::Confirm], vec![ReadStep::LifecycleBusy]);
+    backend.set_title(Some("Different"));
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    let doc = document_json(dir.path());
+    let state = native_entry_for_target(&doc, &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(0));
+    assert_eq!(state["lifecycleBusyDeferrals"].as_u64(), Some(1));
+    assert!(state.get("attemptedReceipts").is_none());
+    let due = state["nextDue"].as_i64().expect("busy retry is scheduled");
+    assert!(due > start_ms);
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "the worker does not spin before the persisted busy backoff expires"
+    );
+    assert_eq!(
+        backend.writes(),
+        0,
+        "a refused pre-read never dispatches a write"
+    );
+
+    set_offset(due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    assert_eq!(
+        backend.reads(),
+        3,
+        "busy read, fresh pre-read, confirmation"
+    );
+    assert_eq!(backend.writes(), 1);
+    assert_eq!(backend.confirmed_writes(), 1);
+    assert_eq!(backend.write_titles(), vec!["Manual Title"]);
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    let state = native_entry_for_target(&document_json(dir.path()), &pending("h-lifecycle-read"));
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(2));
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A busy write does not spend a cycle, while its successful pre-write read
+/// remains charged. The next pass re-reads the current target and writes once.
+#[tokio::test]
+async fn lifecycle_busy_write_refunds_cycle_but_keeps_the_real_pre_read() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_100_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-write", "/h/.claude").await;
+    let backend = ScriptedBackend::new(vec![WriteStep::LifecycleBusy, WriteStep::Confirm]);
+    backend.set_title(Some("Different"));
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(1));
+    assert!(state.get("attemptedReceipts").is_none());
+    let due = state["nextDue"].as_i64().expect("busy retry is scheduled");
+    assert_eq!(backend.reads(), 1);
+    assert_eq!(
+        backend.writes(),
+        1,
+        "first write request is refused before provider dispatch"
+    );
+    assert_eq!(backend.confirmed_writes(), 0);
+
+    set_offset(due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    assert_eq!(backend.reads(), 3, "both pre-reads and one confirmation");
+    assert_eq!(backend.writes(), 2, "one refused call and one fresh write");
+    assert_eq!(backend.confirmed_writes(), 1, "only one write is applied");
+    assert_eq!(backend.write_titles(), vec!["Manual Title", "Manual Title"]);
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(3));
+    assert_eq!(state["attemptedReceipts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// Once a write was acknowledged, a busy confirming read can only be retried
+/// as a read. It must never issue another write while the receipt is awaiting
+/// current-location confirmation.
+#[tokio::test]
+async fn lifecycle_busy_after_write_ack_retries_confirmation_without_rewriting() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_200_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-confirm", "/h/.claude").await;
+    let backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::ConfirmWithoutApplying],
+        vec![ReadStep::Current, ReadStep::LifecycleBusy],
+    );
+    backend.set_title(Some("Different"));
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(1));
+    assert!(state["confirmationPendingReceipt"].is_string());
+    let due = state["nextDue"].as_i64().expect("busy retry is scheduled");
+    assert_eq!(backend.confirmed_writes(), 1);
+
+    set_offset(due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    assert_eq!(
+        backend.reads(),
+        3,
+        "pre-read, refused confirmation, fresh confirmation"
+    );
+    assert_eq!(
+        backend.writes(),
+        1,
+        "the acknowledged write is never repeated even when readback still differs"
+    );
+    assert_eq!(backend.confirmed_writes(), 1);
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(2));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(2));
+    assert!(state["confirmationPendingReceipt"].is_string());
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Unsynced,
+        "a stale divergent read keeps the confirmed receipt read-only and pending"
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A timeout or disconnect while reading after an acknowledged write cannot
+/// mean the write itself is ambiguous. A later matching read must still
+/// confirm the receipt and settle the native series.
+#[tokio::test]
+async fn ambiguous_confirmation_read_keeps_acknowledged_receipt_confirmable() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_212_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-ambiguous-confirm-read", "/h/.claude").await;
+    let backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::Confirm],
+        vec![ReadStep::Current, ReadStep::Ambiguous, ReadStep::Current],
+    );
+    backend.set_title(Some("Different"));
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    let after_ack = native_entry_for_target(&document_json(dir.path()), &target);
+    let receipt = after_ack["confirmationPendingReceipt"]
+        .as_str()
+        .expect("the acknowledged write waits for a confirmation read")
+        .to_string();
+    let due = after_ack["nextDue"]
+        .as_i64()
+        .expect("the failed read schedules a retry");
+    assert_eq!(backend.writes(), 1);
+
+    set_offset(due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    assert_eq!(backend.reads(), 3);
+    assert_eq!(
+        backend.writes(),
+        1,
+        "a read-only retry never repeats the write"
+    );
+    let after_confirmation = native_entry_for_target(&document_json(dir.path()), &target);
+    assert!(after_confirmation["confirmationPendingReceipt"].is_null());
+    assert_eq!(
+        after_confirmation["lastConfirmedReceipt"].as_str(),
+        Some(receipt.as_str())
+    );
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// The acknowledged write receipt and read-only confirmation state survive a
+/// durable store reopen. The new worker process must read again without
+/// repeating the already-acknowledged write.
+#[tokio::test]
+async fn acknowledged_write_busy_confirmation_survives_reopen_without_rewrite() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_225_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-reopen", "/h/.claude").await;
+    let backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::ConfirmWithoutApplying],
+        vec![ReadStep::Current, ReadStep::LifecycleBusy],
+    );
+    backend.set_title(Some("Different"));
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    let first_state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(first_state["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(first_state["readsConsumed"].as_u64(), Some(1));
+    assert!(first_state["confirmationPendingReceipt"].is_string());
+    let due = first_state["nextDue"]
+        .as_i64()
+        .expect("busy retry is scheduled");
+    assert_eq!(backend.confirmed_writes(), 1);
+    drop(store);
+
+    set_offset(due - start_ms);
+    let reopened = open_store(dir.path());
+    let after_restart_backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    after_restart_backend.set_title(Some("Different"));
+
+    super::run_cycle(
+        &reopened,
+        after_restart_backend.as_ref() as &dyn NativeNameBackend,
+        &target,
+    )
+    .await;
+
+    assert_eq!(after_restart_backend.reads(), 1);
+    assert_eq!(after_restart_backend.writes(), 0);
+    assert_eq!(after_restart_backend.confirmed_writes(), 0);
+    let reopened_state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(reopened_state["cyclesConsumed"].as_u64(), Some(2));
+    assert_eq!(reopened_state["readsConsumed"].as_u64(), Some(2));
+    assert!(reopened_state["confirmationPendingReceipt"].is_string());
+    assert_eq!(
+        native_sync_of(&reopened, target).await.unwrap().status,
+        NativeSyncStatus::Unsynced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// The cycle cap also admits one bounded read-only confirmation retry after
+/// a third-cycle acknowledgement. A busy final confirmation cannot strand a
+/// pending receipt, and the subsequent read cannot issue a fourth write.
+#[tokio::test]
+async fn final_cycle_busy_confirmation_gets_read_only_retry_without_extra_write() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_250_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-final-confirm", "/h/.claude").await;
+    let backend = ScriptedBackend::new_with_reads(
+        vec![
+            WriteStep::Undelivered,
+            WriteStep::Undelivered,
+            WriteStep::ConfirmWithoutApplying,
+        ],
+        vec![
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::LifecycleBusy,
+        ],
+    );
+    backend.set_title(Some("Different"));
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    let first_due = native_entry_for_target(&document_json(dir.path()), &target)["nextDue"]
+        .as_i64()
+        .unwrap();
+    set_offset(first_due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    let second_due = native_entry_for_target(&document_json(dir.path()), &target)["nextDue"]
+        .as_i64()
+        .unwrap();
+    set_offset(second_due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(3));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(3));
+    assert!(state["confirmationPendingReceipt"].is_string());
+    let confirmation_due = state["nextDue"].as_i64().unwrap();
+    assert!(store.native_work_snapshot().is_empty());
+
+    set_offset(confirmation_due - start_ms);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    assert_eq!(backend.writes(), 3);
+    assert_eq!(backend.confirmed_writes(), 1);
+    assert_eq!(backend.reads(), 5);
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(3));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(4));
+    assert!(state.get("confirmationPendingReceipt").is_none());
+    assert!(state["settled"].as_bool().unwrap());
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Unsynced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// Repeated pre-dispatch refusals are delayed and bounded independently from
+/// provider writes. Exhausting the fast window schedules a durable cooldown
+/// instead of permanently settling the series.
+#[tokio::test]
+async fn persistent_lifecycle_busy_deferrals_schedule_a_durable_cooldown() {
+    const MAX_BUSY_DEFERRALS: u64 = 6;
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_300_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-always-busy", "/h/.claude").await;
+    let backend = ScriptedBackend::new_with_reads(
+        vec![],
+        (0..MAX_BUSY_DEFERRALS)
+            .map(|_| ReadStep::LifecycleBusy)
+            .collect(),
+    );
+
+    let expected_backoff_ms = [1_000_i64, 2_000, 4_000, 8_000, 8_000];
+    let mut current_offset = 0_i64;
+    for attempt in 0..MAX_BUSY_DEFERRALS {
+        super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+        if attempt + 1 < MAX_BUSY_DEFERRALS {
+            let state = native_entry_for_target(&document_json(dir.path()), &target);
+            let due = state["nextDue"].as_i64().expect("busy retry is scheduled");
+            let retry_in_ms = due - (start_ms + current_offset);
+            assert_eq!(
+                retry_in_ms, expected_backoff_ms[attempt as usize],
+                "lifecycle retries use bounded exponential backoff"
+            );
+            current_offset = due - start_ms;
+            set_offset(current_offset);
+        }
+    }
+
+    assert_eq!(backend.reads(), MAX_BUSY_DEFERRALS as u32);
+    assert_eq!(backend.writes(), 0);
+    assert_eq!(backend.confirmed_writes(), 0);
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(
+        state["lifecycleBusyDeferrals"].as_u64(),
+        Some(MAX_BUSY_DEFERRALS)
+    );
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(0));
+    assert!(state.get("attemptedReceipts").is_none());
+    assert!(!state["settled"].as_bool().unwrap());
+    let due = state["nextDue"].as_i64().expect("cooldown is durable");
+    assert_eq!(
+        due - (start_ms + current_offset),
+        crate::session_names::NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS
+    );
+    let sync = native_sync_of(&store, target.clone()).await.unwrap();
+    assert_eq!(sync.status, NativeSyncStatus::Unsynced);
+    assert!(sync.reason.unwrap().contains("lifecycle lock contention"));
+    assert!(store.native_work_snapshot().is_empty());
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A lifecycle refusal racing with a newer canonical rename cannot release
+/// or delay the successor's fresh series, and the next operation dispatches
+/// only the new desired title.
+#[tokio::test]
+async fn stale_busy_result_after_rename_cannot_defer_or_dispatch_the_old_title() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-rename", "/h/.claude").await;
+    let backend =
+        ScriptedBackend::new_with_reads(vec![WriteStep::Confirm], vec![ReadStep::LifecycleBusy])
+            .arm_read_gate();
+    backend.set_title(Some("Different"));
+
+    let store_for_cycle = Arc::clone(&store);
+    let backend_for_cycle = Arc::clone(&backend);
+    let target_for_cycle = target.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_cycle,
+            backend_for_cycle.as_ref() as &dyn NativeNameBackend,
+            &target_for_cycle,
+        )
+        .await;
+    });
+
+    backend.gate_arrived.notified().await;
+    rename_user(&store, target.clone(), "Newer Title")
+        .await
+        .expect("the new canonical title commits while native read is pending");
+    backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(0));
+    assert_eq!(state["lifecycleBusyDeferrals"].as_u64(), Some(0));
+    assert!(state.get("nextDue").is_none());
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    assert_eq!(backend.write_titles(), vec!["Newer Title"]);
+    assert_eq!(backend.confirmed_writes(), 1);
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+}
+
+/// A busy result captured at an old route cannot schedule stale-route work.
+/// The next claim resolves the current route and any dispatched write targets
+/// only that new location revision.
+#[tokio::test]
+async fn stale_busy_result_after_relocation_cannot_defer_the_old_route() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-lifecycle-route", "/h/.claude").await;
+    let moved = claude_location("/h/.claude-moved", "h-lifecycle-route");
+    let backend =
+        ScriptedBackend::new_with_reads(vec![WriteStep::Confirm], vec![ReadStep::LifecycleBusy])
+            .arm_read_gate();
+
+    let store_for_cycle = Arc::clone(&store);
+    let backend_for_cycle = Arc::clone(&backend);
+    let target_for_cycle = target.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_cycle,
+            backend_for_cycle.as_ref() as &dyn NativeNameBackend,
+            &target_for_cycle,
+        )
+        .await;
+    });
+
+    backend.gate_arrived.notified().await;
+    record_acquisition(&store, target.clone(), verified_acquisition(moved.clone()))
+        .await
+        .expect("the new verified route commits while the old read is pending");
+    backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(state["lifecycleBusyDeferrals"].as_u64(), Some(0));
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(1));
+    assert!(state.get("nextDue").is_none());
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    assert_eq!(backend.write_locations(), vec![moved]);
+    assert_eq!(backend.confirmed_writes(), 1);
+    let sync = native_sync_of(&store, target).await.unwrap();
+    assert_eq!(sync.status, NativeSyncStatus::Synced);
+    assert_eq!(sync.location_revision, 2);
+}
+
 /// The pre-write read already holding the desired value synchronizes without
 /// a write (the native already projects the exact name).
 #[tokio::test]
@@ -836,6 +1483,17 @@ async fn rename_during_a_pending_write_gets_its_own_allowance_and_the_old_ack_ca
 #[tokio::test]
 async fn ambiguous_write_matching_readback_records_observed_current_but_stays_unsynced() {
     let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_475_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-amb", "/h/.claude").await;
     let backend = ScriptedBackend::new(vec![WriteStep::AmbiguousLateApply { delay_ms: 10 }]);
@@ -860,12 +1518,22 @@ async fn ambiguous_write_matching_readback_records_observed_current_but_stays_un
         .await
         .expect("series");
     assert_ne!(sync.status, NativeSyncStatus::Synced);
-    // Fold the matching readback (as the next cycle's read would).
+    // Claim the next due cycle and fold its matching pre-read (as the worker
+    // does). The strict fold API requires the exact claim identity.
+    let retry_due = native_entry_for_target(&document_json(dir.path()), &target)["nextDue"]
+        .as_i64()
+        .expect("ambiguous outcome schedules a retry");
+    set_offset(retry_due - start_ms);
+    let claim = store
+        .claim_native_cycle(target.clone(), "ambiguous-late-read".to_string())
+        .await
+        .unwrap()
+        .expect("the next cycle is due");
+    assert_eq!(claim.cycle, 2);
+    assert!(store.charge_native_read(claim.clone()).await.unwrap());
     store
         .fold_native_outcome(
-            target.clone(),
-            1,
-            current_series_epoch(dir.path()),
+            claim,
             NativeOutcomeFold::Read {
                 observed: Some("Manual Title".to_string()),
                 receipt: None,
@@ -886,6 +1554,7 @@ async fn ambiguous_write_matching_readback_records_observed_current_but_stays_un
     // The series holds no ready work: ambiguity settled with the matching
     // readback recorded.
     assert!(store.native_work_snapshot().is_empty());
+    crate::session_names::clear_test_hooks(dir.path());
 }
 
 /// Undelivered vs ambiguous vs unsupported keep distinct classifications and
@@ -1010,17 +1679,12 @@ async fn binding_transfers_cycles_rebases_desired_revision_and_retains_receipts(
         .expect("claim");
     assert_eq!(claim.cycle, 1);
     assert!(
-        store
-            .charge_native_read(target.clone(), claim.series_epoch)
-            .await
-            .unwrap(),
+        store.charge_native_read(claim.clone()).await.unwrap(),
         "the read allowance charges"
     );
     store
         .fold_native_outcome(
-            target.clone(),
-            claim.location_revision,
-            claim.series_epoch,
+            claim.clone(),
             NativeOutcomeFold::WriteAcknowledged {
                 receipt: claim.receipt_id.clone(),
             },
@@ -1072,6 +1736,1237 @@ async fn binding_transfers_cycles_rebases_desired_revision_and_retains_receipts(
             .iter()
             .any(|r| r.as_str() == Some("bind-receipt-1")),
         "original attempted receipts retained across the bind"
+    );
+}
+
+/// A pending write acknowledgement belongs to its exact native route. When
+/// binding discovers a different route for the durable session, the worker
+/// must write that route once, while retaining the old receipt as provenance.
+#[tokio::test]
+async fn binding_to_a_different_durable_route_writes_once_instead_of_confirming_old_receipt() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_425_i64;
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![
+            crate::session_names::TestHook::FrozenClockMs(start_ms),
+            crate::session_names::TestHook::ClockOffsetMs(0),
+        ],
+    );
+    let store = open_store(dir.path());
+    let pending = armed_pending(&store, "h-bind-route", "/h/pending-route").await;
+    let old_backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::ConfirmWithoutApplying],
+        vec![ReadStep::Current, ReadStep::LifecycleBusy],
+    );
+    old_backend.set_title(Some("Different"));
+
+    super::run_cycle(
+        &store,
+        old_backend.as_ref() as &dyn NativeNameBackend,
+        &pending,
+    )
+    .await;
+
+    let before_bind = native_entry_for_target(&document_json(dir.path()), &pending);
+    let old_receipt = before_bind["confirmationPendingReceipt"]
+        .as_str()
+        .expect("the old route has an acknowledged write awaiting confirmation")
+        .to_string();
+    let retry_due = before_bind["nextDue"]
+        .as_i64()
+        .expect("busy retry scheduled");
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-route",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable session record");
+    let new_location = claude_location("/h/durable-route", "sess-bind-route");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(new_location.clone()),
+    )
+    .await
+    .expect("the durable route is verified at revision one");
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(new_location.clone()),
+        })
+        .await
+        .expect("verified pending-to-durable bind");
+
+    let after_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert_eq!(
+        after_bind["attemptedLocationRevision"].as_u64(),
+        Some(1),
+        "the destination route deliberately shares the old route's numeric revision"
+    );
+    assert!(after_bind["attemptedReceipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|receipt| receipt.as_str() == Some(&old_receipt)));
+
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![
+            crate::session_names::TestHook::FrozenClockMs(start_ms),
+            crate::session_names::TestHook::ClockOffsetMs(retry_due - start_ms),
+        ],
+    );
+    let new_backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    new_backend.set_title(Some("Different"));
+    super::run_cycle(
+        &store,
+        new_backend.as_ref() as &dyn NativeNameBackend,
+        &durable,
+    )
+    .await;
+
+    assert_eq!(
+        new_backend.writes(),
+        1,
+        "the new native route gets one write"
+    );
+    assert_eq!(new_backend.write_locations(), vec![new_location]);
+    assert_eq!(new_backend.write_titles(), vec!["Manual Title"]);
+    assert_eq!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced
+    );
+    let after_write = native_entry_for_target(&document_json(dir.path()), &durable);
+    let receipts = after_write["attemptedReceipts"].as_array().unwrap();
+    assert!(receipts
+        .iter()
+        .any(|receipt| receipt.as_str() == Some(&old_receipt)));
+    let confirmed_receipt = after_write["lastConfirmedReceipt"]
+        .as_str()
+        .expect("the new route write is confirmed");
+    assert_ne!(confirmed_receipt, old_receipt);
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// An acknowledged pending write can be merged into an already-synced
+/// durable record. If the durable name wins, the pending receipt describes a
+/// different title even at the same exact route; the surviving series must be
+/// rearmed so it can observe and repair the provider title.
+#[tokio::test]
+async fn binding_pending_ack_into_synced_durable_winner_rearms_native_repair() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_525_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let pending = pending("h-bind-merge");
+    ensure_pending(&store, "h-bind-merge", Some("/work/project"))
+        .await
+        .expect("pending record");
+    rename_user(&store, pending.clone(), "Pending Title")
+        .await
+        .expect("pending manual title");
+
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-merge",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable record");
+    let shared_route = claude_location("/h/bind-merge", "sess-bind-merge");
+    record_acquisition(
+        &store,
+        pending.clone(),
+        verified_acquisition(shared_route.clone()),
+    )
+    .await
+    .expect("pending route revision one");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(shared_route.clone()),
+    )
+    .await
+    .expect("durable route revision one");
+    rename_user(&store, durable.clone(), "Durable Title")
+        .await
+        .expect("later durable decision wins a manual/manual bind");
+
+    let backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::Confirm, WriteStep::Confirm],
+        vec![
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::LifecycleBusy,
+        ],
+    );
+    backend.set_title(Some("Durable Title"));
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+    assert_eq!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced,
+        "durable winner starts synced at the shared route"
+    );
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &pending).await;
+    assert_eq!(backend.writes(), 1);
+    assert_eq!(backend.write_titles(), vec!["Pending Title"]);
+    let pending_state = native_entry_for_target(&document_json(dir.path()), &pending);
+    let pending_receipt = pending_state["confirmationPendingReceipt"]
+        .as_str()
+        .expect("the acknowledged pending write awaits confirmation")
+        .to_string();
+    let retry_due = pending_state["nextDue"]
+        .as_i64()
+        .expect("busy confirmation schedules a retry");
+
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(shared_route.clone()),
+        })
+        .await
+        .expect("durable winner binds at the same route and revision");
+
+    let after_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert!(after_bind["attemptedReceipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|receipt| receipt.as_str() == Some(&pending_receipt)));
+    assert_ne!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced,
+        "a receipt for the losing pending title must not leave the winner falsely synced"
+    );
+    assert!(after_bind["confirmationPendingReceipt"].is_null());
+    assert_eq!(
+        after_bind["nextDue"].as_i64(),
+        Some(retry_due),
+        "the pending lifecycle backoff transfers with its consumed budget"
+    );
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "the durable winner must honor the pending lifecycle retry delay"
+    );
+
+    set_offset(retry_due - start_ms);
+    assert!(
+        !store.native_work_snapshot().is_empty(),
+        "the durable winner becomes claimable for a read and repair when due"
+    );
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+    assert_eq!(backend.writes(), 2, "the winning title is written once");
+    assert_eq!(
+        backend.write_titles(),
+        vec!["Pending Title", "Durable Title"]
+    );
+    assert_eq!(
+        backend.write_locations(),
+        vec![shared_route.clone(), shared_route]
+    );
+    assert_eq!(
+        native_sync_of(&store, durable).await.unwrap().status,
+        NativeSyncStatus::Synced,
+        "a matching confirmation read synchronizes the durable winner"
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A verified route change during bind must rearm an existing synced durable
+/// winner just as a standalone acquisition does, while carrying the pending
+/// series' retry time and bounded budgets.
+#[tokio::test]
+async fn binding_pending_ack_to_a_new_route_rearms_synced_durable_winner() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_575_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let pending = pending("h-bind-new-route");
+    ensure_pending(&store, "h-bind-new-route", Some("/work/project"))
+        .await
+        .expect("pending record");
+    rename_user(&store, pending.clone(), "Pending Title")
+        .await
+        .expect("pending manual title");
+    let pending_route = claude_location("/h/bind-new-route-pending", "sess-bind-new-route");
+    record_acquisition(
+        &store,
+        pending.clone(),
+        verified_acquisition(pending_route.clone()),
+    )
+    .await
+    .expect("pending route revision one");
+
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-new-route",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable record");
+    let old_durable_route = claude_location("/h/bind-new-route-old", "sess-bind-new-route");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(old_durable_route),
+    )
+    .await
+    .expect("durable route revision one");
+    rename_user(&store, durable.clone(), "Durable Title")
+        .await
+        .expect("later durable decision wins the bind");
+
+    let backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::Confirm, WriteStep::Confirm],
+        vec![
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::LifecycleBusy,
+        ],
+    );
+    backend.set_title(Some("Durable Title"));
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+    assert_eq!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced,
+        "durable winner starts synced at its old route"
+    );
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &pending).await;
+    assert_eq!(backend.writes(), 1);
+    assert_eq!(backend.write_titles(), vec!["Pending Title"]);
+    assert_eq!(backend.write_locations(), vec![pending_route.clone()]);
+    let pending_before_bind = native_entry_for_target(&document_json(dir.path()), &pending);
+    let pending_receipt = pending_before_bind["confirmationPendingReceipt"]
+        .as_str()
+        .expect("pending route write awaits confirmation")
+        .to_string();
+    let retry_due = pending_before_bind["nextDue"]
+        .as_i64()
+        .expect("busy confirmation schedules a retry");
+    let durable_before_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+
+    let new_route = claude_location("/h/bind-new-route-winner", "sess-bind-new-route");
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(new_route.clone()),
+        })
+        .await
+        .expect("bind changes the durable route to the verified winner");
+
+    let after_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert!(after_bind["attemptedReceipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|receipt| receipt.as_str() == Some(&pending_receipt)));
+    assert!(after_bind["confirmationPendingReceipt"].is_null());
+    assert_ne!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced,
+        "changing routes during bind must invalidate the old synced projection"
+    );
+    assert_eq!(
+        after_bind["cyclesConsumed"].as_u64(),
+        Some(
+            (durable_before_bind["cyclesConsumed"].as_u64().unwrap()
+                + pending_before_bind["cyclesConsumed"].as_u64().unwrap())
+            .min(3)
+        ),
+        "bind carries, but does not replenish, the combined cycle budget"
+    );
+    assert_eq!(
+        after_bind["readsConsumed"].as_u64(),
+        Some(
+            (durable_before_bind["readsConsumed"].as_u64().unwrap()
+                + pending_before_bind["readsConsumed"].as_u64().unwrap())
+            .min(6)
+        ),
+        "bind carries, but does not replenish, the combined read budget"
+    );
+    assert_eq!(after_bind["nextDue"].as_i64(), Some(retry_due));
+    assert!(store.native_work_snapshot().is_empty());
+
+    set_offset(retry_due - start_ms);
+    assert!(!store.native_work_snapshot().is_empty());
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+    assert_eq!(backend.writes(), 2, "the new route is written once");
+    assert_eq!(
+        backend.write_titles(),
+        vec!["Pending Title", "Durable Title"]
+    );
+    assert_eq!(backend.write_locations(), vec![pending_route, new_route]);
+    assert_eq!(
+        native_sync_of(&store, durable).await.unwrap().status,
+        NativeSyncStatus::Synced,
+        "the new route is confirmed after the durable winner is restored"
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A pending acknowledgement remains usable when bind verifies the same
+/// provider location for the durable record. Route revisions are allocated
+/// per record key, so the durable key's revision can advance even though the
+/// exact provider target is unchanged. The transferred receipt should be
+/// confirmed by a read on the durable key without issuing another write.
+#[tokio::test]
+async fn binding_pending_ack_to_same_acquired_location_preserves_read_only_confirmation() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_625_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let pending = pending("h-bind-same-acquired-route");
+    ensure_pending(&store, "h-bind-same-acquired-route", Some("/work/project"))
+        .await
+        .expect("pending record");
+    rename_user(&store, pending.clone(), "Bound Title")
+        .await
+        .expect("pending manual title");
+
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-same-acquired-route",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable record");
+    let acquired_route = claude_location(
+        "/h/bind-same-acquired-route",
+        "sess-bind-same-acquired-route",
+    );
+    record_acquisition(
+        &store,
+        pending.clone(),
+        verified_acquisition(acquired_route.clone()),
+    )
+    .await
+    .expect("pending route");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(claude_location(
+            "/h/bind-same-acquired-route-old",
+            "sess-bind-same-acquired-route",
+        )),
+    )
+    .await
+    .expect("durable key starts at a different verified route");
+    rename_user(&store, durable.clone(), "Bound Title")
+        .await
+        .expect("durable record wins the bind with the same title");
+
+    let durable_backend = ScriptedBackend::new(vec![]);
+    durable_backend.set_title(Some("Bound Title"));
+    super::run_cycle(
+        &store,
+        durable_backend.as_ref() as &dyn NativeNameBackend,
+        &durable,
+    )
+    .await;
+    assert_eq!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced,
+        "the durable winner was synchronized at its old route before bind"
+    );
+
+    let backend = ScriptedBackend::new_with_reads(
+        vec![WriteStep::ConfirmWithoutApplying],
+        vec![ReadStep::Current, ReadStep::LifecycleBusy],
+    );
+    backend.set_title(Some("Different"));
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &pending).await;
+    assert_eq!(backend.writes(), 1);
+    let pending_before_bind = native_entry_for_target(&document_json(dir.path()), &pending);
+    let pending_receipt = pending_before_bind["confirmationPendingReceipt"]
+        .as_str()
+        .expect("acknowledged pending write awaits a confirmation read")
+        .to_string();
+    assert_eq!(
+        pending_before_bind["attemptedLocationRevision"].as_u64(),
+        Some(1)
+    );
+    let retry_due = pending_before_bind["nextDue"]
+        .as_i64()
+        .expect("busy confirmation has a retry deadline");
+
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(acquired_route.clone()),
+        })
+        .await
+        .expect("bind verifies the pending route for the durable key");
+
+    let after_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert_eq!(
+        after_bind["confirmationPendingReceipt"].as_str(),
+        Some(pending_receipt.as_str())
+    );
+    assert_eq!(after_bind["nextDue"].as_i64(), Some(retry_due));
+
+    set_offset(retry_due - start_ms);
+    backend.set_title(Some("Bound Title"));
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+
+    assert_eq!(backend.writes(), 1, "bind confirmation is read-only");
+    assert_eq!(backend.read_locations(), vec![acquired_route.clone(); 3]);
+    let after_confirmation = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert!(after_confirmation["confirmationPendingReceipt"].is_null());
+    assert_eq!(
+        after_confirmation["attemptedLocationRevision"].as_u64(),
+        Some(2),
+        "confirmation is restamped with the durable key's current route revision"
+    );
+    assert_eq!(after_confirmation["cyclesConsumed"].as_u64(), Some(3));
+    assert_eq!(after_confirmation["readsConsumed"].as_u64(), Some(3));
+    assert_eq!(
+        after_confirmation["lastConfirmedReceipt"].as_str(),
+        Some(pending_receipt.as_str())
+    );
+    assert_eq!(
+        native_sync_of(&store, durable).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// The verified bind route change itself rearms a synced durable winner even
+/// when the pending series contributes no acknowledged receipt.
+#[tokio::test]
+async fn binding_verified_route_change_rearms_synced_durable_without_pending_receipt() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let pending = pending("h-bind-no-receipt");
+    ensure_pending(&store, "h-bind-no-receipt", Some("/work/project"))
+        .await
+        .expect("pending record");
+    rename_user(&store, pending.clone(), "Pending Title")
+        .await
+        .expect("pending manual title");
+    record_acquisition(
+        &store,
+        pending.clone(),
+        verified_acquisition(claude_location(
+            "/h/bind-no-receipt-pending",
+            "sess-bind-no-receipt",
+        )),
+    )
+    .await
+    .expect("pending route");
+
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-no-receipt",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable record");
+    let old_route = claude_location("/h/bind-no-receipt-old", "sess-bind-no-receipt");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(old_route.clone()),
+    )
+    .await
+    .expect("old durable route");
+    rename_user(&store, durable.clone(), "Durable Title")
+        .await
+        .expect("later durable decision wins the bind");
+
+    let backend = ScriptedBackend::new_with_reads(vec![], vec![ReadStep::Current]);
+    backend.set_title(Some("Durable Title"));
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+    assert_eq!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced
+    );
+    let durable_before_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+    let pending_before_bind = native_entry_for_target(&document_json(dir.path()), &pending);
+    assert!(pending_before_bind["confirmationPendingReceipt"].is_null());
+    assert!(pending_before_bind["attemptedReceipts"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
+
+    let new_route = claude_location("/h/bind-no-receipt-winner", "sess-bind-no-receipt");
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(new_route.clone()),
+        })
+        .await
+        .expect("bind verifies the new winner route");
+
+    let after_bind = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert_ne!(
+        native_sync_of(&store, durable.clone())
+            .await
+            .unwrap()
+            .status,
+        NativeSyncStatus::Synced,
+        "route change alone invalidates a previously synced projection"
+    );
+    assert!(
+        after_bind["observedCurrent"].is_null(),
+        "a read of the old route cannot remain the current observation"
+    );
+    assert_eq!(
+        after_bind["cyclesConsumed"].as_u64(),
+        Some(
+            (durable_before_bind["cyclesConsumed"].as_u64().unwrap()
+                + pending_before_bind["cyclesConsumed"].as_u64().unwrap())
+            .min(3)
+        ),
+        "route rearming does not replenish consumed cycles"
+    );
+    assert_eq!(
+        after_bind["readsConsumed"].as_u64(),
+        Some(
+            (durable_before_bind["readsConsumed"].as_u64().unwrap()
+                + pending_before_bind["readsConsumed"].as_u64().unwrap())
+            .min(6)
+        ),
+        "route rearming does not replenish consumed reads"
+    );
+    assert_eq!(after_bind["nextDue"], durable_before_bind["nextDue"]);
+    assert!(after_bind["confirmationPendingReceipt"].is_null());
+    assert!(!store.native_work_snapshot().is_empty());
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &durable).await;
+    assert_eq!(backend.reads(), 2, "the new route receives a fresh read");
+    assert_eq!(
+        backend.writes(),
+        0,
+        "matching title needs no provider write"
+    );
+    assert_eq!(backend.read_locations(), vec![old_route, new_route]);
+    assert_eq!(
+        native_sync_of(&store, durable).await.unwrap().status,
+        NativeSyncStatus::Synced,
+        "the writable manual winner synchronizes on its new route"
+    );
+}
+
+/// A route change after synchronization on the final cycle invalidates the
+/// old synced/observed projection even though no cycle remains to rearm.
+#[tokio::test]
+async fn route_change_after_last_synced_cycle_invalidates_old_projection_without_rearming() {
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_625_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-bind-last-cycle", "/h/bind-last-cycle-old").await;
+    let old_route = claude_location("/h/bind-last-cycle-old", "h-bind-last-cycle");
+    let backend = ScriptedBackend::new_with_reads(
+        vec![
+            WriteStep::Undelivered,
+            WriteStep::Undelivered,
+            WriteStep::Confirm,
+        ],
+        vec![
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+        ],
+    );
+    backend.set_title(Some("Old Title"));
+
+    for cycle in 0..3 {
+        super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+        if cycle < 2 {
+            let state = native_entry_for_target(&document_json(dir.path()), &target);
+            let due = state["nextDue"]
+                .as_i64()
+                .expect("failed cycle schedules the next attempt");
+            set_offset(due - start_ms);
+        }
+    }
+
+    let before_route_change = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(before_route_change["cyclesConsumed"].as_u64(), Some(3));
+    assert_eq!(before_route_change["readsConsumed"].as_u64(), Some(4));
+    assert_eq!(before_route_change["observedCurrent"].as_bool(), Some(true));
+    assert_eq!(
+        native_sync_of(&store, target.clone()).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    assert_eq!(backend.read_locations(), vec![old_route.clone(); 4]);
+
+    let new_route = claude_location("/h/bind-last-cycle-new", "h-bind-last-cycle");
+    record_acquisition(&store, target.clone(), verified_acquisition(new_route))
+        .await
+        .expect("verified route changes after final-cycle synchronization");
+
+    let after_route_change = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(
+        native_sync_of(&store, target.clone()).await.unwrap().status,
+        NativeSyncStatus::Unsynced,
+        "the last readback applies only to the old route"
+    );
+    assert!(after_route_change["observedCurrent"].is_null());
+    assert!(after_route_change["settled"].as_bool().unwrap());
+    assert_eq!(
+        after_route_change["cyclesConsumed"],
+        before_route_change["cyclesConsumed"]
+    );
+    assert_eq!(
+        after_route_change["readsConsumed"],
+        before_route_change["readsConsumed"]
+    );
+    assert_eq!(
+        after_route_change["nextDue"],
+        before_route_change["nextDue"]
+    );
+    assert!(store.native_work_snapshot().is_empty());
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    assert_eq!(
+        backend.reads(),
+        4,
+        "no read budget remains after route change"
+    );
+    assert_eq!(
+        backend.writes(),
+        3,
+        "no write budget remains after route change"
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A route move during the durable lifecycle-busy cooldown preserves its due
+/// time. The cooldown's due claim then resets the per-window read allowance
+/// and resumes on the new route without increasing the three-cycle cap.
+#[tokio::test]
+async fn route_change_preserves_busy_cooldown_until_due_before_rearming_on_new_route() {
+    const MAX_BUSY_DEFERRALS: usize = 6;
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_675_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(
+        &store,
+        "h-bind-read-exhausted",
+        "/h/bind-read-exhausted-old",
+    )
+    .await;
+    let backend = ScriptedBackend::new_with_reads(
+        vec![
+            WriteStep::LifecycleBusy,
+            WriteStep::LifecycleBusy,
+            WriteStep::LifecycleBusy,
+            WriteStep::LifecycleBusy,
+            WriteStep::LifecycleBusy,
+            WriteStep::LifecycleBusy,
+        ],
+        vec![
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+            ReadStep::Current,
+        ],
+    );
+    backend.set_title(Some("Different"));
+
+    for attempt in 0..MAX_BUSY_DEFERRALS {
+        super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+        if attempt + 1 < MAX_BUSY_DEFERRALS {
+            let state = native_entry_for_target(&document_json(dir.path()), &target);
+            let due = state["nextDue"]
+                .as_i64()
+                .expect("busy retry schedules the next attempt");
+            set_offset(due - start_ms);
+        }
+    }
+
+    let before_route_change = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(before_route_change["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(before_route_change["readsConsumed"].as_u64(), Some(6));
+    assert_eq!(
+        before_route_change["lifecycleBusyDeferrals"].as_u64(),
+        Some(6)
+    );
+    assert!(!before_route_change["settled"].as_bool().unwrap());
+    assert_eq!(backend.reads(), 6);
+    assert_eq!(backend.writes(), 6);
+
+    record_acquisition(
+        &store,
+        target.clone(),
+        verified_acquisition(claude_location(
+            "/h/bind-read-exhausted-new",
+            "h-bind-read-exhausted",
+        )),
+    )
+    .await
+    .expect("verified route changes after bounded write deferrals");
+
+    let after_route_change = native_entry_for_target(&document_json(dir.path()), &target);
+    assert!(
+        !after_route_change["settled"].as_bool().unwrap(),
+        "the pending cooldown remains eligible after its deadline"
+    );
+    assert_eq!(
+        after_route_change["cyclesConsumed"],
+        before_route_change["cyclesConsumed"]
+    );
+    assert_eq!(
+        after_route_change["readsConsumed"],
+        before_route_change["readsConsumed"]
+    );
+    assert_eq!(
+        after_route_change["lifecycleBusyDeferrals"],
+        before_route_change["lifecycleBusyDeferrals"]
+    );
+    assert_eq!(
+        after_route_change["nextDue"],
+        before_route_change["nextDue"]
+    );
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "the persisted cooldown prevents early work on the new route"
+    );
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    assert_eq!(backend.reads(), 6);
+    assert_eq!(backend.writes(), 6);
+    let after_idle_cycle = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(
+        after_idle_cycle["cyclesConsumed"],
+        before_route_change["cyclesConsumed"]
+    );
+
+    // The deferred deadline and exhausted read window survive a restart.
+    // A due claim on the replacement route starts a new six-read window,
+    // while only its actual write increments the permanent cycle allowance.
+    drop(store);
+    let cooldown_due = before_route_change["nextDue"]
+        .as_i64()
+        .expect("durable cooldown is recorded");
+    set_offset(cooldown_due - start_ms);
+    let reopened = open_store(dir.path());
+    assert_eq!(reopened.native_work_snapshot().len(), 1);
+    super::run_cycle(
+        &reopened,
+        backend.as_ref() as &dyn NativeNameBackend,
+        &target,
+    )
+    .await;
+
+    let resumed = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(resumed["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(resumed["readsConsumed"].as_u64(), Some(2));
+    assert_eq!(resumed["lifecycleBusyDeferrals"].as_u64(), Some(0));
+    assert!(resumed["confirmationPendingReceipt"].is_null());
+    assert_eq!(
+        resumed["attemptedReceipts"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(backend.reads(), 8, "one fresh pre-read and confirmation");
+    assert_eq!(
+        backend.writes(),
+        7,
+        "only the deferred claim's write applies"
+    );
+    assert_eq!(backend.confirmed_writes(), 1);
+    let moved_route = claude_location("/h/bind-read-exhausted-new", "h-bind-read-exhausted");
+    assert_eq!(
+        backend.read_locations()[6..],
+        [moved_route.clone(), moved_route]
+    );
+    assert_eq!(
+        native_sync_of(&reopened, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A successful read captured on a pending route must not synchronize a
+/// durable target after bind, even when the two independent route counters
+/// both happen to be one.
+#[tokio::test]
+async fn late_pre_bind_read_cannot_sync_durable_route_with_same_revision_number() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-stale-read",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable session record");
+    let durable_location = claude_location("/h/durable-stale-read", "sess-bind-stale-read");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(durable_location.clone()),
+    )
+    .await
+    .expect("the durable route is verified at revision one");
+
+    let pending = armed_pending(&store, "h-bind-stale-read", "/h/pending-stale-read").await;
+    let backend = ScriptedBackend::new_with_reads(vec![], vec![ReadStep::Current]).arm_read_gate();
+    backend.set_title(Some("Manual Title"));
+    let store_for_worker = Arc::clone(&store);
+    let backend_for_worker = Arc::clone(&backend);
+    let pending_for_worker = pending.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_worker,
+            backend_for_worker.as_ref() as &dyn NativeNameBackend,
+            &pending_for_worker,
+        )
+        .await;
+    });
+
+    backend.gate_arrived.notified().await;
+    let old_series_epoch = current_series_epoch(dir.path());
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(durable_location),
+        })
+        .await
+        .expect("the pending session binds while the old read is in flight");
+    backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    let sync = native_sync_of(&store, durable.clone())
+        .await
+        .expect("the bound series remains projected");
+    assert_eq!(sync.location_revision, 1);
+    assert_ne!(
+        sync.status,
+        NativeSyncStatus::Synced,
+        "the old claim's desired revision and route must not be rebased by bind"
+    );
+    assert_eq!(current_series_epoch(dir.path()), old_series_epoch);
+}
+
+/// A read charge from an old pending claim cannot spend the transferred
+/// durable series' allowance after bind has rebased its desired revision and
+/// route stamp.
+#[tokio::test]
+async fn bind_rejects_a_stale_pending_read_charge_after_route_rebase() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let durable = session(
+        freshell_protocol::session_names::NamedProvider::Claude,
+        "sess-bind-stale-read-charge",
+    );
+    store
+        .ensure_session(durable.clone(), Some("/work/project".to_string()))
+        .await
+        .expect("durable session record");
+    record_acquisition(
+        &store,
+        durable.clone(),
+        verified_acquisition(claude_location(
+            "/h/bind-read-charge-old",
+            "sess-bind-stale-read-charge",
+        )),
+    )
+    .await
+    .expect("the durable record starts with another route");
+
+    let pending = pending("h-bind-stale-read-charge");
+    ensure_pending(&store, "h-bind-stale-read-charge", Some("/work/project"))
+        .await
+        .expect("pending record");
+    rename_user(&store, pending.clone(), "Bound Title")
+        .await
+        .expect("pending manual title");
+    let acquired_route = claude_location("/h/bind-read-charge", "sess-bind-stale-read-charge");
+    record_acquisition(
+        &store,
+        pending.clone(),
+        verified_acquisition(acquired_route.clone()),
+    )
+    .await
+    .expect("pending route");
+
+    let old_claim = store
+        .claim_native_cycle(pending.clone(), "stale-read-charge".to_string())
+        .await
+        .unwrap()
+        .expect("pending cycle claim");
+    assert_eq!(old_claim.location_revision, 1);
+    store
+        .bind_pending(BindNameInput {
+            pending: pending.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(acquired_route),
+        })
+        .await
+        .expect("bind rebases the pending series onto the durable record");
+
+    let before_charge = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert_eq!(before_charge["readsConsumed"].as_u64(), Some(0));
+    assert!(
+        !store.charge_native_read(old_claim.clone()).await.unwrap(),
+        "the old pending claim is stale after bind"
+    );
+    let after_charge = native_entry_for_target(&document_json(dir.path()), &durable);
+    assert_eq!(
+        after_charge["readsConsumed"].as_u64(),
+        Some(0),
+        "a stale claim cannot consume the rebased series' read budget"
+    );
+}
+
+async fn assert_divergent_pre_read_is_fenced_after_store_change(
+    handle: &str,
+    new_name: Option<&str>,
+    new_location: Option<NativeLocation>,
+    expected_title: &str,
+    expected_location: NativeLocation,
+) {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, handle, "/h/prewrite-original").await;
+    let old_backend =
+        ScriptedBackend::new_with_reads(vec![WriteStep::Confirm], vec![ReadStep::Current])
+            .arm_read_gate();
+    old_backend.set_title(Some("Different"));
+    let store_for_worker = Arc::clone(&store);
+    let backend_for_worker = Arc::clone(&old_backend);
+    let target_for_worker = target.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_worker,
+            backend_for_worker.as_ref() as &dyn NativeNameBackend,
+            &target_for_worker,
+        )
+        .await;
+    });
+
+    old_backend.gate_arrived.notified().await;
+    if let Some(new_name) = new_name {
+        rename_user(&store, target.clone(), new_name)
+            .await
+            .expect("the newer canonical title commits while the old read is pending");
+    }
+    if let Some(new_location) = new_location {
+        record_acquisition(&store, target.clone(), verified_acquisition(new_location))
+            .await
+            .expect("the new verified route commits while the old read is pending");
+    }
+    old_backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    assert_eq!(
+        old_backend.writes(),
+        0,
+        "the stale pre-read must not dispatch an old claim's write"
+    );
+    assert!(old_backend.write_locations().is_empty());
+
+    let current_backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    current_backend.set_title(Some("Different"));
+    super::run_cycle(
+        &store,
+        current_backend.as_ref() as &dyn NativeNameBackend,
+        &target,
+    )
+    .await;
+    assert_eq!(current_backend.writes(), 1);
+    assert_eq!(current_backend.write_titles(), vec![expected_title]);
+    assert_eq!(current_backend.write_locations(), vec![expected_location]);
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+}
+
+/// A successful but divergent read that was captured before a user rename
+/// cannot authorize writing the superseded canonical title.
+#[tokio::test]
+async fn stale_divergent_pre_read_after_rename_does_not_dispatch_old_title() {
+    let original = claude_location("/h/prewrite-original", "h-prewrite-rename");
+    assert_divergent_pre_read_is_fenced_after_store_change(
+        "h-prewrite-rename",
+        Some("Newer Title"),
+        None,
+        "Newer Title",
+        original,
+    )
+    .await;
+}
+
+/// A successful but divergent read captured before relocation cannot
+/// authorize writing to the superseded native route.
+#[tokio::test]
+async fn stale_divergent_pre_read_after_relocation_does_not_dispatch_old_route() {
+    let moved = claude_location("/h/prewrite-moved", "h-prewrite-relocate");
+    assert_divergent_pre_read_is_fenced_after_store_change(
+        "h-prewrite-relocate",
+        None,
+        Some(moved.clone()),
+        "Manual Title",
+        moved,
+    )
+    .await;
+}
+
+/// Distinct prospective locations both have numeric revision zero, so a
+/// stale successful read must compare the captured route itself before it can
+/// confirm the replacement prospective route.
+#[tokio::test]
+async fn late_pre_read_after_prospective_route_change_is_fenced_by_location() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-prospective-fence");
+    ensure_pending(&store, "h-prospective-fence", Some("/work/project"))
+        .await
+        .expect("pending record");
+    rename_user(&store, target.clone(), "Manual Title")
+        .await
+        .expect("manual title");
+    let original = claude_location("/h/prospective-original", "h-prospective-fence");
+    let replacement = claude_location("/h/prospective-replacement", "h-prospective-fence");
+    store
+        .record_acquisition(
+            target.clone(),
+            NativeAcquisition {
+                location: original.clone(),
+                evidence: NativeEvidenceKind::InitializedRuntime,
+                persistence: NativePersistence::Prospective,
+            },
+        )
+        .await
+        .expect("initial prospective route");
+
+    let backend = ScriptedBackend::new_with_reads(vec![], vec![ReadStep::Current]).arm_read_gate();
+    backend.set_title(Some("Manual Title"));
+    let store_for_worker = Arc::clone(&store);
+    let backend_for_worker = Arc::clone(&backend);
+    let target_for_worker = target.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_worker,
+            backend_for_worker.as_ref() as &dyn NativeNameBackend,
+            &target_for_worker,
+        )
+        .await;
+    });
+
+    backend.gate_arrived.notified().await;
+    store
+        .record_acquisition(
+            target.clone(),
+            NativeAcquisition {
+                location: replacement.clone(),
+                evidence: NativeEvidenceKind::InitializedRuntime,
+                persistence: NativePersistence::Prospective,
+            },
+        )
+        .await
+        .expect("the prospective route changes while the old read is pending");
+    backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    assert_eq!(backend.read_locations(), vec![original]);
+    assert_ne!(
+        native_sync_of(&store, target.clone()).await.unwrap().status,
+        NativeSyncStatus::Synced,
+        "equal zero revisions do not make distinct prospective locations equivalent"
+    );
+
+    let current_backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    current_backend.set_title(Some("Different"));
+    super::run_cycle(
+        &store,
+        current_backend.as_ref() as &dyn NativeNameBackend,
+        &target,
+    )
+    .await;
+    assert_eq!(current_backend.writes(), 1);
+    assert_eq!(current_backend.write_locations(), vec![replacement]);
+    assert_eq!(
+        native_sync_of(&store, target).await.unwrap().status,
+        NativeSyncStatus::Synced
     );
 }
 
@@ -1220,6 +3115,8 @@ async fn the_selector_prefers_manual_projection_then_the_stable_key() {
             desired_name: "x".to_string(),
             desired_source: source,
             cycles_consumed: 0,
+            series_epoch: 1,
+            lifecycle_busy_deferrals: 0,
             next_due: None,
         };
     let a_freshell = items(
@@ -1326,6 +3223,8 @@ async fn the_selector_orders_due_work_by_earliest_next_due() {
             desired_name: "x".to_string(),
             desired_source: source,
             cycles_consumed: 0,
+            series_epoch: 1,
+            lifecycle_busy_deferrals: 0,
             next_due: None,
         };
     let mut backoff = std::collections::HashMap::new();
@@ -1436,9 +3335,7 @@ async fn native_work_snapshot_reads_the_test_offset_aware_clock() {
         .expect("cycle 1 claims — an armed series is immediately ready");
     store
         .fold_native_outcome(
-            target.clone(),
-            claim.location_revision,
-            claim.series_epoch,
+            claim.clone(),
             NativeOutcomeFold::Undelivered {
                 reason: "connect refusal".to_string(),
             },
@@ -2372,7 +4269,56 @@ impl NativeNameBackend for SwappableDispatch {
         if live {
             self.arrival.lock().unwrap().probed_available();
         }
-        Box::pin(async move { live })
+        Box::pin(async move { live.into() })
+    }
+}
+
+/// A supervisor that keeps refusing only the lifecycle probe. The worker
+/// must apply the finite lifecycle-contention budget without consuming any
+/// provider read/write allowance.
+struct LifecycleBusyProbeBackend {
+    scripted: Arc<ScriptedBackend>,
+    probes: AtomicU32,
+    lifecycle_busy: AtomicBool,
+}
+
+impl LifecycleBusyProbeBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            scripted: ScriptedBackend::new(vec![]),
+            probes: AtomicU32::new(0),
+            lifecycle_busy: AtomicBool::new(true),
+        })
+    }
+
+    fn probes(&self) -> u32 {
+        self.probes.load(Ordering::SeqCst)
+    }
+
+    fn set_lifecycle_busy(&self, busy: bool) {
+        self.lifecycle_busy.store(busy, Ordering::SeqCst);
+    }
+}
+
+impl NativeNameBackend for LifecycleBusyProbeBackend {
+    fn read(&self, target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+        self.scripted.read(target)
+    }
+
+    fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
+        self.scripted.write(attempt)
+    }
+
+    fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        let busy = self.lifecycle_busy.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if busy {
+                super::NativeProbeResult::LifecycleBusy
+            } else {
+                super::NativeProbeResult::Available
+            }
+        })
     }
 }
 
@@ -2417,6 +4363,11 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
         Some(0),
         "no cycle is consumed while the capability is absent"
     );
+    assert_eq!(
+        native_entry_of(&doc)["lifecycleBusyDeferrals"].as_u64(),
+        Some(0),
+        "genuine capability absence does not spend the lifecycle contention budget"
+    );
 
     // The capability arrives: the SAME series is re-probed within one
     // re-probe window and converges through its own cycle.
@@ -2439,6 +4390,315 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
         .assert_discovered_within_one_reprobe_window("the paused series");
     assert_eq!(backend.writes(), 1);
     assert_eq!(backend.reads(), 2);
+}
+
+/// Typed lock refusals from the route probe are lifecycle contention, not
+/// missing capability: after the finite fast-retry budget the series enters
+/// a durable cooldown, survives a store reopen, and resumes when contention
+/// clears.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_busy_route_probe_recovers_after_durable_cooldown_and_restart() {
+    const MAX_BUSY_DEFERRALS: u64 = 6;
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_475_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-probe-always-busy", "/h/probe-busy").await;
+    let backend = LifecycleBusyProbeBackend::new();
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        backend.clone(),
+        inert_generation(dir.path()),
+    );
+
+    for expected in 1..=MAX_BUSY_DEFERRALS {
+        let state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = native_entry_for_target(&document_json(dir.path()), &target);
+                if state["lifecycleBusyDeferrals"].as_u64() == Some(expected) {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("probe busy deferral {expected} was not persisted"));
+
+        if expected < MAX_BUSY_DEFERRALS {
+            let due = state["nextDue"].as_i64().expect("retry is scheduled");
+            set_offset(due - start_ms);
+            tokio::time::advance(WORKER_POLL_INTERVAL).await;
+        }
+    }
+    worker.abort();
+    let _ = worker.await;
+
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(backend.probes(), MAX_BUSY_DEFERRALS as u32);
+    assert_eq!(backend.scripted.reads(), 0, "busy probes dispatch no reads");
+    assert_eq!(
+        backend.scripted.writes(),
+        0,
+        "busy probes dispatch no writes"
+    );
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(state["readsConsumed"].as_u64(), Some(0));
+    assert!(state.get("attemptedReceipts").is_none());
+    assert!(!state["settled"].as_bool().unwrap());
+    let cooldown_due = state["nextDue"]
+        .as_i64()
+        .expect("a durable cooldown is scheduled after the fast budget");
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "cooldown is not yet due"
+    );
+    let sync = native_sync_of(&store, target.clone()).await.unwrap();
+    assert_eq!(sync.status, NativeSyncStatus::Unsynced);
+    assert!(sync.reason.unwrap().contains("lifecycle lock contention"));
+
+    // Restart while the cooldown is pending. The exact series becomes due
+    // from its persisted timestamp and converges after the typed refusal
+    // clears, without claiming or writing while it was busy.
+    drop(store);
+    set_offset(cooldown_due - start_ms);
+    let reopened = open_store(dir.path());
+    assert_eq!(reopened.native_work_snapshot().len(), 1);
+    backend.set_lifecycle_busy(false);
+    let mut published = reopened.subscribe();
+    let resumed_worker = SessionNameWorker::start(
+        Arc::clone(&reopened),
+        backend.clone(),
+        inert_generation(dir.path()),
+    );
+    await_published_native_status(
+        &reopened,
+        &mut published,
+        &target,
+        NativeSyncStatus::Synced,
+        CAPABILITY_ARRIVAL_CONVERGENCE_BOUND,
+        "the same native series resumes after lifecycle contention clears",
+    )
+    .await;
+    resumed_worker.abort();
+    let _ = resumed_worker.await;
+    assert_eq!(backend.probes(), MAX_BUSY_DEFERRALS as u32 + 1);
+    assert_eq!(
+        backend.scripted.reads(),
+        2,
+        "resume reads and confirms once"
+    );
+    assert_eq!(
+        backend.scripted.writes(),
+        1,
+        "resume writes only the target title"
+    );
+    assert_eq!(backend.scripted.confirmed_writes(), 1);
+    assert_eq!(
+        native_entry_for_target(&document_json(dir.path()), &target)["lifecycleBusyDeferrals"]
+            .as_u64(),
+        Some(0),
+        "the due claim starts a fresh bounded contention window"
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+#[tokio::test]
+async fn stale_busy_probe_item_cannot_defer_a_relocated_or_renamed_series() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-probe-stale-item", "/h/probe-original").await;
+    let old_route_item = store
+        .native_work_snapshot()
+        .into_iter()
+        .find(|item| item.target == target)
+        .expect("armed route is due");
+
+    record_acquisition(
+        &store,
+        target.clone(),
+        verified_acquisition(claude_location("/h/probe-moved", "h-probe-stale-item")),
+    )
+    .await
+    .expect("route relocation commits while the old probe is in flight");
+    let after_relocation = native_entry_for_target(&document_json(dir.path()), &target);
+    assert!(matches!(
+        store
+            .defer_native_lifecycle_busy_for_item(old_route_item)
+            .await
+            .unwrap(),
+        super::NativeLifecycleDeferralResult::Stale
+    ));
+    assert_eq!(
+        native_entry_for_target(&document_json(dir.path()), &target),
+        after_relocation,
+        "a busy result for an old route changes no counter or deadline"
+    );
+
+    let old_name_item = store
+        .native_work_snapshot()
+        .into_iter()
+        .find(|item| item.target == target)
+        .expect("relocated route is due");
+    rename_user(&store, target.clone(), "Newer Canonical Title")
+        .await
+        .expect("new canonical revision commits while the probe is in flight");
+    let after_rename = native_entry_for_target(&document_json(dir.path()), &target);
+    assert!(matches!(
+        store
+            .defer_native_lifecycle_busy_for_item(old_name_item)
+            .await
+            .unwrap(),
+        super::NativeLifecycleDeferralResult::Stale
+    ));
+    assert_eq!(
+        native_entry_for_target(&document_json(dir.path()), &target),
+        after_rename,
+        "a busy result for an old name changes no counter or deadline"
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// Repeated write refusals occur after successful pre-reads, so the physical
+/// reads consume the old window's allowance. Starting a fresh durable window
+/// after cooldown must permit a fresh pre-read while retaining the global
+/// write-cycle limit and receipt safety.
+#[tokio::test]
+async fn lifecycle_busy_write_retries_after_cooldown_with_fresh_read_window() {
+    const MAX_BUSY_DEFERRALS: u32 = 6;
+    let dir = temp_data_dir();
+    let start_ms = 1_700_000_000_525_i64;
+    let set_offset = |offset| {
+        crate::session_names::set_test_hooks(
+            dir.path(),
+            vec![
+                crate::session_names::TestHook::FrozenClockMs(start_ms),
+                crate::session_names::TestHook::ClockOffsetMs(offset),
+            ],
+        );
+    };
+    set_offset(0);
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-write-busy-cooldown", "/h/write-busy").await;
+    let backend = ScriptedBackend::new(
+        (0..MAX_BUSY_DEFERRALS)
+            .map(|_| WriteStep::LifecycleBusy)
+            .collect(),
+    );
+    backend.set_title(Some("Different"));
+
+    let mut current_offset = 0_i64;
+    for attempt in 0..MAX_BUSY_DEFERRALS {
+        super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+        if attempt + 1 < MAX_BUSY_DEFERRALS {
+            let state = native_entry_for_target(&document_json(dir.path()), &target);
+            let due = state["nextDue"].as_i64().expect("busy retry is scheduled");
+            current_offset = due - start_ms;
+            set_offset(current_offset);
+        }
+    }
+    let state = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(backend.reads(), MAX_BUSY_DEFERRALS);
+    assert_eq!(backend.writes(), MAX_BUSY_DEFERRALS);
+    assert_eq!(backend.confirmed_writes(), 0);
+    assert_eq!(state["cyclesConsumed"].as_u64(), Some(0));
+    assert_eq!(
+        state["readsConsumed"].as_u64(),
+        Some(MAX_BUSY_DEFERRALS as u64)
+    );
+    assert_eq!(
+        state["lifecycleBusyDeferrals"].as_u64(),
+        Some(MAX_BUSY_DEFERRALS as u64)
+    );
+    assert!(state["attemptedReceipts"]
+        .as_array()
+        .is_none_or(|receipts| receipts.is_empty()));
+    let cooldown_due = state["nextDue"].as_i64().expect("cooldown is scheduled");
+    assert_eq!(
+        cooldown_due - (start_ms + current_offset),
+        crate::session_names::NATIVE_LIFECYCLE_BUSY_COOLDOWN_MS
+    );
+
+    // Reopen after the persisted cooldown. The new window admits the fresh
+    // pre-read and one write; the acknowledgement is confirmed by a second
+    // read, and only that dispatched write has an owned receipt.
+    drop(store);
+    set_offset(cooldown_due - start_ms);
+    let reopened = open_store(dir.path());
+    super::run_cycle(
+        &reopened,
+        backend.as_ref() as &dyn NativeNameBackend,
+        &target,
+    )
+    .await;
+    assert_eq!(backend.reads(), MAX_BUSY_DEFERRALS + 2);
+    assert_eq!(backend.writes(), MAX_BUSY_DEFERRALS + 1);
+    assert_eq!(backend.confirmed_writes(), 1);
+    assert_eq!(backend.write_titles(), vec!["Manual Title".to_string(); 7]);
+    let resumed = native_entry_for_target(&document_json(dir.path()), &target);
+    assert_eq!(resumed["cyclesConsumed"].as_u64(), Some(1));
+    assert_eq!(resumed["readsConsumed"].as_u64(), Some(2));
+    assert_eq!(resumed["lifecycleBusyDeferrals"].as_u64(), Some(0));
+    assert_eq!(
+        native_sync_of(&reopened, target).await.unwrap().status,
+        NativeSyncStatus::Synced
+    );
+    crate::session_names::clear_test_hooks(dir.path());
+}
+
+/// A capability probe authorizes only the exact route it inspected. If that
+/// route relocates while the probe is pending, the stale snapshot cannot
+/// claim or write the replacement route; the worker must probe the new route
+/// before its fresh cycle.
+#[tokio::test(start_paused = true)]
+async fn relocation_during_route_probe_requires_a_fresh_probe_before_claim() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-probe-relocate", "/h/probe-original").await;
+    let original = claude_location("/h/probe-original", "h-probe-relocate");
+    let moved = claude_location("/h/probe-moved", "h-probe-relocate");
+    let backend = ScriptedBackend::new(vec![WriteStep::Confirm]).arm_probe_gate();
+    backend.set_title(Some("Different"));
+    let mut published = store.subscribe();
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        backend.clone(),
+        inert_generation(dir.path()),
+    );
+
+    backend.probe_gate_arrived.notified().await;
+    record_acquisition(&store, target.clone(), verified_acquisition(moved.clone()))
+        .await
+        .expect("the verified route changes while its old probe is pending");
+    backend.probe_gate_open.notify_one();
+
+    await_published_native_status(
+        &store,
+        &mut published,
+        &target,
+        NativeSyncStatus::Synced,
+        CAPABILITY_ARRIVAL_CONVERGENCE_BOUND,
+        "the fresh route should converge after it is probed",
+    )
+    .await;
+    worker.abort();
+
+    assert_eq!(
+        backend.probe_locations(),
+        vec![original, moved.clone()],
+        "a stale probe result cannot authorize work on a replacement route"
+    );
+    assert_eq!(backend.writes(), 1);
+    assert_eq!(backend.write_titles(), vec!["Manual Title"]);
+    assert_eq!(backend.write_locations(), vec![moved]);
 }
 
 /// A dispatch-shaped backend whose capability probe refuses a chosen set of
@@ -2510,7 +4770,7 @@ impl NativeNameBackend for SelectiveCapabilityBackend {
             }
             _ => false,
         };
-        Box::pin(async move { !refused })
+        Box::pin(async move { (!refused).into() })
     }
 }
 
@@ -2737,18 +4997,12 @@ async fn native_reads_are_bounded_at_six_per_revision() {
         .expect("claim");
     for i in 1..=6 {
         assert!(
-            store
-                .charge_native_read(target.clone(), claim.series_epoch)
-                .await
-                .unwrap(),
+            store.charge_native_read(claim.clone()).await.unwrap(),
             "read {i} charges against the allowance"
         );
     }
     assert!(
-        !store
-            .charge_native_read(target.clone(), claim.series_epoch)
-            .await
-            .unwrap(),
+        !store.charge_native_read(claim.clone()).await.unwrap(),
         "the seventh read is refused"
     );
 
@@ -2799,9 +5053,7 @@ async fn a_relocated_target_ignores_late_folds_from_the_old_location() {
     // The old cycle completes late at the OLD location revision.
     store
         .fold_native_outcome(
-            target.clone(),
-            claim.location_revision,
-            claim.series_epoch,
+            claim.clone(),
             NativeOutcomeFold::Read {
                 observed: Some("Manual Title".to_string()),
                 receipt: Some(claim.receipt_id.clone()),

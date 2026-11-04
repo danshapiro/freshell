@@ -93,6 +93,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<HostState>, Arc<PausedRetainedRead
         child: Mutex::new(None),
         pty: Mutex::new(None),
         fresh_agent: Mutex::new(None),
+        fresh_agent_starting: Mutex::new(None),
         fresh_native_command: Mutex::new(()),
         provider_config_paths: ProviderConfigPaths::default(),
         opencode_transfer_mount: PathBuf::from(OPENCODE_TRANSFER_MOUNT),

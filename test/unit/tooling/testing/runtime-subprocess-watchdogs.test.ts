@@ -299,11 +299,15 @@ describe('runtime synchronous subprocess watchdogs', () => {
       if (program === 'docker' && (args[0] === 'ps' || args.join(' ') === 'volume ls --format {{.Name}}')) return ''
       throw new Error(`unexpected cleanup command: ${program} ${args.join(' ')}`)
     })
-    browser.web = { stop: vi.fn().mockRejectedValue(error) } as unknown as typeof browser.web
+    const stopWeb = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(undefined)
+    const killWeb = vi.fn().mockResolvedValue(undefined)
+    browser.web = { stop: stopWeb, kill: killWeb } as unknown as typeof browser.web
     fs.mkdirSync(browser.runtime.buildDir, { recursive: true })
     fs.writeFileSync(path.join(browser.runtime.buildDir, 'retained-build'), 'owned evidence')
     const cleanup = vi.spyOn(browser.runtime, 'cleanup')
     const result = await browser.stop()
+    expect(killWeb).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+    expect(stopWeb).toHaveBeenCalledTimes(2)
     expect(cleanup).toHaveBeenCalledExactlyOnceWith([`web stop: ${error.message}`])
     expect(result.ok).toBe(false)
     expect(result.errors).toEqual([`web stop: ${error.message}`])

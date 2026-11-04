@@ -31,7 +31,7 @@ use crate::gemini_failure::{classify_gemini_failure, GeminiFailure};
 use crate::session_name_capability::SessionNameTransport;
 use crate::session_name_native::{
     NativeCallResult, NativeFuture, NativeNameAttempt, NativeNameBackend, NativeNameReadback,
-    NativeNameTarget, NativeProbeFuture, SessionNameWorker,
+    NativeNameTarget, NativeProbeFuture, NativeProbeResult, SessionNameWorker,
 };
 use crate::session_names::{
     clear_test_hooks, name_ref_key, set_test_hooks, SessionNames, TestHook, GENERATION_RETRY_1_MS,
@@ -319,7 +319,7 @@ impl NativeNameBackend for NoRouteNative {
     }
 
     fn route_available(&self, _target: NativeNameTarget) -> NativeProbeFuture {
-        Box::pin(async move { false })
+        Box::pin(async move { NativeProbeResult::Unavailable })
     }
 }
 
@@ -1418,7 +1418,7 @@ async fn capability_pause_consumes_nothing_and_resumes_on_the_wake() {
             Box::pin(async move { NativeCallResult::Confirmed(()) })
         }
         fn route_available(&self, _target: NativeNameTarget) -> NativeProbeFuture {
-            Box::pin(async move { true })
+            Box::pin(async move { NativeProbeResult::Available })
         }
     }
     let native_backend = Arc::new(ConfirmingNative);
@@ -2376,6 +2376,8 @@ fn the_selector_orders_generation_by_due_then_key_and_alternates_classes() {
         desired_name: "x".to_string(),
         desired_source: NameSource::Manual,
         cycles_consumed: 0,
+        series_epoch: 1,
+        lifecycle_busy_deferrals: 0,
         next_due: None,
     };
     let mut backoff = std::collections::HashMap::new();
@@ -2450,7 +2452,7 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
         fn route_available(&self, _t: NativeNameTarget) -> NativeProbeFuture {
             // One log entry per DISPATCHED cycle — the dispatch order pin.
             self.order.lock().unwrap().push("native");
-            Box::pin(async move { true })
+            Box::pin(async move { NativeProbeResult::Available })
         }
     }
     struct LoggingGeneration {
