@@ -2218,11 +2218,25 @@ async fn grant_execution(
 ) -> Result<HostResult, RuntimeError> {
     let grant_id = request.grant_id.clone();
     let mut timeline = GrantStageTimeline::start(request.dispatch_budget);
-    let result = grant_execution_stages(state, request, effects, &mut timeline).await;
+    let result = grant_execution_stages_boxed(state, request, effects, &mut timeline).await;
     let event = timeline.event(&grant_id, result.as_ref().map(|_| ()));
     emit_environment_event(event.clone());
     append_event_with_secret(&state.state_dir, &state.secret, "host.grant_timing", event).ok();
     result
+}
+
+// Construct the large grant future outside the caller's poll frame, so its
+// construction stack space is released before the future runs.
+#[inline(never)]
+fn grant_execution_stages_boxed<'a>(
+    state: &'a Arc<HostState>,
+    request: GrantExecutionRequest,
+    effects: &'a dyn GrantExecutionEffects,
+    timeline: &'a mut GrantStageTimeline,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<HostResult, RuntimeError>> + Send + 'a>,
+> {
+    Box::pin(grant_execution_stages(state, request, effects, timeline))
 }
 
 async fn grant_execution_stages(
@@ -16591,6 +16605,32 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     }
 
     #[cfg(unix)]
+    #[test]
+    fn synthetic_transfer_grant_fits_a_bounded_test_stack() {
+        // Exercise the actual grant and all its success and refusal cases on a
+        // smaller stack than the test harness normally provides. An overflow
+        // kills only this child, allowing the parent to report the failure.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::production_grant_joins_staging_backend_mount_readiness_and_pty_for_synthetic_history",
+                "--nocapture",
+            ])
+            .env("RUST_MIN_STACK", "1048576")
+            .output()
+            .expect("run synthetic transfer on a bounded stack");
+        assert!(
+            output.status.success(),
+            "synthetic transfer failed on a bounded stack: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "bounded-stack child did not run the synthetic transfer test"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn production_grant_joins_staging_backend_mount_readiness_and_pty_for_synthetic_history()
     {
@@ -18375,11 +18415,15 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         }
     }
 
-    async fn run_joined_synthetic_transfer(
+    #[inline(never)]
+    fn run_joined_synthetic_transfer(
         failure: Option<SyntheticTransferFailure>,
-    ) -> Result<SyntheticGateAttempt, String> {
-        let fixture = stage_synthetic_opencode_transfer()?;
-        run_joined_synthetic_transfer_from_stage(fixture, failure).await
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyntheticGateAttempt, String>>>>
+    {
+        Box::pin(async move {
+            let fixture = stage_synthetic_opencode_transfer()?;
+            run_joined_synthetic_transfer_from_stage(fixture, failure).await
+        })
     }
 
     async fn run_joined_synthetic_transfer_from_stage(
@@ -18576,18 +18620,23 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         })
     }
 
-    async fn run_synthetic_exact_resume(
+    #[inline(never)]
+    fn run_synthetic_exact_resume(
         imported: &SyntheticGateAttempt,
         failure: Option<SyntheticTransferFailure>,
         stopped_repair_baseline: bool,
-    ) -> Result<SyntheticResumeAttempt, String> {
-        run_synthetic_exact_resume_for_soul(
-            imported,
-            failure,
-            stopped_repair_baseline,
-            &SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?,
-        )
-        .await
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SyntheticResumeAttempt, String>> + '_>,
+    > {
+        Box::pin(async move {
+            run_synthetic_exact_resume_for_soul(
+                imported,
+                failure,
+                stopped_repair_baseline,
+                &SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?,
+            )
+            .await
+        })
     }
 
     async fn run_synthetic_exact_resume_for_soul(
