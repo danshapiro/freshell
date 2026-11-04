@@ -265,14 +265,31 @@ pub struct LiveNetworkFacts {
 /// rather than a `OnceCell`, so `invalidate()` can force re-detection
 /// (`network-manager.ts:419-420`'s cache-clear semantics) while a populated
 /// cache still serves instantly on every other request.
-#[derive(Default)]
 pub struct NetworkFactsCache {
     inner: tokio::sync::RwLock<Option<LiveNetworkFacts>>,
+    resolve: Arc<dyn Fn() -> LiveNetworkFacts + Send + Sync>,
+}
+
+impl Default for NetworkFactsCache {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            resolve: Arc::new(resolve_live_network_facts),
+        }
+    }
 }
 
 impl NetworkFactsCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_resolver(resolve: impl Fn() -> LiveNetworkFacts + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Default::default(),
+            resolve: Arc::new(resolve),
+        }
     }
 
     /// Return the cached facts, computing (and caching) them on the first
@@ -286,7 +303,8 @@ impl NetworkFactsCache {
         if let Some(facts) = guard.clone() {
             return facts;
         }
-        let facts = tokio::task::spawn_blocking(resolve_live_network_facts)
+        let resolve = Arc::clone(&self.resolve);
+        let facts = tokio::task::spawn_blocking(move || resolve())
             .await
             .unwrap_or_else(|_| LiveNetworkFacts {
                 firewall: FirewallInfo {
@@ -2898,46 +2916,150 @@ mod tests {
         assert_eq!(resp.status(), 401);
     }
 
+    fn stable_linux_test_state(
+        bind_host: &str,
+    ) -> (NetworkState, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut state = test_state(bind_host, Some(true));
+        let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&resolutions);
+        state.facts = Arc::new(NetworkFactsCache::with_resolver(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            LiveNetworkFacts {
+                firewall: linux_none_inactive(),
+                lan_ips: vec!["192.168.3.50".into()],
+                hostname: "test-host".into(),
+            }
+        }));
+        (state, resolutions)
+    }
+
+    fn network_mutation_request(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("x-auth-token", "tok")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn configure_waits_until_disable_commits_its_live_bind() {
+        use tower::util::ServiceExt;
+        let (state, _) = stable_linux_test_state("0.0.0.0");
+        state.facts.get_or_refresh().await;
+        // Pause disable at cache invalidation AFTER its persisted settings
+        // change but BEFORE its live bind commits. The real mutation lock
+        // must keep configure out of that intentionally exposed gap.
+        let pause = state.facts.inner.read().await;
+        let mut disable = Box::pin(router(state.clone()).oneshot(network_mutation_request(
+            "/api/network/disable-remote-access",
+            "{}",
+        )));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(disable.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(
+            network_host_str(&state.settings.get().await.network.host),
+            "127.0.0.1"
+        );
+        assert_eq!(state.bind.get().await, "0.0.0.0");
+        let mut configure = Box::pin(router(state.clone()).oneshot(network_mutation_request(
+            "/api/network/configure",
+            r#"{"host":"0.0.0.0","configured":true}"#,
+        )));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(configure.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(
+            network_host_str(&state.settings.get().await.network.host),
+            "127.0.0.1",
+            "configure cannot overwrite persisted settings before disable's live bind commits"
+        );
+        drop(pause);
+        let (configured, disabled) = tokio::join!(configure, disable);
+        assert_eq!(configured.unwrap().status(), 200);
+        assert_eq!(disabled.unwrap().status(), 200);
+        assert_eq!(state.bind.get().await, "0.0.0.0");
+        assert_eq!(
+            network_host_str(&state.settings.get().await.network.host),
+            "0.0.0.0"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_configure_and_disable_serialize_to_a_consistent_end_state() {
         // Falsifier for the A-08 mutation lock: without net_mutation held across
         // bind.get() -> bind.set(), interleavings persist a host that contradicts
         // the live bind (concrete counterexample schedules in reports/V5.md).
-        use axum::body::Body;
-        use axum::http::Request;
         use tower::util::ServiceExt;
-        let state = test_state("0.0.0.0", Some(true));
-        seed_facts(&state, vec!["192.168.3.50".into()], linux_none_inactive()).await;
-        let cfg = router(state.clone()).oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/network/configure")
-                .header("x-auth-token", "tok")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"host":"0.0.0.0","configured":true}"#))
-                .unwrap(),
-        );
-        let dis = router(state.clone()).oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/network/disable-remote-access")
-                .header("x-auth-token", "tok")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        );
-        let (r1, r2) = tokio::join!(cfg, dis);
-        assert_eq!(r1.unwrap().status(), 200);
-        assert_eq!(r2.unwrap().status(), 200);
-        // Whichever order the lock imposed, persisted host must equal the live bind.
-        let persisted =
-            serde_json::to_value(&state.settings.get().await.network).unwrap()["host"].clone();
-        let live = state.bind.get().await;
-        assert_eq!(
-            persisted,
-            serde_json::json!(live),
-            "persisted host desynced from live bind (A-08)"
-        );
+        for configure_first in [true, false] {
+            let (state, resolutions) = stable_linux_test_state("0.0.0.0");
+            assert_eq!(state.facts.get_or_refresh().await.hostname, "test-host");
+            let cfg = router(state.clone()).oneshot(network_mutation_request(
+                "/api/network/configure",
+                r#"{"host":"0.0.0.0","configured":true}"#,
+            ));
+            let dis = router(state.clone()).oneshot(network_mutation_request(
+                "/api/network/disable-remote-access",
+                "{}",
+            ));
+            let (r1, r2) = if configure_first {
+                tokio::join!(biased; cfg, dis)
+            } else {
+                let (disable, configure) = tokio::join!(biased; dis, cfg);
+                (configure, disable)
+            };
+            let configure = r1.unwrap();
+            let disable = r2.unwrap();
+            let configure_status = configure.status();
+            let disable_status = disable.status();
+            let configure_body = body_json(configure).await;
+            let disable_body = body_json(disable).await;
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"info", "event":"network.concurrent_mutation_outcomes", "configureFirst":configure_first, "configureStatus":configure_status.as_u16(), "disableStatus":disable_status.as_u16(), "disableBody":disable_body})
+            );
+            assert_eq!(
+                configure_status, 200,
+                "configure-first={configure_first}: {configure_body}"
+            );
+            assert_eq!(
+                disable_status, 200,
+                "configure-first={configure_first}: {disable_body}"
+            );
+            // Whichever order the lock imposed, persisted host must equal the live bind.
+            let persisted =
+                serde_json::to_value(&state.settings.get().await.network).unwrap()["host"].clone();
+            let live = state.bind.get().await;
+            assert_eq!(
+                persisted,
+                serde_json::json!(live),
+                "persisted host desynced from live bind (A-08)"
+            );
+            assert_eq!(
+                live,
+                if configure_first {
+                    "127.0.0.1"
+                } else {
+                    "0.0.0.0"
+                },
+                "the chosen first mutation must be serialized before the second"
+            );
+            let refreshed = state.facts.get_or_refresh().await;
+            assert_eq!(refreshed.hostname, "test-host");
+            assert_eq!(refreshed.firewall.platform, FirewallPlatform::LinuxNone);
+            assert!(
+                resolutions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                "mutations must invalidate and re-resolve the injected facts, never the real host"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4092,27 +4214,28 @@ mod tests {
     /// cached value — proving the cache is refreshable, not a `OnceCell`.
     #[tokio::test]
     async fn facts_cache_invalidate_forces_re_detection_on_next_read() {
-        let cache = NetworkFactsCache::new();
-        *cache.inner.write().await = Some(LiveNetworkFacts {
-            firewall: linux_none_inactive(),
-            lan_ips: vec!["10.0.0.1".to_string()],
-            hostname: "first".to_string(),
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let cache = NetworkFactsCache::with_resolver(move || {
+            let call = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            LiveNetworkFacts {
+                firewall: linux_none_inactive(),
+                lan_ips: vec![format!("10.0.0.{call}")],
+                hostname: format!("resolved-{call}"),
+            }
         });
         let first = cache.get_or_refresh().await;
         assert_eq!(first.lan_ips, vec!["10.0.0.1".to_string()]);
-
+        assert_eq!(first.hostname, "resolved-1");
+        assert_eq!(cache.get_or_refresh().await.hostname, "resolved-1");
         cache.invalidate().await;
-        // Post-invalidate, seed a DIFFERENT value directly (standing in for
-        // the real subprocess re-detection) and prove the cache actually
-        // was cleared (i.e. `get_or_refresh` did not just re-serve `first`).
         assert!(cache.inner.read().await.is_none());
-        *cache.inner.write().await = Some(LiveNetworkFacts {
-            firewall: linux_none_inactive(),
-            lan_ips: vec!["10.0.0.2".to_string()],
-            hostname: "second".to_string(),
-        });
+        // Exercise real refresh after invalidation instead of manually
+        // replacing the cache and bypassing its detector.
         let second = cache.get_or_refresh().await;
         assert_eq!(second.lan_ips, vec!["10.0.0.2".to_string()]);
+        assert_eq!(second.hostname, "resolved-2");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// Acceptance 7 (no privileged/mutating process spawned): the injected
