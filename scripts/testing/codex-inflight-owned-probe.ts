@@ -130,6 +130,7 @@ export async function checkInFlightOwnedProbe(input: {
   let inside: Identity | undefined
   let stopCalls = 0
   let inFlightAtStop = false
+  let ownerStopSucceeded = false
   let cleanup: Promise<void> | undefined
   const rig = {
     runtime: owner.runtime,
@@ -138,7 +139,9 @@ export async function checkInFlightOwnedProbe(input: {
       // Even a failed observation must not prevent the real owner from stopping.
       try { inFlightAtStop = !!cli && !!inside && sameIdentity(cli) && sameIdentity(inside) }
       catch { inFlightAtStop = false }
-      return owner.stop()
+      const result = await owner.stop()
+      ownerStopSucceeded = result.ok
+      return result
     },
   }
   const startCleanup = () => cleanup ??= cleanupManagedCodexParity({ rig, owners, wire: undefined, model: undefined,
@@ -202,10 +205,11 @@ export async function checkInFlightOwnedProbe(input: {
     && probeResult.status === 'fulfilled' && probeResult.value.kind === 'rejected') {
     const error = probeResult.value.error
     const cause = error instanceof Error ? error.cause as { signal?: string } | undefined : undefined
-    const expectedCancellation = cleanupResult.status === 'fulfilled' && stopCalls === 1 && inFlightAtStop
-      && cause?.signal === 'SIGKILL'
+    // Capture and removal can fail independently of a successful owner stop.
+    const ownerCancellationProven = ownerStopSucceeded && stopCalls === 1 && inFlightAtStop
+    const expectedCancellation = ownerCancellationProven && cause?.signal === 'SIGKILL'
     if (!expectedCancellation) {
-      failures.push({ phase: 'probe', kind: 'unexpected_rejection' })
+      failures.push({ phase: 'probe', kind: cause?.signal === 'SIGKILL' ? 'cancellation_unconfirmed' : 'unexpected_rejection' })
       errors.push(error)
     }
   }

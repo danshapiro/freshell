@@ -70,6 +70,7 @@ vi.mock('../../../helpers/codex-managed-cleanup.js', async importOriginal => {
 import { captureInitialProviderVolumes } from '../../../../scripts/testing/initial-provider-volume.js'
 import { ownershipAndUnreserved, settle } from '../../../../scripts/testing/codex-real-volume-lifecycle.js'
 import { checkInFlightOwnedProbe } from '../../../../scripts/testing/codex-inflight-owned-probe.js'
+import { managedCodexCleanupDependencies } from '../../../helpers/codex-managed-cleanup.js'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -374,8 +375,94 @@ it.each(['SIGKILL', 'SIGTERM'] as const)(
       expect(output.some(line => JSON.parse(line).event === 'real_probe.case_passed')).toBe(true)
     } else {
       expect(nestedErrors(failure)).toContain(rejectedProbe)
+      expect(output.flatMap(line => JSON.parse(line).failures ?? []))
+        .toContainEqual({ phase: 'probe', kind: 'unexpected_rejection' })
       expect(output.join('')).not.toContain(rejectedProbe.message)
     }
+  },
+)
+
+it.each([
+  ['capture', true], ['remove', true], ['capture', false],
+] as const)(
+  'checks expected owner cancellation with independent %s failure (owner succeeded: %s)', async (failedStage, ownerSucceeded) => {
+    const probe = deferred<void>()
+    const containerId = 'b'.repeat(64)
+    const daemonId = 'controlled-daemon'
+    const lifecyclePath = '/virtual/task4-lifecycle.jsonl'
+    const cliPid = 21111
+    const insidePid = 21112
+    const fakeCli = '/virtual/docker'
+    const stat = (pid: number) => `${pid} (task4) ${['S', ...Array(18).fill('0'), '1234'].join(' ')}`
+    control.reads.set(lifecyclePath, '')
+    control.reads.set(`/proc/self/task/${process.pid}/children`, `${cliPid}`)
+    control.reads.set(`/proc/${cliPid}/stat`, stat(cliPid))
+    control.reads.set(`/proc/${insidePid}/stat`, stat(insidePid))
+    setFsOverride('realpathSync', `/proc/${cliPid}/exe`, fakeCli)
+    setFsOverride('realpathSync', fakeCli, fakeCli)
+    vi.stubEnv('DOCKER_HOST', 'unix:///virtual/task4-daemon.sock')
+    const cancellation = new Error('synthetic-cancellation-secret-marker', { cause: { signal: 'SIGKILL' } })
+    const cleanupFailure = new Error(`synthetic-${failedStage}-secret-marker`)
+    const capture = vi.spyOn(managedCodexCleanupDependencies, 'captureVolumes').mockImplementation(() => {
+      if (failedStage === 'capture') throw cleanupFailure
+      return []
+    })
+    const remove = vi.spyOn(managedCodexCleanupDependencies, 'removeVolumes').mockImplementation(() => {
+      if (failedStage === 'remove') throw cleanupFailure
+      return []
+    })
+    let nonce = ''
+    control.exec.mockImplementation((_program: string, args: string[]) => {
+      if (args[0] === 'info') return `${daemonId}\n`
+      if (args[0] === 'top') return `PID ARGS\n${insidePid} node ${nonce}\n`
+      throw new Error('unexpected controlled Docker operation')
+    })
+    const owner = {
+      runtime: { lifecyclePath, broker: { receiptIds: () => new Set([containerId]), receipts: () => [{ containerId }] } },
+      ownedProviderExec: vi.fn((_id: string, command: string[]) => {
+        nonce = command[command.length - 1]
+        const args = [fakeCli, 'exec', '--user', '65534:0', containerId, 'env', 'HOME=/home/freshell/provider', ...command]
+        control.reads.set(`/proc/${cliPid}/cmdline`, Buffer.from(`${args.join('\0')}\0`))
+        control.reads.set(`/proc/${insidePid}/cmdline`, Buffer.from(`node\0${nonce}\0`))
+        return probe.promise
+      }),
+      stop: vi.fn(async () => {
+        const gone = Object.assign(new Error('gone'), { code: 'ENOENT' })
+        control.reads.set(`/proc/${cliPid}/stat`, gone)
+        control.reads.set(`/proc/${insidePid}/stat`, gone)
+        probe.reject(cancellation)
+        return ownerSucceeded ? { ok: true, errors: [] as string[] }
+          : { ok: false, errors: ['synthetic-owner-secret-marker'] }
+      }),
+    }
+    const rows: EventRow[] = []
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      rows.push(JSON.parse(String(chunk)) as EventRow); return true
+    }) as typeof process.stdout.write)
+    let failure: unknown
+    try {
+      failure = await checkInFlightOwnedProbe({ owner, containerId, owners: [], daemonId,
+        daemonSocket: '/virtual/task4-daemon.sock', dockerCli: fakeCli } as unknown as Parameters<typeof checkInFlightOwnedProbe>[0])
+        .then(() => undefined, error => error)
+    } finally { stdout.mockRestore() }
+    const failures = rows.flatMap(row => Array.isArray(row.failures) ? row.failures : [])
+    expect.soft(owner.stop).toHaveBeenCalledOnce()
+    expect.soft(capture).toHaveBeenCalledOnce()
+    expect.soft(remove).toHaveBeenCalledTimes(failedStage === 'remove' ? 1 : 0)
+    expect.soft(rows.some(row => row.event === 'real_probe.in_flight')).toBe(true)
+    expect.soft(nestedErrors(failure)).toContain(cleanupFailure)
+    expect.soft(failures).toContainEqual({ phase: 'cleanup', kind: 'exception' })
+    expect.soft(failures).not.toContainEqual({ phase: 'probe', kind: 'unexpected_rejection' })
+    if (ownerSucceeded) {
+      expect.soft(nestedErrors(failure)).not.toContain(cancellation)
+      expect.soft(failures).not.toContainEqual({ phase: 'probe', kind: 'cancellation_unconfirmed' })
+    } else {
+      expect.soft(nestedErrors(failure)).toContain(cancellation)
+      expect.soft(failures).toContainEqual({ phase: 'probe', kind: 'cancellation_unconfirmed' })
+    }
+    expect.soft(JSON.stringify(rows)).not.toContain(cleanupFailure.message)
+    expect.soft(JSON.stringify(rows)).not.toContain('synthetic-owner-secret-marker')
+    expect(JSON.stringify(rows)).not.toContain(cancellation.message)
   },
 )
 
@@ -462,6 +549,7 @@ function fakeLifecycleDaemon(options: {
   control.exec.mockImplementation((_program: string, args: string[]) => {
     if (args[0] === 'info') return args.includes('{{json .SecurityOptions}}') ? '["name=rootless"]' : `${daemonId}\n`
     if (args[0] === 'volume' && args[1] === 'ls') {
+      options.atBoundary?.('volume_list', args)
       const name = args[3].slice('name=^'.length, -1)
       const count = (listCounts.get(name) ?? 0) + 1
       listCounts.set(name, count)
@@ -697,6 +785,8 @@ async function runExecutableFailure(options: {
   stopError?: string
   fixtureAlreadyExists?: boolean
   unreservedObservation?: 'before_stop' | 'after_stop' | 'final_absence'
+  unreservedCleanupFailure?: 'capture' | 'remove'
+  fallbackObservationFailure?: boolean
 }): Promise<EventRow[]> {
   const repo = process.cwd()
   const privateRoot = '/virtual/task4-private'
@@ -723,10 +813,39 @@ async function runExecutableFailure(options: {
     if (key === 'DOCKER_CONFIG') setFsOverride('readdirSync', value, [])
   }
   let observationFaultReached = false
-  fakeLifecycleDaemon({ ...options, atBoundary: point => {
+  let cleanupFaultReached = false
+  let fallbackFaultReached = false
+  let postStopVolumeLists = 0
+  let owner: ReturnType<typeof fakeLifecycleOwner>
+  let daemon: ReturnType<typeof fakeLifecycleDaemon>
+  daemon = fakeLifecycleDaemon({ ...options, atBoundary: (point, args) => {
     if (point === 'unreserved_observation') observationFaultReached = true
+    if (point === 'volume_list' && owner.stop.mock.calls.length > 0
+      && args[3] === `name=^${daemon.createdNames[2]}$`) {
+      postStopVolumeLists++
+      if (options.fallbackObservationFailure && cleanupFaultReached && postStopVolumeLists === 2) {
+        fallbackFaultReached = true
+        throw new Error('synthetic-fallback-secret-marker')
+      }
+    }
   } })
-  fakeLifecycleOwner(options)
+  owner = fakeLifecycleOwner(options)
+  const realCapture = managedCodexCleanupDependencies.captureVolumes
+  const realRemove = managedCodexCleanupDependencies.removeVolumes
+  const capture = vi.spyOn(managedCodexCleanupDependencies, 'captureVolumes').mockImplementation((...args) => {
+    if (options.unreservedCleanupFailure === 'capture') {
+      cleanupFaultReached = true
+      throw new Error('synthetic-capture-secret-marker')
+    }
+    return realCapture(...args)
+  })
+  const remove = vi.spyOn(managedCodexCleanupDependencies, 'removeVolumes').mockImplementation((...args) => {
+    if (options.unreservedCleanupFailure === 'remove') {
+      cleanupFaultReached = true
+      throw new Error('synthetic-remove-secret-marker')
+    }
+    return realRemove(...args)
+  })
   const output: EventRow[] = []
   const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
     output.push(JSON.parse(String(chunk)) as EventRow); callback?.(); return true
@@ -743,6 +862,18 @@ async function runExecutableFailure(options: {
     expect(output.some(row => row.event === 'real_volume.failed')).toBe(true)
     expect(process.exitCode).toBe(1)
     if (options.unreservedObservation) expect(observationFaultReached).toBe(true)
+    if (options.unreservedCleanupFailure) {
+      expect(cleanupFaultReached).toBe(true)
+      expect(owner.stop).toHaveBeenCalledOnce()
+      expect(capture).toHaveBeenCalledOnce()
+      expect(remove).toHaveBeenCalledTimes(options.unreservedCleanupFailure === 'remove' ? 1 : 0)
+      const volume = daemon.createdNames[2]
+      expect(daemon.volumes.has(volume)).toBe(true)
+      expect(output.find(row => row.event === 'real_volume.recovery_required')).toMatchObject({
+        volumes: [volume], ownerStopped: true,
+      })
+      if (options.fallbackObservationFailure) expect(fallbackFaultReached).toBe(true)
+    }
     return output
   } finally {
     process.argv[1] = previousArg
@@ -762,6 +893,34 @@ it('reports setup and teardown failures at the executable boundary without raw c
   ]))
   expect.soft(JSON.stringify(rows)).not.toContain(setup.message)
   expect.soft(JSON.stringify(rows)).not.toContain(teardown)
+})
+
+it.each([
+  ['capture', false], ['capture', true], ['remove', false], ['remove', true],
+] as const)('executable distinguishes unreserved cleanup %s failure (fallback failure: %s)', async (stage, fallbackFailure) => {
+  const rows = await runExecutableFailure({ unreservedCleanupFailure: stage, fallbackObservationFailure: fallbackFailure })
+  const original = rows.find(row => row.event === 'real_volume.unreserved_cleanup_failed')
+  expect.soft(original).toMatchObject({ failures: [{ phase: `volume_${stage}`, kind: 'exception' }] })
+  const recovery = rows.find(row => row.event === 'real_volume.recovery_required')
+  if (fallbackFailure) {
+    expect.soft(recovery).toMatchObject({ failures: [{ phase: 'volume_observation', kind: 'exception' }] })
+  } else {
+    expect.soft(recovery).toMatchObject({ failures: [{ phase: 'volume_retention', kind: 'unconfirmed' }] })
+  }
+  const metadata = JSON.stringify(rows)
+  expect.soft(metadata).not.toContain('synthetic-capture-secret-marker')
+  expect.soft(metadata).not.toContain('synthetic-remove-secret-marker')
+  expect(metadata).not.toContain('synthetic-fallback-secret-marker')
+})
+
+it('executable distinguishes unreserved cleanup owner stop failure without exposing its cause', async () => {
+  const rows = await runExecutableFailure({ stopError: 'synthetic-owner-secret-marker' })
+  const original = rows.find(row => row.event === 'real_volume.unreserved_cleanup_failed')
+  expect.soft(original).toMatchObject({ failures: [{ phase: 'owner_stop', kind: 'reported_failure' }] })
+  const recovery = rows.find(row => row.event === 'real_volume.recovery_required')
+  expect.soft(recovery).toMatchObject({ ownerStopped: false,
+    failures: [{ phase: 'owner_stop', kind: 'reported_failure' }] })
+  expect(JSON.stringify(rows)).not.toContain('synthetic-owner-secret-marker')
 })
 
 it('distinguishes a pre-existing fixture assertion at the executable boundary', async () => {

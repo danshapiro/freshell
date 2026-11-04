@@ -436,22 +436,52 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
     let beforeStop = false
     let afterStop = false
     let stopCalls = 0
+    const unreservedCleanupFailures: CleanupFailure[] = []
     const rig = {
       runtime: state.rig.runtime,
       stop: async () => {
         stopCalls++
         beforeStop = volumeExists(unreserved.owner.providerVolumeName)
-        const result = await state.rig.stop()
+        let result: Awaited<ReturnType<typeof state.rig.stop>>
+        try { result = await state.rig.stop() }
+        catch (error) {
+          unreservedCleanupFailures.push({ phase: 'owner_stop', kind: 'exception' })
+          throw error
+        }
         state.stopped = result.ok
+        if (!result.ok) unreservedCleanupFailures.push({ phase: 'owner_stop', kind: 'reported_failure' })
         afterStop = volumeExists(unreserved.owner.providerVolumeName)
         return result
+      },
+    }
+    const cleanupDependencies = {
+      ...managedCodexCleanupDependencies,
+      captureVolumes: (...args: Parameters<typeof managedCodexCleanupDependencies.captureVolumes>) => {
+        try { return managedCodexCleanupDependencies.captureVolumes(...args) }
+        catch (error) {
+          unreservedCleanupFailures.push({ phase: 'volume_capture', kind: 'exception' })
+          throw error
+        }
+      },
+      removeVolumes: (...args: Parameters<typeof managedCodexCleanupDependencies.removeVolumes>) => {
+        try { return managedCodexCleanupDependencies.removeVolumes(...args) }
+        catch (error) {
+          unreservedCleanupFailures.push({ phase: 'volume_remove', kind: 'exception' })
+          throw error
+        }
       },
     }
     assert.equal(state.rig.runtime.broker.initialProviderVolumeCreations().length, 0)
     assert.equal(state.rig.runtime.broker.receipts().length, 0)
     caseProgress(state, 'unreserved_cleanup')
-    await cleanupManagedCodexParity({ rig, owners: [unreserved.owner], wire: undefined, model: undefined,
-      finalObservation: undefined, naming: undefined, restoreGrants: undefined, grantsDirectory: undefined, home: undefined })
+    try {
+      await cleanupManagedCodexParity({ rig, owners: [unreserved.owner], wire: undefined, model: undefined,
+        finalObservation: undefined, naming: undefined, restoreGrants: undefined, grantsDirectory: undefined, home: undefined }, cleanupDependencies)
+    } catch (error) {
+      event('real_volume.unreserved_cleanup_failed', { failures: unreservedCleanupFailures.length
+        ? unreservedCleanupFailures : [{ phase: 'cleanup', kind: 'exception' }] })
+      throw error
+    }
     caseProgress(state, 'unreserved_stop_calls', Math.min(stopCalls, 2))
     assert.equal(stopCalls, 1)
     caseProgress(state, 'unreserved_before_stop', beforeStop)
