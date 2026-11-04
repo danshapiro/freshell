@@ -123,6 +123,47 @@ function sameFence(left: OwnerFence | null | undefined, right: OwnerFence | null
     && left.epoch === right.epoch && left.generation === right.generation
 }
 
+function restoreUnavailableRetryWitness(
+  round: MutableRound,
+  currentOwnerFence: OwnerFence | null,
+): FreshAgentAttachObservation | null {
+  if (round.kind !== 'reconcile'
+    || round.duplicateAttachments.length > 0
+    || round.restoreUnavailableRetriesGranted > 0
+    || currentOwnerFence === null) return null
+
+  const currentOwnerAttaches = round.attachments.filter((attachment) =>
+    !attachment.retryAfterSessionReserved
+    && !attachment.retryAfterRestoreUnavailable
+    && sameFence(ownerFence({
+      epoch: attachment.observedEpoch,
+      generation: attachment.observedGeneration,
+    }), currentOwnerFence))
+  if (currentOwnerAttaches.length !== 1) return null
+  const witness = currentOwnerAttaches[0]
+  const otherAttaches = round.attachments.filter((attachment) => attachment !== witness)
+  if (otherAttaches.length === 0) {
+    if (round.targetVerdict === 'respawn'
+      && !round.respawnCommittedOwnerFrames?.some((owner) =>
+        owner.frameIndex < witness.frameIndex && sameFence(owner.fence, currentOwnerFence))) return null
+    return witness
+  }
+
+  if (round.targetVerdict !== 'respawn'
+    || otherAttaches.length !== 1
+    || round.respawnCreatedFrameIndex === undefined
+    || round.respawnCreatedFrameIndex <= round.authorizationFrameIndex) return null
+  const [bootstrap] = otherAttaches
+  const committedOwnerMatches = round.respawnCommittedOwnerFrames?.some((owner) =>
+    owner.frameIndex < witness.frameIndex && sameFence(owner.fence, currentOwnerFence)) ?? false
+  if (bootstrap.frameIndex !== round.respawnNullBootstrapFrameIndex
+    || bootstrap.observedEpoch !== null
+    || bootstrap.observedGeneration !== null
+    || bootstrap.frameIndex >= witness.frameIndex
+    || !committedOwnerMatches) return null
+  return witness
+}
+
 function isPositiveVerdict(verdict: unknown): verdict is 'attach' | 'respawn' | 'fresh' {
   return verdict === 'attach' || verdict === 'respawn' || verdict === 'fresh'
 }
@@ -449,27 +490,21 @@ export function analyzeFreshAgentAttachRounds(
     if (frame.direction === 'http-request' && frame.type === 'freshAgent.snapshot.request') {
       const requestId = nonEmptyString(frame.requestId)
       if (!requestId) continue
-      const firstAttach = currentRound.attachments.length === 1 ? currentRound.attachments[0] : null
-      const firstFence = firstAttach ? ownerFence({
-        epoch: firstAttach.observedEpoch,
-        generation: firstAttach.observedGeneration,
+      const witness = restoreUnavailableRetryWitness(currentRound, currentFreshAgentOwnerFence)
+      const witnessFence = witness ? ownerFence({
+        epoch: witness.observedEpoch,
+        generation: witness.observedGeneration,
       }) : null
       const eligibleRequest = snapshotMatchesTarget(frame, target)
-        && currentRound.kind === 'reconcile'
-        && currentRound.duplicateAttachments.length === 0
-        && currentRound.restoreUnavailableRetriesGranted === 0
-        && firstAttach !== null
-        && !firstAttach.retryAfterSessionReserved
-        && !firstAttach.retryAfterRestoreUnavailable
-        && firstFence !== null
-        && sameFence(firstFence, currentFreshAgentOwnerFence)
-        && firstAttach.frameIndex < frameIndex
-      pendingSnapshotRequests.set(requestId, eligibleRequest && firstAttach && firstFence
+        && witness !== null
+        && witnessFence !== null
+        && witness.frameIndex < frameIndex
+      pendingSnapshotRequests.set(requestId, eligibleRequest && witness && witnessFence
         ? {
           roundId: currentRound.id,
           requestFrameIndex: frameIndex,
-          attachmentFrameIndex: firstAttach.frameIndex,
-          fence: firstFence,
+          attachmentFrameIndex: witness.frameIndex,
+          fence: witnessFence,
         }
         : null)
       continue
@@ -480,7 +515,7 @@ export function analyzeFreshAgentAttachRounds(
       if (!requestId) continue
       const request = pendingSnapshotRequests.get(requestId)
       pendingSnapshotRequests.delete(requestId)
-      const firstAttach = currentRound.attachments.length === 1 ? currentRound.attachments[0] : null
+      const witness = restoreUnavailableRetryWitness(currentRound, currentFreshAgentOwnerFence)
       const responseOwnerGeneration = typeof frame.ownerGeneration === 'number'
         ? frame.ownerGeneration
         : isRow(frame.body) && typeof frame.body.ownerGeneration === 'number'
@@ -489,13 +524,11 @@ export function analyzeFreshAgentAttachRounds(
       const responseOwnerKind = frame.ownerKind ?? (isRow(frame.body) ? frame.body.ownerKind : undefined)
       const responseCode = frame.code ?? (isRow(frame.body) ? frame.body.code : undefined)
       if (request
+        && witness
         && currentRound.kind === 'reconcile'
         && currentRound.id === request.roundId
-        && currentRound.duplicateAttachments.length === 0
-        && currentRound.restoreUnavailableRetriesGranted === 0
-        && currentRound.attachments.length === 1
-        && firstAttach?.frameIndex === request.attachmentFrameIndex
-        && firstAttach.frameIndex < request.requestFrameIndex
+        && witness.frameIndex === request.attachmentFrameIndex
+        && witness.frameIndex < request.requestFrameIndex
         && request.requestFrameIndex < frameIndex
         && snapshotMatchesTarget(frame, target)
         && frame.status === 409
@@ -504,8 +537,8 @@ export function analyzeFreshAgentAttachRounds(
         && responseOwnerGeneration === request.fence.generation
         && sameFence(currentFreshAgentOwnerFence, request.fence)
         && sameFence(ownerFence({
-          epoch: firstAttach.observedEpoch,
-          generation: firstAttach.observedGeneration,
+          epoch: witness.observedEpoch,
+          generation: witness.observedGeneration,
         }), request.fence)) {
         currentRound.restoreUnavailableRetriesGranted += 1
         currentRound.restoreUnavailableRetryFences.push(request.fence)
