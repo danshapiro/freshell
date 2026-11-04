@@ -1413,6 +1413,9 @@ async fn create_provider_start_failure_keeps_only_the_safe_category_on_the_wire(
         aliases: Mutex::new(HashMap::new()),
         presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::from(["freshclaude".to_string()]),
         naming: OnceLock::new(),
     });
@@ -1654,6 +1657,9 @@ async fn hosted_created_frame_uses_the_public_request_identity() {
         aliases: Mutex::new(HashMap::new()),
         presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
         checkpoint_barrier: OnceLock::new(),
@@ -1742,6 +1748,9 @@ async fn managed_ordinary_stop_eof_broadcasts_one_failed_ack_to_both_receivers()
             PresentationRoute::initial("presentation-stop-session"),
         )])),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
     });
@@ -1798,6 +1807,9 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
         aliases: Mutex::new(HashMap::from([(("codex".into(), "thread-1".into()), soul)])),
         presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
         checkpoint_barrier: OnceLock::new(),
@@ -1844,6 +1856,9 @@ fn configure_proxy(
         aliases: Mutex::new(aliases),
         presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
         checkpoint_barrier: OnceLock::new(),
@@ -2304,6 +2319,9 @@ async fn materialization_keeps_following_transcript_invalidations_on_the_native_
             PresentationRoute::initial("managed-public"),
         )])),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
     };
@@ -2399,6 +2417,9 @@ async fn replayed_materialization_does_not_rekey_a_forked_pane_to_its_retired_pa
             PresentationRoute::materialized("ses_child"),
         )])),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
     };
@@ -3015,6 +3036,9 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
             PresentationRoute::initial("public-parent"),
         )])),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: std::sync::OnceLock::new(),
         checkpoint_barrier: std::sync::OnceLock::new(),
@@ -3353,6 +3377,9 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
             )])),
             presentation_routes: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
+            attach_replay_states: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            attach_head_pause: OnceLock::new(),
             fixture_modes: HashSet::new(),
             naming: OnceLock::new(),
             checkpoint_barrier: OnceLock::new(),
@@ -3391,6 +3418,9 @@ fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
         aliases: Mutex::new(HashMap::new()),
         presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
+        attach_replay_states: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        attach_head_pause: OnceLock::new(),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
         checkpoint_barrier: OnceLock::new(),

@@ -15,6 +15,7 @@ import type {
   FreshAgentSessionStatus,
   FreshAgentState,
   PendingCreateFailure,
+  RuntimeOwnerRecord,
 } from './freshAgentTypes'
 
 type FreshAgentSessionPayload = {
@@ -85,6 +86,29 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
 function writeSessionStatus(session: FreshAgentSessionState, status: FreshAgentSessionStatus): void {
   session.status = status
   session.statusVersion = (session.statusVersion ?? 0) + 1
+}
+
+function runtimeOwnerRecord(
+  frame: SessionRuntimeOwnerMessage,
+  existing: RuntimeOwnerRecord | undefined,
+  preserveEqualFence: boolean,
+): RuntimeOwnerRecord {
+  const sameFence = existing?.epoch === frame.epoch && existing.generation === frame.generation
+  return {
+    ...(preserveEqualFence && sameFence ? existing : undefined),
+    provider: frame.provider,
+    sessionId: frame.sessionId,
+    epoch: frame.epoch,
+    generation: frame.generation,
+    ownerKind: frame.ownerKind,
+    ...(frame.previousKind !== undefined ? { previousKind: frame.previousKind } : {}),
+    ...(frame.terminalId !== undefined ? { terminalId: frame.terminalId } : {}),
+    transition: preserveEqualFence && sameFence ? existing.transition : frame.transition,
+    ...(frame.reason !== undefined ? { reason: frame.reason } : {}),
+    ...(frame.fenced !== undefined ? { fenced: frame.fenced } : {}),
+    ...(frame.aliasOf !== undefined ? { aliasOf: frame.aliasOf } : {}),
+    updatedAt: Date.now(),
+  }
 }
 
 /** Statuses of a session that is ready and not in a turn. */
@@ -655,20 +679,21 @@ const freshAgentSlice = createSlice({
       const key = `${f.provider}:${f.sessionId}`
       const existing = state.runtimeOwners[key]
       if (existing && existing.epoch === f.epoch && f.generation < existing.generation) return
-      state.runtimeOwners[key] = {
-        provider: f.provider,
-        sessionId: f.sessionId,
-        epoch: f.epoch,
-        generation: f.generation,
-        ownerKind: f.ownerKind,
-        ...(f.previousKind !== undefined ? { previousKind: f.previousKind } : {}),
-        ...(f.terminalId !== undefined ? { terminalId: f.terminalId } : {}),
-        transition: f.transition,
-        ...(f.reason !== undefined ? { reason: f.reason } : {}),
-        ...(f.fenced !== undefined ? { fenced: f.fenced } : {}),
-        ...(f.aliasOf !== undefined ? { aliasOf: f.aliasOf } : {}),
-        updatedAt: Date.now(),
-      }
+      state.runtimeOwners[key] = runtimeOwnerRecord(f, existing, false)
+    },
+
+    /**
+     * Fold owner facts attached to a requester-scoped attach result. These
+     * facts refresh authority, but are not a new owner transition. At an
+     * equal fence keep the complete record learned from the canonical owner
+     * broadcast; attach results may omit identity fields such as terminalId.
+     */
+    refreshRuntimeOwnerFacts(state, action: PayloadAction<SessionRuntimeOwnerMessage>) {
+      const f = action.payload
+      const key = `${f.provider}:${f.sessionId}`
+      const existing = state.runtimeOwners[key]
+      if (existing && existing.epoch === f.epoch && f.generation < existing.generation) return
+      state.runtimeOwners[key] = runtimeOwnerRecord(f, existing, true)
     },
 
     /**
@@ -742,6 +767,7 @@ export const {
   addElicitationRequest,
   removeElicitation,
   applyRuntimeOwner,
+  refreshRuntimeOwnerFacts,
   applyRuntimeOwnerFenceRefresh,
   applyRefusalFence,
   clearPendingCreate,

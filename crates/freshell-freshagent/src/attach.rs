@@ -147,6 +147,21 @@ impl AttachOutcome {
         }
     }
 
+    /// Identity named by this outcome after provider materialization or
+    /// recovery, resolved from its snapshot and requester-only side frames.
+    pub fn resolved_session_id(&self, attach: &FreshAgentAttach) -> String {
+        match self {
+            AttachOutcome::Attached {
+                snapshot,
+                legacy_messages,
+                ..
+            } => resolved_session_id(attach, snapshot.as_ref(), legacy_messages),
+            AttachOutcome::Failed {
+                legacy_messages, ..
+            } => resolved_session_id(attach, None, legacy_messages),
+        }
+    }
+
     pub fn with_current_owner(self, snapshot: freshell_ownership::OwnershipSnapshot) -> Self {
         let owner = match snapshot.state {
             freshell_ownership::OwnershipState::Live {

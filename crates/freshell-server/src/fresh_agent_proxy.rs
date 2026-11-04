@@ -54,11 +54,56 @@ pub(crate) struct HostedFreshAgentProxy {
     aliases: Mutex<HashMap<(String, String), SoulId>>,
     presentation_routes: Mutex<HashMap<SoulId, PresentationRoute>>,
     pollers: Mutex<HashSet<SoulId>>,
+    attach_replay_states: Mutex<HashMap<SoulId, Arc<AttachReplayState>>>,
     fixture_modes: HashSet<String>,
     naming: OnceLock<Arc<dyn SessionNaming>>,
     checkpoint_barrier:
         OnceLock<Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>>,
     ownership: OnceLock<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    #[cfg(test)]
+    attach_head_pause: OnceLock<Arc<AttachHeadPause>>,
+}
+
+#[cfg(test)]
+pub(crate) struct AttachHeadPause {
+    request_id: String,
+    head_claimed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    reply_claimed: std::sync::atomic::AtomicBool,
+    reply_entered: tokio::sync::Notify,
+    reply_release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AttachHeadPause {
+    pub(crate) fn new(request_id: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            head_claimed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            reply_claimed: std::sync::atomic::AtomicBool::new(false),
+            reply_entered: tokio::sync::Notify::new(),
+            reply_release: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn resume(&self) {
+        self.release.notify_one();
+    }
+
+    pub(crate) async fn wait_until_reply_entered(&self) {
+        self.reply_entered.notified().await;
+    }
+
+    pub(crate) fn resume_reply(&self) {
+        self.reply_release.notify_one();
+    }
 }
 
 struct RollbackInvocation {
@@ -76,6 +121,41 @@ struct RollbackInvocation {
 struct PresentationRoute {
     session_id: String,
     materialized: bool,
+}
+
+struct AttachReplayState {
+    delivery: Mutex<()>,
+    cursor: std::sync::atomic::AtomicU64,
+    pending_attaches: std::sync::atomic::AtomicUsize,
+}
+
+impl AttachReplayState {
+    fn new(initial_cursor: u64) -> Self {
+        Self {
+            delivery: Mutex::new(()),
+            cursor: std::sync::atomic::AtomicU64::new(initial_cursor),
+            pending_attaches: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+struct PendingAttachReplay(Arc<AttachReplayState>);
+
+impl PendingAttachReplay {
+    fn new(state: Arc<AttachReplayState>) -> Self {
+        state
+            .pending_attaches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(state)
+    }
+}
+
+impl Drop for PendingAttachReplay {
+    fn drop(&mut self) {
+        self.0
+            .pending_attaches
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug)]
@@ -128,10 +208,13 @@ impl HostedFreshAgentProxy {
             aliases: Mutex::new(HashMap::new()),
             presentation_routes: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
+            attach_replay_states: Mutex::new(HashMap::new()),
             fixture_modes,
             naming: OnceLock::new(),
             checkpoint_barrier: OnceLock::new(),
             ownership: OnceLock::new(),
+            #[cfg(test)]
+            attach_head_pause: OnceLock::new(),
         })))
     }
 
@@ -147,6 +230,51 @@ impl HostedFreshAgentProxy {
         ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     ) {
         let _ = self.ownership.set(ownership);
+    }
+
+    async fn attach_replay_state(&self, soul: &SoulId) -> Arc<AttachReplayState> {
+        Arc::clone(
+            self.attach_replay_states
+                .lock()
+                .await
+                .entry(soul.clone())
+                .or_insert_with(|| Arc::new(AttachReplayState::new(0))),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_attach_head_pause_for_test(&self, pause: Arc<AttachHeadPause>) {
+        let _ = self.attach_head_pause.set(pause);
+    }
+
+    #[cfg(test)]
+    async fn pause_attach_after_head_for_test(&self, request_id: Option<&str>) {
+        let Some(pause) = self.attach_head_pause.get() else {
+            return;
+        };
+        if request_id == Some(pause.request_id.as_str())
+            && !pause
+                .head_claimed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_attach_before_reply_for_test(&self, request_id: Option<&str>) {
+        let Some(pause) = self.attach_head_pause.get() else {
+            return;
+        };
+        if request_id == Some(pause.request_id.as_str())
+            && !pause
+                .reply_claimed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            pause.reply_entered.notify_one();
+            pause.reply_release.notified().await;
+        }
     }
 
     fn post_barrier_admission(&self, message: &FreshAgentSend) -> Result<(), &'static str> {
@@ -229,100 +357,11 @@ impl HostedFreshAgentProxy {
     async fn attach(self: &Arc<Self>, message: FreshAgentAttach, requester: FrameSink) {
         let provider = provider_wire(&message.provider);
         let session_type = session_type_wire(message.session_type);
-        let outcome = if let Some(soul) = self
+        let Some(soul) = self
             .resolve_soul(&message.provider, message.session_type, &message.session_id)
             .await
-        {
-            match self.current_event_head(&soul).await {
-                Ok(head) => {
-                    let attention_since = chrono::Utc::now().timestamp_millis();
-                    self.start_poller_from_cursor(
-                        soul.clone(),
-                        provider.clone(),
-                        message.session_id.clone(),
-                        session_type.clone(),
-                        attention_since,
-                        head,
-                    )
-                    .await;
-
-                    let replay_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
-                    let replay_target = Arc::clone(&replay_messages);
-                    let replay_sink: FrameSink = Arc::new(move |frame| {
-                        replay_target
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(frame);
-                    });
-                    let replay_outcome = self
-                        .replay_once(
-                            soul,
-                            &provider,
-                            &message.session_id,
-                            &session_type,
-                            Some(&replay_sink),
-                            Some(head),
-                        )
-                        .await;
-                    let replay_messages = std::mem::take(
-                        &mut *replay_messages
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
-                    match replay_outcome {
-                        ReplayOutcome::Complete => AttachOutcome::attached_from_replay_for_session(
-                            Some(&message.session_id),
-                            replay_messages,
-                        ),
-                        ReplayOutcome::Incomplete(reason) => {
-                            tracing::warn!(
-                                event = "fresh_agent.gateway.attach_replay_incomplete",
-                                provider,
-                                session_id = %message.session_id,
-                                reason = %reason,
-                                "managed Freshagent attach replay did not reach its captured head"
-                            );
-                            AttachOutcome::Failed {
-                                failure: AttachFailure {
-                                    code: "MANAGED_FRESH_AGENT_REPLAY_INCOMPLETE".into(),
-                                    message: format!(
-                                        "managed fresh-agent replay is incomplete: {reason}"
-                                    ),
-                                    retryable: Some(true),
-                                    owner_kind: None,
-                                    owner_generation: None,
-                                    owner_epoch: None,
-                                },
-                                // Partial replay is held until every page and retained source
-                                // has been validated. It cannot reset the view before failure.
-                                legacy_messages: Vec::new(),
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        event = "fresh_agent.gateway.attach_replay_unavailable",
-                        provider,
-                        session_id = %message.session_id,
-                        error = %error,
-                        "managed Freshagent attach could not read the replay head"
-                    );
-                    AttachOutcome::Failed {
-                        failure: AttachFailure {
-                            code: "MANAGED_FRESH_AGENT_ERROR".into(),
-                            message: "managed fresh-agent replay is temporarily unavailable".into(),
-                            retryable: Some(true),
-                            owner_kind: None,
-                            owner_generation: None,
-                            owner_epoch: None,
-                        },
-                        legacy_messages: Vec::new(),
-                    }
-                }
-            }
-        } else {
-            AttachOutcome::Failed {
+        else {
+            let outcome = AttachOutcome::Failed {
                 failure: AttachFailure {
                     code: "MANAGED_FRESH_AGENT_ERROR".into(),
                     message: "managed fresh-agent soul was not found".into(),
@@ -332,6 +371,101 @@ impl HostedFreshAgentProxy {
                     owner_epoch: None,
                 },
                 legacy_messages: Vec::new(),
+            };
+            for frame in AttachOutcome::requester_messages(&message, outcome) {
+                requester(frame);
+            }
+            return;
+        };
+
+        let replay_state = self.attach_replay_state(&soul).await;
+        let _pending = PendingAttachReplay::new(Arc::clone(&replay_state));
+        // One per-soul delivery window makes the journal head, requester replay,
+        // acknowledgement, and shared poller cursor advance one ordered step.
+        // The poller uses this same lock, so a post-head event cannot overtake
+        // the attach frames on the requesting connection.
+        let _delivery = replay_state.delivery.lock().await;
+        let mut poller_start = None;
+        let outcome = match self.current_event_head(&soul).await {
+            Ok(head) => {
+                #[cfg(test)]
+                self.pause_attach_after_head_for_test(message.request_id.as_deref())
+                    .await;
+
+                let replay_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let replay_target = Arc::clone(&replay_messages);
+                let replay_sink: FrameSink = Arc::new(move |frame| {
+                    replay_target
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(frame);
+                });
+                let replay_outcome = self
+                    .replay_once(
+                        soul.clone(),
+                        &provider,
+                        &message.session_id,
+                        &session_type,
+                        Some(&replay_sink),
+                        Some(head),
+                    )
+                    .await;
+                let replay_messages = std::mem::take(
+                    &mut *replay_messages
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                poller_start = Some(head);
+                match replay_outcome {
+                    ReplayOutcome::Complete => AttachOutcome::attached_from_replay_for_session(
+                        Some(&message.session_id),
+                        replay_messages,
+                    ),
+                    ReplayOutcome::Incomplete(reason) => {
+                        tracing::warn!(
+                            event = "fresh_agent.gateway.attach_replay_incomplete",
+                            provider,
+                            session_id = %message.session_id,
+                            reason = %reason,
+                            "managed Freshagent attach replay did not reach its captured head"
+                        );
+                        AttachOutcome::Failed {
+                            failure: AttachFailure {
+                                code: "MANAGED_FRESH_AGENT_REPLAY_INCOMPLETE".into(),
+                                message: format!(
+                                    "managed fresh-agent replay is incomplete: {reason}"
+                                ),
+                                retryable: Some(true),
+                                owner_kind: None,
+                                owner_generation: None,
+                                owner_epoch: None,
+                            },
+                            // Partial replay is held until every page and retained source
+                            // has been validated. It cannot reset the view before failure.
+                            legacy_messages: Vec::new(),
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "fresh_agent.gateway.attach_replay_unavailable",
+                    provider,
+                    session_id = %message.session_id,
+                    error = %error,
+                    "managed Freshagent attach could not read the replay head"
+                );
+                AttachOutcome::Failed {
+                    failure: AttachFailure {
+                        code: "MANAGED_FRESH_AGENT_ERROR".into(),
+                        message: "managed fresh-agent replay is temporarily unavailable".into(),
+                        retryable: Some(true),
+                        owner_kind: None,
+                        owner_generation: None,
+                        owner_epoch: None,
+                    },
+                    legacy_messages: Vec::new(),
+                }
             }
         };
         let outcome = if let Some(ownership) = self.ownership.get() {
@@ -341,8 +475,23 @@ impl HostedFreshAgentProxy {
             outcome
         };
 
+        #[cfg(test)]
+        self.pause_attach_before_reply_for_test(message.request_id.as_deref())
+            .await;
+
         for frame in AttachOutcome::requester_messages(&message, outcome) {
             requester(frame);
+        }
+        if let Some(head) = poller_start {
+            self.start_poller_from_cursor(
+                soul,
+                provider,
+                message.session_id,
+                session_type,
+                chrono::Utc::now().timestamp_millis(),
+                head,
+            )
+            .await;
         }
     }
 
@@ -1408,13 +1557,18 @@ impl HostedFreshAgentProxy {
             .await
             .entry(soul.clone())
             .or_insert_with(|| PresentationRoute::initial(presentation_session_id.clone()));
+        let replay_state = self.attach_replay_state(&soul).await;
         if !self.pollers.lock().await.insert(soul.clone()) {
             return false;
         }
+        replay_state
+            .cursor
+            .store(initial_cursor, std::sync::atomic::Ordering::SeqCst);
         let proxy = Arc::clone(self);
         tokio::spawn(async move {
-            // The shared poller starts at the journal head captured by the
-            // caller. Earlier state is replayed to an attaching view only.
+            // The shared poller starts at the latest replayed journal head.
+            // Per-soul delivery serialization makes requester replay and live
+            // broadcasts one ordered stream even when devices attach together.
             let mut cursor = initial_cursor;
             let mut retained_through = initial_cursor;
             let mut source_before = if provider == "codex" {
@@ -1423,6 +1577,22 @@ impl HostedFreshAgentProxy {
                 None
             };
             loop {
+                let _delivery = replay_state.delivery.lock().await;
+                if replay_state
+                    .pending_attaches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    drop(_delivery);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                cursor = cursor.max(
+                    replay_state
+                        .cursor
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                );
+                retained_through = retained_through.max(cursor);
                 match proxy
                     .client
                     .fresh_agent_events(soul.clone(), cursor, 128)
@@ -1441,6 +1611,10 @@ impl HostedFreshAgentProxy {
                                 tracing::warn!(provider, soul_id=%soul, "freshagent.gateway.retained_source_changed");
                                 cursor = 0;
                                 retained_through = 0;
+                                replay_state
+                                    .cursor
+                                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                                drop(_delivery);
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
@@ -1518,6 +1692,7 @@ impl HostedFreshAgentProxy {
                         }
                     }
                     Err(_) => {
+                        drop(_delivery);
                         let still_running =
                             proxy.client.inventory().await.ok().is_some_and(|views| {
                                 views.into_iter().any(|view| {
@@ -1529,8 +1704,13 @@ impl HostedFreshAgentProxy {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
                     }
                 }
+                replay_state
+                    .cursor
+                    .store(cursor, std::sync::atomic::Ordering::SeqCst);
+                drop(_delivery);
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             proxy.pollers.lock().await.remove(&soul);

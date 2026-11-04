@@ -78,6 +78,8 @@
 //   FRESHELL_CLAUDE_SIM_HOLD_PROMPT_GATE_PATH  when set, a streamed text turn
 //                                       pauses after its first chunk until this
 //                                       file exists (opt-in browser fixture seam)
+//   FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH  opt-in test seam: fail resumed sessions with a
+//                                        transient provider error after this path exists
 //   FRESHELL_CLAUDE_SIM_RECORD_NATIVE_STOP  '1' records an interrupted live
 //                                       simulator as a `native_stop` ledger row
 
@@ -292,6 +294,11 @@ class SimulatedCli {
     this.ledger('query', { options: describeOptions(options) })
 
     this.sessionId = options.forkSession ? (options.sessionId ?? randomUUID()) : (options.resume ?? options.sessionId ?? randomUUID())
+    const failResumePath = this.env.FRESHELL_CLAUDE_SIM_FAIL_RESUME_PATH
+    if (options.resume && failResumePath && fs.existsSync(failResumePath)) {
+      this.ledger('resume_failure', { sessionId: options.resume })
+      throw new Error('simulated transient provider resume failure')
+    }
     this.spawnCli()
     // The CLI starts its stdio MCP servers with its own environment (mcp.mjs).
     this.mcp = new McpServers(options.mcpServers, { env: this.cliEnv, cwd: this.cwd })

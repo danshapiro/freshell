@@ -630,8 +630,28 @@ async fn an_owed_turn_is_reported_once_after_attach_across_a_server_restart() {
         "shutdown persisted the owed turn marker before tearing down the sidecar"
     );
 
-    let mut after = rig.connect().await;
-    after.attach(&session_id).await;
+    let mut after = rig
+        .connect_with_capabilities(json!({ "freshAgentReconciliationV1": true }))
+        .await;
+    let attach_start = after.frames.len();
+    after
+        .send(json!({
+            "type": "freshAgent.attach",
+            "provider": "claude",
+            "sessionType": "freshclaude",
+            "sessionId": session_id,
+            "sessionRef": { "provider": "claude", "sessionId": session_id },
+            "requestId": "attach-after-restart-correlated",
+            "viewId": "restart-recovery-view",
+        }))
+        .await;
+    after
+        .wait_for_since(attach_start, "the correlated attach result", |frame| {
+            frame["type"] == "freshAgent.attached"
+                && frame["requestId"] == "attach-after-restart-correlated"
+                && frame["viewId"] == "restart-recovery-view"
+        })
+        .await;
     let notice = after
         .wait_for("restart interruption notice", |frame| {
             frame["type"] == "freshAgent.event"
@@ -645,9 +665,8 @@ async fn an_owed_turn_is_reported_once_after_attach_across_a_server_restart() {
         .frames
         .iter()
         .position(|frame| {
-            frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == "freshAgent.session.snapshot"
-                && frame["event"]["sessionId"] == session_id
+            frame["type"] == "freshAgent.attached"
+                && frame["requestId"] == "attach-after-restart-correlated"
         })
         .expect("the attach was acknowledged");
     let notice_at = after

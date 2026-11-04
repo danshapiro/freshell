@@ -117,6 +117,7 @@ pub struct ClaudeRig {
     /// (for example `has_live_session`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
     pub fresh_codex: freshell_freshagent::FreshCodexState,
+    pub fresh_opencode: freshell_freshagent::FreshOpencodeState,
     /// The same coordinator the WS dispatcher and Claude lane use.
     pub ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
@@ -242,6 +243,7 @@ impl ClaudeRig {
             http_url,
             fresh_claude,
             fresh_codex,
+            fresh_opencode,
             ownership,
             server,
         } = spawn_rig_server(environment.clone(), &options, pane_ledger.clone()).await;
@@ -262,6 +264,7 @@ impl ClaudeRig {
             ledger,
             fresh_claude,
             fresh_codex,
+            fresh_opencode,
             ownership,
             _provider: provider,
             environment,
@@ -278,6 +281,8 @@ impl ClaudeRig {
     /// are gone; connect again.
     pub async fn restart(&mut self) {
         self.fresh_claude.shutdown().await;
+        self.fresh_codex.shutdown().await;
+        self.fresh_opencode.shutdown().await;
         self.server.abort();
         let pane_ledger = self.pane_ledger.as_ref().map(|_| {
             Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
@@ -289,6 +294,7 @@ impl ClaudeRig {
             http_url,
             fresh_claude,
             fresh_codex,
+            fresh_opencode,
             ownership,
             server,
         } = spawn_rig_server(self.environment.clone(), &self.options, pane_ledger.clone()).await;
@@ -300,6 +306,7 @@ impl ClaudeRig {
         self.http_url = http_url;
         self.fresh_claude = fresh_claude;
         self.fresh_codex = fresh_codex;
+        self.fresh_opencode = fresh_opencode;
         self.ownership = ownership;
         self.pane_ledger = pane_ledger;
         self.server = server;
@@ -696,6 +703,10 @@ pub struct RigConnection {
 }
 
 impl RigConnection {
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     pub async fn send(&mut self, frame: Value) {
         self.ws
             .send(WsMessage::Text(frame.to_string()))
@@ -1029,6 +1040,7 @@ struct RigServer {
     http_url: String,
     fresh_claude: freshell_freshagent::FreshClaudeState,
     fresh_codex: freshell_freshagent::FreshCodexState,
+    fresh_opencode: freshell_freshagent::FreshOpencodeState,
     ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -1103,6 +1115,16 @@ async fn spawn_rig_server(
     let registry = freshell_terminal::TerminalRegistry::new();
     let cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>> = Arc::new(Vec::new());
 
+    let mut fresh_codex = freshell_freshagent::FreshCodexState::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+        json!({ "freshAgent": { "enabled": true } }),
+    );
+    fresh_codex.set_ownership(Arc::clone(&ownership));
+    let mut fresh_opencode =
+        freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
+    fresh_opencode.set_ownership(Arc::clone(&ownership));
+
     let state = WsState {
         layout,
         terminal_meta: Default::default(),
@@ -1118,13 +1140,9 @@ async fn spawn_rig_server(
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
-        fresh_codex: freshell_freshagent::FreshCodexState::new(
-            Arc::clone(&auth_token),
-            Arc::clone(&broadcast_tx),
-            json!({ "freshAgent": { "enabled": true } }),
-        ),
+        fresh_codex,
         fresh_claude,
-        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone()),
+        fresh_opencode,
         registry: registry.clone(),
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
@@ -1229,6 +1247,7 @@ async fn spawn_rig_server(
         http_url: format!("http://{addr}"),
         fresh_claude: lane,
         fresh_codex: state.fresh_codex.clone(),
+        fresh_opencode: state.fresh_opencode.clone(),
         ownership,
         server,
     }

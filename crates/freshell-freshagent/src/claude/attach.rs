@@ -3,6 +3,12 @@
 use super::*;
 use freshell_terminal::FrameSink;
 
+struct ClaudeAttachCompletion {
+    attached_id: String,
+    session_type: String,
+    guard: crate::ownership_lane::LaneAttachGuard,
+}
+
 impl FreshClaudeState {
     /// Produce one typed attach result, then adapt it for this requester. The
     /// legacy attach implementation still owns lifecycle recovery and its
@@ -10,48 +16,64 @@ impl FreshClaudeState {
     /// instead of entering the shared event bus.
     pub async fn handle_attach(&self, msg: FreshAgentAttach, reply: FrameSink) {
         let attach = msg.clone();
-        let (mut messages, captured_messages) = crate::attach::capture_attach_messages(async {
-            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let target = Arc::clone(&captured);
-            let capture_sink: FrameSink = Arc::new(move |message| {
-                target
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(message);
-            });
-            self.handle_attach_events(msg, capture_sink).await;
-            let messages = {
-                let mut captured = captured
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                std::mem::take(&mut *captured)
-            };
-            messages
-        })
-        .await;
+        let ((mut messages, completion), captured_messages) =
+            crate::attach::capture_attach_messages(async {
+                let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let target = Arc::clone(&captured);
+                let capture_sink: FrameSink = Arc::new(move |message| {
+                    target
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(message);
+                });
+                let completion = self.handle_attach_events(msg, capture_sink).await;
+                let messages = {
+                    let mut captured = captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::take(&mut *captured)
+                };
+                (messages, completion)
+            })
+            .await;
         messages.extend(captured_messages);
         let outcome = crate::attach::AttachOutcome::from_messages(messages)
             .with_current_owner(self.ownership_snapshot(PROVIDER, &attach.session_id));
         for message in crate::attach::AttachOutcome::requester_messages(&attach, outcome) {
             reply(message);
         }
+        if let Some(completion) = completion {
+            // The live-runtime claim covers the final requester result too. A
+            // handoff cannot commit after the snapshot was captured but before
+            // this correlated acknowledgement reaches its socket.
+            drop(completion.guard);
+            self.notify_turn_interrupted_after_ack(
+                &completion.attached_id,
+                &completion.session_type,
+            )
+            .await;
+        }
     }
 
     /// Reply to this page only. Status, content, and attention keep their
     /// ordinary broadcast path and canonical session identity.
-    async fn handle_attach_events(&self, mut msg: FreshAgentAttach, reply: FrameSink) {
+    async fn handle_attach_events(
+        &self,
+        mut msg: FreshAgentAttach,
+        reply: FrameSink,
+    ) -> Option<ClaudeAttachCompletion> {
         let session_type = session_type_str(msg.session_type);
         let fence =
             match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
                 Ok(fence) => fence,
                 Err(error) => {
                     attach_error(&reply, &msg, &msg.session_id, error.code(), error.message());
-                    return;
+                    return None;
                 }
             };
         let Some(candidate) = attach_durable_id(&msg) else {
             reply(lost_session_frame(&msg.session_id, msg.session_type));
-            return;
+            return None;
         };
         if !is_canonical_claude_uuid(&msg.session_id)
             && self.identity_sink().is_some_and(|sink| {
@@ -66,7 +88,7 @@ impl FreshClaudeState {
                 "SESSION_CLOSED",
                 "This pane was closed. Open the conversation again to continue.",
             );
-            return;
+            return None;
         }
         let durable = self
             .identity_sink()
@@ -87,24 +109,16 @@ impl FreshClaudeState {
         msg.resume_session_id = None;
 
         match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(Some(attached_id)) => {
-                self.notify_turn_interrupted_after_ack(&attached_id, session_type)
-                    .await;
-                return;
-            }
-            Err(()) => return,
+            Ok(Some(completion)) => return Some(completion),
+            Err(()) => return None,
             Ok(None) => {}
         }
         // A competing attach may already be booting this conversation.
         // Wait for it, then inspect the runtime again before launching.
         let _flight = self.wait_resume_flight(&durable).await;
         match self.reply_live_attach(&msg, &previous, fence, &reply).await {
-            Ok(Some(attached_id)) => {
-                self.notify_turn_interrupted_after_ack(&attached_id, session_type)
-                    .await;
-                return;
-            }
-            Err(()) => return,
+            Ok(Some(completion)) => return Some(completion),
+            Err(()) => return None,
             Ok(None) => {}
         }
         match self.resume_untracked(&msg, &durable, fence, true).await {
@@ -112,11 +126,10 @@ impl FreshClaudeState {
                 // This operation advanced its own claim. The incoming
                 // pre-launch fence no longer names its committed owner.
                 match self.reply_live_attach(&msg, &previous, None, &reply).await {
-                    Ok(Some(attached_id)) => {
-                        self.notify_turn_interrupted_after_ack(&attached_id, session_type)
-                            .await;
+                    Ok(Some(completion)) => {
+                        return Some(completion);
                     }
-                    Err(()) => {}
+                    Err(()) => return None,
                     Ok(None) => attach_error(
                         &reply,
                         &msg,
@@ -128,20 +141,26 @@ impl FreshClaudeState {
             }
             Err(recovery::RuntimeResumeError::Lost) => {
                 reply(lost_session_frame(&previous, msg.session_type));
+                return None;
             }
-            Err(recovery::RuntimeResumeError::Closed) => attach_error(
-                &reply,
-                &msg,
-                &previous,
-                "SESSION_CLOSED",
-                "This conversation was closed. Open it again to continue.",
-            ),
+            Err(recovery::RuntimeResumeError::Closed) => {
+                attach_error(
+                    &reply,
+                    &msg,
+                    &previous,
+                    "SESSION_CLOSED",
+                    "This conversation was closed. Open it again to continue.",
+                );
+                return None;
+            }
             Err(recovery::RuntimeResumeError::Unavailable { code, message, .. }) => {
                 attach_error(&reply, &msg, &previous, code, &message);
+                return None;
             }
         }
         tracing::debug!(target: "freshell_freshagent::claude", provider = PROVIDER,
             session_id = %durable, session_type, "freshagent.claude.attach_settled");
+        None
     }
 
     /// Hold the coordinator's observation window through the snapshot and
@@ -152,7 +171,7 @@ impl FreshClaudeState {
         previous: &str,
         fence: Option<freshell_ownership::ObservedFence>,
         reply: &FrameSink,
-    ) -> Result<Option<String>, ()> {
+    ) -> Result<Option<ClaudeAttachCompletion>, ()> {
         let Some(key) = self.resolve_session_key(&msg.session_id).await else {
             return Ok(None);
         };
@@ -233,8 +252,11 @@ impl FreshClaudeState {
                 stated.permission_mode.as_deref(),
             ));
         }
-        drop(guard);
-        Ok(Some(native_id))
+        Ok(Some(ClaudeAttachCompletion {
+            attached_id: native_id,
+            session_type: session_type_str(msg.session_type).to_string(),
+            guard,
+        }))
     }
 }
 

@@ -30,6 +30,7 @@ import {
   addElicitationRequest,
   removeElicitation,
   applyRuntimeOwner,
+  refreshRuntimeOwnerFacts,
   clearPendingCreate,
   clearPendingCreateFailure,
   createFailed,
@@ -331,7 +332,7 @@ export function handleFreshAgentMessage(
         provider: attached.provider,
       }
       if (attached.ownerKind && typeof attached.ownerGeneration === 'number' && typeof attached.ownerEpoch === 'number') {
-        dispatch(applyRuntimeOwner({
+        dispatch(refreshRuntimeOwnerFacts({
           type: 'session.runtimeOwner',
           provider: attached.provider,
           sessionId: attached.sessionRef?.sessionId ?? attached.sessionId,
@@ -364,7 +365,7 @@ export function handleFreshAgentMessage(
         provider: failed.provider,
       }
       if (failed.ownerKind && typeof failed.ownerGeneration === 'number' && typeof failed.ownerEpoch === 'number') {
-        dispatch(applyRuntimeOwner({
+        dispatch(refreshRuntimeOwnerFacts({
           type: 'session.runtimeOwner',
           provider: failed.provider,
           sessionId: failed.sessionRef?.sessionId ?? failed.sessionId,
@@ -374,6 +375,12 @@ export function handleFreshAgentMessage(
           operationId: failed.operationId ?? failed.requestId,
           transition: 'handoff-committed',
         }))
+      }
+      if (failed.code === 'INVALID_SESSION_ID') {
+        // The typed attach result carries the same lost-identity fact as the
+        // legacy event-shaped INVALID_SESSION_ID. Reservation and generic
+        // failures remain requester-only and do not start session recovery.
+        dispatch(markSessionLost(locator))
       }
       // Attach settlement belongs to the requesting view. Folding it as a
       // session event would clear or alter shared status for every other view
