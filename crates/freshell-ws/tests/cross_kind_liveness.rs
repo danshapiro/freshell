@@ -687,6 +687,12 @@ async fn spawn_merged_server_with_ledger() -> (MergedHarness, Arc<PaneLedger>) {
     spawn_merged_server_with_ledger_and_claude(None).await
 }
 
+async fn spawn_merged_server_with_ledger_root(
+) -> (MergedHarness, Arc<PaneLedger>, std::path::PathBuf) {
+    spawn_merged_server_with_ledger_and_binding_gate_with_root(None, None, None, None, None, None)
+        .await
+}
+
 async fn spawn_merged_server_with_ledger_and_claude(
     environment: Option<&ClaudeSimEnvironment>,
 ) -> (MergedHarness, Arc<PaneLedger>) {
@@ -697,7 +703,27 @@ async fn spawn_merged_server_with_ledger_and_binding_gate(
     environment: Option<&ClaudeSimEnvironment>,
     binding_gate: Option<Arc<common::ledger_sink::LedgerWriteGate>>,
 ) -> (MergedHarness, Arc<PaneLedger>) {
-    let hooks = Arc::new(freshell_freshagent::HandoffTestHooks::default());
+    let (harness, ledger, _) = spawn_merged_server_with_ledger_and_binding_gate_with_root(
+        environment,
+        binding_gate,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    (harness, ledger)
+}
+
+async fn spawn_merged_server_with_ledger_and_binding_gate_with_root(
+    environment: Option<&ClaudeSimEnvironment>,
+    binding_gate: Option<Arc<common::ledger_sink::LedgerWriteGate>>,
+    repair_gate: Option<Arc<common::ledger_sink::LedgerWriteGate>>,
+    hooks: Option<Arc<freshell_freshagent::HandoffTestHooks>>,
+    flavor_writer: Option<freshell_freshagent::session_handoff::FlavorWriter>,
+    reap_timeout_ms: Option<u64>,
+) -> (MergedHarness, Arc<PaneLedger>, std::path::PathBuf) {
+    let hooks = hooks.unwrap_or_else(|| Arc::new(freshell_freshagent::HandoffTestHooks::default()));
     let cli_commands = Arc::new(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]);
     let (state, registry, fresh_agent_state) = build_ws_state_with_probe_and_env(
         cli_commands.iter().cloned().collect(),
@@ -720,7 +746,8 @@ async fn spawn_merged_server_with_ledger_and_binding_gate(
     // same transitions the runner drives.
     let sink: std::sync::Arc<dyn PaneIdentitySink> = Arc::new(
         LedgerSink::with_ownership(Arc::clone(&pane_ledger), state.ownership.clone())
-            .with_binding_completed_gate(binding_gate),
+            .with_binding_completed_gate(binding_gate)
+            .with_failed_transition_repair_gate(repair_gate),
     );
     state.fresh_claude.set_identity_sink(sink.clone());
     state.fresh_codex.set_identity_sink(sink.clone());
@@ -755,7 +782,9 @@ async fn spawn_merged_server_with_ledger_and_binding_gate(
                 .with_cli_commands(Arc::clone(&cli_commands)),
             Arc::clone(&cli_commands),
         )
-        .with_test_hooks(Arc::clone(&hooks)),
+        .with_test_hooks(Arc::clone(&hooks))
+        .with_flavor_writer(flavor_writer)
+        .with_reap_timeout_ms(reap_timeout_ms.unwrap_or(10_000)),
     );
     let app = freshell_ws::router(state.clone())
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
@@ -782,6 +811,7 @@ async fn spawn_merged_server_with_ledger_and_binding_gate(
             handoff_runner,
         },
         pane_ledger,
+        ledger_root,
     )
 }
 
@@ -7661,6 +7691,565 @@ async fn opencode_map_hit_success_preserves_durable_owner(attach: bool) {
         sink.load_settings("opencode", id).unwrap().model.as_deref(),
         Some("committed-owner-settings")
     );
+}
+
+async fn opencode_live_session_with_failed_sibling_fence(
+    id: &str,
+    request_id: &str,
+) -> (MergedHarness, Arc<PaneLedger>, std::path::PathBuf) {
+    let (h, ledger, ledger_root) = spawn_merged_server_with_ledger_root().await;
+    h.ws_state
+        .fresh_opencode
+        .handle_create(
+            serde_json::from_value(json!({
+                "type": "freshAgent.create",
+                "requestId": request_id,
+                "sessionType": "freshopencode",
+                "provider": "opencode",
+                "sessionRef": { "provider": "opencode", "sessionId": id }
+            }))
+            .unwrap(),
+            None,
+        )
+        .await;
+
+    let ownership = h.ws_state.ownership.as_ref().unwrap();
+    let live = ownership.observe("opencode", id);
+    let freshell_ownership::OwnershipState::Live {
+        owner, generation, ..
+    } = live.state
+    else {
+        panic!("the adopted OpenCode session must have a current owner: {live:?}");
+    };
+    assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+    assert_eq!(owner.live_session_key.as_deref(), Some(id));
+    let operation_id = owner.ownership_id.clone().expect("live owner id");
+    let before = ledger
+        .load_binding("opencode", id)
+        .expect("the current session binding is durable");
+    assert_eq!(before.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(
+        before.owner_operation_id.as_deref(),
+        Some(operation_id.as_str())
+    );
+
+    // Model the scoped cleanup fence from a failed sibling operation that
+    // shared the restored owner's epoch/generation. The exact live row stays
+    // intact, but claimless settings refreshes are fenced.
+    ledger
+        .repair_failed_transition_binding(
+            "opencode",
+            id,
+            "failed-sibling-operation",
+            live.epoch,
+            generation,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        )
+        .expect("the sibling failure fence is written");
+    let preserved = ledger.load_binding("opencode", id).unwrap();
+    assert_eq!(preserved.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(
+        preserved.owner_operation_id.as_deref(),
+        Some(operation_id.as_str())
+    );
+
+    (h, ledger, ledger_root)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opencode_configure_settings_refresh_survives_same_generation_failed_fence() {
+    let _guard = ENV_LOCK.lock().await;
+    let _fake = FakeOpencodeServeEnv::install();
+    let id = "ses_opencode_configure_same_generation_fence";
+    let (h, _ledger, ledger_root) =
+        opencode_live_session_with_failed_sibling_fence(id, "configure-fence-owner").await;
+
+    h.ws_state
+        .fresh_opencode
+        .handle_configure(
+            serde_json::from_value(json!({
+                "type": "freshAgent.configure",
+                "provider": "opencode",
+                "sessionType": "freshopencode",
+                "sessionId": id,
+                "settings": { "model": "prov/mdl-configured", "effort": "high" }
+            }))
+            .unwrap(),
+        )
+        .await;
+
+    let durable = PaneLedger::new(Some(ledger_root))
+        .load_binding("opencode", id)
+        .expect("the configured row survives a ledger reload");
+    let current = h
+        .ws_state
+        .ownership
+        .as_ref()
+        .unwrap()
+        .observe("opencode", id);
+    let freshell_ownership::OwnershipState::Live { owner, .. } = current.state else {
+        panic!("the configured session must still have the same live owner: {current:?}");
+    };
+    assert_eq!(durable.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(
+        durable.owner_operation_id.as_deref(),
+        owner.ownership_id.as_deref(),
+        "the settings write is tied to the exact current owner"
+    );
+    assert_eq!(durable.model.as_deref(), Some("prov/mdl-configured"));
+    assert_eq!(durable.effort.as_deref(), Some("high"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opencode_send_settings_refresh_survives_same_generation_failed_fence() {
+    let _guard = ENV_LOCK.lock().await;
+    let _fake = FakeOpencodeServeEnv::install();
+    let id = "ses_opencode_send_same_generation_fence";
+    let (h, _ledger, ledger_root) =
+        opencode_live_session_with_failed_sibling_fence(id, "send-fence-owner").await;
+
+    h.ws_state
+        .fresh_opencode
+        .handle_send(
+            serde_json::from_value(json!({
+                "type": "freshAgent.send",
+                "provider": "opencode",
+                "sessionType": "freshopencode",
+                "sessionId": id,
+                "requestId": "send-fence-refresh",
+                "text": "update the shared settings",
+                "settings": { "model": "prov/mdl-sent", "effort": "low" }
+            }))
+            .unwrap(),
+        )
+        .await;
+
+    let durable = PaneLedger::new(Some(ledger_root))
+        .load_binding("opencode", id)
+        .expect("the sent row survives a ledger reload");
+    assert_eq!(durable.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(durable.model.as_deref(), Some("prov/mdl-sent"));
+    assert_eq!(durable.effort.as_deref(), Some("low"));
+}
+
+struct HoldingFlavorStage {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+impl freshell_freshagent::session_handoff::FlavorWrite for HoldingFlavorStage {
+    fn stage(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+        _flavor: &str,
+    ) -> freshell_freshagent::session_handoff::StagedFlavorFuture {
+        let entered = Arc::clone(&self.entered);
+        Box::pin(async move {
+            entered.notify_one();
+            std::future::pending::<freshell_freshagent::session_handoff::StagedFlavorOutcome>()
+                .await
+        })
+    }
+}
+
+fn fresh_opencode_handoff_request(session_id: &str) -> freshell_freshagent::HandoffRequest {
+    freshell_freshagent::HandoffRequest {
+        action: freshell_freshagent::session_handoff::HandoffAction::Switch,
+        provider: "opencode".into(),
+        session_id: session_id.into(),
+        target_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        session_type: Some("freshopencode".into()),
+        mode: None,
+        cwd: None,
+        tab_id: None,
+        pane_id: None,
+        observed_epoch: None,
+        observed_generation: None,
+        device_id: Some("c2-repair-test".into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opencode_abort_cleanup_keeps_handoff_held_while_real_ledger_repair_is_held() {
+    let _guard = ENV_LOCK.lock().await;
+    let _fake = FakeOpencodeServeEnv::install();
+    let repair_gate = Arc::new(common::ledger_sink::LedgerWriteGate::new());
+    let stage_entered = Arc::new(tokio::sync::Notify::new());
+    let stop_entered = Arc::new(tokio::sync::Notify::new());
+    let stop_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let hooks = Arc::new({
+        let mut hooks = freshell_freshagent::HandoffTestHooks::default();
+        hooks
+            .pause_opencode_stop_after_confirm
+            .replace(Arc::clone(&stop_entered));
+        hooks
+            .release_opencode_stop_after_confirm
+            .replace(Arc::clone(&stop_release));
+        hooks
+    });
+    let writer: freshell_freshagent::session_handoff::FlavorWriter = Arc::new(HoldingFlavorStage {
+        entered: Arc::clone(&stage_entered),
+    });
+    let (h, ledger, ledger_root) = spawn_merged_server_with_ledger_and_binding_gate_with_root(
+        None,
+        None,
+        Some(Arc::clone(&repair_gate)),
+        Some(hooks),
+        Some(writer),
+        Some(1),
+    )
+    .await;
+    let id = "ses_c2_opencode_abort_repair_held";
+    let handle = h
+        .handoff_runner
+        .spawn_handoff(fresh_opencode_handoff_request(id));
+    tokio::time::timeout(Duration::from_secs(20), stage_entered.notified())
+        .await
+        .expect("the OpenCode target starts before the handoff is canceled");
+    assert!(h.ws_state.fresh_opencode.has_live_session(id).await);
+    let row = ledger
+        .load_binding("opencode", id)
+        .expect("the real ledger records the uncommitted OpenCode target");
+    assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+    let registry = h.ws_state.ownership.as_ref().expect("coordinator wired");
+    let before_abort = registry.observe("opencode", id);
+    let (operation_id, generation) = match before_abort.state {
+        freshell_ownership::OwnershipState::Handoff {
+            operation_id,
+            generation,
+            ..
+        } => (operation_id, generation),
+        state => panic!("the target remains under its handoff claim: {state:?}"),
+    };
+
+    handle.abort();
+    assert!(handle.task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(20), stop_entered.notified())
+        .await
+        .expect("the real OpenCode stop confirms, then parks before the detached watcher sees it");
+    tokio::time::timeout(Duration::from_secs(20), repair_gate.wait_until_entered())
+        .await
+        .expect("abort_cleanup reaches the failed-target repair through the real sink");
+
+    // Exact OpenCode lane teardown has returned Reaped, but its result is
+    // parked in stop_runtime's detached watcher while abort_cleanup waits on
+    // the operation-scoped durable repair. Neither path may release the key.
+    stop_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = registry.observe("opencode", id).state;
+            if repair_gate.attempts() >= 2
+                || matches!(state, freshell_ownership::OwnershipState::Vacant)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the detached watcher either joins repair or exposes the premature release");
+    let held = registry.observe("opencode", id);
+    let held_by_exact_operation = match &held.state {
+        freshell_ownership::OwnershipState::Handoff {
+            operation_id: current,
+            generation: current_generation,
+            ..
+        }
+        | freshell_ownership::OwnershipState::Fenced {
+            operation_id: current,
+            generation: current_generation,
+            ..
+        } => current == &operation_id && *current_generation == generation,
+        _ => false,
+    };
+    assert!(
+        held_by_exact_operation,
+        "repair pending must retain this exact operation, never vacancy or a foreign owner: {held:?}"
+    );
+    assert_eq!(
+        ledger.load_binding("opencode", id).unwrap().state,
+        freshell_ws::pane_ledger::RowState::Bound,
+        "the held repair has not retired the target binding"
+    );
+    assert!(matches!(
+        registry.begin_start(
+            "opencode",
+            id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "c2-competing-start",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ),
+        freshell_ownership::BeginOutcome::Blocked { .. }
+    ));
+
+    repair_gate.release();
+    repair_gate.release();
+    repair_gate.release();
+    repair_gate.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            registry.observe("opencode", id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the exact failed target is released after repair succeeds");
+    let repaired = ledger.load_binding("opencode", id).unwrap();
+    assert_eq!(
+        repaired.retired_reason,
+        Some(freshell_ws::pane_ledger::RetiredReason::FailedTransition)
+    );
+    let _ = std::fs::remove_dir_all(ledger_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opencode_abort_reconfirmation_keeps_fence_after_real_ledger_repair_failure() {
+    let _guard = ENV_LOCK.lock().await;
+    let _fake = FakeOpencodeServeEnv::install();
+    let repair_gate = Arc::new(common::ledger_sink::LedgerWriteGate::new());
+    repair_gate.fail_all();
+    let stage_entered = Arc::new(tokio::sync::Notify::new());
+    let stop_entered = Arc::new(tokio::sync::Notify::new());
+    let stop_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let confirmation_entered = Arc::new(tokio::sync::Notify::new());
+    let confirmation_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let hooks = Arc::new({
+        let mut hooks = freshell_freshagent::HandoffTestHooks::default();
+        hooks
+            .pause_abort_target_reconfirmation_after_confirm
+            .replace(Arc::clone(&confirmation_entered));
+        hooks
+            .release_abort_target_reconfirmation_after_confirm
+            .replace(Arc::clone(&confirmation_release));
+        hooks
+            .pause_opencode_stop_after_confirm
+            .replace(Arc::clone(&stop_entered));
+        hooks
+            .release_opencode_stop_after_confirm
+            .replace(Arc::clone(&stop_release));
+        hooks
+    });
+    let writer: freshell_freshagent::session_handoff::FlavorWriter = Arc::new(HoldingFlavorStage {
+        entered: Arc::clone(&stage_entered),
+    });
+    let (h, ledger, ledger_root) = spawn_merged_server_with_ledger_and_binding_gate_with_root(
+        None,
+        None,
+        Some(Arc::clone(&repair_gate)),
+        Some(hooks),
+        Some(writer),
+        Some(1),
+    )
+    .await;
+    let id = "ses_c2_opencode_abort_repair_failed";
+    let handle = h
+        .handoff_runner
+        .spawn_handoff(fresh_opencode_handoff_request(id));
+    tokio::time::timeout(Duration::from_secs(20), stage_entered.notified())
+        .await
+        .expect("the OpenCode target starts before the handoff is canceled");
+    let row = ledger
+        .load_binding("opencode", id)
+        .expect("the real ledger records the uncommitted OpenCode target");
+    assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+    let registry = h.ws_state.ownership.as_ref().expect("coordinator wired");
+    let before_abort = registry.observe("opencode", id);
+    let (operation_id, generation) = match before_abort.state {
+        freshell_ownership::OwnershipState::Handoff {
+            operation_id,
+            generation,
+            ..
+        } => (operation_id, generation),
+        state => panic!("the target remains under its handoff claim: {state:?}"),
+    };
+
+    handle.abort();
+    assert!(handle.task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(20), stop_entered.notified())
+        .await
+        .expect("the real OpenCode stop confirms before its detached watcher is held");
+    tokio::time::timeout(Duration::from_secs(20), repair_gate.wait_until_entered())
+        .await
+        .expect("abort_cleanup starts exact-operation durable repair");
+    repair_gate.release();
+    tokio::time::timeout(Duration::from_secs(20), confirmation_entered.notified())
+        .await
+        .expect("repair failure enters the real abort target reconfirmation path");
+    assert!(repair_gate.settled() >= 1);
+
+    // This is the exact target's successful death probe, deliberately held
+    // before the generic watcher consumes it. The failed repair left the
+    // original Bound row in place and the ownership key must remain fenced.
+    let fenced = registry.observe("opencode", id);
+    assert!(matches!(
+        fenced.state,
+        freshell_ownership::OwnershipState::Fenced {
+            operation_id: ref current,
+            generation: current_generation,
+            ..
+        } if current == &operation_id && current_generation == generation
+    ));
+    assert_eq!(
+        ledger.load_binding("opencode", id).unwrap().state,
+        freshell_ws::pane_ledger::RowState::Bound,
+        "the injected failed repair leaves the old durable row untouched"
+    );
+    assert!(matches!(
+        registry.begin_start(
+            "opencode",
+            id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "c2-competing-start-after-repair-failure",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ),
+        freshell_ownership::BeginOutcome::Blocked { .. }
+    ));
+
+    confirmation_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = registry.observe("opencode", id);
+            if repair_gate.attempts() >= 2
+                || matches!(current.state, freshell_ownership::OwnershipState::Vacant)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("reconfirmation either attempts durable repair or exposes the premature release");
+    let after_reconfirmation = registry.observe("opencode", id);
+    assert!(
+        matches!(
+            after_reconfirmation.state,
+            freshell_ownership::OwnershipState::Fenced {
+                operation_id: ref current,
+                generation: current_generation,
+                ..
+            } if current == &operation_id && current_generation == generation
+        ),
+        "confirmed death cannot release ownership after failed repair: {after_reconfirmation:?}"
+    );
+    assert!(
+        repair_gate.attempts() >= 2,
+        "the confirmation watcher must require an exact-operation repair before release"
+    );
+    repair_gate.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while repair_gate.settled() < 2 {
+            if matches!(
+                registry.observe("opencode", id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the reconfirmation repair either fails or exposes premature release");
+    let after_failed_reconfirmation_repair = registry.observe("opencode", id);
+    assert!(matches!(
+        after_failed_reconfirmation_repair.state,
+        freshell_ownership::OwnershipState::Fenced {
+            operation_id: ref current,
+            generation: current_generation,
+            ..
+        } if current == &operation_id && current_generation == generation
+    ), "a failed reconfirmation repair must keep the exact owner fenced: {after_failed_reconfirmation_repair:?}");
+    assert!(matches!(
+        registry.begin_start(
+            "opencode",
+            id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "c2-competing-start-after-reconfirmation-repair-failure",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ),
+        freshell_ownership::BeginOutcome::Blocked { .. }
+    ));
+
+    // The original detached stop watcher receives the same exact successful
+    // death confirmation. It must independently remain unable to release
+    // after its repair attempt fails too.
+    stop_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = registry.observe("opencode", id);
+            if repair_gate.attempts() >= 3
+                || matches!(current.state, freshell_ownership::OwnershipState::Vacant)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the detached stop watcher either repairs or exposes premature release");
+    repair_gate.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while repair_gate.settled() < 3 {
+            if matches!(
+                registry.observe("opencode", id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the detached watcher repair either fails or exposes premature release");
+    let after_detached_watcher = registry.observe("opencode", id);
+    assert!(
+        matches!(
+            after_detached_watcher.state,
+            freshell_ownership::OwnershipState::Fenced {
+                operation_id: ref current,
+                generation: current_generation,
+                ..
+            } if current == &operation_id && current_generation == generation
+        ),
+        "the detached watcher cannot release with an unrepaired row: {after_detached_watcher:?}"
+    );
+    assert!(repair_gate.attempts() >= 3);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let still_fenced = registry.observe("opencode", id);
+    assert!(matches!(
+        still_fenced.state,
+        freshell_ownership::OwnershipState::Fenced {
+            operation_id: ref current,
+            generation: current_generation,
+            ..
+        } if current == &operation_id && current_generation == generation
+    ));
+    assert!(matches!(
+        registry.begin_start(
+            "opencode",
+            id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "c2-competing-start-after-reconfirmation",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ),
+        freshell_ownership::BeginOutcome::Blocked { .. }
+    ));
+    let unchanged = ledger.load_binding("opencode", id).unwrap();
+    assert_eq!(unchanged.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(unchanged.retired_reason, None);
+    let _ = std::fs::remove_dir_all(ledger_root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1230,6 +1230,10 @@ pub(crate) type AliasRecordMap = std::collections::HashMap<(String, String), Vec
 #[cfg(test)]
 pub(crate) type RetireBatchLog = Vec<(String, Vec<String>, Vec<String>)>;
 
+/// Exact operation stamps supplied to failed-transition repairs.
+#[cfg(test)]
+pub(crate) type FailedTransitionRepairLog = Vec<(String, String, String, u64, u64)>;
+
 /// In-memory sink for tests, crate-wide. Mutations happen synchronously
 /// before the (already-completed) future is returned, so tests can assert
 /// immediately after `.await`.
@@ -1269,7 +1273,7 @@ pub(crate) struct FakeIdentitySink {
     /// order — `(provider, sessionId, epoch, generation)`. The runner's
     /// abort/failure-path tests assert the failed transition's cleanup
     /// fires the repair with the transition's OWN (epoch, generation).
-    pub repairs: std::sync::Mutex<Vec<(String, String, String, u64, u64)>>,
+    pub repairs: std::sync::Mutex<FailedTransitionRepairLog>,
     /// Focused-ep5-r1 Finding 2 (round-4 amended): the fake mirror of the
     /// ledger's kill tombstones, stamped by `kill_clock` — a deterministic
     /// monotone counter standing in for the real ledger's wall-clock
@@ -1351,6 +1355,10 @@ pub(crate) struct FakeIdentitySink {
     /// before its result so the test can prove the Starting ticket remains
     /// active until durable repair succeeds.
     repair_gate: std::sync::Mutex<Option<RepairGate>>,
+    /// Multi-call repair barrier for cancellation tests that have both a
+    /// provider cleanup and a handoff cleanup repairing the same operation.
+    #[cfg(test)]
+    repair_barrier: std::sync::Mutex<Option<RepairBarrierGate>>,
     /// Focused-ep5-r5 Finding 2: the fake mirror of the ledger's durable
     /// alias tombstones — (provider, placeholder) -> [(durable, at_ms)],
     /// written by `record_alias_tombstone`, consulted by
@@ -1552,9 +1560,23 @@ struct RepairGate {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct RepairBarrierGate {
+    key: (String, String),
+    entered_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    release_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(test)]
 pub(crate) struct RepairGateHandles {
     pub entered: tokio::sync::oneshot::Receiver<()>,
     pub release: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct RepairBarrierHandles {
+    pub entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+    pub release: tokio::sync::watch::Sender<bool>,
 }
 
 /// kata b8ke Task 3 review M-1 test hook: the handles
@@ -1569,6 +1591,21 @@ pub(crate) struct BindingStallHandles {
 
 #[cfg(test)]
 impl FakeIdentitySink {
+    pub(crate) fn arm_repair_barrier(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> RepairBarrierHandles {
+        let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = tokio::sync::watch::channel(false);
+        *self.repair_barrier.lock().unwrap() = Some(RepairBarrierGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx,
+        });
+        RepairBarrierHandles { entered, release }
+    }
+
     pub(crate) fn arm_repair_gate(&self, provider: &str, session_id: &str) -> RepairGateHandles {
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
@@ -2294,6 +2331,33 @@ impl PaneIdentitySink for FakeIdentitySink {
                     let _ = gate.entered_tx.send(());
                     if let Some(release) = release {
                         let _ = release.await;
+                    }
+                    if fail {
+                        Err(std::io::Error::other("fake write failure"))
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+
+            let barrier = self
+                .repair_barrier
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|barrier| barrier.key.0 == provider && barrier.key.1 == session_id)
+                .cloned();
+            if let Some(barrier) = barrier {
+                let fail = self.fail_writes.load(std::sync::atomic::Ordering::SeqCst);
+                return Box::pin(async move {
+                    let _ = barrier.entered_tx.send(());
+                    let mut release = barrier.release_rx;
+                    while !*release.borrow() {
+                        if release.changed().await.is_err() {
+                            return Err(std::io::Error::other(
+                                "fake repair barrier released without a result",
+                            ));
+                        }
                     }
                     if fail {
                         Err(std::io::Error::other("fake write failure"))

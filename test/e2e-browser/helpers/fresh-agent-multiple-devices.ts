@@ -42,6 +42,7 @@ type NativeFixture = {
   bootCount: (sessionId?: string) => number
   runtimeStartCount: (sessionId: string) => number
   stopCount: (sessionId?: string) => number
+  readBinding: (sessionId?: string) => Promise<JsonRow>
   holdNextTurn: (sessionId?: string) => Promise<void>
   releaseTurn: () => Promise<void>
   waitForHeldTurn: (prompt: string, sessionId?: string) => Promise<string>
@@ -55,6 +56,7 @@ export type FreshAgentMultipleDeviceSession = {
   frames: { desktop: JsonRow[]; mobile: JsonRow[] }
   openView: (device: 'desktop' | 'mobile', sessionId: string) => Promise<Device>
   restartWithDeadTerminalBinding: () => Promise<void>
+  restartServer: () => Promise<void>
   close: () => Promise<void>
 }
 
@@ -351,6 +353,40 @@ async function seedDeadTerminalBinding(info: E2eServerInfo, provider: Provider, 
   binding.liveTerminalId = `dead-terminal-fixture-${sessionId}`
   delete binding.paneKind
   await fs.writeFile(bindingPath, `${JSON.stringify(binding)}\n`)
+
+  // Reproduce an older failed-transition repair that lands after the
+  // preserved row. The next boot advances the epoch, so recovery establishes
+  // a legitimate newer owner while this exact-operation tombstone remains
+  // present. Its future timestamp makes an unversioned settings refresh hit
+  // the original silent-suppression case; the exact newer owner pair must
+  // let the real write pass without granting terminal takeover authority.
+  const bootEpochPath = path.join(info.homeDir, '.freshell', 'pane-ledger', 'boot-epoch.json')
+  const bootEpoch = JSON.parse(await fs.readFile(bootEpochPath, 'utf8')) as JsonRow
+  const epoch = typeof bootEpoch.epoch === 'number' ? bootEpoch.epoch : binding.ownerEpoch
+  const generation = binding.ownerGeneration
+  if (typeof epoch !== 'number' || typeof generation !== 'number') {
+    throw new Error(`expected owner epoch/generation before recovery, got ${JSON.stringify(binding)}`)
+  }
+  const now = Date.now() + 60 * 60 * 1000
+  const envelopePath = path.join(
+    info.homeDir,
+    '.freshell',
+    'pane-ledger',
+    'close-envelopes',
+    `${encodeLedgerSegment(`${provider}:${sessionId}`)}.json`,
+  )
+  await fs.mkdir(path.dirname(envelopePath), { recursive: true })
+  await fs.writeFile(envelopePath, `${JSON.stringify({
+    ledgerVersion: 1,
+    closedAt: now,
+    kills: [{
+      provider,
+      sessionId,
+      atMs: now,
+      scope: [epoch, generation],
+      scopeOperationId: `failed-transition-fixture-${sessionId}`,
+    }],
+  })}\n`)
 }
 
 async function openFreshAgentView(
@@ -520,6 +556,17 @@ function nativeFixture(input: {
       return rows().filter((row) => input.mode === 'freshopencode'
         ? row.event === 'native_stop' && row.sessionId === (sessionId ?? input.sessionId)
         : row.kind === 'native_stop' && row.sessionId === (sessionId ?? input.sessionId)).length
+    },
+    readBinding: async (sessionId = input.sessionId) => {
+      const bindingPath = path.join(
+        input.info.homeDir,
+        '.freshell',
+        'pane-ledger',
+        'bindings',
+        encodeLedgerSegment(PROVIDER_BY_MODE[input.mode]),
+        `${encodeLedgerSegment(sessionId)}.json`,
+      )
+      return JSON.parse(await fs.readFile(bindingPath, 'utf8')) as JsonRow
     },
     holdNextTurn: async (sessionId = input.sessionId) => {
       heldPromptSessionId = sessionId
@@ -748,6 +795,21 @@ async function startTwoDeviceSession(
         // while the index is closed, and boot the same home/port/token again.
         await server.kill()
         await seedDeadTerminalBinding(priorInfo, provider, sessionId)
+        server = new RustServer({
+          env,
+          homeDir: priorInfo.homeDir,
+          port: priorInfo.port,
+          token: priorInfo.token,
+          preserveHomeOnStop: true,
+          setupHome: async (homeDir) => seedHome(homeDir, provider),
+          verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+        })
+        info = await server.start()
+      },
+      restartServer: async () => {
+        if (!server) throw new Error('the owned Rust server is unavailable')
+        const priorInfo = info
+        await server.kill()
         server = new RustServer({
           env,
           homeDir: priorInfo.homeDir,
