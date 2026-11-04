@@ -16,6 +16,16 @@ pnpm run test:sandbox "cargo test -p freshell-ws"
 The image builds automatically on first use (`scripts/sandbox-build.sh` runs it directly if you
 need to force a rebuild after changing `docker/sandbox/Dockerfile`).
 
+The default image uses the dependency protocol in `docker/sandbox/protocol.json`.
+Installed Node dependencies are prepared once for their toolchain foundation and
+dependency inputs, then mounted read-only. Matching inputs share the prepared
+trees; different inputs use separate trees and can run together. Source-only
+workload changes reuse the same dependencies. Package and Cargo stores are reused,
+and older runners keep their original image and volumes. Writable tool caches
+remain in the worktree's artifact cache. Explicit images selected with
+`FRESHELL_SANDBOX_IMAGE` must carry the current protocol and foundation metadata;
+rebuild or reprepare older custom images before using this runner.
+
 ## The `--corpus` flag
 
 For realistic-data perf tests, mount real session corpora **read-only**:
@@ -209,34 +219,29 @@ of each is slower — see below):
   that option, the wrapper reports Docker's error and does not fall back to a shared target cache.
 - `freshell-sandbox-cargo-target` — the previous shared target cache. New wrapper runs leave it
   untouched; no contents are migrated or removed automatically.
-- `freshell-sandbox-node-modules` — **sandbox-owned**, populated by the container's dependency
-  preparation (fingerprinted `pnpm install --frozen-lockfile` on pnpm-era trees, `npm ci` on
-  legacy npm-era branches) and carrying the `.sandbox-deps-state` fingerprint. The host's
-  `node_modules` contains host-specific tooling and should not be shared with the container's
-  environment.
-- `freshell-sandbox-sidecar-node-modules`, `freshell-sandbox-mcp-node-modules` — sandbox-owned
-  `node_modules` for the pnpm workspace members (`crates/freshell-claude-sidecar`,
-  `packages/freshell-mcp-runtime`), which have their own dependency trees. On legacy npm-era
-  branches these stay mounted but unused.
+- `freshell-sandbox-dependencies-v2-<dependency-key>-node-modules`,
+  `...-sidecar-node-modules`, and `...-mcp-node-modules` — prepared dependencies for
+  the root and two workspace packages. Preparation writes these once under an exclusive lock;
+  consumers mount them read-only. The key includes the installed dependency foundation,
+  manifests, lockfiles, package-manager configuration, local file-package inputs and the
+  installed tool-cache layout contract. Application
+  source and workload-only image changes reuse the preparation. Tool caches use the existing
+  writable per-worktree target volume through their normal `node_modules` paths.
+- The previous unversioned Node volumes remain untouched for old runners. Old runners cannot
+  write the current protocol's prepared volumes.
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
 
 Set `FRESHELL_SANDBOX_CACHE_PREFIX` to a unique Docker volume name prefix to use an
-independent set of the seven dependency and browser caches, including when running
+independent set of dependency and browser caches, including when running
 `scripts/sandbox-selftest.sh`. The default prefix is `freshell-sandbox`; paths are rejected
 to prevent accidentally mounting host directories. This setting does not change the canonical
 per-worktree Rust target volume. The cold-start regression creates and removes its own caches.
 
-Reset shared dependency and browser-download caches (these will re-warm on the next run):
-
-```bash
-docker volume rm freshell-sandbox-cargo-registry freshell-sandbox-cargo-git \
-  freshell-sandbox-pnpm-store freshell-sandbox-node-modules \
-  freshell-sandbox-sidecar-node-modules freshell-sandbox-mcp-node-modules \
-  freshell-sandbox-playwright-cache
-```
-
-This command does not clear the per-worktree Rust target caches described below. The legacy
-`freshell-sandbox-cargo-target` volume is also left untouched.
+Prepared dependency trees need no reset when inputs change: a different key selects a separate
+preparation automatically. Preserve shared package and Cargo download stores. To remove an unused
+prepared tree, identify its exact three volume names and check `docker ps -aq --filter
+volume=<volume-name>` for every one before using `docker volume rm <volume-name>`. Docker also
+refuses removal while a container references a volume. Keep legacy volumes needed by older runners.
 
 To reset one working copy's Rust target cache, first find its volume by the
 `com.freshell.cache.worktree-sha256` label and inspect all four
@@ -265,7 +270,7 @@ scripts/sandbox-build.sh
 ```
 
 Rebuild after any change to `docker/sandbox/Dockerfile` or `docker/sandbox/entrypoint.sh`. The
-image is tagged `freshell-sandbox:latest` and Docker layer caching keeps rebuilds fast unless a
+image is tagged `freshell-sandbox:dependencies-v2` and Docker layer caching keeps rebuilds fast unless a
 step earlier in the Dockerfile changed.
 
 The canonical image includes the native development libraries for the whole Rust workspace:

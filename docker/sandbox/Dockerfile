@@ -16,7 +16,8 @@
 # native agent-verification smoke stages the real electron-runtime build)
 # needs glibc >= 2.38 — bookworm's loader rejected it with
 # `/lib/x86_64-linux-gnu/libc.so.6: version GLIBC_2.38 not found`.
-FROM node:22-trixie
+ARG FRESHELL_SANDBOX_FOUNDATION_IMAGE=dependency-foundation
+FROM node:22-trixie AS dependency-foundation
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup \
@@ -114,9 +115,18 @@ RUN mkdir -p /home/sandbox/.local/share/pnpm/store \
 # a failed dependency install must fail the BUILD loudly instead.
 RUN npx --yes playwright@1.58.2 install-deps chromium
 
-COPY --chmod=755 entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
-
 WORKDIR /workspace
+LABEL com.freshell.sandbox.foundation-protocol="2"
+
+FROM ${FRESHELL_SANDBOX_FOUNDATION_IMAGE} AS sandbox-runtime
+ARG FRESHELL_SANDBOX_DEPENDENCY_FOUNDATION_ID
+RUN mkdir -p /usr/local/share/freshell-sandbox && printf '%s' "${FRESHELL_SANDBOX_DEPENDENCY_FOUNDATION_ID}" > /usr/local/share/freshell-sandbox/foundation-id
+COPY protocol.json /usr/local/share/freshell-sandbox/protocol.json
+# This helper is installed from the repository's tiny source-only build context.
+COPY dependency-cache.mjs /usr/local/share/freshell-sandbox/dependency-cache.mjs
+COPY --chmod=755 entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+LABEL com.freshell.sandbox.dependency-protocol="2"
+LABEL com.freshell.sandbox.dependency-foundation="${FRESHELL_SANDBOX_DEPENDENCY_FOUNDATION_ID}"
 
 # The container starts as root (not USER sandbox): named volumes Docker
 # creates fresh at runtime (cargo registry/git, the sandbox-owned

@@ -19,7 +19,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="freshell-sandbox:latest"
+IMAGE_TAG="${FRESHELL_SANDBOX_IMAGE:-$(node -p 'require(process.argv[1]).image' "${REPO_ROOT}/docker/sandbox/protocol.json")}"
 NETWORK_NAME="freshell-sandbox"
 
 FAILED=0
@@ -75,7 +75,9 @@ cleanup_selftest_decoys() {
 }
 trap cleanup_selftest_decoys EXIT
 
-bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep 300' &
+# Its lifetime belongs to this test's cleanup trap and the enclosing deadline.
+# A fixed sleep can expire before a cold-cache self-test finishes.
+bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep infinity' &
 HOST_PID_SENTINEL_PID=$!
 
 python3 - "${HOST_PORT_FILE}" <<'PYHOST' &
@@ -270,7 +272,7 @@ echo
 # suite and can include unrelated watcher concurrency that obscures this proof.
 TEST_CRATE="freshell-runtime-protocol"
 echo "--- Proof 4: cargo test -p ${TEST_CRATE} (sandbox vs host, warm caches both) ---"
-"${REPO_ROOT}/scripts/sandbox-test.sh" "cargo test -p ${TEST_CRATE} --quiet" >/tmp/sandbox-selftest-warm.log 2>&1 || true
+"${REPO_ROOT}/scripts/sandbox-test.sh" "cargo test -p ${TEST_CRATE} --quiet" >"${TMPDIR:-/tmp}/sandbox-selftest-warm-$$.log" 2>&1 || true
 
 SANDBOX_STATUS=0
 SANDBOX_START=$(date +%s.%N)
@@ -338,8 +340,7 @@ echo "--- Proof 6: dependency prep (manager selection + fingerprint transitions)
 #       purges the stale volume, and writes the new state file.
 #   6b: an unchanged fingerprint on a second container start skips the
 #       install and leaves the state file untouched.
-#   6c: a changed fingerprint input (package.json bytes) forces a
-#       reinstall and records the new fingerprint.
+#   6c: changed inputs cannot replace a completed tree and install into a new tree.
 #   6d: a legacy npm-era tree (package-lock.json, no packageManager field)
 #       with the old npm marker planted selects npm and runs npm ci anyway —
 #       the old one-shot marker never satisfies the new state.
@@ -347,6 +348,7 @@ P6_FIXTURE_PNPM="$(mktemp -d)"
 P6_FIXTURE_NPM="$(mktemp -d)"
 P6_VOL_PNPM="freshell-selftest-deps-pnpm-$$"
 P6_VOL_NPM="freshell-selftest-deps-npm-$$"
+P6_VOL_PNPM_CHANGED="freshell-selftest-deps-pnpm-changed-$$"
 
 cat > "${P6_FIXTURE_PNPM}/package.json" <<'EOF'
 {
@@ -473,24 +475,26 @@ if [ "${P6_FIXTURES_OK}" = true ]; then
   fi
   echo
 
-  # -- 6c: changed fingerprint input → forced reinstall + new state --
-  # Appending one newline changes package.json's bytes (a fingerprint
-  # input) while keeping the JSON valid and lock-consistent for the frozen
-  # install.
+  # -- 6c: a completed identity cannot be replaced; changed inputs use a new tree --
   printf '\n' >> "${P6_FIXTURE_PNPM}/package.json"
   P6C_STATUS=0
   P6C_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
     -v "${P6_FIXTURE_PNPM}:/workspace" -v "${P6_VOL_PNPM}:/workspace/node_modules" \
-    "${IMAGE_TAG}" bash -c 'cat node_modules/.sandbox-deps-state' 2>&1)" || P6C_STATUS=$?
-  echo "${P6C_OUT}"
-  P6C_FP="$(grep '^fingerprint=' <<<"${P6C_OUT}" | cut -d= -f2 || true)"
-  if [ "${P6C_STATUS}" -eq 0 ] \
-    && echo "${P6C_OUT}" | grep -q "deps: installing via pnpm install --frozen-lockfile" \
-    && [ "${#P6C_FP}" -eq 64 ] \
-    && [ "${P6C_FP}" != "${P6A_FP}" ]; then
-    pass "6c: changed package.json forced a reinstall and recorded a new fingerprint (${P6A_FP:0:12}... → ${P6C_FP:0:12}...)"
+    "${IMAGE_TAG}" bash -c 'exit 99' 2>&1)" || P6C_STATUS=$?
+  if [ "${P6C_STATUS}" -eq 2 ] && grep -q sandbox_dependency_identity_mismatch <<<"${P6C_OUT}"; then
+    pass "6c: changed inputs cannot replace a completed dependency identity"
   else
-    fail "6c: reinstall on changed fingerprint: exit=${P6C_STATUS} before=${P6A_FP:-none} after=${P6C_FP:-none} output=[${P6C_OUT}]"
+    fail "6c: completed identity replacement: exit=${P6C_STATUS}"
+  fi
+  P6C_STATUS=0
+  P6C_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
+    -v "${P6_FIXTURE_PNPM}:/workspace" -v "${P6_VOL_PNPM_CHANGED}:/workspace/node_modules" \
+    "${IMAGE_TAG}" bash -c 'cat node_modules/.sandbox-deps-state' 2>&1)" || P6C_STATUS=$?
+  P6C_FP="$(grep '^fingerprint=' <<<"${P6C_OUT}" | cut -d= -f2 || true)"
+  if [ "${P6C_STATUS}" -eq 0 ] && [ "${#P6C_FP}" -eq 64 ] && [ "${P6C_FP}" != "${P6A_FP}" ]; then
+    pass "6c: changed inputs install successfully into their own dependency tree"
+  else
+    fail "6c: separate changed-input preparation: exit=${P6C_STATUS}"
   fi
   echo
 
@@ -515,7 +519,7 @@ fi
 
 # Throwaway volumes first (they shadow the fixtures' node_modules), then the
 # fixture dirs themselves (all host-owned once the volumes are gone).
-docker volume rm "${P6_VOL_PNPM}" "${P6_VOL_NPM}" >/dev/null 2>&1 || true
+docker volume rm "${P6_VOL_PNPM}" "${P6_VOL_NPM}" "${P6_VOL_PNPM_CHANGED}" >/dev/null 2>&1 || true
 rm -rf "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}" 2>/dev/null || true
 
 # ---- Proof 7: per-worktree Rust target cache volume contract ----

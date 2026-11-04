@@ -15,8 +15,13 @@ if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
 
 function fixture(mode: string) {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'sandbox-wrapper-'))
+  const git = spawnSync('git', ['init', '--quiet', root], { encoding: 'utf8' })
+  if (git.status !== 0) throw new Error(`Cannot initialize sandbox fixture: ${git.stderr}`)
   for (const subdir of ['scripts', 'bin', 'control']) mkdirSync(path.join(root, subdir))
   copyFileSync(path.resolve('scripts/sandbox-test.sh'), path.join(root, 'scripts/sandbox-test.sh'))
+  mkdirSync(path.join(root, 'docker/sandbox'), { recursive: true })
+  copyFileSync(path.resolve('docker/sandbox/protocol.json'), path.join(root, 'docker/sandbox/protocol.json'))
+  copyFileSync(path.resolve('docker/sandbox/dependency-cache.mjs'), path.join(root, 'docker/sandbox/dependency-cache.mjs'))
   const guardSource = process.env.FIXTURE_GUARD_SOURCE ?? 'scripts/testing/sandbox-owner-guard.py'
   if (existsSync(guardSource)) {
     mkdirSync(path.join(root, 'scripts/testing'))
@@ -82,7 +87,7 @@ with (root / 'receipt.jsonl').open('a') as log:
     const volumes = () => fs.existsSync(volumeState) ? JSON.parse(fs.readFileSync(volumeState, 'utf8')) : {};
     const saveVolumes = value => fs.writeFileSync(volumeState, JSON.stringify(value));
     record({kind:'docker', args});
-    if (args[0] === 'image') process.exit(0);
+    if (args[0] === 'image') { console.log(args.at(-1)?.includes('dependency-protocol') ? '2' : 'sha256:'+ 'c'.repeat(64)); process.exit(0); }
     if (args[0] === 'network') process.exit(0);
     if (args[0] === 'volume' && args[1] === 'ls') {
       if (mode === 'volume-list-failed') process.exit(70);
@@ -133,6 +138,7 @@ with (root / 'receipt.jsonl').open('a') as log:
       } else if (mode !== 'no-object' && mode !== 'late-creation') fs.writeFileSync(state, JSON.stringify({cid, name}));
       if (mode === 'published' || mode === 'published-success' || mode === 'removed-race' || mode === 'watchdog-published') fs.writeFileSync(cidfile, cid);
       if (mode === 'removed-race') fs.unlinkSync(state);
+      fs.writeFileSync(path.join(path.dirname(state), 'workload.entered'), '');
       if (mode.startsWith('watchdog-')) {
         setInterval(() => {}, 10000);
       } else if (mode === 'late-creation') {
@@ -170,6 +176,17 @@ with (root / 'receipt.jsonl').open('a') as log:
     async runTimeout() {
       const monitor = setInterval(capturePendingProcesses, 10)
       const watchdogLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+      // These cases protect cleanup of an entered workload. Exclude variable
+      // metadata preflight from their virtual deadline while retaining the real
+      // watchdog tick and real process-tree kill. Startup itself stays bounded.
+      const realNow = Date.now.bind(Date)
+      const started = realNow()
+      let armedAt: number | undefined
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+        if (!existsSync(path.join(root, 'workload.entered')) && realNow() - started < 10_000) return started
+        armedAt ??= realNow()
+        return started + realNow() - armedAt
+      })
       let status: number
       let watchdogEvents: unknown[][]
       try {
@@ -186,6 +203,7 @@ with (root / 'receipt.jsonl').open('a') as log:
         clearInterval(monitor)
         capturePendingProcesses()
         watchdogLog.mockRestore()
+        clock.mockRestore()
       }
       const events = readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
       const run = events.filter(event => event.kind === 'run').at(-1)

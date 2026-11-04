@@ -1,0 +1,5 @@
+{
+  "version": 2,
+  "image": "freshell-sandbox:dependencies-v2",
+  "cacheSuffix": "dependencies-v2"
+}

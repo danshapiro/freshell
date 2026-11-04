@@ -42,7 +42,11 @@ with open(sys.argv[1], "a", encoding="utf-8") as stream:
 PY
 
 case "${1:-}" in
-  image|network)
+  image)
+    if [[ "${*: -1}" == *dependency-protocol* ]]; then printf '2\n'; else printf 'sha256:%064d\n' 1; fi
+    exit 0
+    ;;
+  network)
     exit 0
     ;;
   volume)

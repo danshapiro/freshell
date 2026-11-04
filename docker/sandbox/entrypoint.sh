@@ -105,6 +105,18 @@ if [ -f pnpm-workspace.yaml ]; then
   done
 fi
 
+if is_mount_point /workspace/target; then
+  for slot in root sidecar mcp; do
+    for cache in .vite .vite-temp .vitest .cache; do
+      directory="/workspace/target/.freshell-node-cache/${slot}/${cache}"
+      mkdir -p "${directory}"
+      if [ "$(stat -c %u "${directory}")" != "${TARGET_UID}" ]; then
+        chown -R "${TARGET_UID}:${TARGET_GID}" "${directory}"
+      fi
+    done
+  done
+fi
+
 # --- dependency prep (fingerprinted, dual-manager) ------------------------
 # Replaces the one-shot `.sandbox-npm-ci-done` marker: the sandbox serves
 # both pnpm-era trees (packageManager pin; plan §7.3) and legacy npm-era
@@ -113,7 +125,7 @@ fi
 # The state file lives inside the install volume (node_modules is a named
 # volume under scripts/sandbox-test.sh), so wiping the volume wipes the
 # state. The old marker never satisfies this state: an npm-era volume, a
-# stale marker, or a manager switch all trigger a fresh install.
+# stale marker, or a manager switch selects a separately prepared tree.
 if [ -f package.json ]; then
   # Manager selection precedence mirrors scripts/lib/package-manager.ts
   # (detectProjectManager): the packageManager field is authoritative; a
@@ -159,7 +171,7 @@ if [ -f package.json ]; then
     # Fingerprint over the selected manager's identity, the install policy
     # flags, the root manifest, the selected manager's lock/config files,
     # and the workspace member manifests when present. Absent files are
-    # skipped; changing any input forces a reinstall on the next start.
+    # skipped; changing an input selects a new prepared identity.
     DEPS_FINGERPRINT="$(
       {
         printf 'manager=%s@%s\n' "${DEPS_MANAGER}" "${DEPS_MANAGER_VERSION}"
@@ -175,35 +187,85 @@ if [ -f package.json ]; then
     )"
 
     DEPS_STATE="node_modules/.sandbox-deps-state"
-    DEPS_RECORDED=""
-    if [ -f "${DEPS_STATE}" ]; then
-      DEPS_RECORDED="$(grep '^fingerprint=' "${DEPS_STATE}" | cut -d= -f2 || true)"
+    FOUNDATION_ID="$(cat /usr/local/share/freshell-sandbox/foundation-id)"
+    PROTOCOL_VERSION="$(node -p 'require("/usr/local/share/freshell-sandbox/protocol.json").version')"
+    CACHE_IDENTITY="$(node /usr/local/share/freshell-sandbox/dependency-cache.mjs --key /workspace "${FOUNDATION_ID}" "${PROTOCOL_VERSION}")"
+    if [ -n "${FRESHELL_SANDBOX_DEPENDENCY_KEY:-}" ] && [ "${FRESHELL_SANDBOX_DEPENDENCY_KEY}" != "${CACHE_IDENTITY}" ]; then
+      printf '{"severity":"error","event":"sandbox_dependency_inputs_changed"}\n' >&2
+      exit 2
     fi
-
-    if [ -n "${DEPS_RECORDED}" ] && [ "${DEPS_RECORDED}" = "${DEPS_FINGERPRINT}" ]; then
-      echo "[sandbox] deps: reusing sandbox-owned node_modules (${DEPS_MANAGER} fingerprint ${DEPS_FINGERPRINT} unchanged)" >&2
+    require_current_dependency_inputs() {
+      local current_identity
+      current_identity="$(node /usr/local/share/freshell-sandbox/dependency-cache.mjs --key /workspace "${FOUNDATION_ID}" "${PROTOCOL_VERSION}")"
+      if [ "${current_identity}" != "${CACHE_IDENTITY}" ]; then
+        printf '{"severity":"error","event":"sandbox_dependency_inputs_changed"}\n' >&2
+        exit 2
+      fi
+    }
+    read_dependency_state() {
+      RECORDED_FINGERPRINT=""
+      RECORDED_IDENTITY=""
+      if [ -f "${DEPS_STATE}" ]; then
+        RECORDED_FINGERPRINT="$(grep '^fingerprint=' "${DEPS_STATE}" | cut -d= -f2 || true)"
+        RECORDED_IDENTITY="$(grep '^cache_identity=' "${DEPS_STATE}" | cut -d= -f2 || true)"
+      fi
+    }
+    dependency_state_matches() {
+      [ "${RECORDED_FINGERPRINT}" = "${DEPS_FINGERPRINT}" ] && [ "${RECORDED_IDENTITY}" = "${CACHE_IDENTITY}" ]
+    }
+    # Consumer mounts are read-only. No setup or replacement can occur after
+    # admission, including when its foreground process or descendants exit.
+    if [ "${FRESHELL_SANDBOX_DEPENDENCY_READONLY:-}" = 1 ]; then
+      read_dependency_state
+      if ! dependency_state_matches; then
+        printf '{"severity":"error","event":"sandbox_dependency_not_prepared"}\n' >&2
+        exit 2
+      fi
     else
-      echo "[sandbox] deps: installing via ${DEPS_MANAGER} ${DEPS_POLICY[*]} (fingerprint ${DEPS_FINGERPRINT}, recorded ${DEPS_RECORDED:-none})" >&2
-      # Purge the previous contents before installing: the recorded state
-      # may be another manager's layout (an npm-created tree is
-      # incompatible with pnpm and vice versa), a marker-era leftover, or a
-      # half-failed install. `npm ci` reinstalls from scratch anyway; pnpm
-      # needs the clean slate. Only volume mounts are purged — a direct
-      # docker run without the wrapper's named volumes must never delete
-      # the user's real node_modules through the bind mount; such runs
-      # fail closed on the install instead.
-      for dir in \
-        node_modules \
-        crates/freshell-claude-sidecar/node_modules \
-        packages/freshell-mcp-runtime/node_modules; do
-        if [ -d "${dir}" ] && is_mount_point "/workspace/${dir}"; then
-          find "${dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+      # Only cold/incomplete preparation writes this input-specific tree.
+      # Keep the standard descriptor lock through the synchronous installer.
+      exec {DEPENDENCY_PREPARATION_DESCRIPTOR}</workspace/node_modules
+      printf '{"severity":"info","event":"sandbox_dependency_preparation_waiting"}\n' >&2
+      flock --exclusive "${DEPENDENCY_PREPARATION_DESCRIPTOR}"
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      trap 'exit 129' HUP
+      require_current_dependency_inputs
+      read_dependency_state
+      if [ -f "${DEPS_STATE}" ]; then
+        if ! dependency_state_matches; then
+          printf '{"severity":"error","event":"sandbox_dependency_identity_mismatch"}\n' >&2
+          exit 2
         fi
-      done
-      gosu sandbox "${DEPS_MANAGER}" "${DEPS_POLICY[@]}"
-      printf 'manager=%s\nmanager_version=%s\nfingerprint=%s\n' \
-        "${DEPS_MANAGER}" "${DEPS_MANAGER_VERSION}" "${DEPS_FINGERPRINT}" \
-        | gosu sandbox tee "${DEPS_STATE}" >/dev/null
+        echo "[sandbox] deps: reusing sandbox-owned node_modules (${DEPS_MANAGER} fingerprint ${DEPS_FINGERPRINT} unchanged)" >&2
+      else
+        echo "[sandbox] deps: installing via ${DEPS_MANAGER} ${DEPS_POLICY[*]} (fingerprint ${DEPS_FINGERPRINT}, incomplete tree)" >&2
+        for dir in node_modules crates/freshell-claude-sidecar/node_modules packages/freshell-mcp-runtime/node_modules; do
+          if [ -d "${dir}" ] && is_mount_point "/workspace/${dir}"; then
+            find "${dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          fi
+        done
+        gosu sandbox "${DEPS_MANAGER}" "${DEPS_POLICY[@]}"
+        # Build caches belong to this worktree's writable artifact volume,
+        # rather than the immutable installed dependency trees.
+        module_dirs=(node_modules crates/freshell-claude-sidecar/node_modules packages/freshell-mcp-runtime/node_modules)
+        slots=(root sidecar mcp)
+        for index in 0 1 2; do
+          directory="${module_dirs[index]}"
+          if [ -d "${directory}" ] && is_mount_point "/workspace/${directory}"; then
+            for cache in .vite .vite-temp .vitest .cache; do
+              ln -s "/workspace/target/.freshell-node-cache/${slots[index]}/${cache}" "${directory}/${cache}"
+            done
+          fi
+        done
+        require_current_dependency_inputs
+        temporary_state="${DEPS_STATE}.tmp.$$"
+        printf 'manager=%s\nmanager_version=%s\nfingerprint=%s\ncache_identity=%s\n' "${DEPS_MANAGER}" "${DEPS_MANAGER_VERSION}" "${DEPS_FINGERPRINT}" "${CACHE_IDENTITY}" | gosu sandbox tee "${temporary_state}" >/dev/null
+        gosu sandbox mv "${temporary_state}" "${DEPS_STATE}"
+        printf '{"severity":"info","event":"sandbox_dependency_preparation_published"}\n' >&2
+      fi
+      exec {DEPENDENCY_PREPARATION_DESCRIPTOR}<&-
+      trap - INT TERM HUP
     fi
   fi
 fi

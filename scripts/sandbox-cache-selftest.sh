@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-IMAGE_TAG="freshell-sandbox:latest"
+IMAGE_TAG="${FRESHELL_SANDBOX_IMAGE:-$(node -p 'require(process.argv[1]).image' "${REPO_ROOT}/docker/sandbox/protocol.json")}"
 NETWORK_NAME="freshell-sandbox"
 log() { printf '{"severity":"%s","event":"%s"}\n' "$1" "$2" >&2; }
 fail() { log error "$1"; exit 1; }
@@ -26,6 +26,13 @@ chmod 0755 "${FIRST_ROOT}" "${SECOND_ROOT}"
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${FIRST_ROOT}/scripts/sandbox-test.sh"
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${SECOND_ROOT}/scripts/sandbox-test.sh"
 chmod 0755 "${FIRST_ROOT}/scripts/sandbox-test.sh" "${SECOND_ROOT}/scripts/sandbox-test.sh"
+for fixture_root in "${FIRST_ROOT}" "${SECOND_ROOT}"; do
+  git -C "${fixture_root}" init --quiet
+  mkdir -p "${fixture_root}/docker/sandbox" "${fixture_root}/scripts/testing"
+  cp "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" "${fixture_root}/scripts/testing/sandbox-owner-guard.py"
+  cp "${REPO_ROOT}/docker/sandbox/protocol.json" "${fixture_root}/docker/sandbox/protocol.json"
+  cp "${REPO_ROOT}/docker/sandbox/dependency-cache.mjs" "${fixture_root}/docker/sandbox/dependency-cache.mjs"
+done
 
 hash_path() {
   local root="$1" output

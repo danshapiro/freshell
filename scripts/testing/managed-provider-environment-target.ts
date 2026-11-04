@@ -3,6 +3,7 @@ import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_pr
 import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import fs from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -25,7 +26,7 @@ const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3
 const scenarios = ['healthy', 'missing-reference', 'startup-before-identity'] as const
 const ordinaryFixtureMode = 'managed-fixture-ordinary'
 const managedEnvironmentFixtureModel = 'opencode/big-pickle'
-const checkpointImage = 'freshell-sandbox:latest'
+const checkpointImage = process.env.FRESHELL_SANDBOX_IMAGE || JSON.parse(readFileSync(new URL('../../docker/sandbox/protocol.json', import.meta.url), 'utf8')).image
 const checkpointContainerPort = 3477
 const checkpointForwarderPort = 3478
 const checkpointFixtureRoot = '/tmp/freshell-checkpoint-fixture'

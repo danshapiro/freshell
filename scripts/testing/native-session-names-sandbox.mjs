@@ -5,7 +5,7 @@
 // Validates a CLOSED input list (the five fixed roles below, optionally
 // relocated by a version-1 manifest — never discovered, never installed),
 // then runs the runner read-only inside an OWNED disposable
-// `freshell-sandbox:latest` container. There is no skip/opt-in success
+// versioned `freshell-sandbox` container. There is no skip/opt-in success
 // state: exit 0 only when the Claude, Codex and OpenCode real metadata
 // contracts all ran and passed; exit 1 for a contract failure (including a
 // missing/skipped provider result); exit 2 for a missing prerequisite,
@@ -44,7 +44,7 @@ export const NATIVE_ROLES = Object.freeze([
   'runner',
 ])
 
-export const IMAGE_TAG = 'freshell-sandbox:latest'
+export const IMAGE_TAG = process.env.FRESHELL_SANDBOX_IMAGE || JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'docker/sandbox/protocol.json'), 'utf8')).image
 
 /** The fixed host inputs (the plan's Step 3 table). An optional --manifest
  * may RELOCATE these inputs (absolute roots/entries), never widen the set

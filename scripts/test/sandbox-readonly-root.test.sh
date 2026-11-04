@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE_TAG=freshell-sandbox:latest
+IMAGE_TAG="${FRESHELL_SANDBOX_IMAGE:-$(node -p 'require(process.argv[1]).image' "${REPO_ROOT}/docker/sandbox/protocol.json")}"
 ASSERTION="${REPO_ROOT}/scripts/test/assert-sandbox-readonly-root.sh"
 DOCKER_ARGS=(run --rm -i --network none --user sandbox --cap-drop ALL
   --security-opt no-new-privileges --entrypoint bash)

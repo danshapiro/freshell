@@ -246,7 +246,7 @@ describe('native-session-names docker argv containment', () => {
 
   it('launches the mounted runner with the image Node — never a shell, never an install', () => {
     const argv = nativeDockerArgv(fixedInputs(), { uid: 1000, gid: 1000, scratchDir: '/s', receiptDir: '/r', runnerStagedPath: '/s/native-session-names-runner.mjs' })
-    const imageIndex = argv.indexOf('freshell-sandbox:latest')
+    const imageIndex = argv.indexOf('freshell-sandbox:dependencies-v2')
     expect(imageIndex).toBeGreaterThan(0)
     const runnerArgs = argv.slice(imageIndex + 1)
     expect(runnerArgs[0]).toBe('/opt/freshell-native/native-session-names.mjs')

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE_TAG=freshell-sandbox:latest
+IMAGE_TAG="${FRESHELL_SANDBOX_IMAGE:-$(node -p 'require(process.argv[1]).image' "${REPO_ROOT}/docker/sandbox/protocol.json")}"
 CALLER_UID="$(id -u)"
 CALLER_GID="$(id -g)"
 FIXTURE="$(mktemp -d -t freshell-sandbox-startup.XXXXXXXX)"
@@ -13,7 +13,7 @@ export FRESHELL_SANDBOX_CACHE_PREFIX="freshell-startup-${FIXTURE##*.}"
 TARGET_CACHE_VOLUME=""
 TARGET_CACHE_WORKTREE_SHA256=""
 CACHE_VOLUMES=()
-for suffix in cargo-registry cargo-git pnpm-store node-modules sidecar-node-modules mcp-node-modules playwright-cache; do
+for suffix in cargo-registry cargo-git pnpm-store playwright-cache; do
   CACHE_VOLUMES+=("${FRESHELL_SANDBOX_CACHE_PREFIX}-${suffix}")
 done
 target_volume_exists() {
@@ -66,7 +66,16 @@ cleanup() {
       fi
     fi
   fi
-  docker volume rm "${CACHE_VOLUMES[@]}" >/dev/null 2>&1 || true
+  local private_volumes
+  private_volumes="$(docker volume ls --format '{{.Name}}' --filter "name=^${FRESHELL_SANDBOX_CACHE_PREFIX}-")" || cleanup_failed=1
+  while IFS= read -r private_volume; do
+    [ -n "${private_volume}" ] || continue
+    if refs="$(docker ps -aq --filter "volume=${private_volume}")" && [ -z "${refs}" ]; then
+      docker volume rm "${private_volume}" >/dev/null || cleanup_failed=1
+    else
+      cleanup_failed=1
+    fi
+  done <<< "${private_volumes}"
   rm -rf "${FIXTURE}"
   if [ "${status}" -eq 0 ] && [ "${cleanup_failed}" -ne 0 ]; then status=1; fi
   exit "${status}"
@@ -100,7 +109,10 @@ if ! docker network inspect freshell-sandbox >/dev/null 2>&1; then
   docker network create --driver bridge freshell-sandbox >/dev/null
 fi
 
-mkdir -p "${FIXTURE}/scripts/testing" "${FIXTURE}/src"
+mkdir -p "${FIXTURE}/scripts/testing" "${FIXTURE}/src" "${FIXTURE}/docker/sandbox"
+cp "${REPO_ROOT}/docker/sandbox/protocol.json" "${FIXTURE}/docker/sandbox/protocol.json"
+cp "${REPO_ROOT}/docker/sandbox/dependency-cache.mjs" "${FIXTURE}/docker/sandbox/dependency-cache.mjs"
+git -C "${FIXTURE}" init --quiet
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${FIXTURE}/scripts/"
 cp "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" "${FIXTURE}/scripts/testing/"
 cp "${REPO_ROOT}/scripts/test/assert-sandbox-readonly-root.sh" "${FIXTURE}/scripts/"
@@ -182,16 +194,15 @@ echo 'PASS: a cache prefix cannot become a host bind mount'
 run_runtime 'bash check-runtime.sh 2.1.3'
 echo 'PASS: cold dependency preparation and restricted execution'
 
-# A marker in the install volume survives unchanged inputs, then disappears
-# when the real manifest changes and preparation replaces stale dependencies.
-run_runtime 'touch node_modules/reuse-marker'
-run_runtime 'test -f node_modules/reuse-marker && bash check-runtime.sh 2.1.3'
+# Consumers cannot mutate the prepared tree; unchanged inputs reuse its state.
+run_runtime 'cp node_modules/.sandbox-deps-state target/reuse-state; if touch node_modules/reuse-marker; then exit 1; fi'
+run_runtime 'cmp node_modules/.sandbox-deps-state target/reuse-state && bash check-runtime.sh 2.1.3'
 echo 'PASS: warm dependencies are reused'
 
 write_node_manifest 2.1.2
 generate_fixture_locks 'pnpm install --lockfile-only'
-run_runtime 'test ! -e node_modules/reuse-marker && bash check-runtime.sh 2.1.2'
-echo 'PASS: stale dependencies are refreshed before restricted execution'
+run_runtime '! cmp -s node_modules/.sandbox-deps-state target/reuse-state && bash check-runtime.sh 2.1.2'
+echo 'PASS: changed dependencies select a separately prepared tree before restricted execution'
 
 # A frozen-install failure must stop before the caller command. Its side effect
 # would be visible even if the wrapper accidentally masked a command failure.

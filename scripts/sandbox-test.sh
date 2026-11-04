@@ -34,7 +34,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKSPACE_ROOT="${REPO_ROOT}"
-IMAGE_TAG="freshell-sandbox:latest"
+read -r DEPENDENCY_PROTOCOL DEFAULT_IMAGE_TAG DEPENDENCY_CACHE_SUFFIX < <(
+  node -e 'const p=require(process.argv[1]); console.log(p.version,p.image,p.cacheSuffix)' \
+    "${REPO_ROOT}/docker/sandbox/protocol.json"
+)
+IMAGE_TAG="${FRESHELL_SANDBOX_IMAGE:-${DEFAULT_IMAGE_TAG}}"
 CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
 PNPM_STORE_VOLUME="${CACHE_PREFIX}-pnpm-store"
 P2_G01_RUN_ID="${FRESHELL_SANDBOX_P2_G01_RUN_ID:-}"
@@ -432,9 +436,35 @@ PY
     exit 2
   fi
 
+  if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    if [ "${CODEX_NATIVE_CONTRACT}" -eq 1 ]; then
+      echo '[sandbox] prepared Codex contract image is unavailable; connected preparation is required' >&2
+      exit 2
+    fi
+    echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
+    "${REPO_ROOT}/scripts/sandbox-build.sh"
+  fi
+  RESOLVED_IMAGE_ID="$(docker image inspect "${IMAGE_TAG}" --format '{{.Id}}')"
+  OBSERVED_DEPENDENCY_PROTOCOL="$(docker image inspect "${RESOLVED_IMAGE_ID}" \
+    --format '{{index .Config.Labels "com.freshell.sandbox.dependency-protocol"}}')"
+  if [ "${OBSERVED_DEPENDENCY_PROTOCOL}" != "${DEPENDENCY_PROTOCOL}" ]; then
+    printf '{"severity":"error","event":"sandbox_dependency_protocol_mismatch","expected":%s}\n' \
+      "${DEPENDENCY_PROTOCOL}" >&2
+    echo '[sandbox] selected image requires rebuilding with the current sandbox dependency protocol; reprepare custom contract images too' >&2
+    exit 2
+  fi
+
+  DEPENDENCY_FOUNDATION_ID="$(docker image inspect "${RESOLVED_IMAGE_ID}" --format '{{index .Config.Labels "com.freshell.sandbox.dependency-foundation"}}')"
+  if ! [[ "${DEPENDENCY_FOUNDATION_ID}" =~ ^sha256:[a-f0-9]{64}$ ]] || ! [[ "${RESOLVED_IMAGE_ID}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+    printf '{"severity":"error","event":"sandbox_dependency_foundation_missing"}\n' >&2
+    exit 2
+  fi
+  DEPENDENCY_KEY="$(node "${REPO_ROOT}/docker/sandbox/dependency-cache.mjs" --key "${WORKSPACE_ROOT}" "${DEPENDENCY_FOUNDATION_ID}" "${DEPENDENCY_PROTOCOL}")"
+  NODE_MODULES_CACHE_PREFIX="${CACHE_PREFIX}-${DEPENDENCY_CACHE_SUFFIX}-${DEPENDENCY_KEY}"
+
   # Each phase runs the same owned wrapper lifecycle with its own name, CID,
   # guard and completed settlement. Only the fixed preparation has networking.
-  if [ "${STRICT_SANDBOX}" -eq 1 ] && [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
+  if [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ] \
      && [ "${FRESHELL_SANDBOX_DEPENDENCIES_READY:-}" != 1 ]; then
     PREPARATION_PID=""
     PREPARATION_PENDING_SIGNAL=""
@@ -444,7 +474,8 @@ PY
     trap 'preparation_signal INT 130' INT
     trap 'preparation_signal TERM 143' TERM
     trap 'preparation_signal HUP 129' HUP
-    PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'
+    PREPARATION_COMMAND=true
+    if [ "${STRICT_SANDBOX}" -eq 1 ]; then PREPARATION_COMMAND='if [ -f Cargo.lock ]; then cargo fetch --locked; fi'; fi
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
     fi
@@ -469,7 +500,8 @@ PY
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       CALLER_FLAGS+=(--external-browser "${EXTERNAL_DESCRIPTOR_PATH}")
     else
-      CALLER_FLAGS+=(--runtime-suite)
+      if [ "${RUNTIME_SUITE}" -eq 1 ]; then CALLER_FLAGS+=(--runtime-suite); fi
+      if [ "${MOUNT_CORPUS}" -eq 1 ]; then CALLER_FLAGS+=(--corpus); fi
       if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
     fi
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
@@ -560,15 +592,6 @@ PY
     printf '{"severity":"error","event":"sandbox_target_cache_list_failed","volume":"%s"}\n' \
       "${TARGET_CACHE_VOLUME}" >&2
     exit 1
-  fi
-
-  if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
-    if [ "${CODEX_NATIVE_CONTRACT}" -eq 1 ]; then
-      echo '[sandbox] prepared Codex contract image is unavailable; connected preparation is required' >&2
-      exit 2
-    fi
-    echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
-    "${REPO_ROOT}/scripts/sandbox-build.sh"
   fi
 
   # Ordinary destructive tests and the fixed P2-G01 external browser use only
@@ -791,6 +814,9 @@ if { [ "${RUNTIME_SUITE}" -eq 1 ] || [ "${EXTERNAL_BROWSER}" -eq 1 ]; } \
     "${OWNED_CONTAINER_NAME}" "${OWNER_GUARD_PID}" >&2
 fi
 
+NODE_MODULES_ACCESS=ro
+if [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" = 1 ]; then NODE_MODULES_ACCESS=rw; fi
+
 DOCKER_ARGS=(
   # Reap orphaned test children so zombies cannot exhaust the PID limit.
   run --rm --init
@@ -799,20 +825,28 @@ DOCKER_ARGS=(
   --pids-limit 512
   --memory 8g
   -e GIT_OPTIONAL_LOCKS=0
+  -e "FRESHELL_SANDBOX_DEPENDENCY_KEY=${DEPENDENCY_KEY}"
   -v "${WORKSPACE_ROOT}:/workspace"
   -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
   -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
   -v "${PNPM_STORE_VOLUME}:/home/sandbox/.local/share/pnpm/store"
   --mount "type=volume,src=${TARGET_CACHE_VOLUME},dst=/workspace/target,${TARGET_CACHE_LABEL_OPTIONS}"
-  -v "${CACHE_PREFIX}-node-modules:/workspace/node_modules"
+  -v "${NODE_MODULES_CACHE_PREFIX}-node-modules:/workspace/node_modules:${NODE_MODULES_ACCESS}"
   # pnpm workspace members with their own dependencies get their own
   # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
   # changes, purges these only as mounted volumes). On legacy npm-era
   # branches these stay mounted-but-unused and harmless.
-  -v "${CACHE_PREFIX}-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules"
-  -v "${CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules"
+  -v "${NODE_MODULES_CACHE_PREFIX}-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules:${NODE_MODULES_ACCESS}"
+  -v "${NODE_MODULES_CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules:${NODE_MODULES_ACCESS}"
   -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
 )
+
+if [ "${FRESHELL_SANDBOX_PREPARE_ONLY:-}" != 1 ]; then
+  DOCKER_ARGS+=(-e FRESHELL_SANDBOX_DEPENDENCY_READONLY=1)
+else
+  # The installed init forwards cancellation to the synchronous installer too.
+  DOCKER_ARGS+=(-e TINI_KILL_PROCESS_GROUP=1)
+fi
 
 if [ -n "${LINKED_WORKTREE_GIT_COMMON_DIR}" ]; then
   DOCKER_ARGS+=(
@@ -902,7 +936,7 @@ done
 # cargo/rustup PATH entry set via the image's Dockerfile ENV.
 DOCKER_STATUS=0
 sandbox_log info sandbox_workload_started 0
-docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" &
+docker "${DOCKER_ARGS[@]}" "${RESOLVED_IMAGE_ID}" bash -c "${CMD}" &
 DOCKER_CLIENT_PID=$!
 wait "${DOCKER_CLIENT_PID}" || DOCKER_STATUS=$?
 DOCKER_CLIENT_PID=""

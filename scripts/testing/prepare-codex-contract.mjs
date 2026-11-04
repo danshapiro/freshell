@@ -9,12 +9,14 @@ import { spawnSync } from 'node:child_process'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { CODEX_NETWORK_REQUIREMENTS } from '../../test/integration/providers/codex-local-provider.mjs'
+import { dependencyCacheIdentity, dependencyVolumeNames } from '../../docker/sandbox/dependency-cache.mjs'
 
 export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 export const artifactMetadata = JSON.parse(fs.readFileSync(path.join(repoRoot, 'test/fixtures/coding-cli/codex-native-artifact.json'), 'utf8'))
 const stageRoot = path.join(repoRoot, '.runtime-build/codex-contract')
 const stageManifest = path.join(stageRoot, 'staged.json')
-const imageTag = 'freshell-sandbox:latest'
+const dependencyProtocol = JSON.parse(fs.readFileSync(path.join(repoRoot, 'docker/sandbox/protocol.json'), 'utf8'))
+const imageTag = process.env.FRESHELL_SANDBOX_IMAGE || dependencyProtocol.image
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
 const fail = (message) => { throw new Error(`CODEX_CONTRACT_PREREQUISITE: ${message}`) }
 const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value
@@ -206,6 +208,7 @@ async function verifyPrepared() {
   if (manifest.fingerprint !== dependencyFingerprint()) fail('dependency inputs changed since connected warmup')
   const state = await fsp.readFile('/workspace/node_modules/.sandbox-deps-state', 'utf8')
   if (!state.includes(`fingerprint=${manifest.fingerprint}\n`) || !state.includes('manager_version=10.34.5\n')) fail('sandbox dependency cache is absent or stale')
+  if (process.env.FRESHELL_SANDBOX_DEPENDENCY_KEY && !state.includes(`cache_identity=${process.env.FRESHELL_SANDBOX_DEPENDENCY_KEY}\n`)) fail('sandbox prepared dependency identity differs')
   const artifact = await verifyArtifact(manifest.artifactRoot)
   if (manifest.policyClientProbe?.path !== `${manifest.root}/policy-client-probe`) fail('required real-client policy probe is absent or escaped its owned stage')
   await verifyPolicyClientProbe(manifest.policyClientProbe.path, manifest.policyClientProbe.sha256)
@@ -248,10 +251,15 @@ export async function verifySandbox() {
     const observed = JSON.parse(run('docker', ['image', 'inspect', image]))[0]
     if (observed.Id !== image || observed.Config?.Labels?.['org.freshell.codex-contract-owner'] !== manifest.subdir || manifest.contractImage.requirementsSha256 !== digest(CODEX_NETWORK_REQUIREMENTS)) fail('owned Codex test image or system prerequisites changed')
   }
+  const observedProtocol = run('docker', ['image', 'inspect', image, '--format', '{{index .Config.Labels "com.freshell.sandbox.dependency-protocol"}}']).trim()
+  if (observedProtocol !== String(dependencyProtocol.version)) fail('sandbox dependency protocol changed; reprepare the contract image')
+  const foundation = run('docker', ['image', 'inspect', image, '--format', '{{index .Config.Labels "com.freshell.sandbox.dependency-foundation"}}']).trim()
+  const cacheIdentity = dependencyCacheIdentity(repoRoot, foundation, dependencyProtocol.version)
+  const volumes = dependencyVolumeNames('freshell-sandbox', dependencyProtocol.cacheSuffix, cacheIdentity)
   const { name: targetVolume } = verifySandboxTargetCache()
-  for (const volume of ['freshell-sandbox-node-modules', 'freshell-sandbox-sidecar-node-modules', 'freshell-sandbox-mcp-node-modules']) run('docker', ['volume', 'inspect', volume])
+  for (const volume of volumes) run('docker', ['volume', 'inspect', volume])
   const name = `freshcodex-verifier-${randomUUID()}`
-  const args = ['run', '--rm', '--name', name, '--label', `org.freshell.codex-contract=${name}`, '--read-only', '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', `${manifest.uid}:${manifest.gid}`, '--entrypoint', 'node', '-v', `${repoRoot}:/workspace:ro`, '-v', `${targetVolume}:/freshell-test-artifacts:ro`, '-v', 'freshell-sandbox-node-modules:/workspace/node_modules:ro', image, '/workspace/scripts/testing/prepare-codex-contract.mjs', '--verify-prepared']
+  const args = ['run', '--rm', '--init', '--name', name, '--label', `org.freshell.codex-contract=${name}`, '--read-only', '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', `${manifest.uid}:${manifest.gid}`, '--entrypoint', 'node', '-v', `${repoRoot}:/workspace:ro`, '-v', `${targetVolume}:/freshell-test-artifacts:ro`, '-v', `${volumes[0]}:/workspace/node_modules:ro`, '-e', `FRESHELL_SANDBOX_DEPENDENCY_KEY=${cacheIdentity}`, image, '/workspace/scripts/testing/prepare-codex-contract.mjs', '--verify-prepared']
   try { return JSON.parse(run('docker', args, { timeout: 60_000 })) } finally {
     const inspection = spawnSync('docker', ['container', 'inspect', name], { encoding: 'utf8', timeout: 15_000 })
     if (inspection.status === 0) {

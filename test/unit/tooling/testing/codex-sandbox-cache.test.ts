@@ -6,12 +6,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { expect, it } from 'vitest'
 
-function fixture(mode: 'available' | 'missing' | 'foreign' | 'stale-policy') {
+function fixture(mode: 'available' | 'missing' | 'foreign' | 'stale-policy' | 'legacy-protocol') {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'codex-sandbox-cache-'))
   const gitInit = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8', timeout: 10_000 })
   expect(gitInit.status, gitInit.stderr).toBe(0)
   for (const file of [
-    'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs',
+    'scripts/sandbox-test.sh', 'scripts/testing/prepare-codex-contract.mjs', 'docker/sandbox/protocol.json', 'docker/sandbox/dependency-cache.mjs',
     'test/integration/providers/codex-local-provider.mjs',
     'test/fixtures/coding-cli/codex-native-artifact.json', 'docker/runtime/codex-native-sandbox.json',
   ]) {
@@ -26,7 +26,7 @@ function fixture(mode: 'available' | 'missing' | 'foreign' | 'stale-policy') {
   writeFileSync(path.join(root, '.runtime-build/codex-contract/codex-policy.json'), policy.stdout)
   const image = `sha256:${'b'.repeat(64)}`
   writeFileSync(path.join(root, '.runtime-build/codex-contract/staged.json'), JSON.stringify({
-    image, uid: 1000, gid: 1000, nativeSandboxPolicy: { profileSha256: mode === 'stale-policy' ? `sha256:${'0'.repeat(64)}` : `sha256:${createHash('sha256').update(policy.stdout).digest('hex')}` },
+    image, fingerprint: 'f'.repeat(64), uid: 1000, gid: 1000, nativeSandboxPolicy: { profileSha256: mode === 'stale-policy' ? `sha256:${'0'.repeat(64)}` : `sha256:${createHash('sha256').update(policy.stdout).digest('hex')}` },
   }))
   const canonical = spawnSync('bash', ['-c', 'pwd -P'], { cwd: root, encoding: 'utf8', timeout: 10_000 })
   expect(canonical.status, canonical.stderr).toBe(0)
@@ -39,7 +39,7 @@ import fs from 'node:fs';
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FIXTURE_RECEIPT, JSON.stringify(args)+'\\n');
 const volume = ${JSON.stringify(volume)}, labels = ${JSON.stringify(labels)}, mode = ${JSON.stringify(mode)};
-if (args[0] === 'image' && args[1] === 'inspect') console.log(${JSON.stringify(image)});
+if (args[0] === 'image' && args[1] === 'inspect') console.log(args.at(-1).includes('dependency-protocol') ? (mode === 'legacy-protocol' ? '1' : '2') : ${JSON.stringify(image)});
 else if (args[0] === 'volume' && args[1] === 'inspect') {
   const name = args.at(-1);
   if (name === 'freshell-sandbox-cargo-target' || (name === volume && mode === 'missing')) {
@@ -84,10 +84,24 @@ it('verifies native prerequisites in the canonical per-worktree target mounted b
     expect(JSON.parse(result.stdout)).toEqual({ verified: true })
     expect(result.calls).toContainEqual(['volume', 'inspect', f.volume])
     const verifier = result.calls.find(args => args[0] === 'run')!
+    expect(verifier.slice(verifier.indexOf('--entrypoint'), verifier.indexOf('--entrypoint') + 2))
+      .toEqual(['--entrypoint', 'node'])
+    expect(verifier.some(arg => /^freshell-sandbox-dependencies-v2-[a-f0-9]{64}-node-modules:\/workspace\/node_modules:ro$/.test(arg))).toBe(true)
+    expect(verifier.some(arg => /^FRESHELL_SANDBOX_DEPENDENCY_KEY=[a-f0-9]{64}$/.test(arg))).toBe(true)
     expect(verifier).toContain(`${f.volume}:/freshell-test-artifacts:ro`)
     expect(verifier).toContain('--read-only')
     expect(verifier.slice(verifier.indexOf('--network'), verifier.indexOf('--network') + 2)).toEqual(['--network', 'none'])
     expect(result.calls.flat()).not.toContain('freshell-sandbox-cargo-target')
+  } finally { f.cleanup() }
+})
+
+it('refuses a custom image without the dependency lifetime protocol before mounting protected caches', () => {
+  const f = fixture('legacy-protocol')
+  try {
+    const result = f.run(true)
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('sandbox dependency protocol changed; reprepare the contract image')
+    expect(result.calls.some(args => args[0] === 'run')).toBe(false)
   } finally { f.cleanup() }
 })
 
@@ -149,7 +163,8 @@ it('keeps a neighboring Codex Vitest selector on the default sandbox policy', ()
     expect(result.status, result.stderr).toBe(0)
     const runs = result.calls.filter(args => args[0] === 'run')
     const runtime = runs.find(args => args.includes('FRESHELL_SANDBOX_MODE=runtime-suite'))!
-    expect(runtime).toContain('freshell-sandbox:latest')
+    expect(runtime).toContain(f.image)
+    expect(result.calls.some(args => args[0] === 'image' && args.includes('freshell-sandbox:dependencies-v2'))).toBe(true)
     expect(runtime.at(-1)).toBe(neighboringSelector)
     expect(runtime.some(argument => argument.startsWith('seccomp='))).toBe(false)
     expect(runtime).not.toContain('FRESHELL_CODEX_CONTRACT_POLICY=prepared')
