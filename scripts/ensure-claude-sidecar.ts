@@ -7,10 +7,11 @@
  * SDK entrypoint, and the target-platform native package) against a
  * recorded fingerprint of the sidecar manifest, the workspace lockfile,
  * and the workspace config. A current installation returns a readiness
- * receipt without installing anything; a missing or stale installation is
- * repaired with one frozen, sidecar-filtered pnpm install at the workspace
- * root. Failures happen before server spawn and never fall back to a
- * mutable install.
+ * receipt without installing anything. Read-only sandboxes instead reuse the
+ * normal frozen workspace preparation after verifying its current identity
+ * and installed SDK. Ordinary missing or stale installations are repaired
+ * with one frozen, sidecar-filtered pnpm install at the workspace root.
+ * Failures happen before server spawn and never use a mutable install.
  */
 
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
@@ -300,35 +301,27 @@ export function ensureClaudeSidecarDependencies(
 
   const integrity = inspectInstallIntegrity(sidecarDir, platform)
   const fingerprint = computeFingerprint(manifestPath, lockPath, workspacePath)
+  let currentPnpmVersion: string | undefined
 
   if (env.FRESHELL_SANDBOX_DEPENDENCY_READONLY === '1') {
     if (!integrity.ok || fingerprint === undefined) {
       throw new Error(`Cannot use Claude sidecar dependencies in a read-only sandbox: ${integrity.ok ? 'dependency inputs are unreadable' : integrity.reason}`)
     }
-    const pnpmVersion = preparedSandboxPnpmVersion(repoRoot,
+    currentPnpmVersion = preparedSandboxPnpmVersion(repoRoot,
       options.sandboxMetadataDir ?? '/usr/local/share/freshell-sandbox', env)
+  } else if (fingerprint !== undefined) {
+    currentPnpmVersion = readCurrentReceiptPnpmVersion(receiptPath, fingerprint)
+  }
+
+  if (integrity.ok && fingerprint !== undefined && currentPnpmVersion !== undefined) {
     return buildReadyReceipt({
       sidecarDir,
       packageVersion: integrity.sdkVersion,
       installCommand: ['pnpm', ...FROZEN_FILTERED_INSTALL_ARGS],
-      pnpmVersion,
+      pnpmVersion: currentPnpmVersion,
       fingerprint,
       repaired: false,
     })
-  }
-
-  if (integrity.ok && fingerprint !== undefined) {
-    const currentPnpmVersion = readCurrentReceiptPnpmVersion(receiptPath, fingerprint)
-    if (currentPnpmVersion !== undefined) {
-      return buildReadyReceipt({
-        sidecarDir,
-        packageVersion: integrity.sdkVersion,
-        installCommand: ['pnpm', ...FROZEN_FILTERED_INSTALL_ARGS],
-        pnpmVersion: currentPnpmVersion,
-        fingerprint,
-        repaired: false,
-      })
-    }
   }
 
   const selection = detectProjectManager(repoRoot)
