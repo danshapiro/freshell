@@ -423,10 +423,25 @@ impl<'de> serde::de::Visitor<'de> for NativeExport<'_> {
     }
 }
 fn validate_native_artifacts(request: &NativeValidationRequest) -> Result<(), StageError> {
-    validate_native_batch(std::slice::from_ref(request))
+    validate_native_requests(
+        std::slice::from_ref(request),
+        NativeValidationScope::OneSession,
+    )
 }
 
 fn validate_native_batch(requests: &[NativeValidationRequest]) -> Result<(), StageError> {
+    validate_native_requests(requests, NativeValidationScope::CompleteGraph)
+}
+
+enum NativeValidationScope {
+    OneSession,
+    CompleteGraph,
+}
+
+fn validate_native_requests(
+    requests: &[NativeValidationRequest],
+    scope: NativeValidationScope,
+) -> Result<(), StageError> {
     let first = requests
         .first()
         .ok_or("native artifact selection is empty")?;
@@ -469,6 +484,34 @@ fn validate_native_batch(requests: &[NativeValidationRequest]) -> Result<(), Sta
     } else {
         None
     };
+    if matches!(scope, NativeValidationScope::CompleteGraph) {
+        let expected = if let Some(selection) = &selection {
+            selection
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            manifest["rows"]
+                .as_array()
+                .ok_or("native selection missing")?
+                .iter()
+                .filter(|row| row["table"] == "session")
+                .map(|row| {
+                    row["key"][0]["value"]
+                        .as_str()
+                        .ok_or("native session identity missing")
+                })
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+        };
+        let supplied = requests
+            .iter()
+            .map(|request| request.session_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if supplied != expected {
+            return Err("native batch does not cover the complete selected graph".into());
+        }
+    }
     for request in requests {
         validate_native_artifact(request, selection.as_ref())?;
     }
@@ -642,6 +685,10 @@ fn native_artifact_validator_compares_full_parts_and_requires_complete_eof() {
     )
     .unwrap();
     assert!(validate_native_artifacts(&request).is_ok());
+    assert!(
+        validate_native_batch(std::slice::from_ref(&request)).is_ok(),
+        "a complete legacy native batch remains supported"
+    );
     let omitted_info = json!({"id":"ses_one"});
     fs::write(
         &request.info_file,
@@ -851,6 +898,14 @@ fn native_validator_reads_current_producer_payload_without_manifest_rows() {
     )
     .unwrap();
     assert!(validate_native_batch(&[native.clone(), root_native.clone()]).is_ok());
+    assert!(
+        validate_native_artifacts(&root_native).is_ok(),
+        "single-session validation remains supported"
+    );
+    assert!(
+        validate_native_batch(std::slice::from_ref(&root_native)).is_err(),
+        "a complete native batch cannot omit the entire selected child session"
+    );
     fs::write(&root_native.page_files[0], b"[]").unwrap();
     assert!(
         validate_native_batch(&[native.clone(), root_native]).is_err(),

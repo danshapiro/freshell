@@ -156,6 +156,13 @@ export function admitNativeSelection(value: unknown, rootSessionId: string, grap
   return selection.sessions
 }
 
+export function admitNativeReadback(value: unknown, expected: { rootSessionId: string; graphDigest: string; sessionCount: number }): void {
+  const native = value as { rootSessionId?: unknown; graphDigest?: unknown; nativeVersion?: unknown; providerUid?: unknown; providerGid?: unknown; nativeReadableSessionCount?: number } | null
+  if (!native || native.rootSessionId !== expected.rootSessionId || native.graphDigest !== expected.graphDigest || native.nativeVersion !== '1.18.21'
+    || native.providerUid !== 65534 || native.providerGid !== 0 || !Number.isSafeInteger(expected.sessionCount) || expected.sessionCount < 1
+    || native.nativeReadableSessionCount !== expected.sessionCount) throw new Error('actual pinned native graph receipt differs')
+}
+
 export const REAL_NATIVE_READER = `const redactNativeDiagnostic = ${redactNativeDiagnostic.toString()};\nconst nativeExecutionDetails = ${nativeExecutionDetails.toString()};\nconst admitNativeSelection = ${admitNativeSelection.toString()};\n` + String.raw`
 const fs=require('node:fs'),cp=require('node:child_process'),crypto=require('node:crypto'),{Readable}=require('node:stream'),{pipeline}=require('node:stream/promises');
 const [requestFile,resultFile]=process.argv.slice(1),input=JSON.parse(fs.readFileSync(requestFile,'utf8'));
@@ -363,8 +370,7 @@ export async function runRealRootRehearsal(input: { manifestFile: string; scratc
       const nativeOutput = await readNativeRehearsal(harness, owned.containerId, directory,
         { rootSessionId, candidateSha, imageDigest: manifest.imageDigest }, [token])
       const native = JSON.parse(nativeOutput)
-      if (native.rootSessionId !== rootSessionId || native.graphDigest !== root.graphDigest || native.nativeVersion !== '1.18.21'
-        || native.providerUid !== 65534 || native.providerGid !== 0 || native.nativeReadableSessionCount < 1) throw new Error('actual pinned native graph receipt differs')
+      admitNativeReadback(native, { rootSessionId, graphDigest: root.graphDigest, sessionCount })
       // Recheck the complete qualified history after native children settle.
       // The existing current reader admits the pinned native project's normal
       // discovery timestamp refresh while protecting imported history/identity.

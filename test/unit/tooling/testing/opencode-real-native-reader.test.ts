@@ -8,7 +8,7 @@ import { runInNewContext } from 'node:vm'
 import * as stream from 'node:stream'
 import * as streamPromises from 'node:stream/promises'
 import { spawnSync } from 'node:child_process'
-import { admitNativeSelection, readNativeRehearsal, REAL_NATIVE_READER } from '../../../../scripts/testing/opencode-restoration-rehearsal.js'
+import { admitNativeReadback, admitNativeSelection, readNativeRehearsal, REAL_NATIVE_READER } from '../../../../scripts/testing/opencode-restoration-rehearsal.js'
 import type { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 
 // This portable fixture exercises reader control and real streaming filesystem
@@ -90,6 +90,14 @@ async function fixture(mode: 'complete' | 'repeated' | 'empty' | 'failed-cli' | 
 }
 
 describe('streamed complete native-reader lifecycle', () => {
+  it('admits the complete native readback and refuses omitted or extra whole sessions', () => {
+    const expected = { rootSessionId: 'ses_one', graphDigest: 'f'.repeat(64), sessionCount: 2 }
+    const native = { rootSessionId: expected.rootSessionId, graphDigest: expected.graphDigest, nativeVersion: '1.18.21', providerUid: 65534, providerGid: 0, nativeReadableSessionCount: 2 }
+    expect(() => admitNativeReadback(native, expected)).not.toThrow()
+    for (const count of [0, 1, 3, NaN]) {
+      expect(() => admitNativeReadback({ ...native, nativeReadableSessionCount: count }, expected)).toThrow('actual pinned native graph receipt differs')
+    }
+  })
   it('refuses substituted, repeated, absent-root and unbounded native selections', () => {
     const selection = { rootSessionId: 'ses_one', graphDigest: 'f'.repeat(64), sessions: [{ sessionId: 'ses_one', messageCount: 2 }] }
     for (const changed of [null, { ...selection, rootSessionId: 'ses_other' }, { ...selection, graphDigest: 'e'.repeat(64) },
