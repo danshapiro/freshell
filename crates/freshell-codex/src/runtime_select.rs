@@ -36,11 +36,7 @@ pub async fn select_codex_runtime(
     {
         if let Some(record) = reconciler.claim_for_session(session_id).await {
             if plan.require_retained_sidecar {
-                if !record
-                    .terminal_id
-                    .as_deref()
-                    .is_some_and(|id| !id.is_empty())
-                {
+                if record.terminal_id.as_deref().is_none_or(|id| id.is_empty()) {
                     reconciler.return_uncommitted_claim(record);
                     tracing::warn!(
                         event = "codex.retained_sidecar_claim_unqualified",
