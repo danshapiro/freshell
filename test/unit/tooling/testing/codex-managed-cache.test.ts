@@ -14,6 +14,7 @@ function fixture(mode: Mode) {
   const root = mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'codex-managed-cache-'))
   for (const file of [
     'scripts/testing/prepare-codex-contract.mjs', 'test/integration/providers/codex-managed-contract.mjs',
+    'docker/sandbox/dependency-cache.mjs', 'docker/sandbox/protocol.json',
     'test/integration/providers/codex-cli-contract.mjs',
     'test/integration/providers/codex-local-provider.mjs', 'docker/runtime/codex-native-sandbox.json',
   ]) {

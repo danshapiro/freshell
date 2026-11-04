@@ -496,6 +496,14 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       path.resolve(import.meta.dirname, '../../../scripts/sandbox-test.sh'),
       path.join(sharedScriptsDir, 'sandbox-test.sh'),
     )
+    for (const file of ['docker/sandbox/protocol.json', 'docker/sandbox/dependency-cache.mjs']) {
+      const destination = path.join(sharedOwnerRoot, file)
+      fs.mkdirSync(path.dirname(destination), { recursive: true })
+      fs.copyFileSync(path.resolve(import.meta.dirname, '../../..', file), destination)
+    }
+    const dependencyProtocol = JSON.parse(fs.readFileSync(path.join(sharedOwnerRoot, 'docker/sandbox/protocol.json'), 'utf8'))
+    const sandboxImage = `sha256:${'b'.repeat(64)}`
+    const sandboxFoundation = `sha256:${'c'.repeat(64)}`
     writeFixture(path.join(sharedBinDir, 'tsx'), `#!/bin/sh\nexec "${realTsx}" "$@"\n`)
     fs.chmodSync(path.join(sharedBinDir, 'tsx'), 0o755)
     const dockerBinDir = path.join(fixtureRoot, 'fake-docker-bin')
@@ -508,7 +516,19 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
         'import fs from "node:fs"',
         'const args = process.argv.slice(2)',
         'fs.appendFileSync(process.env.DOCKER_ARGS_FILE, JSON.stringify(args) + "\\n")',
-        'if (["volume", "image", "network", "ps"].includes(args[0])) process.exit(0)',
+        `const protocol = ${JSON.stringify(dependencyProtocol)}, image = ${JSON.stringify(sandboxImage)}, foundation = ${JSON.stringify(sandboxFoundation)}`,
+        'if (args[0] === "image" && args[1] === "inspect") {',
+        '  if (![protocol.image, image].includes(args[2])) throw new Error("unexpected fixture image: " + args[2])',
+        '  const format = args[args.indexOf("--format") + 1]',
+        '  const labels = { "com.freshell.sandbox.dependency-protocol": String(protocol.version), "com.freshell.sandbox.dependency-foundation": foundation }',
+        '  if (!args.includes("--format")) console.log(JSON.stringify([{ Id: image, Config: { Labels: labels } }]))',
+        '  else if (format === "{{.Id}}") console.log(image)',
+        '  else if (format.includes("dependency-protocol")) console.log(labels["com.freshell.sandbox.dependency-protocol"])',
+        '  else if (format.includes("dependency-foundation")) console.log(foundation)',
+        '  else throw new Error("unexpected fixture image format: " + format)',
+        '  process.exit(0)',
+        '}',
+        'if (["volume", "network", "ps"].includes(args[0])) process.exit(0)',
         'if (args[0] === "container") process.exit(1)',
         'if (args[0] === "run") { const cidIndex = args.indexOf("--cidfile"); if (cidIndex >= 0) fs.writeFileSync(args[cidIndex + 1], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n"); process.exit(Number(process.env.DOCKER_RUN_STATUS ?? 0)) }',
         'process.exit(0)',
@@ -726,7 +746,10 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   it('uses the shared owner sandbox wrapper to mount the pushed worktree', () => {
     const out = runHookThroughSharedSandbox()
     expect(out.status, out.stderr).toBe(0)
-    const runArgs = out.dockerCalls.find(([operation]) => operation === 'run')
+    const runs = out.dockerCalls.filter(([operation]) => operation === 'run')
+    expect(runs).toHaveLength(2)
+    expect(runs[0].at(-1)).toBe('true')
+    const runArgs = runs[1]
     expect(runArgs).toBeDefined()
     const workspaceMountIndex = runArgs?.indexOf('-v') ?? -1
     expect(workspaceMountIndex).toBeGreaterThanOrEqual(0)
@@ -739,6 +762,15 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
   it('fails the hook when the shared sandbox command fails', () => {
     const out = runHookThroughSharedSandbox(23)
+    const runs = out.dockerCalls.filter(([operation]) => operation === 'run')
+    expect(runs).toHaveLength(2)
+    expect(runs[0].at(-1)).toBe('true')
+    expect(runs[1].at(-1)).toBe(
+      'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws',
+    )
+    expect(out.stderr).toContain('"event":"sandbox_workload_finished"')
+    expect(out.stderr).toContain('"event":"sandbox_workload_failed"')
+    expect(out.stderr).toContain('"code":23')
     expect(out.status).toBe(1)
     expect(out.stderr).toContain('pre-push: FAILED — CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws (sandboxed)')
   })
