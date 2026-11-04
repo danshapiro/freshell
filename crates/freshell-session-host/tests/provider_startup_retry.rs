@@ -36,6 +36,12 @@ fn in_disposable_container(test: &str) -> bool {
     assert!(security.status.success());
     let options: Vec<String> = serde_json::from_slice(&security.stdout).unwrap();
     assert!(options.iter().any(|option| option == "name=rootless"));
+    let sandbox_protocol: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docker/sandbox/protocol.json"))
+            .expect("parse repository sandbox protocol");
+    let sandbox_image = sandbox_protocol["image"]
+        .as_str()
+        .expect("repository sandbox protocol image");
     let name = format!("freshell-startup-retry-{}", uuid::Uuid::new_v4().simple());
     let output = Command::new("docker")
         .args([
@@ -82,7 +88,7 @@ fn in_disposable_container(test: &str) -> bool {
             &format!("{CONTAINER_MARKER}=1"),
             "--entrypoint",
             "/runtime/contract-tests",
-            "freshell-sandbox:latest",
+            sandbox_image,
             "--exact",
             test,
             "--nocapture",
@@ -261,6 +267,7 @@ fn selected_context(provider: &str, destination: &str) -> ProviderLaunchContext 
     ProviderLaunchContext {
         preparation: if provider == "codex" {
             ProviderPreparation::Codex {
+                approval_default: None,
                 tui_args: vec![],
                 sidecar_args: vec![],
             }
