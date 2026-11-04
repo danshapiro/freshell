@@ -201,6 +201,14 @@ const WINDOW_ID = 'client-tv-lifecycle-tests'
 sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 
+// These mocks are shared by every describe block in this file. Keep recovered
+// targets test-local even when suite shuffling runs another describe next.
+beforeEach(() => {
+  restoreMocks.armRecoveredLiveTerminalTarget.mockReset()
+  restoreMocks.consumeRecoveredLiveTerminalTarget.mockReset()
+  restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue(undefined)
+})
+
 describe('isEngagementInput (real-keystroke detection)', () => {
   it('treats printable characters and Enter as engagement', () => {
     expect(isEngagementInput('x')).toBe(true)
@@ -449,9 +457,6 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
-    restoreMocks.armRecoveredLiveTerminalTarget.mockReset()
-    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReset()
-    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue(undefined)
     resetEnsureExtensionsRegistryCacheForTests()
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
@@ -4983,7 +4988,7 @@ describe('TerminalView lifecycle updates', () => {
     }
 
     it('reattaches to the armed live terminal and NEVER dispatches a create', async () => {
-      restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue('t-still-running')
+      restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValueOnce('t-still-running')
 
       const { store, tabId } = setupRecoveredLivePane()
 
