@@ -909,11 +909,17 @@ describe('runtime harness indexed input cleanup', () => {
 })
 
 describe('runtime harness candidate scratch cleanup', () => {
-  it.each(['removed', 'already-gone', 'foreign-label'] as const)(
+  it.each(['removed', 'already-gone', 'foreign-label', 'lost-ack-removed', 'lost-ack-already-gone',
+    'lost-ack-retained', 'lost-ack-readback-reset', 'lost-ack-readback-unavailable',
+    'refused-delete', 'attached', 'server-error', 'refused-ack-reset', 'upstream-reset',
+    'foreign-label-lost-ack'] as const)(
     'removes the Claude candidate scratch volumes the broker saw created: %s', async outcome => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-candidate-cleanup-'))
       const calls: { method: string; url: string }[] = []
+      const localCalls: { method: string; url: string; connection: object }[] = []
+      const expectedSuccess = ['removed', 'already-gone', 'lost-ack-removed', 'lost-ack-already-gone'].includes(outcome)
       let volume: any
+      let relay: http.Server | undefined
       fakeDocker.settled = false
       fakeDocker.commands = []
       const daemon = http.createServer(async (request, response) => {
@@ -929,8 +935,11 @@ describe('runtime harness candidate scratch cleanup', () => {
           response.statusCode = volume ? 200 : 404
           response.end(JSON.stringify(volume ?? {}))
         } else if (request.method === 'DELETE') {
-          response.statusCode = volume ? 204 : 404
-          volume = undefined
+          if (outcome === 'upstream-reset') { request.socket.destroy(); return }
+          response.statusCode = outcome.startsWith('refused') ? 403 : outcome === 'attached' ? 409
+            : outcome === 'server-error' ? 500 : volume ? 204 : 404
+          if (expectedSuccess || outcome === 'lost-ack-readback-reset' || outcome === 'lost-ack-readback-unavailable'
+            || outcome === 'refused-ack-reset') volume = undefined
           response.end()
         } else { response.statusCode = 500; response.end() }
       })
@@ -974,19 +983,65 @@ describe('runtime harness candidate scratch cleanup', () => {
         // The supervisor created the scratch volume; it was removed mid-read
         // (or before its background cleanup ran) and left the volume behind.
         expect(await request('POST', '/v1.47/volumes/create', { Name: name, Driver: 'local', DriverOpts: {}, Labels: labels })).toBe(201)
-        if (outcome === 'already-gone') volume = undefined
-        if (outcome === 'foreign-label') volume.Labels['com.freshell.soul-id'] = 'foreign'
+        if (outcome === 'already-gone' || outcome === 'lost-ack-already-gone') volume = undefined
+        if (outcome.startsWith('foreign-label')) volume.Labels['com.freshell.soul-id'] = 'foreign'
+        if (outcome.includes('lost-ack') || outcome === 'refused-ack-reset') {
+          const actualSocket = broker.proxySocketPath
+          relay = http.createServer((incoming, response) => {
+            localCalls.push({ method: incoming.method!, url: incoming.url!, connection: incoming.socket })
+            if (incoming.method === 'GET' && outcome === 'lost-ack-readback-reset') { incoming.socket.destroy(); return }
+            if (incoming.method === 'GET' && outcome === 'lost-ack-readback-unavailable') { response.writeHead(503); response.end(); return }
+            const outgoing = http.request({ socketPath: actualSocket, path: incoming.url, method: incoming.method,
+              agent: false }, upstream => {
+              const chunks: Buffer[] = []
+              upstream.on('data', chunk => chunks.push(Buffer.from(chunk)))
+              upstream.once('end', () => {
+                if (incoming.method === 'DELETE') {
+                  if (outcome === 'refused-ack-reset') {
+                    response.writeHead(upstream.statusCode!, { 'Content-Length': '10' })
+                    response.write('x')
+                    setImmediate(() => response.destroy())
+                  } else incoming.socket.destroy()
+                  return
+                }
+                response.writeHead(upstream.statusCode!)
+                response.end(Buffer.concat(chunks))
+              })
+            })
+            outgoing.once('error', () => response.destroy())
+            incoming.pipe(outgoing)
+          })
+          const relaySocket = path.join(directory, 'cleanup.sock')
+          await new Promise<void>(resolve => relay!.listen(relaySocket, resolve))
+          // Keep the actual broker and its ownership/settlement lifecycle;
+          // only the local cleanup acknowledgement crosses the fault relay.
+          harness.broker = new Proxy(broker, { get(target, key) {
+            if (key === 'proxySocketPath') return relaySocket
+            const value = Reflect.get(target, key, target)
+            return typeof value === 'function' ? value.bind(target) : value
+          } })
+        }
         const result = await harness.cleanup()
-        expect(result.ok, result.errors.join('\n')).toBe(outcome !== 'foreign-label')
-        expect(volume === undefined).toBe(outcome !== 'foreign-label')
+        expect.soft(result.ok, result.errors.join('\n')).toBe(expectedSuccess)
+        expect(volume === undefined).toBe(expectedSuccess || outcome === 'lost-ack-readback-reset'
+          || outcome === 'lost-ack-readback-unavailable' || outcome === 'refused-ack-reset')
         const deletes = calls.filter(call => call.method === 'DELETE')
-        expect(deletes).toEqual(outcome === 'foreign-label' ? [] : [{ method: 'DELETE', url: `/v1.47/volumes/${name}` }])
-        if (outcome === 'foreign-label') expect(result.errors.join('\n')).toContain(name)
-        else expect(calls.at(-1)).toEqual({ method: 'GET', url: `/v1.47/volumes/${name}` })
+        expect(deletes).toEqual(outcome.startsWith('foreign-label') ? [] : [{ method: 'DELETE', url: `/v1.47/volumes/${name}` }])
+        if (!expectedSuccess) expect(result.errors.join('\n')).toContain(name)
+        if (outcome === 'removed' || outcome === 'already-gone') expect(calls.at(-1)).toEqual({ method: 'GET', url: `/v1.47/volumes/${name}` })
+        if (outcome.includes('lost-ack')) {
+          expect.soft(localCalls.map(({ method, url }) => ({ method, url }))).toEqual([
+            { method: 'DELETE', url: `/v1.47/volumes/${name}` }, { method: 'GET', url: `/v1.47/volumes/${name}` },
+          ])
+          if (localCalls.length === 2) expect(localCalls[1].connection).not.toBe(localCalls[0].connection)
+        }
+        if (outcome === 'refused-ack-reset') expect(localCalls.map(call => call.method)).toEqual(['DELETE'])
         const cleanup = JSON.parse(await fs.readFile(path.join(harness.evidenceDir, 'cleanup.json'), 'utf8'))
         expect(cleanup.volumes).toContain(name)
+        expect(cleanup.ok).toBe(expectedSuccess)
       } finally {
         await broker.close()
+        if (relay) await new Promise<void>(resolve => relay!.close(() => resolve()))
         await new Promise<void>(resolve => daemon.close(() => resolve()))
         await fs.rm(directory, { recursive: true, force: true })
       }

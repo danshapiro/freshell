@@ -3579,10 +3579,9 @@ export class RuntimeHarness {
     for (const broker of brokers) {
       for (const volume of broker.candidateVolumeNames()) {
         try {
-          const url = `/v1.47/volumes/${volume}`
-          const deleted = await brokerRequestStatus(broker.proxySocketPath, 'DELETE', url)
-          if (deleted !== 204 && deleted !== 404) throw new Error('owned candidate volume deletion unavailable')
-          if (await brokerRequestStatus(broker.proxySocketPath, 'GET', url) !== 404) throw new Error('owned candidate volume absence unconfirmed')
+          if (await removeOwnedCandidateVolume(broker.proxySocketPath, volume) === 'reconciled') this.recordLifecycle('runtime.candidate_delete_ack_reconciled', {
+            severity: 'warn', volumeName: volume, transportCode: 'ECONNRESET', verifiedStatus: 404,
+          })
         } catch (error) { errors.push(`candidate volume ${volume}: ${String(error)}`) }
       }
     }
@@ -4802,14 +4801,44 @@ export class RuntimeHarness {
   }
 }
 
-function brokerRequestStatus(socketPath: string, method: 'GET' | 'DELETE', url: string): Promise<number> {
+class BrokerRequestFailure extends Error {
+  readonly code?: string
+  constructor(error: Error, readonly responseStatus?: number) {
+    super(error.message, { cause: error })
+    this.code = (error as NodeJS.ErrnoException).code
+  }
+}
+
+async function removeOwnedCandidateVolume(socketPath: string, volume: string): Promise<'acknowledged' | 'reconciled'> {
+  const url = `/v1.47/volumes/${volume}`
+  let acknowledgement: 'acknowledged' | 'reconciled' = 'acknowledged'
+  try {
+    const deleted = await brokerRequestStatus(socketPath, 'DELETE', url)
+    if (deleted !== 204 && deleted !== 404) throw new Error('owned candidate volume deletion unavailable')
+  } catch (error) {
+    // A reset does not establish the deletion result. A known refusal remains
+    // a failure even if its response body was interrupted.
+    if (!(error instanceof BrokerRequestFailure && error.code === 'ECONNRESET'
+      && (error.responseStatus === undefined || [204, 404].includes(error.responseStatus)))) throw error
+    acknowledgement = 'reconciled'
+  }
+  // Keep the exact broker authority and use a new connection for readback.
+  // This is the existing verification operation, not another DELETE attempt.
+  if (await brokerRequestStatus(socketPath, 'GET', url, true) !== 404) throw new Error('owned candidate volume absence unconfirmed')
+  return acknowledgement
+}
+
+function brokerRequestStatus(socketPath: string, method: 'GET' | 'DELETE', url: string, freshConnection = false): Promise<number> {
   return new Promise((resolve, reject) => {
-    const request = http.request({ socketPath, path: url, method }, response => {
+    let responseStatus: number | undefined
+    const fail = (error: Error) => reject(new BrokerRequestFailure(error, responseStatus))
+    const request = http.request({ socketPath, path: url, method, agent: freshConnection ? false : undefined }, response => {
+      responseStatus = response.statusCode
       response.resume()
-      response.once('error', reject)
+      response.once('error', fail)
       response.once('end', () => resolve(response.statusCode ?? 0))
     })
-    request.once('error', reject)
+    request.once('error', fail)
     request.end()
   })
 }
