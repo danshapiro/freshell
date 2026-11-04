@@ -3737,9 +3737,9 @@ impl Drop for PendingMcpCapability {
     }
 }
 
-/// A web-server restart restores only grants whose exact incarnation remains
-/// live in the supervisor inventory. Recoverable souls retain their private
-/// OpenCode inputs before stale scopes and incarnation stages are revoked.
+/// A web-server restart restores access only for a live exact incarnation.
+/// Recoverable stopped incarnations retain their accepted source generation
+/// with its old access scope disabled until replacement commits or Stop.
 pub(crate) async fn rehydrate_running_capabilities(
     client: &freshell_runtime_client::RuntimeClient,
 ) -> Result<(), String> {
@@ -3747,9 +3747,17 @@ pub(crate) async fn rehydrate_running_capabilities(
         .inventory()
         .await
         .map_err(|error| error.to_string())?;
-    let directory = capability_dir()?;
-    let protected = protected_preparation_ids(&directory)?;
-    for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
+    rehydrate_capabilities(store(), &capability_dir()?, &endpoint()?, &views)
+}
+
+fn rehydrate_capabilities(
+    store: &CapabilityStore,
+    directory: &Path,
+    endpoint: &str,
+    views: &[freshell_runtime_protocol::RuntimeView],
+) -> Result<(), String> {
+    let protected = protected_preparation_ids(directory)?;
+    for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         let Some(grant_id) = path
@@ -3760,7 +3768,7 @@ pub(crate) async fn rehydrate_running_capabilities(
             continue;
         };
         if path.extension().and_then(|extension| extension.to_str()) != Some("json")
-            || grant_path(&capability_dir()?, &grant_id).is_err()
+            || grant_path(directory, &grant_id).is_err()
         {
             continue;
         }
@@ -3777,10 +3785,10 @@ pub(crate) async fn rehydrate_running_capabilities(
                 continue;
             }
         }
-        let stored = read_stored_capability(&directory, &grant_id)?;
+        let stored = read_stored_capability(directory, &grant_id)?;
         if protected.contains(&grant_id) {
-            let current = stored.endpoint == endpoint()? && !stored.scope.is_empty();
-            store().grants.lock().unwrap().insert(
+            let current = stored.endpoint == endpoint && !stored.scope.is_empty();
+            store.grants.lock().unwrap().insert(
                 grant_id.clone(),
                 Grant {
                     soul_id: stored.soul_id,
@@ -3800,10 +3808,10 @@ pub(crate) async fn rehydrate_running_capabilities(
             continue;
         }
         let Some(incarnation_id) = stored.incarnation_id.clone() else {
-            if soul_wants_recovery(&views, &stored.soul_id) {
-                retain_recoverable_inputs(&directory, &stored.soul_id, &grant_id)?;
+            if soul_wants_recovery(views, &stored.soul_id) {
+                retain_recoverable_inputs(directory, &stored.soul_id, &grant_id)?;
             }
-            store().revoke(&grant_id, &directory)?;
+            store.revoke(&grant_id, directory)?;
             continue;
         };
         if !views.iter().any(|view| {
@@ -3812,24 +3820,50 @@ pub(crate) async fn rehydrate_running_capabilities(
                 && view.desired_state == DesiredState::Running
                 && view.launch_state == LaunchState::Running
         }) {
-            if soul_wants_recovery(&views, &stored.soul_id) {
-                retain_recoverable_inputs(&directory, &stored.soul_id, &grant_id)?;
+            let recoverable = views.iter().any(|view| {
+                view.soul_id == stored.soul_id
+                    && view.incarnation_id == incarnation_id
+                    && view.desired_state == DesiredState::Running
+            }) && !views.iter().any(|view| {
+                view.soul_id == stored.soul_id && view.launch_state == LaunchState::Running
+            });
+            if recoverable {
+                // The accepted generation owns source origins used by the
+                // replacement callback. Keep that data through web restart,
+                // while making the stopped execution's access scope inert.
+                // A committed replacement retires this exact prior generation.
+                let grant = Grant {
+                    soul_id: stored.soul_id,
+                    incarnation_id: Some(incarnation_id),
+                    token: String::new(),
+                    expires_at: 0,
+                    endpoint: stored.endpoint,
+                    path,
+                    preparation: stored.preparation,
+                };
+                write_capability(&grant.path, &grant)?;
+                store.grants.lock().unwrap().insert(grant_id.clone(), grant);
+                tracing::info!(
+                    event = "managed_mcp.recovery_sources.retained",
+                    grant_id,
+                    "Retained accepted provider sources with the stopped execution scope disabled"
+                );
+                continue;
             }
-            store().revoke(&grant_id, &directory)?;
+            if soul_wants_recovery(views, &stored.soul_id) {
+                retain_recoverable_inputs(directory, &stored.soul_id, &grant_id)?;
+            }
+            store.revoke(&grant_id, directory)?;
             continue;
         }
-        let grant = restored_grant(stored, incarnation_id, path, &endpoint()?);
+        let grant = restored_grant(stored, incarnation_id, path, endpoint);
         if !grant.token.is_empty() {
             write_capability(&grant.path, &grant)?;
         }
-        store()
-            .grants
-            .lock()
-            .unwrap()
-            .insert(grant_id.clone(), grant);
+        store.grants.lock().unwrap().insert(grant_id.clone(), grant);
     }
-    cleanup_orphaned_provider_roots(&directory)?;
-    cleanup_unrecoverable_inputs(&directory, &views)?;
+    cleanup_orphaned_provider_roots(directory)?;
+    cleanup_unrecoverable_inputs(directory, views)?;
     Ok(())
 }
 
@@ -13237,6 +13271,172 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert!(staged_provider_root_path(&directory, &prior.grant_id)
             .unwrap()
             .is_dir());
+    }
+
+    #[tokio::test]
+    async fn managed_mcp_restart_recovers_exact_prepared_sources_without_old_scope() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let config = home.join(".config/opencode");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            config.join("opencode.json"),
+            r#"{"model":"selected-before-restart"}"#,
+        )
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let first_store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let incarnation = IncarnationId::new();
+        let endpoint = "http://host.docker.internal:4000";
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let mut callback = serde_json::json!({
+            "action":"issue", "controlSecret":"fixture-control", "soulId":soul,
+            "provider":"opencode", "workspace":workspace, "cwd":workspace,
+            "authLookupAuthority":"fixture-owned-attempt", "providerSecretReferences":[]
+        });
+        let first: freshell_runtime_protocol::PreparedProviderContext = serde_json::from_slice(
+            &apply_prepared_callback(
+                &serde_json::to_vec(&callback).unwrap(),
+                "fixture-control",
+                &first_store,
+                &directory,
+                endpoint,
+                &home,
+                &client,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let prior = first
+            .provider_launch_context
+            .mcp_capability
+            .as_ref()
+            .unwrap();
+        first_store
+            .activate(
+                &prior.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        first_store
+            .commit_preparation(&prior.grant_id, &soul, &incarnation, &directory)
+            .unwrap();
+        let old_scope = first_store
+            .grants
+            .lock()
+            .unwrap()
+            .get(&prior.grant_id)
+            .unwrap()
+            .token
+            .clone();
+        assert!(first_store.authenticates(&old_scope));
+        let stopped: freshell_runtime_protocol::RuntimeView = serde_json::from_value(serde_json::json!({
+            "soulId":soul,"incarnationId":incarnation,"launchState":"stopped","cleanupState":"none",
+            "intentRevision":1,"executionGeneration":1,"desiredState":"running","recoveryState":"blocked",
+            "recoveryReason":"CAPABILITY_PENDING","provider":"opencode"
+        })).unwrap();
+        let restarted = CapabilityStore::default();
+        rehydrate_capabilities(&restarted, &directory, endpoint, &[stopped]).unwrap();
+        assert!(
+            !restarted.authenticates(&old_scope),
+            "restart must not reactivate the stopped execution's MCP scope"
+        );
+        std::fs::write(
+            config.join("opencode.json"),
+            r#"{"model":"selected-after-restart"}"#,
+        )
+        .unwrap();
+        callback["priorContext"] = serde_json::to_value(&first.provider_launch_context).unwrap();
+        let mut wrong_owner = callback.clone();
+        wrong_owner["soulId"] = serde_json::to_value(SoulId::new()).unwrap();
+        assert!(apply_prepared_callback(
+            &serde_json::to_vec(&wrong_owner).unwrap(),
+            "fixture-control",
+            &restarted,
+            &directory,
+            endpoint,
+            &home,
+            &client
+        )
+        .await
+        .unwrap_err()
+        .contains("another owner"));
+        let next: freshell_runtime_protocol::PreparedProviderContext = serde_json::from_slice(
+            &apply_prepared_callback(
+                &serde_json::to_vec(&callback).unwrap(),
+                "fixture-control",
+                &restarted,
+                &directory,
+                endpoint,
+                &home,
+                &client,
+            )
+            .await
+            .expect("stopped soul must retain exact accepted source custody through web restart"),
+        )
+        .unwrap();
+        let replacement = next
+            .provider_launch_context
+            .mcp_capability
+            .as_ref()
+            .unwrap();
+        assert_ne!(replacement.grant_id, prior.grant_id);
+        let stage = staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
+        let bind = &next
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .config_binds[0];
+        let selected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stage.join(&bind.source_relative_path)).unwrap())
+                .unwrap();
+        assert_eq!(selected["model"], "selected-after-restart");
+        let bytes = std::fs::read(stage.join(".freshell/prepared-context.json")).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<freshell_runtime_protocol::ProviderLaunchContext>(&bytes)
+                .unwrap(),
+            next.provider_launch_context
+        );
+        let next_incarnation = IncarnationId::new();
+        restarted
+            .activate(
+                &replacement.grant_id,
+                soul.clone(),
+                next_incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        restarted
+            .commit_preparation(&replacement.grant_id, &soul, &next_incarnation, &directory)
+            .unwrap();
+        assert!(!staged_provider_root_path(&directory, &prior.grant_id)
+            .unwrap()
+            .exists());
+        assert!(!restarted.authenticates(&old_scope));
+        let stopped: freshell_runtime_protocol::RuntimeView = serde_json::from_value(serde_json::json!({
+            "soulId":soul,"incarnationId":next_incarnation,"launchState":"stopped","cleanupState":"none",
+            "intentRevision":2,"executionGeneration":1,"desiredState":"stopped","recoveryState":"stopped",
+            "provider":"opencode"
+        })).unwrap();
+        let stopped_store = CapabilityStore::default();
+        rehydrate_capabilities(&stopped_store, &directory, endpoint, &[stopped]).unwrap();
+        assert!(
+            !stage.exists(),
+            "an explicit Stop must not retain a recoverable generation"
+        );
     }
 
     #[tokio::test]

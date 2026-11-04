@@ -14,6 +14,7 @@ import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, pr
 import { authorizeProviderParityRequest, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
+import { selectProviderReplacement, waitForProviderReplacement, type RetryEvent } from '../../helpers/provider-replacement-observation.js'
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'amplifier'
 type RecordRow = { provider: Provider; kind: 'launch' | 'mcp' | 'identity' | 'startup'; [key: string]: any }
@@ -424,6 +425,13 @@ describe('ordinary and managed terminal provider parity', () => {
     const authorization = authorizeProviderParityRequest(rig.runtime.broker, initialProviderSource, requestId)
     registeredVolumes.push({ ...authorization, requestId })
     rig.runtime.writeIncident('provider-parity-registered-requests', registeredVolumes)
+  }
+  async function replacementObservation() {
+    const rows = await rig.inventory()
+    const file = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence/lifecycle.jsonl')
+    const events = (await fs.promises.readFile(file, 'utf8')).split('\n').filter(Boolean)
+      .map(line => JSON.parse(line) as RetryEvent)
+    return { rows, events }
   }
   async function providerOwnedMountEvidence(containerId: string): Promise<unknown> {
     const source = `const fs = require('node:fs')
@@ -962,16 +970,11 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     fs.rmSync(path.join(workspace, '.opencode'), { recursive: true, force: true })
     const editedTui = '{ // changed before replacement\n  "theme": "light"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
+    const controlEpoch = await rig.controlEpoch()
+    const recoveryDeadline = Date.now() + managedLifecycleWaitMs('opencode')
     await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
-    const after = await waitFor('replacement OpenCode incarnation', async () => {
-      const rows = (await rig.inventory()).filter((row: any) => row.terminalId === terminalId)
-      const blocked = rows.find((row: any) => row.recoveryState === 'blocked')
-      if (blocked) {
-        throw new Error(`OpenCode replacement is blocked: ${blocked.recoveryReason}; evidenceRevision=${blocked.evidenceRevision}`)
-      }
-      return rows.find((row: any) => row.launchState === 'running'
-        && row.containerId && row.incarnationId !== before.incarnationId)
-    }, managedLifecycleWaitMs('opencode')).catch(async error => {
+    const after = await waitForProviderReplacement({ ...before, terminalId, controlEpoch },
+      replacementObservation, recoveryDeadline).catch(async error => {
       const inventory = await rig.inventory()
       const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(inventory)}; supervisor logs: ${supervisorLogs}`)
@@ -1092,10 +1095,26 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       return view?.containerId ? view : undefined
     })
     if (!before.containerId) throw new Error('initial OpenCode container missing')
+    const controlEpoch = await rig.controlEpoch()
+    const recoveryFence = { ...before, terminalId, controlEpoch }
+    const recoveryDeadline = Date.now() + managedLifecycleWaitMs('opencode')
     await rig.web.kill()
     const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
     await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
+    const pending = await waitFor('same-fenced OpenCode preparation retry while web is down', async () => {
+      const observation = await replacementObservation()
+      // This validates the typed retry and every fence; genuine blocks throw.
+      selectProviderReplacement(observation.rows, recoveryFence, observation.events)
+      return observation.rows.find(row => row.terminalId === terminalId
+        && row.recoveryState === 'blocked' && row.recoveryReason === 'CAPABILITY_PENDING')
+    }, Math.max(0, recoveryDeadline - Date.now()))
+    expect(pending.incarnationId).toBe(before.incarnationId)
+    rig.runtime.recordLifecycle('provider_parity.preparation_retry_observed', {
+      severity: 'info', soulId: pending.soulId, incarnationId: pending.incarnationId,
+      terminalId, nativeSessionId: pending.nativeSessionId, intentRevision: pending.intentRevision,
+      controlEpoch, recoveryReason: pending.recoveryReason,
+    })
     await rig.restartWebGracefully()
     const recoveredWire = await TerminalWire.connect(rig.info, true)
     sockets.push(recoveredWire)
@@ -1109,15 +1128,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       && frame.reconcileId === reconcileId, 30_000)
     expect(reconcile.verdicts[0].verdict).toBe('attach')
     await recoveredWire.requestAttachOnce(terminalId)
-    const after = await waitFor('replacement after web restart', async () => {
-      const rows = (await rig.inventory()).filter((row: any) => row.terminalId === terminalId)
-      const blocked = rows.find((row: any) => row.recoveryState === 'blocked')
-      if (blocked) {
-        throw new Error(`OpenCode web-restart recovery is blocked: ${blocked.recoveryReason}; evidenceRevision=${blocked.evidenceRevision}`)
-      }
-      return rows.find((row: any) => row.launchState === 'running'
-        && row.containerId && row.incarnationId !== before.incarnationId)
-    }, managedLifecycleWaitMs('opencode'))
+    const after = await waitForProviderReplacement(recoveryFence, replacementObservation, recoveryDeadline)
     expect(after.soulId).toBe(before.soulId)
     await recoveredWire.attach(terminalId)
     const resumed = await waitFor('resumed OpenCode child after web restart', () => recoveredWire.recordRows().find(row => (
