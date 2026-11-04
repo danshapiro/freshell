@@ -462,9 +462,9 @@ git commit -m "fix(freshagent): establish recovered identities under exact owner
 ### Task 4: Every attach settles only its requester on default and managed paths
 
 **Files:**
-- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `crates/freshell-protocol/src/client_messages.rs`, `crates/freshell-protocol/src/server_messages.rs`, `port/contract/ws-protocol.schema.json`, `port/contract/ws-server-messages.schema.json`, `port/contract/ws-message-inventory.json`, `port/contract/managed-runtime.schema.json`, `crates/freshell-ws/src/terminal.rs`, `crates/freshell-ws/src/hosted_fresh_agent.rs`, `crates/freshell-freshagent/src/claude/attach.rs`, `crates/freshell-freshagent/src/codex.rs:7388`, `crates/freshell-freshagent/src/opencode_ws.rs:7221`, `crates/freshell-server/src/fresh_agent_proxy.rs:249`.
+- Modify: `shared/ws-protocol.ts`, `shared/fresh-agent-contract.ts`, `src/lib/ws-client.ts`, `src/lib/fresh-agent-ws.ts`, `src/lib/fresh-agent-view-attachment.ts`, `src/components/fresh-agent/FreshAgentView.tsx`, `crates/freshell-protocol/src/client_messages.rs`, `crates/freshell-protocol/src/server_messages.rs`, `port/contract/ws-protocol.schema.json`, `port/contract/ws-server-messages.schema.json`, `port/contract/ws-message-inventory.json`, `port/contract/managed-runtime.schema.json`, `crates/freshell-ws/src/terminal.rs`, `crates/freshell-ws/src/hosted_fresh_agent.rs`, `crates/freshell-freshagent/src/claude/attach.rs`, `crates/freshell-freshagent/src/codex.rs:7388`, `crates/freshell-freshagent/src/opencode_ws.rs:7221`, `crates/freshell-server/src/fresh_agent_proxy.rs:249`.
 - Create: `crates/freshell-ws/tests/freshagent_multiple_devices.rs`, `tests/common/multiple_devices.rs`.
-- Test: `crates/freshell-ws/tests/freshagent_claude_observers.rs`, `src/hosted_fresh_agent_tests.rs`, `crates/freshell-server/src/fresh_agent_proxy_readiness_tests.rs`, `test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts`.
+- Test: `crates/freshell-ws/tests/freshagent_claude_observers.rs`, `src/hosted_fresh_agent_tests.rs`, `crates/freshell-server/src/fresh_agent_proxy_readiness_tests.rs`, `test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts`, `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, `test/unit/client/lib/ws-client.test.ts`, `test/unit/client/lib/fresh-agent-ws.test.ts`.
 
 **Interfaces:**
 - Consumes: Task 1 requester FrameSink and attachment identity; Task 3 committed owner authority.
@@ -486,6 +486,10 @@ Hosted test: second attach uses its sink for replay/ack/error, keeps exactly one
 poller, and does not replay into A's stream. Legacy attach without request ID
 gets its previous shape on only the requester sink. Browser 'stage2 requester'
 joins mobile during desktop output and checks no peer transcript reset/error.
+Also verify modern attached/attach.failed frames are emitted only after
+freshAgentReconciliationV1 negotiation; unnegotiated and request-ID-free
+legacy callers keep their old event payload shape while receiving attach-only
+frames on their own connection.
 ```
 
 - [ ] **Step 2: Red**
@@ -503,6 +507,13 @@ facts. Thread reply through Codex/OpenCode and hosted gateway; inner attach
 helpers return typed outcomes instead of global errors. Claude retains its
 correct live observer implementation and gains correlation/full refusal owner.
 
+Negotiate freshAgentReconciliationV1 in hello/ready using the existing
+capability machinery. The browser includes a stable requestId for each
+immutable attach decision, reuses it across transport retry, and creates a new
+one when the observed owner decision changes. The server emits the new
+correlated attached/attach.failed frames only to negotiated clients; older or
+unnegotiated clients retain legacy payload parsing and provider semantics.
+
 Fresh_agent_proxy replay_once takes a requester sink and never global send;
 start_poller remains one canonical live broadcaster. Runtime materialization,
 status transitions and real stream events still broadcast. Already-running
@@ -517,6 +528,8 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagen
 Run: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts --grep 'stage2 requester'`
 
 Expected PASS for four modes.
+Also pass the protocol/WS client negotiation tests and confirm a legacy
+connection receives only the prior event shape on its own sink.
 
 - [ ] **Step 5: Refactor**
 
@@ -532,12 +545,14 @@ Run: `pnpm run test:sandbox "cargo test --locked -p freshell-ws --test freshagen
 
 Run: `pnpm run test:sandbox "cargo test --locked -p freshell-server --features managed-runtime-v1 fresh_agent_proxy"`
 
+Run: `pnpm run test:vitest run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --config config/vitest/vitest.config.ts`
+
 Run: `pnpm run typecheck`; expected PASS, plus Step 4 browser selector. These cover all attach dispatch callers and managed gateway routing.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add shared/ws-protocol.ts shared/fresh-agent-contract.ts crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/hosted_fresh_agent.rs crates/freshell-ws/src/hosted_fresh_agent_tests.rs crates/freshell-freshagent/src/claude/attach.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/fresh_agent_proxy_readiness_tests.rs crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/common/multiple_devices.rs crates/freshell-ws/tests/freshagent_claude_observers.rs test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
+git add shared/ws-protocol.ts shared/fresh-agent-contract.ts src/lib/ws-client.ts src/lib/fresh-agent-view-attachment.ts src/components/fresh-agent/FreshAgentView.tsx crates/freshell-protocol/src/client_messages.rs crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/hosted_fresh_agent.rs crates/freshell-ws/src/hosted_fresh_agent_tests.rs crates/freshell-freshagent/src/claude/attach.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-server/src/fresh_agent_proxy_readiness_tests.rs crates/freshell-ws/tests/freshagent_multiple_devices.rs crates/freshell-ws/tests/common/multiple_devices.rs crates/freshell-ws/tests/freshagent_claude_observers.rs test/e2e-browser/specs/fresh-agent-multiple-devices-rust.spec.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/lib/ws-client.test.ts test/unit/client/lib/fresh-agent-ws.test.ts port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/managed-runtime.schema.json
 git commit -m "fix(freshagent): scope attach completion and replay to the requesting view"
 ```
 
@@ -1111,8 +1126,9 @@ Expected FAIL: attach replays globally, sequence is discarded, live/replay race 
 - [ ] **Step 3: Production patch**
 
 ```text
-Negotiate freshAgentReconciliationV1 in hello/ready using existing capability
-machinery. Server chooses per-connection modern envelope or legacy payload.
+Reuse Task 4's freshAgentReconciliationV1 hello/ready negotiation; do not add
+a second capability or handshake. Server chooses per-connection modern
+envelope or legacy payload.
 Store interests by connection/view, canonical locator and adopted source.
 Register before snapshot capture and buffer a bounded live suffix. Capture head,
 page through it on explicit sync requests, then drain strictly greater suffix;
