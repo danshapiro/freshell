@@ -43,6 +43,7 @@ type NativeFixture = {
   runtimeStartCount: (sessionId: string) => number
   stopCount: (sessionId?: string) => number
   readBinding: (sessionId?: string) => Promise<JsonRow>
+  readBootEpoch: () => Promise<number>
   holdNextTurn: (sessionId?: string) => Promise<void>
   releaseTurn: () => Promise<void>
   waitForHeldTurn: (prompt: string, sessionId?: string) => Promise<string>
@@ -55,7 +56,7 @@ export type FreshAgentMultipleDeviceSession = {
   session: { provider: Provider; sessionType: FreshAgentMultipleDeviceMode; sessionId: string }
   frames: { desktop: JsonRow[]; mobile: JsonRow[] }
   openView: (device: 'desktop' | 'mobile', sessionId: string) => Promise<Device>
-  restartWithDeadTerminalBinding: () => Promise<void>
+  restartWithDeadTerminalBinding: (sessionId?: string) => Promise<void>
   restartServer: () => Promise<void>
   close: () => Promise<void>
 }
@@ -130,6 +131,53 @@ async function waitForFreshAgentSessionId(device: Device, timeoutMs = 45_000): P
   return sessionId
 }
 
+async function codexRolloutArtifacts(homeDir: string, sessionId: string): Promise<string[]> {
+  const sessionsDir = path.join(homeDir, '.codex', 'sessions')
+  const matchingFiles: string[] = []
+  const visit = async (directory: string): Promise<void> => {
+    let entries
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    await Promise.all(entries.map(async (entry) => {
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isDirectory()) {
+        await visit(entryPath)
+      } else if (entry.isFile() && entry.name === `rollout-${encodeURIComponent(sessionId)}.jsonl`) {
+        let firstLine: string
+        try {
+          firstLine = (await fs.readFile(entryPath, 'utf8')).split('\n', 1)[0] ?? ''
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+          throw error
+        }
+        let metadata: unknown
+        try {
+          metadata = JSON.parse(firstLine)
+        } catch {
+          return
+        }
+        const record = metadata as { type?: unknown; payload?: { id?: unknown } } | null
+        if (record?.type === 'session_meta' && record.payload?.id === sessionId) {
+          matchingFiles.push(entryPath)
+        }
+      }
+    }))
+  }
+  await visit(sessionsDir)
+  return matchingFiles
+}
+
+async function waitForCodexRolloutArtifact(homeDir: string, sessionId: string): Promise<void> {
+  await expect.poll(() => codexRolloutArtifacts(homeDir, sessionId), {
+    timeout: 30_000,
+    message: `the exact Codex rollout for ${sessionId} exists before the test restarts the server`,
+  }).toHaveLength(1)
+}
+
 async function enableCli(page: Page, provider: Provider): Promise<void> {
   await page.evaluate((currentProvider) => {
     window.__FRESHELL_TEST_HARNESS__?.dispatch({
@@ -179,7 +227,17 @@ function appendFrame(frames: JsonRow[], direction: 'sent' | 'received', payload:
   try {
     const frame: unknown = JSON.parse(payload)
     if (frame && typeof frame === 'object' && !Array.isArray(frame)) {
-      frames.push({ direction, ...(frame as JsonRow) })
+      const row = frame as JsonRow
+      const timestamped = row.type === 'ready'
+        || row.type === 'pane.reconcile.request'
+        || row.type === 'pane.reconcile.result'
+        || row.type === 'freshAgent.attach'
+        || row.type === 'freshAgent.create'
+        || row.type === 'freshAgent.created'
+        || row.type === 'freshAgent.create.failed'
+        || row.type === 'session.runtimeOwner'
+        || row.type === 'freshAgent.event'
+      frames.push({ direction, ...(timestamped ? { capturedAtMs: Date.now() } : {}), ...row })
     }
   } catch {
     // Ignore non-JSON WebSocket frames.
@@ -568,6 +626,14 @@ function nativeFixture(input: {
       )
       return JSON.parse(await fs.readFile(bindingPath, 'utf8')) as JsonRow
     },
+    readBootEpoch: async () => {
+      const bootEpochPath = path.join(input.info.homeDir, '.freshell', 'pane-ledger', 'boot-epoch.json')
+      const bootEpoch = JSON.parse(await fs.readFile(bootEpochPath, 'utf8')) as JsonRow
+      if (typeof bootEpoch.epoch !== 'number' || !Number.isInteger(bootEpoch.epoch) || bootEpoch.epoch < 0) {
+        throw new Error(`expected a persisted server boot epoch, got ${JSON.stringify(bootEpoch)}`)
+      }
+      return bootEpoch.epoch
+    },
     holdNextTurn: async (sessionId = input.sessionId) => {
       heldPromptSessionId = sessionId
       heldPromptCountBefore = heldPromptCount(sessionId)
@@ -760,6 +826,13 @@ async function startTwoDeviceSession(
     await sendComposerText(desktop.page, 'stage1 warm session for multiple devices')
     await waitForPaneStatus(desktop, 'idle')
     const sessionId = await waitForFreshAgentSessionId(desktop)
+    if (mode === 'freshcodex') {
+      // Pane idle can still reflect the pre-turn snapshot while native startup
+      // is completing. Reconciliation after a restart requires this exact
+      // session's durable rollout, so make its presence an explicit
+      // happens-before condition instead of assuming the idle status proves it.
+      await waitForCodexRolloutArtifact(info.homeDir, sessionId)
+    }
     session = { provider, sessionType: mode, sessionId }
 
     const mobileSession = await openFreshAgentView(mobileOpen, sessionId, provider, mode, projectDir)
@@ -788,13 +861,13 @@ async function startTwoDeviceSession(
         const view = await openFreshAgentView(target, viewSessionId, provider, mode, projectDir)
         return { ...target, ...view }
       },
-      restartWithDeadTerminalBinding: async () => {
+      restartWithDeadTerminalBinding: async (sessionIdForRecovery = session.sessionId) => {
         if (!server) throw new Error('the owned Rust server is unavailable')
         const priorInfo = info
         // Kill only this fixture's owned process tree, edit its durable row
         // while the index is closed, and boot the same home/port/token again.
         await server.kill()
-        await seedDeadTerminalBinding(priorInfo, provider, sessionId)
+        await seedDeadTerminalBinding(priorInfo, provider, sessionIdForRecovery)
         server = new RustServer({
           env,
           homeDir: priorInfo.homeDir,

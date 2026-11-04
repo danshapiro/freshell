@@ -583,6 +583,18 @@ pub trait PaneIdentitySink: Send + Sync {
         session_id: &str,
     ) -> SinkTakeTurnInterruptedWrite;
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings>;
+    /// Recover settings while a current Starting or Handoff FreshAgent claim
+    /// owns this identity. Implementations may use this narrowly to read a
+    /// historical terminal binding after the caller's dead-terminal admission;
+    /// ordinary settings reads remain gated to FreshAgent rows. A sink without
+    /// access to authoritative ownership state must fail closed here; callers
+    /// use `load_settings` separately for ordinary FreshAgent rows.
+    fn load_settings_for_recovery_claim(
+        &self,
+        _claim: &BindingClaim,
+    ) -> Option<FreshAgentSettings> {
+        None
+    }
     /// The fresh-agent binding row's genesis (claude core design §4.1), bound
     /// or retired; `None` when it has none or there is no fresh-agent row.
     /// Memory-only.
@@ -2852,6 +2864,34 @@ impl PaneIdentitySink for FakeIdentitySink {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn starting_claim_settings_recovery_fails_closed_without_registry_verification() {
+        let sink = FakeIdentitySink::default();
+        sink.seed(
+            "codex",
+            "thread-claim-settings",
+            FreshAgentSettings {
+                model: Some("remembered-model".into()),
+                ..FreshAgentSettings::default()
+            },
+        );
+        let unverified_claim = BindingClaim {
+            provider: "codex".into(),
+            session_id: "thread-claim-settings".into(),
+            operation_id: "unverified-start".into(),
+            epoch: 1,
+            generation: 1,
+            kind: BindingClaimKind::Starting,
+        };
+
+        assert!(sink
+            .load_settings("codex", "thread-claim-settings")
+            .is_some());
+        assert!(sink
+            .load_settings_for_recovery_claim(&unverified_claim)
+            .is_none());
+    }
 
     fn starting_ticket(
         registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,

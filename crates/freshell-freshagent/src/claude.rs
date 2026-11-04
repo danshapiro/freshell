@@ -5434,9 +5434,25 @@ impl FreshClaudeState {
         // PROVES prior recording yet no snapshot is recoverable. Never-recorded
         // transcripts (the entire pre-existing ~/.claude/projects population —
         // resume_for_attach exists FOR them) stay silent.
+        let recovery_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| handoff_claim.clone());
         let recovered = sink
             .as_ref()
             .and_then(|s| s.load_settings("claude", durable))
+            .or_else(|| {
+                sink.as_ref().and_then(|s| {
+                    recovery_claim
+                        .as_ref()
+                        .and_then(|claim| s.load_settings_for_recovery_claim(claim))
+                })
+            })
             .or_else(|| dead.as_ref().map(|dead| dead.settings.clone()));
         if recovered.is_none()
             && sink
@@ -16254,7 +16270,7 @@ pub(crate) mod tests {
         write_fake_transcript(home.path(), DURABLE);
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
 
-        let (state, _rx) = state_with_bus();
+        let (state, mut rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         fake.seed(
             "claude",
@@ -16276,6 +16292,22 @@ pub(crate) mod tests {
             .attach_for_test(attach_msg_with_resume("client-nanoid-settings", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let metadata = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let raw = rx.recv().await.expect("the test bus remains open");
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.metadata"
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("a cold attach publishes its recovered settings to every view");
+        assert_eq!(metadata["event"]["model"], "opus-x");
+        assert_eq!(metadata["event"]["effort"], "high");
 
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         let create_req: serde_json::Value =

@@ -25,6 +25,7 @@ import {
   applyFreshAgentReconcileAttach,
   requestPaneRefresh,
   resetFreshAgentPaneForReconcileCreate,
+  setReconcilePendingPanes,
   startNewManagedRuntimeConversation,
   setActivePane,
   setPaneHandoffError,
@@ -17922,6 +17923,118 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     expect(sentFreshAgentMessages('freshAgent.attach')[1]).toMatchObject({
       observedEpoch: 2, observedGeneration: 1,
     })
+  })
+
+  it('coalesces a live-owner attach with the pending reconcile result for that same view and fence', async () => {
+    const store = createStore()
+    const sid = 'thread-owner-commit-reconcile-overlap'
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionId: sid, sessionRef: { provider: 'codex', sessionId: sid },
+    }) }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+
+    const owner = { type: 'session.runtimeOwner' as const, provider: 'codex' as const, sessionId: sid,
+      epoch: 3, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'overlap-owner' }
+    act(() => store.dispatch(setReconcilePendingPanes({ paneKeys: ['tab-1:pane-1'], startedAt: 700 })))
+    act(() => store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-started' as const })))
+    act(() => store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-committed' as const })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      sessionId: sid, observedEpoch: 3, observedGeneration: 1,
+    })
+
+    // The result completes the already-pending reconcile decision. Its fold
+    // must not emit a second attach for the same target and committed fence.
+    act(() => store.dispatch(applyFreshAgentReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1',
+      sessionRef: { provider: 'codex', sessionId: sid }, serverInstanceId: 'overlap-server',
+    })))
+    await waitFor(() => expect(getFreshAgentPaneContent(store).reconcileEpoch).toBe(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+
+    // A later reconcile is a distinct decision, even with the same target
+    // and owner fence, and still gets its own one attachment.
+    act(() => store.dispatch(setReconcilePendingPanes({ paneKeys: ['tab-1:pane-1'], startedAt: 701 })))
+    act(() => store.dispatch(applyFreshAgentReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1',
+      sessionRef: { provider: 'codex', sessionId: sid }, serverInstanceId: 'overlap-server',
+    })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    expect(sentFreshAgentMessages('freshAgent.attach')[1]).toMatchObject({
+      sessionId: sid, observedEpoch: 3, observedGeneration: 1,
+    })
+  })
+
+  it('does not coalesce an owner attach with a reconcile decision that started afterward', async () => {
+    const store = createStore()
+    const sid = 'thread-owner-attach-later-reconcile'
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionId: sid, sessionRef: { provider: 'codex', sessionId: sid },
+    }) }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    wsMock.send.mockClear()
+
+    const owner = { type: 'session.runtimeOwner' as const, provider: 'codex' as const, sessionId: sid,
+      epoch: 3, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'later-reconcile-owner' }
+    act(() => store.dispatch(setReconcilePendingPanes({ paneKeys: ['tab-1:pane-1'], startedAt: 800 })))
+    act(() => store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-started' as const })))
+    act(() => store.dispatch(applyRuntimeOwner({ ...owner, transition: 'handoff-committed' as const })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+
+    // This pending marker belongs to a new reconciliation request that began
+    // after the owner-triggered attach. It must not be consumed as the request
+    // that was already in flight when that attach was sent.
+    act(() => store.dispatch(setReconcilePendingPanes({ paneKeys: ['tab-1:pane-1'], startedAt: 801 })))
+    act(() => store.dispatch(applyFreshAgentReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1',
+      sessionRef: { provider: 'codex', sessionId: sid }, serverInstanceId: 'later-reconcile-server',
+    })))
+    await waitFor(() => expect(getFreshAgentPaneContent(store).reconcileEpoch).toBe(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2)
+    expect(sentFreshAgentMessages('freshAgent.attach')[1]).toMatchObject({
+      sessionId: sid, observedEpoch: 3, observedGeneration: 1,
+    })
+  })
+
+  it('coalesces a generic connection attach with the pending reconcile result when the owner is already live', async () => {
+    const store = createStore()
+    const sid = 'thread-live-owner-reconcile-overlap'
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionId: sid, sessionRef: { provider: 'codex', sessionId: sid },
+    }) }))
+    const owner = { type: 'session.runtimeOwner' as const, provider: 'codex' as const, sessionId: sid,
+      epoch: 3, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'already-live-owner',
+      transition: 'handoff-committed' as const }
+    store.dispatch(applyRuntimeOwner(owner))
+    store.dispatch(setReconcilePendingPanes({ paneKeys: ['tab-1:pane-1'], startedAt: 900 }))
+
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      sessionId: sid, observedEpoch: 3, observedGeneration: 1,
+    })
+
+    // The mount/rebind sender has already attached this live owner while
+    // the same view is waiting on reconcile. Its matching result must not
+    // send a second time for the same pending decision.
+    act(() => store.dispatch(applyFreshAgentReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1',
+      sessionRef: { provider: 'codex', sessionId: sid }, serverInstanceId: 'live-owner-server',
+    })))
+    await waitFor(() => expect(getFreshAgentPaneContent(store).reconcileEpoch).toBe(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+
+    // The one-shot marker is scoped to that reconcile decision; a later
+    // pending request with the same target and fence still gets an attach.
+    act(() => store.dispatch(setReconcilePendingPanes({ paneKeys: ['tab-1:pane-1'], startedAt: 901 })))
+    act(() => store.dispatch(applyFreshAgentReconcileAttach({
+      tabId: 'tab-1', paneId: 'pane-1',
+      sessionRef: { provider: 'codex', sessionId: sid }, serverInstanceId: 'live-owner-server',
+    })))
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
   })
 
   it('preserves the first authoritative fence after a respawn created reply attached without one', async () => {

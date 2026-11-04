@@ -7996,6 +7996,18 @@ impl FreshOpencodeState {
             &status_session_id,
             snapshot_event(&status_session_id, status),
         ));
+        let (model, effort) = {
+            let session = session_arc.lock().await;
+            (session.model.clone(), session.effort.clone())
+        };
+        self.broadcast(&crate::session_metadata::session_metadata_frame(
+            PROVIDER,
+            SESSION_TYPE,
+            &status_session_id,
+            model.as_deref(),
+            effort.as_deref(),
+            None,
+        ));
         // b8ke ext r12 F2: the existing-session attach's window CLOSES
         // here — the guard covered the bridge restart + the attach tail
         // through completion.
@@ -8143,6 +8155,26 @@ impl FreshOpencodeState {
             }
         };
 
+        let binding_claim = own_ticket
+            .as_ref()
+            .and_then(|ticket| {
+                crate::identity_sink::BindingClaim::from_ticket(
+                    ticket,
+                    crate::identity_sink::BindingClaimKind::Starting,
+                )
+            })
+            .or_else(|| {
+                let (operation_id, generation) = handoff?;
+                let registry = self.fresh_agent.ownership.as_ref()?;
+                Some(crate::identity_sink::BindingClaim::handoff(
+                    PROVIDER,
+                    session_id,
+                    operation_id,
+                    registry.boot_epoch(),
+                    generation,
+                ))
+            });
+
         // V5 caveat (b): `RequestOptions.timeout` defaults to `None`, so a
         // wedged-but-accepting `opencode serve` would hang this await forever and hold
         // the sessionRef reserved until restart. Bound it (env-tunable for tests) —
@@ -8188,7 +8220,14 @@ impl FreshOpencodeState {
         let sink = self.identity_sink();
         let recovered = sink
             .as_ref()
-            .and_then(|s| s.load_settings(PROVIDER, session_id));
+            .and_then(|s| s.load_settings(PROVIDER, session_id))
+            .or_else(|| {
+                sink.as_ref().and_then(|s| {
+                    binding_claim
+                        .as_ref()
+                        .and_then(|claim| s.load_settings_for_recovery_claim(claim))
+                })
+            });
         if recovered.is_none()
             && sink
                 .as_ref()
@@ -8246,28 +8285,6 @@ impl FreshOpencodeState {
                 .and_then(|s| s.load_provenance(PROVIDER, session_id))
         });
         let session_arc = session_cell(session);
-        // Capture the exact operation before any commit can change coordinator
-        // state. A normal cold resume owns Starting; a handoff continuation
-        // carries the runner's exact Handoff identity.
-        let binding_claim = own_ticket
-            .as_ref()
-            .and_then(|ticket| {
-                crate::identity_sink::BindingClaim::from_ticket(
-                    ticket,
-                    crate::identity_sink::BindingClaimKind::Starting,
-                )
-            })
-            .or_else(|| {
-                let (operation_id, generation) = handoff?;
-                let registry = self.fresh_agent.ownership.as_ref()?;
-                Some(crate::identity_sink::BindingClaim::handoff(
-                    PROVIDER,
-                    session_id,
-                    operation_id,
-                    registry.boot_epoch(),
-                    generation,
-                ))
-            });
         let binding_epoch = binding_claim.as_ref().map(|claim| claim.epoch);
         let binding_generation = binding_claim.as_ref().map(|claim| claim.generation);
         let mut binding_guard = Some(self.registered_binding_guard(
@@ -15732,7 +15749,7 @@ mod tests {
     #[tokio::test]
     async fn resume_durable_session_reapplies_settings_from_ledger() {
         // Same RealisticServeHttp harness as the donor test.
-        let (state, _rx) = state_with_durable_serve_session().await;
+        let (state, mut rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         fake.seed(
             "opencode",
@@ -15765,6 +15782,19 @@ mod tests {
             Some("/real/project"),
             "cwd from the record, not the attach message"
         );
+        drop(s);
+        drop(sessions);
+
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.metadata"
+            })
+            .expect("a cold attach publishes its recovered settings to every view");
+        assert_eq!(metadata["event"]["model"], "big-model");
+        assert_eq!(metadata["event"]["effort"], "high");
     }
 
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2), the tombstone
