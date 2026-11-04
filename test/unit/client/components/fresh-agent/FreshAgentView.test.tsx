@@ -4181,6 +4181,23 @@ describe('FreshAgentView', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
 
+      const reconnectAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
+      expect(reconnectAttach).toMatchObject({ requestId: expect.any(String), viewId: expect.any(String) })
+      act(() => {
+        for (const listener of [...freshAgentMessageListeners]) {
+          listener({
+            type: 'freshAgent.attached',
+            requestId: reconnectAttach!.requestId,
+            viewId: reconnectAttach!.viewId,
+            provider: 'opencode',
+            sessionType: 'freshopencode',
+            sessionId,
+            status: 'idle',
+            snapshot: { type: 'freshAgent.session.snapshot', sessionId, status: 'idle' },
+          })
+        }
+      })
+
       view.rerender(
         <Provider store={store}>
           <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
@@ -4193,8 +4210,10 @@ describe('FreshAgentView', () => {
       expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
       expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
 
-      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(16_000) })
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     } finally {
       cleanup()
       resetSnapshotSchedulerForTests()
@@ -11003,6 +11022,8 @@ describe('FreshAgentView', () => {
     const attachB = attachFor('view-b')
     expect(attachA.requestId).not.toBe(attachB.requestId)
 
+    // Default providers emit SESSION_RESERVED through freshAgent.error without
+    // a retryable flag; the correlated attach result keeps that wire shape.
     act(() => {
       for (const listener of [...freshAgentMessageListeners]) {
         listener({
@@ -11015,7 +11036,6 @@ describe('FreshAgentView', () => {
           status: 'failed',
           code: 'SESSION_RESERVED',
           message: 'retry after the current lifecycle operation',
-          retryable: true,
         })
       }
     })
@@ -11041,7 +11061,47 @@ describe('FreshAgentView', () => {
           status: 'failed',
           code: 'SESSION_RESERVED',
           message: 'stale attach response',
+        })
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 1_050))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(newerDecisionCount + 1)
+
+    const currentAttachB = sentFreshAgentMessages('freshAgent.attach').filter((message) => message.viewId === 'view-b').at(-1)!
+    act(() => {
+      for (const listener of [...freshAgentMessageListeners]) {
+        listener({
+          type: 'freshAgent.attach.failed',
+          requestId: currentAttachB.requestId,
+          viewId: currentAttachB.viewId,
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          sessionId: snapshot.threadId,
+          status: 'failed',
+          code: 'SESSION_RESERVED',
+          message: 'a terminal owns this session',
           retryable: true,
+          ownerKind: 'terminal',
+        })
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 1_050))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(newerDecisionCount + 1)
+
+    act(() => {
+      for (const listener of [...freshAgentMessageListeners]) {
+        listener({
+          type: 'freshAgent.attach.failed',
+          requestId: currentAttachB.requestId,
+          viewId: currentAttachB.viewId,
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          sessionId: snapshot.threadId,
+          status: 'failed',
+          code: 'SESSION_RESERVED',
+          message: 'the reservation is not retryable',
+          retryable: false,
+          ownerKind: 'fresh-agent',
         })
       }
     })

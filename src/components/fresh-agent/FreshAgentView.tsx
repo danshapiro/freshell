@@ -2058,12 +2058,13 @@ export function FreshAgentView({
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
 
-  const markSnapshotDirty = useCallback((cause: 'reconnect' | 'transcript' | 'send-accepted') => {
+  const markSnapshotDirty = useCallback((cause: 'reconnect' | 'attach' | 'transcript' | 'send-accepted') => {
+    const requiresRevisionAdvance = cause === 'transcript' || cause === 'send-accepted'
     if (!snapshotDirtyRef.current) {
       const revision = snapshotRef.current?.revision
       snapshotDirtyBaseRevisionRef.current = typeof revision === 'number' ? revision : null
-      snapshotDirtyRequiresRevisionAdvanceRef.current = cause !== 'reconnect'
-    } else if (cause !== 'reconnect') {
+      snapshotDirtyRequiresRevisionAdvanceRef.current = requiresRevisionAdvance
+    } else if (requiresRevisionAdvance) {
       snapshotDirtyRequiresRevisionAdvanceRef.current = true
     }
     snapshotDirtyVersionRef.current += 1
@@ -3500,8 +3501,10 @@ export function FreshAgentView({
       if (message.type === 'freshAgent.attached' && attachResultMatchesCurrentView(message)) {
         // The attach result is the requesting view's acknowledgement that its
         // snapshot is current. A visible pane retries a failed/stale read now;
-        // a hidden pane waits until reveal and then fetches once.
-        if (hiddenRef.current) markSnapshotDirty('transcript')
+        // a hidden pane waits until reveal and then fetches once. Attachment
+        // refreshes observation, but by themselves they do not prove the
+        // durable transcript advanced beyond the revision already displayed.
+        if (hiddenRef.current) markSnapshotDirty('attach')
         else requestSnapshotRefresh('event')
       }
       if (message.type === 'freshAgent.attach.failed') {
@@ -3520,9 +3523,11 @@ export function FreshAgentView({
             ownerGeneration: message.ownerGeneration,
           }))
         }
-        if (message.ownerKind !== 'terminal' && message.code === 'SESSION_RESERVED' && message.retryable) {
+        if (message.ownerKind !== 'terminal' && message.code === 'SESSION_RESERVED' && message.retryable !== false) {
           // A transient reservation re-drives only the matching view's
-          // immutable attach decision.
+          // immutable attach decision. Default provider attach refusals keep
+          // the legacy shape, which omits retryable; an explicit false still
+          // prevents re-drive.
           redriveAfterSessionReserved()
         } else {
           setNotice(message.message || 'The conversation could not be attached.')

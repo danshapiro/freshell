@@ -213,6 +213,17 @@ impl AttachOutcome {
                     owner,
                     legacy_messages,
                 } => {
+                    // Keep an earlier replay snapshot in place when a later
+                    // state-changing frame follows it. Moving it into the
+                    // final ack would reapply old state after newer events.
+                    let preserve_snapshot_order = snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot_has_later_state_change(&legacy_messages, snapshot)
+                    });
+                    let (status, snapshot) = if preserve_snapshot_order {
+                        ("unknown".to_string(), None)
+                    } else {
+                        (status, snapshot)
+                    };
                     let session_id =
                         resolved_session_id(attach, snapshot.as_ref(), &legacy_messages);
                     let session_ref = Some(SessionLocator {
@@ -323,20 +334,14 @@ fn resolved_session_id(
 }
 
 /// Preserve requester-only companion frames such as durable re-key and
-/// effective settings while folding the chosen snapshot/error into the one
-/// correlated result. Historical snapshots remain ordered before the final
-/// acknowledgement, which carries the latest one.
+/// effective settings. The selected snapshot is folded into the correlated
+/// result only when later replay frames cannot change its state.
 fn attach_side_messages(
     messages: &[ServerMessage],
     snapshot: Option<&Value>,
     settlement_failure: Option<&AttachFailure>,
 ) -> Vec<ServerMessage> {
-    let snapshot_index = snapshot.and_then(|snapshot| {
-        messages.iter().rposition(|message| match message {
-            ServerMessage::FreshAgentEvent(FreshAgentEvent { event, .. }) => event == snapshot,
-            _ => false,
-        })
-    });
+    let snapshot_index = snapshot.and_then(|snapshot| replay_snapshot_index(messages, snapshot));
     // Providers enrich the typed outcome with the current owner after
     // capturing its settlement event. Match its stable error identity and
     // remove the last matching event, since an operation's settlement follows
@@ -359,6 +364,31 @@ fn attach_side_messages(
             Some(message.clone())
         })
         .collect()
+}
+
+fn replay_snapshot_index(messages: &[ServerMessage], snapshot: &Value) -> Option<usize> {
+    messages.iter().rposition(|message| match message {
+        ServerMessage::FreshAgentEvent(FreshAgentEvent { event, .. }) => event == snapshot,
+        _ => false,
+    })
+}
+
+fn snapshot_has_later_state_change(messages: &[ServerMessage], snapshot: &Value) -> bool {
+    let Some(snapshot_index) = replay_snapshot_index(messages, snapshot) else {
+        return false;
+    };
+    messages
+        .iter()
+        .skip(snapshot_index + 1)
+        .any(|message| !is_snapshot_safe_trailing_frame(message))
+}
+
+fn is_snapshot_safe_trailing_frame(message: &ServerMessage) -> bool {
+    matches!(
+        message,
+        ServerMessage::FreshAgentEvent(FreshAgentEvent { event, .. })
+            if event.get("type").and_then(Value::as_str) == Some("freshAgent.session.metadata")
+    )
 }
 
 fn failure_matches(message: &ServerMessage, failure: &AttachFailure) -> bool {
@@ -652,6 +682,115 @@ mod tests {
                 if attached.request_id == "attach-9"
                     && attached.snapshot.as_ref() == Some(&latest_snapshot)
         ));
+    }
+
+    #[test]
+    fn modern_replay_keeps_an_earlier_snapshot_before_later_errors() {
+        let running_snapshot = snapshot("native-session", "running");
+        let warning = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: serde_json::json!({
+                "type": "freshAgent.error",
+                "sessionId": "native-session",
+                "code": "PROVIDER_WARNING",
+                "message": "an earlier retained warning",
+            }),
+            provider: "claude".into(),
+            session_id: "native-session".into(),
+            session_type: "freshclaude".into(),
+        });
+        let hard_error = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: serde_json::json!({
+                "type": "freshAgent.error",
+                "sessionId": "native-session",
+                "code": "PROVIDER_ERROR",
+                "message": "the retained session is no longer available",
+            }),
+            provider: "claude".into(),
+            session_id: "native-session".into(),
+            session_type: "freshclaude".into(),
+        });
+        let outcome = AttachOutcome::attached_from_replay_for_session(
+            Some("native-session"),
+            vec![
+                running_snapshot.clone(),
+                warning.clone(),
+                hard_error.clone(),
+            ],
+        );
+
+        let messages = AttachOutcome::requester_messages(&attach(Some("attach-order")), outcome);
+
+        assert_eq!(
+            messages.len(),
+            4,
+            "one settlement follows the ordered replay: {messages:?}"
+        );
+        assert_eq!(messages[0], running_snapshot);
+        assert_eq!(messages[1], warning);
+        assert_eq!(messages[2], hard_error);
+        assert!(matches!(
+            &messages[3],
+            ServerMessage::FreshAgentAttached(attached)
+                if attached.request_id == "attach-order"
+                    && attached.status == "unknown"
+                    && attached.snapshot.is_none()
+        ));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, ServerMessage::FreshAgentAttached(_)))
+                .count(),
+            1,
+            "the replay has exactly one requester-scoped settlement"
+        );
+    }
+
+    #[test]
+    fn reservation_attach_result_preserves_provider_error_wire_shape() {
+        let provider_error = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: serde_json::json!({
+                "type": "freshAgent.error",
+                "sessionId": "native-session",
+                "code": "SESSION_RESERVED",
+                "message": "another lifecycle operation is in progress",
+            }),
+            provider: "codex".into(),
+            session_id: "native-session".into(),
+            session_type: "freshcodex".into(),
+        });
+        let outcome = AttachOutcome::from_messages(vec![provider_error]);
+
+        let messages = AttachOutcome::requester_messages(&attach(Some("attach-reserved")), outcome);
+        let ServerMessage::FreshAgentAttachFailed(failed) = messages.last().unwrap() else {
+            panic!("reservation must settle as one typed failure: {messages:?}");
+        };
+        let wire = serde_json::to_value(failed).unwrap();
+        assert_eq!(failed.code, "SESSION_RESERVED");
+        assert_eq!(failed.retryable, None);
+        assert!(
+            wire.get("retryable").is_none(),
+            "the default provider error omits retryable: {wire}"
+        );
+
+        let terminal_outcome = AttachOutcome::Failed {
+            failure: AttachFailure {
+                code: "SESSION_RESERVED".into(),
+                message: "a terminal owns this session".into(),
+                retryable: None,
+                owner_kind: Some("terminal".into()),
+                owner_generation: Some(8),
+                owner_epoch: Some(4),
+            },
+            legacy_messages: Vec::new(),
+        };
+        let terminal_messages =
+            AttachOutcome::requester_messages(&attach(Some("attach-terminal")), terminal_outcome);
+        let ServerMessage::FreshAgentAttachFailed(terminal) = terminal_messages.last().unwrap()
+        else {
+            panic!("terminal refusal must remain a typed failure: {terminal_messages:?}");
+        };
+        assert_eq!(terminal.owner_kind.as_deref(), Some("terminal"));
+        assert_eq!(terminal.retryable, None);
     }
 
     #[test]
