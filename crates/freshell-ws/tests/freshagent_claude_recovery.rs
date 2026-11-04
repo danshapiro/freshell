@@ -6,7 +6,11 @@
 mod common;
 
 use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use common::ledger_sink::LedgerSink;
+use freshell_freshagent::{BindingClaim, FreshAgentSettings, PaneIdentitySink, SettingsUpdate};
+use freshell_ws::pane_ledger::{FreshAgentBindingWrite, GenesisWrite, ProvenancePolicy};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 
 async fn crash_runtime(rig: &ClaudeRig, conn: &mut RigConnection, id: &str) {
@@ -400,6 +404,143 @@ async fn a_cold_hosted_configuration_has_a_runtime_to_retain_its_settings() {
     assert_eq!(rig.ledger_rows("query").len(), 2);
     let (_, snapshot) = rig.snapshot(&id).await;
     assert_eq!(snapshot["settings"]["model"], "sonnet", "{snapshot}");
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_claude_settings_refresh_survives_an_equal_generation_failed_transition_fence() {
+    let mut rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut conn = rig.connect().await;
+    let session_id = conn.create("live-settings-failed-transition-fence").await;
+    let owner_snapshot = rig.fresh_claude.ownership_snapshot("claude", &session_id);
+    let (epoch, generation, current_operation_id) = match owner_snapshot.state {
+        freshell_ownership::OwnershipState::Live {
+            owner, generation, ..
+        } => (
+            owner_snapshot.epoch,
+            generation,
+            owner
+                .ownership_id
+                .expect("the live Claude owner carries its exact operation id"),
+        ),
+        other => panic!("the created Claude session must be live: {other:?}"),
+    };
+    let failed_operation_id = format!("unrelated-failed-transition-{session_id}");
+    assert_ne!(failed_operation_id, current_operation_id);
+
+    let pane_ledger = Arc::clone(rig.pane_ledger.as_ref().expect("durable ledger enabled"));
+    LedgerSink::new(Arc::clone(&pane_ledger))
+        .repair_failed_transition(
+            "claude",
+            &session_id,
+            &failed_operation_id,
+            epoch,
+            generation,
+        )
+        .await
+        .expect("the unrelated same-generation failed transition is fenced");
+    assert_eq!(
+        pane_ledger
+            .load_binding("claude", &session_id)
+            .expect("the current live binding remains present")
+            .state,
+        freshell_ws::pane_ledger::RowState::Bound,
+        "the unrelated failed transition does not retire the current owner's row"
+    );
+
+    conn.send(json!({
+        "type": "freshAgent.configure",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": session_id,
+        "requestId": "configure-settings-past-fence",
+        "settings": { "permissionMode": "plan" },
+    }))
+    .await;
+    let metadata = conn
+        .wait_for("the live settings update", |frame| {
+            frame["sessionId"] == session_id
+                && frame["event"]["type"] == "freshAgent.session.metadata"
+                && frame["event"]["permissionMode"] == "plan"
+        })
+        .await;
+    assert_eq!(metadata["event"]["permissionMode"], "plan");
+    assert_eq!(
+        pane_ledger
+            .load_binding("claude", &session_id)
+            .expect("the current binding remains present")
+            .permission_mode
+            .as_deref(),
+        Some("plan"),
+        "the current Live owner's configure must persist through the unrelated fence"
+    );
+
+    // The exact failed operation is still fenced even after the current owner
+    // refreshed the same-generation row with its own claim.
+    let late_settings = FreshAgentSettings {
+        model: Some("suppressed-late-failed-write".into()),
+        ..FreshAgentSettings::default()
+    };
+    let late_claim = BindingClaim::live_fresh_agent(
+        "claude",
+        &session_id,
+        &failed_operation_id,
+        epoch,
+        generation,
+    );
+    let late_write = FreshAgentBindingWrite {
+        collaboration_mode: None,
+        provider: "claude",
+        session_id: &session_id,
+        mode: "freshclaude",
+        cwd: None,
+        create_request_id: None,
+        model: late_settings.model.as_deref(),
+        sandbox: None,
+        permission_mode: late_settings.permission_mode.as_deref(),
+        effort: late_settings.effort.as_deref(),
+        plugins: None,
+        genesis: GenesisWrite::Keep,
+        supersedes: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(epoch),
+        observed_generation: Some(generation),
+        now_ms: 0,
+    };
+    let late_settings_update = SettingsUpdate::Replace(late_settings.clone());
+    pane_ledger
+        .record_fresh_agent_binding_claimed(&late_write, Some(&late_claim), &late_settings_update)
+        .expect("the exact failed operation's late write is suppressed by its fence");
+    assert_eq!(
+        pane_ledger
+            .load_binding("claude", &session_id)
+            .expect("the live binding remains present")
+            .permission_mode
+            .as_deref(),
+        Some("plan"),
+        "the failed operation's late write cannot replace the current setting"
+    );
+
+    // The rig restarts the server over a newly loaded production PaneLedger.
+    rig.restart().await;
+    assert_eq!(
+        rig.pane_ledger
+            .as_ref()
+            .expect("durable ledger survives restart")
+            .load_binding("claude", &session_id)
+            .expect("the current binding reloads from disk")
+            .permission_mode
+            .as_deref(),
+        Some("plan"),
+        "the valid Claude configure survives ledger reload"
+    );
     rig.fresh_claude.shutdown().await;
 }
 

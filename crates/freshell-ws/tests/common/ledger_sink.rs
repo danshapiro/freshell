@@ -116,6 +116,7 @@ pub struct LedgerSink {
     genesis_clear_gate: Option<Arc<LedgerWriteGate>>,
     binding_completed_gate: Option<Arc<LedgerWriteGate>>,
     failed_transition_repair_gate: Option<Arc<LedgerWriteGate>>,
+    fail_binding_writes: bool,
 }
 
 impl LedgerSink {
@@ -128,6 +129,7 @@ impl LedgerSink {
             genesis_clear_gate: None,
             binding_completed_gate: None,
             failed_transition_repair_gate: None,
+            fail_binding_writes: false,
         }
     }
 
@@ -144,6 +146,7 @@ impl LedgerSink {
             genesis_clear_gate: None,
             binding_completed_gate: None,
             failed_transition_repair_gate: None,
+            fail_binding_writes: false,
         }
     }
 
@@ -157,6 +160,14 @@ impl LedgerSink {
         gate: Option<Arc<LedgerWriteGate>>,
     ) -> Self {
         self.failed_transition_repair_gate = gate;
+        self
+    }
+
+    /// Inject a clean failure before each binding mutation through this sink. Used by
+    /// provider integration tests to prove handlers keep their in-memory and
+    /// broadcast state aligned with the durable ledger result.
+    pub fn with_binding_write_failure(mut self) -> Self {
+        self.fail_binding_writes = true;
         self
     }
 
@@ -293,6 +304,7 @@ impl PaneIdentitySink for LedgerSink {
         let ledger = self.ledger.clone();
         let ownership = self.ownership.clone();
         let now = now_ms();
+        let fail_before_write = self.fail_binding_writes;
         let write = blocking(move || {
             if let Some(refusal) = authoritative_write_refusal(ownership.as_deref(), &upsert) {
                 return Err(refusal);
@@ -363,6 +375,9 @@ impl PaneIdentitySink for LedgerSink {
         });
         let gate = self.binding_completed_gate.clone();
         Box::pin(async move {
+            if fail_before_write {
+                return Err(std::io::Error::other("injected binding write failure"));
+            }
             write.await?;
             if let Some(gate) = gate {
                 gate.hold().await?;

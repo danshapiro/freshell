@@ -1574,6 +1574,28 @@ impl FreshOpencodeState {
         ));
     }
 
+    /// A requester-correlated OpenCode control failure. It uses the same
+    /// `freshAgent.error` event consumed by existing views, with `requestId`
+    /// preserving correlation to the configure request.
+    fn emit_fresh_agent_control_error(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        code: &str,
+        message: &str,
+    ) {
+        let mut event = json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": code,
+            "message": message,
+        });
+        if let Some(request_id) = request_id {
+            event["requestId"] = json!(request_id);
+        }
+        self.broadcast(&event_frame(session_id, event));
+    }
+
     fn broadcast(&self, msg: &ServerMessage) {
         self.fresh_agent.broadcast(msg);
     }
@@ -3342,7 +3364,7 @@ impl FreshOpencodeState {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %acked_session_id,
                     request_id = ?request_id,
-                    "freshagent.opencode.send_settings_refresh_skipped: no exact current +                     live owner is available to authorize the durable refresh"
+                    "freshagent.opencode.send_settings_refresh_skipped: no exact current live owner is available to authorize the durable refresh"
                 );
             } else {
                 let _ = self
@@ -3840,7 +3862,7 @@ impl FreshOpencodeState {
             if self.fresh_agent.ownership.is_some() && claim.is_none() {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %durable_id,
-                    "freshagent.opencode.configure_refused: no exact current live owner +                     is available to authorize the durable settings refresh"
+                    "freshagent.opencode.configure_refused: no exact current live owner is available to authorize the durable settings refresh"
                 );
                 drop(session);
                 self.emit_fresh_agent_error(
@@ -3854,18 +3876,14 @@ impl FreshOpencodeState {
         } else {
             None
         };
-        session.model = model.clone();
-        session.effort = effort.clone();
-
         // Materialized sessions re-snapshot the binding row's settings (the
         // same per-send refresh `handle_send` performs — durable before the
         // broadcast). A configure for a placeholder has no row yet; the
         // materialization write will carry the staged pair.
         let provenance = session.provenance.clone();
         let cwd = session.cwd.clone();
-        drop(session);
         if let Some(durable_id) = durable_id {
-            let _ = self
+            if let Err(error) = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                     genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
@@ -3892,8 +3910,29 @@ impl FreshOpencodeState {
                         },
                     ),
                 })
-                .await;
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::opencode",
+                    event = "freshagent.opencode.configure_binding_write_failed",
+                    provider = PROVIDER, session_id = %session_id,
+                    request_id = ?msg.request_id, cause = %error,
+                    "the OpenCode settings remain unchanged because their durable write failed"
+                );
+                self.emit_fresh_agent_control_error(
+                    &session_id,
+                    msg.request_id.as_deref(),
+                    "LEDGER_WRITE_FAILED",
+                    "OpenCode could not save the session settings. Try again.",
+                );
+                return;
+            }
         }
+
+        // Keep the settings update serialized with other per-session
+        // operations until its durable row is known to be current.
+        session.model = model.clone();
+        session.effort = effort.clone();
+        drop(session);
 
         // Broadcast keyed at the CLIENT-ADDRESSED id (the id the configure
         // named): the client's fold resolves the sessions-map entry by it.
@@ -3944,6 +3983,45 @@ impl FreshOpencodeState {
                 None,
             )),
         );
+    }
+
+    /// Test-support fixture for a materialized session whose only lane under
+    /// test is settings persistence. Production sessions are registered by
+    /// `handle_send` after the shared OpenCode daemon materializes them.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn insert_materialized_session_for_test(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
+        let mut session = OpencodeSession::new(
+            session_id.to_string(),
+            None,
+            model.map(str::to_string),
+            effort.map(str::to_string),
+        );
+        session.real_session_id = Some(session_id.to_string());
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_string(), session_cell(session));
+    }
+
+    /// Test-support observation of the settings stored on a live session.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn session_settings_for_test(
+        &self,
+        session_id: &str,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let session_arc = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).cloned()
+        }?;
+        let session = session_arc.lock().await;
+        Some((session.model.clone(), session.effort.clone()))
     }
 
     /// Test-only seam (focused E3R2 review defect 1): read the session's
