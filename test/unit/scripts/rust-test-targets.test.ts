@@ -530,7 +530,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
         '}',
         'if (["volume", "network", "ps"].includes(args[0])) process.exit(0)',
         'if (args[0] === "container") process.exit(1)',
-        'if (args[0] === "run") { const cidIndex = args.indexOf("--cidfile"); if (cidIndex >= 0) fs.writeFileSync(args[cidIndex + 1], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n"); process.exit(Number(process.env.DOCKER_RUN_STATUS ?? 0)) }',
+        'if (args[0] === "run") { const cidIndex = args.indexOf("--cidfile"); if (cidIndex >= 0) fs.writeFileSync(args[cidIndex + 1], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n"); process.exit(process.env.FRESHELL_SANDBOX_PREPARE_ONLY === "1" ? 0 : Number(process.env.DOCKER_RUN_STATUS ?? 0)) }',
         'process.exit(0)',
         '',
       ].join('\n'),
