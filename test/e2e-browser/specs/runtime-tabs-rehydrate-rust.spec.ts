@@ -12,7 +12,7 @@ import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 
 import { test } from '../helpers/fixtures.js'
-import { type ManagedFixtureRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish, FreshCodexSavedHistoryMeasurementSchema, FreshCodexSavedHistoryPreservationSchema } from '../helpers/managed-runtime.js'
+import { type ManagedFixtureRig, ManagedRuntimeBrowserRig, createManagedRuntimeBrowserRig, type FreshCodexHistoryMeasurementError, type FreshCodexHistoryMeasurementFinish, FreshCodexSavedHistoryMeasurementSchema, FreshCodexSavedHistoryPreservationSchema } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
@@ -828,34 +828,39 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         return failed ? { kind: 'failed' as const, frame: failed } : null
       }, 60_000)
       if (forkOutcome.kind === 'failed') {
-        const serverForkFailure = [...rig.web.capturedOutput().stdout.split('\n'), ...rig.web.capturedOutput().stderr.split('\n')]
-          .filter(line => line.includes('freshagent.gateway.managed_fork_failed')).at(-1)
-        const hostProcess = rig.runtime.topOwnedContainerExact(view.containerId, ['-eo', 'pid,args']).split('\n')
-          .find(line => line.includes('freshell-session-host') && line.includes(' serve '))
-        const hostStateDir = hostProcess?.match(/--state-dir(?:=|\s+)([^\s]+)/)?.[1]
-        const actorStatePath = hostStateDir
-          ? rig.ownedContainerExec(view.containerId, ['find', hostStateDir, '-name', 'fresh-agent-state.json', '-print'])
-            .trim().split('\n').find(Boolean)
-          : null
+        let serverForkFailure: string | undefined
         let actorState: any = null
-        if (actorStatePath) {
-          try { actorState = JSON.parse(rig.ownedContainerExec(view.containerId, ['cat', actorStatePath])) }
-          catch { /* the actor state may not be readable from the provider container */ }
+        let fixtureState: any = null
+        let runtimeEvents: unknown[] = []
+        if (rig instanceof ManagedRuntimeBrowserRig) {
+          serverForkFailure = [...rig.web.capturedOutput().stdout.split('\n'), ...rig.web.capturedOutput().stderr.split('\n')]
+            .filter(line => line.includes('freshagent.gateway.managed_fork_failed')).at(-1)
+          const hostProcess = rig.runtime.topOwnedContainerExact(runtimeHandle.containerId, ['-eo', 'pid,args']).split('\n')
+            .find((line: string) => line.includes('freshell-session-host') && line.includes(' serve '))
+          const hostStateDir = hostProcess?.match(/--state-dir(?:=|\s+)([^\s]+)/)?.[1]
+          const actorStatePath = hostStateDir
+            ? rig.ownedContainerExec(runtimeHandle.containerId, ['find', hostStateDir, '-name', 'fresh-agent-state.json', '-print'])
+              .trim().split('\n').find(Boolean)
+            : null
+          if (actorStatePath) {
+            try { actorState = JSON.parse(rig.ownedContainerExec(runtimeHandle.containerId, ['cat', actorStatePath])) }
+            catch { /* the actor state may not be readable from the provider container */ }
+          }
+          fixtureState = await rig.fixtureNativeState(runtimeHandle).catch(() => null)
+          runtimeEvents = [runtimeHandle.containerId, rig.supervisor.containerId].flatMap(containerId =>
+            rig.runtime.containerLogs(containerId).split('\n').flatMap((line: string) => {
+            try {
+              const row = JSON.parse(line)
+              const fields = row.fields ?? row
+              const event = fields.event ?? row.event
+              if (typeof event !== 'string' || !/(fresh.?agent|host\.native_input)/i.test(event)) return []
+              return [{ event, severity: fields.severity ?? row.severity, code: fields.code ?? row.code,
+                errorCode: fields.error_code ?? row.error_code ?? fields.errorCode ?? row.errorCode,
+                reason: fields.reason ?? row.reason, profileMatchesParent: fields.profileMatchesParent ?? row.profileMatchesParent }]
+            } catch { return [] }
+            }),
+          ).slice(-20)
         }
-        const fixtureState = await rig.fixtureNativeState(runtimeHandle).catch(() => null)
-        const runtimeEvents = [view.containerId, rig.supervisor.containerId].flatMap(containerId =>
-          rig.runtime.containerLogs(containerId).split('\n').flatMap(line => {
-          try {
-            const row = JSON.parse(line)
-            const fields = row.fields ?? row
-            const event = fields.event ?? row.event
-            if (typeof event !== 'string' || !/(fresh.?agent|host\.native_input)/i.test(event)) return []
-            return [{ event, severity: fields.severity ?? row.severity, code: fields.code ?? row.code,
-              errorCode: fields.error_code ?? row.error_code ?? fields.errorCode ?? row.errorCode,
-              reason: fields.reason ?? row.reason, profileMatchesParent: fields.profileMatchesParent ?? row.profileMatchesParent }]
-          } catch { return [] }
-          }),
-        ).slice(-20)
         throw new Error(`managed provider-native fork failed: ${JSON.stringify({
           code: forkOutcome.frame.event?.code, serverForkFailure, runtimeEvents,
           actorProfileMatchesParent: actorState?.profile?.nativeSessionId === parentSessionId,

@@ -967,6 +967,8 @@ tool_timeout_sec = 120
       collaborationMode: 'plan', permissionMode: 'never', sandbox: 'read-only' })
     const beforeCrash = { view: await rig.runningViewForFreshSession(created.sessionId), snapshot: await snapshot(),
       name: await readName(), nativeContext: await inspectNativeContext(), trafficCursor: (await model.getTraffic()).length }
+    const beforeCrashView = beforeCrash.view
+    if (!beforeCrashView) throw new Error('expected a running view for the fresh session before crash')
     expect(beforeCrash.name).toEqual(canonicalName)
     expect(beforeCrash.snapshot.status).toBe('idle')
     rig.runtime.writeIncident('freshcodex-managed-native-before-crash', beforeCrash)
@@ -974,7 +976,14 @@ tool_timeout_sec = 120
     // first lets automatic recovery probe the still-present rollout while the
     // archive is in flight, turning a missing-store case into stale readiness.
     // Re-read CODEX_HOME and every exact rollout from the post-restart process.
-    const quarantined = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
+    type QuarantinedNativeFile = { source: string; archive: string; sha256: string; bytes: number; base64: string }
+    const quarantined: {
+      effectiveCodexHome: string
+      sessionsRoot: string
+      exactRollouts: string[]
+      remainingExact: string[]
+      files: QuarantinedNativeFile[]
+    } = JSON.parse(await rig.ownedProviderExec(providerContainerId, ['node', '-e', `
       const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
       const expected=${JSON.stringify(view.nativeSessionId)},pid=${beforeCrash.nativeContext.pid};
       const env=Object.fromEntries(fs.readFileSync('/proc/'+pid+'/environ','utf8').split(String.fromCharCode(0)).flatMap(entry=>{
@@ -1044,7 +1053,7 @@ tool_timeout_sec = 120
     })
     const blockedView = await waitFor('missing exact native Codex store blocks recovery', async () => {
       const views = await rig.inventory()
-      return views.find(row => row.soulId === beforeCrash.view.soulId
+      return views.find(row => row.soulId === beforeCrashView.soulId
         && row.freshAgentSessionId === created.sessionId && row.nativeSessionId === view.nativeSessionId
         && row.recoveryState === 'blocked' && row.recoveryReason === 'STORE_UNREADABLE')
     })
@@ -1052,7 +1061,7 @@ tool_timeout_sec = 120
       .filter((row: any) => row.path === '/v1/responses')
     const sessionViews = (await rig.inventory()).filter(row => row.freshAgentSessionId === created.sessionId)
     expect(blockedView).toMatchObject({
-      soulId: beforeCrash.view.soulId, freshAgentSessionId: created.sessionId,
+      soulId: beforeCrashView.soulId, freshAgentSessionId: created.sessionId,
       nativeSessionId: view.nativeSessionId, recoveryState: 'blocked', recoveryReason: 'STORE_UNREADABLE',
     })
     expect(new Set(sessionViews.map(row => row.nativeSessionId).filter(Boolean))).toEqual(new Set([view.nativeSessionId]))
