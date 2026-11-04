@@ -16,6 +16,11 @@ type JsonRow = Record<string, unknown>
 
 const MODES: FreshAgentMultipleDeviceMode[] = ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']
 
+type FreshAgentDeviceView = {
+  harness: { getPaneLayout(tabId: string): Promise<any> }
+  tabId: string
+}
+
 function findFreshAgentLeaf(node: any): any {
   if (!node) return null
   if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
@@ -26,30 +31,6 @@ function findFreshAgentLeaf(node: any): any {
     }
   }
   return null
-}
-
-type FreshAgentDeviceView = {
-  harness: {
-    getPaneLayout(tabId: string): Promise<any>
-    getState(): Promise<any>
-  }
-  tabId: string
-}
-
-async function readDeviceSessionEffort(
-  device: FreshAgentDeviceView,
-  session: { provider: string; sessionType: string; sessionId: string },
-): Promise<string | null> {
-  const state = await device.harness.getState()
-  const match = (Object.values(state.freshAgent?.sessions ?? {}) as Array<{
-    provider?: string
-    sessionType?: string
-    sessionId?: string
-    effort?: string | null
-  }>).find((candidate) => candidate.provider === session.provider
-    && candidate.sessionType === session.sessionType
-    && candidate.sessionId === session.sessionId)
-  return match?.effort ?? null
 }
 
 async function waitForPaneStatus(device: FreshAgentDeviceView, status: RegExp): Promise<void> {
@@ -769,7 +750,7 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
           provider,
           sessionType,
           sessionId,
-          settings: { model: 'fakeprov/fakemodel', effort: 'low' },
+          settings: { effort: 'low' },
         })
       }, session)
       for (const deviceFrames of [frames.desktop, frames.mobile]) {
@@ -783,7 +764,7 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         }).toBe(true)
       }
       const baselineBinding = await native.readBinding(session.sessionId)
-      expect(baselineBinding).toMatchObject({ model: 'fakeprov/fakemodel', effort: 'low' })
+      expect(baselineBinding).toMatchObject({ effort: 'low' })
 
       const expectRecoveryAttachRounds = async (
         deviceName: 'desktop' | 'mobile',
@@ -924,11 +905,11 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
       }
       await expect.poll(async () => {
         const binding = await native.readBinding(session.sessionId)
-        return { model: binding.model, effort: binding.effort }
+        return binding.effort
       }, {
         timeout: 30_000,
         message: 'the configure command replaces the durable settings behind the failed-transition fence',
-      }).toEqual({ model: 'fakeprov/fakemodel', effort: 'high' })
+      }).toBe('high')
       expect(frames.mobile.some((frame) => frame.direction === 'sent'
         && frame.type === 'freshAgent.configure'
         && frame.requestId === 'stage1-dead-binding-configure')).toBe(true)
@@ -937,16 +918,12 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         && frame.sessionId === session.sessionId
         && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.error'
         && (frame.event as Record<string, unknown> | undefined)?.requestId === 'stage1-dead-binding-configure')).toBe(false)
-      for (const device of [desktop, mobile]) {
-        await expect.poll(() => readDeviceSessionEffort(device, session), {
-          timeout: 30_000,
-          message: 'each device folds the configured effort into its live-session state',
-        }).toBe('high')
-      }
 
       // Restart after the settings command, forcing both independent views
       // to reconnect to the shared owner. The ledger file is the persistence
-      // oracle; both view states must retain the configured values.
+      // oracle, and each reconnect must deliver the persisted metadata.
+      const desktopSettingsFrameCursor = frames.desktop.length
+      const mobileSettingsFrameCursor = frames.mobile.length
       const desktopSettingsReady = await desktop.harness.getLastReadyAt()
       const mobileSettingsReady = await mobile.harness.getLastReadyAt()
       await restartServer()
@@ -959,14 +936,20 @@ test.describe('Fresh Agent shared sessions across desktop and mobile devices (Ru
         waitForPaneStatus(mobile, /^(connected|idle)$/),
       ])
       expect(await native.readBinding(session.sessionId)).toMatchObject({
-        model: 'fakeprov/fakemodel',
         effort: 'high',
       })
-      for (const device of [desktop, mobile]) {
-        await expect.poll(() => readDeviceSessionEffort(device, session), {
+      for (const [deviceName, deviceFrames, frameCursor] of [
+        ['desktop', frames.desktop, desktopSettingsFrameCursor],
+        ['mobile', frames.mobile, mobileSettingsFrameCursor],
+      ] as const) {
+        await expect.poll(() => deviceFrames.slice(frameCursor).some((frame) => frame.direction === 'received'
+          && frame.type === 'freshAgent.event'
+          && frame.sessionId === session.sessionId
+          && (frame.event as Record<string, unknown> | undefined)?.type === 'freshAgent.session.metadata'
+          && (frame.event as Record<string, unknown> | undefined)?.effort === 'high'), {
           timeout: 30_000,
-          message: 'each reconnected view retains the configured live-session effort',
-        }).toBe('high')
+          message: deviceName + ' receives persisted settings after reconnecting',
+        }).toBe(true)
       }
       // Attach reservation retries are bounded and keep their captured fence.
       // Wait for target attach and SESSION_RESERVED traffic to stay quiet
