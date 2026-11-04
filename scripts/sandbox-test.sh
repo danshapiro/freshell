@@ -182,6 +182,11 @@ if [ "${1:-}" = "--workspace-root" ]; then
   fi
 fi
 
+WORKSPACE_FLAGS=()
+if [ "${WORKSPACE_ROOT}" != "${REPO_ROOT}" ]; then
+  WORKSPACE_FLAGS=(--workspace-root "${WORKSPACE_ROOT}")
+fi
+
 # A linked worktree's .git file points to its per-worktree admin directory,
 # which in turn resolves its objects and refs through the shared Git common
 # directory. The workspace bind mount below does not expose that path. Mount only
@@ -420,7 +425,9 @@ PY
       'node test/integration/providers/codex-cli-contract.mjs --scenario approval-policy-restricted-exec')
         node "${REPO_ROOT}/scripts/testing/prepare-codex-contract.mjs" --verify-sandbox >/dev/null
         CODEX_NATIVE_CONTRACT=1
-        IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${WORKSPACE_ROOT}/.runtime-build/codex-contract/staged.json")"
+        if [ -z "${FRESHELL_SANDBOX_SELECTED_DEPENDENCY_KEY:-}" ]; then
+          IMAGE_TAG="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).image)' "${WORKSPACE_ROOT}/.runtime-build/codex-contract/staged.json")"
+        fi
         ;;
     esac
   fi
@@ -460,7 +467,16 @@ PY
     exit 2
   fi
   DEPENDENCY_KEY="$(node "${REPO_ROOT}/docker/sandbox/dependency-cache.mjs" --key "${WORKSPACE_ROOT}" "${DEPENDENCY_FOUNDATION_ID}" "${DEPENDENCY_PROTOCOL}")"
+  if [ -n "${FRESHELL_SANDBOX_SELECTED_DEPENDENCY_KEY:-}" ] \
+    && [ "${FRESHELL_SANDBOX_SELECTED_DEPENDENCY_KEY}" != "${DEPENDENCY_KEY}" ]; then
+    printf '{"severity":"error","event":"sandbox_dependency_inputs_changed"}\n' >&2
+    exit 2
+  fi
   NODE_MODULES_CACHE_PREFIX="${CACHE_PREFIX}-${DEPENDENCY_CACHE_SUFFIX}-${DEPENDENCY_KEY}"
+  DEPENDENCY_PHASE_ENV=(
+    "FRESHELL_SANDBOX_IMAGE=${RESOLVED_IMAGE_ID}"
+    "FRESHELL_SANDBOX_SELECTED_DEPENDENCY_KEY=${DEPENDENCY_KEY}"
+  )
 
   # Each phase runs the same owned wrapper lifecycle with its own name, CID,
   # guard and completed settlement. Only the fixed preparation has networking.
@@ -480,10 +496,10 @@ PY
       PREPARATION_COMMAND+=' && pnpm exec playwright install chromium'
     fi
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
-      env FRESHELL_SANDBOX_PREPARE_ONLY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=preparation \
-        bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite "${PREPARATION_COMMAND}" &
+      env "${DEPENDENCY_PHASE_ENV[@]}" FRESHELL_SANDBOX_PREPARE_ONLY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=preparation \
+        bash "${BASH_SOURCE[0]}" "${WORKSPACE_FLAGS[@]}" --runtime-suite "${PREPARATION_COMMAND}" &
     else
-      env FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" --workspace-root "${WORKSPACE_ROOT}" --runtime-suite \
+      env "${DEPENDENCY_PHASE_ENV[@]}" FRESHELL_SANDBOX_PREPARE_ONLY=1 bash "${BASH_SOURCE[0]}" "${WORKSPACE_FLAGS[@]}" --runtime-suite \
       "${PREPARATION_COMMAND}" &
     fi
     PREPARATION_PID=$!
@@ -496,7 +512,7 @@ PY
     if [ "${PREPARATION_STATUS}" -ne 0 ]; then
       exit "${PREPARATION_STATUS}"
     fi
-    CALLER_FLAGS=(--workspace-root "${WORKSPACE_ROOT}")
+    CALLER_FLAGS=("${WORKSPACE_FLAGS[@]}")
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
       CALLER_FLAGS+=(--external-browser "${EXTERNAL_DESCRIPTOR_PATH}")
     else
@@ -505,10 +521,10 @@ PY
       if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then CALLER_FLAGS+=(--checkpoint-fixture); fi
     fi
     if [ "${EXTERNAL_BROWSER}" -eq 1 ]; then
-      exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
+      exec env "${DEPENDENCY_PHASE_ENV[@]}" FRESHELL_SANDBOX_DEPENDENCIES_READY=1 FRESHELL_SANDBOX_EXTERNAL_BROWSER_PHASE=execution \
         bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}"
     fi
-    exec env FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
+    exec env "${DEPENDENCY_PHASE_ENV[@]}" FRESHELL_SANDBOX_DEPENDENCIES_READY=1 bash "${BASH_SOURCE[0]}" "${CALLER_FLAGS[@]}" "${CMD}"
   fi
 
   # Keep Cargo targets reusable within one canonical working copy while

@@ -73,9 +73,11 @@ VOLUME_DIRS=(
   "/usr/local/cargo/git"
   "/home/sandbox/.local/share/pnpm/store"
   "/workspace/target"
-  "/workspace/node_modules"
   "/home/sandbox/.cache/ms-playwright"
 )
+if [ "${FRESHELL_SANDBOX_DEPENDENCY_READONLY:-}" != 1 ]; then
+  VOLUME_DIRS+=("/workspace/node_modules")
+fi
 for dir in "${VOLUME_DIRS[@]}"; do
   mkdir -p "${dir}"
   if [ "$(stat -c %u "${dir}")" != "${TARGET_UID}" ]; then
@@ -93,7 +95,7 @@ done
 is_mount_point() {
   awk '{print $5}' /proc/self/mountinfo | grep -qxF "$1"
 }
-if [ -f pnpm-workspace.yaml ]; then
+if [ -f pnpm-workspace.yaml ] && [ "${FRESHELL_SANDBOX_DEPENDENCY_READONLY:-}" != 1 ]; then
   for dir in \
     crates/freshell-claude-sidecar/node_modules \
     packages/freshell-mcp-runtime/node_modules; do
@@ -254,7 +256,12 @@ if [ -f package.json ]; then
           directory="${module_dirs[index]}"
           if [ -d "${directory}" ] && is_mount_point "/workspace/${directory}"; then
             for cache in .vite .vite-temp .vitest .cache; do
-              ln -s "/workspace/target/.freshell-node-cache/${slots[index]}/${cache}" "${directory}/${cache}"
+              if [ -e "${directory}/${cache}" ] || [ -L "${directory}/${cache}" ]; then
+                printf '{"severity":"error","event":"sandbox_dependency_cache_collision","slot":"%s","cache":"%s"}\n' \
+                  "${slots[index]}" "${cache}" >&2
+                exit 2
+              fi
+              ln -sT "/workspace/target/.freshell-node-cache/${slots[index]}/${cache}" "${directory}/${cache}"
             done
           fi
         done

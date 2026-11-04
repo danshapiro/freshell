@@ -22,7 +22,7 @@ FOUNDATION = "com.freshell.sandbox.dependency-foundation"
 PROTOCOL = "com.freshell.sandbox.dependency-protocol"
 CASES = ("singleflight", "coherence", "readonly", "reuse", "failure",
          "interruption", "legacy", "inputs-during-prepare", "node-linker-input", "admission",
-         "standard-builder")
+         "standard-builder", "phase-image", "phase-input", "cache-collision", "cache-file", "non-git-default")
 
 
 def require(value, message):
@@ -121,6 +121,26 @@ assert(denied,'prepared dependency root was writable');
 assert.equal(require('sandbox-marker'),'A');
 """
 
+PHASE_DOCKER = r"""#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+docker = os.environ['FIXTURE_REAL_DOCKER']
+project = Path(os.environ['FIXTURE_PHASE_PROJECT'])
+result = subprocess.run([docker, *args])
+if args and args[0] == 'run':
+    preparing = os.getenv('FRESHELL_SANDBOX_PREPARE_ONLY') == '1'
+    with (project / 'controls/phases.jsonl').open('a') as stream:
+        stream.write(json.dumps({'prepare': preparing, 'image': args[-4]}) + '\n')
+    if result.returncode == 0 and preparing:
+        if os.environ['FIXTURE_PHASE_CHANGE'] == 'phase-image':
+            subprocess.run([docker, 'tag', os.environ['FIXTURE_REPLACEMENT_IMAGE'],
+                            os.environ['FIXTURE_MUTABLE_IMAGE']], check=True)
+        else:
+            (project / '.npmrc').write_text('prefer-offline=true\n')
+sys.exit(result.returncode)
+"""
+
 
 class Fixture:
     def __init__(self, args, case):
@@ -161,7 +181,7 @@ class Fixture:
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             *arguments, image, *command], okay=okay)
 
-    def project(self, name, value="A"):
+    def project(self, name, value="A", git=True):
         root = self.root / name
         root.mkdir(mode=0o755)
         for relative in ("scripts/sandbox-test.sh",
@@ -191,7 +211,8 @@ class Fixture:
         write(root / "marker/tool.cjs", TOOL, 0o755)
         write(root / "scripts/install.cjs", INSTALL)
         write(root / "scripts/reader.cjs", READER)
-        self.capture(["git","init","--quiet",str(root)])
+        if git:
+            self.capture(["git","init","--quiet",str(root)])
         owner = self.direct_run(self.args.image,
             ["--read-only","--entrypoint","stat","-v",str(root)+":/fixture:ro"],
             ["-c","%u:%g","/fixture"]).strip()
@@ -219,7 +240,8 @@ class Fixture:
         file = project / "controls/installs.jsonl"
         return len(file.read_text().splitlines()) if file.exists() else 0
 
-    def start(self, project, name, command=None, image=None, watch=False):
+    def start(self, project, name, command=None, image=None, watch=False,
+              extra_env=None, runtime=True):
         require(re.fullmatch("[a-z0-9-]+", name), "invalid fixture name")
         control = self.root / ("owner-"+name)
         control.mkdir(mode=0o700)
@@ -236,13 +258,14 @@ class Fixture:
         env.update(FRESHELL_SANDBOX_IMAGE=image or self.args.image,
                    FRESHELL_SANDBOX_CACHE_PREFIX=self.prefix,
                    FRESHELL_SANDBOX_OWNER_GUARD="1", TMPDIR=str(control))
+        env.update(extra_env or {})
         if command is None:
             value = json.loads((project / "marker/index.cjs").read_text()
                                .removeprefix("module.exports="))
             command = shlex.join(["node","scripts/reader.cjs",name,value,
                                   "watch" if watch else "once"])
         proc = subprocess.Popen(["bash",str(project/"scripts/sandbox-test.sh"),
-                                 "--runtime-suite",command], cwd=REPO,
+                                 *(["--runtime-suite"] if runtime else []),command], cwd=REPO,
                                 env=env,stdout=stream,stderr=subprocess.STDOUT)
         job = dict(process=proc,identity=process_identity(proc.pid),
                    project=project,control=control,name=name,stream=stream)
@@ -332,6 +355,24 @@ class Fixture:
         return tag,item["Id"]
 
     def run_case(self):
+        if self.case in ("phase-image", "phase-input"):
+            return phase_change(self)
+        if self.case == "cache-collision":
+            return cache_collision(self)
+        if self.case == "cache-file":
+            return cache_collision(self, ("file",))
+        if self.case == "non-git-default":
+            a = self.project("non-git", git=False)
+            explicit = self.capture(["bash", str(a / "scripts/sandbox-test.sh"),
+                                     "--workspace-root", str(a), "true"], okay=False)
+            require(explicit.returncode == 2 and
+                    "trusted wrapper repository" in explicit.stderr,
+                    "explicit non-Git workspace bypassed the admission trust check")
+            job = self.start(a, "ordinary-default", runtime=False)
+            self.finish(job)
+            require(self.ack(job)["imports"] == 1 and self.installs(a) == 1,
+                    "ordinary non-Git two-phase invocation did not import dependencies")
+            return
         if self.case == "standard-builder":
             return standard_builder(self)
         if self.case == "admission":
@@ -541,6 +582,80 @@ class Fixture:
         require(not errors,"owned settlement failed; retain private evidence")
 
 
+def phase_change(f):
+    """Mutate the real tag or inputs after preparation's real Docker run."""
+    a = f.project("phases")
+    mutable, original = f.build("phase-tag", "FROM " + f.args.image + "\n")
+    replacement, replacement_id = f.build("phase-replacement",
+        "FROM " + f.args.image + "\nENV FRESHELL_PHASE_REVISION=changed\n")
+    bin_dir = f.root / "phase-bin"
+    bin_dir.mkdir()
+    # This is a transparent real-Docker boundary hook, not a fake daemon. It
+    # changes only task-owned fixture inputs/tag after the preparation exits.
+    write(bin_dir / "docker", PHASE_DOCKER, 0o755)
+    command = "test -z \"${FRESHELL_PHASE_REVISION:-}\" && " + shlex.join(
+        ["node", "scripts/reader.cjs", "phases", "A", "once"])
+    job = f.start(a, "phases", image=mutable, command=command,
+                  extra_env={"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                             "FIXTURE_REAL_DOCKER": shutil.which("docker"),
+                             "FIXTURE_PHASE_PROJECT": str(a),
+                             "FIXTURE_PHASE_CHANGE": f.case,
+                             "FIXTURE_REPLACEMENT_IMAGE": replacement,
+                             "FIXTURE_MUTABLE_IMAGE": mutable})
+    if f.case == "phase-image":
+        f.images[mutable] = replacement_id  # The exact test-owned boundary retag.
+        f.finish(job)
+        require(f.ack(job)["imports"] == 1 and f.installs(a) == 1,
+                "tag change disrupted the selected image's actual import")
+    else:
+        f.finish(job, expected=2)
+        log = (f.results / "phases.log").read_text()
+        require('"event":"sandbox_dependency_inputs_changed"' in log,
+                "input change did not produce the typed coherence refusal")
+        require(not (a / "controls/phases.entered").exists(),
+                "changed-input caller was admitted")
+        volumes = f.capture(["docker", "volume", "ls", "--format", "{{.Name}}",
+                             "--filter", "name=^" + f.prefix + "-dependencies-"]).splitlines()
+        require(len(volumes) == 3, "input change created unprepared execution volumes")
+    records = [json.loads(line) for line in
+               (a / "controls/phases.jsonl").read_text().splitlines()]
+    require(len(records) == (2 if f.case == "phase-image" else 1) and
+            all(record["image"] == original for record in records),
+            "one invocation executed different selected image identities")
+    write(f.results / "phase-boundary.json", json.dumps(records), 0o600)
+
+
+def cache_collision(f, kinds=("directory", "file")):
+    """Actual installer lifecycle output cannot silently nest cache links."""
+    for kind in kinds:
+        a = f.project("collision-" + kind)
+        manifest = json.loads((a / "package.json").read_text())
+        manifest["scripts"]["postinstall"] = "node scripts/collision.cjs"
+        write(a / "package.json", json.dumps(manifest))
+        write(a / "scripts/collision.cjs", "const fs=require('node:fs');" +
+              ("fs.mkdirSync('node_modules/.cache',{recursive:true});"
+               if kind == "directory" else
+               "fs.writeFileSync('node_modules/.cache','installer-owned');"))
+        job = f.start(a, "collision-" + kind)
+        f.finish(job, expected=2)
+        require('"event":"sandbox_dependency_cache_collision"' in
+                (f.results / ("collision-" + kind + ".log")).read_text(),
+                "installer cache collision did not clearly refuse preparation")
+        foundation = f.image(f.args.image)["Config"]["Labels"][FOUNDATION]
+        version = f.image(f.args.image)["Config"]["Labels"][PROTOCOL]
+        key = f.capture(["node", str(a / "docker/sandbox/dependency-cache.mjs"),
+                         "--key", str(a), foundation, version]).strip()
+        volume = f.prefix + "-dependencies-v2-" + key + "-node-modules"
+        f.state_absent(volume)
+        probe = "test -d /modules/.cache && test ! -L /modules/.cache/.cache" if kind == "directory" else "test \"$(cat /modules/.cache)\" = installer-owned"
+        f.direct_run(f.args.image,
+            ["--read-only", "--entrypoint", "bash", "-v", volume + ":/modules:ro"],
+            ["-ec", probe])
+        require(f.installs(a) == 1 and not (a / "controls" /
+                ("collision-" + kind + ".entered")).exists(),
+                "collision admitted a caller or installed more than once")
+
+
 def standard_builder(f):
     """Run the production builder: workload changes reuse actual prepared trees."""
     a = f.project("builder")
@@ -744,17 +859,6 @@ def admission(f):
              for slot in ("root", "sidecar", "mcp")}
     root_target = next(m["Name"] for m in item["Mounts"]
                        if m["Destination"] == "/workspace/target")
-    init_mounts = []
-    for slot, volume in empty.items():
-        init_mounts += ["-v", volume + ":/empty/" + slot]
-    # direct_run drops all capabilities. CHOWN is restored only for these
-    # exact empty-volume ownership operations, matching the normal initializer.
-    f.direct_run(f.args.image,
-        ["--read-only", "--entrypoint", "bash", "--cap-add", "CHOWN",
-         *init_mounts],
-        ["-ec", 'chown "$(id -u sandbox):$(id -g sandbox)" '
-         "/empty/root /empty/sidecar /empty/mcp"])
-
     mounts = [
         "-v", str(a) + ":/workspace",
         "-v", f.prefix + "-cargo-registry:/usr/local/cargo/registry",
@@ -810,7 +914,7 @@ def admission(f):
                            if not line.startswith("cache_identity=")) + "\n"
     write(a / "controls/without-identity.state", incomplete)
     f.direct_run(f.args.image,
-        ["--read-only", "--user", "sandbox", "--entrypoint", "bash",
+        ["--read-only", "--entrypoint", "bash",
          "-v", str(a) + ":/fixture:ro", "-v", empty["root"] + ":/empty"],
         ["-ec", "cp /fixture/controls/without-identity.state "
          "/empty/.sandbox-deps-state"])
