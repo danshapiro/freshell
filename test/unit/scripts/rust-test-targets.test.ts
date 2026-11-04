@@ -743,34 +743,54 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     ])
   })
 
+  function expectSharedSandboxPhases(out: ReturnType<typeof runHookThroughSharedSandbox>) {
+    const runs = out.dockerCalls.filter(([operation]) => operation === 'run')
+    expect(runs).toHaveLength(2)
+    const [preparation, caller] = runs
+    expect(preparation.at(-1)).toBe('true')
+    expect(caller.at(-1)).toBe(
+      'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws',
+    )
+    expect(preparation).toContain('TINI_KILL_PROCESS_GROUP=1')
+    expect(caller).toContain('FRESHELL_SANDBOX_DEPENDENCY_READONLY=1')
+    expect(preparation[preparation.indexOf('--name') + 1]).not.toBe(caller[caller.indexOf('--name') + 1])
+    for (const [phase, args] of runs.entries()) {
+      const workspaceMountIndex = args.indexOf('-v')
+      expect(workspaceMountIndex).toBeGreaterThanOrEqual(0)
+      expect(args[workspaceMountIndex + 1]).toBe(`${pushedWorktreeRoot}:/workspace`)
+      expect(args).not.toContain(`${sharedOwnerRoot}:/workspace`)
+      expect(args[args.indexOf('--memory') + 1]).toBe('8g')
+      expect(args[args.indexOf('--pids-limit') + 1]).toBe('512')
+      expect(args).not.toContain('--cpus')
+      expect(args).not.toContain('--cpu-quota')
+      const dependencyMounts = args.filter(arg => /:\/workspace(?:\/crates\/freshell-claude-sidecar|\/packages\/freshell-mcp-runtime)?\/node_modules:/.test(arg))
+      expect(dependencyMounts).toHaveLength(3)
+      expect(dependencyMounts.every(mount => mount.endsWith(phase === 0 ? ':rw' : ':ro'))).toBe(true)
+    }
+    return out.stderr.split('\n').flatMap(line => {
+      try {
+        const event = JSON.parse(line) as { event: string; code: number }
+        return ['sandbox_workload_finished', 'sandbox_workload_failed'].includes(event.event)
+          ? [{ event: event.event, code: event.code }] : []
+      } catch { return [] }
+    })
+  }
+
   it('uses the shared owner sandbox wrapper to mount the pushed worktree', () => {
     const out = runHookThroughSharedSandbox()
     expect(out.status, out.stderr).toBe(0)
-    const runs = out.dockerCalls.filter(([operation]) => operation === 'run')
-    expect(runs).toHaveLength(2)
-    expect(runs[0].at(-1)).toBe('true')
-    const runArgs = runs[1]
-    expect(runArgs).toBeDefined()
-    const workspaceMountIndex = runArgs?.indexOf('-v') ?? -1
-    expect(workspaceMountIndex).toBeGreaterThanOrEqual(0)
-    expect(runArgs?.[workspaceMountIndex + 1]).toBe(`${pushedWorktreeRoot}:/workspace`)
-    expect(runArgs).not.toContain(`${sharedOwnerRoot}:/workspace`)
-    expect(runArgs?.at(-1)).toContain(
-      'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws',
-    )
+    expect(expectSharedSandboxPhases(out)).toEqual([
+      { event: 'sandbox_workload_finished', code: 0 },
+      { event: 'sandbox_workload_finished', code: 0 },
+    ])
   })
 
   it('fails the hook when the shared sandbox command fails', () => {
     const out = runHookThroughSharedSandbox(23)
-    const runs = out.dockerCalls.filter(([operation]) => operation === 'run')
-    expect(runs).toHaveLength(2)
-    expect(runs[0].at(-1)).toBe('true')
-    expect(runs[1].at(-1)).toBe(
-      'CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws',
-    )
-    expect(out.stderr).toContain('"event":"sandbox_workload_finished"')
-    expect(out.stderr).toContain('"event":"sandbox_workload_failed"')
-    expect(out.stderr).toContain('"code":23')
+    expect(expectSharedSandboxPhases(out)).toEqual([
+      { event: 'sandbox_workload_finished', code: 0 },
+      { event: 'sandbox_workload_failed', code: 23 },
+    ])
     expect(out.status).toBe(1)
     expect(out.stderr).toContain('pre-push: FAILED — CARGO_BUILD_JOBS=3 RUST_TEST_THREADS=4 TOKIO_WORKER_THREADS=2 cargo test --locked -p freshell-freshagent -p freshell-server -p freshell-ws (sandboxed)')
   })
