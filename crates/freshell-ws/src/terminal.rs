@@ -7918,9 +7918,11 @@ pub enum RespawnError {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RespawnedIdentity {
-    /// The respawn resumed the exact recorded session id (the gate passed
-    /// or failed open) — the hub COMPLETES the claimed lease against the
-    /// new terminal.
+    /// The respawn proceeds WITH the exact recorded session id — the
+    /// gate positively passed it, failed open on it, or (unvalidated
+    /// providers and empty-id passthrough shapes) the recorded id was
+    /// merely handed through as a resume arg — the hub COMPLETES the
+    /// claimed lease against the new terminal.
     Resumed,
     /// The resume gate refused the recorded id (positively absent on
     /// disk) and MINTED a replacement id at spawn time — the
@@ -8483,9 +8485,10 @@ pub async fn respawn_agent_terminal(
     // record itself always exists, but its session id does NOT: a
     // gate-fired fresh respawn of a no-mint provider
     // (codex/opencode/antigravity) carries `resume_session_id == None`,
-    // so the identity upsert and the ledger binding below are SKIPPED —
-    // the pane has NO saved identity and the natural rebind binds the
-    // conversation the CLI mints on its next clean typed prompt.
+    // so the ledger binding below is SKIPPED, and the identity upsert
+    // runs with NO session id — a session-less row: the pane has NO
+    // saved identity and the natural rebind binds the conversation the
+    // CLI mints on its next clean typed prompt.
     let create_meta_record = terminal_meta_record_for_create(
         &terminal_id,
         &mode,

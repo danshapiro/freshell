@@ -114,16 +114,28 @@ describe('antigravity real launch smoke', () => {
     ? it
     : it.skip
   itTurn('completes a headless turn and echoes the nonce', async () => {
-    const { stdout } = await execFileAsync(
-      agyCommand,
-      // GC15: the session-scoped API-key-auth overlay — the shared settings.json
-      // is never mutated. Argv shape per the Task 1 receipts: --settings earlier
-      // in argv, the prompt attached to its flag (-p='<prompt>'); the bare
-      // positional form misparses and exits 2.
-      ['--settings', '{"modelProvider":"gemini"}', '-p=Reply with exactly: antigravity-smoke-ok'],
-      { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
-    )
-    expect(stdout).toContain('antigravity-smoke-ok')
+    const nonce = `antigravity-smoke-ok-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const beforeByRoot = await snapshotBeforeByRoot()
+    try {
+      const { stdout } = await execFileAsync(
+        agyCommand,
+        // GC15: the session-scoped API-key-auth overlay — the shared settings.json
+        // is never mutated. Argv shape per the Task 1 receipts: --settings earlier
+        // in argv, the prompt attached to its flag (-p='<prompt>'); the bare
+        // positional form misparses and exits 2. The nonce is run-unique so the
+        // tier can own and sweep its conversation (a 2026-11-03 gated run leaked
+        // exactly this tier's conversation: a fixed nonce with no sweep).
+        ['--settings', '{"modelProvider":"gemini"}', `-p=Reply with exactly: ${nonce}`],
+        { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 },
+      )
+      expect(stdout).toContain(nonce)
+    } finally {
+      // The tier owns its conversation in every candidate root: a
+      // creation-then-failure (or a passing run) must not leave scratch
+      // data in the live store — the same sweep discipline as the resume
+      // tier below.
+      await sweepNonceBearingFresh(nonce, beforeByRoot)
+    }
   }, 200_000)
 
   // Candidate store roots, in preference order. The SEAM resolves ONE
@@ -150,6 +162,44 @@ describe('antigravity real launch smoke', () => {
   }
 
   const brainDirOf = (root: string) => path.join(root, 'brain')
+
+  // Per-root `before` snapshots over every candidate root (the run owns
+  // what it creates; the freshness filter is scoped per root).
+  async function snapshotBeforeByRoot(): Promise<Map<string, Set<string>>> {
+    const beforeByRoot = new Map<string, Set<string>>()
+    for (const root of agyStoreRootCandidates()) {
+      beforeByRoot.set(root, new Set(await fs.readdir(brainDirOf(root)).catch(() => [] as string[])))
+    }
+    return beforeByRoot
+  }
+
+  // Sweep every FRESH conversation carrying THIS run's unique nonce in
+  // every candidate root — success or any failure. The nonce gate stays:
+  // this run removes only conversations carrying its own unique nonce,
+  // never a concurrent user conversation.
+  async function sweepNonceBearingFresh(
+    nonce: string,
+    beforeByRoot: Map<string, Set<string>>,
+  ): Promise<void> {
+    const nonceBearing = new Set<string>()
+    for (const [root, before] of beforeByRoot) {
+      const brainDir = brainDirOf(root)
+      const nowIds = await fs.readdir(brainDir).catch(() => [] as string[])
+      for (const id of nowIds) {
+        if (before.has(id)) continue
+        const body = await fs
+          .readFile(path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8')
+          .catch(() => '')
+        if (body.includes(nonce)) nonceBearing.add(id)
+      }
+    }
+    for (const id of nonceBearing) {
+      for (const root of beforeByRoot.keys()) {
+        await fs.rm(path.join(brainDirOf(root), id), { recursive: true, force: true }).catch(() => {})
+        await fs.rm(path.join(root, 'conversations', `${id}.db`), { force: true }).catch(() => {})
+      }
+    }
+  }
 
   const runResume = available && realEnabled && hasProviderKey
   const itResume = runResume ? it : it.skip
