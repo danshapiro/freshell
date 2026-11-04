@@ -6114,18 +6114,19 @@ impl Supervisor {
     ) -> crate::recovery::NativeIdentityWait {
         use crate::recovery::NativeIdentityWait;
         let opencode_readiness = workload.opencode_tui_readiness_required(&context.provider);
-        let result = self
-            .wait_for_native_identity_with_reopen_authority(
-                &workload.soul_id,
-                incarnation_id,
-                intent_revision,
-                crate::recovery::native_identity_wait_timeout(opencode_readiness),
-                false,
-                context.recovery_attempt_id.as_ref().filter(|_| {
-                    context.desired_state == freshell_runtime_protocol::DesiredState::Stopped
-                }),
-            )
-            .await;
+        // Keep the nested identity wait off the activation poll frame. Ordinary
+        // observer recovery must fit the normal Tokio worker stack as well.
+        let result = Box::pin(self.wait_for_native_identity_with_reopen_authority(
+            &workload.soul_id,
+            incarnation_id,
+            intent_revision,
+            crate::recovery::native_identity_wait_timeout(opencode_readiness),
+            false,
+            context.recovery_attempt_id.as_ref().filter(|_| {
+                context.desired_state == freshell_runtime_protocol::DesiredState::Stopped
+            }),
+        ))
+        .await;
         let (outcome, adoption_pending, elapsed_ms) = match &result {
             NativeIdentityWait::Observed { elapsed_ms, .. } => ("observed", false, elapsed_ms),
             NativeIdentityWait::ProviderExited { elapsed_ms } => {

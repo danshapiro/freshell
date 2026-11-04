@@ -8856,6 +8856,7 @@ pub(crate) mod automatic_retry_tests {
 
     include!("deterministic_fixture_recovery_tests.rs");
     include!("fresh_agent_queued_recovery_tests.rs");
+    include!("native_recovery_stack_tests.rs");
 
     // These four subprocess tests are only entered by the documented runtime
     // sandbox. Abrupt exit skips every Rust destructor, including SQLite owners.
@@ -8887,6 +8888,7 @@ pub(crate) mod automatic_retry_tests {
         clock: Arc<AtomicI64>,
         hosts: Mutex<Vec<(PathBuf, tokio::task::JoinHandle<()>)>>,
         baseline_stop: Option<Arc<BaselineStopReadiness>>,
+        native_readiness: Option<Arc<NativeRecoveryReadiness>>,
     }
     impl Drop for RetryBackend {
         fn drop(&mut self) {
@@ -8902,6 +8904,7 @@ pub(crate) mod automatic_retry_tests {
                 clock,
                 hosts: Mutex::new(vec![]),
                 baseline_stop: None,
+                native_readiness: None,
             }
         }
         fn record(&self, name: &str, value: &str) {
@@ -9011,6 +9014,7 @@ pub(crate) mod automatic_retry_tests {
                 native_file.exists() || retained_observation.exists() || retained_provider;
             let final_identity_path = runtime.join("final-wrong-identity");
             let baseline_stop = self.baseline_stop.clone();
+            let native_readiness = self.native_readiness.clone();
             let terminal = handle.terminal().cloned();
             let host_incarnation = handle.incarnation_id().clone();
             let facts_root = self.root.clone();
@@ -9165,6 +9169,15 @@ pub(crate) mod automatic_retry_tests {
                         .await
                         .unwrap();
                         continue;
+                    }
+                    if let Some(readiness) = &native_readiness {
+                        if generation > 0 && matches!(&request.body, HostCommand::Status { .. }) {
+                            native_recovery_stage("post_grant_status");
+                            readiness.pending.notify_one();
+                            while !readiness.released.load(Ordering::Acquire) {
+                                readiness.release.notified().await;
+                            }
+                        }
                     }
                     let result = match request.body {
                         HostCommand::Hello {
@@ -9415,6 +9428,7 @@ pub(crate) mod automatic_retry_tests {
                         }
                         other => panic!("unexpected retry fixture command: {other:?}"),
                     };
+                    let grant_accepted = matches!(&result, HostResult::GrantAccepted { .. });
                     write_frame(
                         &mut socket,
                         &HostReply {
@@ -9424,6 +9438,12 @@ pub(crate) mod automatic_retry_tests {
                     )
                     .await
                     .unwrap();
+                    if grant_accepted {
+                        if let Some(readiness) = &native_readiness {
+                            readiness.grants.fetch_add(1, Ordering::SeqCst);
+                            native_recovery_stage("grant_written");
+                        }
+                    }
                 }
             });
             hosts.push((runtime, task));
@@ -11442,51 +11462,55 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn retry_final_native_inspection_keeps_typed_transient() {
-        for failure in ["transient", "identity"] {
-            let dir = tempfile::tempdir().unwrap();
-            let (supervisor, backend, _) = open(dir.path(), 0);
-            let soul = seed_native(&supervisor, dir.path()).await;
-            std::fs::write(dir.path().join("final-inspection-failure"), failure).unwrap();
-            supervisor.reconcile_startup().await.unwrap();
-            assert_eq!(
-                backend.count("final-inspection"),
-                1,
-                "must reach the activated native replacement's final inspection"
-            );
-            assert_eq!(backend.count("creates"), 1);
-            assert_eq!(attempts(dir.path()).len(), 1);
-            assert_eq!(
-                due(dir.path()),
-                (failure == "transient").then_some(2_750),
-                "{failure}: delay starts at final failure settlement"
-            );
-            assert_root_and_successes(&supervisor, &soul, 0).await;
-            std::fs::remove_file(dir.path().join("final-inspection-failure")).unwrap();
-            drop(supervisor);
-            drop(backend);
-            let (supervisor, backend, clock) = open(dir.path(), 2_000);
-            supervisor.reconcile_startup().await.unwrap();
-            assert_eq!(attempts(dir.path()).len(), 1);
-            clock.store(2_750, Ordering::SeqCst);
-            supervisor.observe_once().await.unwrap();
-            let current = supervisor
-                .registry
-                .recovery_context(soul.clone())
-                .await
-                .unwrap();
-            if failure == "transient" {
-                assert_eq!(current.recovery_state, RecoveryState::Live);
-                assert_eq!(backend.count("creates"), 2);
-                assert_eq!(attempts(dir.path()).len(), 2);
-                assert_root_and_successes(&supervisor, &soul, 1).await;
-            } else {
-                assert_eq!(current.recovery_state, RecoveryState::Blocked);
+        // Keep both reopen scenarios off the default libtest stack.
+        Box::pin(async {
+            for failure in ["transient", "identity"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (supervisor, backend, _) = open(dir.path(), 0);
+                let soul = seed_native(&supervisor, dir.path()).await;
+                std::fs::write(dir.path().join("final-inspection-failure"), failure).unwrap();
+                supervisor.reconcile_startup().await.unwrap();
+                assert_eq!(
+                    backend.count("final-inspection"),
+                    1,
+                    "must reach the activated native replacement's final inspection"
+                );
                 assert_eq!(backend.count("creates"), 1);
                 assert_eq!(attempts(dir.path()).len(), 1);
+                assert_eq!(
+                    due(dir.path()),
+                    (failure == "transient").then_some(2_750),
+                    "{failure}: delay starts at final failure settlement"
+                );
                 assert_root_and_successes(&supervisor, &soul, 0).await;
+                std::fs::remove_file(dir.path().join("final-inspection-failure")).unwrap();
+                drop(supervisor);
+                drop(backend);
+                let (supervisor, backend, clock) = open(dir.path(), 2_000);
+                supervisor.reconcile_startup().await.unwrap();
+                assert_eq!(attempts(dir.path()).len(), 1);
+                clock.store(2_750, Ordering::SeqCst);
+                supervisor.observe_once().await.unwrap();
+                let current = supervisor
+                    .registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap();
+                if failure == "transient" {
+                    assert_eq!(current.recovery_state, RecoveryState::Live);
+                    assert_eq!(backend.count("creates"), 2);
+                    assert_eq!(attempts(dir.path()).len(), 2);
+                    assert_root_and_successes(&supervisor, &soul, 1).await;
+                } else {
+                    assert_eq!(current.recovery_state, RecoveryState::Blocked);
+                    assert_eq!(backend.count("creates"), 1);
+                    assert_eq!(attempts(dir.path()).len(), 1);
+                    assert_root_and_successes(&supervisor, &soul, 0).await;
+                }
+                assert_eq!(due(dir.path()), None);
             }
-            assert_eq!(due(dir.path()), None);
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -12129,24 +12153,28 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn retry_startup_and_observer_share_one_due_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        let (supervisor, backend, clock) = open(dir.path(), 0);
-        let soul = seed(&supervisor).await;
-        backend.unavailable(true);
-        supervisor.reconcile_startup().await.unwrap();
-        backend.unavailable(false);
-        clock.store(2_000, Ordering::SeqCst);
-        let (startup, observer) =
-            tokio::join!(supervisor.reconcile_startup(), supervisor.observe_once());
-        startup.unwrap();
-        observer.unwrap();
-        assert_eq!(
-            attempts(dir.path()).len(),
-            2,
-            "startup and observer must dispatch the same due reservation only once"
-        );
-        assert_eq!(backend.count("creates"), 1);
-        assert_root_and_successes(&supervisor, &soul, 1).await;
+        // Both concurrent recovery drivers must fit the default test stack.
+        Box::pin(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed(&supervisor).await;
+            backend.unavailable(true);
+            supervisor.reconcile_startup().await.unwrap();
+            backend.unavailable(false);
+            clock.store(2_000, Ordering::SeqCst);
+            let (startup, observer) =
+                tokio::join!(supervisor.reconcile_startup(), supervisor.observe_once());
+            startup.unwrap();
+            observer.unwrap();
+            assert_eq!(
+                attempts(dir.path()).len(),
+                2,
+                "startup and observer must dispatch the same due reservation only once"
+            );
+            assert_eq!(backend.count("creates"), 1);
+            assert_root_and_successes(&supervisor, &soul, 1).await;
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -12933,199 +12961,207 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn retry_uncommitted_replacement_reopens_with_backoff_and_preserves_native_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = seed_native(&supervisor, dir.path()).await;
+        // Keep the complete reopen scenario off the default libtest stack.
+        Box::pin(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(dir.path(), 0);
+            let soul = seed_native(&supervisor, dir.path()).await;
 
-        let original = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        let (incarnation, runtime, container) =
-            uncommitted_replacement(&supervisor, &backend, &soul).await;
-        let attempt = attempts(dir.path())[0].0.clone();
-        drop(supervisor);
-        drop(backend);
+            let original = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let (incarnation, runtime, container) =
+                uncommitted_replacement(&supervisor, &backend, &soul).await;
+            let attempt = attempts(dir.path())[0].0.clone();
+            drop(supervisor);
+            drop(backend);
 
-        let (supervisor, backend, _) = open(dir.path(), 1_000);
-        let report = supervisor.reconcile_startup().await.unwrap();
-        assert!(
-            report.results.iter().all(|result| result.error.is_none()),
-            "{report:?}"
-        );
-        assert_eq!(due(dir.path()), Some(3_000));
-        let retry = supervisor
-            .registry
-            .recovery_retry(soul.clone(), original.intent_revision)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retry.attempt_count, 1);
-        assert!(retry.reserved_attempt_id.is_none());
-        assert_eq!(
-            attempts(dir.path()),
-            vec![(
-                attempt.clone(),
-                "interrupted_before_ownership_commit".into()
-            )]
-        );
-        assert_eq!(backend.count("creates"), 1);
-        assert_uncommitted_object_quarantined(
-            &supervisor,
-            &backend,
-            &incarnation,
-            &runtime,
-            &container,
-        );
-        let events = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
-        assert_retirement_event(
-            dir.path(),
-            &incarnation,
-            &attempt,
-            &original,
-            original.intent_revision,
-        );
-        let scheduled: serde_json::Value = events
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| event["event"] == "supervisor.recovery_retry.scheduled")
-            .unwrap();
-        assert_eq!(scheduled["data"]["attemptCount"], 1);
-        assert_eq!(scheduled["data"]["nextDueAtMs"], 3_000);
-        assert_eq!(scheduled["data"]["reason"], "ownership_not_committed");
-        assert_eq!(scheduled["data"]["severity"], "info");
-        drop(supervisor);
-        drop(backend);
-
-        let (supervisor, backend, clock) = open(dir.path(), 2_000);
-        supervisor.reconcile_startup().await.unwrap();
-        assert_eq!(due(dir.path()), Some(3_000));
-        assert_eq!(backend.count("creates"), 1);
-        clock.store(3_000, Ordering::SeqCst);
-        supervisor.observe_once().await.unwrap();
-        let current = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        assert_eq!(current.recovery_state, RecoveryState::Live);
-        assert_eq!(current.intent_revision, original.intent_revision);
-        assert_ne!(current.prior_handle.incarnation_id(), &incarnation);
-        assert_ne!(current.prior_handle.container_id(), container);
-        assert_eq!(backend.count("creates"), 2);
-        assert_eq!(attempts(dir.path()).len(), 2);
-        assert_eq!(attempts(dir.path())[1].1, "succeeded");
-        assert_eq!(due(dir.path()), None);
-        assert_root_and_successes(&supervisor, &soul, 1).await;
-        assert_uncommitted_object_quarantined(
-            &supervisor,
-            &backend,
-            &incarnation,
-            &runtime,
-            &container,
-        );
-        close_retry_hosts(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn retired_unowned_replacement_settles_dependency_failure_across_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = seed_native(&supervisor, dir.path()).await;
-
-        let original = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        let (incarnation, runtime, container) =
-            uncommitted_replacement(&supervisor, &backend, &soul).await;
-        drop(supervisor);
-        drop(backend);
-
-        let (supervisor, backend, clock) = open(dir.path(), 1_000);
-        supervisor.reconcile_startup().await.unwrap();
-        assert_eq!(due(dir.path()), Some(3_000));
-        backend.unavailable(true);
-        clock.store(3_000, Ordering::SeqCst);
-        let report = supervisor.reconcile_startup().await.unwrap();
-        assert!(
-            report.results.iter().all(|result| result.error.is_none()),
-            "{report:?}"
-        );
-        let blocked = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        assert_eq!(blocked.recovery_state, RecoveryState::Blocked);
-        assert_eq!(
-            blocked.prior_handle.incarnation_id(),
-            original.prior_handle.incarnation_id()
-        );
-        let settled = supervisor
-            .registry
-            .recovery_retry(soul.clone(), original.intent_revision)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(settled.attempt_count, 2);
-        assert!(settled.reserved_attempt_id.is_none());
-        assert_eq!(settled.next_due_at_ms, Some(13_000));
-        assert_eq!(settled.last_reason, "backend_unavailable");
-        let journals = attempts(dir.path());
-        assert_eq!(journals.len(), 2);
-        assert_eq!(journals[1].1, "blocked");
-        assert_uncommitted_object_quarantined(
-            &supervisor,
-            &backend,
-            &incarnation,
-            &runtime,
-            &container,
-        );
-        drop(supervisor);
-        drop(backend);
-
-        let (supervisor, backend, clock) = open(dir.path(), 4_000);
-        supervisor.reconcile_startup().await.unwrap();
-        supervisor.observe_once().await.unwrap();
-        assert_eq!(attempts(dir.path()), journals);
-        assert_eq!(
-            supervisor
+            let (supervisor, backend, _) = open(dir.path(), 1_000);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            assert!(
+                report.results.iter().all(|result| result.error.is_none()),
+                "{report:?}"
+            );
+            assert_eq!(due(dir.path()), Some(3_000));
+            let retry = supervisor
                 .registry
                 .recovery_retry(soul.clone(), original.intent_revision)
                 .await
                 .unwrap()
-                .unwrap(),
-            settled
-        );
-        assert_eq!(backend.count("creates"), 1);
-        backend.unavailable(false);
-        clock.store(13_000, Ordering::SeqCst);
-        supervisor.observe_once().await.unwrap();
-        let recovered = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        assert_eq!(recovered.recovery_state, RecoveryState::Live);
-        assert_eq!(recovered.native_session_id, original.native_session_id);
-        assert_eq!(recovered.provider_store_id, original.provider_store_id);
-        assert_eq!(recovered.intent_revision, original.intent_revision);
-        assert_eq!(backend.count("creates"), 2);
-        assert_eq!(attempts(dir.path()).len(), 3);
-        assert_eq!(attempts(dir.path())[2].1, "succeeded");
-        assert_eq!(due(dir.path()), None);
-        assert_root_and_successes(&supervisor, &soul, 1).await;
-        assert_uncommitted_object_quarantined(
-            &supervisor,
-            &backend,
-            &incarnation,
-            &runtime,
-            &container,
-        );
-        close_retry_hosts(&backend).await;
+                .unwrap();
+            assert_eq!(retry.attempt_count, 1);
+            assert!(retry.reserved_attempt_id.is_none());
+            assert_eq!(
+                attempts(dir.path()),
+                vec![(
+                    attempt.clone(),
+                    "interrupted_before_ownership_commit".into()
+                )]
+            );
+            assert_eq!(backend.count("creates"), 1);
+            assert_uncommitted_object_quarantined(
+                &supervisor,
+                &backend,
+                &incarnation,
+                &runtime,
+                &container,
+            );
+            let events = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+            assert_retirement_event(
+                dir.path(),
+                &incarnation,
+                &attempt,
+                &original,
+                original.intent_revision,
+            );
+            let scheduled: serde_json::Value = events
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|event| event["event"] == "supervisor.recovery_retry.scheduled")
+                .unwrap();
+            assert_eq!(scheduled["data"]["attemptCount"], 1);
+            assert_eq!(scheduled["data"]["nextDueAtMs"], 3_000);
+            assert_eq!(scheduled["data"]["reason"], "ownership_not_committed");
+            assert_eq!(scheduled["data"]["severity"], "info");
+            drop(supervisor);
+            drop(backend);
+
+            let (supervisor, backend, clock) = open(dir.path(), 2_000);
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(due(dir.path()), Some(3_000));
+            assert_eq!(backend.count("creates"), 1);
+            clock.store(3_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(current.intent_revision, original.intent_revision);
+            assert_ne!(current.prior_handle.incarnation_id(), &incarnation);
+            assert_ne!(current.prior_handle.container_id(), container);
+            assert_eq!(backend.count("creates"), 2);
+            assert_eq!(attempts(dir.path()).len(), 2);
+            assert_eq!(attempts(dir.path())[1].1, "succeeded");
+            assert_eq!(due(dir.path()), None);
+            assert_root_and_successes(&supervisor, &soul, 1).await;
+            assert_uncommitted_object_quarantined(
+                &supervisor,
+                &backend,
+                &incarnation,
+                &runtime,
+                &container,
+            );
+            close_retry_hosts(&backend).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retired_unowned_replacement_settles_dependency_failure_across_reopen() {
+        // Keep the multi-reopen test driver off the default libtest stack.
+        Box::pin(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, _) = open(dir.path(), 0);
+            let soul = seed_native(&supervisor, dir.path()).await;
+
+            let original = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let (incarnation, runtime, container) =
+                uncommitted_replacement(&supervisor, &backend, &soul).await;
+            drop(supervisor);
+            drop(backend);
+
+            let (supervisor, backend, clock) = open(dir.path(), 1_000);
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(due(dir.path()), Some(3_000));
+            backend.unavailable(true);
+            clock.store(3_000, Ordering::SeqCst);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            assert!(
+                report.results.iter().all(|result| result.error.is_none()),
+                "{report:?}"
+            );
+            let blocked = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(blocked.recovery_state, RecoveryState::Blocked);
+            assert_eq!(
+                blocked.prior_handle.incarnation_id(),
+                original.prior_handle.incarnation_id()
+            );
+            let settled = supervisor
+                .registry
+                .recovery_retry(soul.clone(), original.intent_revision)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(settled.attempt_count, 2);
+            assert!(settled.reserved_attempt_id.is_none());
+            assert_eq!(settled.next_due_at_ms, Some(13_000));
+            assert_eq!(settled.last_reason, "backend_unavailable");
+            let journals = attempts(dir.path());
+            assert_eq!(journals.len(), 2);
+            assert_eq!(journals[1].1, "blocked");
+            assert_uncommitted_object_quarantined(
+                &supervisor,
+                &backend,
+                &incarnation,
+                &runtime,
+                &container,
+            );
+            drop(supervisor);
+            drop(backend);
+
+            let (supervisor, backend, clock) = open(dir.path(), 4_000);
+            supervisor.reconcile_startup().await.unwrap();
+            supervisor.observe_once().await.unwrap();
+            assert_eq!(attempts(dir.path()), journals);
+            assert_eq!(
+                supervisor
+                    .registry
+                    .recovery_retry(soul.clone(), original.intent_revision)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                settled
+            );
+            assert_eq!(backend.count("creates"), 1);
+            backend.unavailable(false);
+            clock.store(13_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            let recovered = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(recovered.recovery_state, RecoveryState::Live);
+            assert_eq!(recovered.native_session_id, original.native_session_id);
+            assert_eq!(recovered.provider_store_id, original.provider_store_id);
+            assert_eq!(recovered.intent_revision, original.intent_revision);
+            assert_eq!(backend.count("creates"), 2);
+            assert_eq!(attempts(dir.path()).len(), 3);
+            assert_eq!(attempts(dir.path())[2].1, "succeeded");
+            assert_eq!(due(dir.path()), None);
+            assert_root_and_successes(&supervisor, &soul, 1).await;
+            assert_uncommitted_object_quarantined(
+                &supervisor,
+                &backend,
+                &incarnation,
+                &runtime,
+                &container,
+            );
+            close_retry_hosts(&backend).await;
+        })
+        .await;
     }
 
     #[tokio::test]
