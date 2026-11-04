@@ -1227,6 +1227,22 @@ export const PaneVerdictSchema = z.object({
   reason: z.string().optional(),
   /** A newer duplicate generation exists for the same createRequestId; flags the duplicate terminalId. */
   duplicate: z.string().optional(),
+  /**
+   * attach only, the fresh_unbound shape (additive/optional — older servers
+   * omit it; older clients ignore it and keep the legacy
+   * preserve-the-recorded-ref fold): the attached terminal is an
+   * identity-less FreshUnbound replacement — the resume gate refused its
+   * predecessor's recorded id and the server RELEASED the stale claim. The
+   * reconnect-path mirror of terminal.replaced's identityDisposition: a
+   * browser that was disconnected during the server-side auto-resume (or
+   * reloaded after it) missed the replaced frame, and this verdict signal
+   * tells it to CLEAR the pane's stale saved sessionRef, so the CLI's
+   * natural rebind (the fresh conversation's terminal.session.associated
+   * with a new session id and NO previousSessionId) folds instead of
+   * conflicting. Only `fresh_unbound` is ever set, and never beside a
+   * sessionRef.
+   */
+  identityDisposition: z.enum(['resumed', 'minted_replacement', 'fresh_unbound']).optional(),
 })
 
 export const PaneReconcileResultSchema = z.object({

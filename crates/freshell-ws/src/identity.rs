@@ -79,6 +79,27 @@ pub struct TerminalIdentity {
     /// retained-on-retire by design, see [`TerminalIdentityRegistry::retire`]),
     /// so it adds no new growth beyond the map that already exists.
     classify_generation: u64,
+    /// Focused repair round 5, Major: this terminal is an identity-less
+    /// FreshUnbound REPLACEMENT — the auto-resume respawn spawned it after
+    /// the resume gate refused its predecessor's recorded session id, and
+    /// the hub RELEASED the stale claim (never completing it against this
+    /// terminal). The in-memory mirror of the live `terminal.replaced`
+    /// frame's `fresh_unbound` disposition: a browser that was DISCONNECTED
+    /// during the server-side auto-resume (or reloaded after it) missed
+    /// that transient frame, so the reconcile attach derivation reads this
+    /// marker to carry the same identity-clearing signal on its verdict —
+    /// without it the pane keeps a stale saved sessionRef across the
+    /// reconnection and the CLI's natural rebind folds as a conflict.
+    /// Stamped ONLY by the auto-resume respawn door
+    /// (`terminal.rs::respawn_agent_terminal` — ordinary creates never
+    /// set it, which is exactly what keeps an ordinary identity-less
+    /// attach — a young pane whose identity is not captured yet — from
+    /// clearing a still-valid claim). Preserved by plain upserts (the
+    /// marker describes the terminal's ORIGIN, not its current binding);
+    /// moot once the CLI's natural rebind gives the terminal an identity
+    /// (the reconcile derivation only consults it while the terminal has
+    /// no session ref).
+    pub fresh_unbound_replacement: bool,
 }
 
 /// The minimal entry created when a write lands before the terminal's first
@@ -97,6 +118,7 @@ fn minimal_entry(terminal_id: &str) -> TerminalIdentity {
         name_ref: None,
         naming_handle: None,
         classify_generation: 0,
+        fresh_unbound_replacement: false,
     }
 }
 
@@ -356,6 +378,34 @@ impl TerminalIdentityRegistry {
             .or_insert_with(|| minimal_entry(terminal_id));
         entry.is_subagent = value;
         entry.updated_at = crate::terminal::now_ms();
+    }
+
+    /// Focused repair round 5, Major: mark this terminal as an identity-less
+    /// FreshUnbound replacement — the auto-resume respawn's `FreshUnbound`
+    /// shape (the gate refused the predecessor's recorded id; the hub
+    /// RELEASED the stale claim). See [`TerminalIdentity::fresh_unbound_replacement`].
+    /// Creates a minimal entry when the terminal has no identity row yet
+    /// (the respawn's session-less seed upsert runs on the same registry, so
+    /// in practice the entry exists; the or-insert keeps the stamp
+    /// order-independent). Same in-place patch discipline as
+    /// [`Self::set_is_subagent`]: touches nothing else.
+    pub fn mark_fresh_unbound_replacement(&self, terminal_id: &str) {
+        let mut map = self.inner.write().expect("identity registry lock poisoned");
+        let entry = map
+            .entry(terminal_id.to_string())
+            .or_insert_with(|| minimal_entry(terminal_id));
+        entry.fresh_unbound_replacement = true;
+    }
+
+    /// Whether this terminal is an identity-less FreshUnbound replacement
+    /// (see [`TerminalIdentity::fresh_unbound_replacement`]). `false` for
+    /// unknown ids — an ordinary terminal is never one.
+    pub fn is_fresh_unbound_replacement(&self, terminal_id: &str) -> bool {
+        self.inner
+            .read()
+            .expect("identity registry lock poisoned")
+            .get(terminal_id)
+            .is_some_and(|entry| entry.fresh_unbound_replacement)
     }
 
     /// Out-of-order guard, request half (Bug-1 review): atomically advance

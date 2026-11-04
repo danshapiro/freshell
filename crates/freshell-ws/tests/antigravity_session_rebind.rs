@@ -1887,3 +1887,154 @@ async fn antigravity_crash_respawn_with_deleted_conversation_releases_the_stale_
     let _ = std::fs::remove_file(&argv_capture);
     let _ = std::fs::remove_file(&fake_agy);
 }
+
+/// Focused repair round 5, Major — the cap-round hole: the live
+/// `terminal.replaced` fold clears the pane's stale session identity, but
+/// a browser DISCONNECTED during the server-side auto-resume (or reloaded
+/// after it) never sees that transient frame. Its reconnection reconciles
+/// by createRequestId carrying the pane's PRE-replacement view — the dead
+/// predecessor's terminal id and the stale sessionRef the gate refused —
+/// and the attach verdict must carry the SAME identity-clearing signal
+/// (`identityDisposition: fresh_unbound`), or the pane retains the
+/// deleted conversation id across the reconnection and the CLI's natural
+/// rebind (a fresh id with no previousSessionId) folds as a conflict
+/// forever. End-to-end: real crash, real gate refusal, real FreshUnbound
+/// respawn, real reconnect, real verdict.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn antigravity_fresh_unbound_reconnect_reconcile_carries_the_clearing_disposition() {
+    let home = tempfile::tempdir().expect("antigravity home tempdir");
+    let cwd_dir = tempfile::tempdir().expect("pane cwd tempdir");
+    let ledger_dir = tempfile::tempdir().expect("pane ledger tempdir");
+    let cwd = cwd_dir.path().to_string_lossy().into_owned();
+    let argv_capture = std::env::temp_dir().join(format!(
+        "freshell-antigravity-rebind-argv-fu-reconnect-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&argv_capture);
+    let fake_agy = write_fake_agy("fu-reconnect");
+
+    let probe = Arc::new(DiskWiredAntigravityProbe {
+        brain_root: home.path().join("brain"),
+    });
+    let server = spawn_antigravity_server_with_probe(
+        vec![antigravity_fake_spec(home.path(), &argv_capture, &fake_agy)],
+        home.path(),
+        ledger_dir.path(),
+        probe.clone(),
+    )
+    .await;
+    let mut ws = common::connect_and_capture_inventory(&server.url).await.0;
+
+    // 1. Bind a conversation the normal way: create, clean prompt, adopt.
+    let create_request_id = "req-agy-fu-reconnect";
+    let tid = create_pane(&mut ws, &cwd, create_request_id).await;
+    submit_prompt(&mut ws, &tid, "reconnect stale crash prompt quebec").await;
+    let adopted = next_associated_frame(&mut ws, &tid, "fu-reconnect-adopt").await;
+    let conv = conv_of(&tid);
+    assert_eq!(
+        adopted["sessionRef"]["sessionId"], conv,
+        "the pane adopts its own conversation first: {adopted}"
+    );
+
+    // 2. The conversation is deleted from disk (the data-loss shape).
+    std::fs::remove_dir_all(home.path().join("brain").join(&conv))
+        .expect("delete the conversation directory");
+
+    // 3. THE BROWSER DISCONNECTS (this connection is gone — it never sees
+    //    the replaced frame), and the pane crashes on a second connection.
+    //    The server-side auto-resume then runs to completion while the
+    //    browser is away.
+    drop(ws);
+    let mut ws2 = common::connect_and_capture_inventory(&server.url).await.0;
+    common::send_input(&mut ws2, &tid, "/crash").await;
+    common::send_input(&mut ws2, &tid, "\r").await;
+
+    // 4. Wait for the FreshUnbound respawn to complete server-side: a NEW
+    //    live terminal under the SAME createRequestId, identity-less, and
+    //    stamped with the replacement marker (the in-memory mirror the
+    //    reconcile derive reads).
+    let new_tid = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(candidate) = server
+                .registry
+                .newest_live_by_create_request_id(create_request_id)
+                .filter(|t| t != &tid)
+            {
+                return candidate;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the FreshUnbound respawn completes within the budget");
+    assert_eq!(
+        registry_resume_id(&server.registry, &new_tid),
+        None,
+        "the replacement is identity-less"
+    );
+    assert!(
+        server.state.identity.session_ref_for(&new_tid).is_none(),
+        "the replacement seeds no identity row"
+    );
+    assert!(
+        server.state.identity.is_fresh_unbound_replacement(&new_tid),
+        "the respawn stamps the fresh_unbound replacement marker"
+    );
+
+    // 5. The browser comes back — a FRESH negotiated connection (it missed
+    //    every frame broadcast before this point, the replaced frame
+    //    included) — and reconciles the pane with its PRE-replacement
+    //    view: the dead predecessor's terminal handle and the stale
+    //    sessionRef the gate refused.
+    let (mut ws3, _inv) = common::connect_with_hello(
+        &server.url,
+        serde_json::json!({
+            "type": "hello",
+            "token": common::AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities": { "paneReconcileV1": true },
+        }),
+    )
+    .await;
+    ws3.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.reconcile.request",
+            "reconcileId": "rec-fu-reconnect",
+            "panes": [{
+                "paneKey": "tab1:p1",
+                "kind": "terminal",
+                "mode": "antigravity",
+                "createRequestId": create_request_id,
+                "terminalId": tid,
+                "sessionRef": { "provider": "antigravity", "sessionId": conv },
+            }],
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send pane.reconcile.request");
+    let result = next_frame_of_type(&mut ws3, "pane.reconcile.result").await;
+
+    // 6. The verdict attaches the identity-less replacement AND carries
+    //    the clearing disposition — the reconnect-path mirror of the
+    //    terminal.replaced frame the pane never saw. RED pre-fix: the
+    //    verdict carried no disposition and the pane's stale id survived
+    //    the reconnection.
+    let verdict = &result["verdicts"][0];
+    assert_eq!(verdict["paneKey"], "tab1:p1", "{result}");
+    assert_eq!(verdict["verdict"], "attach", "{result}");
+    assert_eq!(verdict["terminalId"], new_tid.as_str(), "{result}");
+    assert!(
+        verdict.get("sessionRef").is_none(),
+        "the replacement is identity-less: {result}"
+    );
+    assert_eq!(
+        verdict["identityDisposition"], "fresh_unbound",
+        "the reconnect verdict carries the identity-clearing signal: {result}"
+    );
+
+    server.registry.kill(&new_tid);
+    let _ = std::fs::remove_file(&argv_capture);
+    let _ = std::fs::remove_file(&fake_agy);
+}

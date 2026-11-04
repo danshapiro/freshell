@@ -1231,6 +1231,23 @@ pub struct PaneVerdict {
     /// merely flags the duplicate `terminalId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate: Option<String>,
+    /// `attach` only, the `fresh_unbound` shape (focused repair round 5,
+    /// Major — additive/optional; older clients ignore it and keep the
+    /// legacy preserve-the-recorded-ref fold): the attached terminal is an
+    /// identity-less FreshUnbound replacement — the resume gate refused its
+    /// predecessor's recorded id and the server RELEASED the stale claim.
+    /// This is the reconnect-path mirror of `terminal.replaced`'s
+    /// [`TerminalReplacedIdentityDisposition`]: a browser that was
+    /// disconnected during the server-side auto-resume (or reloaded after
+    /// it) missed the replaced frame, and its reconciliation attach must
+    /// carry the same identity-clearing signal or the pane keeps a stale
+    /// saved sessionRef and the CLI's natural rebind — the fresh
+    /// conversation's `terminal.session.associated` with a new id and no
+    /// `previousSessionId` — folds as a conflict. Only `fresh_unbound` is
+    /// ever set on a verdict (resumed/minted replacements carry their
+    /// identity in `session_ref`) and never beside a `session_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_disposition: Option<TerminalReplacedIdentityDisposition>,
 }
 
 /// Sent ONLY in response to `pane.reconcile.request` — the server never

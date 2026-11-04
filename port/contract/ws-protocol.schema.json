@@ -8718,6 +8718,14 @@
               "duplicate": {
                 "type": "string"
               },
+              "identityDisposition": {
+                "enum": [
+                  "resumed",
+                  "minted_replacement",
+                  "fresh_unbound"
+                ],
+                "type": "string"
+              },
               "paneKey": {
                 "minLength": 1,
                 "type": "string"
@@ -8786,6 +8794,14 @@
           "type": "boolean"
         },
         "duplicate": {
+          "type": "string"
+        },
+        "identityDisposition": {
+          "enum": [
+            "resumed",
+            "minted_replacement",
+            "fresh_unbound"
+          ],
           "type": "string"
         },
         "paneKey": {

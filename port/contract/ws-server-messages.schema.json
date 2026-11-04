@@ -3060,6 +3060,14 @@
               "duplicate": {
                 "type": "string"
               },
+              "identityDisposition": {
+                "enum": [
+                  "resumed",
+                  "minted_replacement",
+                  "fresh_unbound"
+                ],
+                "type": "string"
+              },
               "paneKey": {
                 "type": "string"
               },

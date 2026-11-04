@@ -518,6 +518,19 @@ export function foldVerdicts(
           sessionRef: verdict.sessionRef,
           corrected: verdict.corrected,
           duplicate: verdict.duplicate ? true : undefined,
+          // Focused repair round 5, Major — the reconnect carrier: the
+          // pane missed the live terminal.replaced frame (disconnected
+          // during the server-side auto-resume, or reloaded after it), so
+          // THIS verdict is the only signal that the attached terminal is
+          // an identity-less FreshUnbound replacement whose predecessor's
+          // claim the server RELEASED. Mirror the live fold's exact
+          // discriminator (identityDisposition === 'fresh_unbound') so the
+          // pane clears its stale saved sessionRef and the CLI's natural
+          // rebind folds instead of conflicting. Never set beside a
+          // sessionRef (the server sends at most one of the two).
+          ...(verdict.identityDisposition === 'fresh_unbound'
+            ? { clearSessionIdentity: true }
+            : {}),
         }))
         outcome.attached++
         break

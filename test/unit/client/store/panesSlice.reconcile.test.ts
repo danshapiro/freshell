@@ -280,6 +280,28 @@ describe('reconcile reducers', () => {
       expect(next.reconcilePendingPanes?.['tab1:p1']).toBeUndefined()
     })
 
+    // Focused repair round 5, Major: the reconnect verdict can arrive for
+    // the terminal the pane ALREADY adopted (a prior fold adopted the
+    // FreshUnbound replacement while the pane's sessionRef kept naming the
+    // deleted conversation). The clear-demanding fold must run EVEN THEN —
+    // the no-change gate must not keep the stale sessionRef alive on the
+    // identity-less terminal — while the unchanged terminal keeps its
+    // streamId (foldLiveTerminalAttach only drops it on a terminal change).
+    it('a clear-demanding fold never takes the no-change gate, even on the already-adopted terminal', () => {
+      const next = panesReducer(convergedPane(), applyReconcileAttach({
+        tabId: 'tab1',
+        paneId: 'p1',
+        terminalId: 't1',
+        serverInstanceId: 'srv-1',
+        clearSessionIdentity: true,
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.sessionRef).toBeUndefined()
+      expect(c.reconcileEpoch).toBe(1)
+      expect(c.streamId).toBe('st-1')
+      expect(c.terminalId).toBe('t1')
+    })
+
     it('a corrective duplicate verdict still bumps the epoch but preserves the same terminal streamId', () => {
       const next = panesReducer(convergedPane(), applyReconcileAttach({
         tabId: 'tab1',

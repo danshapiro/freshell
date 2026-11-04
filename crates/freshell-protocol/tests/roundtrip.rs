@@ -741,6 +741,44 @@ fn terminal_replaced_stale_session_notice_is_optional_and_additive() {
 }
 
 #[test]
+fn pane_reconcile_verdict_identity_disposition_is_optional_and_additive() {
+    // Focused repair round 5, Major: a browser DISCONNECTED during the
+    // server-side auto-resume (or reloaded after it) misses the transient
+    // terminal.replaced frame, so the reconnect path's identity-clearing
+    // signal rides the reconcile ATTACH VERDICT instead — same additive
+    // field name and enum as the replaced frame, set only on the
+    // identity-less FreshUnbound shape (never beside a sessionRef; a
+    // resumed/minted replacement carries its identity in sessionRef).
+    // Additive/optional: absent keeps the legacy verdict byte-shape and the
+    // legacy preserve-the-recorded-ref fold.
+    let legacy = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2"}]}"#;
+    match server_roundtrip(legacy, "pane.reconcile.result") {
+        ServerMessage::PaneReconcileResult(r) => {
+            assert_eq!(r.verdicts[0].identity_disposition, None);
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
+    let wire = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2","identityDisposition":"fresh_unbound"}]}"#;
+    match server_roundtrip(wire, "pane.reconcile.result") {
+        ServerMessage::PaneReconcileResult(r) => {
+            assert_eq!(
+                r.verdicts[0].identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+            // The wire key serializes camelCase (the struct is
+            // rename_all = camelCase; the enum values stay snake_case).
+            let reser =
+                serde_json::to_value(ServerMessage::PaneReconcileResult(r)).expect("re-serialize");
+            assert_eq!(
+                reser["verdicts"][0]["identityDisposition"], "fresh_unbound",
+                "the disposition must survive the round-trip on the wire"
+            );
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_status_exited_settle_frame_roundtrips() {
     // znhn item 3: the auto-resume SETTLE frame — status 'exited' on the
     // existing terminal.status message, with the typed resumeCycles field

@@ -8570,6 +8570,23 @@ pub async fn respawn_agent_terminal(
         }
     }
 
+    // Focused repair round 5, Major: stamp the FreshUnbound replacement's
+    // identity marker — the in-memory mirror of the `terminal.replaced`
+    // frame's `fresh_unbound` disposition. A browser DISCONNECTED during
+    // the server-side auto-resume (or reloaded after it) never sees that
+    // transient frame; on reconnection its pane.reconcile attach of this
+    // identity-less terminal is the only path that can tell the pane its
+    // stale saved sessionRef was released (the reconcile derive reads this
+    // marker and carries the clearing disposition on the attach verdict).
+    // Only the FreshUnbound shape stamps (Resumed keeps a correct recorded
+    // ref; MintedReplacement carries its minted id in every identity home),
+    // which is exactly what keeps an ordinary identity-less attach — a
+    // young pane whose identity is not captured yet — from clearing a
+    // still-valid claim.
+    if respawned_identity == RespawnedIdentity::FreshUnbound {
+        state.identity.mark_fresh_unbound_replacement(&terminal_id);
+    }
+
     // Name reliability (Task 10): the replacement row resumes the SAME
     // durable session, so it binds that session's saved name (its title was
     // "<Mode> (auto-resumed)" with no binding at all). With no record yet the
