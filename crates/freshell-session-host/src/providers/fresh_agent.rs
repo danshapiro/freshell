@@ -4929,9 +4929,10 @@ try {{
     async fn task010_failed_resume_confirms_its_owned_tree_before_minting_again() {
         let logs = tempfile::tempdir().unwrap();
         let marker = logs.path().join("original-native-exit");
-        let fixture = native_codex_fixture(json!({"recordTurns":true,
+        let original_id = "old-owned-native";
+        let fixture = native_codex_fixture(json!({"threadStartThreadId":original_id,"recordTurns":true,
             "exitProcessAfterMethodsOnce":["turn/start"],"exitProcessAfterMethodsOnceMarkerPath":marker,
-            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id old-owned-native"}}}
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original_id}")}}}
         })).await;
         let actor = FreshAgentHostActor::open(
             fixture.dir.path().join("owned-tree-actor"),
@@ -5513,7 +5514,7 @@ await import(parameters.source)
             "exitProcessAfterMethodsOnce":[if pending {"thread/start"} else {"turn/start"}],
             "processExitGate":gate.behavior(),
             "exitProcessAfterMethodsOnceMarkerPath":logs.path().join("first-native-exit"),
-            "overrides":{"thread/resume":{"error":{"code":-32600,"message":"no rollout found for thread id original-native"}}}
+            "overrides":{"thread/resume":{"error":{"code":-32600,"message":format!("no rollout found for thread id {original_id}")}}}
         });
         let fixture = native_codex_fixture(behavior.clone()).await;
         let mut cleanup = NativeCodexCleanupReadiness::withheld(&fixture, pending);
