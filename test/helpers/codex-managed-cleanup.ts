@@ -32,7 +32,7 @@ function boundedDocker(deadline: number) {
   }
 }
 
-const cleanupDependencies = {
+export const managedCodexCleanupDependencies = {
   captureVolumes: (owners: InitialProviderVolumeAuthorization[], budgetMs: number) =>
     captureProviderParityVolumes(owners, boundedDocker(Date.now() + budgetMs)),
   removeVolumes: (volumes: ReturnType<typeof captureProviderParityVolumes>, budgetMs: number) =>
@@ -114,7 +114,7 @@ export async function collectManagedCodexProviderDiagnostics(
 /** Settle the installed-Codex parity fixture and its receipt-owned runtime. */
 export async function cleanupManagedCodexParity(
   { rig, owners, wire, model, fixtureWork, finalObservation, naming, restoreGrants, grantsDirectory, home }: ManagedCodexCleanup,
-  dependencies = cleanupDependencies,
+  dependencies = managedCodexCleanupDependencies,
 ): Promise<void> {
   const errors: unknown[] = []
   const attempt = async (operation: () => unknown | Promise<unknown>) => {
