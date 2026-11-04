@@ -253,10 +253,10 @@ function newState(repo: string): State {
 }
 
 export async function settle(state: State, options: {
-  expectedDaemonId?: string
+  expectedDaemonId: string
   onOwnerStop?: () => void
   onOwnerStopResult?: (result: Awaited<ReturnType<ManagedRuntimeOwner['stop']>>) => void
-} = {}): Promise<void> {
+}): Promise<void> {
   const failures: CleanupFailure[] = []
   const errors: unknown[] = []
   for (const attachment of state.attachments) {
@@ -281,7 +281,7 @@ export async function settle(state: State, options: {
       stop: async () => {
         const started = Date.now()
         try {
-          if (options.expectedDaemonId) requireDaemon(options.expectedDaemonId)
+          requireDaemon(options.expectedDaemonId)
           options.onOwnerStop?.()
           const result = await state.rig.stop()
           options.onOwnerStopResult?.(result)
@@ -358,7 +358,7 @@ export async function settle(state: State, options: {
       errors.push(new Error('exact fixture volume remains for reviewed recovery'))
     }
     event('real_volume.recovery_required', {
-      daemonId: state.fixtures[0]?.owner.daemonId ?? null,
+      daemonId: options.expectedDaemonId,
       volumes: state.fixtures.filter(value => value.attempted).map(value => value.owner.providerVolumeName),
       attachments: state.attachments.map(value => ({ name: value.name, id: value.id ?? null })),
       ownerStopped: state.stopped,
@@ -368,13 +368,13 @@ export async function settle(state: State, options: {
   }
 }
 
-async function runVolumeCase(state: State, body: () => Promise<void>): Promise<void> {
+async function runVolumeCase(state: State, daemonId: string, body: () => Promise<void>): Promise<void> {
   let caseFailed = false
   let caseError: unknown
   let cleanupFailed = false
   let cleanupError: unknown
   try { await body() } catch (error) { caseFailed = true; caseError = error }
-  try { await settle(state) } catch (error) { cleanupFailed = true; cleanupError = error }
+  try { await settle(state, { expectedDaemonId: daemonId }) } catch (error) { cleanupFailed = true; cleanupError = error }
   if (caseFailed) {
     event('real_volume.case_failed', { failures: [{ ...state.caseProgress,
       kind: caseError instanceof assert.AssertionError ? 'assertion' : 'operation' }], ownerStopped: state.stopped })
@@ -386,7 +386,7 @@ async function runVolumeCase(state: State, body: () => Promise<void>): Promise<v
 
 export async function ownershipAndUnreserved(repo: string, daemonId: string): Promise<void> {
   const state = newState(repo)
-  await runVolumeCase(state, async () => {
+  await runVolumeCase(state, daemonId, async () => {
     caseProgress(state, 'prepare')
     await state.rig.runtime.prepare()
     const changed = await createFixture(state, daemonId)
@@ -447,10 +447,13 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
     const rig = {
       runtime: state.rig.runtime,
       stop: async () => {
-        stopCalls++
         beforeStop = volumeExists(unreserved.owner.providerVolumeName)
         let result: Awaited<ReturnType<typeof state.rig.stop>>
-        try { result = await state.rig.stop() }
+        try {
+          requireDaemon(daemonId)
+          stopCalls++
+          result = await state.rig.stop()
+        }
         catch (error) {
           unreservedCleanupFailures.push({ phase: 'owner_stop', kind: 'exception' })
           throw error
@@ -507,7 +510,7 @@ export async function ownershipAndUnreserved(repo: string, daemonId: string): Pr
 
 async function unprovenCapture(repo: string, daemonId: string): Promise<void> {
   const state = newState(repo)
-  await runVolumeCase(state, async () => {
+  await runVolumeCase(state, daemonId, async () => {
     caseProgress(state, 'prepare')
     await state.rig.runtime.prepare()
     const fixture = await createFixture(state, daemonId)
@@ -518,6 +521,7 @@ async function unprovenCapture(repo: string, daemonId: string): Promise<void> {
     const rig = {
       runtime: state.rig.runtime,
       stop: async () => {
+        requireDaemon(daemonId)
         stopCalls++
         const result = await state.rig.stop()
         state.stopped = result.ok
@@ -530,8 +534,10 @@ async function unprovenCapture(repo: string, daemonId: string): Promise<void> {
         wire: undefined, model: undefined, finalObservation: undefined, naming: undefined, restoreGrants: undefined,
         grantsDirectory: undefined, home: undefined })
     } catch (error) { failure = error }
-    assert.ok(failure instanceof AggregateError)
-    assert.ok(failure.errors.some((error: unknown) => error instanceof Error && /artifact or daemon changed; retain it/.test(error.message)))
+    const expectedCaptureFailure = failure instanceof AggregateError && failure.errors.length === 1
+      && failure.errors[0] instanceof Error && /artifact or daemon changed; retain it/.test(failure.errors[0].message)
+    if (!expectedCaptureFailure && failure !== undefined) throw failure
+    assert.ok(expectedCaptureFailure)
     assert.equal(stopCalls, 1)
     assert.equal(state.stopped, true)
     assert.equal(volumeExists(fixture.owner.providerVolumeName), true)

@@ -174,7 +174,7 @@ it('retains the volume when a fresh ownership capture fails after an earlier cap
   control.stats.set(f.fixture.owner.hostBinaryPath, new Error('controlled artifact became unavailable'))
   const stop = vi.fn(async () => ({ ok: true, errors: [] as string[] }))
 
-  const failure = await settle(volumeState(f.fixture, stop)).then(() => undefined, error => error)
+  const failure = await settle(volumeState(f.fixture, stop), { expectedDaemonId: f.fixture.owner.daemonId }).then(() => undefined, error => error)
 
   expect(stop).toHaveBeenCalledOnce()
   expect(failure).toBeInstanceOf(Error)
@@ -206,16 +206,17 @@ it.each(['before_capture', 'after_owner_stop'] as const)(
       return { ok: true, errors: [] as string[] }
     })
     let failure: unknown
-    try { failure = await settle(volumeState(f.fixture, stop)).then(() => undefined, error => error) }
+    try { failure = await settle(volumeState(f.fixture, stop), { expectedDaemonId: f.fixture.owner.daemonId }).then(() => undefined, error => error) }
     finally { stdout.mockRestore() }
 
     const recovery = output.map(line => JSON.parse(line)).find(row => row.event === 'real_volume.recovery_required')
-    expect(stop).toHaveBeenCalledOnce()
+    expect(stop).toHaveBeenCalledTimes(switchAt === 'before_capture' ? 0 : 1)
     expect.soft(failure).toBeInstanceOf(Error)
     expect.soft(removals).toBe(0)
     expect.soft(f.docker.present).toBe(true)
     expect.soft(f.fixture.attempted).toBe(true)
-    expect.soft(recovery).toMatchObject({ daemonId: f.fixture.owner.daemonId, volumes: [f.fixture.owner.providerVolumeName], ownerStopped: true })
+    expect.soft(recovery).toMatchObject({ daemonId: f.fixture.owner.daemonId, volumes: [f.fixture.owner.providerVolumeName],
+      ownerStopped: switchAt === 'after_owner_stop' })
   },
 )
 
@@ -229,7 +230,7 @@ it('retains the volume when the daemon changes while final absence is being obse
   })
   const state = volumeState(f.fixture, vi.fn())
   state.stopped = true
-  const failure = await settle(state).then(() => undefined, error => error)
+  const failure = await settle(state, { expectedDaemonId: f.fixture.owner.daemonId }).then(() => undefined, error => error)
   expect.soft(failure).toBeInstanceOf(Error)
   expect.soft(f.fixture.attempted).toBe(true)
   expect.soft(f.docker.present).toBe(true)
@@ -670,11 +671,13 @@ it.each([
 it('bounds the complete fallback capture before attempting owner stop', async () => {
   const f = volumeFixture()
   let now = 0
+  let captureTimedOutAt = -1
   vi.spyOn(Date, 'now').mockImplementation(() => now)
   mockDocker(f, (args, timeout) => {
     const cost = (args[0] === 'volume' && args[1] === 'ls') || args[0] === 'info' ? 6000 : 0
     if (cost > timeout) {
       now += timeout
+      captureTimedOutAt = now
       throw Object.assign(new Error('controlled daemon command timeout'), { code: 'ETIMEDOUT' })
     }
     now += cost
@@ -685,12 +688,14 @@ it('bounds the complete fallback capture before attempting owner stop', async ()
     return { ok: true, errors: [] as string[] }
   })
 
-  const failure = await settle(volumeState(f.fixture, stop)).then(() => undefined, error => error)
+  const failure = await settle(volumeState(f.fixture, stop), { expectedDaemonId: f.fixture.owner.daemonId }).then(() => undefined, error => error)
 
   expect(stop).toHaveBeenCalledOnce()
   expect.soft(control.exec.mock.calls.some(([, args]) => args[0] === 'info')).toBe(true)
-  expect.soft(stopStartedAt).toBeGreaterThanOrEqual(6000)
-  expect.soft(stopStartedAt).toBeLessThanOrEqual(10_000)
+  expect.soft(captureTimedOutAt).toBeGreaterThanOrEqual(6000)
+  expect.soft(captureTimedOutAt).toBeLessThanOrEqual(10_000)
+  expect.soft(stopStartedAt).toBeGreaterThanOrEqual(captureTimedOutAt)
+  expect.soft(stopStartedAt).toBeLessThanOrEqual(captureTimedOutAt + 10_000)
   expect.soft(f.docker.present).toBe(true)
   expect.soft(nestedErrors(failure).some(error => error instanceof Error && error.message === 'controlled daemon command timeout')).toBe(true)
 })
@@ -699,6 +704,10 @@ it('reports original and teardown phases without emitting raw failure details', 
   const original = new Error('synthetic-original-secret-marker')
   const ownerError = 'synthetic-owner-secret-marker'
   const stop = vi.fn(async () => ({ ok: false, errors: [ownerError] }))
+  control.exec.mockImplementation((_program: string, args: string[]) => {
+    if (args[0] === 'info') return 'controlled-daemon\n'
+    throw new Error('unexpected controlled Docker operation')
+  })
   control.owner = {
     runtime: {
       runId: 'controlled-run', testRoot: '/virtual/task4-root', evidenceDir: '/virtual/task4-evidence',
@@ -733,12 +742,14 @@ it('reports original and teardown phases without emitting raw failure details', 
 })
 
 type EventRow = Record<string, unknown> & { event?: string }
+type DaemonFault = 'changed' | 'uncheckable'
 
 /** An in-memory daemon which exercises the real case functions without starting Docker. */
 function fakeLifecycleDaemon(options: {
   atBoundary?: (point: string, args: string[]) => void
   unreservedObservation?: 'before_stop' | 'after_stop' | 'final_absence'
   unreservedDaemonChange?: boolean
+  unreservedBeforeStopFault?: { fault: DaemonFault; observationFails?: boolean }
   fixtureAlreadyExists?: boolean
 } = {}) {
   const volumes = new Map<string, Record<string, string>>()
@@ -746,14 +757,28 @@ function fakeLifecycleDaemon(options: {
   const listCounts = new Map<string, number>()
   let attachment: { name: string; volume: string; runId: string; id: string } | undefined
   let daemonId = 'controlled-daemon'
+  let infoFails = false
   const containerId = 'c'.repeat(64)
+  const faultDaemon = (fault: DaemonFault) => {
+    if (fault === 'changed') daemonId = 'daemon-b'
+    else infoFails = true
+  }
   control.exec.mockImplementation((_program: string, args: string[]) => {
-    if (args[0] === 'info') return args.includes('{{json .SecurityOptions}}') ? '["name=rootless"]' : `${daemonId}\n`
+    if (args[0] === 'info') {
+      if (infoFails) throw new Error('synthetic-daemon-info-secret-marker')
+      return args.includes('{{json .SecurityOptions}}') ? '["name=rootless"]' : `${daemonId}\n`
+    }
     if (args[0] === 'volume' && args[1] === 'ls') {
       options.atBoundary?.('volume_list', args)
       const name = args[3].slice('name=^'.length, -1)
       const count = (listCounts.get(name) ?? 0) + 1
       listCounts.set(name, count)
+      if (options.unreservedBeforeStopFault && name === createdNames[2] && count === 4) {
+        faultDaemon(options.unreservedBeforeStopFault.fault)
+        options.atBoundary?.('unreserved_before_stop_fault', args)
+        if (options.unreservedBeforeStopFault.observationFails) throw new Error('synthetic-observation-secret-marker')
+        return `${name}\n` // The observation completed on the admitted daemon before the fault.
+      }
       const faultAt = { before_stop: 4, after_stop: 5, final_absence: 8 } as const
       if (options.unreservedObservation && name === createdNames[2] && count === faultAt[options.unreservedObservation]) {
         options.atBoundary?.('unreserved_observation', args)
@@ -816,7 +841,7 @@ function fakeLifecycleDaemon(options: {
     }
     throw new Error('unexpected controlled Docker operation')
   })
-  return { containerId, createdNames, volumes, get daemonId() { return daemonId } }
+  return { containerId, createdNames, volumes, faultDaemon, get daemonId() { return daemonId } }
 }
 
 function fakeLifecycleOwner(options: { prepareError?: Error; stopError?: string } = {}) {
@@ -836,6 +861,101 @@ function fakeLifecycleOwner(options: { prepareError?: Error; stopError?: string 
   control.owner = owner
   return owner
 }
+
+it.each(['changed', 'uncheckable'] as const)(
+  'retains the owner without stopping it when the daemon is %s after setup fails before any volume exists', async fault => {
+    const original = new Error('synthetic-setup-secret-marker')
+    const rows: EventRow[] = []
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      rows.push(JSON.parse(String(chunk)) as EventRow); callback?.(); return true
+    }) as typeof process.stdout.write)
+    const daemon = fakeLifecycleDaemon()
+    const owner = fakeLifecycleOwner({ prepareError: original })
+    daemon.faultDaemon(fault)
+    let failure: unknown
+    try { failure = await ownershipAndUnreserved('/virtual/repo', 'controlled-daemon').then(() => undefined, error => error) }
+    finally { stdout.mockRestore() }
+
+    expect.soft(nestedErrors(failure)).toContain(original)
+    expect.soft(owner.stop).not.toHaveBeenCalled()
+    expect.soft(rows.find(row => row.event === 'real_volume.recovery_required')).toMatchObject({
+      daemonId: 'controlled-daemon', volumes: [], ownerStopped: false,
+      failures: expect.arrayContaining([{ phase: 'owner_stop', kind: 'exception' }]),
+    })
+    expect(JSON.stringify(rows)).not.toContain(original.message)
+  },
+)
+
+it.each(['unchanged', 'changed', 'uncheckable'] as const)(
+  'checks the daemon after fallback volume capture fails (%s)', async fault => {
+    const captureError = new Error('synthetic-capture-secret-marker')
+    const rows: EventRow[] = []
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      rows.push(JSON.parse(String(chunk)) as EventRow); callback?.(); return true
+    }) as typeof process.stdout.write)
+    let interrupted = false
+    const daemon = fakeLifecycleDaemon({ atBoundary: point => {
+      if (point === 'attachment_create') { interrupted = true; throw new Error('controlled attachment interruption') }
+    } })
+    const owner = fakeLifecycleOwner()
+    const capture = vi.spyOn(managedCodexCleanupDependencies, 'captureVolumes').mockImplementation(() => {
+      if (fault !== 'unchanged') daemon.faultDaemon(fault)
+      throw captureError
+    })
+    let failure: unknown
+    try { failure = await ownershipAndUnreserved('/virtual/repo', 'controlled-daemon').then(() => undefined, error => error) }
+    finally { stdout.mockRestore() }
+
+    const volume = daemon.createdNames[1]
+    expect.soft(interrupted).toBe(true)
+    expect.soft(capture).toHaveBeenCalledOnce()
+    expect.soft(nestedErrors(failure)).toContain(captureError)
+    expect.soft(owner.stop).toHaveBeenCalledTimes(fault === 'unchanged' ? 1 : 0)
+    expect.soft(daemon.volumes.has(volume)).toBe(true)
+    expect.soft(rows.find(row => row.event === 'real_volume.recovery_required')).toMatchObject({
+      daemonId: 'controlled-daemon', volumes: [volume], ownerStopped: fault === 'unchanged',
+      failures: expect.arrayContaining([{ phase: 'volume_capture', kind: 'exception' }]),
+    })
+    expect.soft(rows.find(row => row.event === 'real_volume.case_failed')).toMatchObject({
+      failures: [{ phase: 'attachment_create', kind: 'operation' }],
+    })
+    expect(JSON.stringify(rows)).not.toContain(captureError.message)
+  },
+)
+
+it.each([
+  ['changed', false], ['uncheckable', false], ['changed', true], ['uncheckable', true],
+] as const)(
+  'does not stop the unreserved owner when the daemon is %s before stop (observation fails: %s)',
+  async (fault, observationFails) => {
+    const rows: EventRow[] = []
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      rows.push(JSON.parse(String(chunk)) as EventRow); callback?.(); return true
+    }) as typeof process.stdout.write)
+    let faultReached = false
+    const daemon = fakeLifecycleDaemon({ unreservedBeforeStopFault: { fault, observationFails }, atBoundary: point => {
+      if (point === 'unreserved_before_stop_fault') faultReached = true
+    } })
+    const owner = fakeLifecycleOwner()
+    let failure: unknown
+    try { failure = await ownershipAndUnreserved('/virtual/repo', 'controlled-daemon').then(() => undefined, error => error) }
+    finally { stdout.mockRestore() }
+
+    const volume = daemon.createdNames[2]
+    expect.soft(faultReached).toBe(true)
+    expect.soft(failure).toBeInstanceOf(Error)
+    expect.soft(owner.stop).not.toHaveBeenCalled()
+    expect.soft(daemon.volumes.has(volume)).toBe(true)
+    expect.soft(rows.find(row => row.event === 'real_volume.recovery_required')).toMatchObject({
+      daemonId: 'controlled-daemon', volumes: [volume], ownerStopped: false,
+      failures: expect.arrayContaining([{ phase: 'owner_stop', kind: 'exception' }]),
+    })
+    expect.soft(rows.some(row => row.event === 'real_volume.case_passed' && row.case === 'unreserved_outer_removal')).toBe(false)
+    if (observationFails) expect.soft(nestedErrors(failure).some(error =>
+      error instanceof Error && error.message === 'fixture Docker operation failed: volume_list')).toBe(true)
+    expect(JSON.stringify(rows)).not.toMatch(/synthetic-(daemon-info|observation)-secret-marker/)
+  },
+)
 
 it.each(['volume_create', 'volume_replace', 'attachment_create', 'attachment_known'] as const)(
   'records exact recovery identity before the %s interruption boundary', async boundary => {
@@ -981,14 +1101,16 @@ function setFsOverride(method: string, target: string, value: unknown) {
 }
 
 /** Enter the actual script main guard with only the guest checks simulated. */
-async function runExecutableFailure(options: {
+async function runExecutableCase(options: {
   prepareError?: Error
   stopError?: string
   fixtureAlreadyExists?: boolean
   unreservedObservation?: 'before_stop' | 'after_stop' | 'final_absence'
   unreservedCleanupFailure?: 'capture' | 'remove'
   fallbackObservationFailure?: boolean
-}): Promise<EventRow[]> {
+  unprovenStopDaemonFault?: DaemonFault
+  expectedSuccess?: boolean
+}): Promise<{ rows: EventRow[]; owner: ReturnType<typeof fakeLifecycleOwner>; daemon: ReturnType<typeof fakeLifecycleDaemon> }> {
   const repo = process.cwd()
   const privateRoot = '/virtual/task4-private'
   const socket = '/virtual/task4-daemon.sock'
@@ -1038,6 +1160,10 @@ async function runExecutableFailure(options: {
       cleanupFaultReached = true
       throw new Error('synthetic-capture-secret-marker')
     }
+    if (options.unprovenStopDaemonFault && args[0][0]?.daemonId.startsWith('changed-')) {
+      try { return realCapture(...args) }
+      finally { daemon.faultDaemon(options.unprovenStopDaemonFault) }
+    }
     return realCapture(...args)
   })
   const remove = vi.spyOn(managedCodexCleanupDependencies, 'removeVolumes').mockImplementation((...args) => {
@@ -1059,9 +1185,9 @@ async function runExecutableFailure(options: {
     await import('../../../../scripts/testing/codex-real-volume-lifecycle.js')
     // The case uses only in-memory async functions, so bounded microtask turns
     // are enough to observe its real main() catch without a host subprocess.
-    for (let index = 0; index < 200 && !output.some(row => row.event === 'real_volume.failed'); index++) await Promise.resolve()
-    expect(output.some(row => row.event === 'real_volume.failed')).toBe(true)
-    expect(process.exitCode).toBe(1)
+    for (let index = 0; index < 200 && !output.some(row => row.event === 'real_volume.failed' || row.event === 'real_volume.completed'); index++) await Promise.resolve()
+    expect(output.some(row => row.event === (options.expectedSuccess ? 'real_volume.completed' : 'real_volume.failed'))).toBe(true)
+    expect(process.exitCode).toBe(options.expectedSuccess ? previousExitCode : 1)
     if (options.unreservedObservation) expect(observationFaultReached).toBe(true)
     if (options.unreservedCleanupFailure) {
       expect(cleanupFaultReached).toBe(true)
@@ -1075,13 +1201,46 @@ async function runExecutableFailure(options: {
       })
       if (options.fallbackObservationFailure) expect(fallbackFaultReached).toBe(true)
     }
-    return output
+    return { rows: output, owner, daemon }
   } finally {
     process.argv[1] = previousArg
     process.exitCode = previousExitCode
     stdout.mockRestore()
   }
 }
+
+async function runExecutableFailure(options: Parameters<typeof runExecutableCase>[0]): Promise<EventRow[]> {
+  return (await runExecutableCase(options)).rows
+}
+
+it.each(['changed', 'uncheckable'] as const)(
+  'does not stop the unproven-capture owner when the daemon is %s after the expected capture failure', async fault => {
+    const { rows, owner, daemon } = await runExecutableCase({ unprovenStopDaemonFault: fault })
+    const volume = daemon.createdNames[3]
+    expect.soft(daemon.createdNames).toHaveLength(4)
+    expect.soft(owner.stop).toHaveBeenCalledOnce() // Only the preceding unreserved case stopped its owner.
+    expect.soft(daemon.volumes.has(volume)).toBe(true)
+    expect.soft(rows.find(row => row.event === 'real_volume.recovery_required')).toMatchObject({
+      daemonId: 'controlled-daemon', volumes: [volume], ownerStopped: false,
+      failures: expect.arrayContaining([{ phase: 'owner_stop', kind: 'exception' }]),
+    })
+    expect.soft(rows.find(row => row.event === 'real_volume.case_failed')).toMatchObject({
+      failures: [{ phase: 'unproven_capture', kind: 'operation' }],
+    })
+    expect.soft(rows.some(row => row.event === 'real_volume.case_passed' && row.case === 'unproven_capture_owner_stop')).toBe(false)
+    expect(JSON.stringify(rows)).not.toContain('synthetic-daemon-info-secret-marker')
+  },
+)
+
+it('completes all four real volume caller cases when the admitted daemon remains unchanged', async () => {
+  const { rows, owner, daemon } = await runExecutableCase({ expectedSuccess: true })
+  expect(rows.filter(row => row.event === 'real_volume.case_passed').map(row => row.case)).toEqual([
+    'changed_owner', 'attached', 'unreserved_outer_removal', 'unproven_capture_owner_stop',
+  ])
+  expect(owner.stop).toHaveBeenCalledTimes(2)
+  expect(daemon.volumes.size).toBe(0)
+  expect(rows.find(row => row.event === 'real_volume.completed')).toMatchObject({ passedCases: 4, daemonId: 'controlled-daemon' })
+})
 
 it('reports setup and teardown failures at the executable boundary without raw causes', async () => {
   const setup = new Error('synthetic-setup-secret-marker')
