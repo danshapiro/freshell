@@ -6,7 +6,14 @@
 //! real-binary-transcript-evidence.md): step-indexed records —
 //! USER_INPUT / PLANNER_RESPONSE / GENERIC / SYSTEM_MESSAGE /
 //! CHECKPOINT — every record carrying `source`, `status`, `step_index`,
-//! and a SECOND-granularity RFC3339 `created_at`. Real records carry NO
+//! and a SECOND-granularity RFC3339 `created_at`. The SIXTH contract
+//! type (evidenced 2026-11-03, same report's overlay-conformant
+//! receipts) is the failure-path `ERROR_MESSAGE` (src=SYSTEM,
+//! status=DONE, carries `error` + `step_index` + `created_at`): it
+//! carries no content/thinking, so it is deliberately INERT here — a
+//! non-message record left in the unknown-type arm (no message, no
+//! summary, no stamp fold; pinned by the fixture-parity suite's
+//! ERROR_MESSAGE test). Real records carry NO
 //! conversation id and NO workspace evidence: the conversation id IS
 //! the `brain/<id>` directory name (passed in by the caller), and `cwd`
 //! is `None` for real transcripts (rows group under an unknown project).

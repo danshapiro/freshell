@@ -1241,13 +1241,27 @@ pub struct PaneVerdict {
     /// disconnected during the server-side auto-resume (or reloaded after
     /// it) missed the replaced frame, and its reconciliation attach must
     /// carry the same identity-clearing signal or the pane keeps a stale
-    /// saved sessionRef and the CLI's natural rebind — the fresh
+    /// saved sessionRef and a later re-bind association — the fresh
     /// conversation's `terminal.session.associated` with a new id and no
-    /// `previousSessionId` — folds as a conflict. Only `fresh_unbound` is
-    /// ever set on a verdict (resumed/minted replacements carry their
-    /// identity in `session_ref`) and never beside a `session_ref`.
+    /// `previousSessionId`, emitted only by providers whose association
+    /// machinery re-binds (real-format antigravity sessions never do) —
+    /// folds as a conflict. Only `fresh_unbound` is ever set on a verdict
+    /// (resumed/minted replacements carry their identity in `session_ref`)
+    /// and never beside a `session_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_disposition: Option<TerminalReplacedIdentityDisposition>,
+    /// `attach` only, beside `identity_disposition: fresh_unbound` (final-
+    /// delta review round 2, Fix 1 — additive/optional; absent keeps the
+    /// legacy verdict byte-shape): the gate's stale-id notice naming the
+    /// REFUSED conversation, carried on the reconnect path exactly as the
+    /// live `terminal.replaced` frame carries it. A pane disconnected
+    /// during the server-side auto-resume missed the replaced frame — and
+    /// with it the only visible explanation naming the lost conversation —
+    /// so the verdict carries the same notice and the client fold surfaces
+    /// the same pane-level dismissible notice. Absent on every other
+    /// verdict shape. Prose is presentational-only (council 7w4h/xkhx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_session_notice: Option<String>,
 }
 
 /// Sent ONLY in response to `pane.reconcile.request` — the server never
@@ -1845,9 +1859,13 @@ pub enum TerminalReplacedIdentityDisposition {
     /// The gate refused the recorded id and NO replacement id exists —
     /// the respawn launched an identity-less FRESH conversation and the
     /// server RELEASED the stale claim. The client must CLEAR the pane's
-    /// saved sessionRef (mirror the identity-less terminal) so the CLI's
-    /// natural rebind — a `terminal.session.associated` with a fresh id
-    /// and no `previousSessionId` — folds instead of conflicting.
+    /// saved sessionRef (mirror the identity-less terminal) so a later
+    /// re-bind association — a `terminal.session.associated` with a fresh
+    /// id and no `previousSessionId`, emitted only by providers whose
+    /// association machinery re-binds (codex/opencode; antigravity's
+    /// typed-prompt rebind is the fake-contract fixtures only, so
+    /// real-format antigravity sessions never re-bind per-pane) — folds
+    /// instead of conflicting.
     FreshUnbound,
 }
 

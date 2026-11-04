@@ -2563,9 +2563,12 @@ export const panesSlice = createSlice({
         /** FreshUnbound replacement fold (focused repair round 2, Major 2):
          * the server released the stale claim and the replacement terminal is
          * identity-less — clear the pane's saved sessionRef (and the dead
-         * resume intent) so the pane mirrors the server and the CLI's natural
-         * rebind (an association with a fresh id and no previousSessionId)
-         * folds without a conflict. Never set by reconcile verdicts. */
+         * resume intent) so the pane mirrors the server and a later re-bind
+         * association (an association with a fresh id and no
+         * previousSessionId, emitted only by providers whose association
+         * machinery re-binds) folds without a conflict. Set by BOTH the live
+         * terminal.replaced fold and the reconcile attach verdict's
+         * fresh_unbound fold (focused repair round 5). */
         clearSessionIdentity?: boolean
       }>
     ) => {

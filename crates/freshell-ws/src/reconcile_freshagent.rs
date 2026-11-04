@@ -314,6 +314,7 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         reason: None,
         duplicate: None,
         identity_disposition: None,
+        stale_session_notice: None,
     }
 }
 

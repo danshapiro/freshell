@@ -7941,9 +7941,13 @@ pub enum RespawnedIdentity {
     /// a conversation it does not name — the silent replacement the
     /// direct create path refuses with the typed SESSION_MISSING error
     /// (GC3). The hub must RELEASE the claim instead; the pane has NO
-    /// saved identity and binds the conversation the CLI mints through
-    /// the provider's natural rebind (the antigravity association sweep;
-    /// README's binding paragraph).
+    /// saved identity. Any later re-bind is then the provider's own
+    /// machinery, not Freshell's: codex/opencode re-associate through
+    /// their real session discovery, while antigravity's typed-prompt
+    /// rebind engages only on Freshell's fake-contract fixtures —
+    /// real-format antigravity sessions never re-bind per-pane (the
+    /// README's recorded limitation), so the fresh conversation is
+    /// simply the CLI's own new conversation.
     FreshUnbound,
 }
 
@@ -8102,9 +8106,12 @@ pub async fn respawn_agent_terminal(
         // fresh terminal. Completing it would re-bind the STALE identity
         // over an identity-less fresh conversation — the silent replacement
         // the direct create path refuses with the typed SESSION_MISSING
-        // error (GC3). The pane comes back with NO saved identity and binds
-        // the conversation the CLI mints on its next clean typed prompt
-        // (the documented natural rebind; README's binding paragraph).
+        // error (GC3). The pane comes back with NO saved identity; any
+        // later re-bind is the provider's own machinery — codex/opencode
+        // re-associate through real session discovery, while
+        // antigravity's typed-prompt rebind engages only on Freshell's
+        // fake-contract fixtures (real-format antigravity sessions never
+        // re-bind per-pane; README's binding paragraph).
         // The Recovering frame broadcast above names the stale id, but it
         // is addressed to the NEW terminal id — which the pane cannot know
         // before `terminal.replaced` — and the replaced fold clears the
@@ -8510,8 +8517,11 @@ pub async fn respawn_agent_terminal(
     // (codex/opencode/antigravity) carries `resume_session_id == None`,
     // so the ledger binding below is SKIPPED, and the identity upsert
     // runs with NO session id — a session-less row: the pane has NO
-    // saved identity and the natural rebind binds the conversation the
-    // CLI mints on its next clean typed prompt.
+    // saved identity, and any later re-bind is the provider's own
+    // machinery (codex/opencode re-associate through real session
+    // discovery; antigravity's typed-prompt rebind is fake-contract
+    // fixtures only — real-format antigravity sessions never re-bind
+    // per-pane).
     let create_meta_record = terminal_meta_record_for_create(
         &terminal_id,
         &mode,
@@ -8583,8 +8593,16 @@ pub async fn respawn_agent_terminal(
     // which is exactly what keeps an ordinary identity-less attach — a
     // young pane whose identity is not captured yet — from clearing a
     // still-valid claim.
+    //
+    // Final-delta review round 2, Fix 1: the marker stores the gate's
+    // stale-id NOTICE too — the reconnect verdict must carry the same
+    // visible explanation the missed `terminal.replaced` frame carried
+    // (`staleSessionNotice`), or the pane re-attaches with its id cleared
+    // and no visible naming of the lost conversation.
     if respawned_identity == RespawnedIdentity::FreshUnbound {
-        state.identity.mark_fresh_unbound_replacement(&terminal_id);
+        state
+            .identity
+            .mark_fresh_unbound_replacement(&terminal_id, stale_session_notice.as_deref());
     }
 
     // Name reliability (Task 10): the replacement row resumes the SAME

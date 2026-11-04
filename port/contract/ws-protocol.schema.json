@@ -8751,6 +8751,9 @@
                 ],
                 "type": "object"
               },
+              "staleSessionNotice": {
+                "type": "string"
+              },
               "terminalId": {
                 "minLength": 1,
                 "type": "string"
@@ -8828,6 +8831,9 @@
             "sessionId"
           ],
           "type": "object"
+        },
+        "staleSessionNotice": {
+          "type": "string"
         },
         "terminalId": {
           "minLength": 1,

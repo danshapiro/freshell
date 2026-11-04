@@ -6689,10 +6689,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // the FreshUnbound disposition (focused repair round 2, Major 2):
             // the server RELEASED the stale claim and the replacement is an
             // identity-less fresh conversation, so the pane must MIRROR that
-            // (clear its saved sessionRef) or the CLI's natural rebind — the
-            // fresh conversation's terminal.session.associated with a new id
-            // and no previousSessionId — hits the association conflict rule
-            // and strands the pane on the deleted conversation.
+            // (clear its saved sessionRef) or a later re-bind association —
+            // the fresh conversation's terminal.session.associated with a
+            // new id and no previousSessionId, where the provider's
+            // machinery emits one — hits the association conflict rule and
+            // strands the pane on the deleted conversation.
             // Bind-before-attach holds: the reducer's epoch bump re-fires the
             // create-or-attach effect after this rebind.
             dispatch(applyReconcileAttach({

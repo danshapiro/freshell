@@ -221,3 +221,42 @@ fn title_derives_from_first_user_input_content_at_200_chars() {
     assert_eq!(meta.title.as_deref(), Some("A".repeat(200).as_str()));
     assert!(!meta.title_provider_generated);
 }
+
+/// Final-delta review round 2, Fix 2 — the SIXTH contract record type
+/// (evidenced 2026-11-03, the overlay-conformant receipts' ERROR_MESSAGE
+/// note): `ERROR_MESSAGE` (src=SYSTEM, status=DONE, carries `error` +
+/// `step_index` + a second-granularity `created_at`) is the CLI's
+/// failure-path record, produced by API/network failure retries. It
+/// carries no content/thinking, so it stays a NON-message record in the
+/// parser: the unknown-type arm is its deliberate home (the same
+/// discipline the evidence report recorded as "no parser change is
+/// indicated"), and this pin holds it there — no message, no summary,
+/// no title, no stamp fold — while the surrounding real-shaped records
+/// still own the row. A record shaped exactly per the receipt (with a
+/// NEWER stamp than the reply) proves the stamp does not move.
+#[test]
+fn error_message_record_parses_as_a_non_message_record() {
+    let content = concat!(
+        r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"created_at":"2026-10-29T20:00:01Z","content":"Prompt that hit a dead proxy"}"#,
+        "\n",
+        r#"{"type":"ERROR_MESSAGE","source":"SYSTEM","status":"DONE","step_index":1,"created_at":"2026-10-29T20:00:09Z","error":"connection error: dial tcp: unreachable"}"#,
+        "\n",
+        r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":2,"created_at":"2026-10-29T20:00:12Z","content":"Retried and replied.","input_tokens":7,"output_tokens":8,"cache_read_tokens":0}"#,
+    );
+    let meta = parse_antigravity_session_content(content, "e1").expect("parses");
+    // The message-bearing records own every message-level field; the
+    // ERROR_MESSAGE contributed none of them.
+    assert_eq!(
+        meta.first_user_message.as_deref(),
+        Some("Prompt that hit a dead proxy")
+    );
+    assert_eq!(meta.title.as_deref(), Some("Prompt that hit a dead proxy"));
+    assert_eq!(meta.summary.as_deref(), Some("Retried and replied."));
+    // The stamps come from the real-shaped records only: the ERROR_MESSAGE
+    // record's own NEWER created_at (20:00:09) moves nothing.
+    assert_eq!(meta.created_at, Some(1_793_304_001_000));
+    assert_eq!(meta.last_activity_at, Some(1_793_304_012_000));
+    // The record is COUNTED (it is real bytes on disk) but stays inert.
+    assert_eq!(meta.message_count, 3);
+    assert_eq!(meta.token_usage, Some(usage(7, 8, 0, 15)));
+}

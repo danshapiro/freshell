@@ -275,9 +275,12 @@ conversations — the chosen root is named in the server log at startup,
 and neither root existing is logged loudly. Freshell's view of Antigravity's
 on-disk conversation format was validated against real `agy` 1.4.12 sessions
 on 2026-11-02: conversations are step-indexed records (`USER_INPUT`,
-`PLANNER_RESPONSE`, `GENERIC`, `SYSTEM_MESSAGE`, `CHECKPOINT`) with
-second-granularity timestamps, and Freshell's parser follows that validated
-format. Because the real format carries no workspace or ownership fields,
+`PLANNER_RESPONSE`, `GENERIC`, `SYSTEM_MESSAGE`, `CHECKPOINT`, plus a
+failure-path `ERROR_MESSAGE` record the CLI writes when a turn dies on an
+API or network error) with second-granularity timestamps, and Freshell's
+parser follows that validated format (the failure-path record carries no
+message content; the parser reads past it). Because the real format
+carries no workspace or ownership fields,
 native conversations group under an unknown project, and per-pane
 conversation binding and transcript-driven busy/turn-completion state do not
 engage on real-format sessions — recorded limitations. Freshell installs no
@@ -307,8 +310,12 @@ resumes exactly (`agy --conversation <id>`), while a stale id is refused
 with a visible notice and nothing is spawned in its place — start a new
 conversation explicitly instead. After a crash, though, recovery works
 differently on purpose: Freshell starts a fresh conversation in the pane (a
-visible notice names the lost conversation), and the pane attaches to the
-next conversation the CLI starts. When both the default and the snap store
+visible notice names the lost conversation). The fresh pane starts unbound,
+and for real Antigravity conversations the per-pane binding does not
+re-engage (the recorded limitation above) — the fresh conversation is
+simply the CLI's own new conversation; the typed-prompt rebind exists only
+in Freshell's own test fixtures, which append records the real CLI never
+writes. When both the default and the snap store
 roots hold conversations, Freshell cannot know which one the CLI reads: a
 saved id found in either root is handed to the CLI to decide (its own
 missing-id warning appears in the pane), and a startup log line tells the

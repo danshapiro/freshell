@@ -1236,13 +1236,27 @@ export const PaneVerdictSchema = z.object({
    * reconnect-path mirror of terminal.replaced's identityDisposition: a
    * browser that was disconnected during the server-side auto-resume (or
    * reloaded after it) missed the replaced frame, and this verdict signal
-   * tells it to CLEAR the pane's stale saved sessionRef, so the CLI's
-   * natural rebind (the fresh conversation's terminal.session.associated
-   * with a new session id and NO previousSessionId) folds instead of
-   * conflicting. Only `fresh_unbound` is ever set, and never beside a
-   * sessionRef.
+   * tells it to CLEAR the pane's stale saved sessionRef, so a later re-bind
+   * association (the fresh conversation's terminal.session.associated with a
+   * new session id and NO previousSessionId — emitted only by providers
+   * whose association machinery re-binds; real-format antigravity sessions
+   * never re-bind per-pane) folds instead of conflicting. Only
+   * `fresh_unbound` is ever set, and never beside a sessionRef.
    */
   identityDisposition: z.enum(['resumed', 'minted_replacement', 'fresh_unbound']).optional(),
+  /**
+   * attach only, beside identityDisposition: 'fresh_unbound' (additive/
+   * optional — same discipline as the field above): the gate's stale-id
+   * notice naming the REFUSED conversation, carried on the reconnect path
+   * exactly as the live terminal.replaced frame carries it. A pane that
+   * was disconnected during the server-side auto-resume missed the
+   * replaced frame — and with it the ONLY visible explanation naming the
+   * lost conversation — so the verdict carries the same notice and the
+   * fold surfaces the same pane-level dismissible notice. Absent on every
+   * other verdict shape (including fresh_unbound without a recorded
+   * notice). Prose is presentational-only.
+   */
+  staleSessionNotice: z.string().optional(),
 })
 
 export const PaneReconcileResultSchema = z.object({
@@ -1668,9 +1682,13 @@ export type TerminalReplacedMessage = {
    * `fresh_unbound` — the resume gate refused the recorded id and the
    * respawn launched an identity-less FRESH conversation (the stale
    * claim was RELEASED server-side) — tells the client to CLEAR the
-   * pane's saved sessionRef, so the CLI's natural rebind (the fresh
-   * conversation's `terminal.session.associated` with a new session id
-   * and NO previousSessionId) folds instead of conflicting. `resumed`
+   * pane's saved sessionRef, so a later re-bind association (the fresh
+   * conversation's terminal.session.associated with a new session id and
+   * NO previousSessionId) folds instead of conflicting. The re-bind
+   * itself is the provider's own machinery: codex/opencode re-associate
+   * through real session discovery, while antigravity's typed-prompt
+   * rebind engages only on Freshell's fake-contract fixtures
+   * (real-format antigravity sessions never re-bind per-pane). `resumed`
    * keeps the recorded ref (still correct); `minted_replacement` keeps
    * it too (the accepted AD-3 shape). */
   identityDisposition?: 'resumed' | 'minted_replacement' | 'fresh_unbound'

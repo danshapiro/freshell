@@ -3090,6 +3090,9 @@
                 ],
                 "type": "object"
               },
+              "staleSessionNotice": {
+                "type": "string"
+              },
               "terminalId": {
                 "type": "string"
               },

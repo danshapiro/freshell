@@ -114,6 +114,7 @@ fn invalid(pane: &ReconcilePane, reason: &str) -> PaneVerdict {
         reason: Some(reason.to_string()),
         duplicate: None,
         identity_disposition: None,
+        stale_session_notice: None,
     }
 }
 
@@ -127,6 +128,7 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         reason: None,
         duplicate: None,
         identity_disposition: None,
+        stale_session_notice: None,
     }
 }
 
@@ -243,21 +245,34 @@ fn attach(
     // auto-resume respawn's FreshUnbound shape (ordinary creates never
     // stamp it — an identity-less attach of a young pane whose identity is
     // not captured yet carries no disposition and keeps the pane's
-    // claim), and the signal rides only an identity-less attach (once the
-    // CLI's natural rebind gives the replacement a session id, the
-    // verdict carries it in session_ref as a corrected fold instead).
+    // claim), and the signal rides only an identity-less attach (once a
+    // later association gives the replacement a session id, the verdict
+    // carries it in session_ref as a corrected fold instead).
+    //
+    // Final-delta review round 2, Fix 1 — the carrier must carry the
+    // NOTICE too: the missed frame's `staleSessionNotice` is the only
+    // operator-visible explanation naming the lost conversation, so the
+    // marker stores it at stamp time and the identity-less attach verdict
+    // relays it (`staleSessionNotice`), mirroring the live replaced
+    // frame's fold exactly. Never set beside a session_ref and never
+    // without the fresh_unbound disposition.
     let identity_disposition =
         if server_ref.is_none() && deps.identity.is_fresh_unbound_replacement(&terminal_id) {
             Some(TerminalReplacedIdentityDisposition::FreshUnbound)
         } else {
             None
         };
+    let stale_session_notice = identity_disposition
+        .is_some()
+        .then(|| deps.identity.fresh_unbound_replacement_notice(&terminal_id))
+        .flatten();
     PaneVerdict {
         terminal_id: Some(terminal_id),
         session_ref: server_ref,
         corrected,
         duplicate,
         identity_disposition,
+        stale_session_notice,
         ..base(pane, ReconcileVerdict::Attach)
     }
 }
@@ -774,18 +789,27 @@ mod tests {
     /// same createRequestId — and the verdict must carry the same
     /// identity-clearing signal the live `terminal.replaced` frame carries
     /// (`identityDisposition: fresh_unbound`), or the client fold retains
-    /// the stale sessionRef and the CLI's natural rebind folds as a
+    /// the stale sessionRef and a later re-bind association folds as a
     /// conflict. RED pre-fix: the verdict carried no disposition and the
     /// stale id survived the reconnection.
+    ///
+    /// Final-delta review round 2, Fix 1: the verdict must ALSO carry the
+    /// stale-id notice the missed frame carried (`staleSessionNotice`) —
+    /// the only operator-visible explanation naming the lost conversation.
+    /// RED pre-fix: the verdict carried no notice and the reconnected pane
+    /// showed no explanation at all.
     #[test]
     fn row1_fresh_unbound_replacement_attach_carries_the_clearing_disposition() {
         let f = Fixture::new();
         f.headless("T-fresh", Some("cr-fu"), "antigravity", 2_000);
         // The FreshUnbound respawn's post-spawn identity state: a
-        // session-less seed plus the replacement marker the respawn stamps.
+        // session-less seed plus the replacement marker (and its notice)
+        // the respawn stamps.
         f.identity
             .upsert("T-fresh", Some("antigravity"), None, None, 2);
-        f.identity.mark_fresh_unbound_replacement("T-fresh");
+        let notice = "Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.";
+        f.identity
+            .mark_fresh_unbound_replacement("T-fresh", Some(notice));
 
         let mut p = pane("cr-fu");
         p.terminal_id = Some("T-crashed".to_string()); // the dead predecessor
@@ -798,6 +822,36 @@ mod tests {
             v.identity_disposition,
             Some(TerminalReplacedIdentityDisposition::FreshUnbound),
             "the reconnect fold must clear the pane's stale sessionRef"
+        );
+        assert_eq!(
+            v.stale_session_notice.as_deref(),
+            Some(notice),
+            "the reconnect fold must surface the same notice the missed terminal.replaced frame carried"
+        );
+    }
+
+    /// A FreshUnbound marker stamped WITHOUT a notice (an older stamp caller)
+    /// still carries the clearing disposition — the notice is additive and
+    /// its absence must never regress the verdict to the legacy shape.
+    #[test]
+    fn notice_less_fresh_unbound_marker_still_carries_the_disposition() {
+        let f = Fixture::new();
+        f.headless("T-fresh", Some("cr-fu-n"), "antigravity", 2_000);
+        f.identity
+            .upsert("T-fresh", Some("antigravity"), None, None, 2);
+        f.identity.mark_fresh_unbound_replacement("T-fresh", None);
+
+        let mut p = pane("cr-fu-n");
+        p.session_ref = Some(sref("antigravity", "deleted-conversation"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Attach);
+        assert_eq!(
+            v.identity_disposition,
+            Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+        );
+        assert_eq!(
+            v.stale_session_notice, None,
+            "no notice stamped ⇒ no notice on the verdict"
         );
     }
 
@@ -826,17 +880,19 @@ mod tests {
         );
     }
 
-    /// After the CLI's natural rebind the replacement HAS an identity — the
+    /// After a later association gives the replacement an identity the
     /// verdict carries it in sessionRef (corrected) and must never carry
     /// BOTH signals (the fold's sessionRef arm wins, but the wire contract
-    /// keeps the disposition identity-less-only by construction).
+    /// keeps the disposition — and its notice — identity-less-only by
+    /// construction).
     #[test]
     fn rebound_fresh_unbound_replacement_carries_the_identity_not_the_disposition() {
         let f = Fixture::new();
         f.headless("T-fresh", Some("cr-fu2"), "antigravity", 2_000);
         f.identity
             .upsert("T-fresh", Some("antigravity"), Some("s-rebound"), None, 3);
-        f.identity.mark_fresh_unbound_replacement("T-fresh");
+        f.identity
+            .mark_fresh_unbound_replacement("T-fresh", Some("stale id refused"));
 
         let mut p = pane("cr-fu2");
         p.session_ref = Some(sref("antigravity", "deleted-conversation"));
@@ -845,6 +901,10 @@ mod tests {
         assert_eq!(v.session_ref, Some(sref("antigravity", "s-rebound")));
         assert_eq!(v.corrected, Some(true));
         assert_eq!(v.identity_disposition, None);
+        assert_eq!(
+            v.stale_session_notice, None,
+            "the notice never rides beside a session_ref"
+        );
     }
 
     /// Row 3 (+ §9.1 test 11): terminal exited; its RETIRED identity drives

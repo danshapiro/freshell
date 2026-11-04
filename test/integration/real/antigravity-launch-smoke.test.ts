@@ -268,13 +268,20 @@ describe('antigravity real launch smoke', () => {
       expect(lines[0].type).toBe('USER_INPUT')
       expect(lines.some((r: { type: string }) => r.type === 'PLANNER_RESPONSE')).toBe(true)
       const version = (await execFileAsync(agyCommand, ['--version'], { timeout: 15_000 })).stdout.trim()
-      const KNOWN_TYPES = new Set(['USER_INPUT', 'PLANNER_RESPONSE', 'GENERIC', 'SYSTEM_MESSAGE', 'CHECKPOINT'])
+      // The SIX contract record types (Provider Contract Record row 67): the
+      // five success-path types plus the evidenced failure-path ERROR_MESSAGE
+      // (src=SYSTEM, status=DONE, carries `error` + `step_index` + a
+      // second-granularity `created_at`; observed on API/network failure
+      // retries — the overlay-conformant receipts' ERROR_MESSAGE note,
+      // 2026-11-03). Promoting it here is a STRENGTHENING: its stamps are
+      // asserted like every other known type.
+      const KNOWN_TYPES = new Set(['USER_INPUT', 'PLANNER_RESPONSE', 'GENERIC', 'SYSTEM_MESSAGE', 'CHECKPOINT', 'ERROR_MESSAGE'])
       const unknownTypes = new Set<string>()
       for (const record of lines) {
         if (!KNOWN_TYPES.has(record.type)) { unknownTypes.add(record.type); continue }
-        // Stamps are asserted on the FIVE validated record types only: the contract
+        // Stamps are asserted on the SIX contract record types only: the contract
         // says these types carry step_index and second-granularity created_at — it does
-        // not forbid a future CLI version from adding a sixth type. A stamp change on
+        // not forbid a future CLI version from adding a seventh type. A stamp change on
         // a KNOWN type still fails, and that failure is the drift alarm doing its job:
         // record the version receipt and re-open the Provider Contract Record; never
         // loosen the known-type assertions to get green.

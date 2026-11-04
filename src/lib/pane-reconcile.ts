@@ -33,6 +33,7 @@ import {
   resetPaneForReconcileCreate,
   setPaneReconcileNotice,
   setPaneRestoreError,
+  setPaneStaleSessionNotice,
   setReconcileWarming,
 } from '@/store/panesSlice'
 import { retainedManagedPreparationFailure } from '@/store/paneTypes'
@@ -525,13 +526,27 @@ export function foldVerdicts(
           // an identity-less FreshUnbound replacement whose predecessor's
           // claim the server RELEASED. Mirror the live fold's exact
           // discriminator (identityDisposition === 'fresh_unbound') so the
-          // pane clears its stale saved sessionRef and the CLI's natural
-          // rebind folds instead of conflicting. Never set beside a
+          // pane clears its stale saved sessionRef and a later re-bind
+          // association folds instead of conflicting. Never set beside a
           // sessionRef (the server sends at most one of the two).
           ...(verdict.identityDisposition === 'fresh_unbound'
             ? { clearSessionIdentity: true }
             : {}),
         }))
+        // Final-delta review round 2, Fix 1 — the missed frame carried
+        // MORE than the disposition: its staleSessionNotice is the only
+        // operator-visible explanation naming the lost conversation, and
+        // a pane that was disconnected during the recovery never saw it.
+        // The verdict carries the same notice; surface it exactly as the
+        // live terminal.replaced fold does (the pane-level dismissible
+        // notice — same reducer, same persistence, same dismissal).
+        if (verdict.staleSessionNotice) {
+          dispatch(setPaneStaleSessionNotice({
+            tabId,
+            paneId,
+            staleSessionNotice: verdict.staleSessionNotice,
+          }))
+        }
         outcome.attached++
         break
       }

@@ -657,8 +657,9 @@ fn terminal_replaced_identity_disposition_is_optional_and_additive() {
     // `fresh_unbound` (the resume gate refused the recorded id; the
     // respawn launched an identity-less fresh conversation whose stale
     // claim was RELEASED) tells the client to CLEAR the pane's saved
-    // sessionRef so the CLI's natural rebind (an association with a
-    // fresh id and no previousSessionId) folds instead of conflicting.
+    // sessionRef so a later re-bind association (an association with a
+    // fresh id and no previousSessionId, where the provider's machinery
+    // emits one) folds instead of conflicting.
     // Additive/optional: absent keeps the legacy frame byte-shape (the
     // frozen client keeps the preserve-the-recorded-ref fold).
     let legacy = r#"{"type":"terminal.replaced","oldTerminalId":"t1","newTerminalId":"t2","exitCode":137,"attempt":1,"maxAttempts":3}"#;
@@ -776,6 +777,65 @@ fn pane_reconcile_verdict_identity_disposition_is_optional_and_additive() {
         }
         other => panic!("expected PaneReconcileResult, got {other:?}"),
     }
+}
+
+#[test]
+fn pane_reconcile_verdict_stale_session_notice_is_optional_and_additive() {
+    // Final-delta review round 2, Fix 1: the reconnect verdict carries the
+    // gate's stale-id notice BESIDE the fresh_unbound disposition — the
+    // same visible explanation naming the refused conversation that the
+    // missed terminal.replaced frame carried. Without it a pane that was
+    // disconnected during the server-side auto-resume re-attaches with
+    // its id cleared and no visible explanation at all. Additive/
+    // optional: absent keeps the legacy verdict byte-shape (an older
+    // server's fresh_unbound verdict still folds the clear; an older
+    // client ignores the key).
+    //
+    // Wire-level (serde_json::Value) assertions so the contract failure is
+    // observable at RUNTIME against a pre-field build, not only as a
+    // compile error: a server that ignores the key drops it on
+    // re-serialization.
+    let legacy = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2","identityDisposition":"fresh_unbound"}]}"#;
+    let msg: ServerMessage = serde_json::from_str(legacy).expect("parse legacy");
+    let reser = serde_json::to_value(&msg).expect("serialize legacy");
+    assert!(
+        reser["verdicts"][0].get("staleSessionNotice").is_none(),
+        "absent notice keeps the legacy verdict byte-shape — no key on the wire"
+    );
+    // The full FreshUnbound reconnect shape: disposition + notice ride
+    // through unchanged and conform to the frozen (regenerated) schema.
+    let wire = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"tab:p","verdict":"attach","terminalId":"t2","identityDisposition":"fresh_unbound","staleSessionNotice":"Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead."}]}"#;
+    let msg: ServerMessage =
+        serde_json::from_str(wire).expect("parse fresh_unbound reconnect shape");
+    let reser = serde_json::to_value(&msg).expect("serialize fresh_unbound reconnect shape");
+    assert_eq!(
+        reser["verdicts"][0]["staleSessionNotice"],
+        "Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.",
+        "the stale-id notice must survive the round-trip on the wire"
+    );
+    assert_eq!(reser["verdicts"][0]["identityDisposition"], "fresh_unbound");
+    // Struct-level pin: the parsed verdict carries both the disposition
+    // and the notice; the legacy wire-level absence assertion above pins
+    // the None shape.
+    match msg {
+        ServerMessage::PaneReconcileResult(r) => {
+            assert_eq!(
+                r.verdicts[0].identity_disposition,
+                Some(TerminalReplacedIdentityDisposition::FreshUnbound)
+            );
+            assert_eq!(
+                r.verdicts[0].stale_session_notice.as_deref(),
+                Some("Saved antigravity session 11111111-2222-3333-4444-555555555555 could not be found on disk — started a fresh session instead.")
+            );
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
+    let schema = outbound_schema()["messages"]["pane.reconcile.result"].clone();
+    assert!(
+        !schema.is_null(),
+        "no frozen schema for server `pane.reconcile.result`"
+    );
+    assert_conforms(&validator(&schema), &reser, "pane.reconcile.result");
 }
 
 #[test]

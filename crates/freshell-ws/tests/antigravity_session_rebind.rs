@@ -100,8 +100,11 @@
 //! retired, the hub releases the stale locator's claim (a later restore
 //! create answers the typed SESSION_MISSING refusal, never an adoption),
 //! and the natural rebind binds the fresh conversation on the next clean
-//! typed prompt. It runs its own server with a disk-wired existence probe
-//! (the suite above runs the fail-open NoIndexProbe).
+//! typed prompt — the FAKE-CONTRACT machinery this suite drives (its
+//! fake agy appends the ownership records the locator consumes;
+//! real-format antigravity sessions never re-bind per-pane). It runs its
+//! own server with a disk-wired existence probe (the suite above runs
+//! the fail-open NoIndexProbe).
 
 mod common;
 
@@ -1675,8 +1678,10 @@ async fn antigravity_exact_live_identity_rebind_suite() {
 /// SESSION_MISSING refusal exactly like the direct create door, NEVER
 /// the BoundElsewhere adoption of the identity-less fresh terminal (the
 /// silent replacement this test forbids). The pane has NO saved identity
-/// until its next clean typed prompt, when the natural rebind (README's
-/// binding paragraph) binds the FRESH conversation the CLI minted.
+/// until its next clean typed prompt, when the natural rebind (the
+/// fake-contract machinery this suite's fake agy exercises; real-format
+/// antigravity sessions never re-bind per-pane) binds the FRESH
+/// conversation the CLI minted.
 #[tokio::test(flavor = "multi_thread")]
 async fn antigravity_crash_respawn_with_deleted_conversation_releases_the_stale_identity() {
     let home = tempfile::tempdir().expect("antigravity home tempdir");
@@ -1896,8 +1901,9 @@ async fn antigravity_crash_respawn_with_deleted_conversation_releases_the_stale_
 /// predecessor's terminal id and the stale sessionRef the gate refused —
 /// and the attach verdict must carry the SAME identity-clearing signal
 /// (`identityDisposition: fresh_unbound`), or the pane retains the
-/// deleted conversation id across the reconnection and the CLI's natural
-/// rebind (a fresh id with no previousSessionId) folds as a conflict
+/// deleted conversation id across the reconnection and the later re-bind
+/// association (the fake-contract machinery this suite exercises; a
+/// fresh id with no previousSessionId) folds as a conflict
 /// forever. End-to-end: real crash, real gate refusal, real FreshUnbound
 /// respawn, real reconnect, real verdict.
 #[tokio::test(flavor = "multi_thread")]
@@ -2032,6 +2038,24 @@ async fn antigravity_fresh_unbound_reconnect_reconcile_carries_the_clearing_disp
     assert_eq!(
         verdict["identityDisposition"], "fresh_unbound",
         "the reconnect verdict carries the identity-clearing signal: {result}"
+    );
+
+    // 7. Final-delta review round 2, Fix 1 — the verdict carries the
+    //    stale-id NOTICE too: the missed terminal.replaced frame was
+    //    also the only carrier of the visible explanation naming the
+    //    lost conversation, so the reconnect verdict must relay it
+    //    (`staleSessionNotice`) or the reconnected pane clears its id
+    //    with no explanation at all. RED pre-fix: no notice key.
+    let reconnect_notice = verdict["staleSessionNotice"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the reconnect verdict must carry staleSessionNotice: {result}"));
+    assert!(
+        reconnect_notice.contains(conv.as_str()),
+        "the reconnect verdict's notice names the stale conversation id: {reconnect_notice}"
+    );
+    assert!(
+        reconnect_notice.contains("could not be found"),
+        "the reconnect verdict's notice explains the fresh replacement: {reconnect_notice}"
     );
 
     server.registry.kill(&new_tid);

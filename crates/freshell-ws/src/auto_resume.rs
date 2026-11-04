@@ -649,9 +649,15 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                             // completed against the fresh terminal (GC3's
                             // no-silent-replacement rule; the direct create
                             // path refuses the same id with the typed
-                            // SESSION_MISSING error). The pane has NO saved
-                            // identity and binds the conversation the CLI
-                            // mints through the provider's natural rebind;
+                            // SESSION_MISSING error). The pane has NO
+                            // saved identity; any later re-bind is the
+                            // provider's own machinery — codex/opencode
+                            // re-associate through real session discovery,
+                            // while antigravity's typed-prompt rebind
+                            // engages only on Freshell's fake-contract
+                            // fixtures (real-format antigravity sessions
+                            // never re-bind per-pane; README's binding
+                            // paragraph);
                             // the replaced frame carries the gate's notice
                             // naming the stale id (round 3, Major 2) — the
                             // respawn's Recovering broadcast names it too,
@@ -765,8 +771,9 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
 /// wire field (focused repair round 2, Major 2): the client needs the
 /// FreshUnbound distinction — the gate refused the recorded id, the
 /// respawn launched an identity-less fresh conversation, and the stale
-/// claim was RELEASED — to clear the pane's saved sessionRef, so the
-/// CLI's natural rebind folds without a conflict. Resumed and
+/// claim was RELEASED — to clear the pane's saved sessionRef, so a later
+/// re-bind association (where the provider's machinery emits one) folds
+/// without a conflict. Resumed and
 /// MintedReplacement keep the legacy preserve-the-recorded-ref client
 /// fold (AD-3 for the minted shape).
 fn replacement_identity_disposition(
@@ -939,9 +946,10 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     /// disposition (focused repair round 2, Major 2): `FreshUnbound` — the
     /// gate refused the recorded id and the respawn launched an
     /// identity-less fresh conversation whose stale claim was RELEASED —
-    /// tells the client to CLEAR the pane's saved sessionRef, so the
-    /// CLI's natural rebind (the fresh conversation's association with
-    /// no `previousSessionId`) folds without hitting the client's
+    /// tells the client to CLEAR the pane's saved sessionRef, so a later
+    /// re-bind association (the fresh conversation's association with
+    /// no `previousSessionId`, emitted only by providers whose
+    /// association machinery re-binds) folds without hitting the client's
     /// association conflict rule. `Resumed`/`MintedReplacement` keep the
     /// legacy client fold (the pane's recorded ref is preserved).
     ///
@@ -2839,9 +2847,10 @@ mod tests {
         );
         // Focused repair round 2, Major 2: the FreshUnbound replacement
         // announces `fresh_unbound` — the client CLEARS the pane's stale
-        // sessionRef on it, so the CLI's natural rebind (the fresh
-        // conversation's association with no previousSessionId) folds
-        // instead of conflicting.
+        // sessionRef on it, so a later re-bind association (the fresh
+        // conversation's association with no previousSessionId, where
+        // the provider's machinery emits one) folds instead of
+        // conflicting.
         assert_eq!(
             fake.replaced_dispositions(),
             vec![freshell_protocol::TerminalReplacedIdentityDisposition::FreshUnbound],

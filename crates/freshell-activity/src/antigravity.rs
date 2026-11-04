@@ -8,7 +8,12 @@
 //! (brain/<id>/.system_generated/logs/transcript.jsonl) carries
 //! step-indexed records — USER_INPUT / PLANNER_RESPONSE / GENERIC /
 //! SYSTEM_MESSAGE / CHECKPOINT — every record with `source`, `status`,
-//! `step_index`, and a SECOND-granularity RFC3339 `created_at`. Two
+//! `step_index`, and a SECOND-granularity RFC3339 `created_at`. The
+//! SIXTH contract type (evidenced 2026-11-03) is the failure-path
+//! `ERROR_MESSAGE` (src=SYSTEM, carries `error`, no content): it is
+//! inert here by design — the classifier keys on USER_INPUT (and the
+//! fake-contract `turn_settled`) only, so an ERROR_MESSAGE record
+//! classifies nothing and never mints a completion. Two
 //! structures the real binary does NOT write remain as LABELED
 //! FAKE-CONTRACT extensions the e2e/rebind fakes append so this machinery
 //! has its signals (both carry the real-shaped field discipline —
